@@ -23,6 +23,20 @@ fn main() {
         move || web::run(&cfg)
     });
 
+    // Start KEYDB auto-update thread (updates once daily)
+    let _keydb_handle = std::thread::spawn({
+        let _cfg = cfg.clone();
+        move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
+            if let Some(ref url) = std::env::var("KEYDB_URL").ok() {
+                match libfreemkv::keydb::update(url) {
+                    Ok(r) => log::syslog(&format!("KEYDB updated: {} entries", r.entries)),
+                    Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
+                }
+            }
+        }
+    });
+
     // Main loop: poll drives
     ripper::drive_poll_loop(&cfg);
 }
