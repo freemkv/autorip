@@ -487,6 +487,12 @@ fn format_epoch_date() -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
+pub fn eject_drive(device_path: &str) {
+    if let Ok(mut session) = libfreemkv::DriveSession::open(std::path::Path::new(device_path)) {
+        let _ = session.eject();
+    }
+}
+
 fn sanitize_filename(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '-' || *c == '_' || *c == '.')

@@ -824,36 +824,21 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
 
 fn handle_eject(request: tiny_http::Request, device: &str) {
     let device_path = format!("/dev/{}", device);
-    let result = std::process::Command::new("eject")
-        .arg(&device_path)
-        .output();
-    match result {
-        Ok(out) if out.status.success() => {
-            ripper::STATE
-                .lock()
-                .map(|mut s| {
-                    s.insert(
-                        device.to_string(),
-                        ripper::RipState {
-                            device: device.to_string(),
-                            status: "idle".to_string(),
-                            ..Default::default()
-                        },
-                    );
-                })
-                .ok();
-            json_response(request, 200, r#"{"ok":true}"#);
-        }
-        Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let body = serde_json::json!({"ok": false, "error": err.trim()}).to_string();
-            json_response(request, 500, &body);
-        }
-        Err(e) => {
-            let body = serde_json::json!({"ok": false, "error": e.to_string()}).to_string();
-            json_response(request, 500, &body);
-        }
-    }
+    crate::ripper::eject_drive(&device_path);
+    ripper::STATE
+        .lock()
+        .map(|mut s| {
+            s.insert(
+                device.to_string(),
+                ripper::RipState {
+                    device: device.to_string(),
+                    status: "idle".to_string(),
+                    ..Default::default()
+                },
+            );
+        })
+        .ok();
+    json_response(request, 200, r#"{"ok":true}"#);
 }
 
 fn handle_stop(request: tiny_http::Request, device: &str) {
