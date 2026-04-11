@@ -91,7 +91,7 @@ fn check_and_move(cfg: &Config) {
             if move_file(mkv_path, Path::new(&dest)) {
                 dest_paths.push(dest);
             } else {
-                eprintln!("Failed to move {:?} to {}", mkv_path, dest);
+                crate::log::device_log(&rs.device, &format!("Failed to move {:?} to {}", mkv_path, dest));
                 all_moved = false;
             }
         }

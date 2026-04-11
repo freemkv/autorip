@@ -1,0 +1,24 @@
+services:
+  autorip:
+    image: ghcr.io/freemkv/autorip:latest
+    container_name: autorip
+    restart: unless-stopped
+    devices:
+      - /dev/sr0:/dev/sr0
+    environment:
+      - AUTORIP_DIR=/config
+      - OUTPUT_DIR=/output
+      - MOVIE_DIR=/output/Movies
+      - TV_DIR=/output/TV
+      - STAGING_DIR=/staging
+      - TMDB_API_KEY=your_tmdb_api_key
+      - MIN_LENGTH=600
+      - AUTO_EJECT=true
+      - ON_INSERT=rip
+    volumes:
+      - ./config:/config
+      - /mnt/media:/output
+      - /tmp/autorip:/staging
+    ports:
+      - 8080:8080
+    privileged: true  # Required for disc access

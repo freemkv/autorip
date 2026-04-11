@@ -50,13 +50,46 @@ pub static STATE: once_cell::sync::Lazy<
     std::sync::Mutex<std::collections::HashMap<String, RipState>>,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Stop cooldowns: device -> epoch seconds when cooldown expires.
+/// After a manual stop, suppress auto-rip for STOP_COOLDOWN_SECS.
+pub static STOP_COOLDOWNS: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+const STOP_COOLDOWN_SECS: u64 = 15;
+
+/// Record a stop cooldown for the given device.
+pub fn set_stop_cooldown(device: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Ok(mut cd) = STOP_COOLDOWNS.lock() {
+        cd.insert(device.to_string(), now + STOP_COOLDOWN_SECS);
+    }
+}
+
+/// Check if a device is within its stop cooldown period.
+fn is_in_cooldown(device: &str) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Ok(cd) = STOP_COOLDOWNS.lock() {
+        if let Some(&expires) = cd.get(device) {
+            return now < expires;
+        }
+    }
+    false
+}
+
 /// Poll drives for disc insertion.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     loop {
         let drives = libfreemkv::find_drives();
         for (path, _id) in &drives {
             let device = path.rsplit('/').next().unwrap_or(path);
-            if has_disc(path) && !is_ripping(device) {
+            if has_disc(path) && !is_ripping(device) && !is_in_cooldown(device) {
                 let cfg = cfg.clone();
                 let device = device.to_string();
                 let path = path.clone();
@@ -377,7 +410,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    eprintln!("Read error: {}", e);
+                    crate::log::device_log(device, &format!("Read error: {}", e));
                     break;
                 }
             }

@@ -1,5 +1,6 @@
 mod config;
 mod history;
+mod log;
 mod mover;
 mod ripper;
 mod tmdb;

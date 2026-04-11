@@ -302,11 +302,11 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
     let server = match Server::http(&addr) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!("Web server failed to start on {}: {}", addr, e);
+            crate::log::syslog(&format!("Web server failed to start on {}: {}", addr, e));
             return;
         }
     };
-    eprintln!("Web UI: http://0.0.0.0:{}", port);
+    crate::log::syslog(&format!("Web UI: http://0.0.0.0:{}", port));
 
     // Dummy SSE clients list (kept for API compatibility, SSE is per-thread).
     let sse_clients: Arc<std::sync::Mutex<Vec<std::net::TcpStream>>> =
@@ -349,6 +349,12 @@ fn handle_request(
         handle_settings_post(request, cfg);
     } else if is_get && url == "/events" {
         handle_sse(request);
+    } else if is_get && url.starts_with("/api/logs/") {
+        let device = url.trim_start_matches("/api/logs/");
+        let device = percent_decode(device);
+        let lines = crate::log::get_device_log(&device, 200);
+        let json = serde_json::to_string(&lines).unwrap_or_else(|_| "[]".to_string());
+        json_response(request, 200, &json);
     } else if is_post && url.starts_with("/api/rip/") {
         let device = url.trim_start_matches("/api/rip/");
         let device = percent_decode(device);
