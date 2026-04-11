@@ -12,6 +12,7 @@ pub struct Config {
     pub main_feature: bool,
     pub auto_eject: bool,
     pub on_insert: String, // "nothing", "identify", "rip"
+    pub abort_on_error: bool,
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,
     pub webhooks: Vec<WebhookConfig>,
