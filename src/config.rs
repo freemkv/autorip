@@ -52,6 +52,7 @@ pub fn load() -> Arc<RwLock<Config>> {
         main_feature: env_or("MAIN_FEATURE", "true") == "true",
         auto_eject: env_or("AUTO_EJECT", "true") == "true",
         on_insert: env_or("ON_INSERT", "rip"),
+        abort_on_error: env_or("ABORT_ON_ERROR", "true") == "true",
         tmdb_api_key: env_or("TMDB_API_KEY", ""),
         keydb_path: std::env::var("KEYDB_PATH").ok(),
         webhooks: Vec::new(),
@@ -91,6 +92,9 @@ fn load_saved(mut cfg: Config) -> Config {
             }
             if let Some(v) = saved.get("on_insert").and_then(|v| v.as_str()) {
                 cfg.on_insert = v.to_string();
+            }
+            if let Some(v) = saved.get("abort_on_error").and_then(|v| v.as_bool()) {
+                cfg.abort_on_error = v;
             }
         }
     }

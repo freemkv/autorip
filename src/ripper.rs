@@ -18,6 +18,10 @@ pub struct RipState {
     pub errors: u32,
     pub last_error: String,
     pub output_file: String,
+    pub tmdb_title: String,
+    pub tmdb_year: u16,
+    pub tmdb_poster: String,
+    pub tmdb_overview: String,
 }
 
 impl Default for RipState {
@@ -33,6 +37,10 @@ impl Default for RipState {
             errors: 0,
             last_error: String::new(),
             output_file: String::new(),
+            tmdb_title: String::new(),
+            tmdb_year: 0,
+            tmdb_poster: String::new(),
+            tmdb_overview: String::new(),
         }
     }
 }
@@ -90,7 +98,7 @@ fn is_ripping(device: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn update_state(device: &str, state: RipState) {
+pub fn update_state(device: &str, state: RipState) {
     if let Ok(mut s) = STATE.lock() {
         s.insert(device.to_string(), state);
     }
@@ -165,6 +173,22 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     }
     .to_string();
 
+    // TMDB lookup
+    let tmdb = crate::tmdb::lookup(
+        &crate::tmdb::clean_title(&disc_name),
+        &cfg_read.tmdb_api_key,
+    );
+    let tmdb_title = tmdb.as_ref().map(|t| t.title.clone()).unwrap_or_default();
+    let tmdb_year = tmdb.as_ref().map(|t| t.year).unwrap_or(0);
+    let tmdb_poster = tmdb
+        .as_ref()
+        .map(|t| t.poster_url.clone())
+        .unwrap_or_default();
+    let tmdb_overview = tmdb
+        .as_ref()
+        .map(|t| t.overview.clone())
+        .unwrap_or_default();
+
     update_state(
         device,
         RipState {
@@ -172,6 +196,10 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             status: "scanning".to_string(),
             disc_name: disc_name.clone(),
             disc_format: disc_format.clone(),
+            tmdb_title: tmdb_title.clone(),
+            tmdb_year,
+            tmdb_poster: tmdb_poster.clone(),
+            tmdb_overview: tmdb_overview.clone(),
             ..Default::default()
         },
     );
@@ -319,8 +347,33 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                             errors: reader.errors,
                             last_error: String::new(),
                             output_file: filename.clone(),
+                            tmdb_title: tmdb_title.clone(),
+                            tmdb_year,
+                            tmdb_poster: tmdb_poster.clone(),
+                            tmdb_overview: tmdb_overview.clone(),
                         },
                     );
+
+                    // Abort on error if configured
+                    if cfg_read.abort_on_error && reader.errors > 0 {
+                        update_state(
+                            device,
+                            RipState {
+                                device: device.to_string(),
+                                status: "error".to_string(),
+                                disc_name: disc_name.clone(),
+                                disc_format: disc_format.clone(),
+                                errors: reader.errors,
+                                last_error: "Aborted due to read errors".to_string(),
+                                tmdb_title: tmdb_title.clone(),
+                                tmdb_year,
+                                tmdb_poster: tmdb_poster.clone(),
+                                tmdb_overview: tmdb_overview.clone(),
+                                ..Default::default()
+                            },
+                        );
+                        return;
+                    }
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -333,6 +386,27 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let _ = mkv.finish();
     }
 
+    // Record history
+    {
+        let title = if tmdb_title.is_empty() {
+            disc_name.clone()
+        } else {
+            tmdb_title.clone()
+        };
+        let entry = serde_json::json!({
+            "title": title,
+            "disc_name": disc_name,
+            "format": disc_format,
+            "year": tmdb_year,
+            "media_type": tmdb.as_ref().map(|t| t.media_type.as_str()).unwrap_or("unknown"),
+            "poster_url": tmdb_poster,
+            "overview": tmdb_overview,
+            "staging_dir": staging,
+            "date": format_epoch_date(),
+        });
+        crate::history::record(&cfg_read.history_dir(), &entry);
+    }
+
     // Done
     update_state(
         device,
@@ -343,6 +417,10 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             disc_format: disc_format.clone(),
             progress_pct: 100,
             output_file: staging.clone(),
+            tmdb_title: tmdb_title.clone(),
+            tmdb_year,
+            tmdb_poster: tmdb_poster.clone(),
+            tmdb_overview: tmdb_overview.clone(),
             ..Default::default()
         },
     );
@@ -354,6 +432,26 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     // Notify
     crate::webhook::send(&cfg_read, "rip_complete", &disc_name, &staging);
+}
+
+fn format_epoch_date() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86400) as i64;
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
 fn sanitize_filename(name: &str) -> String {

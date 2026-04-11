@@ -1,5 +1,3 @@
-use std::path::Path;
-
 pub fn record(history_dir: &str, entry: &serde_json::Value) {
     let _ = std::fs::create_dir_all(history_dir);
     let timestamp = chrono_timestamp();
