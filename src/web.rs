@@ -661,7 +661,7 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     };
 
     // System log: last 50 lines
-    let syslog_path = format!("{}/logs/system.log", cfg.autorip_dir);
+    let syslog_path = format!("{}/system.log", cfg.log_dir());
     let syslog = std::fs::read_to_string(&syslog_path)
         .unwrap_or_default()
         .lines()
@@ -682,20 +682,14 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     json_response(request, 200, &body.to_string());
 }
 
-fn handle_device_log(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
+fn handle_device_log(request: tiny_http::Request, _cfg: &Arc<RwLock<Config>>, device: &str) {
     // Validate device name
     if !device.chars().all(|c| c.is_ascii_alphanumeric()) {
         text_response(request, "invalid device");
         return;
     }
-    let log_dir = cfg.read().unwrap().log_dir();
-    let path = format!("{}/current_{}.log", log_dir, device);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    // Return last 200 lines
-    let lines: Vec<&str> = content.lines().collect();
-    let start = if lines.len() > 200 { lines.len() - 200 } else { 0 };
-    let tail = lines[start..].join("\n");
-    text_response(request, &tail);
+    let lines = crate::log::get_device_log(device, 200);
+    text_response(request, &lines.join("\n"));
 }
 
 fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {

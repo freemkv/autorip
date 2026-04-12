@@ -261,11 +261,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     }
 
     // Rip each title
-    let staging = format!(
-        "{}/{}",
-        cfg_read.staging_dir,
-        sanitize_filename(&disc_name)
-    );
+    let staging = cfg_read.staging_device_dir(&sanitize_filename(&disc_name));
     let _ = std::fs::create_dir_all(&staging);
 
     for &title_idx in &titles_to_rip {

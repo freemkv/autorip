@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          path: libfreemkv
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+        working-directory: autorip
+
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          path: libfreemkv
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check
+        working-directory: autorip

@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          CARGO_VER="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          if [ "$CARGO_VER" != "${{ github.ref_name }}" ]; then
+            echo "::error::Cargo.toml says $CARGO_VER but tag is ${{ github.ref_name }}"
+            exit 1
+          fi
+          echo "Version match: $CARGO_VER"
+
+  build:
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          path: libfreemkv
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Test
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo test --target ${{ matrix.target }}
+        working-directory: autorip
+
+      - name: Build (native)
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }}
+        working-directory: autorip
+
+      - name: Build (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
+        working-directory: autorip
+
+      - name: Package
+        run: |
+          cd autorip/target/${{ matrix.target }}/release
+          tar czf "../../../../autorip-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" autorip
+          tar czf "../../../../autorip-${{ matrix.target }}.tar.gz" autorip
+
+      - name: Upload
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          path: libfreemkv
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: autorip/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/freemkv/autorip:latest
+            ghcr.io/freemkv/autorip:${{ github.ref_name }}
+
+  update-homepage:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update org README with new version
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.ORG_DISPATCH_TOKEN }}
+          repository: freemkv/.github
+          event-type: new-release
+          client-payload: '{"version": "${{ github.ref_name }}"}'
