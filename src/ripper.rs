@@ -1,6 +1,5 @@
-use libfreemkv::{Disc, DiscFormat, DriveSession, IOStream, MkvStream, ScanOptions};
+use libfreemkv::{Disc, DiscFormat, Drive, IOStream, MkvStream, ScanOptions};
 use std::io::Write;
-use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::config::Config;
@@ -87,14 +86,16 @@ fn is_in_cooldown(device: &str) -> bool {
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     loop {
         let drives = libfreemkv::find_drives();
-        for (path, _id) in &drives {
-            let device = path.rsplit('/').next().unwrap_or(path);
-            if has_disc(path) && !is_ripping(device) && !is_in_cooldown(device) {
+        for mut drive in drives {
+            let path = drive.device_path().to_string();
+            let device = path.rsplit('/').next().unwrap_or(&path).to_string();
+            if drive.drive_status() == libfreemkv::DriveStatus::DiscPresent
+                && !is_ripping(&device)
+                && !is_in_cooldown(&device)
+            {
                 let cfg = cfg.clone();
-                let device = device.to_string();
-                let path = path.clone();
                 std::thread::spawn(move || {
-                    rip_disc(&cfg, &device, &path);
+                    rip_disc(&cfg, &device, &mut drive);
                 });
             }
         }
@@ -102,23 +103,6 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     }
 }
 
-fn has_disc(device_path: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        if let Ok(f) = std::fs::File::open(device_path) {
-            let fd = f.as_raw_fd();
-            // CDROM_DRIVE_STATUS = 0x5326, CDS_DISC_OK = 4
-            let status = unsafe { libc::ioctl(fd, 0x5326) };
-            return status == 4;
-        }
-        false
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Path::new(device_path).exists()
-    }
-}
 
 fn is_ripping(device: &str) -> bool {
     STATE
@@ -138,7 +122,7 @@ pub fn update_state(device: &str, state: RipState) {
 }
 
 /// Rip a disc from start to finish.
-fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
+fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
     let cfg_read = cfg.read().unwrap();
 
     update_state(
@@ -150,23 +134,6 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         },
     );
 
-    // Open drive
-    let mut session = match DriveSession::open(Path::new(device_path)) {
-        Ok(s) => s,
-        Err(e) => {
-            update_state(
-                device,
-                RipState {
-                    device: device.to_string(),
-                    status: "error".to_string(),
-                    last_error: e.to_string(),
-                    ..Default::default()
-                },
-            );
-            return;
-        }
-    };
-
     // Init (unlock + firmware)
     let _ = session.wait_ready();
     let _ = session.init();
@@ -177,7 +144,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         Some(p) => ScanOptions::with_keydb(p),
         None => ScanOptions::default(),
     };
-    let disc = match Disc::scan(&mut session, &scan_opts) {
+    let disc = match Disc::scan(session, &scan_opts) {
         Ok(d) => d,
         Err(e) => {
             update_state(
@@ -260,6 +227,9 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         return;
     }
 
+    // Lock tray during rip to prevent accidental ejection
+    session.lock_tray();
+
     // Rip each title
     let staging = cfg_read.staging_device_dir(&sanitize_filename(&disc_name));
     let _ = std::fs::create_dir_all(&staging);
@@ -302,6 +272,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         ..Default::default()
                     },
                 );
+                session.unlock_tray();
                 return;
             }
         };
@@ -312,7 +283,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             .max_buffer(10 * 1024 * 1024);
 
         // Open title for reading
-        let mut reader = match disc.open_title(&mut session, title_idx) {
+        let mut reader = match disc.open_title(session, title_idx) {
             Ok(r) => r,
             Err(e) => {
                 update_state(
@@ -324,6 +295,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         ..Default::default()
                     },
                 );
+                session.unlock_tray();
                 return;
             }
         };
@@ -401,6 +373,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                                 ..Default::default()
                             },
                         );
+                        session.unlock_tray();
                         return;
                     }
                 }
@@ -454,7 +427,8 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         },
     );
 
-    // Eject
+    // Always unlock tray so manual eject works; only auto-eject if configured
+    session.unlock_tray();
     if cfg_read.auto_eject {
         let _ = session.eject();
     }
@@ -484,7 +458,7 @@ fn format_epoch_date() -> String {
 }
 
 pub fn eject_drive(device_path: &str) {
-    if let Ok(mut session) = libfreemkv::DriveSession::open(std::path::Path::new(device_path)) {
+    if let Ok(mut session) = libfreemkv::Drive::open(std::path::Path::new(device_path)) {
         let _ = session.eject();
     }
 }
