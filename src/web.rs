@@ -69,13 +69,15 @@ tr:hover { background:var(--chip); }
 .files { font-size:.8rem; line-height:1.8; }
 .files span { color:var(--text2); }
 /* Settings */
-.setting { margin-bottom:16px; }
-.setting label { display:block; font-size:.75rem; color:var(--text3); text-transform:uppercase; font-weight:600; letter-spacing:.5px; margin-bottom:4px; }
-.setting input[type=text], .setting input[type=number] { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--log-bg); color:var(--text); font-size:.85rem; font-family:inherit; }
+.setting { margin-bottom:20px; }
+.setting label { display:block; font-size:.75rem; color:var(--text3); text-transform:uppercase; font-weight:600; letter-spacing:.5px; margin-bottom:6px; }
+.setting input[type=text], .setting input[type=number] { width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:6px; background:var(--log-bg); color:var(--text); font-size:.85rem; font-family:inherit; box-sizing:border-box; }
 .setting input:focus { outline:none; border-color:var(--accent); }
-.setting .hint { font-size:.7rem; color:var(--text3); margin-top:2px; }
-.toggle { display:flex; align-items:center; gap:8px; font-size:.85rem; cursor:pointer; }
-.toggle input { width:16px; height:16px; }
+.setting .hint { font-size:.72rem; color:var(--text3); margin-top:4px; line-height:1.4; }
+.toggle { display:flex; align-items:center; gap:10px; font-size:.85rem; cursor:pointer; text-transform:none; font-weight:400; color:var(--text); letter-spacing:0; }
+.toggle input[type=checkbox] { width:18px; height:18px; margin:0; flex-shrink:0; accent-color:var(--accent); }
+#settings-form .card { margin-bottom:12px; }
+#settings-form .card h2 { margin-bottom:16px; }
 .section { display:none; } .section.active { display:flex; flex-direction:column; flex:1; }
 @media(max-width:600px){ .c{padding:10px} .np{flex-direction:column;gap:12px} .poster,.ph{width:100%;min-height:auto;max-height:200px} .mt{font-size:1.2rem} }
 </style>
@@ -448,7 +450,7 @@ function renderSettings(s){
       const indent=f.indent?'margin-left:20px;border-left:2px solid var(--border);padding-left:12px':'';
       const ph=f.placeholder?' placeholder="'+f.placeholder+'"':'';
       if(f.type==='radio'){
-        const opts=f.options.map(o=>'<label style="font-size:.85rem;cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-right:16px"><input type="radio" name="'+f.key+'" data-key="'+f.key+'" value="'+o.value+'" '+(v===o.value?'checked':'')+'>'+o.label+'</label>').join('');
+        const opts=f.options.map(o=>'<label style="font-size:.85rem;cursor:pointer;display:inline-flex;align-items:center;gap:8px;margin-right:20px"><input type="radio" name="'+f.key+'" data-key="'+f.key+'" value="'+o.value+'" style="width:16px;height:16px;margin:0;accent-color:var(--accent)" '+(v===o.value?'checked':'')+'>'+o.label+'</label>').join('');
         html+='<div class="setting" style="'+indent+'"><label>'+f.label+'</label><div style="margin-top:4px">'+opts+'</div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }else if(f.type==='bool'){
         html+='<div class="setting" style="'+indent+'"><label class="toggle"><input type="checkbox" data-key="'+f.key+'" '+(v?'checked':'')+'>'+f.label+'</label>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
