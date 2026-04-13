@@ -109,7 +109,7 @@ tr:hover { background:var(--chip); }
 
 <!-- System page -->
 <div id="system" class="section">
-  <div class="card" style="margin-top:16px"><h2>Data Files</h2><div id="files" class="files"></div></div>
+  <div class="card" style="margin-top:16px"><h2>Data Files</h2><div id="files" class="files"></div><button class="btn" style="margin-top:8px" onclick="updateKeydb()">Update KEYDB</button><span id="keydb-status" style="margin-left:8px;font-size:.8rem"></span></div>
   <div class="card"><h2>Move Queue</h2><div id="moves"></div></div>
   <div><h2 style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;margin-bottom:8px">System Log</h2><div id="syslog" class="log" style="max-height:400px"></div></div>
 </div>
@@ -371,6 +371,14 @@ function loadHistory(){
   });
 }
 
+function updateKeydb(){
+  const st=document.getElementById('keydb-status');
+  st.textContent='Updating...';st.style.color='var(--text3)';
+  fetch('/api/update-keydb',{method:'POST'}).then(r=>r.json()).then(data=>{
+    if(data.ok){st.textContent='Updated: '+data.entries+' entries';st.style.color='var(--green)';loadSystem();}
+    else{st.textContent='Error: '+(data.error||'unknown');st.style.color='var(--red)';}
+  }).catch(e=>{st.textContent='Error: '+e;st.style.color='var(--red)';});
+}
 /* ---- System page ---- */
 function loadSystem(){
   fetch('/api/system').then(r=>r.json()).then(data=>{
@@ -530,6 +538,8 @@ fn handle_request(
         let device = url.trim_start_matches("/api/rip/");
         let device = percent_decode(device);
         handle_rip(request, cfg, &device);
+    } else if is_post && url == "/api/update-keydb" {
+        handle_update_keydb(request, cfg);
     } else if is_post && url.starts_with("/api/eject/") {
         let device = url.trim_start_matches("/api/eject/");
         let device = percent_decode(device);
@@ -607,8 +617,8 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     let cfg = cfg.read().unwrap();
 
     // Data files check
-    let data_dir = format!("{}/makemkv", cfg.autorip_dir);
-    let data_files = ["KEYDB.cfg", "hkd.dat", "sdf.dat", "_private_data.tar"];
+    let data_dir = format!("{}/freemkv", cfg.autorip_dir);
+    let data_files = ["KEYDB.cfg"];
     let mut files_json = Vec::new();
     for name in &data_files {
         let path = format!("{}/{}", data_dir, name);
@@ -814,6 +824,40 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
     });
 
     json_response(request, 200, r#"{"ok":true}"#);
+}
+
+fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
+    let keydb_url = cfg.read().ok()
+        .and_then(|c| c.keydb_path.clone())
+        .unwrap_or_default();
+    if keydb_url.is_empty() {
+        // No URL configured — try default update
+        match libfreemkv::keydb::default_path() {
+            Ok(path) => {
+                let exists = path.exists();
+                json_response(request, 200, &format!(
+                    r#"{{"ok":{},"entries":0,"message":"KEYDB at {}"}}"#,
+                    exists, path.display()
+                ));
+            }
+            Err(_) => json_response(request, 500, r#"{"ok":false,"error":"cannot determine KEYDB path"}"#),
+        }
+        return;
+    }
+    match libfreemkv::keydb::update(&keydb_url) {
+        Ok(result) => {
+            let body = serde_json::json!({
+                "ok": true,
+                "entries": result.entries,
+                "bytes": result.bytes,
+                "path": result.path.display().to_string(),
+            });
+            json_response(request, 200, &body.to_string());
+        }
+        Err(e) => {
+            json_response(request, 500, &format!(r#"{{"ok":false,"error":"{}"}}"#, e));
+        }
+    }
 }
 
 fn handle_eject(request: tiny_http::Request, device: &str) {
