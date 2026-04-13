@@ -15,6 +15,7 @@ pub struct Config {
     pub abort_on_error: bool,
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,
+    pub keydb_url: String,
     pub webhooks: Vec<WebhookConfig>,
     pub autorip_dir: String,
 }
@@ -55,6 +56,7 @@ pub fn load() -> Arc<RwLock<Config>> {
         abort_on_error: env_or("ABORT_ON_ERROR", "true") == "true",
         tmdb_api_key: env_or("TMDB_API_KEY", ""),
         keydb_path: std::env::var("KEYDB_PATH").ok(),
+        keydb_url: env_or("KEYDB_URL", ""),
         webhooks: Vec::new(),
         autorip_dir,
     };
@@ -83,6 +85,9 @@ fn load_saved(mut cfg: Config) -> Config {
             }
             if let Some(v) = saved.get("tmdb_api_key").and_then(|v| v.as_str()) {
                 cfg.tmdb_api_key = v.to_string();
+            }
+            if let Some(v) = saved.get("keydb_url").and_then(|v| v.as_str()) {
+                cfg.keydb_url = v.to_string();
             }
             if let Some(v) = saved.get("main_feature").and_then(|v| v.as_bool()) {
                 cfg.main_feature = v;

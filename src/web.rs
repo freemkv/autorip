@@ -128,7 +128,7 @@ tr:hover { background:var(--chip); }
 </div>
 </div>
 
-<div style="text-align:center;padding:16px;font-size:.7rem"><a href="https://github.com/freemkv/autorip" style="color:var(--text3);text-decoration:none" target="_blank">autorip</a></div>
+<div style="text-align:center;padding:16px;font-size:.7rem"><a href="https://github.com/freemkv/autorip" style="color:var(--text3);text-decoration:none" target="_blank">autorip v{VERSION}</a></div>
 
 <script>
 /* ---- Theme ---- */
@@ -389,8 +389,8 @@ function loadSystem(){
     if(data.files&&data.files.length){
       let fhtml='';
       data.files.forEach(f=>{
-        const dot=f.present?'var(--green)':'var(--red)';
-        const info=f.present?(f.size||'')+' \u00b7 '+(f.updated||''):'missing';
+        const dot=f.present?'var(--green)':'var(--text3)';
+        const info=f.present?(f.size||'')+' \u00b7 '+(f.updated||''):(f.size||'not found');
         fhtml+='<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dot+';margin-right:8px;vertical-align:middle"></span>'+esc(f.name)+' <span>'+esc(info)+'</span></div>';
       });
       filesEl.innerHTML=fhtml;
@@ -440,6 +440,7 @@ function renderSettings(s){
     ]},
     {title:'API Keys',fields:[
       {key:'tmdb_api_key',label:'TMDB API Key',type:'text',hint:'v3 API key from themoviedb.org'},
+      {key:'keydb_url',label:'KEYDB Update URL',type:'text',hint:'HTTP URL to download KEYDB.cfg (zip, gz, or plain text)'},
     ]},
   ];
   let html='';
@@ -559,7 +560,8 @@ fn handle_request(
 
 fn serve_html(request: tiny_http::Request) {
     let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
-    let response = Response::from_string(DASHBOARD_HTML).with_header(header);
+    let html = DASHBOARD_HTML.replace("{VERSION}", env!("CARGO_PKG_VERSION"));
+    let response = Response::from_string(html).with_header(header);
     let _ = request.respond(response);
 }
 
@@ -618,14 +620,20 @@ fn handle_history_file(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, f
 fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     let cfg = cfg.read().unwrap();
 
-    // Data files check
-    let data_dir = format!("{}/freemkv", cfg.autorip_dir);
-    let data_files = ["KEYDB.cfg"];
+    // KEYDB status — check config path, then default path
+    let keydb_paths: Vec<std::path::PathBuf> = [
+        cfg.keydb_path.as_ref().map(std::path::PathBuf::from),
+        Some(std::path::PathBuf::from(format!("{}/freemkv/KEYDB.cfg", cfg.autorip_dir))),
+        libfreemkv::keydb::default_path().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
     let mut files_json = Vec::new();
-    for name in &data_files {
-        let path = format!("{}/{}", data_dir, name);
-        let meta = std::fs::metadata(&path);
-        if let Ok(m) = meta {
+    let mut found = false;
+    for path in &keydb_paths {
+        if let Ok(m) = std::fs::metadata(path) {
             let size = m.len();
             let size_str = if size > 1024 * 1024 {
                 format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
@@ -636,24 +644,26 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             };
             let modified = m.modified().ok().and_then(|t| {
                 t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| {
-                    let secs = d.as_secs();
-                    format_epoch_datetime(secs)
+                    format_epoch_datetime(d.as_secs())
                 })
             }).unwrap_or_default();
             files_json.push(serde_json::json!({
-                "name": name,
+                "name": format!("KEYDB.cfg ({})", path.display()),
                 "present": true,
                 "size": size_str,
                 "updated": modified,
             }));
-        } else {
-            files_json.push(serde_json::json!({
-                "name": name,
-                "present": false,
-                "size": null,
-                "updated": null,
-            }));
+            found = true;
+            break;
         }
+    }
+    if !found {
+        files_json.push(serde_json::json!({
+            "name": "KEYDB.cfg",
+            "present": false,
+            "size": "optional — needed for encrypted Blu-ray/UHD discs",
+            "updated": null,
+        }));
     }
 
     // Move queue: find drives with status "done" or "moving"
@@ -734,6 +744,9 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         }
         if let Some(v) = patch.get("tmdb_api_key").and_then(|v| v.as_str()) {
             c.tmdb_api_key = v.to_string();
+        }
+        if let Some(v) = patch.get("keydb_url").and_then(|v| v.as_str()) {
+            c.keydb_url = v.to_string();
         }
         if let Some(v) = patch.get("on_insert").and_then(|v| v.as_str()) {
             c.on_insert = v.to_string();
@@ -830,20 +843,11 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
 
 fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     let keydb_url = cfg.read().ok()
-        .and_then(|c| c.keydb_path.clone())
+        .map(|c| c.keydb_url.clone())
         .unwrap_or_default();
     if keydb_url.is_empty() {
-        // No URL configured — try default update
-        match libfreemkv::keydb::default_path() {
-            Ok(path) => {
-                let exists = path.exists();
-                json_response(request, 200, &format!(
-                    r#"{{"ok":{},"entries":0,"message":"KEYDB at {}"}}"#,
-                    exists, path.display()
-                ));
-            }
-            Err(_) => json_response(request, 500, r#"{"ok":false,"error":"cannot determine KEYDB path"}"#),
-        }
+        json_response(request, 400,
+            r#"{"ok":false,"error":"No KEYDB_URL configured. Set it in Settings or as an environment variable."}"#);
         return;
     }
     match libfreemkv::keydb::update(&keydb_url) {
