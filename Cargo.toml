@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-autorip"
-version = "0.1.0"
+version = "0.8.1"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Automatic disc ripper — insert a disc, get an MKV"
@@ -13,7 +13,7 @@ name = "autorip"
 path = "src/main.rs"
 
 [dependencies]
-libfreemkv = { path = "../libfreemkv" }
+libfreemkv = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
