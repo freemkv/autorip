@@ -1,13 +1,14 @@
-# Build requires libfreemkv checked out at ../libfreemkv relative to this repo.
-# The release workflow and docker-compose handle this automatically.
+# Docker build context must include both autorip/ and libfreemkv/ directories.
+# The release workflow handles this by checking out both repos side-by-side.
+# For local builds: docker build -t autorip -f autorip/Dockerfile ..
 
 FROM rust:1.82-slim AS builder
 
-WORKDIR /build/libfreemkv
-COPY ../libfreemkv .
+WORKDIR /build
+COPY libfreemkv/ libfreemkv/
+COPY autorip/ autorip/
 
 WORKDIR /build/autorip
-COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
@@ -16,8 +17,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/autorip/target/release/autorip /usr/local/bin/autorip
-COPY entrypoint.sh /entrypoint.sh
-COPY udev-trigger.sh /usr/local/bin/udev-trigger.sh
+COPY autorip/entrypoint.sh /entrypoint.sh
+COPY autorip/udev-trigger.sh /usr/local/bin/udev-trigger.sh
 RUN chmod +x /entrypoint.sh /usr/local/bin/udev-trigger.sh
 
 EXPOSE 8080
