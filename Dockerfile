@@ -2,7 +2,7 @@
 # The release workflow handles this by checking out both repos side-by-side.
 # For local builds: docker build -t autorip -f autorip/Dockerfile ..
 
-FROM rust:1.82-slim AS builder
+FROM rust:1.86-slim AS builder
 
 WORKDIR /build
 COPY libfreemkv/ libfreemkv/

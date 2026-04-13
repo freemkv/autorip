@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-autorip"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Automatic disc ripper — insert a disc, get an MKV"
