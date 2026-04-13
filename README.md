@@ -20,6 +20,8 @@ docker-compose up -d
 
 Open http://localhost:8080
 
+**First-time setup:** Go to Settings and enter your KEYDB Update URL to enable Blu-ray/UHD decryption. DVD ripping works out of the box. TMDB API key is optional (enables automatic title/poster lookup).
+
 ### Build from source
 
 ```bash
