@@ -16,7 +16,7 @@ jobs:
         with:
           repository: freemkv/libfreemkv
           path: libfreemkv
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.86.0
       - run: cargo test
         working-directory: autorip
 
@@ -30,6 +30,6 @@ jobs:
         with:
           repository: freemkv/libfreemkv
           path: libfreemkv
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.86.0
       - run: cargo check
         working-directory: autorip
