@@ -126,7 +126,7 @@ tr:hover { background:var(--chip); }
 </div>
 </div>
 
-<div style="text-align:center;padding:16px;font-size:.7rem"><a href="https://github.com/MattJackson/autorip" style="color:var(--text3);text-decoration:none" target="_blank">autorip</a></div>
+<div style="text-align:center;padding:16px;font-size:.7rem"><a href="https://github.com/freemkv/autorip" style="color:var(--text3);text-decoration:none" target="_blank">autorip</a></div>
 
 <script>
 /* ---- Theme ---- */
