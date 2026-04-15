@@ -30,7 +30,7 @@ fn install_signal_handler() {
     #[cfg(windows)]
     unsafe {
         extern "system" fn handler(_: u32) -> i32 {
-            INTERRUPTED.store(true, Ordering::Relaxed);
+            INTERRUPTED.store(true, Ordering::SeqCst);
             1
         }
         extern "system" {
@@ -45,10 +45,10 @@ fn install_signal_handler() {
 
 #[cfg(unix)]
 extern "C" fn handle_sigint(_sig: libc::c_int) {
-    if INTERRUPTED.load(Ordering::Relaxed) {
+    if INTERRUPTED.load(Ordering::SeqCst) {
         std::process::exit(130);
     }
-    INTERRUPTED.store(true, Ordering::Relaxed);
+    INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
 // ── CLI entry point ─────────────────────────────────────────────────────────
@@ -114,7 +114,10 @@ pub fn run(source: &str, dest: &str, args: &[String]) {
     } else {
         // Single title
         let title_index = title_nums.first().map(|n| n - 1);
-        pipe(source, dest, &keydb_path, title_index, raw, &out);
+        if let Err(e) = pipe(source, dest, &keydb_path, title_index, raw, &out) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -129,7 +132,7 @@ fn pipe(
     title_index: Option<usize>,
     raw: bool,
     out: &Output,
-) {
+) -> Result<(), String> {
     out.raw_inline(Normal, &format!("Opening {}... ", source));
     let input_opts = libfreemkv::InputOptions {
         keydb_path: keydb_path.clone(),
@@ -143,8 +146,7 @@ fn pipe(
         }
         Err(e) => {
             out.raw(Normal, "FAILED");
-            eprintln!("  {}", e);
-            std::process::exit(1);
+            return Err(format!("{}", e));
         }
     };
 
@@ -159,8 +161,7 @@ fn pipe(
         }
         Err(e) => {
             out.raw(Normal, "FAILED");
-            eprintln!("  {}", e);
-            std::process::exit(1);
+            return Err(format!("{}", e));
         }
     };
 
@@ -168,6 +169,7 @@ fn pipe(
     out.blank(Normal);
     copy_loop(&mut *input, &mut *output, total_bytes, 0, out);
     let _ = output.finish();
+    Ok(())
 }
 
 // ── Disc → ISO (special case: raw sector copy with resume) ──────────────────
@@ -467,7 +469,9 @@ fn batch_stream(
         Some(t) => t,
         None => {
             // Source doesn't have titles — treat as single
-            pipe(source, dest, keydb_path, None, raw, out);
+            if let Err(e) = pipe(source, dest, keydb_path, None, raw, out) {
+                eprintln!("Error: {}", e);
+            }
             return;
         }
     };
@@ -501,7 +505,9 @@ fn batch_stream(
         let dest_url = format!("{}://{}", ext, dir.join(filename).display());
 
         out.raw(Normal, &format!("Title {} → {}", idx + 1, dest_url));
-        pipe(source, &dest_url, keydb_path, Some(idx), raw, out);
+        if let Err(e) = pipe(source, &dest_url, keydb_path, Some(idx), raw, out) {
+            eprintln!("Error: {}", e);
+        }
         out.blank(Normal);
     }
 }
@@ -543,7 +549,7 @@ fn copy_loop(
     let mut last_update = start;
 
     loop {
-        if INTERRUPTED.load(Ordering::Relaxed) {
+        if INTERRUPTED.load(Ordering::SeqCst) {
             out.blank(Normal);
             out.raw(Normal, "Interrupted.");
             break;
