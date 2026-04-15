@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.2 (2026-04-15)
+
+### Fixes
+- **Disc→ISO batch overflow** — pass detect_max_batch_sectors() to Disc::copy() instead of hardcoded 64 sectors
+- **Header scan ordering** — stream info displayed after headers_ready() scan so stdio/network metadata is populated
+
 ## 0.10.1 (2026-04-15)
 
 ### Clean architecture
