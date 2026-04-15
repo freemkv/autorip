@@ -16,3 +16,9 @@ All user-facing text comes from `strings.rs` (locale JSON files). Never hardcode
 - **disc.copy() for ISO.** `disc_to_iso()` calls `Disc::copy()`, not a stream.
 - **No process::exit in pipe.** Functions return bool/Result. Only `main()` exits.
 - **Progress is a CLI concern.** Library returns `DiscTitle.size_bytes`. CLI calculates and displays progress.
+
+## Public repo rules
+
+- **No internal docs.** Audit reports, test plans, roadmaps, TODOs go in freemkv-private, never here.
+- **No Co-Authored-By** in commit messages. One contributor: MattJackson.
+- **No private references.** No Gitea URLs, no /data/code paths, no internal IPs in code (examples in docs are fine).
