@@ -239,7 +239,7 @@ fn disc_to_iso(
     source: &str,
     dest: &str,
     keydb_path: &Option<String>,
-    raw: bool,
+    _raw: bool,
     out: &Output,
 ) {
     let parsed_source = libfreemkv::parse_url(source);
@@ -283,7 +283,7 @@ fn disc_to_iso(
     };
 
     let disc = &result.disc;
-    let mut drive = result.stream.into_drive();
+    let drive = result.stream.into_drive();
     let disc_name = sanitize_name(
         disc.meta_title.as_deref().unwrap_or(&disc.volume_id),
     );
@@ -309,7 +309,7 @@ fn disc_to_iso(
                     safe_sectors
                 ),
             );
-            (safe_sectors, resume_from as u64)
+            (safe_sectors, resume_from)
         }
         _ => (0u32, 0u64),
     };
@@ -372,7 +372,7 @@ fn disc_to_stream(
     parsed_dest: &libfreemkv::StreamUrl,
     keydb_path: &Option<String>,
     title_nums: &[usize],
-    raw: bool,
+    _raw: bool,
     out: &Output,
 ) {
     let parsed_source = libfreemkv::parse_url(source);
