@@ -1,7 +1,7 @@
 use crate::config::{self, Config};
 use crate::history;
 use crate::ripper;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::sync::{Arc, RwLock};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
@@ -111,7 +111,7 @@ tr:hover { background:var(--chip); }
 
 <!-- System page -->
 <div id="system" class="section">
-  <div class="card" style="margin-top:16px"><h2>Data Files</h2><div id="files" class="files"></div><button class="btn" style="margin-top:8px" onclick="updateKeydb()">Update KEYDB</button><span id="keydb-status" style="margin-left:8px;font-size:.8rem"></span></div>
+  <div class="card" style="margin-top:16px"><h2>Data Files</h2><div id="files" class="files" style="margin-bottom:12px"></div><div style="display:flex;align-items:center;gap:10px"><button class="btn" onclick="updateKeydb()">Update KEYDB</button><span id="keydb-status" style="font-size:.8rem"></span></div></div>
   <div class="card"><h2>Move Queue</h2><div id="moves"></div></div>
   <div><h2 style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;margin-bottom:8px">System Log</h2><div id="syslog" class="log" style="max-height:400px"></div></div>
 </div>
@@ -378,8 +378,8 @@ function updateKeydb(){
   st.textContent='Updating...';st.style.color='var(--text3)';
   fetch('/api/update-keydb',{method:'POST'}).then(r=>r.json()).then(data=>{
     if(data.ok){st.textContent='Updated: '+data.entries+' entries';st.style.color='var(--green)';loadSystem();}
-    else{st.textContent='Error: '+(data.error||'unknown');st.style.color='var(--red)';}
-  }).catch(e=>{st.textContent='Error: '+e;st.style.color='var(--red)';});
+    else{st.textContent=data.error||'Update failed';st.style.color='var(--red)';}
+  }).catch(e=>{st.textContent='Network error';st.style.color='var(--red)';});
 }
 /* ---- System page ---- */
 function loadSystem(){
@@ -389,9 +389,11 @@ function loadSystem(){
     if(data.files&&data.files.length){
       let fhtml='';
       data.files.forEach(f=>{
-        const dot=f.present?'var(--green)':'var(--text3)';
-        const info=f.present?(f.size||'')+' \u00b7 '+(f.updated||''):(f.size||'not found');
-        fhtml+='<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dot+';margin-right:8px;vertical-align:middle"></span>'+esc(f.name)+' <span>'+esc(info)+'</span></div>';
+        if(f.present){
+          fhtml+='<div style="display:flex;align-items:center;gap:8px;padding:4px 0"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0"></span><div><div>'+esc(f.name)+'</div><div style="font-size:.75rem;color:var(--text3)">'+esc(f.size||'')+' \u00b7 '+esc(f.updated||'')+'</div></div></div>';
+        }else{
+          fhtml+='<div style="display:flex;align-items:center;gap:8px;padding:4px 0"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text3);flex-shrink:0"></span><div><div>KEYDB.cfg <span style="color:var(--text3);font-size:.8rem">— not found</span></div><div style="font-size:.75rem;color:var(--text3)">Optional — needed for encrypted Blu-ray/UHD discs. Set URL in Settings then click Update.</div></div></div>';
+        }
       });
       filesEl.innerHTML=fhtml;
     }else{
@@ -503,10 +505,7 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
     }
 }
 
-fn handle_request(
-    request: tiny_http::Request,
-    cfg: &Arc<RwLock<Config>>,
-) {
+fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     let url = request.url().to_string();
     let is_get = *request.method() == Method::Get;
     let is_post = *request.method() == Method::Post;
@@ -559,15 +558,15 @@ fn handle_request(
 // ---------- Helpers ----------
 
 fn serve_html(request: tiny_http::Request) {
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
+    let header =
+        Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
     let html = DASHBOARD_HTML.replace("{VERSION}", env!("CARGO_PKG_VERSION"));
     let response = Response::from_string(html).with_header(header);
     let _ = request.respond(response);
 }
 
 fn json_response(request: tiny_http::Request, status: u16, body: &str) {
-    let header =
-        Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
     let response = Response::from_string(body)
         .with_status_code(StatusCode(status))
         .with_header(header);
@@ -597,15 +596,11 @@ fn handle_history_file(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, f
     let path = format!("{}/{}", history_dir, fname);
     match std::fs::read_to_string(&path) {
         Ok(content) => {
-            let header = Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"application/json"[..],
-            ).unwrap();
+            let header =
+                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
             let disp = format!("attachment; filename=\"{}\"", fname);
-            let disp_header = Header::from_bytes(
-                &b"Content-Disposition"[..],
-                disp.as_bytes(),
-            ).unwrap();
+            let disp_header =
+                Header::from_bytes(&b"Content-Disposition"[..], disp.as_bytes()).unwrap();
             let response = Response::from_string(content)
                 .with_header(header)
                 .with_header(disp_header);
@@ -623,7 +618,10 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // KEYDB status — check config path, then default path
     let keydb_paths: Vec<std::path::PathBuf> = [
         cfg.keydb_path.as_ref().map(std::path::PathBuf::from),
-        Some(std::path::PathBuf::from(format!("{}/freemkv/KEYDB.cfg", cfg.autorip_dir))),
+        Some(std::path::PathBuf::from(format!(
+            "{}/freemkv/KEYDB.cfg",
+            cfg.autorip_dir
+        ))),
         libfreemkv::keydb::default_path().ok(),
     ]
     .into_iter()
@@ -642,11 +640,15 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             } else {
                 format!("{} B", size)
             };
-            let modified = m.modified().ok().and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| {
-                    format_epoch_datetime(d.as_secs())
+            let modified = m
+                .modified()
+                .ok()
+                .and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| format_epoch_datetime(d.as_secs()))
                 })
-            }).unwrap_or_default();
+                .unwrap_or_default();
             files_json.push(serde_json::json!({
                 "name": format!("KEYDB.cfg ({})", path.display()),
                 "present": true,
@@ -661,15 +663,14 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         files_json.push(serde_json::json!({
             "name": "KEYDB.cfg",
             "present": false,
-            "size": "optional — needed for encrypted Blu-ray/UHD discs",
-            "updated": null,
         }));
     }
 
     // Move queue: find drives with status "done" or "moving"
     let move_queue: Vec<String> = {
         let state = ripper::STATE.lock().unwrap();
-        state.values()
+        state
+            .values()
             .filter(|rs| rs.status == "done" || rs.status == "moving")
             .map(|rs| {
                 let title = if rs.tmdb_title.is_empty() {
@@ -785,9 +786,7 @@ fn handle_sse(request: tiny_http::Request) {
         response = response.with_header(h);
     }
 
-    let mut stream = match request.upgrade("sse", response) {
-        stream => stream,
-    };
+    let mut stream = request.upgrade("sse", response);
 
     let initial = format!("data: {}\n\n", get_state_json());
     if stream.write_all(initial.as_bytes()).is_err() {
@@ -808,11 +807,14 @@ fn handle_sse(request: tiny_http::Request) {
 }
 
 fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
-    let already = ripper::STATE.lock().map(|s| {
-        s.get(device)
-            .map(|r| r.status == "scanning" || r.status == "ripping")
-            .unwrap_or(false)
-    }).unwrap_or(false);
+    let already = ripper::STATE
+        .lock()
+        .map(|s| {
+            s.get(device)
+                .map(|r| r.status == "scanning" || r.status == "ripping")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
 
     if already {
         json_response(request, 409, r#"{"ok":false,"error":"already ripping"}"#);
@@ -842,15 +844,58 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
 }
 
 fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
-    let keydb_url = cfg.read().ok()
+    let keydb_url = cfg
+        .read()
+        .ok()
         .map(|c| c.keydb_url.clone())
         .unwrap_or_default();
     if keydb_url.is_empty() {
-        json_response(request, 400,
-            r#"{"ok":false,"error":"No KEYDB_URL configured. Set it in Settings or as an environment variable."}"#);
+        json_response(
+            request,
+            400,
+            r#"{"ok":false,"error":"No KEYDB URL configured. Set it in Settings."}"#,
+        );
         return;
     }
-    match libfreemkv::keydb::update(&keydb_url) {
+
+    // Download via ureq (supports HTTPS) then save via libfreemkv
+    let body = match ureq::get(&keydb_url).call() {
+        Ok(resp) => {
+            let mut buf = Vec::new();
+            if resp
+                .into_reader()
+                .take(100 * 1024 * 1024)
+                .read_to_end(&mut buf)
+                .is_err()
+            {
+                json_response(
+                    request,
+                    500,
+                    r#"{"ok":false,"error":"Failed to read response body."}"#,
+                );
+                return;
+            }
+            buf
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            let msg = format!(
+                r#"{{"ok":false,"error":"Server returned HTTP {}. Check the URL in Settings."}}"#,
+                code
+            );
+            json_response(request, 502, &msg);
+            return;
+        }
+        Err(_) => {
+            let msg = format!(
+                r#"{{"ok":false,"error":"Could not connect to {}. Check the URL in Settings."}}"#,
+                keydb_url.split('/').nth(2).unwrap_or(&keydb_url)
+            );
+            json_response(request, 502, &msg);
+            return;
+        }
+    };
+
+    match libfreemkv::keydb::save(&body) {
         Ok(result) => {
             let body = serde_json::json!({
                 "ok": true,
@@ -860,8 +905,12 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             });
             json_response(request, 200, &body.to_string());
         }
-        Err(e) => {
-            json_response(request, 500, &format!(r#"{{"ok":false,"error":"{}"}}"#, e));
+        Err(_) => {
+            json_response(
+                request,
+                500,
+                r#"{"ok":false,"error":"Downloaded file is not a valid KEYDB. Check the URL."}"#,
+            );
         }
     }
 }
@@ -913,10 +962,8 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                &String::from_utf8_lossy(&bytes[i + 1..i + 3]),
-                16,
-            ) {
+            if let Ok(byte) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16)
+            {
                 result.push(byte);
                 i += 3;
                 continue;

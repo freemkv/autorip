@@ -103,7 +103,6 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     }
 }
 
-
 fn is_ripping(device: &str) -> bool {
     STATE
         .lock()

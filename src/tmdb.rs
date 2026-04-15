@@ -54,8 +54,7 @@ pub fn lookup(query: &str, api_key: &str) -> Option<TmdbResult> {
 /// Clean a disc label for TMDB search: "DUNE_PART_TWO" -> "Dune Part Two"
 pub fn clean_title(label: &str) -> String {
     label
-        .replace('_', " ")
-        .replace('-', " ")
+        .replace(['_', '-'], " ")
         .split_whitespace()
         .map(|w| {
             let mut chars = w.chars();
@@ -71,9 +70,7 @@ pub fn clean_title(label: &str) -> String {
 fn urlencoded(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
-                (b as char).to_string()
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
             b' ' => "+".to_string(),
             _ => format!("%{:02X}", b),
         })

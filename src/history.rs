@@ -15,16 +15,11 @@ pub fn load_recent(history_dir: &str, count: usize) -> Vec<serde_json::Value> {
 
     let mut entries: Vec<_> = dir
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "json")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
         .collect();
 
     // Sort by filename (timestamp) descending
-    entries.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
     entries.truncate(count);
 
     entries

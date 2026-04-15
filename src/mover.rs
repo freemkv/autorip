@@ -64,10 +64,19 @@ fn check_and_move(cfg: &Config) {
                 disc_name: rs.disc_name.clone(),
                 disc_format: rs.disc_format.clone(),
                 progress_pct: 100,
-                tmdb_title: tmdb_result.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
+                tmdb_title: tmdb_result
+                    .as_ref()
+                    .map(|t| t.title.clone())
+                    .unwrap_or_default(),
                 tmdb_year: tmdb_result.as_ref().map(|t| t.year).unwrap_or(0),
-                tmdb_poster: tmdb_result.as_ref().map(|t| t.poster_url.clone()).unwrap_or_default(),
-                tmdb_overview: tmdb_result.as_ref().map(|t| t.overview.clone()).unwrap_or_default(),
+                tmdb_poster: tmdb_result
+                    .as_ref()
+                    .map(|t| t.poster_url.clone())
+                    .unwrap_or_default(),
+                tmdb_overview: tmdb_result
+                    .as_ref()
+                    .map(|t| t.overview.clone())
+                    .unwrap_or_default(),
                 ..Default::default()
             },
         );
@@ -91,7 +100,10 @@ fn check_and_move(cfg: &Config) {
             if move_file(mkv_path, Path::new(&dest)) {
                 dest_paths.push(dest);
             } else {
-                crate::log::device_log(&rs.device, &format!("Failed to move {:?} to {}", mkv_path, dest));
+                crate::log::device_log(
+                    &rs.device,
+                    &format!("Failed to move {:?} to {}", mkv_path, dest),
+                );
                 all_moved = false;
             }
         }
