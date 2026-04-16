@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.3 (2026-04-16)
+
+### DVD support
+- First successful DVD rip — CSS authentication enables reading scrambled sectors
+- Removed internal audit and test plan files from public repo
+- Added multi-language section to README
+- Added public repo rules to CLAUDE.md
+
 ## 0.10.2 (2026-04-15)
 
 ### Fixes
