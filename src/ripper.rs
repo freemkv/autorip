@@ -1,5 +1,5 @@
-use libfreemkv::{Disc, DiscFormat, Drive, IOStream, MkvStream, ScanOptions};
-use std::io::Write;
+use libfreemkv::pes::Stream as PesStream;
+use libfreemkv::{Disc, DiscFormat, Drive, ScanOptions};
 use std::sync::{Arc, RwLock};
 
 use crate::config::Config;
@@ -50,30 +50,21 @@ pub static STATE: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Stop cooldowns: device -> epoch seconds when cooldown expires.
-/// After a manual stop, suppress auto-rip for STOP_COOLDOWN_SECS.
 pub static STOP_COOLDOWNS: once_cell::sync::Lazy<
     std::sync::Mutex<std::collections::HashMap<String, u64>>,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 const STOP_COOLDOWN_SECS: u64 = 15;
 
-/// Record a stop cooldown for the given device.
 pub fn set_stop_cooldown(device: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = epoch_secs();
     if let Ok(mut cd) = STOP_COOLDOWNS.lock() {
         cd.insert(device.to_string(), now + STOP_COOLDOWN_SECS);
     }
 }
 
-/// Check if a device is within its stop cooldown period.
 fn is_in_cooldown(device: &str) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = epoch_secs();
     if let Ok(cd) = STOP_COOLDOWNS.lock() {
         if let Some(&expires) = cd.get(device) {
             return now < expires;
@@ -85,18 +76,30 @@ fn is_in_cooldown(device: &str) -> bool {
 /// Poll drives for disc insertion.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     loop {
-        let drives = libfreemkv::find_drives();
-        for mut drive in drives {
-            let path = drive.device_path().to_string();
-            let device = path.rsplit('/').next().unwrap_or(&path).to_string();
-            if drive.drive_status() == libfreemkv::DriveStatus::DiscPresent
-                && !is_ripping(&device)
-                && !is_in_cooldown(&device)
-            {
-                let cfg = cfg.clone();
-                std::thread::spawn(move || {
-                    rip_disc(&cfg, &device, &mut drive);
-                });
+        {
+            let drives = libfreemkv::find_drives();
+            for mut drive in drives {
+                let path = drive.device_path().to_string();
+                let device = path.rsplit('/').next().unwrap_or(&path).to_string();
+                if drive.drive_status() == libfreemkv::DriveStatus::DiscPresent
+                    && !is_ripping(&device)
+                    && !is_in_cooldown(&device)
+                {
+                    let on_insert = cfg
+                        .read()
+                        .ok()
+                        .map(|c| c.on_insert.clone())
+                        .unwrap_or_else(|| "rip".to_string());
+
+                    if on_insert == "nothing" {
+                        continue;
+                    }
+
+                    let cfg = cfg.clone();
+                    std::thread::spawn(move || {
+                        rip_disc(&cfg, &device, &mut drive);
+                    });
+                }
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(5));
@@ -120,9 +123,12 @@ pub fn update_state(device: &str, state: RipState) {
     }
 }
 
-/// Rip a disc from start to finish.
+/// Rip a disc from start to finish using the PES pipeline.
 fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
-    let cfg_read = cfg.read().unwrap();
+    let cfg_read = match cfg.read() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
 
     update_state(
         device,
@@ -132,6 +138,8 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
             ..Default::default()
         },
     );
+
+    crate::log::device_log(device, "Disc detected, scanning...");
 
     // Init (unlock + firmware)
     let _ = session.wait_ready();
@@ -146,12 +154,14 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
     let disc = match Disc::scan(session, &scan_opts) {
         Ok(d) => d,
         Err(e) => {
+            let msg = format!("Scan failed: {}", e);
+            crate::log::device_log(device, &msg);
             update_state(
                 device,
                 RipState {
                     device: device.to_string(),
                     status: "error".to_string(),
-                    last_error: format!("Scan failed: {}", e),
+                    last_error: msg,
                     ..Default::default()
                 },
             );
@@ -171,6 +181,16 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
         DiscFormat::Unknown => "unknown",
     }
     .to_string();
+
+    crate::log::device_log(
+        device,
+        &format!(
+            "Disc: {} ({}, {} titles)",
+            disc_name,
+            disc_format,
+            disc.titles.len()
+        ),
+    );
 
     // TMDB lookup
     let tmdb = crate::tmdb::lookup(
@@ -203,9 +223,33 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
         },
     );
 
+    // If on_insert is "identify", stop after scanning
+    let on_insert = cfg_read.on_insert.clone();
+    if on_insert == "identify" {
+        update_state(
+            device,
+            RipState {
+                device: device.to_string(),
+                status: "done".to_string(),
+                disc_name: disc_name.clone(),
+                disc_format: disc_format.clone(),
+                tmdb_title: tmdb_title.clone(),
+                tmdb_year,
+                tmdb_poster: tmdb_poster.clone(),
+                tmdb_overview: tmdb_overview.clone(),
+                ..Default::default()
+            },
+        );
+        return;
+    }
+
     // Select titles
     let titles_to_rip: Vec<usize> = if cfg_read.main_feature {
-        vec![0] // longest title (already sorted)
+        if disc.titles.is_empty() {
+            vec![]
+        } else {
+            vec![0] // longest title (already sorted by duration)
+        }
     } else {
         (0..disc.titles.len())
             .filter(|&i| disc.titles[i].duration_secs >= cfg_read.min_length_secs as f64)
@@ -213,35 +257,172 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
     };
 
     if titles_to_rip.is_empty() {
+        let msg = "No titles found matching criteria".to_string();
+        crate::log::device_log(device, &msg);
         update_state(
             device,
             RipState {
                 device: device.to_string(),
                 status: "error".to_string(),
                 disc_name: disc_name.clone(),
-                last_error: "No titles found".to_string(),
+                last_error: msg,
                 ..Default::default()
             },
         );
         return;
     }
 
-    // Lock tray during rip to prevent accidental ejection
+    let output_format = cfg_read.output_format.clone();
+
+    crate::log::device_log(
+        device,
+        &format!(
+            "Ripping {} title(s) to {}",
+            titles_to_rip.len(),
+            output_format.to_uppercase()
+        ),
+    );
+
+    // Lock tray during rip
     session.lock_tray();
 
-    // Rip each title
     let staging = cfg_read.staging_device_dir(&sanitize_filename(&disc_name));
     let _ = std::fs::create_dir_all(&staging);
 
+    let device_path = session.device_path().to_string();
+
+    // ISO output: raw sector copy (not PES pipeline)
+    if output_format == "iso" {
+        let iso_path = format!("{}/{}.iso", staging, sanitize_filename(&disc_name));
+        update_state(
+            device,
+            RipState {
+                device: device.to_string(),
+                status: "ripping".to_string(),
+                disc_name: disc_name.clone(),
+                disc_format: disc_format.clone(),
+                output_file: iso_path.clone(),
+                tmdb_title: tmdb_title.clone(),
+                tmdb_year,
+                tmdb_poster: tmdb_poster.clone(),
+                tmdb_overview: tmdb_overview.clone(),
+                ..Default::default()
+            },
+        );
+
+        let total_bytes = disc.capacity_sectors as u64 * 2048;
+        let start = std::time::Instant::now();
+        let device_str = device.to_string();
+        let disc_name_c = disc_name.clone();
+        let disc_format_c = disc_format.clone();
+        let tmdb_title_c = tmdb_title.clone();
+        let tmdb_poster_c = tmdb_poster.clone();
+        let tmdb_overview_c = tmdb_overview.clone();
+
+        let batch = libfreemkv::disc::detect_max_batch_sectors(&device_path);
+        let progress = |done: u64, total: u64| {
+            let elapsed = start.elapsed().as_secs_f64();
+            let pct = if total > 0 {
+                (done * 100 / total).min(100) as u8
+            } else {
+                0
+            };
+            let speed = if elapsed > 0.0 {
+                done as f64 / (1024.0 * 1024.0) / elapsed
+            } else {
+                0.0
+            };
+            let eta = if speed > 0.0 && total > done {
+                let remaining = (total - done) as f64 / (1024.0 * 1024.0) / speed;
+                format!(
+                    "{}:{:02}",
+                    (remaining / 60.0) as u32,
+                    (remaining % 60.0) as u32
+                )
+            } else {
+                String::new()
+            };
+            update_state(
+                &device_str,
+                RipState {
+                    device: device_str.clone(),
+                    status: "ripping".to_string(),
+                    disc_name: disc_name_c.clone(),
+                    disc_format: disc_format_c.clone(),
+                    progress_pct: pct,
+                    speed_mbs: speed,
+                    eta,
+                    tmdb_title: tmdb_title_c.clone(),
+                    tmdb_year,
+                    tmdb_poster: tmdb_poster_c.clone(),
+                    tmdb_overview: tmdb_overview_c.clone(),
+                    ..Default::default()
+                },
+            );
+        };
+
+        let decrypt = true; // always decrypt for ISO
+        let resume = true;
+        match disc.copy(
+            session,
+            std::path::Path::new(&iso_path),
+            decrypt,
+            resume,
+            Some(batch),
+            Some(&progress),
+        ) {
+            Ok(()) => {
+                let elapsed = start.elapsed().as_secs_f64();
+                let speed = if elapsed > 0.0 {
+                    total_bytes as f64 / (1024.0 * 1024.0) / elapsed
+                } else {
+                    0.0
+                };
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "ISO complete: {:.1} GB in {:.0}s ({:.0} MB/s)",
+                        total_bytes as f64 / 1_073_741_824.0,
+                        elapsed,
+                        speed
+                    ),
+                );
+            }
+            Err(e) => {
+                let msg = format!("ISO rip failed: {}", e);
+                crate::log::device_log(device, &msg);
+                update_state(
+                    device,
+                    RipState {
+                        device: device.to_string(),
+                        status: "error".to_string(),
+                        last_error: msg,
+                        ..Default::default()
+                    },
+                );
+                session.unlock_tray();
+                return;
+            }
+        }
+    } else {
+        // MKV, M2TS, or network output: PES pipeline
+        let ext = match output_format.as_str() {
+            "m2ts" => "m2ts",
+            "network" => "mkv", // network streams MKV data
+            _ => "mkv",
+        };
+
+    // Rip each title using the PES pipeline
     for &title_idx in &titles_to_rip {
-        let title = &disc.titles[title_idx];
+        let _title = &disc.titles[title_idx];
         let filename = if titles_to_rip.len() == 1 {
-            format!("{}.mkv", sanitize_filename(&disc_name))
+            format!("{}.{}", sanitize_filename(&disc_name), ext)
         } else {
             format!(
-                "{}_t{:02}.mkv",
+                "{}_t{:02}.{}",
                 sanitize_filename(&disc_name),
-                title_idx + 1
+                title_idx + 1,
+                ext
             )
         };
         let output_path = format!("{}/{}", staging, filename);
@@ -254,20 +435,38 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
                 disc_name: disc_name.clone(),
                 disc_format: disc_format.clone(),
                 output_file: filename.clone(),
+                tmdb_title: tmdb_title.clone(),
+                tmdb_year,
+                tmdb_poster: tmdb_poster.clone(),
+                tmdb_overview: tmdb_overview.clone(),
                 ..Default::default()
             },
         );
 
-        // Create MKV output
-        let file = match std::fs::File::create(&output_path) {
-            Ok(f) => f,
+        let source_url = format!("disc://{}", device_path);
+        let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
+            format!("network://{}", cfg_read.network_target)
+        } else {
+            format!("{}://{}", ext, output_path)
+        };
+        let opts = libfreemkv::InputOptions {
+            keydb_path: cfg_read.keydb_path.clone(),
+            title_index: Some(title_idx),
+            raw: false,
+        };
+
+        // Open input (PES stream from disc)
+        let mut input = match libfreemkv::input(&source_url, &opts) {
+            Ok(s) => s,
             Err(e) => {
+                let msg = format!("Open input failed: {}", e);
+                crate::log::device_log(device, &msg);
                 update_state(
                     device,
                     RipState {
                         device: device.to_string(),
                         status: "error".to_string(),
-                        last_error: format!("Cannot create output: {}", e),
+                        last_error: msg,
                         ..Default::default()
                     },
                 );
@@ -276,21 +475,37 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
             }
         };
 
-        let buf_writer = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
-        let mut mkv = MkvStream::new(buf_writer)
-            .meta(title)
-            .max_buffer(10 * 1024 * 1024);
+        // Read frames until codec headers are ready
+        let mut buffered = Vec::new();
+        while !input.headers_ready() {
+            match input.read() {
+                Ok(Some(frame)) => buffered.push(frame),
+                Ok(None) => break,
+                Err(e) => {
+                    crate::log::device_log(device, &format!("Header scan error: {}", e));
+                    break;
+                }
+            }
+        }
 
-        // Open title for reading
-        let mut reader = match disc.open_title(session, title_idx) {
-            Ok(r) => r,
+        let info = input.info().clone();
+        let mut out_title = info.clone();
+        out_title.codec_privates = (0..info.streams.len())
+            .map(|i| input.codec_private(i))
+            .collect();
+
+        // Open output (MKV file)
+        let raw_output = match libfreemkv::output(&dest_url, &out_title) {
+            Ok(s) => s,
             Err(e) => {
+                let msg = format!("Open output failed: {}", e);
+                crate::log::device_log(device, &msg);
                 update_state(
                     device,
                     RipState {
                         device: device.to_string(),
                         status: "error".to_string(),
-                        last_error: format!("Open title failed: {}", e),
+                        last_error: msg,
                         ..Default::default()
                     },
                 );
@@ -298,33 +513,41 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
                 return;
             }
         };
+        let mut output = libfreemkv::pes::CountingStream::new(raw_output);
 
-        let total_bytes = title.size_bytes;
-        let mut bytes_written: u64 = 0;
+        let total_bytes = info.size_bytes;
         let start = std::time::Instant::now();
 
+        // Write buffered frames
+        for frame in &buffered {
+            if output.write(frame).is_err() {
+                break;
+            }
+        }
+
+        // Stream remaining frames
         loop {
-            match reader.read_batch() {
-                Ok(Some(batch)) => {
-                    if mkv.write_all(batch).is_err() {
+            match input.read() {
+                Ok(Some(frame)) => {
+                    if output.write(&frame).is_err() {
                         break;
                     }
-                    bytes_written += batch.len() as u64;
 
+                    let bytes_done = output.bytes_written();
                     let elapsed = start.elapsed().as_secs_f64();
                     let pct = if total_bytes > 0 {
-                        (bytes_written * 100 / total_bytes) as u8
+                        (bytes_done * 100 / total_bytes).min(100) as u8
                     } else {
                         0
                     };
                     let speed = if elapsed > 0.0 {
-                        bytes_written as f64 / (1024.0 * 1024.0) / elapsed
+                        bytes_done as f64 / (1024.0 * 1024.0) / elapsed
                     } else {
                         0.0
                     };
-                    let eta = if speed > 0.0 && total_bytes > 0 {
+                    let eta = if speed > 0.0 && total_bytes > bytes_done {
                         let remaining =
-                            (total_bytes - bytes_written) as f64 / (1024.0 * 1024.0) / speed;
+                            (total_bytes - bytes_done) as f64 / (1024.0 * 1024.0) / speed;
                         format!(
                             "{}:{:02}",
                             (remaining / 60.0) as u32,
@@ -344,37 +567,14 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
                             progress_pct: pct,
                             speed_mbs: speed,
                             eta,
-                            errors: reader.errors,
-                            last_error: String::new(),
                             output_file: filename.clone(),
                             tmdb_title: tmdb_title.clone(),
                             tmdb_year,
                             tmdb_poster: tmdb_poster.clone(),
                             tmdb_overview: tmdb_overview.clone(),
+                            ..Default::default()
                         },
                     );
-
-                    // Abort on error if configured
-                    if cfg_read.abort_on_error && reader.errors > 0 {
-                        update_state(
-                            device,
-                            RipState {
-                                device: device.to_string(),
-                                status: "error".to_string(),
-                                disc_name: disc_name.clone(),
-                                disc_format: disc_format.clone(),
-                                errors: reader.errors,
-                                last_error: "Aborted due to read errors".to_string(),
-                                tmdb_title: tmdb_title.clone(),
-                                tmdb_year,
-                                tmdb_poster: tmdb_poster.clone(),
-                                tmdb_overview: tmdb_overview.clone(),
-                                ..Default::default()
-                            },
-                        );
-                        session.unlock_tray();
-                        return;
-                    }
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -384,8 +584,27 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
             }
         }
 
-        let _ = mkv.finish();
+        let _ = output.finish();
+
+        let bytes_done = output.bytes_written();
+        let elapsed = start.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 {
+            bytes_done as f64 / (1024.0 * 1024.0) / elapsed
+        } else {
+            0.0
+        };
+        crate::log::device_log(
+            device,
+            &format!(
+                "Title {} complete: {:.1} GB in {:.0}s ({:.0} MB/s)",
+                title_idx + 1,
+                bytes_done as f64 / 1_073_741_824.0,
+                elapsed,
+                speed
+            ),
+        );
     }
+    } // end else (MKV/M2TS branch)
 
     // Record history
     {
@@ -426,22 +645,27 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
         },
     );
 
-    // Always unlock tray so manual eject works; only auto-eject if configured
+    // Unlock tray; auto-eject if configured
     session.unlock_tray();
     if cfg_read.auto_eject {
         let _ = session.eject();
     }
 
-    // Notify
+    crate::log::device_log(device, "Rip complete");
+
+    // Webhook
     crate::webhook::send(&cfg_read, "rip_complete", &disc_name, &staging);
 }
 
-fn format_epoch_date() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs()
+}
+
+fn format_epoch_date() -> String {
+    let secs = epoch_secs();
     let days = (secs / 86400) as i64;
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
