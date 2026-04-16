@@ -428,198 +428,198 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
             _ => "mkv",
         };
 
-    // Rip each title using the PES pipeline
-    for &title_idx in &titles_to_rip {
-        let _title = &disc.titles[title_idx];
-        let filename = if titles_to_rip.len() == 1 {
-            format!("{}.{}", sanitize_filename(&disc_name), ext)
-        } else {
-            format!(
-                "{}_t{:02}.{}",
-                sanitize_filename(&disc_name),
-                title_idx + 1,
-                ext
-            )
-        };
-        let output_path = format!("{}/{}", staging, filename);
+        // Rip each title using the PES pipeline
+        for &title_idx in &titles_to_rip {
+            let _title = &disc.titles[title_idx];
+            let filename = if titles_to_rip.len() == 1 {
+                format!("{}.{}", sanitize_filename(&disc_name), ext)
+            } else {
+                format!(
+                    "{}_t{:02}.{}",
+                    sanitize_filename(&disc_name),
+                    title_idx + 1,
+                    ext
+                )
+            };
+            let output_path = format!("{}/{}", staging, filename);
 
-        update_state(
-            device,
-            RipState {
-                device: device.to_string(),
-                status: "ripping".to_string(),
-                disc_name: disc_name.clone(),
-                disc_format: disc_format.clone(),
-                output_file: filename.clone(),
-                tmdb_title: tmdb_title.clone(),
-                tmdb_year,
-                tmdb_poster: tmdb_poster.clone(),
-                tmdb_overview: tmdb_overview.clone(),
-                ..Default::default()
-            },
-        );
+            update_state(
+                device,
+                RipState {
+                    device: device.to_string(),
+                    status: "ripping".to_string(),
+                    disc_name: disc_name.clone(),
+                    disc_format: disc_format.clone(),
+                    output_file: filename.clone(),
+                    tmdb_title: tmdb_title.clone(),
+                    tmdb_year,
+                    tmdb_poster: tmdb_poster.clone(),
+                    tmdb_overview: tmdb_overview.clone(),
+                    ..Default::default()
+                },
+            );
 
-        let source_url = format!("disc://{}", device_path);
-        let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
-            format!("network://{}", cfg_read.network_target)
-        } else {
-            format!("{}://{}", ext, output_path)
-        };
-        let opts = libfreemkv::InputOptions {
-            keydb_path: cfg_read.keydb_path.clone(),
-            title_index: Some(title_idx),
-            raw: false,
-        };
+            let source_url = format!("disc://{}", device_path);
+            let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
+                format!("network://{}", cfg_read.network_target)
+            } else {
+                format!("{}://{}", ext, output_path)
+            };
+            let opts = libfreemkv::InputOptions {
+                keydb_path: cfg_read.keydb_path.clone(),
+                title_index: Some(title_idx),
+                raw: false,
+            };
 
-        // Open input (PES stream from disc)
-        let mut input = match libfreemkv::input(&source_url, &opts) {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = format!("Open input failed: {}", e);
-                crate::log::device_log(device, &msg);
-                update_state(
-                    device,
-                    RipState {
-                        device: device.to_string(),
-                        status: "error".to_string(),
-                        last_error: msg,
-                        ..Default::default()
-                    },
-                );
-                session.unlock_tray();
-                return;
-            }
-        };
-
-        // Read frames until codec headers are ready
-        let mut buffered = Vec::new();
-        while !input.headers_ready() {
-            match input.read() {
-                Ok(Some(frame)) => buffered.push(frame),
-                Ok(None) => break,
+            // Open input (PES stream from disc)
+            let mut input = match libfreemkv::input(&source_url, &opts) {
+                Ok(s) => s,
                 Err(e) => {
-                    crate::log::device_log(device, &format!("Header scan error: {}", e));
-                    break;
-                }
-            }
-        }
-
-        let info = input.info().clone();
-        let mut out_title = info.clone();
-        out_title.codec_privates = (0..info.streams.len())
-            .map(|i| input.codec_private(i))
-            .collect();
-
-        // Open output (MKV file)
-        let raw_output = match libfreemkv::output(&dest_url, &out_title) {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = format!("Open output failed: {}", e);
-                crate::log::device_log(device, &msg);
-                update_state(
-                    device,
-                    RipState {
-                        device: device.to_string(),
-                        status: "error".to_string(),
-                        last_error: msg,
-                        ..Default::default()
-                    },
-                );
-                session.unlock_tray();
-                return;
-            }
-        };
-        let mut output = libfreemkv::pes::CountingStream::new(raw_output);
-
-        let total_bytes = info.size_bytes;
-        let start = std::time::Instant::now();
-
-        // Write buffered frames
-        for frame in &buffered {
-            if output.write(frame).is_err() {
-                break;
-            }
-        }
-
-        // Stream remaining frames
-        loop {
-            match input.read() {
-                Ok(Some(frame)) => {
-                    if output.write(&frame).is_err() {
-                        break;
-                    }
-
-                    let bytes_done = output.bytes_written();
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let pct = if total_bytes > 0 {
-                        (bytes_done * 100 / total_bytes).min(100) as u8
-                    } else {
-                        0
-                    };
-                    let speed = if elapsed > 0.0 {
-                        bytes_done as f64 / (1024.0 * 1024.0) / elapsed
-                    } else {
-                        0.0
-                    };
-                    let eta = if speed > 0.0 && total_bytes > bytes_done {
-                        let remaining =
-                            (total_bytes - bytes_done) as f64 / (1024.0 * 1024.0) / speed;
-                        format!(
-                            "{}:{:02}",
-                            (remaining / 60.0) as u32,
-                            (remaining % 60.0) as u32
-                        )
-                    } else {
-                        String::new()
-                    };
-
+                    let msg = format!("Open input failed: {}", e);
+                    crate::log::device_log(device, &msg);
                     update_state(
                         device,
                         RipState {
                             device: device.to_string(),
-                            status: "ripping".to_string(),
-                            disc_name: disc_name.clone(),
-                            disc_format: disc_format.clone(),
-                            progress_pct: pct,
-                            speed_mbs: speed,
-                            eta,
-                            output_file: filename.clone(),
-                            tmdb_title: tmdb_title.clone(),
-                            tmdb_year,
-                            tmdb_poster: tmdb_poster.clone(),
-                            tmdb_overview: tmdb_overview.clone(),
+                            status: "error".to_string(),
+                            last_error: msg,
                             ..Default::default()
                         },
                     );
+                    session.unlock_tray();
+                    return;
                 }
-                Ok(None) => break,
+            };
+
+            // Read frames until codec headers are ready
+            let mut buffered = Vec::new();
+            while !input.headers_ready() {
+                match input.read() {
+                    Ok(Some(frame)) => buffered.push(frame),
+                    Ok(None) => break,
+                    Err(e) => {
+                        crate::log::device_log(device, &format!("Header scan error: {}", e));
+                        break;
+                    }
+                }
+            }
+
+            let info = input.info().clone();
+            let mut out_title = info.clone();
+            out_title.codec_privates = (0..info.streams.len())
+                .map(|i| input.codec_private(i))
+                .collect();
+
+            // Open output (MKV file)
+            let raw_output = match libfreemkv::output(&dest_url, &out_title) {
+                Ok(s) => s,
                 Err(e) => {
-                    crate::log::device_log(device, &format!("Read error: {}", e));
+                    let msg = format!("Open output failed: {}", e);
+                    crate::log::device_log(device, &msg);
+                    update_state(
+                        device,
+                        RipState {
+                            device: device.to_string(),
+                            status: "error".to_string(),
+                            last_error: msg,
+                            ..Default::default()
+                        },
+                    );
+                    session.unlock_tray();
+                    return;
+                }
+            };
+            let mut output = libfreemkv::pes::CountingStream::new(raw_output);
+
+            let total_bytes = info.size_bytes;
+            let start = std::time::Instant::now();
+
+            // Write buffered frames
+            for frame in &buffered {
+                if output.write(frame).is_err() {
                     break;
                 }
             }
+
+            // Stream remaining frames
+            loop {
+                match input.read() {
+                    Ok(Some(frame)) => {
+                        if output.write(&frame).is_err() {
+                            break;
+                        }
+
+                        let bytes_done = output.bytes_written();
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let pct = if total_bytes > 0 {
+                            (bytes_done * 100 / total_bytes).min(100) as u8
+                        } else {
+                            0
+                        };
+                        let speed = if elapsed > 0.0 {
+                            bytes_done as f64 / (1024.0 * 1024.0) / elapsed
+                        } else {
+                            0.0
+                        };
+                        let eta = if speed > 0.0 && total_bytes > bytes_done {
+                            let remaining =
+                                (total_bytes - bytes_done) as f64 / (1024.0 * 1024.0) / speed;
+                            format!(
+                                "{}:{:02}",
+                                (remaining / 60.0) as u32,
+                                (remaining % 60.0) as u32
+                            )
+                        } else {
+                            String::new()
+                        };
+
+                        update_state(
+                            device,
+                            RipState {
+                                device: device.to_string(),
+                                status: "ripping".to_string(),
+                                disc_name: disc_name.clone(),
+                                disc_format: disc_format.clone(),
+                                progress_pct: pct,
+                                speed_mbs: speed,
+                                eta,
+                                output_file: filename.clone(),
+                                tmdb_title: tmdb_title.clone(),
+                                tmdb_year,
+                                tmdb_poster: tmdb_poster.clone(),
+                                tmdb_overview: tmdb_overview.clone(),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        crate::log::device_log(device, &format!("Read error: {}", e));
+                        break;
+                    }
+                }
+            }
+
+            let _ = output.finish();
+
+            let bytes_done = output.bytes_written();
+            let elapsed = start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                bytes_done as f64 / (1024.0 * 1024.0) / elapsed
+            } else {
+                0.0
+            };
+            crate::log::device_log(
+                device,
+                &format!(
+                    "Title {} complete: {:.1} GB in {:.0}s ({:.0} MB/s)",
+                    title_idx + 1,
+                    bytes_done as f64 / 1_073_741_824.0,
+                    elapsed,
+                    speed
+                ),
+            );
         }
-
-        let _ = output.finish();
-
-        let bytes_done = output.bytes_written();
-        let elapsed = start.elapsed().as_secs_f64();
-        let speed = if elapsed > 0.0 {
-            bytes_done as f64 / (1024.0 * 1024.0) / elapsed
-        } else {
-            0.0
-        };
-        crate::log::device_log(
-            device,
-            &format!(
-                "Title {} complete: {:.1} GB in {:.0}s ({:.0} MB/s)",
-                title_idx + 1,
-                bytes_done as f64 / 1_073_741_824.0,
-                elapsed,
-                speed
-            ),
-        );
-    }
     } // end else (MKV/M2TS branch)
 
     // Record history

@@ -144,10 +144,7 @@ fn check_and_move(cfg: &Config) {
         let mut all_moved = true;
         for (src, dest) in &planned_moves {
             if move_file(src, Path::new(dest)) {
-                crate::log::device_log(
-                    &rs.device,
-                    &format!("Moved to {}", dest),
-                );
+                crate::log::device_log(&rs.device, &format!("Moved to {}", dest));
             } else {
                 crate::log::device_log(
                     &rs.device,
@@ -232,4 +229,3 @@ fn sanitize_dir_name(name: &str) -> String {
         .trim()
         .to_string()
 }
-

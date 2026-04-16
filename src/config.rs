@@ -11,9 +11,9 @@ pub struct Config {
     pub min_length_secs: u64,
     pub main_feature: bool,
     pub auto_eject: bool,
-    pub on_insert: String,    // "nothing", "identify", "rip"
+    pub on_insert: String,      // "nothing", "identify", "rip"
     pub output_format: String,  // "mkv", "m2ts", "iso"
-    pub network_target: String,  // e.g. "192.168.1.100:9000" for network output
+    pub network_target: String, // e.g. "192.168.1.100:9000" for network output
     pub abort_on_error: bool,
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,

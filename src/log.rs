@@ -54,4 +54,3 @@ pub fn get_device_log(device: &str, lines: usize) -> Vec<String> {
 pub fn syslog(msg: &str) {
     device_log("system", msg);
 }
-

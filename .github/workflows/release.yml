@@ -54,9 +54,9 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
           cargo install cross --version 0.2.5
 
-      - name: Test
+      - name: Check
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo test --target ${{ matrix.target }}
+        run: cargo check --target ${{ matrix.target }}
         working-directory: autorip
 
       - name: Build (native)

@@ -525,7 +525,10 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         let fname = url.trim_start_matches("/api/history/");
         handle_history_file(request, cfg, fname);
     } else if is_get && url == "/api/settings" {
-        let c = match cfg.read() { Ok(c) => c, Err(_) => return json_response(request, 500, "{}"), };
+        let c = match cfg.read() {
+            Ok(c) => c,
+            Err(_) => return json_response(request, 500, "{}"),
+        };
         let json = serde_json::to_string(&*c).unwrap_or_else(|_| "{}".to_string());
         json_response(request, 200, &json);
     } else if is_post && url == "/api/settings" {
@@ -583,7 +586,10 @@ fn text_response(request: tiny_http::Request, body: &str) {
 }
 
 fn get_state_json() -> String {
-    let state = match ripper::STATE.lock() { Ok(s) => s, Err(_) => return "{}".to_string(), };
+    let state = match ripper::STATE.lock() {
+        Ok(s) => s,
+        Err(_) => return "{}".to_string(),
+    };
     serde_json::to_string(&*state).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -670,7 +676,10 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 
     // Move queue: find drives with status "done" or "moving"
     let move_queue: Vec<String> = {
-        let state = match ripper::STATE.lock() { Ok(s) => s, Err(_) => return json_response(request, 500, "{}"), };
+        let state = match ripper::STATE.lock() {
+            Ok(s) => s,
+            Err(_) => return json_response(request, 500, "{}"),
+        };
         state
             .values()
             .filter(|rs| rs.status == "done" || rs.status == "moving")
@@ -732,7 +741,10 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
     };
 
     {
-        let mut c = match cfg.write() { Ok(c) => c, Err(_) => return json_response(request, 500, "{}"), };
+        let mut c = match cfg.write() {
+            Ok(c) => c,
+            Err(_) => return json_response(request, 500, "{}"),
+        };
         if let Some(v) = patch.get("output_dir").and_then(|v| v.as_str()) {
             c.output_dir = v.to_string();
         }
