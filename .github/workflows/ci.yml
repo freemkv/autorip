@@ -38,16 +38,5 @@ jobs:
       - run: cargo test
         working-directory: autorip
 
-  check-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          path: autorip
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/libfreemkv
-          path: libfreemkv
-      - uses: dtolnay/rust-toolchain@1.86.0
-      - run: cargo check
-        working-directory: autorip
+  # autorip targets Linux only (disc access via /dev/sg*)
+  # Windows check removed — freemkv CLI covers cross-platform

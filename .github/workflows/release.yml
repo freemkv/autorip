@@ -56,7 +56,7 @@ jobs:
 
       - name: Check
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo check --target ${{ matrix.target }}
+        run: cargo check
         working-directory: autorip
 
       - name: Build (native)
