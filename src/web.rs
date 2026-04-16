@@ -468,6 +468,7 @@ function renderSettings(s){
     html+='</div>';
   });
   document.getElementById('settings-form').innerHTML=html;
+  toggleConditional();
 }
 function toggleConditional(){
   document.querySelectorAll('[data-show-key]').forEach(el=>{
