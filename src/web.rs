@@ -435,7 +435,7 @@ function renderSettings(s){
       {key:'auto_eject',label:'Auto Eject',type:'bool',hint:'Eject disc after rip completes'},
       {key:'abort_on_error',label:'Abort on Error',type:'bool',hint:'Stop rip on first disc read error'},
       {key:'output_format',label:'Output Format',type:'radio',options:[{value:'mkv',label:'MKV'},{value:'m2ts',label:'M2TS'},{value:'iso',label:'ISO (disc image)'},{value:'network',label:'Network'}],hint:'Format for ripped files'},
-      {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. 192.168.1.100:9000)',indent:true,placeholder:'192.168.1.100:9000'},
+      {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. 192.168.1.100:9000)',indent:true,placeholder:'192.168.1.100:9000',showIf:{key:'output_format',value:'network'}},
     ]},
     {title:'Output',fields:[
       {key:'output_dir',label:'Output Directory',type:'text',hint:'Where all ripped files go by default'},
@@ -454,18 +454,27 @@ function renderSettings(s){
       const v=s[f.key]!=null?s[f.key]:'';
       const indent=f.indent?'margin-left:20px;border-left:2px solid var(--border);padding-left:12px':'';
       const ph=f.placeholder?' placeholder="'+f.placeholder+'"':'';
+      const hide=f.showIf&&s[f.showIf.key]!==f.showIf.value?'display:none;':'';
+      const showAttr=f.showIf?' data-show-key="'+f.showIf.key+'" data-show-value="'+f.showIf.value+'"':'';
       if(f.type==='radio'){
-        const opts=f.options.map(o=>'<label style="font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-right:16px"><input type="radio" name="'+f.key+'" data-key="'+f.key+'" value="'+o.value+'" style="width:14px;height:14px;margin:0;accent-color:var(--accent)" '+(v===o.value?'checked':'')+'>'+o.label+'</label>').join('');
-        html+='<div class="setting" style="'+indent+'"><label>'+f.label+'</label><div style="margin-top:4px">'+opts+'</div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
+        const opts=f.options.map(o=>'<label style="font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-right:16px"><input type="radio" name="'+f.key+'" data-key="'+f.key+'" value="'+o.value+'" style="width:14px;height:14px;margin:0;accent-color:var(--accent)" onchange="toggleConditional()" '+(v===o.value?'checked':'')+'>'+o.label+'</label>').join('');
+        html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label>'+f.label+'</label><div style="margin-top:4px">'+opts+'</div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }else if(f.type==='bool'){
-        html+='<div class="setting" style="'+indent+'"><label class="toggle"><input type="checkbox" data-key="'+f.key+'" '+(v?'checked':'')+'>'+f.label+'</label>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
+        html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label class="toggle"><input type="checkbox" data-key="'+f.key+'" '+(v?'checked':'')+'>'+f.label+'</label>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }else{
-        html+='<div class="setting" style="'+indent+'"><label>'+f.label+'</label><input type="'+f.type+'" data-key="'+f.key+'" value="'+esc(String(v))+'"'+ph+'>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
+        html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label>'+f.label+'</label><input type="'+f.type+'" data-key="'+f.key+'" value="'+esc(String(v))+'"'+ph+'>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }
     });
     html+='</div>';
   });
   document.getElementById('settings-form').innerHTML=html;
+}
+function toggleConditional(){
+  document.querySelectorAll('[data-show-key]').forEach(el=>{
+    const k=el.dataset.showKey,v=el.dataset.showValue;
+    const radio=document.querySelector('input[data-key="'+k+'"]:checked');
+    el.style.display=radio&&radio.value===v?'':'none';
+  });
 }
 
 function saveSettings(){
