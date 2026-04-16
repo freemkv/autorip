@@ -69,15 +69,15 @@ tr:hover { background:var(--chip); }
 .files { font-size:.8rem; line-height:1.8; }
 .files span { color:var(--text2); }
 /* Settings */
-.setting { margin-bottom:24px; }
-.setting label { display:block; font-size:.85rem; color:var(--text2); font-weight:500; margin-bottom:8px; }
-.setting input[type=text], .setting input[type=number] { width:100%; padding:10px 14px; border:1px solid var(--border); border-radius:8px; background:var(--log-bg); color:var(--text); font-size:.9rem; font-family:inherit; box-sizing:border-box; line-height:1.5; }
-.setting input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(9,105,218,.15); }
-.setting .hint { font-size:.8rem; color:var(--text3); margin-top:6px; line-height:1.5; }
-.toggle { display:flex; align-items:center; gap:12px; font-size:.9rem; cursor:pointer; font-weight:400; color:var(--text); }
-.toggle input[type=checkbox] { width:20px; height:20px; margin:0; flex-shrink:0; accent-color:var(--accent); }
-#settings-form .card { margin-bottom:16px; padding:20px; }
-#settings-form .card h2 { margin-bottom:20px; font-size:.8rem; }
+.setting { margin-bottom:18px; }
+.setting label { display:block; font-size:13px; color:var(--text2); font-weight:500; margin-bottom:5px; }
+.setting input[type=text], .setting input[type=number] { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--log-bg); color:var(--text); font-size:13px; font-family:inherit; box-sizing:border-box; }
+.setting input:focus { outline:none; border-color:var(--accent); }
+.setting .hint { font-size:12px; color:var(--text3); margin-top:3px; line-height:1.4; }
+.toggle { display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer; font-weight:400; color:var(--text); }
+.toggle input[type=checkbox] { width:15px; height:15px; margin:0; flex-shrink:0; accent-color:var(--accent); }
+#settings-form .card { margin-bottom:12px; }
+#settings-form .card h2 { margin-bottom:14px; }
 .section { display:none; } .section.active { display:flex; flex-direction:column; flex:1; }
 @media(max-width:600px){ .c{padding:10px} .np{flex-direction:column;gap:12px} .poster,.ph{width:100%;min-height:auto;max-height:200px} .mt{font-size:1.2rem} }
 </style>
@@ -455,7 +455,7 @@ function renderSettings(s){
       const indent=f.indent?'margin-left:20px;border-left:2px solid var(--border);padding-left:12px':'';
       const ph=f.placeholder?' placeholder="'+f.placeholder+'"':'';
       if(f.type==='radio'){
-        const opts=f.options.map(o=>'<label style="font-size:.9rem;cursor:pointer;display:inline-flex;align-items:center;gap:10px;margin-right:24px;padding:4px 0"><input type="radio" name="'+f.key+'" data-key="'+f.key+'" value="'+o.value+'" style="width:18px;height:18px;margin:0;accent-color:var(--accent)" '+(v===o.value?'checked':'')+'>'+o.label+'</label>').join('');
+        const opts=f.options.map(o=>'<label style="font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-right:16px"><input type="radio" name="'+f.key+'" data-key="'+f.key+'" value="'+o.value+'" style="width:14px;height:14px;margin:0;accent-color:var(--accent)" '+(v===o.value?'checked':'')+'>'+o.label+'</label>').join('');
         html+='<div class="setting" style="'+indent+'"><label>'+f.label+'</label><div style="margin-top:4px">'+opts+'</div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }else if(f.type==='bool'){
         html+='<div class="setting" style="'+indent+'"><label class="toggle"><input type="checkbox" data-key="'+f.key+'" '+(v?'checked':'')+'>'+f.label+'</label>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
