@@ -161,6 +161,29 @@ Titles
                  German
 ```
 
+### DVD disc info
+
+```
+$ freemkv info disc://
+
+Disc: Greenland
+Format: DVD (1L, 6.3 GB)
+CSS: Encrypted
+
+Titles
+
+   1. VTS_02_3.VOB    1h 59m    5.8 GB  0 clips
+
+      Video:     MPEG-2 480i 29.97fps
+
+      Audio:     English DD
+                 English DD
+                 English DD
+
+      Subtitle:  English
+                 Spanish
+```
+
 ## Stream Labels
 
 freemkv reads BD-J authoring files on the disc — metadata that other tools can't see. Standard tools only read MPLS data (language code + codec). freemkv identifies:
