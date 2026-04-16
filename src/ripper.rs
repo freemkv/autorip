@@ -81,14 +81,30 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
 
     while !crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
         {
-            let drives = libfreemkv::find_drives();
+            // Scan /dev/sg* without opening — just check existence
             let mut current_with_disc: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
 
-            for mut drive in drives {
-                let path = drive.device_path().to_string();
-                let device = path.rsplit('/').next().unwrap_or(&path).to_string();
+            for i in 0..16u8 {
+                let path = format!("/dev/sg{}", i);
+                if !std::path::Path::new(&path).exists() {
+                    continue;
+                }
+                let device = format!("sg{}", i);
+
+                // Don't touch drives that are actively ripping
+                if is_ripping(&device) {
+                    current_with_disc.insert(device);
+                    continue;
+                }
+
+                // Open briefly to check status, then drop immediately
+                let mut drive = match libfreemkv::Drive::open(std::path::Path::new(&path)) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
                 let disc_present = drive.drive_status() == libfreemkv::DriveStatus::DiscPresent;
+                drop(drive); // close fd immediately
 
                 // Always show drive in state (idle if no disc)
                 if !disc_present {
