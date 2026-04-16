@@ -434,6 +434,8 @@ function renderSettings(s){
       {key:'min_length_secs',label:'Minimum Title Length (seconds)',type:'number',hint:'Shorter titles are skipped (600 = 10 min)'},
       {key:'auto_eject',label:'Auto Eject',type:'bool',hint:'Eject disc after rip completes'},
       {key:'abort_on_error',label:'Abort on Error',type:'bool',hint:'Stop rip on first disc read error'},
+      {key:'output_format',label:'Output Format',type:'radio',options:[{value:'mkv',label:'MKV'},{value:'m2ts',label:'M2TS'},{value:'iso',label:'ISO (disc image)'},{value:'network',label:'Network'}],hint:'Format for ripped files'},
+      {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. 192.168.1.100:9000)',indent:true,placeholder:'192.168.1.100:9000'},
     ]},
     {title:'Output',fields:[
       {key:'output_dir',label:'Output Directory',type:'text',hint:'Where all ripped files go by default'},
@@ -486,7 +488,7 @@ fetch('/api/state').then(r=>r.json()).then(data=>{handleState(data);connectSSE()
 </html>"##;
 
 pub fn run(cfg: &Arc<RwLock<Config>>) {
-    let port = cfg.read().unwrap().port;
+    let port = cfg.read().map(|c| c.port).unwrap_or(8080);
     let addr = format!("0.0.0.0:{}", port);
     let server = match Server::http(&addr) {
         Ok(s) => Arc::new(s),
@@ -515,7 +517,7 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     } else if is_get && url == "/api/state" {
         json_response(request, 200, &get_state_json());
     } else if is_get && url == "/api/history" {
-        let history_dir = cfg.read().unwrap().history_dir();
+        let history_dir = cfg.read().map(|c| c.history_dir()).unwrap_or_default();
         let items = history::load_recent(&history_dir, 50);
         let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
         json_response(request, 200, &json);
@@ -523,7 +525,7 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         let fname = url.trim_start_matches("/api/history/");
         handle_history_file(request, cfg, fname);
     } else if is_get && url == "/api/settings" {
-        let c = cfg.read().unwrap();
+        let c = match cfg.read() { Ok(c) => c, Err(_) => return json_response(request, 500, "{}"), };
         let json = serde_json::to_string(&*c).unwrap_or_else(|_| "{}".to_string());
         json_response(request, 200, &json);
     } else if is_post && url == "/api/settings" {
@@ -581,7 +583,7 @@ fn text_response(request: tiny_http::Request, body: &str) {
 }
 
 fn get_state_json() -> String {
-    let state = ripper::STATE.lock().unwrap();
+    let state = match ripper::STATE.lock() { Ok(s) => s, Err(_) => return "{}".to_string(), };
     serde_json::to_string(&*state).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -592,7 +594,7 @@ fn handle_history_file(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, f
         json_response(request, 400, r#"{"error":"invalid filename"}"#);
         return;
     }
-    let history_dir = cfg.read().unwrap().history_dir();
+    let history_dir = cfg.read().map(|c| c.history_dir()).unwrap_or_default();
     let path = format!("{}/{}", history_dir, fname);
     match std::fs::read_to_string(&path) {
         Ok(content) => {
@@ -668,7 +670,7 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 
     // Move queue: find drives with status "done" or "moving"
     let move_queue: Vec<String> = {
-        let state = ripper::STATE.lock().unwrap();
+        let state = match ripper::STATE.lock() { Ok(s) => s, Err(_) => return json_response(request, 500, "{}"), };
         state
             .values()
             .filter(|rs| rs.status == "done" || rs.status == "moving")
@@ -730,7 +732,7 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
     };
 
     {
-        let mut c = cfg.write().unwrap();
+        let mut c = match cfg.write() { Ok(c) => c, Err(_) => return json_response(request, 500, "{}"), };
         if let Some(v) = patch.get("output_dir").and_then(|v| v.as_str()) {
             c.output_dir = v.to_string();
         }
@@ -760,6 +762,12 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         }
         if let Some(v) = patch.get("abort_on_error").and_then(|v| v.as_bool()) {
             c.abort_on_error = v;
+        }
+        if let Some(v) = patch.get("output_format").and_then(|v| v.as_str()) {
+            c.output_format = v.to_string();
+        }
+        if let Some(v) = patch.get("network_target").and_then(|v| v.as_str()) {
+            c.network_target = v.to_string();
         }
         if let Some(v) = patch.get("min_length_secs").and_then(|v| v.as_u64()) {
             c.min_length_secs = v;

@@ -57,14 +57,14 @@ pub static STOP_COOLDOWNS: once_cell::sync::Lazy<
 const STOP_COOLDOWN_SECS: u64 = 15;
 
 pub fn set_stop_cooldown(device: &str) {
-    let now = epoch_secs();
+    let now = crate::util::epoch_secs();
     if let Ok(mut cd) = STOP_COOLDOWNS.lock() {
         cd.insert(device.to_string(), now + STOP_COOLDOWN_SECS);
     }
 }
 
 fn is_in_cooldown(device: &str) -> bool {
-    let now = epoch_secs();
+    let now = crate::util::epoch_secs();
     if let Ok(cd) = STOP_COOLDOWNS.lock() {
         if let Some(&expires) = cd.get(device) {
             return now < expires;
@@ -75,7 +75,7 @@ fn is_in_cooldown(device: &str) -> bool {
 
 /// Poll drives for disc insertion.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
-    loop {
+    while !crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
         {
             let drives = libfreemkv::find_drives();
             for mut drive in drives {
@@ -97,7 +97,23 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
 
                     let cfg = cfg.clone();
                     std::thread::spawn(move || {
-                        rip_disc(&cfg, &device, &mut drive);
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            rip_disc(&cfg, &device, &mut drive);
+                        }))
+                        .is_err()
+                        {
+                            crate::log::device_log(&device, "Rip thread panicked");
+                            update_state(
+                                &device,
+                                RipState {
+                                    device: device.clone(),
+                                    status: "error".to_string(),
+                                    last_error: "Internal error (panic)".to_string(),
+                                    ..Default::default()
+                                },
+                            );
+                            drive.unlock_tray();
+                        }
                     });
                 }
             }
@@ -622,7 +638,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
             "poster_url": tmdb_poster,
             "overview": tmdb_overview,
             "staging_dir": staging,
-            "date": format_epoch_date(),
+            "date": crate::util::format_date(),
         });
         crate::history::record(&cfg_read.history_dir(), &entry);
     }
@@ -655,29 +671,6 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
 
     // Webhook
     crate::webhook::send(&cfg_read, "rip_complete", &disc_name, &staging);
-}
-
-fn epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn format_epoch_date() -> String {
-    let secs = epoch_secs();
-    let days = (secs / 86400) as i64;
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
 pub fn eject_drive(device_path: &str) {

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.10.0 (2026-04-16)
+
+### Engine rewrite for libfreemkv 0.10.4
+- **PES pipeline** — replaced deleted IOStream/MkvStream API with current input()/output() PES pipeline
+- **DVD + BD + UHD** — full support for all disc types via unified DiscStream
+- **CSS decryption** — DVD rips auto-decrypt through libfreemkv's CSS key hierarchy
+
+### Output format settings
+- **Output format** — choose MKV, M2TS, ISO, or Network from web UI settings
+- **Network output** — stream rips directly to a remote server (no local disk needed)
+- **ISO output** — full disc image with AACS/CSS decryption via Disc::copy()
+
+### Production hardening
+- **Graceful shutdown** — SIGTERM/SIGINT handler, stops poll loop, unlocks trays
+- **Panic recovery** — rip threads wrapped in catch_unwind, errors reported to UI
+- **No unwrap() in locks** — RwLock/Mutex errors handled gracefully throughout
+- **File safety** — history recorded before file moves, destination verified first
+- **on_insert "identify"** — scan and display disc info without ripping
+
+### Cleanup
+- **Shared util module** — deduplicated date formatting from 3 files
+- **Mover handles all formats** — moves .mkv, .m2ts, .iso files (was .mkv only)
+
 ## 0.9.2 (2026-04-15)
 
 - **libfreemkv 0.9** dependency update

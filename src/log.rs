@@ -7,7 +7,7 @@ static LOGS: once_cell::sync::Lazy<Mutex<HashMap<String, Vec<String>>>> =
 
 /// Log a message for a specific device. Stored in memory + written to file.
 pub fn device_log(device: &str, msg: &str) {
-    let timestamp = epoch_secs();
+    let timestamp = crate::util::epoch_secs();
     let line = format!("[{}] {}", timestamp, msg);
 
     // In-memory buffer (last 500 lines per device)
@@ -55,9 +55,3 @@ pub fn syslog(msg: &str) {
     device_log("system", msg);
 }
 
-fn epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}

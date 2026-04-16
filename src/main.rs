@@ -4,16 +4,29 @@ mod log;
 mod mover;
 mod ripper;
 mod tmdb;
+mod util;
 mod web;
 mod webhook;
 
 use std::io::Read as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 fn main() {
+    // Signal handler for graceful shutdown
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle_signal as *const () as libc::sighandler_t);
+    }
+
+    log::syslog("autorip starting");
+
     // Load config
     let cfg = config::load();
 
-    // Start mover thread (watches staging -> moves to output)
+    // Start mover thread
     let _mover_handle = std::thread::spawn({
         let cfg = cfg.clone();
         move || mover::run(&cfg)
@@ -25,11 +38,17 @@ fn main() {
         move || web::run(&cfg)
     });
 
-    // Start KEYDB auto-update thread (updates once daily)
+    // Start KEYDB auto-update thread
     let _keydb_handle = std::thread::spawn({
         let cfg2 = cfg.clone();
         move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
+            // Check every hour, update once daily
+            for _ in 0..24 {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+                if SHUTDOWN.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
             let url = cfg2
                 .read()
                 .ok()
@@ -58,6 +77,17 @@ fn main() {
         }
     });
 
-    // Main loop: poll drives
+    // Main loop: poll drives (checks SHUTDOWN flag internally)
     ripper::drive_poll_loop(&cfg);
+
+    log::syslog("autorip stopped");
+}
+
+#[cfg(unix)]
+extern "C" fn handle_signal(_sig: libc::c_int) {
+    if SHUTDOWN.load(Ordering::Relaxed) {
+        // Second signal — force exit
+        unsafe { libc::_exit(1) };
+    }
+    SHUTDOWN.store(true, Ordering::Relaxed);
 }
