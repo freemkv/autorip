@@ -74,8 +74,8 @@ tr:hover { background:var(--chip); }
 .setting input[type=text], .setting input[type=number] { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--log-bg); color:var(--text); font-size:13px; font-family:inherit; box-sizing:border-box; }
 .setting input:focus { outline:none; border-color:var(--accent); }
 .setting .hint { font-size:12px; color:var(--text3); margin-top:3px; line-height:1.4; }
-.toggle { display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer; font-weight:400; color:var(--text); }
-.toggle input[type=checkbox] { width:15px; height:15px; margin:0; flex-shrink:0; accent-color:var(--accent); }
+.toggle { display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; font-weight:400; color:var(--text); line-height:1; }
+.toggle input[type=checkbox] { width:13px; height:13px; margin:0; flex-shrink:0; accent-color:var(--accent); }
 #settings-form .card { margin-bottom:12px; }
 #settings-form .card h2 { margin-bottom:14px; }
 .section { display:none; } .section.active { display:flex; flex-direction:column; flex:1; }
