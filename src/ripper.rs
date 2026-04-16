@@ -73,15 +73,45 @@ fn is_in_cooldown(device: &str) -> bool {
     false
 }
 
-/// Poll drives for disc insertion.
+/// Poll drives for disc insertion. Only triggers on state change
+/// (no disc → disc present), not on disc already being there.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
+    // Track which devices had a disc on last poll
+    let mut had_disc: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     while !crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
         {
             let drives = libfreemkv::find_drives();
+            let mut current_with_disc: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
             for mut drive in drives {
                 let path = drive.device_path().to_string();
                 let device = path.rsplit('/').next().unwrap_or(&path).to_string();
-                if drive.drive_status() == libfreemkv::DriveStatus::DiscPresent
+                let disc_present =
+                    drive.drive_status() == libfreemkv::DriveStatus::DiscPresent;
+
+                // Always show drive in state (idle if no disc)
+                if !disc_present {
+                    if !is_ripping(&device) {
+                        update_state(
+                            &device,
+                            RipState {
+                                device: device.clone(),
+                                status: "idle".to_string(),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    continue;
+                }
+
+                current_with_disc.insert(device.clone());
+
+                // Only auto-trigger on NEW insertion (wasn't present last poll)
+                let is_new_insert = !had_disc.contains(&device);
+
+                if is_new_insert
                     && !is_ripping(&device)
                     && !is_in_cooldown(&device)
                 {
@@ -92,6 +122,15 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         .unwrap_or_else(|| "rip".to_string());
 
                     if on_insert == "nothing" {
+                        // Show disc info but don't act
+                        update_state(
+                            &device,
+                            RipState {
+                                device: device.clone(),
+                                status: "idle".to_string(),
+                                ..Default::default()
+                            },
+                        );
                         continue;
                     }
 
@@ -117,6 +156,8 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     });
                 }
             }
+
+            had_disc = current_with_disc;
         }
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
@@ -531,8 +572,16 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
             };
             let mut output = libfreemkv::pes::CountingStream::new(raw_output);
 
-            let total_bytes = info.size_bytes;
+            // Use title size from disc scan (more reliable than stream info)
+            let disc_title_size = disc.titles.get(title_idx).map(|t| t.size_bytes).unwrap_or(0);
+            let total_bytes = if disc_title_size > 0 {
+                disc_title_size
+            } else {
+                info.size_bytes
+            };
             let start = std::time::Instant::now();
+            let mut last_update = start;
+            let mut last_log = start;
 
             // Write buffered frames
             for frame in &buffered {
@@ -548,6 +597,12 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
                         if output.write(&frame).is_err() {
                             break;
                         }
+
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_update).as_secs_f64() < 1.0 {
+                            continue; // throttle state updates to 1/sec
+                        }
+                        last_update = now;
 
                         let bytes_done = output.bytes_written();
                         let elapsed = start.elapsed().as_secs_f64();
@@ -572,6 +627,27 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, session: &mut Drive) {
                         } else {
                             String::new()
                         };
+
+                        // Log progress every 60 seconds
+                        if now.duration_since(last_log).as_secs() >= 60 {
+                            last_log = now;
+                            let gb = bytes_done as f64 / 1_073_741_824.0;
+                            let total_gb = total_bytes as f64 / 1_073_741_824.0;
+                            if total_bytes > 0 {
+                                crate::log::device_log(
+                                    device,
+                                    &format!(
+                                        "{:.1} GB / {:.1} GB ({}%) {:.1} MB/s ETA {}",
+                                        gb, total_gb, pct, speed, eta
+                                    ),
+                                );
+                            } else {
+                                crate::log::device_log(
+                                    device,
+                                    &format!("{:.1} GB {:.1} MB/s", gb, speed),
+                                );
+                            }
+                        }
 
                         update_state(
                             device,
