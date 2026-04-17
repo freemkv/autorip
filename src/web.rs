@@ -182,7 +182,7 @@ let _lastStatus={};
 let _activeTab=null;
 
 function renderSteps(steps,progress,eta,speed){
-  if(!steps||!steps.length)return'<div style="color:var(--text3);font-size:.85rem;padding:8px 0">Insert a disc to start ripping</div>';
+  if(!steps||!steps.length)return'';
   const icons={done:'\u2713',active:'\u25cf',pending:'\u25cb'};
   const colors={done:'var(--green)',active:'var(--accent)',pending:'var(--text3)'};
   return steps.map(st=>{
