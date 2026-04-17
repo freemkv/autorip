@@ -187,11 +187,12 @@ function renderSteps(steps,progress,eta,speed){
   const colors={done:'var(--green)',active:'var(--accent)',pending:'var(--text3)'};
   return steps.map(st=>{
     let detail=st.detail||'';
-    if(st.status==='active'&&st.name==='Ripping'&&progress){
+    if(st.status==='active'&&st.name==='Ripping'&&(progress||speed)){
       const p=parseInt(progress)||0;
       const spdStr=speed?' \u00b7 '+speed:'';
       const etaStr=eta?' \u00b7 '+eta+' remaining':'';
-      detail='<div style="display:flex;align-items:center;gap:8px;margin-top:4px"><div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+p+'%;transition:width 1s"></div></div><span style="font-size:.75rem;color:var(--text2)">'+progress+spdStr+etaStr+'</span></div>';
+      const label=progress?progress+spdStr+etaStr:speed+(etaStr||'');
+      detail='<div style="display:flex;align-items:center;gap:8px;margin-top:4px">'+(p>0?'<div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+p+'%;transition:width 1s"></div></div>':'')+'<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div>';
     }else if(detail){detail=' \u2014 '+detail}
     const anim=st.status==='active'?';animation:p 1.5s infinite':'';
     return '<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:.8rem"><span style="color:'+colors[st.status]+';font-size:.7rem;width:14px;text-align:center'+anim+'">'+icons[st.status]+'</span><span style="color:'+(st.status==='pending'?'var(--text3)':'var(--text)')+'">'+st.name+detail+'</span></div>';

@@ -148,8 +148,6 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
 
                     let cfg = cfg.clone();
                     let dev_path = path.clone();
-                    // Drop the drive handle — rip_disc will open its own via input()
-                    drop(drive);
                     std::thread::spawn(move || {
                         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             rip_disc(&cfg, &device, &dev_path);
@@ -195,8 +193,7 @@ pub fn update_state(device: &str, state: RipState) {
 }
 
 /// Rip a disc from start to finish.
-/// Mirrors the freemkv CLI pipe() pattern: input() → headers → output() → frame loop.
-/// Only opens the drive once via input().
+/// One open, one init, one scan. Uses DiscStream::open_drive() directly.
 fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let cfg_read = match cfg.read() {
         Ok(c) => c,
@@ -214,17 +211,34 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     crate::log::device_log(device, "Disc detected, scanning...");
 
-    // Open input — this handles init, scan, decrypt, demux in one call.
-    // Exactly like the freemkv CLI does it.
-    let source_url = format!("disc://{}", device_path);
-    let opts = libfreemkv::InputOptions {
-        keydb_path: cfg_read.keydb_path.clone(),
-        title_index: Some(0), // main title (longest, already sorted)
-        raw: false,
+    // One open. One init. One scan. One stream.
+    let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!("Cannot open drive: {}", e);
+            crate::log::device_log(device, &msg);
+            update_state(
+                device,
+                RipState {
+                    device: device.to_string(),
+                    status: "error".to_string(),
+                    last_error: msg,
+                    ..Default::default()
+                },
+            );
+            return;
+        }
     };
+    let _ = drive.wait_ready();
+    let _ = drive.init();
+    let _ = drive.probe_disc();
+    drive.lock_tray();
 
-    let mut input = match libfreemkv::input(&source_url, &opts) {
-        Ok(s) => s,
+    // open_drive: scans disc + creates PES stream from the same session.
+    // Returns (stream, disc) — metadata and data from one handle.
+    let keydb = cfg_read.keydb_path.as_deref();
+    let (mut input, disc) = match libfreemkv::DiscStream::open_drive(drive, keydb, 0) {
+        Ok(r) => r,
         Err(e) => {
             let msg = format!("Scan failed: {}", e);
             crate::log::device_log(device, &msg);
@@ -241,6 +255,31 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     };
 
+    // Disc metadata — from the same scan, no re-open needed
+    let disc_name = disc
+        .meta_title
+        .as_deref()
+        .unwrap_or(&disc.volume_id)
+        .to_string();
+    let disc_format = match disc.format {
+        libfreemkv::DiscFormat::Uhd => "uhd",
+        libfreemkv::DiscFormat::BluRay => "bluray",
+        libfreemkv::DiscFormat::Dvd => "dvd",
+        libfreemkv::DiscFormat::Unknown => "unknown",
+    }
+    .to_string();
+    let total_bytes = disc.titles.first().map(|t| t.size_bytes).unwrap_or(0);
+
+    crate::log::device_log(
+        device,
+        &format!(
+            "Disc: {} ({}, {} titles)",
+            disc_name,
+            disc_format,
+            disc.titles.len()
+        ),
+    );
+
     // Read frames until codec headers are ready
     let mut buffered = Vec::new();
     while !input.headers_ready() {
@@ -248,25 +287,13 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             Ok(Some(frame)) => buffered.push(frame),
             Ok(None) => break,
             Err(e) => {
-                crate::log::device_log(device, &format!("Header scan error: {}", e));
+                crate::log::device_log(device, &format!("Header error: {}", e));
                 break;
             }
         }
     }
 
-    // Get disc info from the stream (populated by input())
     let info = input.info().clone();
-    let disc_name = if info.playlist.is_empty() {
-        "Unknown".to_string()
-    } else {
-        sanitize_filename(&info.playlist)
-    };
-    let disc_format = "disc".to_string(); // format detection from info
-
-    crate::log::device_log(
-        device,
-        &format!("Disc: {} ({} streams)", disc_name, info.streams.len()),
-    );
 
     // TMDB lookup
     let tmdb = crate::tmdb::lookup(
@@ -343,11 +370,16 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         },
     );
 
-    // Build output title with codec_privates
+    // Build output title with codec_privates from the stream's parsers
     let mut out_title = info.clone();
     out_title.codec_privates = (0..info.streams.len())
         .map(|i| input.codec_private(i))
         .collect();
+    let total_bytes = if total_bytes > 0 {
+        total_bytes
+    } else {
+        info.size_bytes
+    };
 
     // Open output
     let raw_output = match libfreemkv::output(&dest_url, &out_title) {
@@ -369,7 +401,6 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     };
     let mut output = libfreemkv::pes::CountingStream::new(raw_output);
 
-    let total_bytes = info.size_bytes;
     let start = std::time::Instant::now();
     let mut last_update = start;
     let mut last_log = start;
