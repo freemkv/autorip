@@ -712,7 +712,7 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     };
 
     // System log: last 50 lines
-    let syslog_path = format!("{}/system.log", cfg.log_dir());
+    let syslog_path = format!("{}/device_system.log", cfg.log_dir());
     let syslog = std::fs::read_to_string(&syslog_path)
         .unwrap_or_default()
         .lines()

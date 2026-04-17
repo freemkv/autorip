@@ -426,7 +426,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 if header_reads <= 3 || header_reads % 100 == 0 {
                     crate::log::device_log(
                         device,
-                        &format!("Header frame {} track={} len={}", header_reads, frame.track, frame.data.len()),
+                        &format!(
+                            "Header frame {} track={} len={}",
+                            header_reads,
+                            frame.track,
+                            frame.data.len()
+                        ),
                     );
                 }
                 buffered.push(frame);
@@ -482,7 +487,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let mut last_update = start;
     let mut last_log = start;
 
-    crate::log::device_log(device, &format!("Output open, writing {} buffered frames", buffered.len()));
+    crate::log::device_log(
+        device,
+        &format!("Output open, writing {} buffered frames", buffered.len()),
+    );
     // Write buffered frames
     for frame in &buffered {
         if output.write(frame).is_err() {

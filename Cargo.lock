@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-autorip"
-version = "0.10.2"
+version = "0.10.4"
 dependencies = [
  "libc",
  "libfreemkv",

@@ -44,7 +44,7 @@ impl Config {
 }
 
 pub fn load() -> Arc<RwLock<Config>> {
-    let autorip_dir = std::env::var("AUTORIP_DIR").expect("AUTORIP_DIR not set");
+    let autorip_dir = std::env::var("AUTORIP_DIR").unwrap_or_else(|_| "/config".to_string());
     let cfg = Config {
         port: env_or("PORT", "8080").parse().unwrap_or(8080),
         staging_dir: env_or("STAGING_DIR", "/staging"),
