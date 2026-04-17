@@ -12,6 +12,7 @@ pub struct RipState {
     pub disc_name: String,
     pub disc_format: String, // "uhd", "bluray", "dvd"
     pub progress_pct: u8,
+    pub progress_gb: f64,
     pub speed_mbs: f64,
     pub eta: String,
     pub errors: u32,
@@ -31,6 +32,7 @@ impl Default for RipState {
             disc_name: String::new(),
             disc_format: String::new(),
             progress_pct: 0,
+            progress_gb: 0.0,
             speed_mbs: 0.0,
             eta: String::new(),
             errors: 0,
@@ -485,6 +487,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         disc_name: display_name.clone(),
                         disc_format: disc_format.clone(),
                         progress_pct: pct,
+                        progress_gb: bytes_done as f64 / 1_073_741_824.0,
                         speed_mbs: speed,
                         eta,
                         output_file: filename.clone(),

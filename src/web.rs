@@ -285,8 +285,14 @@ function renderCurrent(){
   /* Now Playing card */
   let card;
   const title=s.tmdb_title||s.disc_name;
-  if(s.status==='idle'||!title){
-    card='<div class="np"><div class="idle-msg">'+D+'<p>Insert a disc to start ripping</p></div></div>';
+  if(s.status==='idle'&&!title){
+    card='<div class="np"><div class="idle-msg">'+D+'<p>Waiting for disc</p></div></div>';
+  }else if(s.status==='idle'&&title){
+    const img=s.tmdb_poster?'<img class="poster" src="'+esc(s.tmdb_poster)+'" alt="">':'<div class="ph">'+D+'</div>';
+    const fmt=s.disc_format;
+    const b=fmt&&fmt!=='unknown'?'<span class="b '+fmt+'">'+fmt+'</span>':'';
+    const yr=s.tmdb_year>0?s.tmdb_year:'';
+    card='<div class="np">'+img+'<div class="nfo"><div class="mt">'+esc(title)+'</div><div class="my">'+yr+' '+b+'</div><div class="mo" style="color:var(--green)">Ready to rip</div></div></div>';
   }else{
     const img=s.tmdb_poster?'<img class="poster" src="'+esc(s.tmdb_poster)+'" alt="">':'<div class="ph">'+D+'</div>';
     const fmt=s.disc_format;
@@ -299,12 +305,11 @@ function renderCurrent(){
 
   /* Actions bar */
   const active=ACTIVE_STATES.includes(s.status);
-  const hasDisc=s.status!=='idle';
   let btns='';
   if(active){
     btns='<button class="btn btn-stop" onclick="if(confirm(\'Stop the current rip?\')){this.disabled=true;fetch(\'/api/stop/'+dev+'\',{method:\'POST\'})}">Stop</button>';
     btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
-  }else if(hasDisc&&s.status!=='error'){
+  }else{
     btns='<button class="btn" onclick="fetch(\'/api/rip/'+dev+'\',{method:\'POST\'})">Rip</button>';
     btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
   }
@@ -315,7 +320,7 @@ function renderCurrent(){
 
   /* Steps */
   const steps=buildSteps(s);
-  const progressStr=s.progress_pct>0?s.progress_pct+'%':'';
+  const progressStr=s.progress_pct>0?s.progress_pct+'%':(s.progress_gb>0?s.progress_gb.toFixed(1)+' GB':'');
   const speedStr=s.speed_mbs>0?s.speed_mbs.toFixed(1)+' MB/s':'';
   const etaStr=s.eta||'';
   upd('steps',renderSteps(steps,progressStr,etaStr,speedStr));
