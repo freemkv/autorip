@@ -403,20 +403,48 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let keys = disc.decrypt_keys();
     let batch = libfreemkv::disc::detect_max_batch_sectors(device_path);
     let format = disc.content_format;
+    crate::log::device_log(
+        device,
+        &format!(
+            "DiscStream::new batch={} format={:?} extents={} streams={}",
+            batch,
+            format,
+            title.extents.len(),
+            title.streams.len()
+        ),
+    );
     let mut input = libfreemkv::DiscStream::new(Box::new(drive), title, keys, batch, format);
+    crate::log::device_log(device, "Stream created, reading headers...");
 
     // Read frames until codec headers are ready
     let mut buffered = Vec::new();
+    let mut header_reads = 0u32;
     while !input.headers_ready() {
         match input.read() {
-            Ok(Some(frame)) => buffered.push(frame),
-            Ok(None) => break,
+            Ok(Some(frame)) => {
+                header_reads += 1;
+                if header_reads <= 3 || header_reads % 100 == 0 {
+                    crate::log::device_log(
+                        device,
+                        &format!("Header frame {} track={} len={}", header_reads, frame.track, frame.data.len()),
+                    );
+                }
+                buffered.push(frame);
+            }
+            Ok(None) => {
+                crate::log::device_log(device, "EOF during header read");
+                break;
+            }
             Err(e) => {
                 crate::log::device_log(device, &format!("Header error: {}", e));
                 break;
             }
         }
     }
+    crate::log::device_log(
+        device,
+        &format!("Headers ready, {} frames buffered", buffered.len()),
+    );
 
     let info = input.info().clone();
     let mut out_title = info.clone();
@@ -429,6 +457,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         info.size_bytes
     };
 
+    crate::log::device_log(device, &format!("Opening output: {}", dest_url));
     // Open output
     let raw_output = match libfreemkv::output(&dest_url, &out_title) {
         Ok(s) => s,
@@ -453,6 +482,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let mut last_update = start;
     let mut last_log = start;
 
+    crate::log::device_log(device, &format!("Output open, writing {} buffered frames", buffered.len()));
     // Write buffered frames
     for frame in &buffered {
         if output.write(frame).is_err() {
@@ -460,6 +490,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     }
 
+    crate::log::device_log(device, "Starting frame loop");
     // Stream remaining frames — same loop as freemkv CLI
     loop {
         match input.read() {
