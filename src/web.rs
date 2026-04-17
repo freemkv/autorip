@@ -50,8 +50,7 @@ body { font-family:-apple-system,system-ui,"Segoe UI",Roboto,sans-serif; backgro
 .b.uhd { background:#0969da18; color:var(--blue); border:1px solid #0969da33; }
 .b.bluray { background:#1a7f3718; color:var(--green); border:1px solid #1a7f3733; }
 .b.dvd { background:#9a670018; color:var(--yellow); border:1px solid #9a670033; }
-.btn-stop { font-size:.65rem; padding:2px 8px; color:var(--text3); border-color:var(--border); background:var(--chip); white-space:nowrap; }
-.btn-eject { font-size:.7rem; padding:3px 10px; color:var(--text3); }
+.btn-stop, .btn-eject { font-size:.78rem; }
 .idle-msg { display:flex; flex-direction:column; align-items:center; justify-content:center; width:100%; min-height:160px; color:var(--text3); }
 .idle-msg svg { width:48px; height:48px; opacity:.4; margin-bottom:12px; }
 .idle-msg p { font-size:.85rem; }
@@ -71,7 +70,9 @@ tr:hover { background:var(--chip); }
 /* Settings */
 .setting { margin-bottom:18px; }
 .setting label { display:block; font-size:13px; color:var(--text2); font-weight:500; margin-bottom:5px; }
-.setting input[type=text], .setting input[type=number] { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--log-bg); color:var(--text); font-size:13px; font-family:inherit; box-sizing:border-box; }
+.setting input[type=text], .setting input[type=number] { padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--log-bg); color:var(--text); font-size:13px; font-family:inherit; box-sizing:border-box; }
+.setting input[type=text] { width:100%; }
+.setting input[type=number] { width:120px; }
 .setting input:focus { outline:none; border-color:var(--accent); }
 .setting .hint { font-size:12px; color:var(--text3); margin-top:3px; line-height:1.4; }
 .toggle { display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; font-weight:400; color:var(--text); line-height:1; }
@@ -282,40 +283,42 @@ function renderCurrent(){
   const s=data[dev];
   if(!s)return;
 
+  /* Derived state */
+  const active=ACTIVE_STATES.includes(s.status);
+  const title=s.tmdb_title||s.disc_name;
+  const scanned=!!title;
+  const discIn=s.disc_present||scanned;
+
   /* Now Playing card */
   let card;
-  const title=s.tmdb_title||s.disc_name;
-  if(s.status==='idle'&&!title){
-    card='<div class="np"><div class="idle-msg">'+D+'<p>Waiting for disc</p></div></div>';
-  }else if(s.status==='idle'&&title){
-    const img=s.tmdb_poster?'<img class="poster" src="'+esc(s.tmdb_poster)+'" alt="">':'<div class="ph">'+D+'</div>';
-    const fmt=s.disc_format;
-    const b=fmt&&fmt!=='unknown'?'<span class="b '+fmt+'">'+fmt+'</span>':'';
-    const yr=s.tmdb_year>0?s.tmdb_year:'';
-    card='<div class="np">'+img+'<div class="nfo"><div class="mt">'+esc(title)+'</div><div class="my">'+yr+' '+b+'</div><div class="mo" style="color:var(--green)">Ready to rip</div></div></div>';
+  if(!discIn){
+    card='<div class="np"><div class="idle-msg">'+D+'<p>No disc</p></div></div>';
+  }else if(!scanned){
+    card='<div class="np"><div class="idle-msg">'+D+'<p>Disc detected</p></div></div>';
   }else{
     const img=s.tmdb_poster?'<img class="poster" src="'+esc(s.tmdb_poster)+'" alt="">':'<div class="ph">'+D+'</div>';
     const fmt=s.disc_format;
     const b=fmt&&fmt!=='unknown'?'<span class="b '+fmt+'">'+fmt+'</span>':'';
     const o=s.tmdb_overview?'<div class="mo">'+esc(s.tmdb_overview)+'</div>':'';
     const yr=s.tmdb_year>0?s.tmdb_year:'';
-    card='<div class="np">'+img+'<div class="nfo"><div class="mt">'+esc(title)+'</div><div class="my">'+yr+' '+b+'</div>'+o+'</div></div>';
+    const sub=s.status==='idle'?'<div class="mo" style="color:var(--green)">Ready to rip</div>':o;
+    card='<div class="np">'+img+'<div class="nfo"><div class="mt">'+esc(title)+'</div><div class="my">'+yr+' '+b+'</div>'+sub+'</div></div>';
   }
   upd('np',card);
 
   /* Actions bar */
-  const active=ACTIVE_STATES.includes(s.status);
   let btns='';
   if(active){
-    btns='<button class="btn btn-stop" onclick="if(confirm(\'Stop the current rip?\')){this.disabled=true;fetch(\'/api/stop/'+dev+'\',{method:\'POST\'})}">Stop</button>';
-    btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
-  }else{
-    btns='<button class="btn" onclick="fetch(\'/api/rip/'+dev+'\',{method:\'POST\'})">Rip</button>';
-    btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
+    btns='<button class="btn btn-stop" onclick="if(confirm(\'Stop?\')){this.disabled=true;fetch(\'/api/stop/'+dev+'\',{method:\'POST\'})}">Stop</button>';
+  }else if(scanned){
+    btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="fetch(\'/api/rip/'+dev+'\',{method:\'POST\'})">Rip</button>';
+  }else if(discIn){
+    btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan</button>';
   }
+  if(discIn)btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
+
   const statusLabel=s.status||'idle';
-  const hasDisc=!!(s.disc_name||s.tmdb_title);
-  const dot=active?'var(--green)':hasDisc?'var(--accent)':'var(--text3)';
+  const dot=active?'var(--green)':scanned?'var(--accent)':discIn?'var(--yellow)':'var(--text3)';
   const pulse=active?'animation:p 1.5s infinite;':'';
   upd('actions','<div class="actions"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dot+';vertical-align:middle;margin-right:6px;'+pulse+'"></span><span style="font-size:.8rem;color:var(--text2)">'+dev+' \u00b7 '+statusLabel+'</span><span style="margin-left:auto;display:flex;gap:6px">'+btns+'</span></div>');
 
@@ -340,11 +343,10 @@ function loadDeviceLog(dev){
   clearTimeout(_logTimer);
   fetch('/api/logs/'+encodeURIComponent(dev)).then(r=>r.text()).then(text=>{
     const e=document.getElementById('log');
-    if(e&&e._last!==text){
-      const atBottom=e.scrollHeight-e.scrollTop-e.clientHeight<50;
-      e.textContent=text;
-      e._last=text;
-      if(atBottom)e.scrollTop=e.scrollHeight;
+    const reversed=text.split('\n').filter(l=>l).reverse().join('\n');
+    if(e&&e._last!==reversed){
+      e.textContent=reversed;
+      e._last=reversed;
     }
   }).catch(()=>{});
   _logTimer=setTimeout(()=>loadDeviceLog(dev),3000);
@@ -436,7 +438,7 @@ function loadSettings(){
 function renderSettings(s){
   const groups=[
     {title:'Ripping',fields:[
-      {key:'on_insert',label:'On Disc Insert',type:'radio',options:[{value:'nothing',label:'Do Nothing'},{value:'identify',label:'Identify'},{value:'rip',label:'Rip'}],hint:'What happens when a disc is inserted'},
+      {key:'on_insert',label:'On Disc Insert',type:'radio',options:[{value:'nothing',label:'Do Nothing'},{value:'scan',label:'Scan'},{value:'rip',label:'Rip'}],hint:'What happens when a disc is inserted'},
       {key:'main_feature',label:'Main Feature Only',type:'bool',hint:'Rip longest title only'},
       {key:'min_length_secs',label:'Minimum Title Length (seconds)',type:'number',hint:'Shorter titles are skipped (600 = 10 min)'},
       {key:'auto_eject',label:'Auto Eject',type:'bool',hint:'Eject disc after rip completes'},
@@ -467,7 +469,7 @@ function renderSettings(s){
         const opts=f.options.map(o=>'<label style="font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-right:16px"><input type="radio" name="'+f.key+'" data-key="'+f.key+'" value="'+o.value+'" style="width:14px;height:14px;margin:0;accent-color:var(--accent)" onchange="toggleConditional()" '+(v===o.value?'checked':'')+'>'+o.label+'</label>').join('');
         html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label>'+f.label+'</label><div style="margin-top:4px">'+opts+'</div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }else if(f.type==='bool'){
-        html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label class="toggle"><input type="checkbox" data-key="'+f.key+'" '+(v?'checked':'')+'>'+f.label+'</label>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
+        html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label class="toggle"><input type="checkbox" data-key="'+f.key+'" '+(v?'checked':'')+'> '+f.label+'</label>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }else{
         html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label>'+f.label+'</label><input type="'+f.type+'" data-key="'+f.key+'" value="'+esc(String(v))+'"'+ph+'>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }
@@ -558,6 +560,10 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         handle_device_log(request, cfg, &device);
     } else if is_get && url == "/events" {
         handle_sse(request);
+    } else if is_post && url.starts_with("/api/scan/") {
+        let device = url.trim_start_matches("/api/scan/");
+        let device = percent_decode(device);
+        handle_scan(request, cfg, &device);
     } else if is_post && url.starts_with("/api/rip/") {
         let device = url.trim_start_matches("/api/rip/");
         let device = percent_decode(device);
@@ -719,9 +725,6 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         .rev()
         .take(50)
         .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
         .join("\n");
 
     let body = serde_json::json!({
@@ -841,6 +844,38 @@ fn handle_sse(request: tiny_http::Request) {
             break;
         }
     }
+}
+
+fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
+    if ripper::STATE
+        .lock()
+        .map(|s| {
+            s.get(device)
+                .map(|r| r.status == "scanning" || r.status == "ripping")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+    {
+        json_response(request, 409, r#"{"ok":false,"error":"busy"}"#);
+        return;
+    }
+
+    let dev = device.to_string();
+    let dev_path = format!("/dev/{}", device);
+    let cfg = Arc::clone(cfg);
+    ripper::update_state(
+        &dev,
+        ripper::RipState {
+            device: dev.clone(),
+            status: "scanning".to_string(),
+            disc_present: true,
+            ..Default::default()
+        },
+    );
+    std::thread::spawn(move || {
+        ripper::scan_disc(&cfg, &dev, &dev_path);
+    });
+    json_response(request, 200, r#"{"ok":true}"#);
 }
 
 fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
@@ -984,11 +1019,15 @@ fn handle_eject(request: tiny_http::Request, device: &str) {
 }
 
 fn handle_stop(request: tiny_http::Request, device: &str) {
+    // Signal the rip thread to stop
+    ripper::request_stop(device);
+
     let existed = ripper::STATE
         .lock()
         .map(|mut s| {
             if let Some(rs) = s.get_mut(device) {
                 rs.status = "idle".to_string();
+                rs.disc_present = true;
                 true
             } else {
                 false

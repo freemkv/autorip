@@ -54,6 +54,13 @@ pub fn get_device_log(device: &str, lines: usize) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Clear log for a device.
+pub fn clear_device_log(device: &str) {
+    if let Ok(mut logs) = LOGS.lock() {
+        logs.remove(device);
+    }
+}
+
 /// Log to system log (not device-specific).
 pub fn syslog(msg: &str) {
     device_log("system", msg);

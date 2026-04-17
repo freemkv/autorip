@@ -54,7 +54,7 @@ pub fn load() -> Arc<RwLock<Config>> {
         min_length_secs: env_or("MIN_LENGTH", "600").parse().unwrap_or(600),
         main_feature: env_or("MAIN_FEATURE", "true") == "true",
         auto_eject: env_or("AUTO_EJECT", "true") == "true",
-        on_insert: env_or("ON_INSERT", "rip"),
+        on_insert: env_or("ON_INSERT", "scan"),
         output_format: env_or("OUTPUT_FORMAT", "mkv"),
         network_target: env_or("NETWORK_TARGET", ""),
         abort_on_error: env_or("ABORT_ON_ERROR", "true") == "true",

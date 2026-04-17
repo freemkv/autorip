@@ -32,6 +32,43 @@ fn main() {
     // Load config
     let cfg = config::load();
 
+    // Ensure KEYDB exists — download on first boot if URL is configured
+    if libfreemkv::keydb::default_path()
+        .ok()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+    {
+        log::syslog("KEYDB found");
+    } else {
+        let url = cfg
+            .read()
+            .ok()
+            .map(|c| c.keydb_url.clone())
+            .unwrap_or_default();
+        if !url.is_empty() {
+            log::syslog("KEYDB not found, downloading...");
+            match ureq::get(&url).call() {
+                Ok(resp) => {
+                    let mut buf = Vec::new();
+                    if resp
+                        .into_reader()
+                        .take(100 * 1024 * 1024)
+                        .read_to_end(&mut buf)
+                        .is_ok()
+                    {
+                        match libfreemkv::keydb::save(&buf) {
+                            Ok(r) => {
+                                log::syslog(&format!("KEYDB downloaded: {} entries", r.entries))
+                            }
+                            Err(e) => log::syslog(&format!("KEYDB save failed: {e}")),
+                        }
+                    }
+                }
+                Err(e) => log::syslog(&format!("KEYDB download failed: {e}")),
+            }
+        }
+    }
+
     // Start mover thread
     let _mover_handle = std::thread::spawn({
         let cfg = cfg.clone();
