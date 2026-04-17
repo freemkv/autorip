@@ -134,7 +134,6 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         .unwrap_or_else(|| "rip".to_string());
 
                     if on_insert == "nothing" {
-                        // Show disc info but don't act
                         update_state(
                             &device,
                             RipState {
@@ -145,6 +144,17 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         );
                         continue;
                     }
+
+                    // Mark as scanning BEFORE spawning thread — prevents poll loop
+                    // from reopening the drive on next iteration (race condition).
+                    update_state(
+                        &device,
+                        RipState {
+                            device: device.clone(),
+                            status: "scanning".to_string(),
+                            ..Default::default()
+                        },
+                    );
 
                     let cfg = cfg.clone();
                     let dev_path = path.clone();
