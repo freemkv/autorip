@@ -554,6 +554,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     crate::log::device_log(device, "Rip complete");
     crate::webhook::send(&cfg_read, "rip_complete", &display_name, &staging);
 }
+
 pub fn eject_drive(device_path: &str) {
     if let Ok(mut session) = libfreemkv::Drive::open(std::path::Path::new(device_path)) {
         let _ = session.eject();
