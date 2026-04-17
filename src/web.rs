@@ -314,6 +314,7 @@ function renderCurrent(){
     btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
   }
   const statusLabel=s.status||'idle';
+  const hasDisc=!!(s.disc_name||s.tmdb_title);
   const dot=active?'var(--green)':hasDisc?'var(--accent)':'var(--text3)';
   const pulse=active?'animation:p 1.5s infinite;':'';
   upd('actions','<div class="actions"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dot+';vertical-align:middle;margin-right:6px;'+pulse+'"></span><span style="font-size:.8rem;color:var(--text2)">'+dev+' \u00b7 '+statusLabel+'</span><span style="margin-left:auto;display:flex;gap:6px">'+btns+'</span></div>');
@@ -858,22 +859,34 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
     }
 
     let dev = device.to_string();
+    let dev_path = format!("/dev/{}", device);
     let cfg = Arc::clone(cfg);
+    // Set scanning state before spawn to prevent poll loop race
+    ripper::update_state(
+        &dev,
+        ripper::RipState {
+            device: dev.clone(),
+            status: "scanning".to_string(),
+            ..Default::default()
+        },
+    );
     std::thread::spawn(move || {
-        ripper::STATE
-            .lock()
-            .map(|mut s| {
-                s.insert(
-                    dev.clone(),
-                    ripper::RipState {
-                        device: dev.clone(),
-                        status: "idle".to_string(),
-                        ..Default::default()
-                    },
-                );
-            })
-            .ok();
-        let _ = cfg;
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ripper::rip_disc(&cfg, &dev, &dev_path);
+        }))
+        .is_err()
+        {
+            crate::log::device_log(&dev, "Rip thread panicked");
+            ripper::update_state(
+                &dev,
+                ripper::RipState {
+                    device: dev.clone(),
+                    status: "error".to_string(),
+                    last_error: "Internal error (panic)".to_string(),
+                    ..Default::default()
+                },
+            );
+        }
     });
 
     json_response(request, 200, r#"{"ok":true}"#);

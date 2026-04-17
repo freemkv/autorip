@@ -205,8 +205,8 @@ pub fn update_state(device: &str, state: RipState) {
 }
 
 /// Rip a disc from start to finish.
-/// One open, one init, one scan. Uses DiscStream::open_drive() directly.
-fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
+/// One open, one init, one scan, one stream.
+pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let cfg_read = match cfg.read() {
         Ok(c) => c,
         Err(_) => return,
