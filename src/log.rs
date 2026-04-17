@@ -7,8 +7,12 @@ static LOGS: once_cell::sync::Lazy<Mutex<HashMap<String, Vec<String>>>> =
 
 /// Log a message for a specific device. Stored in memory + written to file.
 pub fn device_log(device: &str, msg: &str) {
-    let timestamp = crate::util::epoch_secs();
-    let line = format!("[{}] {}", timestamp, msg);
+    let secs = crate::util::epoch_secs();
+    let day_secs = (secs % 86400) as u32;
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    let line = format!("[{:02}:{:02}:{:02}] {}", h, m, s, msg);
 
     // In-memory buffer (last 500 lines per device)
     if let Ok(mut logs) = LOGS.lock() {

@@ -246,11 +246,13 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let _ = drive.probe_disc();
     drive.lock_tray();
 
-    // open_drive: scans disc + creates PES stream from the same session.
-    // Returns (stream, disc) — metadata and data from one handle.
-    let keydb = cfg_read.keydb_path.as_deref();
-    let (mut input, disc) = match libfreemkv::DiscStream::open_drive(drive, keydb, 0) {
-        Ok(r) => r,
+    // Scan — disc name, format, titles available after this
+    let scan_opts = match &cfg_read.keydb_path {
+        Some(p) => libfreemkv::ScanOptions::with_keydb(p),
+        None => libfreemkv::ScanOptions::default(),
+    };
+    let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
+        Ok(d) => d,
         Err(e) => {
             let msg = format!("Scan failed: {}", e);
             crate::log::device_log(device, &msg);
@@ -292,22 +294,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         ),
     );
 
-    // Read frames until codec headers are ready
-    let mut buffered = Vec::new();
-    while !input.headers_ready() {
-        match input.read() {
-            Ok(Some(frame)) => buffered.push(frame),
-            Ok(None) => break,
-            Err(e) => {
-                crate::log::device_log(device, &format!("Header error: {}", e));
-                break;
-            }
-        }
-    }
-
-    let info = input.info().clone();
-
-    // TMDB lookup
+    // TMDB lookup — disc name available NOW, before streaming starts
     let tmdb = crate::tmdb::lookup(
         &crate::tmdb::clean_title(&disc_name),
         &cfg_read.tmdb_api_key,
@@ -328,6 +315,22 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     } else {
         tmdb_title.clone()
     };
+
+    // Update UI immediately with disc info + TMDB — user sees poster during rip setup
+    update_state(
+        device,
+        RipState {
+            device: device.to_string(),
+            status: "scanning".to_string(),
+            disc_name: display_name.clone(),
+            disc_format: disc_format.clone(),
+            tmdb_title: tmdb_title.clone(),
+            tmdb_year,
+            tmdb_poster: tmdb_poster.clone(),
+            tmdb_overview: tmdb_overview.clone(),
+            ..Default::default()
+        },
+    );
 
     // If on_insert is "identify", stop after scanning
     if cfg_read.on_insert == "identify" {
@@ -364,7 +367,7 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         format!("{}://{}", ext, output_path)
     };
 
-    crate::log::device_log(device, &format!("Ripping to {}", filename));
+    crate::log::device_log(device, &format!("Ripping {} to {}", display_name, filename));
 
     update_state(
         device,
@@ -382,7 +385,40 @@ fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         },
     );
 
-    // Build output title with codec_privates from the stream's parsers
+    // Create PES stream — same drive session, no re-open
+    if disc.titles.is_empty() {
+        crate::log::device_log(device, "No titles found");
+        update_state(
+            device,
+            RipState {
+                device: device.to_string(),
+                status: "error".to_string(),
+                last_error: "No titles".to_string(),
+                ..Default::default()
+            },
+        );
+        return;
+    }
+    let title = disc.titles[0].clone();
+    let keys = disc.decrypt_keys();
+    let batch = libfreemkv::disc::detect_max_batch_sectors(device_path);
+    let format = disc.content_format;
+    let mut input = libfreemkv::DiscStream::new(Box::new(drive), title, keys, batch, format);
+
+    // Read frames until codec headers are ready
+    let mut buffered = Vec::new();
+    while !input.headers_ready() {
+        match input.read() {
+            Ok(Some(frame)) => buffered.push(frame),
+            Ok(None) => break,
+            Err(e) => {
+                crate::log::device_log(device, &format!("Header error: {}", e));
+                break;
+            }
+        }
+    }
+
+    let info = input.info().clone();
     let mut out_title = info.clone();
     out_title.codec_privates = (0..info.streams.len())
         .map(|i| input.codec_private(i))
