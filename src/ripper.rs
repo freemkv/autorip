@@ -287,18 +287,12 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let _ = drive.wait_ready();
     crate::log::device_log(device, "Initializing...");
     let _ = drive.init();
-    crate::log::device_log(device, "Probing...");
-    let _ = drive.probe_disc();
-    crate::log::device_log(device, "Scanning titles...");
+    crate::log::device_log(device, "Identifying disc...");
 
-    let scan_opts = match &cfg_read.keydb_path {
-        Some(p) => libfreemkv::ScanOptions::with_keydb(p),
-        None => libfreemkv::ScanOptions::default(),
-    };
-    let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
-        Ok(d) => d,
+    let disc_id = match libfreemkv::Disc::identify(&mut drive) {
+        Ok(id) => id,
         Err(e) => {
-            crate::log::device_log(device, &format!("Scan failed: {}", e));
+            crate::log::device_log(device, &format!("Identify failed: {}", e));
             update_state(
                 device,
                 RipState {
@@ -312,12 +306,8 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     };
 
-    let disc_name = disc
-        .meta_title
-        .as_deref()
-        .unwrap_or(&disc.volume_id)
-        .to_string();
-    let disc_format = match disc.format {
+    let disc_name = disc_id.name().to_string();
+    let disc_format = match disc_id.format {
         libfreemkv::DiscFormat::Uhd => "uhd",
         libfreemkv::DiscFormat::BluRay => "bluray",
         libfreemkv::DiscFormat::Dvd => "dvd",
@@ -327,12 +317,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     crate::log::device_log(
         device,
-        &format!(
-            "Disc: {} ({}, {} titles)",
-            disc_name,
-            disc_format,
-            disc.titles.len()
-        ),
+        &format!("Disc: {} ({})", disc_name, disc_format),
     );
 
     let tmdb = crate::tmdb::lookup(
@@ -382,16 +367,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         Err(_) => return,
     };
 
+    // Preserve TMDB info from identify phase while we do full scan
+    let prev = STATE.lock().ok().and_then(|s| s.get(device).cloned());
     update_state(
         device,
         RipState {
             device: device.to_string(),
             status: "scanning".to_string(),
+            disc_name: prev.as_ref().map(|p| p.disc_name.clone()).unwrap_or_default(),
+            disc_format: prev.as_ref().map(|p| p.disc_format.clone()).unwrap_or_default(),
+            tmdb_title: prev.as_ref().map(|p| p.tmdb_title.clone()).unwrap_or_default(),
+            tmdb_year: prev.as_ref().map(|p| p.tmdb_year).unwrap_or(0),
+            tmdb_poster: prev.as_ref().map(|p| p.tmdb_poster.clone()).unwrap_or_default(),
+            tmdb_overview: prev.as_ref().map(|p| p.tmdb_overview.clone()).unwrap_or_default(),
             ..Default::default()
         },
     );
 
-    crate::log::device_log(device, "Disc detected, scanning...");
+    crate::log::device_log(device, "Scanning titles...");
 
     // One open. One init. One scan. One stream.
     let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
@@ -552,8 +545,31 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     }
     let title = disc.titles[0].clone();
     let keys = disc.decrypt_keys();
+
+    if disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None) {
+        let msg = "Disc is encrypted but no decryption keys found (check KEYDB)";
+        crate::log::device_log(device, msg);
+        update_state(
+            device,
+            RipState {
+                device: device.to_string(),
+                status: "error".to_string(),
+                last_error: msg.to_string(),
+                disc_name: display_name,
+                disc_format,
+                tmdb_title,
+                tmdb_year,
+                tmdb_poster,
+                tmdb_overview,
+                ..Default::default()
+            },
+        );
+        return;
+    }
+
     let batch = libfreemkv::disc::detect_max_batch_sectors(device_path);
     let format = disc.content_format;
+
     crate::log::device_log(
         device,
         &format!(

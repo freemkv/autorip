@@ -52,9 +52,37 @@ pub fn lookup(query: &str, api_key: &str) -> Option<TmdbResult> {
 }
 
 /// Clean a disc label for TMDB search: "DUNE_PART_TWO" -> "Dune Part Two"
+/// Strips common disc suffixes like "4K Ultra HD", "Blu-ray", "DVD", etc.
 pub fn clean_title(label: &str) -> String {
-    label
-        .replace(['_', '-'], " ")
+    let s = label.replace(['_', '-'], " ");
+
+    // Strip common disc format suffixes (case-insensitive)
+    let suffixes = [
+        "4k ultra hd",
+        "4k uhd",
+        "ultra hd",
+        "blu ray",
+        "bluray",
+        "dvd",
+        "disc 1",
+        "disc 2",
+        "disc 3",
+        "disc 4",
+        "disk 1",
+        "disk 2",
+    ];
+    let lower = s.to_lowercase();
+    let mut end = s.len();
+    for suffix in &suffixes {
+        if let Some(pos) = lower.find(suffix) {
+            if pos < end {
+                end = pos;
+            }
+        }
+    }
+    let trimmed = s[..end].trim();
+
+    trimmed
         .split_whitespace()
         .map(|w| {
             let mut chars = w.chars();
