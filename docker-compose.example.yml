@@ -4,7 +4,7 @@ services:
     container_name: autorip
     restart: unless-stopped
     devices:
-      - /dev/sr0:/dev/sr0
+      - /dev/sg4:/dev/sg4
     environment:
       - AUTORIP_DIR=/config
       - OUTPUT_DIR=/output
@@ -19,6 +19,7 @@ services:
       - ./config:/config
       - /mnt/media:/output
       - /tmp/autorip:/staging
+      - /sys:/sys:ro
     ports:
       - 8080:8080
     privileged: true  # Required for disc access

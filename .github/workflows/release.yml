@@ -33,12 +33,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: autorip
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/libfreemkv
-          path: libfreemkv
       - uses: dtolnay/rust-toolchain@1.86.0
         with:
           targets: ${{ matrix.target }}
@@ -57,23 +51,20 @@ jobs:
       - name: Check
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo check
-        working-directory: autorip
 
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }}
-        working-directory: autorip
 
       - name: Build (cross)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cross build --release --target ${{ matrix.target }}
-        working-directory: autorip
 
       - name: Package
         run: |
-          cd autorip/target/${{ matrix.target }}/release
-          tar czf "../../../../autorip-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" autorip
-          tar czf "../../../../autorip-${{ matrix.target }}.tar.gz" autorip
+          cd target/${{ matrix.target }}/release
+          tar czf "../../../autorip-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" autorip
+          tar czf "../../../autorip-${{ matrix.target }}.tar.gz" autorip
 
       - name: Upload
         uses: softprops/action-gh-release@v2
@@ -89,12 +80,6 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: autorip
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/libfreemkv
-          path: libfreemkv
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -107,7 +92,6 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: autorip/Dockerfile
           push: true
           tags: |
             ghcr.io/freemkv/autorip:latest
