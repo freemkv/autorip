@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.5 (2026-04-18)
+
+### MKV container fixes
+- **MKV title tag** — writes disc name instead of playlist filename (e.g. "Dune" not "00800.mpls").
+- All libfreemkv 0.11.5 MKV fixes: timestamps, frame rate, HDR, chapters, disposition.
+
 ## 0.11.3 (2026-04-18)
 
 ### Unified versioning
