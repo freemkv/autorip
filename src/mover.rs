@@ -199,18 +199,55 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
     }
 }
 
-/// Move a file: try rename first (instant on same filesystem), fall back to copy+delete.
+/// Move a file: try rename first (instant on same filesystem), fall back to copy+delete with progress.
 fn move_file(src: &Path, dest: &Path) -> bool {
     if std::fs::rename(src, dest).is_ok() {
         return true;
     }
-    match std::fs::copy(src, dest) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(src);
-            true
+    // Cross-filesystem: copy with progress logging
+    let src_size = match std::fs::metadata(src) {
+        Ok(m) => m.len(),
+        Err(_) => return false,
+    };
+    let mut reader = match std::fs::File::open(src) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut writer = match std::fs::File::create(dest) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MB buffer
+    let mut copied: u64 = 0;
+    let start = std::time::Instant::now();
+    let mut last_log = start;
+    loop {
+        let n = match std::io::Read::read(&mut reader, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if std::io::Write::write_all(&mut writer, &buf[..n]).is_err() {
+            return false;
         }
-        Err(_) => false,
+        copied += n as u64;
+        let now = std::time::Instant::now();
+        if now.duration_since(last_log).as_secs() >= 10 {
+            last_log = now;
+            let pct = if src_size > 0 { copied * 100 / src_size } else { 0 };
+            let elapsed = start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 { copied as f64 / (1024.0 * 1024.0) / elapsed } else { 0.0 };
+            crate::log::syslog(&format!(
+                "Moving: {:.1} GB / {:.1} GB ({}%) {:.0} MB/s",
+                copied as f64 / 1_073_741_824.0,
+                src_size as f64 / 1_073_741_824.0,
+                pct,
+                speed
+            ));
+        }
     }
+    let _ = std::fs::remove_file(src);
+    true
 }
 
 fn sanitize_dir_name(name: &str) -> String {
