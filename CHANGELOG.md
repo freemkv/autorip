@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.6 (2026-04-18)
+
+### TrueHD fix + History revamp
+- **TrueHD audio fix** — libfreemkv 0.11.6 strips BD-TS access unit headers. Fixes corrupt TrueHD/Atmos audio in ripped MKVs.
+- **History page** — card layout with poster, title, format badge, date, rip stats (size, speed, elapsed). Expandable log per rip.
+
 ## 0.11.5 (2026-04-18)
 
 ### MKV container fixes
