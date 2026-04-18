@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.4 (2026-04-18)
+
+### Webhooks
+- **Configurable webhook URLs** — add/remove URLs in Settings. POST JSON payload on rip complete and move complete.
+- **Rich payload** — title, year, format, poster, duration, codecs, size, speed, elapsed time, output path.
+- **move_complete event** — fires after file is moved to final destination (NAS/library).
+- Works with Discord, Jellyfin, n8n, Zapier, or any HTTP endpoint.
+
 ## 0.11.3 (2026-04-18)
 
 ### Unified versioning
