@@ -699,25 +699,20 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         }));
     }
 
-    // Move queue: find drives with status "done" or "moving"
-    let move_queue: Vec<String> = {
-        let state = match ripper::STATE.lock() {
-            Ok(s) => s,
-            Err(_) => return json_response(request, 500, "{}"),
-        };
-        state
-            .values()
-            .filter(|rs| rs.status == "done" || rs.status == "moving")
-            .map(|rs| {
-                let title = if rs.tmdb_title.is_empty() {
-                    rs.disc_name.clone()
-                } else {
-                    rs.tmdb_title.clone()
-                };
-                format!("{} ({})", title, rs.status)
-            })
-            .collect()
-    };
+    // Move queue: scan staging for .done markers (pending moves)
+    let move_queue: Vec<String> = std::fs::read_dir(&cfg.staging_dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir() && e.path().join(".done").exists())
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().replace('_', " ");
+                    format!("{} (moving)", name)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // System log: last 50 lines
     let syslog_path = format!("{}/device_system.log", cfg.log_dir());

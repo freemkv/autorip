@@ -942,10 +942,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         ),
     );
 
-    // Record history — only on successful completion
+    // Mark staging as complete — mover picks this up even after restart/stop
     {
         let tmdb_ref = &session.tmdb;
-        let entry = serde_json::json!({
+        let marker = serde_json::json!({
             "title": display_name,
             "disc_name": disc_name,
             "format": disc_format,
@@ -953,9 +953,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             "media_type": tmdb_ref.as_ref().map(|t| t.media_type.as_str()).unwrap_or("unknown"),
             "poster_url": tmdb_poster,
             "overview": tmdb_overview,
-            "staging_dir": staging,
             "date": crate::util::format_date(),
         });
+        let marker_path = format!("{}/.done", staging);
+        let _ = std::fs::write(&marker_path, serde_json::to_string_pretty(&marker).unwrap_or_default());
+
+        // Record history
+        let mut entry = marker.clone();
+        entry["staging_dir"] = serde_json::json!(staging);
         crate::history::record(&cfg_read.history_dir(), &entry);
     }
 
@@ -988,9 +993,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 }
 
 pub fn eject_drive(device_path: &str) {
-    // Find device name from path
     let dev = device_path.rsplit('/').next().unwrap_or("");
     drop_session(dev);
+    crate::log::clear_device_log(dev);
     if let Ok(mut session) = libfreemkv::Drive::open(std::path::Path::new(device_path)) {
         let _ = session.eject();
     }
@@ -1012,19 +1017,26 @@ fn format_duration(secs: f64) -> String {
 
 fn format_codecs(title: &libfreemkv::DiscTitle) -> String {
     let mut parts = Vec::new();
+    // Primary video
     for s in &title.streams {
-        match s {
-            libfreemkv::Stream::Video(v) if !v.secondary => {
+        if let libfreemkv::Stream::Video(v) = s {
+            if !v.secondary {
                 let mut desc = format!("{} {}", v.codec.name(), v.resolution);
                 if v.hdr != libfreemkv::HdrFormat::Sdr {
                     desc.push_str(&format!(" {}", v.hdr.name()));
                 }
                 parts.push(desc);
+                break;
             }
-            libfreemkv::Stream::Audio(a) if !a.secondary => {
+        }
+    }
+    // First primary audio only
+    for s in &title.streams {
+        if let libfreemkv::Stream::Audio(a) = s {
+            if !a.secondary {
                 parts.push(format!("{} {}", a.codec.name(), a.channels));
+                break;
             }
-            _ => {}
         }
     }
     parts.join(" · ")

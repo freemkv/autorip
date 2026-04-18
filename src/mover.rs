@@ -20,27 +20,49 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
 }
 
 fn check_and_move(cfg: &Config) {
-    // Find drives with status "done"
-    let done_entries: Vec<ripper::RipState> = {
-        let state = match ripper::STATE.lock() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        state
-            .values()
-            .filter(|rs| rs.status == "done")
-            .cloned()
-            .collect()
+    // Scan staging directory for completed rips (directories with .done marker)
+    let staging_root = &cfg.staging_dir;
+    let entries = match std::fs::read_dir(staging_root) {
+        Ok(e) => e,
+        Err(_) => return,
     };
 
-    for rs in &done_entries {
-        let staging_dir = &rs.output_file; // staging path stored here when done
-        if staging_dir.is_empty() || !Path::new(staging_dir).is_dir() {
+    for entry in entries.filter_map(|e| e.ok()) {
+        let dir = entry.path();
+        if !dir.is_dir() {
             continue;
         }
 
-        // Find all ripped files in the staging directory (mkv, m2ts, iso)
-        let ripped_files: Vec<std::path::PathBuf> = match std::fs::read_dir(staging_dir) {
+        let marker_path = dir.join(".done");
+        if !marker_path.exists() {
+            continue;
+        }
+
+        // Read marker for TMDB metadata
+        let marker: serde_json::Value = match std::fs::read_to_string(&marker_path) {
+            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+            Err(_) => continue,
+        };
+
+        let disc_name = marker["disc_name"].as_str().unwrap_or("").to_string();
+        let display_name = marker["title"].as_str().unwrap_or(&disc_name).to_string();
+        let disc_format = marker["format"].as_str().unwrap_or("").to_string();
+
+        // Build TMDB result from marker
+        let tmdb_result = if !marker["title"].is_null() {
+            Some(tmdb::TmdbResult {
+                title: marker["title"].as_str().unwrap_or("").to_string(),
+                year: marker["year"].as_u64().unwrap_or(0) as u16,
+                poster_url: marker["poster_url"].as_str().unwrap_or("").to_string(),
+                overview: marker["overview"].as_str().unwrap_or("").to_string(),
+                media_type: marker["media_type"].as_str().unwrap_or("movie").to_string(),
+            })
+        } else {
+            None
+        };
+
+        // Find ripped files
+        let ripped_files: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
             Ok(entries) => entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
@@ -57,38 +79,28 @@ fn check_and_move(cfg: &Config) {
             continue;
         }
 
-        // Look up TMDB metadata
-        let tmdb_result = if !cfg.tmdb_api_key.is_empty() {
-            tmdb::lookup(&tmdb::clean_title(&rs.disc_name), &cfg.tmdb_api_key)
-        } else {
-            None
-        };
+        let staging_dir = dir.to_string_lossy().to_string();
+        crate::log::syslog(&format!("Moving: {} ({} files)", display_name, ripped_files.len()));
 
-        // Update state to "moving"
-        ripper::update_state(
-            &rs.device,
-            ripper::RipState {
-                device: rs.device.clone(),
-                status: "moving".to_string(),
-                disc_name: rs.disc_name.clone(),
-                disc_format: rs.disc_format.clone(),
-                progress_pct: 100,
-                tmdb_title: tmdb_result
-                    .as_ref()
-                    .map(|t| t.title.clone())
-                    .unwrap_or_default(),
-                tmdb_year: tmdb_result.as_ref().map(|t| t.year).unwrap_or(0),
-                tmdb_poster: tmdb_result
-                    .as_ref()
-                    .map(|t| t.poster_url.clone())
-                    .unwrap_or_default(),
-                tmdb_overview: tmdb_result
-                    .as_ref()
-                    .map(|t| t.overview.clone())
-                    .unwrap_or_default(),
-                ..Default::default()
-            },
-        );
+        // Update UI state to "moving" — find a device or use a synthetic key
+        let device_key = find_device_for_staging(&staging_dir);
+        if let Some(ref dev) = device_key {
+            ripper::update_state(
+                dev,
+                ripper::RipState {
+                    device: dev.clone(),
+                    status: "moving".to_string(),
+                    disc_name: display_name.clone(),
+                    disc_format: disc_format.clone(),
+                    progress_pct: 100,
+                    tmdb_title: tmdb_result.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
+                    tmdb_year: tmdb_result.as_ref().map(|t| t.year).unwrap_or(0),
+                    tmdb_poster: tmdb_result.as_ref().map(|t| t.poster_url.clone()).unwrap_or_default(),
+                    tmdb_overview: tmdb_result.as_ref().map(|t| t.overview.clone()).unwrap_or_default(),
+                    ..Default::default()
+                },
+            );
+        }
 
         // Build destination paths
         let mut planned_moves: Vec<(std::path::PathBuf, String)> = Vec::new();
@@ -102,15 +114,12 @@ fn check_and_move(cfg: &Config) {
             planned_moves.push((file_path.clone(), dest));
         }
 
-        // Verify all destination directories can be created
+        // Create destination directories
         let mut dest_ok = true;
         for (_, dest) in &planned_moves {
             if let Some(parent) = Path::new(dest).parent() {
                 if std::fs::create_dir_all(parent).is_err() {
-                    crate::log::device_log(
-                        &rs.device,
-                        &format!("Cannot create directory: {:?}", parent),
-                    );
+                    crate::log::syslog(&format!("Cannot create directory: {:?}", parent));
                     dest_ok = false;
                 }
             }
@@ -122,32 +131,45 @@ fn check_and_move(cfg: &Config) {
         // Move files
         let mut all_moved = true;
         for (src, dest) in &planned_moves {
+            crate::log::syslog(&format!("Copying {} to {}", src.display(), dest));
             if move_file(src, Path::new(dest)) {
-                crate::log::device_log(&rs.device, &format!("Moved to {}", dest));
+                crate::log::syslog(&format!("Moved to {}", dest));
             } else {
-                crate::log::device_log(
-                    &rs.device,
-                    &format!("Failed to move {:?} to {}", src, dest),
-                );
+                crate::log::syslog(&format!("Failed to move {:?} to {}", src, dest));
                 all_moved = false;
             }
         }
 
         if all_moved {
-            // Remove the staging directory only after all files moved
-            let _ = std::fs::remove_dir_all(staging_dir);
+            // Remove staging directory (including .done marker)
+            let _ = std::fs::remove_dir_all(&dir);
+            crate::log::syslog(&format!("Move complete: {}", display_name));
 
-            // Mark device as idle
-            ripper::update_state(
-                &rs.device,
-                ripper::RipState {
-                    device: rs.device.clone(),
-                    status: "idle".to_string(),
-                    ..Default::default()
-                },
-            );
+            if let Some(ref dev) = device_key {
+                ripper::update_state(
+                    dev,
+                    ripper::RipState {
+                        device: dev.clone(),
+                        status: "idle".to_string(),
+                        ..Default::default()
+                    },
+                );
+            }
         }
     }
+}
+
+/// Find a device key that matches this staging dir, or the first idle/done device.
+fn find_device_for_staging(staging_dir: &str) -> Option<String> {
+    let state = ripper::STATE.lock().ok()?;
+    // Check if any device has this staging dir as output_file
+    for (dev, rs) in state.iter() {
+        if rs.output_file == staging_dir || rs.status == "done" {
+            return Some(dev.clone());
+        }
+    }
+    // Fall back to first device
+    state.keys().next().cloned()
 }
 
 fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
@@ -165,7 +187,6 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
                 format!("{}/{}", dir, mkv_name)
             }
             "tv" if !cfg.tv_dir.is_empty() => {
-                // For TV, keep the original filename which may contain episode info
                 let dir = format!("{}/{}/Season 1", cfg.tv_dir, safe_title);
                 format!("{}/{}", dir, filename)
             }
@@ -180,11 +201,9 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
 
 /// Move a file: try rename first (instant on same filesystem), fall back to copy+delete.
 fn move_file(src: &Path, dest: &Path) -> bool {
-    // Try rename first (same filesystem)
     if std::fs::rename(src, dest).is_ok() {
         return true;
     }
-    // Fall back to copy + delete
     match std::fs::copy(src, dest) {
         Ok(_) => {
             let _ = std::fs::remove_file(src);
