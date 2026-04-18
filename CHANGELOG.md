@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.3 (2026-04-18)
+
+### Unified versioning
+- All freemkv repos now share the same version number.
+- Updated libfreemkv dependency to 0.11.
+
 ## 0.11.2 (2026-04-18)
 
 ### Smoother speed/ETA display
