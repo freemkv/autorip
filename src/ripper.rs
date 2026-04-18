@@ -816,7 +816,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 smooth_speed = if smooth_speed < 0.01 {
                     instant_speed
                 } else {
-                    0.8 * smooth_speed + 0.2 * instant_speed
+                    0.95 * smooth_speed + 0.05 * instant_speed
                 };
                 let speed = smooth_speed;
                 let eta = if speed > 0.0 && total_bytes > bytes_done {
