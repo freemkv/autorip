@@ -208,26 +208,14 @@ function buildSteps(s){
   if(st==='scanning'){
     steps.push({name:'Scanning',status:'active',detail:''});
     steps.push({name:'Ripping',status:'pending',detail:''});
-    steps.push({name:'Verified',status:'pending',detail:''});
-    steps.push({name:'Moving',status:'pending',detail:''});
     steps.push({name:'Done',status:'pending',detail:''});
   }else if(st==='ripping'){
     steps.push({name:'Scanning',status:'done',detail:''});
     steps.push({name:'Ripping',status:'active',detail:''});
-    steps.push({name:'Verified',status:'pending',detail:''});
-    steps.push({name:'Moving',status:'pending',detail:''});
     steps.push({name:'Done',status:'pending',detail:''});
-  }else if(st==='moving'){
+  }else if(st==='moving'||st==='done'){
     steps.push({name:'Scanning',status:'done',detail:''});
     steps.push({name:'Ripping',status:'done',detail:''});
-    steps.push({name:'Verified',status:'done',detail:''});
-    steps.push({name:'Moving',status:'active',detail:''});
-    steps.push({name:'Done',status:'pending',detail:''});
-  }else if(st==='done'){
-    steps.push({name:'Scanning',status:'done',detail:''});
-    steps.push({name:'Ripping',status:'done',detail:''});
-    steps.push({name:'Verified',status:'done',detail:''});
-    steps.push({name:'Moving',status:'done',detail:''});
     steps.push({name:'Done',status:'done',detail:''});
   }else if(st==='error'){
     steps.push({name:'Error',status:'active',detail:s.last_error||''});
@@ -274,6 +262,7 @@ function handleState(data){
 
   window._stateData=data;
   renderCurrent();
+  if(document.getElementById('system').classList.contains('active'))renderMoves();
 }
 
 function renderCurrent(){
@@ -339,13 +328,22 @@ function renderCurrent(){
   loadDeviceLog(dev);
 }
 
+/* ---- Local time conversion for log lines ---- */
+function utcToLocal(line){
+  return line.replace(/^\[(\d{2}):(\d{2}):(\d{2})\]/,function(_,h,m,s){
+    const now=new Date();
+    const d=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),+h,+m,+s));
+    return '['+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0')+']';
+  });
+}
+
 /* ---- Device log viewer ---- */
 let _logTimer=null;
 function loadDeviceLog(dev){
   clearTimeout(_logTimer);
   fetch('/api/logs/'+encodeURIComponent(dev)).then(r=>r.text()).then(text=>{
     const e=document.getElementById('log');
-    const reversed=text.split('\n').filter(l=>l).reverse().join('\n');
+    const reversed=text.split('\n').filter(l=>l).map(utcToLocal).reverse().join('\n');
     if(e&&e._last!==reversed){
       e.textContent=reversed;
       e._last=reversed;
@@ -392,6 +390,38 @@ function updateKeydb(){
     else{st.textContent=data.error||'Update failed';st.style.color='var(--red)';}
   }).catch(e=>{st.textContent='Network error';st.style.color='var(--red)';});
 }
+/* ---- Move queue with live progress ---- */
+function renderMoves(){
+  const el=document.getElementById('moves');
+  if(!el)return;
+  const data=window._stateData||{};
+  let html='';
+  let hasContent=false;
+  for(const[dev,s]of Object.entries(data)){
+    if(s.status!=='moving')continue;
+    hasContent=true;
+    const name=s.tmdb_title||s.disc_name||dev;
+    const pct=s.progress_pct||0;
+    const spdStr=s.speed_mbs>=1?s.speed_mbs.toFixed(1)+' MB/s':s.speed_mbs>0?(s.speed_mbs*1024).toFixed(0)+' KB/s':'';
+    const etaStr=s.eta?s.eta+' remaining':'';
+    const label=[pct+'%',spdStr,etaStr].filter(x=>x).join(' \u00b7 ');
+    html+='<div style="padding:6px 0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);animation:p 1.5s infinite;flex-shrink:0"></span><span style="font-size:.85rem;font-weight:500">'+esc(name)+'</span></div>';
+    html+='<div style="display:flex;align-items:center;gap:8px">';
+    if(pct>0)html+='<div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+pct+'%;transition:width 1s"></div></div>';
+    html+='<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div></div>';
+  }
+  if(window._moveQueue){
+    window._moveQueue.forEach(m=>{
+      const alreadyShown=Object.values(data).some(s=>s.status==='moving'&&(s.tmdb_title||s.disc_name||'').replace(/ /g,'_').includes(m.replace(/ \(moving\)/,'').replace(/ /g,'_')));
+      if(alreadyShown)return;
+      hasContent=true;
+      html+='<div style="padding:4px 0;font-size:.8rem"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--yellow);margin-right:8px;vertical-align:middle"></span>'+esc(m)+'</div>';
+    });
+  }
+  if(!hasContent)html='<div style="color:var(--text3);font-size:.8rem">No pending moves</div>';
+  upd('moves',html);
+}
+
 /* ---- System page ---- */
 function loadSystem(){
   fetch('/api/system').then(r=>r.json()).then(data=>{
@@ -410,21 +440,13 @@ function loadSystem(){
     }else{
       filesEl.innerHTML='<div style="color:var(--text3);font-size:.8rem">No data files found</div>';
     }
-    /* Move queue */
-    const movesEl=document.getElementById('moves');
-    if(data.move_queue&&data.move_queue.length){
-      let mhtml='';
-      data.move_queue.forEach(m=>{
-        mhtml+='<div style="padding:4px 0;font-size:.8rem"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--yellow);margin-right:8px;vertical-align:middle"></span>'+esc(m)+'</div>';
-      });
-      movesEl.innerHTML=mhtml;
-    }else{
-      movesEl.innerHTML='<div style="color:var(--text3);font-size:.8rem">No pending moves</div>';
-    }
+    /* Move queue — store for renderMoves, then render */
+    window._moveQueue=data.move_queue||[];
+    renderMoves();
     /* System log */
     const logEl=document.getElementById('syslog');
     if(data.syslog){
-      logEl.textContent=data.syslog;
+      logEl.textContent=data.syslog.split('\n').map(utcToLocal).join('\n');
       logEl.scrollTop=0;
     }else{
       logEl.textContent='No system log available';
