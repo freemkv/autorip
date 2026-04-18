@@ -485,17 +485,6 @@ function renderSettings(s){
     ]},
   ];
   let html='';
-  /* Webhooks — dynamic list */
-  const hooks=(s.webhook_urls||[]).filter(u=>u);
-  html+='<div class="card"><h2>Webhooks</h2>';
-  html+='<div id="webhook-list">';
-  hooks.forEach((u,i)=>{
-    html+='<div style="display:flex;gap:6px;margin-bottom:6px;align-items:center"><input type="text" data-webhook="'+i+'" value="'+esc(u)+'" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--log-bg);color:var(--text);font-size:13px;font-family:inherit"><button class="btn" onclick="this.parentElement.remove()" style="padding:5px 8px;font-size:.75rem">X</button></div>';
-  });
-  html+='</div>';
-  html+='<button class="btn" onclick="addWebhook()" style="font-size:.75rem;margin-top:4px">+ Add Webhook</button>';
-  html+='<div class="hint" style="margin-top:8px">POST with JSON payload on rip complete. Works with Discord, Jellyfin, n8n, or any HTTP endpoint.</div>';
-  html+='</div>';
   groups.forEach(g=>{
     html+='<div class="card"><h2>'+g.title+'</h2>';
     g.fields.forEach(f=>{
@@ -514,6 +503,19 @@ function renderSettings(s){
       }
     });
     html+='</div>';
+    /* Insert webhooks card after Output */
+    if(g.title==='Output'){
+      const hooks=(s.webhook_urls||[]).filter(u=>u);
+      html+='<div class="card"><h2>Webhooks</h2>';
+      html+='<div id="webhook-list">';
+      hooks.forEach((u,i)=>{
+        html+='<div style="display:flex;gap:6px;margin-bottom:6px;align-items:center"><input type="text" data-webhook="'+i+'" value="'+esc(u)+'" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--log-bg);color:var(--text);font-size:13px;font-family:inherit"><button class="btn" onclick="this.parentElement.remove()" style="padding:5px 8px;font-size:.75rem">X</button></div>';
+      });
+      html+='</div>';
+      html+='<button class="btn" onclick="addWebhook()" style="font-size:.75rem;margin-top:4px">+ Add Webhook</button>';
+      html+='<div style="font-size:12px;color:var(--text3);margin-top:8px;line-height:1.4">POST JSON on rip and move complete. Works with Discord, Jellyfin, n8n, or any HTTP endpoint.</div>';
+      html+='</div>';
+    }
   });
   document.getElementById('settings-form').innerHTML=html;
   toggleConditional();
