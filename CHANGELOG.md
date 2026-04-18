@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.6 (2026-04-18)
+
+### TrueHD fix
+- All libfreemkv 0.11.6 fixes including TrueHD BD-TS header corruption.
+
 ## 0.11.5 (2026-04-18)
 
 ### MKV container fixes
