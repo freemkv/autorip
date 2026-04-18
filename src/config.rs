@@ -18,14 +18,8 @@ pub struct Config {
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,
     pub keydb_url: String,
-    pub webhooks: Vec<WebhookConfig>,
+    pub webhook_urls: Vec<String>,
     pub autorip_dir: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebhookConfig {
-    pub url: String,
-    pub events: Vec<String>,
 }
 
 impl Config {
@@ -61,7 +55,7 @@ pub fn load() -> Arc<RwLock<Config>> {
         tmdb_api_key: env_or("TMDB_API_KEY", ""),
         keydb_path: std::env::var("KEYDB_PATH").ok(),
         keydb_url: env_or("KEYDB_URL", ""),
-        webhooks: Vec::new(),
+        webhook_urls: Vec::new(),
         autorip_dir,
     };
     // Try loading saved settings
@@ -110,6 +104,9 @@ fn load_saved(mut cfg: Config) -> Config {
             }
             if let Some(v) = saved.get("abort_on_error").and_then(|v| v.as_bool()) {
                 cfg.abort_on_error = v;
+            }
+            if let Some(arr) = saved.get("webhook_urls").and_then(|v| v.as_array()) {
+                cfg.webhook_urls = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).filter(|s| !s.is_empty()).collect();
             }
         }
     }

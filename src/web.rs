@@ -485,6 +485,17 @@ function renderSettings(s){
     ]},
   ];
   let html='';
+  /* Webhooks — dynamic list */
+  const hooks=(s.webhook_urls||[]).filter(u=>u);
+  html+='<div class="card"><h2>Webhooks</h2>';
+  html+='<div id="webhook-list">';
+  hooks.forEach((u,i)=>{
+    html+='<div style="display:flex;gap:6px;margin-bottom:6px;align-items:center"><input type="text" data-webhook="'+i+'" value="'+esc(u)+'" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--log-bg);color:var(--text);font-size:13px;font-family:inherit"><button class="btn" onclick="this.parentElement.remove()" style="padding:5px 8px;font-size:.75rem">X</button></div>';
+  });
+  html+='</div>';
+  html+='<button class="btn" onclick="addWebhook()" style="font-size:.75rem;margin-top:4px">+ Add Webhook</button>';
+  html+='<div class="hint" style="margin-top:8px">POST with JSON payload on rip complete. Works with Discord, Jellyfin, n8n, or any HTTP endpoint.</div>';
+  html+='</div>';
   groups.forEach(g=>{
     html+='<div class="card"><h2>'+g.title+'</h2>';
     g.fields.forEach(f=>{
@@ -515,6 +526,16 @@ function toggleConditional(){
   });
 }
 
+function addWebhook(){
+  const list=document.getElementById('webhook-list');
+  const i=list.children.length;
+  const div=document.createElement('div');
+  div.style='display:flex;gap:6px;margin-bottom:6px;align-items:center';
+  div.innerHTML='<input type="text" data-webhook="'+i+'" placeholder="https://discord.com/api/webhooks/..." style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--log-bg);color:var(--text);font-size:13px;font-family:inherit"><button class="btn" onclick="this.parentElement.remove()" style="padding:5px 8px;font-size:.75rem">X</button>';
+  list.appendChild(div);
+  div.querySelector('input').focus();
+}
+
 function saveSettings(){
   const inputs=document.querySelectorAll('#settings-form [data-key]');
   const s={};
@@ -524,6 +545,13 @@ function saveSettings(){
     else if(el.type==='number')s[el.dataset.key]=parseInt(el.value)||0;
     else s[el.dataset.key]=el.value;
   });
+  /* Collect webhook URLs */
+  const hooks=[];
+  document.querySelectorAll('#webhook-list input[data-webhook]').forEach(el=>{
+    const v=el.value.trim();
+    if(v)hooks.push(v);
+  });
+  s.webhook_urls=hooks;
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)})
   .then(r=>{if(r.ok){document.getElementById('save-status').textContent='Saved';setTimeout(()=>document.getElementById('save-status').textContent='',2000)}});
 }
@@ -829,6 +857,9 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         }
         if let Some(v) = patch.get("port").and_then(|v| v.as_u64()) {
             c.port = v as u16;
+        }
+        if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {
+            c.webhook_urls = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).filter(|s| !s.is_empty()).collect();
         }
         config::save(&c);
     }

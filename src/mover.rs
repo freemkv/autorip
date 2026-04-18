@@ -178,6 +178,10 @@ fn check_and_move(cfg: &Config) {
             let _ = std::fs::remove_dir_all(&dir);
             crate::log::syslog(&format!("Move complete: {}", display_name));
 
+            // Webhook: move_complete
+            let dest_path = planned_moves.last().map(|(_, d)| d.as_str()).unwrap_or("");
+            crate::webhook::send_move(cfg, &display_name, dest_path);
+
             if let Some(ref dev) = device_key {
                 ripper::update_state(
                     dev,

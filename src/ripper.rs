@@ -989,7 +989,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     }
 
     crate::log::device_log(device, "Rip complete");
-    crate::webhook::send(&cfg_read, "rip_complete", &display_name, &staging);
+    crate::webhook::send_rich(
+        &cfg_read,
+        "rip_complete",
+        &display_name,
+        tmdb_year,
+        &disc_format,
+        &tmdb_poster,
+        &duration,
+        &codecs,
+        bytes_done as f64 / 1_073_741_824.0,
+        speed,
+        elapsed,
+        &staging,
+    );
 }
 
 pub fn eject_drive(device_path: &str) {
