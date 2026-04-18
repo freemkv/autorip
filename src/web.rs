@@ -410,7 +410,11 @@ function renderMoves(){
     if(pct>0)html+='<div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+pct+'%;transition:width 1s"></div></div>';
     html+='<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div></div>';
   }
-  if(window._moveQueue){
+  if(!hasContent&&window._moveQueue&&window._moveQueue.length){
+    /* No active move in state — re-fetch queue in case staging was cleaned up */
+    fetch('/api/system').then(r=>r.json()).then(d=>{window._moveQueue=d.move_queue||[];renderMoves()}).catch(()=>{});
+    window._moveQueue=[];
+  }else if(window._moveQueue){
     window._moveQueue.forEach(m=>{
       const alreadyShown=Object.values(data).some(s=>s.status==='moving'&&(s.tmdb_title||s.disc_name||'').replace(/ /g,'_').includes(m.replace(/ \(moving\)/,'').replace(/ /g,'_')));
       if(alreadyShown)return;
