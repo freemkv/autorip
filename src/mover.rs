@@ -132,7 +132,45 @@ fn check_and_move(cfg: &Config) {
         let mut all_moved = true;
         for (src, dest) in &planned_moves {
             crate::log::syslog(&format!("Copying {} to {}", src.display(), dest));
-            if move_file(src, Path::new(dest)) {
+            let dev_for_progress = device_key.clone();
+            let name_for_progress = display_name.clone();
+            let fmt_for_progress = disc_format.clone();
+            let tmdb_for_progress = tmdb_result.clone();
+            let on_progress = move |pct: u8, gb: f64, total_gb: f64, speed: f64| {
+                if let Some(ref dev) = dev_for_progress {
+                    let speed_str = if speed >= 1.0 {
+                        format!("{:.0} MB/s", speed)
+                    } else {
+                        format!("{:.0} KB/s", speed * 1024.0)
+                    };
+                    ripper::update_state(
+                        dev,
+                        ripper::RipState {
+                            device: dev.clone(),
+                            status: "moving".to_string(),
+                            disc_name: name_for_progress.clone(),
+                            disc_format: fmt_for_progress.clone(),
+                            progress_pct: pct,
+                            progress_gb: gb,
+                            speed_mbs: speed,
+                            eta: if speed > 1.0 && total_gb > gb {
+                                let secs = ((total_gb - gb) * 1024.0 / speed) as u32;
+                                let m = secs / 60;
+                                let s = secs % 60;
+                                format!("{}:{:02}", m, s)
+                            } else {
+                                String::new()
+                            },
+                            tmdb_title: tmdb_for_progress.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
+                            tmdb_year: tmdb_for_progress.as_ref().map(|t| t.year).unwrap_or(0),
+                            tmdb_poster: tmdb_for_progress.as_ref().map(|t| t.poster_url.clone()).unwrap_or_default(),
+                            tmdb_overview: tmdb_for_progress.as_ref().map(|t| t.overview.clone()).unwrap_or_default(),
+                            ..Default::default()
+                        },
+                    );
+                }
+            };
+            if move_file(src, Path::new(dest), &on_progress) {
                 crate::log::syslog(&format!("Moved to {}", dest));
             } else {
                 crate::log::syslog(&format!("Failed to move {:?} to {}", src, dest));
@@ -200,22 +238,16 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
 }
 
 /// Move a file: try rename first, fall back to cp in a child process.
-/// Child process prevents NFS stalls from blocking the main autorip process.
-fn move_file(src: &Path, dest: &Path) -> bool {
+/// Child process prevents NFS/CIFS stalls from blocking the main autorip process.
+/// Calls on_progress(pct, gb_done, gb_total, speed_mbs) every few seconds.
+fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -> bool {
     if std::fs::rename(src, dest).is_ok() {
         return true;
     }
-    // Cross-filesystem: spawn cp as child process so NFS stalls don't hang autorip
     let src_str = src.to_string_lossy().to_string();
     let dest_str = dest.to_string_lossy().to_string();
     let src_size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-
-    crate::log::syslog(&format!(
-        "Copying {:.1} GB: {} -> {}",
-        src_size as f64 / 1_073_741_824.0,
-        src_str,
-        dest_str
-    ));
+    let total_gb = src_size as f64 / 1_073_741_824.0;
 
     let mut child = match std::process::Command::new("cp")
         .arg("--")
@@ -230,12 +262,12 @@ fn move_file(src: &Path, dest: &Path) -> bool {
         }
     };
 
-    // Monitor progress while cp runs
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if status.success() {
+                    on_progress(100, total_gb, total_gb, 0.0);
                     let _ = std::fs::remove_file(src);
                     return true;
                 } else {
@@ -244,23 +276,13 @@ fn move_file(src: &Path, dest: &Path) -> bool {
                 }
             }
             Ok(None) => {
-                // Still running — log progress
                 let dest_size = std::fs::metadata(&dest_str).map(|m| m.len()).unwrap_or(0);
-                let pct = if src_size > 0 { dest_size * 100 / src_size } else { 0 };
+                let pct = if src_size > 0 { (dest_size * 100 / src_size).min(100) as u8 } else { 0 };
+                let gb = dest_size as f64 / 1_073_741_824.0;
                 let elapsed = start.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    dest_size as f64 / (1024.0 * 1024.0) / elapsed
-                } else {
-                    0.0
-                };
-                crate::log::syslog(&format!(
-                    "Moving: {:.1} GB / {:.1} GB ({}%) {:.0} MB/s",
-                    dest_size as f64 / 1_073_741_824.0,
-                    src_size as f64 / 1_073_741_824.0,
-                    pct,
-                    speed
-                ));
-                std::thread::sleep(std::time::Duration::from_secs(10));
+                let speed = if elapsed > 0.0 { dest_size as f64 / (1024.0 * 1024.0) / elapsed } else { 0.0 };
+                on_progress(pct, gb, total_gb, speed);
+                std::thread::sleep(std::time::Duration::from_secs(3));
             }
             Err(e) => {
                 crate::log::syslog(&format!("Failed to wait on cp: {}", e));
