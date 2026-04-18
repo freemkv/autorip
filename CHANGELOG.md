@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.11.0 (2026-04-18)
+
+### Dual-layer disc fix
+- **UDF extent allocation** — read actual UDF allocation descriptors instead of assuming contiguous m2ts files. Fixes truncated rips (~37%) on all dual-layer UHD/BD discs.
+- **Read error propagation** — SCSI read errors surface as errors instead of silent EOF.
+
+### Drive session persistence
+- **Single drive session** — scan and rip share one Drive instance. No double-open, no double-init, no riplock from re-initialization.
+- **DriveSession** — persists across scan → rip transitions. Survives eject/stop for clean state management.
+
+### Marker-based mover
+- **`.done` marker** — rip writes JSON marker on completion. Mover scans staging directories for markers instead of relying on in-memory state. Survives container restart, stop button, eject.
+- **Move progress** — custom copy loop logs progress every 10 seconds (GB, %, MB/s) to system log.
+- **Move queue UI** — system page shows pending moves from staging markers.
+
+### UI improvements
+- **Duration + codecs** — now-playing card shows movie length and primary video/audio codec.
+- **No format badge during identify** — UHD/BD badge only appears after full scan confirms format.
+- **Instantaneous speed** — EMA-smoothed (80/20) instead of lifetime average. Shows real throughput.
+- **Adaptive speed units** — MB/s above 1, KB/s below.
+- **ETA capped** — blank when over 99 hours instead of millions.
+- **No duplicate checkmarks** — step indicators show icon only, no trailing text.
+- **Eject clears log** — fresh log for next disc.
+- **History** — only completed rips recorded, no duplicates from mover.
+
+### Fast disc identification
+- **Disc::identify()** — 3-second scan (UDF only) for disc name + TMDB poster. Full scan runs separately.
+- **TMDB before rip** — user sees title + poster immediately, full scan runs in background.
+
 ## 0.10.0 (2026-04-16)
 
 ### Engine rewrite for libfreemkv 0.10.4
