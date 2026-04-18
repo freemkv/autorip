@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.5 (2026-04-18)
+
+### MKV container fixes
+- **MKV title tag** — writes TMDB/disc title instead of playlist filename.
+- All libfreemkv 0.11.5 MKV fixes: timestamps normalized to 0, correct frame rate, HDR colour metadata, chapters (BD + DVD), proper default track disposition.
+- Rips now play correctly in Jellyfin with chapters, HDR tone mapping, and correct audio auto-selection.
+
 ## 0.11.4 (2026-04-18)
 
 ### Webhooks
