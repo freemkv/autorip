@@ -212,23 +212,23 @@ function buildSteps(s){
     steps.push({name:'Moving',status:'pending',detail:''});
     steps.push({name:'Done',status:'pending',detail:''});
   }else if(st==='ripping'){
-    steps.push({name:'Scanning',status:'done',detail:'\u2713'});
+    steps.push({name:'Scanning',status:'done',detail:''});
     steps.push({name:'Ripping',status:'active',detail:''});
     steps.push({name:'Verified',status:'pending',detail:''});
     steps.push({name:'Moving',status:'pending',detail:''});
     steps.push({name:'Done',status:'pending',detail:''});
   }else if(st==='moving'){
-    steps.push({name:'Scanning',status:'done',detail:'\u2713'});
-    steps.push({name:'Ripping',status:'done',detail:'\u2713'});
-    steps.push({name:'Verified',status:'done',detail:'\u2713'});
+    steps.push({name:'Scanning',status:'done',detail:''});
+    steps.push({name:'Ripping',status:'done',detail:''});
+    steps.push({name:'Verified',status:'done',detail:''});
     steps.push({name:'Moving',status:'active',detail:''});
     steps.push({name:'Done',status:'pending',detail:''});
   }else if(st==='done'){
-    steps.push({name:'Scanning',status:'done',detail:'\u2713'});
-    steps.push({name:'Ripping',status:'done',detail:'\u2713'});
-    steps.push({name:'Verified',status:'done',detail:'\u2713'});
-    steps.push({name:'Moving',status:'done',detail:'\u2713'});
-    steps.push({name:'Done',status:'done',detail:'\u2713'});
+    steps.push({name:'Scanning',status:'done',detail:''});
+    steps.push({name:'Ripping',status:'done',detail:''});
+    steps.push({name:'Verified',status:'done',detail:''});
+    steps.push({name:'Moving',status:'done',detail:''});
+    steps.push({name:'Done',status:'done',detail:''});
   }else if(st==='error'){
     steps.push({name:'Error',status:'active',detail:s.last_error||''});
   }
@@ -287,7 +287,7 @@ function renderCurrent(){
   const active=ACTIVE_STATES.includes(s.status);
   const title=s.tmdb_title||s.disc_name;
   const scanned=!!title;
-  const discIn=s.disc_present||scanned;
+  const discIn=s.disc_present||scanned||active;
 
   /* Now Playing card */
   let card;
@@ -301,8 +301,10 @@ function renderCurrent(){
     const b=fmt&&fmt!=='unknown'?'<span class="b '+fmt+'">'+fmt+'</span>':'';
     const o=s.tmdb_overview?'<div class="mo">'+esc(s.tmdb_overview)+'</div>':'';
     const yr=s.tmdb_year>0?s.tmdb_year:'';
-    const sub=s.status==='idle'?'<div class="mo" style="color:var(--green)">Ready to rip</div>':o;
-    card='<div class="np">'+img+'<div class="nfo"><div class="mt">'+esc(title)+'</div><div class="my">'+yr+' '+b+'</div>'+sub+'</div></div>';
+    const dur=s.duration?' \u00b7 '+esc(s.duration):'';
+    const codecs=s.codecs?'<div class="mo" style="color:var(--text3);font-size:.75rem;margin-top:6px">'+esc(s.codecs)+'</div>':'';
+    const ready=s.status==='idle'?'<div class="mo" style="color:var(--green)">Ready to rip</div>':'';
+    card='<div class="np">'+img+'<div class="nfo"><div class="mt">'+esc(title)+'</div><div class="my">'+yr+dur+' '+b+'</div>'+o+codecs+ready+'</div></div>';
   }
   upd('np',card);
 
@@ -325,7 +327,7 @@ function renderCurrent(){
   /* Steps */
   const steps=buildSteps(s);
   const progressStr=s.progress_pct>0?s.progress_pct+'%':(s.progress_gb>0?s.progress_gb.toFixed(1)+' GB':'');
-  const speedStr=s.speed_mbs>0?s.speed_mbs.toFixed(1)+' MB/s':'';
+  const speedStr=s.speed_mbs>=1?s.speed_mbs.toFixed(1)+' MB/s':s.speed_mbs>0?(s.speed_mbs*1024).toFixed(0)+' KB/s':'0 KB/s';
   const etaStr=s.eta||'';
   upd('steps',renderSteps(steps,progressStr,etaStr,speedStr));
 
@@ -896,15 +898,22 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
     let dev = device.to_string();
     let dev_path = format!("/dev/{}", device);
     let cfg = Arc::clone(cfg);
-    // Set scanning state before spawn to prevent poll loop race
-    ripper::update_state(
-        &dev,
-        ripper::RipState {
-            device: dev.clone(),
-            status: "scanning".to_string(),
-            ..Default::default()
-        },
-    );
+    // Set scanning state before spawn — preserve TMDB info to prevent UI flash
+    if let Ok(mut s) = ripper::STATE.lock() {
+        if let Some(rs) = s.get_mut(&dev) {
+            rs.status = "scanning".to_string();
+        } else {
+            s.insert(
+                dev.clone(),
+                ripper::RipState {
+                    device: dev.clone(),
+                    status: "scanning".to_string(),
+                    disc_present: true,
+                    ..Default::default()
+                },
+            );
+        }
+    }
     std::thread::spawn(move || {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ripper::rip_disc(&cfg, &dev, &dev_path);

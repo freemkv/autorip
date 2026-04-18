@@ -1,14 +1,14 @@
 use libfreemkv::pes::Stream as PesStream;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::Config;
 
 /// Per-device stop flag. Rip thread checks this and exits if true.
 pub static STOP_FLAGS: once_cell::sync::Lazy<
-    std::sync::Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
-> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 pub fn request_stop(device: &str) {
     if let Ok(flags) = STOP_FLAGS.lock() {
@@ -53,6 +53,8 @@ pub struct RipState {
     pub tmdb_year: u16,
     pub tmdb_poster: String,
     pub tmdb_overview: String,
+    pub duration: String,
+    pub codecs: String,
 }
 
 impl Default for RipState {
@@ -74,19 +76,21 @@ impl Default for RipState {
             tmdb_year: 0,
             tmdb_poster: String::new(),
             tmdb_overview: String::new(),
+            duration: String::new(),
+            codecs: String::new(),
         }
     }
 }
 
 // Global state for web UI.
 pub static STATE: once_cell::sync::Lazy<
-    std::sync::Mutex<std::collections::HashMap<String, RipState>>,
-> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    Mutex<std::collections::HashMap<String, RipState>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// Stop cooldowns: device -> epoch seconds when cooldown expires.
 pub static STOP_COOLDOWNS: once_cell::sync::Lazy<
-    std::sync::Mutex<std::collections::HashMap<String, u64>>,
-> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    Mutex<std::collections::HashMap<String, u64>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 const STOP_COOLDOWN_SECS: u64 = 5;
 
@@ -107,15 +111,48 @@ fn is_in_cooldown(device: &str) -> bool {
     false
 }
 
+// ─── Per-device drive session ──────────────────────────────────────────────
+
+/// Persistent drive session — survives across scan → rip transitions.
+/// Dropped on eject, stop, or error.
+struct DriveSession {
+    drive: libfreemkv::Drive,
+    disc: Option<libfreemkv::Disc>,
+    scanned: bool,
+    probed: bool,
+    tmdb: Option<crate::tmdb::TmdbResult>,
+}
+
+/// Global drive sessions — one per device.
+static SESSIONS: once_cell::sync::Lazy<
+    Mutex<std::collections::HashMap<String, DriveSession>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn take_session(device: &str) -> Option<DriveSession> {
+    SESSIONS.lock().ok()?.remove(device)
+}
+
+fn store_session(device: &str, session: DriveSession) {
+    if let Ok(mut s) = SESSIONS.lock() {
+        s.insert(device.to_string(), session);
+    }
+}
+
+fn drop_session(device: &str) {
+    if let Ok(mut s) = SESSIONS.lock() {
+        s.remove(device);
+    }
+}
+
+// ─── Poll loop ─────────────────────────────────────────────────────────────
+
 /// Poll drives for disc insertion. Only triggers on state change
 /// (no disc → disc present), not on disc already being there.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
-    // Track which devices had a disc on last poll
     let mut had_disc: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    while !crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+    while !crate::SHUTDOWN.load(Ordering::Relaxed) {
         {
-            // Scan /dev/sg* without opening — just check existence
             let mut current_with_disc: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
 
@@ -126,8 +163,8 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 }
                 let device = format!("sg{}", i);
 
-                // Don't touch drives that are actively ripping
-                if is_ripping(&device) {
+                // Don't touch drives that are actively scanning/ripping
+                if is_busy(&device) {
                     current_with_disc.insert(device);
                     continue;
                 }
@@ -138,11 +175,14 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     Err(_) => continue,
                 };
                 let disc_present = drive.drive_status() == libfreemkv::DriveStatus::DiscPresent;
-                drop(drive); // close fd immediately
+                drop(drive);
 
-                // Always show drive in state (idle if no disc)
                 if !disc_present {
-                    if !is_ripping(&device) {
+                    // Disc removed — clean up session
+                    if had_disc.contains(&device) {
+                        drop_session(&device);
+                    }
+                    if !is_busy(&device) {
                         update_state(
                             &device,
                             RipState {
@@ -157,10 +197,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
 
                 current_with_disc.insert(device.clone());
 
-                // Only auto-trigger on NEW insertion (wasn't present last poll)
                 let is_new_insert = !had_disc.contains(&device);
 
-                if is_new_insert && !is_ripping(&device) && !is_in_cooldown(&device) {
+                if is_new_insert && !is_busy(&device) && !is_in_cooldown(&device) {
                     let on_insert = cfg
                         .read()
                         .ok()
@@ -180,7 +219,6 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         continue;
                     }
 
-                    // Mark as scanning BEFORE spawning thread
                     update_state(
                         &device,
                         RipState {
@@ -204,6 +242,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         .is_err()
                         {
                             crate::log::device_log(&device, "Thread panicked");
+                            drop_session(&device);
                             update_state(
                                 &device,
                                 RipState {
@@ -215,8 +254,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                             );
                         }
                     });
-                } else if !is_new_insert && !is_ripping(&device) {
-                    // Disc was already here — just make sure state has disc_present
+                } else if !is_new_insert && !is_busy(&device) {
                     if let Ok(mut s) = STATE.lock() {
                         if let Some(rs) = s.get_mut(&device) {
                             rs.disc_present = true;
@@ -231,7 +269,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     }
 }
 
-fn is_ripping(device: &str) -> bool {
+fn is_busy(device: &str) -> bool {
     STATE
         .lock()
         .map(|s| {
@@ -248,7 +286,9 @@ pub fn update_state(device: &str, state: RipState) {
     }
 }
 
-/// Scan a disc — identify title, format, TMDB. No rip.
+// ─── Scan ──────────────────────────────────────────────────────────────────
+
+/// Scan a disc — open, init, identify, TMDB, full scan. Stores session for rip.
 pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let cfg_read = match cfg.read() {
         Ok(c) => c,
@@ -260,6 +300,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         RipState {
             device: device.to_string(),
             status: "scanning".to_string(),
+            disc_present: true,
             ..Default::default()
         },
     );
@@ -283,12 +324,12 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             return;
         }
     };
-    crate::log::device_log(device, "Drive open, waiting for ready...");
     let _ = drive.wait_ready();
     crate::log::device_log(device, "Initializing...");
     let _ = drive.init();
-    crate::log::device_log(device, "Identifying disc...");
 
+    // Fast identify — disc name only, no playlists
+    crate::log::device_log(device, "Identifying disc...");
     let disc_id = match libfreemkv::Disc::identify(&mut drive) {
         Ok(id) => id,
         Err(e) => {
@@ -306,8 +347,67 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     };
 
-    let disc_name = disc_id.name().to_string();
-    let disc_format = match disc_id.format {
+    let id_name = disc_id.name().to_string();
+
+    crate::log::device_log(device, &format!("Disc: {}", id_name));
+
+    // TMDB lookup — fast, user sees poster while full scan runs
+    let tmdb = crate::tmdb::lookup(
+        &crate::tmdb::clean_title(&id_name),
+        &cfg_read.tmdb_api_key,
+    );
+    let display_name = tmdb
+        .as_ref()
+        .map(|t| t.title.clone())
+        .unwrap_or_else(|| id_name.clone());
+
+    // Show identify results immediately — no format badge until full scan confirms UHD vs BD
+    update_state(
+        device,
+        RipState {
+            device: device.to_string(),
+            status: "scanning".to_string(),
+            disc_present: true,
+            disc_name: display_name.clone(),
+            disc_format: String::new(),
+            tmdb_title: tmdb.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
+            tmdb_year: tmdb.as_ref().map(|t| t.year).unwrap_or(0),
+            tmdb_poster: tmdb.as_ref().map(|t| t.poster_url.clone()).unwrap_or_default(),
+            tmdb_overview: tmdb.as_ref().map(|t| t.overview.clone()).unwrap_or_default(),
+            ..Default::default()
+        },
+    );
+
+    // Full scan — titles, streams, AACS keys
+    crate::log::device_log(device, "Scanning titles...");
+    let scan_opts = match &cfg_read.keydb_path {
+        Some(p) => libfreemkv::ScanOptions::with_keydb(p),
+        None => libfreemkv::ScanOptions::default(),
+    };
+    let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::log::device_log(device, &format!("Scan failed: {}", e));
+            update_state(
+                device,
+                RipState {
+                    device: device.to_string(),
+                    status: "error".to_string(),
+                    last_error: format!("{}", e),
+                    ..Default::default()
+                },
+            );
+            return;
+        }
+    };
+
+    // Update format from full scan (UHD vs BD now known)
+    let disc_name = disc
+        .meta_title
+        .as_deref()
+        .unwrap_or(&disc.volume_id)
+        .to_string();
+    let disc_format = match disc.format {
         libfreemkv::DiscFormat::Uhd => "uhd",
         libfreemkv::DiscFormat::BluRay => "bluray",
         libfreemkv::DiscFormat::Dvd => "dvd",
@@ -317,48 +417,53 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     crate::log::device_log(
         device,
-        &format!("Disc: {} ({})", disc_name, disc_format),
+        &format!(
+            "Scanned: {} ({}, {} titles)",
+            disc_name,
+            disc_format,
+            disc.titles.len()
+        ),
     );
 
-    let tmdb = crate::tmdb::lookup(
-        &crate::tmdb::clean_title(&disc_name),
-        &cfg_read.tmdb_api_key,
-    );
-    let tmdb_title = tmdb.as_ref().map(|t| t.title.clone()).unwrap_or_default();
-    let tmdb_year = tmdb.as_ref().map(|t| t.year).unwrap_or(0);
-    let tmdb_poster = tmdb
-        .as_ref()
-        .map(|t| t.poster_url.clone())
-        .unwrap_or_default();
-    let tmdb_overview = tmdb
-        .as_ref()
-        .map(|t| t.overview.clone())
-        .unwrap_or_default();
+    // Extract title info before storing session
+    let duration = disc.titles.first().map(|t| format_duration(t.duration_secs)).unwrap_or_default();
+    let codecs = disc.titles.first().map(|t| format_codecs(t)).unwrap_or_default();
 
-    let display_name = if tmdb_title.is_empty() {
-        disc_name.clone()
-    } else {
-        tmdb_title.clone()
-    };
+    // Store session — drive stays open for rip
+    store_session(
+        device,
+        DriveSession {
+            drive,
+            disc: Some(disc),
+            scanned: true,
+            probed: false,
+            tmdb: tmdb.clone(),
+        },
+    );
 
     update_state(
         device,
         RipState {
             device: device.to_string(),
             status: "idle".to_string(),
+            disc_present: true,
             disc_name: display_name,
             disc_format,
-            tmdb_title,
-            tmdb_year,
-            tmdb_poster,
-            tmdb_overview,
+            tmdb_title: tmdb.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
+            tmdb_year: tmdb.as_ref().map(|t| t.year).unwrap_or(0),
+            tmdb_poster: tmdb.as_ref().map(|t| t.poster_url.clone()).unwrap_or_default(),
+            tmdb_overview: tmdb.as_ref().map(|t| t.overview.clone()).unwrap_or_default(),
+            duration,
+            codecs,
             ..Default::default()
         },
     );
 }
 
-/// Rip a disc from start to finish.
-/// One open, one init, one scan, one stream.
+// ─── Rip ───────────────────────────────────────────────────────────────────
+
+/// Rip a disc. Reuses the existing drive session from scan_disc.
+/// If no session exists, opens fresh (for on_insert=rip).
 pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     reset_stop_flag(device);
 
@@ -367,13 +472,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         Err(_) => return,
     };
 
-    // Preserve TMDB info from identify phase while we do full scan
+    // Preserve UI state
     let prev = STATE.lock().ok().and_then(|s| s.get(device).cloned());
     update_state(
         device,
         RipState {
             device: device.to_string(),
             status: "scanning".to_string(),
+            disc_present: true,
             disc_name: prev.as_ref().map(|p| p.disc_name.clone()).unwrap_or_default(),
             disc_format: prev.as_ref().map(|p| p.disc_format.clone()).unwrap_or_default(),
             tmdb_title: prev.as_ref().map(|p| p.tmdb_title.clone()).unwrap_or_default(),
@@ -384,55 +490,85 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         },
     );
 
-    crate::log::device_log(device, "Scanning titles...");
+    // Take the existing session, or open fresh
+    let mut session = match take_session(device) {
+        Some(s) if s.scanned => {
+            crate::log::device_log(device, "Reusing drive session");
+            s
+        }
+        existing => {
+            // No session or not scanned — open fresh
+            if existing.is_some() {
+                drop_session(device);
+            }
+            crate::log::device_log(device, "Opening drive...");
+            let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
+                Ok(d) => d,
+                Err(e) => {
+                    let msg = format!("Cannot open drive: {}", e);
+                    crate::log::device_log(device, &msg);
+                    update_state(
+                        device,
+                        RipState {
+                            device: device.to_string(),
+                            status: "error".to_string(),
+                            last_error: msg,
+                            ..Default::default()
+                        },
+                    );
+                    return;
+                }
+            };
+            let _ = drive.wait_ready();
+            crate::log::device_log(device, "Initializing...");
+            let _ = drive.init();
 
-    // One open. One init. One scan. One stream.
-    let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
-        Ok(d) => d,
-        Err(e) => {
-            let msg = format!("Cannot open drive: {}", e);
-            crate::log::device_log(device, &msg);
-            update_state(
-                device,
-                RipState {
-                    device: device.to_string(),
-                    status: "error".to_string(),
-                    last_error: msg,
-                    ..Default::default()
-                },
+            let scan_opts = match &cfg_read.keydb_path {
+                Some(p) => libfreemkv::ScanOptions::with_keydb(p),
+                None => libfreemkv::ScanOptions::default(),
+            };
+            crate::log::device_log(device, "Scanning titles...");
+            let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
+                Ok(d) => d,
+                Err(e) => {
+                    let msg = format!("Scan failed: {}", e);
+                    crate::log::device_log(device, &msg);
+                    update_state(
+                        device,
+                        RipState {
+                            device: device.to_string(),
+                            status: "error".to_string(),
+                            last_error: msg,
+                            ..Default::default()
+                        },
+                    );
+                    return;
+                }
+            };
+
+            let disc_name = disc
+                .meta_title
+                .as_deref()
+                .unwrap_or(&disc.volume_id)
+                .to_string();
+
+            let tmdb = crate::tmdb::lookup(
+                &crate::tmdb::clean_title(&disc_name),
+                &cfg_read.tmdb_api_key,
             );
-            return;
+
+            DriveSession {
+                drive,
+                disc: Some(disc),
+                scanned: true,
+                probed: false,
+                tmdb,
+            }
         }
     };
-    let _ = drive.wait_ready();
-    let _ = drive.init();
-    let _ = drive.probe_disc();
-    drive.lock_tray();
 
-    // Scan — disc name, format, titles available after this
-    let scan_opts = match &cfg_read.keydb_path {
-        Some(p) => libfreemkv::ScanOptions::with_keydb(p),
-        None => libfreemkv::ScanOptions::default(),
-    };
-    let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
-        Ok(d) => d,
-        Err(e) => {
-            let msg = format!("Scan failed: {}", e);
-            crate::log::device_log(device, &msg);
-            update_state(
-                device,
-                RipState {
-                    device: device.to_string(),
-                    status: "error".to_string(),
-                    last_error: msg,
-                    ..Default::default()
-                },
-            );
-            return;
-        }
-    };
+    let disc = session.disc.take().unwrap();
 
-    // Disc metadata — from the same scan, no re-open needed
     let disc_name = disc
         .meta_title
         .as_deref()
@@ -447,6 +583,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     .to_string();
     let total_bytes = disc.titles.first().map(|t| t.size_bytes).unwrap_or(0);
 
+    let tmdb = &session.tmdb;
+    let tmdb_title = tmdb.as_ref().map(|t| t.title.clone()).unwrap_or_default();
+    let tmdb_year = tmdb.as_ref().map(|t| t.year).unwrap_or(0);
+    let tmdb_poster = tmdb.as_ref().map(|t| t.poster_url.clone()).unwrap_or_default();
+    let tmdb_overview = tmdb.as_ref().map(|t| t.overview.clone()).unwrap_or_default();
+
+    let display_name = if tmdb_title.is_empty() {
+        disc_name.clone()
+    } else {
+        tmdb_title.clone()
+    };
+
     crate::log::device_log(
         device,
         &format!(
@@ -457,79 +605,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         ),
     );
 
-    // TMDB lookup — disc name available NOW, before streaming starts
-    let tmdb = crate::tmdb::lookup(
-        &crate::tmdb::clean_title(&disc_name),
-        &cfg_read.tmdb_api_key,
-    );
-    let tmdb_title = tmdb.as_ref().map(|t| t.title.clone()).unwrap_or_default();
-    let tmdb_year = tmdb.as_ref().map(|t| t.year).unwrap_or(0);
-    let tmdb_poster = tmdb
-        .as_ref()
-        .map(|t| t.poster_url.clone())
-        .unwrap_or_default();
-    let tmdb_overview = tmdb
-        .as_ref()
-        .map(|t| t.overview.clone())
-        .unwrap_or_default();
-
-    let display_name = if tmdb_title.is_empty() {
-        disc_name.clone()
-    } else {
-        tmdb_title.clone()
-    };
-
-    // Update UI immediately with disc info + TMDB — user sees poster during rip setup
-    update_state(
-        device,
-        RipState {
-            device: device.to_string(),
-            status: "scanning".to_string(),
-            disc_name: display_name.clone(),
-            disc_format: disc_format.clone(),
-            tmdb_title: tmdb_title.clone(),
-            tmdb_year,
-            tmdb_poster: tmdb_poster.clone(),
-            tmdb_overview: tmdb_overview.clone(),
-            ..Default::default()
-        },
-    );
-
-    let output_format = cfg_read.output_format.clone();
-    let ext = match output_format.as_str() {
-        "m2ts" => "m2ts",
-        _ => "mkv",
-    };
-
-    let staging = cfg_read.staging_device_dir(&sanitize_filename(&display_name));
-    let _ = std::fs::create_dir_all(&staging);
-    let filename = format!("{}.{}", sanitize_filename(&display_name), ext);
-    let output_path = format!("{}/{}", staging, filename);
-    let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
-        format!("network://{}", cfg_read.network_target)
-    } else {
-        format!("{}://{}", ext, output_path)
-    };
-
-    crate::log::device_log(device, &format!("Ripping {} to {}", display_name, filename));
-
-    update_state(
-        device,
-        RipState {
-            device: device.to_string(),
-            status: "ripping".to_string(),
-            disc_name: display_name.clone(),
-            disc_format: disc_format.clone(),
-            output_file: filename.clone(),
-            tmdb_title: tmdb_title.clone(),
-            tmdb_year,
-            tmdb_poster: tmdb_poster.clone(),
-            tmdb_overview: tmdb_overview.clone(),
-            ..Default::default()
-        },
-    );
-
-    // Create PES stream — same drive session, no re-open
     if disc.titles.is_empty() {
         crate::log::device_log(device, "No titles found");
         update_state(
@@ -543,6 +618,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         );
         return;
     }
+
+    let duration = format_duration(disc.titles[0].duration_secs);
+    let codecs = format_codecs(&disc.titles[0]);
     let title = disc.titles[0].clone();
     let keys = disc.decrypt_keys();
 
@@ -567,21 +645,56 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         return;
     }
 
+    // Probe for speed — only needed for rip, not scan
+    if !session.probed {
+        crate::log::device_log(device, "Probing disc speed...");
+        let _ = session.drive.probe_disc();
+        session.probed = true;
+    }
+
     let batch = libfreemkv::disc::detect_max_batch_sectors(device_path);
     let format = disc.content_format;
 
-    crate::log::device_log(
+    let output_format = cfg_read.output_format.clone();
+    let ext = match output_format.as_str() {
+        "m2ts" => "m2ts",
+        _ => "mkv",
+    };
+
+    let staging = cfg_read.staging_device_dir(&sanitize_filename(&display_name));
+    let _ = std::fs::create_dir_all(&staging);
+    let filename = format!("{}.{}", sanitize_filename(&display_name), ext);
+    let output_path = format!("{}/{}", staging, filename);
+    let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
+        format!("network://{}", cfg_read.network_target)
+    } else {
+        format!("{}://{}", ext, output_path)
+    };
+
+    crate::log::device_log(device, &format!("Ripping {} to {}", display_name, filename));
+
+    update_state(
         device,
-        &format!(
-            "DiscStream::new batch={} format={:?} extents={} streams={}",
-            batch,
-            format,
-            title.extents.len(),
-            title.streams.len()
-        ),
+        RipState {
+            device: device.to_string(),
+            status: "ripping".to_string(),
+            disc_present: true,
+            disc_name: display_name.clone(),
+            disc_format: disc_format.clone(),
+            output_file: filename.clone(),
+            tmdb_title: tmdb_title.clone(),
+            tmdb_year,
+            tmdb_poster: tmdb_poster.clone(),
+            tmdb_overview: tmdb_overview.clone(),
+            duration: duration.clone(),
+            codecs: codecs.clone(),
+            ..Default::default()
+        },
     );
-    let mut input = libfreemkv::DiscStream::new(Box::new(drive), title, keys, batch, format);
-    crate::log::device_log(device, "Stream created, reading headers...");
+
+    // Create PES stream — same drive session, no re-open
+    let mut input =
+        libfreemkv::DiscStream::new(Box::new(session.drive), title, keys, batch, format);
 
     // Read frames until codec headers are ready
     let mut buffered = Vec::new();
@@ -634,7 +747,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     };
 
     crate::log::device_log(device, &format!("Opening output: {}", dest_url));
-    // Open output
     let raw_output = match libfreemkv::output(&dest_url, &out_title) {
         Ok(s) => s,
         Err(e) => {
@@ -657,11 +769,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let start = std::time::Instant::now();
     let mut last_update = start;
     let mut last_log = start;
+    let mut last_speed_bytes: u64 = 0;
+    let mut last_speed_time = start;
+    let mut smooth_speed: f64 = 0.0;
 
-    crate::log::device_log(
-        device,
-        &format!("Output open, writing {} buffered frames", buffered.len()),
-    );
     // Write buffered frames
     for frame in &buffered {
         if output.write(frame).is_err() {
@@ -669,8 +780,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     }
 
-    crate::log::device_log(device, "Starting frame loop");
-    // Stream remaining frames — same loop as freemkv CLI
+    // Stream remaining frames
+    let mut completed = false;
     loop {
         if stop_requested(device) {
             crate::log::device_log(device, "Stop requested");
@@ -689,43 +800,64 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 last_update = now;
 
                 let bytes_done = output.bytes_written();
-                let elapsed = start.elapsed().as_secs_f64();
                 let pct = if total_bytes > 0 {
                     (bytes_done * 100 / total_bytes).min(100) as u8
                 } else {
                     0
                 };
-                let speed = if elapsed > 0.0 {
-                    bytes_done as f64 / (1024.0 * 1024.0) / elapsed
+                let speed_interval = now.duration_since(last_speed_time).as_secs_f64();
+                let instant_speed = if speed_interval > 0.0 {
+                    (bytes_done - last_speed_bytes) as f64 / (1024.0 * 1024.0) / speed_interval
                 } else {
                     0.0
                 };
+                last_speed_bytes = bytes_done;
+                last_speed_time = now;
+                smooth_speed = if smooth_speed < 0.01 {
+                    instant_speed
+                } else {
+                    0.8 * smooth_speed + 0.2 * instant_speed
+                };
+                let speed = smooth_speed;
                 let eta = if speed > 0.0 && total_bytes > bytes_done {
-                    let remaining = (total_bytes - bytes_done) as f64 / (1024.0 * 1024.0) / speed;
-                    format!(
-                        "{}:{:02}",
-                        (remaining / 60.0) as u32,
-                        (remaining % 60.0) as u32
-                    )
+                    let secs = ((total_bytes - bytes_done) as f64 / (1024.0 * 1024.0) / speed) as u32;
+                    if secs > 359999 {
+                        // > 99 hours — ETA is meaningless
+                        String::new()
+                    } else {
+                        let h = secs / 3600;
+                        let m = (secs % 3600) / 60;
+                        let s = secs % 60;
+                        if h > 0 {
+                            format!("{}:{:02}:{:02}", h, m, s)
+                        } else {
+                            format!("{}:{:02}", m, s)
+                        }
+                    }
                 } else {
                     String::new()
                 };
 
-                // Log every 60 seconds
                 if now.duration_since(last_log).as_secs() >= 60 {
                     last_log = now;
                     let gb = bytes_done as f64 / 1_073_741_824.0;
+                    let speed_str = if speed >= 1.0 {
+                        format!("{:.1} MB/s", speed)
+                    } else {
+                        format!("{:.0} KB/s", speed * 1024.0)
+                    };
+                    let eta_str = if eta.is_empty() { String::new() } else { format!(" ETA {}", eta) };
                     if total_bytes > 0 {
                         let total_gb = total_bytes as f64 / 1_073_741_824.0;
                         crate::log::device_log(
                             device,
                             &format!(
-                                "{:.1} GB / {:.1} GB ({}%) {:.1} MB/s ETA {}",
-                                gb, total_gb, pct, speed, eta
+                                "{:.1} GB / {:.1} GB ({}%) {}{}",
+                                gb, total_gb, pct, speed_str, eta_str
                             ),
                         );
                     } else {
-                        crate::log::device_log(device, &format!("{:.1} GB {:.1} MB/s", gb, speed));
+                        crate::log::device_log(device, &format!("{:.1} GB {}", gb, speed_str));
                     }
                 }
 
@@ -734,6 +866,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     RipState {
                         device: device.to_string(),
                         status: "ripping".to_string(),
+                        disc_present: true,
                         disc_name: display_name.clone(),
                         disc_format: disc_format.clone(),
                         progress_pct: pct,
@@ -745,11 +878,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         tmdb_year,
                         tmdb_poster: tmdb_poster.clone(),
                         tmdb_overview: tmdb_overview.clone(),
+                        duration: duration.clone(),
+                        codecs: codecs.clone(),
                         ..Default::default()
                     },
                 );
             }
-            Ok(None) => break,
+            Ok(None) => { completed = true; break; }
             Err(e) => {
                 crate::log::device_log(device, &format!("Read error: {}", e));
                 break;
@@ -766,6 +901,37 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     } else {
         0.0
     };
+
+    if !completed {
+        crate::log::device_log(
+            device,
+            &format!(
+                "Stopped: {:.1} GB in {:.0}s ({:.0} MB/s)",
+                bytes_done as f64 / 1_073_741_824.0,
+                elapsed,
+                speed
+            ),
+        );
+        update_state(
+            device,
+            RipState {
+                device: device.to_string(),
+                status: "idle".to_string(),
+                disc_present: true,
+                disc_name: display_name.clone(),
+                disc_format: disc_format.clone(),
+                tmdb_title: tmdb_title.clone(),
+                tmdb_year,
+                tmdb_poster: tmdb_poster.clone(),
+                tmdb_overview: tmdb_overview.clone(),
+                duration: duration.clone(),
+                codecs: codecs.clone(),
+                ..Default::default()
+            },
+        );
+        return;
+    }
+
     crate::log::device_log(
         device,
         &format!(
@@ -776,14 +942,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         ),
     );
 
-    // Record history
+    // Record history — only on successful completion
     {
+        let tmdb_ref = &session.tmdb;
         let entry = serde_json::json!({
             "title": display_name,
             "disc_name": disc_name,
             "format": disc_format,
             "year": tmdb_year,
-            "media_type": tmdb.as_ref().map(|t| t.media_type.as_str()).unwrap_or("unknown"),
+            "media_type": tmdb_ref.as_ref().map(|t| t.media_type.as_str()).unwrap_or("unknown"),
             "poster_url": tmdb_poster,
             "overview": tmdb_overview,
             "staging_dir": staging,
@@ -792,12 +959,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         crate::history::record(&cfg_read.history_dir(), &entry);
     }
 
-    // Done
     update_state(
         device,
         RipState {
             device: device.to_string(),
             status: "done".to_string(),
+            disc_present: true,
             disc_name: display_name.clone(),
             disc_format: disc_format.clone(),
             progress_pct: 100,
@@ -806,6 +973,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             tmdb_year,
             tmdb_poster: tmdb_poster.clone(),
             tmdb_overview: tmdb_overview.clone(),
+            duration: duration.clone(),
+            codecs: codecs.clone(),
             ..Default::default()
         },
     );
@@ -819,6 +988,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 }
 
 pub fn eject_drive(device_path: &str) {
+    // Find device name from path
+    let dev = device_path.rsplit('/').next().unwrap_or("");
+    drop_session(dev);
     if let Ok(mut session) = libfreemkv::Drive::open(std::path::Path::new(device_path)) {
         let _ = session.eject();
     }
@@ -830,4 +1002,30 @@ fn sanitize_filename(name: &str) -> String {
         .collect::<String>()
         .trim()
         .replace(' ', "_")
+}
+
+fn format_duration(secs: f64) -> String {
+    let h = (secs / 3600.0) as u32;
+    let m = ((secs % 3600.0) / 60.0) as u32;
+    format!("{}h {:02}m", h, m)
+}
+
+fn format_codecs(title: &libfreemkv::DiscTitle) -> String {
+    let mut parts = Vec::new();
+    for s in &title.streams {
+        match s {
+            libfreemkv::Stream::Video(v) if !v.secondary => {
+                let mut desc = format!("{} {}", v.codec.name(), v.resolution);
+                if v.hdr != libfreemkv::HdrFormat::Sdr {
+                    desc.push_str(&format!(" {}", v.hdr.name()));
+                }
+                parts.push(desc);
+            }
+            libfreemkv::Stream::Audio(a) if !a.secondary => {
+                parts.push(format!("{} {}", a.codec.name(), a.channels));
+            }
+            _ => {}
+        }
+    }
+    parts.join(" · ")
 }

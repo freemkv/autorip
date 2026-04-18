@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::history;
 use crate::ripper;
 use crate::tmdb;
 use std::path::Path;
@@ -119,26 +118,6 @@ fn check_and_move(cfg: &Config) {
         if !dest_ok {
             continue;
         }
-
-        // Record history BEFORE moving (so we have a record even if move fails)
-        let title = tmdb_result
-            .as_ref()
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| rs.disc_name.clone());
-        let year = tmdb_result.as_ref().map(|t| t.year).unwrap_or(0);
-        let dest_paths: Vec<String> = planned_moves.iter().map(|(_, d)| d.clone()).collect();
-        let entry = serde_json::json!({
-            "title": title,
-            "disc_name": rs.disc_name,
-            "format": rs.disc_format,
-            "year": year,
-            "media_type": tmdb_result.as_ref().map(|t| t.media_type.as_str()).unwrap_or("unknown"),
-            "poster_url": tmdb_result.as_ref().map(|t| t.poster_url.as_str()).unwrap_or(""),
-            "overview": tmdb_result.as_ref().map(|t| t.overview.as_str()).unwrap_or(""),
-            "files": dest_paths,
-            "date": crate::util::format_date(),
-        });
-        history::record(&cfg.history_dir(), &entry);
 
         // Move files
         let mut all_moved = true;
