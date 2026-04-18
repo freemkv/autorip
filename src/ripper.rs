@@ -737,6 +737,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     let info = input.info().clone();
     let mut out_title = info.clone();
+    out_title.playlist = display_name.clone();
     out_title.codec_privates = (0..info.streams.len())
         .map(|i| input.codec_private(i))
         .collect();
