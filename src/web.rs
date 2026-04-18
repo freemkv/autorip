@@ -362,21 +362,38 @@ function connectSSE(){
 }
 
 /* ---- History page ---- */
+function fmtElapsed(s){if(!s)return'';s=+s;const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h>0?h+'h '+m+'m':m+'m'}
 function loadHistory(){
   fetch('/api/history').then(r=>r.json()).then(h=>{
     if(!h.length){document.getElementById('hi').innerHTML='<div style="color:var(--text2);font-size:.85rem;padding:20px">No rips yet</div>';return}
-    let t='<table><tr><th></th><th>Title</th><th>Type</th><th>Date</th><th>Duration</th><th></th></tr>';
-    h.forEach(i=>{
-      const poster=i.poster_url?'<img src="'+esc(i.poster_url)+'" style="width:32px;height:48px;border-radius:4px;object-fit:cover" alt="">':'';
-      const fmt=(i.format||'').toUpperCase();
-      const fmtCls=(i.format||'').toLowerCase();
-      const badge=fmt?'<span class="b '+fmtCls+'">'+fmt+'</span>':'';
-      const dt=(i.date||i.timestamp||'').split('T')[0];
-      const dl=i._file?'<a href="/api/history/'+i._file+'" class="btn" style="font-size:.65rem;padding:2px 6px;text-decoration:none">JSON</a>':'';
-      t+='<tr><td>'+poster+'</td><td><strong>'+esc(i.title||i.disc_name||'Unknown')+'</strong></td><td>'+badge+'</td><td>'+esc(dt)+'</td><td>'+esc(i.duration||'')+'</td><td>'+dl+'</td></tr>';
+    let html='';
+    h.forEach((i,idx)=>{
+      const title=i.title||i.disc_name||'Unknown';
+      const fmt=(i.format||'').toLowerCase();
+      const badge=fmt&&fmt!=='unknown'?'<span class="b '+fmt+'">'+fmt.toUpperCase()+'</span>':'';
+      const dt=(i.date||'').split('T')[0];
+      const poster=i.poster_url?'<img src="'+esc(i.poster_url)+'" style="width:48px;height:72px;border-radius:6px;object-fit:cover;flex-shrink:0" alt="">':'<div style="width:48px;height:72px;border-radius:6px;background:var(--chip);flex-shrink:0"></div>';
+      const elapsed=fmtElapsed(i.elapsed_secs);
+      const size=i.size_gb?(+i.size_gb).toFixed(1)+' GB':'';
+      const speed=i.speed_mbs?(+i.speed_mbs).toFixed(0)+' MB/s':'';
+      const stats=[size,elapsed,speed].filter(x=>x).join(' \u00b7 ');
+      const codecs=i.codecs||'';
+      const dur=i.duration||'';
+      const hasLog=!!i.log;
+
+      html+='<div style="display:flex;gap:14px;padding:14px 0;border-bottom:1px solid var(--border);align-items:flex-start">';
+      html+=poster;
+      html+='<div style="flex:1;min-width:0">';
+      html+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><strong style="font-size:.9rem">'+esc(title)+'</strong>'+badge+'</div>';
+      html+='<div style="font-size:.75rem;color:var(--text3);margin-top:3px">'+esc(dt);
+      if(dur)html+=' \u00b7 '+esc(dur);
+      html+='</div>';
+      if(stats)html+='<div style="font-size:.75rem;color:var(--text2);margin-top:2px">'+esc(stats)+'</div>';
+      if(codecs)html+='<div style="font-size:.7rem;color:var(--text3);margin-top:2px">'+esc(codecs)+'</div>';
+      if(hasLog)html+='<details style="margin-top:6px"><summary style="font-size:.7rem;color:var(--text3);cursor:pointer;user-select:none">Log</summary><div class="log" style="margin-top:4px;max-height:200px;font-size:.7rem">'+esc(i.log)+'</div></details>';
+      html+='</div></div>';
     });
-    t+='</table>';
-    document.getElementById('hi').innerHTML=t;
+    document.getElementById('hi').innerHTML=html;
   }).catch(()=>{
     document.getElementById('hi').innerHTML='<div style="color:var(--text2);font-size:.85rem;padding:20px">Could not load history</div>';
   });
