@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.1 (2026-04-18)
+
+### Mover progress bar
+- **Live move progress on System page** — Move Queue shows animated progress bar with percentage, speed (MB/s), and ETA while files are being moved to their destination. Updates every second via SSE.
+
+### Ripper page simplified
+- **Scanning → Ripping → Done** — removed Verified/Moving steps from ripper. Moving is a background system concern, not shown on the ripper page.
+
+### Local time in logs
+- **Browser-local timestamps** — device logs and system logs display times in the user's local timezone instead of UTC.
+
 ## 0.11.0 (2026-04-18)
 
 ### Dual-layer disc fix
