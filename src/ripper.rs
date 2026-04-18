@@ -959,9 +959,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let marker_path = format!("{}/.done", staging);
         let _ = std::fs::write(&marker_path, serde_json::to_string_pretty(&marker).unwrap_or_default());
 
-        // Record history
+        // Record history with rip stats
         let mut entry = marker.clone();
         entry["staging_dir"] = serde_json::json!(staging);
+        entry["size_gb"] = serde_json::json!((bytes_done as f64 / 1_073_741_824.0 * 10.0).round() / 10.0);
+        entry["speed_mbs"] = serde_json::json!((speed * 10.0).round() / 10.0);
+        entry["elapsed_secs"] = serde_json::json!(elapsed.round() as u64);
+        entry["duration"] = serde_json::json!(duration);
+        entry["codecs"] = serde_json::json!(codecs);
+        entry["device"] = serde_json::json!(device);
+        let log_lines = crate::log::get_device_log(device, 500);
+        entry["log"] = serde_json::json!(log_lines.join("\n"));
         crate::history::record(&cfg_read.history_dir(), &entry);
     }
 
