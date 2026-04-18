@@ -306,6 +306,8 @@ fn pipe_disc(
     print_stream_info(out, &info);
 
     let mut title = info.clone();
+    let disc_name = disc.meta_title.as_deref().unwrap_or(&disc.volume_id);
+    title.playlist = disc_name.to_string();
     title.codec_privates = (0..info.streams.len())
         .map(|i| input.codec_private(i))
         .collect();
