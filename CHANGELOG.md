@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.5 (2026-04-18)
+
+### Single drive session
+- **pipe_disc()** — disc rips use one Drive session from open through stream. No double-open, no double-init.
+- **DiscStream::new()** — uses the new constructor directly instead of open_drive()/open_iso() helpers.
+- **README** — added DVD disc info sample output, listed all 7 bundled languages.
+
 ## 0.10.4 (2026-04-16)
 
 ### DVD CSS decryption
