@@ -138,11 +138,6 @@ fn check_and_move(cfg: &Config) {
             let tmdb_for_progress = tmdb_result.clone();
             let on_progress = move |pct: u8, gb: f64, total_gb: f64, speed: f64| {
                 if let Some(ref dev) = dev_for_progress {
-                    let speed_str = if speed >= 1.0 {
-                        format!("{:.0} MB/s", speed)
-                    } else {
-                        format!("{:.0} KB/s", speed * 1024.0)
-                    };
                     ripper::update_state(
                         dev,
                         ripper::RipState {
