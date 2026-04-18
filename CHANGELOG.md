@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.2 (2026-04-18)
+
+### Smoother speed/ETA display
+- **95/5 EMA smoothing** — speed and ETA no longer jump every second. Each 1-second sample contributes only 5% to the displayed value. Sustained changes take ~20 seconds to reflect.
+
+### Fixes
+- **Move queue cleanup** — System page Move Queue now clears automatically when move completes instead of showing stale entries.
+
 ## 0.11.1 (2026-04-18)
 
 ### Mover progress bar
