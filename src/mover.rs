@@ -199,55 +199,75 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
     }
 }
 
-/// Move a file: try rename first (instant on same filesystem), fall back to copy+delete with progress.
+/// Move a file: try rename first, fall back to cp in a child process.
+/// Child process prevents NFS stalls from blocking the main autorip process.
 fn move_file(src: &Path, dest: &Path) -> bool {
     if std::fs::rename(src, dest).is_ok() {
         return true;
     }
-    // Cross-filesystem: copy with progress logging
-    let src_size = match std::fs::metadata(src) {
-        Ok(m) => m.len(),
-        Err(_) => return false,
-    };
-    let mut reader = match std::fs::File::open(src) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let mut writer = match std::fs::File::create(dest) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MB buffer
-    let mut copied: u64 = 0;
-    let start = std::time::Instant::now();
-    let mut last_log = start;
-    loop {
-        let n = match std::io::Read::read(&mut reader, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        if std::io::Write::write_all(&mut writer, &buf[..n]).is_err() {
+    // Cross-filesystem: spawn cp as child process so NFS stalls don't hang autorip
+    let src_str = src.to_string_lossy().to_string();
+    let dest_str = dest.to_string_lossy().to_string();
+    let src_size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+
+    crate::log::syslog(&format!(
+        "Copying {:.1} GB: {} -> {}",
+        src_size as f64 / 1_073_741_824.0,
+        src_str,
+        dest_str
+    ));
+
+    let mut child = match std::process::Command::new("cp")
+        .arg("--")
+        .arg(&src_str)
+        .arg(&dest_str)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            crate::log::syslog(&format!("Failed to spawn cp: {}", e));
             return false;
         }
-        copied += n as u64;
-        let now = std::time::Instant::now();
-        if now.duration_since(last_log).as_secs() >= 10 {
-            last_log = now;
-            let pct = if src_size > 0 { copied * 100 / src_size } else { 0 };
-            let elapsed = start.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.0 { copied as f64 / (1024.0 * 1024.0) / elapsed } else { 0.0 };
-            crate::log::syslog(&format!(
-                "Moving: {:.1} GB / {:.1} GB ({}%) {:.0} MB/s",
-                copied as f64 / 1_073_741_824.0,
-                src_size as f64 / 1_073_741_824.0,
-                pct,
-                speed
-            ));
+    };
+
+    // Monitor progress while cp runs
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    let _ = std::fs::remove_file(src);
+                    return true;
+                } else {
+                    crate::log::syslog(&format!("cp failed with {}", status));
+                    return false;
+                }
+            }
+            Ok(None) => {
+                // Still running — log progress
+                let dest_size = std::fs::metadata(&dest_str).map(|m| m.len()).unwrap_or(0);
+                let pct = if src_size > 0 { dest_size * 100 / src_size } else { 0 };
+                let elapsed = start.elapsed().as_secs_f64();
+                let speed = if elapsed > 0.0 {
+                    dest_size as f64 / (1024.0 * 1024.0) / elapsed
+                } else {
+                    0.0
+                };
+                crate::log::syslog(&format!(
+                    "Moving: {:.1} GB / {:.1} GB ({}%) {:.0} MB/s",
+                    dest_size as f64 / 1_073_741_824.0,
+                    src_size as f64 / 1_073_741_824.0,
+                    pct,
+                    speed
+                ));
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+            Err(e) => {
+                crate::log::syslog(&format!("Failed to wait on cp: {}", e));
+                return false;
+            }
         }
     }
-    let _ = std::fs::remove_file(src);
-    true
 }
 
 fn sanitize_dir_name(name: &str) -> String {
