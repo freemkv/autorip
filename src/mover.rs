@@ -196,17 +196,25 @@ fn check_and_move(cfg: &Config) {
     }
 }
 
-/// Find a device key that matches this staging dir, or the first idle/done device.
+/// Find a device key that matches this staging dir, but only if it's not busy.
+/// Never steal a device that's actively scanning or ripping.
 fn find_device_for_staging(staging_dir: &str) -> Option<String> {
     let state = ripper::STATE.lock().ok()?;
-    // Check if any device has this staging dir as output_file
     for (dev, rs) in state.iter() {
+        if rs.status == "scanning" || rs.status == "ripping" {
+            continue; // don't touch busy devices
+        }
         if rs.output_file == staging_dir || rs.status == "done" {
             return Some(dev.clone());
         }
     }
-    // Fall back to first device
-    state.keys().next().cloned()
+    // Only fall back to idle devices
+    for (dev, rs) in state.iter() {
+        if rs.status == "idle" {
+            return Some(dev.clone());
+        }
+    }
+    None
 }
 
 fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
