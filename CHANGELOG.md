@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.7 (2026-04-19)
+
+### TrueHD audio fix
+- libfreemkv 0.11.7: TrueHD parser rewrite — 12-bit length mask, AC-3 frame skipping, cross-PES buffering. Zero decode errors.
+
 ## 0.11.6 (2026-04-18)
 
 ### TrueHD fix + History revamp
