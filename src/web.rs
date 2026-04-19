@@ -412,29 +412,25 @@ function renderMoves(){
   const el=document.getElementById('moves');
   if(!el)return;
   const data=window._stateData||{};
+  const mv=data._move;
   let html='';
   let hasContent=false;
-  for(const[dev,s]of Object.entries(data)){
-    if(s.status!=='moving')continue;
+  /* Active move from dedicated move state */
+  if(mv&&mv.name){
     hasContent=true;
-    const name=s.tmdb_title||s.disc_name||dev;
-    const pct=s.progress_pct||0;
-    const spdStr=s.speed_mbs>=1?s.speed_mbs.toFixed(1)+' MB/s':s.speed_mbs>0?(s.speed_mbs*1024).toFixed(0)+' KB/s':'';
-    const etaStr=s.eta?s.eta+' remaining':'';
+    const pct=mv.progress_pct||0;
+    const spdStr=mv.speed_mbs>=1?mv.speed_mbs.toFixed(1)+' MB/s':mv.speed_mbs>0?(mv.speed_mbs*1024).toFixed(0)+' KB/s':'';
+    const etaStr=mv.eta?mv.eta+' remaining':'';
     const label=[pct+'%',spdStr,etaStr].filter(x=>x).join(' \u00b7 ');
-    html+='<div style="padding:6px 0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);animation:p 1.5s infinite;flex-shrink:0"></span><span style="font-size:.85rem;font-weight:500">'+esc(name)+'</span></div>';
+    html+='<div style="padding:6px 0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);animation:p 1.5s infinite;flex-shrink:0"></span><span style="font-size:.85rem;font-weight:500">'+esc(mv.name)+'</span></div>';
     html+='<div style="display:flex;align-items:center;gap:8px">';
     if(pct>0)html+='<div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+pct+'%;transition:width 1s"></div></div>';
     html+='<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div></div>';
   }
-  if(!hasContent&&window._moveQueue&&window._moveQueue.length){
-    /* No active move in state — re-fetch queue in case staging was cleaned up */
-    fetch('/api/system').then(r=>r.json()).then(d=>{window._moveQueue=d.move_queue||[];renderMoves()}).catch(()=>{});
-    window._moveQueue=[];
-  }else if(window._moveQueue){
+  /* Pending queue items */
+  if(window._moveQueue){
     window._moveQueue.forEach(m=>{
-      const alreadyShown=Object.values(data).some(s=>s.status==='moving'&&(s.tmdb_title||s.disc_name||'').replace(/ /g,'_').includes(m.replace(/ \(moving\)/,'').replace(/ /g,'_')));
-      if(alreadyShown)return;
+      if(mv&&mv.name&&m.replace(/ \(moving\)/,'').replace(/ /g,'_').includes(mv.name.replace(/ /g,'_')))return;
       hasContent=true;
       html+='<div style="padding:4px 0;font-size:.8rem"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--yellow);margin-right:8px;vertical-align:middle"></span>'+esc(m)+'</div>';
     });
@@ -688,7 +684,12 @@ fn get_state_json() -> String {
         Ok(s) => s,
         Err(_) => return "{}".to_string(),
     };
-    serde_json::to_string(&*state).unwrap_or_else(|_| "{}".to_string())
+    let move_state = crate::mover::MOVE_STATE.lock().ok().and_then(|ms| ms.clone());
+    let mut obj = serde_json::to_value(&*state).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(ms) = move_state {
+        obj["_move"] = serde_json::to_value(&ms).unwrap_or_default();
+    }
+    obj.to_string()
 }
 
 fn handle_history_file(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, fname: &str) {

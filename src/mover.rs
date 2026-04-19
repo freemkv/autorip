@@ -1,8 +1,22 @@
 use crate::config::Config;
-use crate::ripper;
 use crate::tmdb;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Move progress — separate from device/rip state.
+/// Read by the System page's renderMoves() via SSE.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MoveState {
+    pub name: String,
+    pub progress_pct: u8,
+    pub progress_gb: f64,
+    pub total_gb: f64,
+    pub speed_mbs: f64,
+    pub eta: String,
+}
+
+pub static MOVE_STATE: once_cell::sync::Lazy<Mutex<Option<MoveState>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 pub fn run(cfg: &Arc<RwLock<Config>>) {
     loop {
@@ -46,7 +60,7 @@ fn check_and_move(cfg: &Config) {
 
         let disc_name = marker["disc_name"].as_str().unwrap_or("").to_string();
         let display_name = marker["title"].as_str().unwrap_or(&disc_name).to_string();
-        let disc_format = marker["format"].as_str().unwrap_or("").to_string();
+        let _disc_format = marker["format"].as_str().unwrap_or("").to_string();
 
         // Build TMDB result from marker
         let tmdb_result = if !marker["title"].is_null() {
@@ -79,28 +93,7 @@ fn check_and_move(cfg: &Config) {
             continue;
         }
 
-        let staging_dir = dir.to_string_lossy().to_string();
         crate::log::syslog(&format!("Moving: {} ({} files)", display_name, ripped_files.len()));
-
-        // Update UI state to "moving" — find a device or use a synthetic key
-        let device_key = find_device_for_staging(&staging_dir);
-        if let Some(ref dev) = device_key {
-            ripper::update_state(
-                dev,
-                ripper::RipState {
-                    device: dev.clone(),
-                    status: "moving".to_string(),
-                    disc_name: display_name.clone(),
-                    disc_format: disc_format.clone(),
-                    progress_pct: 100,
-                    tmdb_title: tmdb_result.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
-                    tmdb_year: tmdb_result.as_ref().map(|t| t.year).unwrap_or(0),
-                    tmdb_poster: tmdb_result.as_ref().map(|t| t.poster_url.clone()).unwrap_or_default(),
-                    tmdb_overview: tmdb_result.as_ref().map(|t| t.overview.clone()).unwrap_or_default(),
-                    ..Default::default()
-                },
-            );
-        }
 
         // Build destination paths
         let mut planned_moves: Vec<(std::path::PathBuf, String)> = Vec::new();
@@ -132,37 +125,25 @@ fn check_and_move(cfg: &Config) {
         let mut all_moved = true;
         for (src, dest) in &planned_moves {
             crate::log::syslog(&format!("Copying {} to {}", src.display(), dest));
-            let dev_for_progress = device_key.clone();
             let name_for_progress = display_name.clone();
-            let fmt_for_progress = disc_format.clone();
-            let tmdb_for_progress = tmdb_result.clone();
             let on_progress = move |pct: u8, gb: f64, total_gb: f64, speed: f64| {
-                if let Some(ref dev) = dev_for_progress {
-                    ripper::update_state(
-                        dev,
-                        ripper::RipState {
-                            device: dev.clone(),
-                            status: "moving".to_string(),
-                            disc_name: name_for_progress.clone(),
-                            disc_format: fmt_for_progress.clone(),
-                            progress_pct: pct,
-                            progress_gb: gb,
-                            speed_mbs: speed,
-                            eta: if speed > 1.0 && total_gb > gb {
-                                let secs = ((total_gb - gb) * 1024.0 / speed) as u32;
-                                let m = secs / 60;
-                                let s = secs % 60;
-                                format!("{}:{:02}", m, s)
-                            } else {
-                                String::new()
-                            },
-                            tmdb_title: tmdb_for_progress.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
-                            tmdb_year: tmdb_for_progress.as_ref().map(|t| t.year).unwrap_or(0),
-                            tmdb_poster: tmdb_for_progress.as_ref().map(|t| t.poster_url.clone()).unwrap_or_default(),
-                            tmdb_overview: tmdb_for_progress.as_ref().map(|t| t.overview.clone()).unwrap_or_default(),
-                            ..Default::default()
-                        },
-                    );
+                let eta = if speed > 1.0 && total_gb > gb {
+                    let secs = ((total_gb - gb) * 1024.0 / speed) as u32;
+                    let m = secs / 60;
+                    let s = secs % 60;
+                    format!("{}:{:02}", m, s)
+                } else {
+                    String::new()
+                };
+                if let Ok(mut ms) = MOVE_STATE.lock() {
+                    *ms = Some(MoveState {
+                        name: name_for_progress.clone(),
+                        progress_pct: pct,
+                        progress_gb: gb,
+                        total_gb,
+                        speed_mbs: speed,
+                        eta,
+                    });
                 }
             };
             if move_file(src, Path::new(dest), &on_progress) {
@@ -182,40 +163,14 @@ fn check_and_move(cfg: &Config) {
             let dest_path = planned_moves.last().map(|(_, d)| d.as_str()).unwrap_or("");
             crate::webhook::send_move(cfg, &display_name, dest_path);
 
-            if let Some(ref dev) = device_key {
-                ripper::update_state(
-                    dev,
-                    ripper::RipState {
-                        device: dev.clone(),
-                        status: "idle".to_string(),
-                        ..Default::default()
-                    },
-                );
+            // Clear move state
+            if let Ok(mut ms) = MOVE_STATE.lock() {
+                *ms = None;
             }
         }
     }
 }
 
-/// Find a device key that matches this staging dir, but only if it's not busy.
-/// Never steal a device that's actively scanning or ripping.
-fn find_device_for_staging(staging_dir: &str) -> Option<String> {
-    let state = ripper::STATE.lock().ok()?;
-    for (dev, rs) in state.iter() {
-        if rs.status == "scanning" || rs.status == "ripping" {
-            continue; // don't touch busy devices
-        }
-        if rs.output_file == staging_dir || rs.status == "done" {
-            return Some(dev.clone());
-        }
-    }
-    // Only fall back to idle devices
-    for (dev, rs) in state.iter() {
-        if rs.status == "idle" {
-            return Some(dev.clone());
-        }
-    }
-    None
-}
 
 fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
     if let Some(ref result) = tmdb {
