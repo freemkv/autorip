@@ -939,8 +939,9 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         if let Some(v) = patch.get("on_read_error").and_then(|v| v.as_str()) {
             c.on_read_error = v.to_string();
         }
-        if let Some(v) = patch.get("abort_on_error").and_then(|v| v.as_bool()) {
-            c.abort_on_error = v;
+        // Legacy: migrate abort_on_error bool to on_read_error string
+        if let Some(false) = patch.get("abort_on_error").and_then(|v| v.as_bool()) {
+            c.on_read_error = "skip".to_string();
         }
         if let Some(v) = patch.get("output_format").and_then(|v| v.as_str()) {
             c.output_format = v.to_string();
