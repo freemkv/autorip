@@ -351,7 +351,15 @@ function renderCurrent(){
     /* Stats line */
     if(v.status==='running'){
       const spd=v.speed_mbs?v.speed_mbs.toFixed(1)+' MB/s':'';
-      vhtml+='<div style="font-size:.75rem;color:var(--text2)">Verifying... '+v.progress_pct+'% \u00b7 '+spd+' \u00b7 '+(v.sectors_done||0).toLocaleString()+' / '+(v.sectors_total||0).toLocaleString()+' sectors</div>';
+      const done=v.sectors_done||0;
+      const total=v.sectors_total||1;
+      const badMb=((v.bad||0)*2048/1048576).toFixed(1);
+      const badSecs=((v.bad||0)*2048/8250000).toFixed(2);
+      let stats='<span style="color:var(--green)">'+(done-(v.bad||0)-(v.slow||0)).toLocaleString()+' good</span>';
+      if(v.bad)stats+=' \u00b7 <span style="color:var(--red)">'+v.bad+' bad ('+badMb+' MB, ~'+badSecs+'s)</span>';
+      if(v.slow)stats+=' \u00b7 <span style="color:var(--yellow)">'+v.slow+' slow</span>';
+      vhtml+='<div style="font-size:.75rem;color:var(--text2)">Verifying... '+v.progress_pct+'% \u00b7 '+spd+' \u00b7 '+done.toLocaleString()+' / '+total.toLocaleString()+' sectors</div>';
+      vhtml+='<div style="font-size:.75rem;margin-top:2px">'+stats+'</div>';
     }else{
       const total=v.sectors_total||1;
       const pct=(((total-(v.bad||0))/total)*100).toFixed(v.bad>0?4:0);
@@ -538,7 +546,7 @@ function renderSettings(s){
       {key:'main_feature',label:'Main Feature Only',type:'bool',hint:'Rip longest title only'},
       {key:'min_length_secs',label:'Minimum Title Length (seconds)',type:'number',hint:'Shorter titles are skipped (600 = 10 min)'},
       {key:'auto_eject',label:'Auto Eject',type:'bool',hint:'Eject disc after rip completes'},
-      {key:'abort_on_error',label:'Abort on Error',type:'bool',hint:'Stop rip on first disc read error'},
+      {key:'on_read_error',label:'On Read Error',type:'radio',options:[{value:'stop',label:'Stop'},{value:'skip',label:'Skip (zero-fill)'}],hint:'Stop aborts the rip. Skip zero-fills bad sectors and continues — use after Verify confirms damage is minor.'},
       {key:'output_format',label:'Output Format',type:'radio',options:[{value:'mkv',label:'MKV'},{value:'m2ts',label:'M2TS'},{value:'iso',label:'ISO (disc image)'},{value:'network',label:'Network'}],hint:'Format for ripped files'},
       {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. 192.168.1.100:9000)',indent:true,placeholder:'192.168.1.100:9000',showIf:{key:'output_format',value:'network'}},
     ]},
@@ -927,6 +935,9 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         }
         if let Some(v) = patch.get("auto_eject").and_then(|v| v.as_bool()) {
             c.auto_eject = v;
+        }
+        if let Some(v) = patch.get("on_read_error").and_then(|v| v.as_str()) {
+            c.on_read_error = v.to_string();
         }
         if let Some(v) = patch.get("abort_on_error").and_then(|v| v.as_bool()) {
             c.abort_on_error = v;
