@@ -14,7 +14,7 @@ pub struct Config {
     pub on_insert: String,      // "nothing", "identify", "rip"
     pub output_format: String,  // "mkv", "m2ts", "iso"
     pub network_target: String, // e.g. "192.168.1.100:9000" for network output
-    pub abort_on_error: bool,
+    pub on_read_error: String, // "stop", "skip"
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,
     pub keydb_url: String,
@@ -51,7 +51,7 @@ pub fn load() -> Arc<RwLock<Config>> {
         on_insert: env_or("ON_INSERT", "scan"),
         output_format: env_or("OUTPUT_FORMAT", "mkv"),
         network_target: env_or("NETWORK_TARGET", ""),
-        abort_on_error: env_or("ABORT_ON_ERROR", "true") == "true",
+        on_read_error: env_or("ON_READ_ERROR", "stop"),
         tmdb_api_key: env_or("TMDB_API_KEY", ""),
         keydb_path: std::env::var("KEYDB_PATH").ok(),
         keydb_url: env_or("KEYDB_URL", ""),
@@ -102,8 +102,12 @@ fn load_saved(mut cfg: Config) -> Config {
             if let Some(v) = saved.get("network_target").and_then(|v| v.as_str()) {
                 cfg.network_target = v.to_string();
             }
-            if let Some(v) = saved.get("abort_on_error").and_then(|v| v.as_bool()) {
-                cfg.abort_on_error = v;
+            if let Some(v) = saved.get("on_read_error").and_then(|v| v.as_str()) {
+                cfg.on_read_error = v.to_string();
+            }
+            // Migrate old setting
+            if let Some(true) = saved.get("abort_on_error").and_then(|v| v.as_bool()) {
+                cfg.on_read_error = "stop".to_string();
             }
             if let Some(arr) = saved.get("webhook_urls").and_then(|v| v.as_array()) {
                 cfg.webhook_urls = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).filter(|s| !s.is_empty()).collect();

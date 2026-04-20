@@ -695,6 +695,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Create PES stream — same drive session, no re-open
     let mut input =
         libfreemkv::DiscStream::new(Box::new(session.drive), title, keys, batch, format);
+    if cfg_read.on_read_error == "skip" {
+        input.skip_errors = true;
+    }
 
     // Read frames until codec headers are ready
     let mut buffered = Vec::new();
