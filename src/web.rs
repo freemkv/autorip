@@ -178,7 +178,7 @@ const RV={'3840x2160':'4K','1920x1080':'1080p','1280x720':'720p','720x480':'480p
 function ml(v,m){if(!v)return'';for(const[k,l]of m)if(v.includes(k))return l;return''}
 
 /* ---- Step-by-step progress ---- */
-const ACTIVE_STATES=['ripping','scanning','detecting'];
+const ACTIVE_STATES=['ripping','scanning','detecting','verifying'];
 let _lastStatus={};
 let _activeTab=null;
 
@@ -273,7 +273,8 @@ function renderCurrent(){
   if(!s)return;
 
   /* Derived state */
-  const active=ACTIVE_STATES.includes(s.status);
+  const verifying=data._verify&&data._verify.status==='running';
+  const active=ACTIVE_STATES.includes(s.status)||verifying;
   const title=s.tmdb_title||s.disc_name;
   const scanned=!!title;
   const discIn=s.disc_present||scanned||active;
@@ -307,9 +308,9 @@ function renderCurrent(){
   }else if(discIn){
     btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan</button>';
   }
-  if(discIn)btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
+  if(discIn&&!active)btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
 
-  const statusLabel=s.status||'idle';
+  const statusLabel=verifying?'verifying':(s.status||'idle');
   const dot=active?'var(--green)':scanned?'var(--accent)':discIn?'var(--yellow)':'var(--text3)';
   const pulse=active?'animation:p 1.5s infinite;':'';
   upd('actions','<div class="actions"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dot+';vertical-align:middle;margin-right:6px;'+pulse+'"></span><span style="font-size:.8rem;color:var(--text2)">'+dev+' \u00b7 '+statusLabel+'</span><span style="margin-left:auto;display:flex;gap:6px">'+btns+'</span></div>');
