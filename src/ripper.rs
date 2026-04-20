@@ -10,8 +10,25 @@ pub static STOP_FLAGS: once_cell::sync::Lazy<
     Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Drive halt flags — set by request_stop to interrupt Drive::read() recovery.
+static HALT_FLAGS: once_cell::sync::Lazy<
+    Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+pub fn register_halt(device: &str, flag: Arc<AtomicBool>) {
+    if let Ok(mut flags) = HALT_FLAGS.lock() {
+        flags.insert(device.to_string(), flag);
+    }
+}
+
 pub fn request_stop(device: &str) {
     if let Ok(flags) = STOP_FLAGS.lock() {
+        if let Some(flag) = flags.get(device) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+    // Also halt the drive to break out of recovery loops
+    if let Ok(flags) = HALT_FLAGS.lock() {
         if let Some(flag) = flags.get(device) {
             flag.store(true, Ordering::Relaxed);
         }
@@ -693,11 +710,50 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     );
 
     // Create PES stream — same drive session, no re-open
+    let halt = session.drive.halt_flag();
+    register_halt(device, halt.clone());
+    let dev_for_events = device.to_string();
+    session.drive.on_event(move |event| {
+        match event.kind {
+            libfreemkv::event::EventKind::ReadError { sector, .. } => {
+                crate::log::device_log(&dev_for_events, &format!("Read error at sector {}", sector));
+            }
+            libfreemkv::event::EventKind::Retry { attempt } => {
+                crate::log::device_log(&dev_for_events, &format!("Retrying (attempt {})", attempt));
+            }
+            libfreemkv::event::EventKind::SectorRecovered { sector } => {
+                crate::log::device_log(&dev_for_events, &format!("Sector {} recovered", sector));
+            }
+            libfreemkv::event::EventKind::SpeedChange { speed_kbs } => {
+                if speed_kbs == 0 {
+                    crate::log::device_log(&dev_for_events, "Recovery: min speed");
+                } else {
+                    crate::log::device_log(&dev_for_events, "Restoring full speed");
+                }
+            }
+            _ => {}
+        }
+    });
     let mut input =
         libfreemkv::DiscStream::new(Box::new(session.drive), title, keys, batch, format);
     if cfg_read.on_read_error == "skip" {
         input.skip_errors = true;
     }
+    let dev_for_stream_events = device.to_string();
+    input.on_event(move |event| {
+        match event.kind {
+            libfreemkv::event::EventKind::BinarySearch { sector, batch_size } => {
+                crate::log::device_log(&dev_for_stream_events, &format!("Binary search at sector {} (batch {})", sector, batch_size));
+            }
+            libfreemkv::event::EventKind::SectorSkipped { sector } => {
+                crate::log::device_log(&dev_for_stream_events, &format!("Sector {} skipped (zero-filled)", sector));
+            }
+            libfreemkv::event::EventKind::SectorRecovered { sector } => {
+                crate::log::device_log(&dev_for_stream_events, &format!("Sector {} recovered via binary search", sector));
+            }
+            _ => {}
+        }
+    });
 
     // Read frames until codec headers are ready
     let mut buffered = Vec::new();
