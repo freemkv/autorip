@@ -303,6 +303,7 @@ function renderCurrent(){
     btns='<button class="btn btn-stop" onclick="if(confirm(\'Stop?\')){this.disabled=true;fetch(\'/api/stop/'+dev+'\',{method:\'POST\'})}">Stop</button>';
   }else if(scanned){
     btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="fetch(\'/api/rip/'+dev+'\',{method:\'POST\'})">Rip</button>';
+    btns+='<button class="btn" onclick="fetch(\'/api/verify/'+dev+'\',{method:\'POST\'})">Verify</button>';
   }else if(discIn){
     btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan</button>';
   }
@@ -323,6 +324,59 @@ function renderCurrent(){
   /* Error banner */
   const errHtml=s.errors>0?'<div style="background:var(--red);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u26a0 '+s.errors+' error'+(s.errors>1?'s':'')+': '+esc(s.last_error)+'</div>':'';
   upd('err',errHtml);
+
+  /* Verify / Disc Health */
+  const v=data._verify;
+  let vhtml='';
+  if(v&&(v.status==='running'||v.status==='done')){
+    vhtml+='<div class="card" style="margin-top:12px"><h2>Disc Health</h2>';
+    /* Sector map bar */
+    vhtml+='<div style="position:relative;height:12px;background:var(--chip);border-radius:3px;overflow:hidden;margin-bottom:8px">';
+    if(v.status==='running'){
+      const pct=v.progress_pct||0;
+      vhtml+='<div style="position:absolute;left:0;top:0;height:100%;width:'+pct+'%;background:var(--green);transition:width 1s"></div>';
+    }else{
+      /* Full green background for completed */
+      vhtml+='<div style="position:absolute;left:0;top:0;height:100%;width:100%;background:var(--green)"></div>';
+    }
+    /* Overlay bad/slow sectors */
+    if(v.sector_map){
+      v.sector_map.forEach(s=>{
+        const color=s.status==='bad'?'var(--red)':s.status==='recovered'?'var(--yellow)':'var(--yellow)';
+        vhtml+='<div style="position:absolute;left:'+s.offset_pct+'%;top:0;height:100%;width:'+Math.max(s.width_pct,0.3)+'%;background:'+color+'"></div>';
+      });
+    }
+    vhtml+='</div>';
+    /* Stats line */
+    if(v.status==='running'){
+      const spd=v.speed_mbs?v.speed_mbs.toFixed(1)+' MB/s':'';
+      vhtml+='<div style="font-size:.75rem;color:var(--text2)">Verifying... '+v.progress_pct+'% \u00b7 '+spd+' \u00b7 '+(v.sectors_done||0).toLocaleString()+' / '+(v.sectors_total||0).toLocaleString()+' sectors</div>';
+    }else{
+      const total=v.sectors_total||1;
+      const pct=(((total-(v.bad||0))/total)*100).toFixed(v.bad>0?4:0);
+      const elapsed=v.elapsed_secs||0;
+      const m=Math.floor(elapsed/60);
+      const s=Math.floor(elapsed%60);
+      vhtml+='<div style="font-size:.8rem;color:var(--text);margin-bottom:4px"><strong>'+pct+'%</strong> readable in '+m+':'+String(s).padStart(2,'0')+'</div>';
+      vhtml+='<div style="font-size:.75rem;color:var(--text2)">';
+      vhtml+='Good: '+(v.good||0).toLocaleString();
+      if(v.slow)vhtml+=' \u00b7 Slow: '+v.slow.toLocaleString();
+      if(v.recovered)vhtml+=' \u00b7 Recovered: '+v.recovered.toLocaleString();
+      if(v.bad)vhtml+=' \u00b7 <span style="color:var(--red)">Bad: '+v.bad.toLocaleString()+'</span>';
+      vhtml+='</div>';
+      /* Bad ranges */
+      if(v.bad_ranges&&v.bad_ranges.length){
+        v.bad_ranges.filter(r=>r.status==='bad').forEach(r=>{
+          vhtml+='<div style="font-size:.75rem;color:var(--red);margin-top:4px">\u26a0 '+r.count+' bad sectors at '+r.gb_offset.toFixed(1)+' GB';
+          if(r.chapter)vhtml+=' ('+esc(r.chapter)+')';
+          vhtml+='</div>';
+        });
+      }
+      if(!v.bad&&!v.slow)vhtml+='<div style="font-size:.8rem;color:var(--green);margin-top:4px">\u2713 Disc is perfect</div>';
+    }
+    vhtml+='</div>';
+  }
+  upd('err',errHtml+vhtml);
 
   /* Device log */
   loadDeviceLog(dev);
@@ -649,6 +703,12 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         let device = url.trim_start_matches("/api/stop/");
         let device = percent_decode(device);
         handle_stop(request, &device);
+    } else if is_post && url.starts_with("/api/verify/") {
+        let device = url.trim_start_matches("/api/verify/");
+        let device = percent_decode(device);
+        let dev_path = format!("/dev/{}", device);
+        crate::verify::run_verify(&device, &dev_path);
+        json_response(request, 200, r#"{"ok":true}"#);
     } else {
         json_response(request, 404, r#"{"error":"not found"}"#);
     }
@@ -685,9 +745,13 @@ fn get_state_json() -> String {
         Err(_) => return "{}".to_string(),
     };
     let move_state = crate::mover::MOVE_STATE.lock().ok().and_then(|ms| ms.clone());
+    let verify_state = crate::verify::VERIFY_STATE.lock().ok().and_then(|vs| vs.clone());
     let mut obj = serde_json::to_value(&*state).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(ms) = move_state {
         obj["_move"] = serde_json::to_value(&ms).unwrap_or_default();
+    }
+    if let Some(vs) = verify_state {
+        obj["_verify"] = serde_json::to_value(&vs).unwrap_or_default();
     }
     obj.to_string()
 }
