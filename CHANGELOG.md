@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.8 (2026-04-20)
+
+### Disc verify
+- **Verify button** on Ripper page — sector-by-sector disc health check before ripping.
+- **Sector map** — defrag-style visualization: green bar with red/yellow markers for bad/slow sectors.
+- **Stats display** — Good/Slow/Recovered/Bad counts, readable percentage, chapter-mapped bad ranges.
+- **Mover state separation** — mover no longer touches ripper state, fixes UI flickering.
+
 ## 0.11.7 (2026-04-19)
 
 ### TrueHD audio fix
