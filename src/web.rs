@@ -353,13 +353,17 @@ function renderCurrent(){
       const spd=v.speed_mbs?v.speed_mbs.toFixed(1)+' MB/s':'';
       const done=v.sectors_done||0;
       const total=v.sectors_total||1;
+      const pct=(done/total*100).toFixed(1);
+      const goodCount=done-(v.bad||0)-(v.slow||0)-(v.recovered||0);
       const badMb=((v.bad||0)*2048/1048576).toFixed(1);
-      const badSecs=((v.bad||0)*2048/8250000).toFixed(2);
-      let stats='<span style="color:var(--green)">'+(done-(v.bad||0)-(v.slow||0)).toLocaleString()+' good</span>';
-      if(v.bad)stats+=' \u00b7 <span style="color:var(--red)">'+v.bad+' bad ('+badMb+' MB, ~'+badSecs+'s)</span>';
-      if(v.slow)stats+=' \u00b7 <span style="color:var(--yellow)">'+v.slow+' slow</span>';
-      vhtml+='<div style="font-size:.75rem;color:var(--text2)">Verifying... '+v.progress_pct+'% \u00b7 '+spd+' \u00b7 '+done.toLocaleString()+' / '+total.toLocaleString()+' sectors</div>';
-      vhtml+='<div style="font-size:.75rem;margin-top:2px">'+stats+'</div>';
+      const badSecs=((v.bad||0)*2048/8250000).toFixed(1);
+      vhtml+='<div style="font-size:.8rem;color:var(--text)">Verifying... <strong>'+pct+'%</strong> \u00b7 '+spd+'</div>';
+      let stats='<span style="color:var(--green)">'+goodCount.toLocaleString()+' good</span>';
+      if(v.bad)stats+=' \u00b7 <span style="color:var(--red)">'+v.bad.toLocaleString()+' bad ('+badMb+' MB, ~'+badSecs+'s)</span>';
+      if(v.slow)stats+=' \u00b7 <span style="color:var(--yellow)">'+v.slow.toLocaleString()+' slow</span>';
+      if(v.recovered)stats+=' \u00b7 <span style="color:var(--accent)">'+v.recovered.toLocaleString()+' recovered</span>';
+      stats+=' \u00b7 <span style="color:var(--text3)">'+total.toLocaleString()+' total</span>';
+      vhtml+='<div style="font-size:.75rem;margin-top:4px">'+stats+'</div>';
     }else{
       const total=v.sectors_total||1;
       const pct=(((total-(v.bad||0))/total)*100).toFixed(v.bad>0?4:0);

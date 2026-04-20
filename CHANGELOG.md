@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.11 (2026-04-20)
+
+### Binary search recovery + UI fix
+- Binary search error recovery for marginal disc sectors (libfreemkv 0.11.11).
+- Verify UI: clean percentage formatting, simplified layout.
+
 ## 0.11.10 (2026-04-20)
 
 ### Verify rewrite + skip mode
