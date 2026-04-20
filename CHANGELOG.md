@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.9 (2026-04-20)
+
+### Fast verify + UI fixes
+- Verify uses fast reads (5s timeout) — bad sectors detected in seconds not minutes.
+- Fixed: _verify/_move no longer show as device tabs.
+- Fixed: Verify shows Stop button, hides Rip/Eject, status shows verifying.
+
 ## 0.11.8 (2026-04-20)
 
 ### Disc verify
