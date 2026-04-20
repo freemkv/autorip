@@ -225,7 +225,7 @@ function buildSteps(s){
 
 /* ---- Ripper page render ---- */
 function handleState(data){
-  const devs=Object.keys(data);
+  const devs=Object.keys(data).filter(k=>!k.startsWith('_'));
   if(!devs.length){
     upd('dtabs','');
     upd('np','<div class="np"><div class="idle-msg">'+D+'<p>No drives detected</p></div></div>');
