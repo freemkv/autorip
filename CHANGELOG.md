@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.10 (2026-04-20)
+
+### Verify rewrite + skip mode
+- **Verify rewrite** — correct live counters (good/bad/slow), damage assessment (MB + seconds of video), stop flag.
+- **On Read Error** setting — stop (default) or skip (zero-fill). Radio buttons in Settings.
+- **Verify UI** — real-time stats, sector map bar, bad sector warnings with MB/seconds context.
+- **UI fixes** — _verify/_move filtered from device tabs, verify shows Stop button and verifying status, no Eject during active operations.
+
 ## 0.11.9 (2026-04-20)
 
 ### Fast verify + UI fixes
