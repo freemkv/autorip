@@ -323,7 +323,14 @@ function renderCurrent(){
   upd('steps',renderSteps(steps,progressStr,etaStr,speedStr));
 
   /* Error banner */
-  const errHtml=s.errors>0?'<div style="background:var(--red);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u26a0 '+s.errors+' error'+(s.errors>1?'s':'')+': '+esc(s.last_error)+'</div>':'';
+  let errHtml='';
+  if(s.errors>0&&s.last_error){
+    errHtml='<div style="background:var(--red);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u26a0 '+esc(s.last_error)+'</div>';
+  }else if(s.errors>0){
+    const errMb=(s.errors*2048/1048576).toFixed(1);
+    const errSecs=(s.errors*2048/8250000).toFixed(1);
+    errHtml='<div style="background:var(--yellow);color:#000;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+s.errors+' sector'+(s.errors>1?'s':'')+' skipped ('+errMb+' MB, ~'+errSecs+'s of video)</div>';
+  }
   upd('err',errHtml);
 
   /* Verify / Disc Health */
