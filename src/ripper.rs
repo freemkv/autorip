@@ -286,7 +286,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     }
 }
 
-fn is_busy(device: &str) -> bool {
+pub fn is_busy(device: &str) -> bool {
     STATE
         .lock()
         .map(|s| {
@@ -761,6 +761,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     while !input.headers_ready() {
         if stop_requested(device) {
             crate::log::device_log(device, "Stop requested during header read");
+            if let Ok(mut flags) = HALT_FLAGS.lock() {
+                flags.remove(device);
+            }
             return;
         }
         match input.read() {
@@ -954,15 +957,30 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     }
 
     // Write buffered frames
+    let mut buffered_ok = true;
     for frame in &buffered {
-        if output.write(frame).is_err() {
+        if stop_requested(device) {
+            crate::log::device_log(device, "Stop requested during buffered write");
+            buffered_ok = false;
             break;
         }
+        if let Err(e) = output.write(frame) {
+            crate::log::device_log(device, &format!("Write error (buffered): {}", e));
+            buffered_ok = false;
+            break;
+        }
+        // Update watchdog so it doesn't falsely report stall
+        wd_last_frame.store(crate::util::epoch_secs(), Ordering::Relaxed);
+        wd_bytes.store(output.bytes_written(), Ordering::Relaxed);
     }
 
     // Stream remaining frames
     let mut completed = false;
+    if !buffered_ok {
+        crate::log::device_log(device, "Skipping stream loop — buffered write failed");
+    }
     loop {
+        if !buffered_ok { break; }
         if stop_requested(device) {
             crate::log::device_log(device, "Stop requested");
             break;
@@ -1081,7 +1099,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     // Watchdog stops automatically via _wd_guard Drop
 
-    let _ = output.finish();
+    // Clean up halt flag
+    if let Ok(mut flags) = HALT_FLAGS.lock() {
+        flags.remove(device);
+    }
+
+    if let Err(e) = output.finish() {
+        crate::log::device_log(device, &format!("Output finish error: {}", e));
+    }
 
     let bytes_done = output.bytes_written();
     let elapsed = start.elapsed().as_secs_f64();

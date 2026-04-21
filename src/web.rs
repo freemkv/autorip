@@ -727,8 +727,13 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         let device = url.trim_start_matches("/api/verify/");
         let device = percent_decode(device);
         let dev_path = format!("/dev/{}", device);
-        crate::verify::run_verify(&device, &dev_path);
-        json_response(request, 200, r#"{"ok":true}"#);
+        if crate::verify::is_running() {
+            json_response(request, 409, r#"{"error":"verify already running"}"#);
+        } else {
+            let keydb = cfg.read().ok().and_then(|c| c.keydb_path.clone());
+            crate::verify::run_verify(&device, &dev_path, keydb);
+            json_response(request, 200, r#"{"ok":true}"#);
+        }
     } else {
         json_response(request, 404, r#"{"error":"not found"}"#);
     }
@@ -1190,6 +1195,8 @@ fn handle_eject(request: tiny_http::Request, device: &str) {
 fn handle_stop(request: tiny_http::Request, device: &str) {
     // Signal the rip thread to stop
     ripper::request_stop(device);
+    // Also stop verify if running
+    crate::verify::request_stop();
 
     let existed = ripper::STATE
         .lock()
