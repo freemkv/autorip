@@ -65,18 +65,44 @@ pub fn clear() {
     }
 }
 
-pub fn run_verify(device: &str, device_path: &str) {
+pub fn run_verify(device: &str, device_path: &str, keydb_path: Option<String>) {
+    // Check if device is busy (ripping or scanning)
+    if crate::ripper::is_busy(device) {
+        crate::log::device_log(device, "Verify: device is busy");
+        set_state(VerifyState {
+            status: "error".into(),
+            disc_name: "Device busy".into(),
+            ..empty()
+        });
+        return;
+    }
+
     let device = device.to_string();
     let device_path = device_path.to_string();
     STOP_FLAG.store(false, Ordering::Relaxed);
 
     std::thread::spawn(move || {
-        crate::log::device_log(&device, "Verify: opening drive...");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_verify_inner(&device, &device_path, keydb_path.as_deref())
+        }));
+        if result.is_err() {
+            crate::log::device_log(&device, "Verify: thread panicked");
+            set_state(VerifyState {
+                status: "error".into(),
+                disc_name: "Internal error".into(),
+                ..empty()
+            });
+        }
+    });
+}
 
-        let mut drive = match libfreemkv::Drive::open(std::path::Path::new(&device_path)) {
+fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
+        crate::log::device_log(device, "Verify: opening drive...");
+
+        let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
             Ok(d) => d,
             Err(e) => {
-                crate::log::device_log(&device, &format!("Verify failed: {}", e));
+                crate::log::device_log(device, &format!("Verify failed: {}", e));
                 set_state(VerifyState {
                     status: "error".into(),
                     disc_name: format!("{}", e),
@@ -88,12 +114,15 @@ pub fn run_verify(device: &str, device_path: &str) {
         let _ = drive.wait_ready();
         let _ = drive.init();
 
-        crate::log::device_log(&device, "Verify: scanning...");
-        let scan_opts = libfreemkv::ScanOptions::default();
+        crate::log::device_log(device, "Verify: scanning...");
+        let scan_opts = match keydb_path {
+            Some(p) => libfreemkv::ScanOptions::with_keydb(p),
+            None => libfreemkv::ScanOptions::default(),
+        };
         let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
             Ok(d) => d,
             Err(e) => {
-                crate::log::device_log(&device, &format!("Verify scan failed: {}", e));
+                crate::log::device_log(device, &format!("Verify scan failed: {}", e));
                 set_state(VerifyState {
                     status: "error".into(),
                     disc_name: format!("{}", e),
@@ -141,13 +170,27 @@ pub fn run_verify(device: &str, device_path: &str) {
         let start = std::time::Instant::now();
         let title_clone = title.clone();
 
+        let mut cb_good: u64 = 0;
+        let mut cb_slow: u64 = 0;
+        let mut cb_recovered: u64 = 0;
+        let mut cb_bad: u64 = 0;
+        let mut prev_done: u64 = 0;
+
         let result = libfreemkv::verify::verify_title(
             &mut drive,
             title,
             batch,
             Some(Box::new(move |done, total, status| {
-                // The verify_title callback fires once per batch (good) or once per sector (bad zone).
-                // We update state on every call.
+                // Update live counts — batch reads report count sectors at once
+                let delta = done.saturating_sub(prev_done).max(1);
+                prev_done = done;
+                match status {
+                    libfreemkv::verify::SectorStatus::Good => cb_good += delta,
+                    libfreemkv::verify::SectorStatus::Slow => cb_slow += delta,
+                    libfreemkv::verify::SectorStatus::Recovered => cb_recovered += delta,
+                    libfreemkv::verify::SectorStatus::Bad => cb_bad += delta,
+                }
+
                 let elapsed = start.elapsed().as_secs_f64();
                 let speed = if elapsed > 0.0 {
                     done as f64 * 2048.0 / (1024.0 * 1024.0) / elapsed
@@ -162,16 +205,15 @@ pub fn run_verify(device: &str, device_path: &str) {
                         state.sectors_done = done;
                         state.speed_mbs = speed;
                         state.elapsed_secs = elapsed;
-                        // Note: good/bad/slow are set from the final result, not per-callback.
-                        // The callback status tells us what the CURRENT sector was, but
-                        // the cumulative counts come from verify_title's VerifyResult.
-                        // We approximate live counts from done - we'll get exact at the end.
+                        state.good = cb_good;
+                        state.slow = cb_slow;
+                        state.recovered = cb_recovered;
+                        state.bad = cb_bad;
                     }
                 }
 
-                // Check stop flag — we can't break from here but verify_title
-                // will check the return value... actually it doesn't.
-                // TODO: add stop support to verify_title
+                // Return false to stop verification
+                !STOP_FLAG.load(Ordering::Relaxed)
             })),
         );
 
@@ -256,7 +298,6 @@ pub fn run_verify(device: &str, device_path: &str) {
             bad_ranges,
             elapsed_secs: result.elapsed_secs,
         });
-    });
 }
 
 fn set_state(state: VerifyState) {

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.14 (2026-04-21)
+
+### Audit fixes: verify, rip error handling, logging
+- **Fix: verify keydb** — passes keydb_path from config so encrypted discs scan correctly.
+- **Fix: verify stop** — stop button now stops verify (was only stopping rip).
+- **Fix: verify live counts** — good/bad/slow/recovered update in real-time, delta-based for batch reads.
+- **Fix: verify busy/concurrent guard** — checks is_busy() and is_running() before starting.
+- **Fix: verify panic guard** — catch_unwind wraps verify thread, sets error state on panic.
+- **Fix: buffered frame write errors** — logged and stop-checked instead of silently dropped.
+- **Fix: watchdog during buffered writes** — updates timestamp to prevent false stall detection.
+- **Fix: halt flag cleanup** — removed from HALT_FLAGS on completion and early return.
+- **Fix: output.finish() error logging** — MKV finalization errors now logged.
+
 ## 0.11.13 (2026-04-21)
 
 ### Fix: fast reads only in rip path
