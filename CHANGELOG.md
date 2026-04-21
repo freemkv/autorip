@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.13 (2026-04-21)
+
+### Fix: fast reads only in rip path
+- libfreemkv 0.11.13: batch reads use 5s fast timeout. No more 10-min recovery blocking binary search.
+
 ## 0.11.12 (2026-04-21)
 
 ### Halt + events + light recovery
