@@ -1,6 +1,6 @@
 use libfreemkv::pes::Stream as PesStream;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::Config;
@@ -833,6 +833,126 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let mut last_speed_time = start;
     let mut smooth_speed: f64 = 0.0;
 
+    // Watchdog: monitors the rip loop and logs when reads stall.
+    // The rip thread updates last_frame_epoch on every frame. The watchdog
+    // checks every 15s and logs if no frame has arrived in 30+ seconds.
+    let wd_active = Arc::new(AtomicBool::new(true));
+    // Drop guard: stops watchdog on return OR panic (catch_unwind unwinds stack)
+    struct WatchdogGuard(Arc<AtomicBool>);
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+    let _wd_guard = WatchdogGuard(wd_active.clone());
+    let wd_last_frame = Arc::new(AtomicU64::new(crate::util::epoch_secs()));
+    let wd_bytes = Arc::new(AtomicU64::new(0));
+    {
+        let active = wd_active.clone();
+        let last_frame = wd_last_frame.clone();
+        let wbytes = wd_bytes.clone();
+        let wd_device = device.to_string();
+        let wd_display = display_name.clone();
+        let wd_format = disc_format.clone();
+        let wd_tmdb_title = tmdb_title.clone();
+        let wd_tmdb_poster = tmdb_poster.clone();
+        let wd_tmdb_overview = tmdb_overview.clone();
+        let wd_duration = duration.clone();
+        let wd_codecs = codecs.clone();
+        let wd_total = total_bytes;
+        let wd_tmdb_year = tmdb_year;
+        let wd_filename = filename.clone();
+        std::thread::spawn(move || {
+            let mut was_stalled = false;
+            let mut last_log_secs: u64 = 0;
+            while active.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                if !active.load(Ordering::Relaxed) {
+                    break;
+                }
+                let now = crate::util::epoch_secs();
+                let last = last_frame.load(Ordering::Relaxed);
+                let stall_secs = now.saturating_sub(last);
+
+                if stall_secs >= 30 {
+                    // Log on first detection, then every 60s
+                    let should_log = !was_stalled || stall_secs >= last_log_secs + 60;
+                    if should_log {
+                        last_log_secs = stall_secs;
+                        let bytes = wbytes.load(Ordering::Relaxed);
+                        let gb = bytes as f64 / 1_073_741_824.0;
+                        let pct = if wd_total > 0 {
+                            (bytes * 100 / wd_total).min(100) as u8
+                        } else {
+                            0
+                        };
+                        let mins = stall_secs / 60;
+                        let secs = stall_secs % 60;
+                        let stall_str = if mins > 0 {
+                            format!("{}m {:02}s", mins, secs)
+                        } else {
+                            format!("{}s", secs)
+                        };
+                        crate::log::device_log(
+                            &wd_device,
+                            &format!(
+                                "Drive stalled at {:.1} GB ({}%) — waiting for read ({})",
+                                gb, pct, stall_str
+                            ),
+                        );
+                    }
+                    // Update UI state every cycle — keep speed/eta current
+                    let bytes = wbytes.load(Ordering::Relaxed);
+                    let gb = bytes as f64 / 1_073_741_824.0;
+                    let pct = if wd_total > 0 {
+                        (bytes * 100 / wd_total).min(100) as u8
+                    } else {
+                        0
+                    };
+                    let stall_str = {
+                        let m = stall_secs / 60;
+                        let s = stall_secs % 60;
+                        if m > 0 { format!("{}m {:02}s", m, s) } else { format!("{}s", s) }
+                    };
+                    // Preserve error count from existing state
+                    let prev_errors = STATE
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.get(&wd_device).map(|r| r.errors))
+                        .unwrap_or(0);
+                    update_state(
+                        &wd_device,
+                        RipState {
+                            device: wd_device.clone(),
+                            status: "ripping".to_string(),
+                            disc_present: true,
+                            disc_name: wd_display.clone(),
+                            disc_format: wd_format.clone(),
+                            progress_pct: pct,
+                            progress_gb: gb,
+                            speed_mbs: 0.0,
+                            eta: format!("stalled {}", stall_str),
+                            errors: prev_errors,
+                            output_file: wd_filename.clone(),
+                            tmdb_title: wd_tmdb_title.clone(),
+                            tmdb_year: wd_tmdb_year,
+                            tmdb_poster: wd_tmdb_poster.clone(),
+                            tmdb_overview: wd_tmdb_overview.clone(),
+                            duration: wd_duration.clone(),
+                            codecs: wd_codecs.clone(),
+                            ..Default::default()
+                        },
+                    );
+                    was_stalled = true;
+                } else if was_stalled {
+                    crate::log::device_log(&wd_device, "Drive recovered — reads resumed");
+                    was_stalled = false;
+                    last_log_secs = 0;
+                }
+            }
+        });
+    }
+
     // Write buffered frames
     for frame in &buffered {
         if output.write(frame).is_err() {
@@ -849,9 +969,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
         match input.read() {
             Ok(Some(frame)) => {
-                if output.write(&frame).is_err() {
+                if let Err(e) = output.write(&frame) {
+                    crate::log::device_log(device, &format!("Write error: {}", e));
                     break;
                 }
+
+                // Signal watchdog: frame received
+                wd_last_frame.store(crate::util::epoch_secs(), Ordering::Relaxed);
+                wd_bytes.store(output.bytes_written(), Ordering::Relaxed);
 
                 let now = std::time::Instant::now();
                 if now.duration_since(last_update).as_secs_f64() < 1.0 {
@@ -953,6 +1078,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             }
         }
     }
+
+    // Watchdog stops automatically via _wd_guard Drop
 
     let _ = output.finish();
 
