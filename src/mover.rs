@@ -93,7 +93,11 @@ fn check_and_move(cfg: &Config) {
             continue;
         }
 
-        crate::log::syslog(&format!("Moving: {} ({} files)", display_name, ripped_files.len()));
+        crate::log::syslog(&format!(
+            "Moving: {} ({} files)",
+            display_name,
+            ripped_files.len()
+        ));
 
         // Build destination paths
         let mut planned_moves: Vec<(std::path::PathBuf, String)> = Vec::new();
@@ -171,7 +175,6 @@ fn check_and_move(cfg: &Config) {
     }
 }
 
-
 fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
     if let Some(ref result) = tmdb {
         let safe_title = sanitize_dir_name(&result.title);
@@ -239,10 +242,18 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             }
             Ok(None) => {
                 let dest_size = std::fs::metadata(&dest_str).map(|m| m.len()).unwrap_or(0);
-                let pct = if src_size > 0 { (dest_size * 100 / src_size).min(100) as u8 } else { 0 };
+                let pct = if src_size > 0 {
+                    (dest_size * 100 / src_size).min(100) as u8
+                } else {
+                    0
+                };
                 let gb = dest_size as f64 / 1_073_741_824.0;
                 let elapsed = start.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 { dest_size as f64 / (1024.0 * 1024.0) / elapsed } else { 0.0 };
+                let speed = if elapsed > 0.0 {
+                    dest_size as f64 / (1024.0 * 1024.0) / elapsed
+                } else {
+                    0.0
+                };
                 on_progress(pct, gb, total_gb, speed);
                 std::thread::sleep(std::time::Duration::from_secs(3));
             }

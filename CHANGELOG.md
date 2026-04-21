@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.15 (2026-04-21)
+
+### Lint cleanup
+- Fix all `cargo fmt` and `cargo clippy -D warnings` issues.
+- Webhook `send_rich` refactored to use `RipEvent` struct (too-many-arguments).
+- Remove unused `verify::clear()`.
+- Fix unnecessary double-references in verify logging.
+
 ## 0.11.14 (2026-04-21)
 
 ### Audit fixes: verify, rip error handling, logging

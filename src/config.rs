@@ -14,7 +14,7 @@ pub struct Config {
     pub on_insert: String,      // "nothing", "identify", "rip"
     pub output_format: String,  // "mkv", "m2ts", "iso"
     pub network_target: String, // e.g. "192.168.1.100:9000" for network output
-    pub on_read_error: String, // "stop", "skip"
+    pub on_read_error: String,  // "stop", "skip"
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,
     pub keydb_url: String,
@@ -110,7 +110,11 @@ fn load_saved(mut cfg: Config) -> Config {
                 cfg.on_read_error = "stop".to_string();
             }
             if let Some(arr) = saved.get("webhook_urls").and_then(|v| v.as_array()) {
-                cfg.webhook_urls = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).filter(|s| !s.is_empty()).collect();
+                cfg.webhook_urls = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
         }
     }
