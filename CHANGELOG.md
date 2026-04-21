@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.12 (2026-04-21)
+
+### Halt + sector logging + light recovery
+- **Stop actually stops** — halt flag interrupts Drive::read() recovery in <30s.
+- **Sector-level logging** — read errors, retries, binary search, recovered/skipped sectors all logged.
+- **Light recovery** — binary search single sectors: 3x5s (15s max) instead of 10-min full recovery.
+- **On Read Error** — stop/skip setting wired to DiscStream.skip_errors.
+
 ## 0.11.11 (2026-04-20)
 
 ### Binary search recovery + UI fix
