@@ -255,6 +255,7 @@ fn verify_cmd(args: &[String]) {
                 eprint!("\r  {}% · {:.1} MB/s · {} / {}{}", pct, speed, done, total, marker);
                 *lp = std::time::Instant::now();
             }
+            true // continue
         })),
     );
     eprintln!(); // newline after progress

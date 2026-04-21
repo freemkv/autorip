@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.14 (2026-04-21)
+
+### Audit fixes
+- libfreemkv 0.11.14: trailing sector fix, verify stop support, O_CLOEXEC, sense format detection.
+- CLI verify callback updated for new ProgressFn return type.
+
 ## 0.11.13 (2026-04-21)
 
 ### Fix: fast reads only in rip path
