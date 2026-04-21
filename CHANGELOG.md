@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.13 (2026-04-21)
+
+### Fix: fast reads only in rip path
+- All rip reads use 5s fast timeout. Binary search starts immediately on batch failure. Max 15s per bad sector instead of 10 minutes.
+
 ## 0.11.12 (2026-04-21)
 
 ### Halt + sector logging + light recovery
