@@ -921,6 +921,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     }
                 }
 
+                let skip_errors = input.errors as u32;
                 update_state(
                     device,
                     RipState {
@@ -933,6 +934,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         progress_gb: bytes_done as f64 / 1_073_741_824.0,
                         speed_mbs: speed,
                         eta,
+                        errors: skip_errors,
                         output_file: filename.clone(),
                         tmdb_title: tmdb_title.clone(),
                         tmdb_year,
