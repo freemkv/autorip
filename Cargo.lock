@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-autorip"
-version = "0.11.13"
+version = "0.11.14"
 dependencies = [
  "libc",
  "libfreemkv",
@@ -412,7 +412,7 @@ checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
 
 [[package]]
 name = "libfreemkv"
-version = "0.11.13"
+version = "0.11.14"
 dependencies = [
  "aes",
  "base64",

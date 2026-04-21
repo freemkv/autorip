@@ -769,8 +769,14 @@ fn get_state_json() -> String {
         Ok(s) => s,
         Err(_) => return "{}".to_string(),
     };
-    let move_state = crate::mover::MOVE_STATE.lock().ok().and_then(|ms| ms.clone());
-    let verify_state = crate::verify::VERIFY_STATE.lock().ok().and_then(|vs| vs.clone());
+    let move_state = crate::mover::MOVE_STATE
+        .lock()
+        .ok()
+        .and_then(|ms| ms.clone());
+    let verify_state = crate::verify::VERIFY_STATE
+        .lock()
+        .ok()
+        .and_then(|vs| vs.clone());
     let mut obj = serde_json::to_value(&*state).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(ms) = move_state {
         obj["_move"] = serde_json::to_value(&ms).unwrap_or_default();
@@ -972,7 +978,11 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
             c.port = v as u16;
         }
         if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {
-            c.webhook_urls = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).filter(|s| !s.is_empty()).collect();
+            c.webhook_urls = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         config::save(&c);
     }

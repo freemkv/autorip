@@ -10,39 +10,45 @@ pub fn send_move(cfg: &Config, title: &str, dest_path: &str) {
     fire(cfg, &payload);
 }
 
+pub struct RipEvent<'a> {
+    pub event: &'a str,
+    pub title: &'a str,
+    pub year: u16,
+    pub format: &'a str,
+    pub poster_url: &'a str,
+    pub duration: &'a str,
+    pub codecs: &'a str,
+    pub size_gb: f64,
+    pub speed_mbs: f64,
+    pub elapsed_secs: f64,
+    pub output_path: &'a str,
+}
+
 /// Rich payload with full metadata — used for rip_complete.
-pub fn send_rich(
-    cfg: &Config,
-    event: &str,
-    title: &str,
-    year: u16,
-    format: &str,
-    poster_url: &str,
-    duration: &str,
-    codecs: &str,
-    size_gb: f64,
-    speed_mbs: f64,
-    elapsed_secs: f64,
-    output_path: &str,
-) {
+pub fn send_rich(cfg: &Config, ev: &RipEvent) {
     let payload = serde_json::json!({
-        "event": event,
-        "title": title,
-        "year": year,
-        "format": format,
-        "poster_url": poster_url,
-        "duration": duration,
-        "codecs": codecs,
-        "size_gb": (size_gb * 10.0).round() / 10.0,
-        "speed_mbs": (speed_mbs * 10.0).round() / 10.0,
-        "elapsed_secs": elapsed_secs.round() as u64,
-        "output_path": output_path,
+        "event": ev.event,
+        "title": ev.title,
+        "year": ev.year,
+        "format": ev.format,
+        "poster_url": ev.poster_url,
+        "duration": ev.duration,
+        "codecs": ev.codecs,
+        "size_gb": (ev.size_gb * 10.0).round() / 10.0,
+        "speed_mbs": (ev.speed_mbs * 10.0).round() / 10.0,
+        "elapsed_secs": ev.elapsed_secs.round() as u64,
+        "output_path": ev.output_path,
     });
     fire(cfg, &payload);
 }
 
 fn fire(cfg: &Config, payload: &serde_json::Value) {
-    let urls: Vec<String> = cfg.webhook_urls.iter().filter(|u| !u.is_empty()).cloned().collect();
+    let urls: Vec<String> = cfg
+        .webhook_urls
+        .iter()
+        .filter(|u| !u.is_empty())
+        .cloned()
+        .collect();
     if urls.is_empty() {
         return;
     }

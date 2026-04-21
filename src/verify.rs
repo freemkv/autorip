@@ -59,12 +59,6 @@ pub fn is_running() -> bool {
         .unwrap_or(false)
 }
 
-pub fn clear() {
-    if let Ok(mut vs) = VERIFY_STATE.lock() {
-        *vs = None;
-    }
-}
-
 pub fn run_verify(device: &str, device_path: &str, keydb_path: Option<String>) {
     // Check if device is busy (ripping or scanning)
     if crate::ripper::is_busy(device) {
@@ -97,207 +91,218 @@ pub fn run_verify(device: &str, device_path: &str, keydb_path: Option<String>) {
 }
 
 fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
-        crate::log::device_log(device, "Verify: opening drive...");
+    crate::log::device_log(device, "Verify: opening drive...");
 
-        let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
-            Ok(d) => d,
-            Err(e) => {
-                crate::log::device_log(device, &format!("Verify failed: {}", e));
-                set_state(VerifyState {
-                    status: "error".into(),
-                    disc_name: format!("{}", e),
-                    ..empty()
-                });
-                return;
-            }
-        };
-        let _ = drive.wait_ready();
-        let _ = drive.init();
-
-        crate::log::device_log(device, "Verify: scanning...");
-        let scan_opts = match keydb_path {
-            Some(p) => libfreemkv::ScanOptions::with_keydb(p),
-            None => libfreemkv::ScanOptions::default(),
-        };
-        let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
-            Ok(d) => d,
-            Err(e) => {
-                crate::log::device_log(device, &format!("Verify scan failed: {}", e));
-                set_state(VerifyState {
-                    status: "error".into(),
-                    disc_name: format!("{}", e),
-                    ..empty()
-                });
-                return;
-            }
-        };
-        if disc.titles.is_empty() {
+    let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::log::device_log(device, &format!("Verify failed: {}", e));
             set_state(VerifyState {
                 status: "error".into(),
-                disc_name: "No titles".into(),
+                disc_name: format!("{}", e),
                 ..empty()
             });
             return;
         }
+    };
+    let _ = drive.wait_ready();
+    let _ = drive.init();
 
-        let title = &disc.titles[0];
-        let disc_name = disc.meta_title.as_deref().unwrap_or(&disc.volume_id).to_string();
-        let total_sectors: u64 = title.extents.iter().map(|e| e.sector_count as u64).sum();
-        let total_bytes = total_sectors * 2048;
-        let bytes_per_sec = if title.duration_secs > 0.0 {
-            total_bytes as f64 / title.duration_secs
-        } else {
-            8_250_000.0
-        };
-        let batch = libfreemkv::disc::detect_max_batch_sectors(&device_path);
+    crate::log::device_log(device, "Verify: scanning...");
+    let scan_opts = match keydb_path {
+        Some(p) => libfreemkv::ScanOptions::with_keydb(p),
+        None => libfreemkv::ScanOptions::default(),
+    };
+    let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::log::device_log(device, &format!("Verify scan failed: {}", e));
+            set_state(VerifyState {
+                status: "error".into(),
+                disc_name: format!("{}", e),
+                ..empty()
+            });
+            return;
+        }
+    };
+    if disc.titles.is_empty() {
+        set_state(VerifyState {
+            status: "error".into(),
+            disc_name: "No titles".into(),
+            ..empty()
+        });
+        return;
+    }
 
-        let _ = drive.probe_disc();
+    let title = &disc.titles[0];
+    let disc_name = disc
+        .meta_title
+        .as_deref()
+        .unwrap_or(&disc.volume_id)
+        .to_string();
+    let total_sectors: u64 = title.extents.iter().map(|e| e.sector_count as u64).sum();
+    let total_bytes = total_sectors * 2048;
+    let bytes_per_sec = if title.duration_secs > 0.0 {
+        total_bytes as f64 / title.duration_secs
+    } else {
+        8_250_000.0
+    };
+    let batch = libfreemkv::disc::detect_max_batch_sectors(device_path);
 
-        crate::log::device_log(&device, &format!(
+    let _ = drive.probe_disc();
+
+    crate::log::device_log(
+        device,
+        &format!(
             "Verify: {} ({:.1} GB, {} sectors)",
             disc_name,
             total_bytes as f64 / 1_073_741_824.0,
             total_sectors
-        ));
+        ),
+    );
 
-        set_state(VerifyState {
-            status: "running".into(),
-            disc_name: disc_name.clone(),
-            sectors_total: total_sectors,
-            ..empty()
+    set_state(VerifyState {
+        status: "running".into(),
+        disc_name: disc_name.clone(),
+        sectors_total: total_sectors,
+        ..empty()
+    });
+
+    let start = std::time::Instant::now();
+    let title_clone = title.clone();
+
+    let mut cb_good: u64 = 0;
+    let mut cb_slow: u64 = 0;
+    let mut cb_recovered: u64 = 0;
+    let mut cb_bad: u64 = 0;
+    let mut prev_done: u64 = 0;
+
+    let result = libfreemkv::verify::verify_title(
+        &mut drive,
+        title,
+        batch,
+        Some(Box::new(move |done, total, status| {
+            // Update live counts — batch reads report count sectors at once
+            let delta = done.saturating_sub(prev_done).max(1);
+            prev_done = done;
+            match status {
+                libfreemkv::verify::SectorStatus::Good => cb_good += delta,
+                libfreemkv::verify::SectorStatus::Slow => cb_slow += delta,
+                libfreemkv::verify::SectorStatus::Recovered => cb_recovered += delta,
+                libfreemkv::verify::SectorStatus::Bad => cb_bad += delta,
+            }
+
+            let elapsed = start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                done as f64 * 2048.0 / (1024.0 * 1024.0) / elapsed
+            } else {
+                0.0
+            };
+            let pct = if total > 0 {
+                done as f64 * 100.0 / total as f64
+            } else {
+                0.0
+            };
+
+            if let Ok(mut vs) = crate::verify::VERIFY_STATE.lock() {
+                if let Some(ref mut state) = *vs {
+                    state.progress_pct = pct;
+                    state.sectors_done = done;
+                    state.speed_mbs = speed;
+                    state.elapsed_secs = elapsed;
+                    state.good = cb_good;
+                    state.slow = cb_slow;
+                    state.recovered = cb_recovered;
+                    state.bad = cb_bad;
+                }
+            }
+
+            // Return false to stop verification
+            !STOP_FLAG.load(Ordering::Relaxed)
+        })),
+    );
+
+    let was_stopped = STOP_FLAG.load(Ordering::Relaxed);
+
+    // Build sector map
+    let mut sector_map = Vec::new();
+    let mut bad_ranges = Vec::new();
+
+    for range in &result.ranges {
+        let offset_pct = range.byte_offset as f64 / (total_sectors as f64 * 2048.0) * 100.0;
+        let width_pct = (range.count as f64 / total_sectors as f64 * 100.0).max(0.3);
+        let status_str = match range.status {
+            libfreemkv::verify::SectorStatus::Slow => "slow",
+            libfreemkv::verify::SectorStatus::Recovered => "recovered",
+            libfreemkv::verify::SectorStatus::Bad => "bad",
+            _ => continue,
+        };
+        sector_map.push(SectorMapEntry {
+            offset_pct,
+            width_pct,
+            status: status_str.into(),
         });
 
-        let start = std::time::Instant::now();
-        let title_clone = title.clone();
+        let gb = range.byte_offset as f64 / 1_073_741_824.0;
+        let ch_str = libfreemkv::verify::VerifyResult::chapter_at_offset(
+            &title_clone.chapters,
+            range.byte_offset,
+            title_clone.duration_secs,
+            title_clone.size_bytes,
+        )
+        .map(|(ch, secs)| {
+            let h = secs as u32 / 3600;
+            let m = (secs as u32 % 3600) / 60;
+            let s = secs as u32 % 60;
+            if h > 0 {
+                format!("Chapter {}, {}:{:02}:{:02}", ch, h, m, s)
+            } else {
+                format!("Chapter {}, {:02}:{:02}", ch, m, s)
+            }
+        })
+        .unwrap_or_default();
 
-        let mut cb_good: u64 = 0;
-        let mut cb_slow: u64 = 0;
-        let mut cb_recovered: u64 = 0;
-        let mut cb_bad: u64 = 0;
-        let mut prev_done: u64 = 0;
+        bad_ranges.push(BadRange {
+            start_sector: range.start_lba as u64,
+            count: range.count,
+            gb_offset: gb,
+            chapter: ch_str,
+            status: status_str.into(),
+        });
+    }
 
-        let result = libfreemkv::verify::verify_title(
-            &mut drive,
-            title,
-            batch,
-            Some(Box::new(move |done, total, status| {
-                // Update live counts — batch reads report count sectors at once
-                let delta = done.saturating_sub(prev_done).max(1);
-                prev_done = done;
-                match status {
-                    libfreemkv::verify::SectorStatus::Good => cb_good += delta,
-                    libfreemkv::verify::SectorStatus::Slow => cb_slow += delta,
-                    libfreemkv::verify::SectorStatus::Recovered => cb_recovered += delta,
-                    libfreemkv::verify::SectorStatus::Bad => cb_bad += delta,
-                }
+    let bad_bytes = result.bad * 2048;
+    let bad_mb = bad_bytes as f64 / 1_048_576.0;
+    let bad_secs = bad_bytes as f64 / bytes_per_sec;
 
-                let elapsed = start.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    done as f64 * 2048.0 / (1024.0 * 1024.0) / elapsed
-                } else {
-                    0.0
-                };
-                let pct = if total > 0 { done as f64 * 100.0 / total as f64 } else { 0.0 };
+    let status = if was_stopped { "stopped" } else { "done" };
 
-                if let Ok(mut vs) = crate::verify::VERIFY_STATE.lock() {
-                    if let Some(ref mut state) = *vs {
-                        state.progress_pct = pct;
-                        state.sectors_done = done;
-                        state.speed_mbs = speed;
-                        state.elapsed_secs = elapsed;
-                        state.good = cb_good;
-                        state.slow = cb_slow;
-                        state.recovered = cb_recovered;
-                        state.bad = cb_bad;
-                    }
-                }
-
-                // Return false to stop verification
-                !STOP_FLAG.load(Ordering::Relaxed)
-            })),
-        );
-
-        let was_stopped = STOP_FLAG.load(Ordering::Relaxed);
-
-        // Build sector map
-        let mut sector_map = Vec::new();
-        let mut bad_ranges = Vec::new();
-
-        for range in &result.ranges {
-            let offset_pct = range.byte_offset as f64 / (total_sectors as f64 * 2048.0) * 100.0;
-            let width_pct = (range.count as f64 / total_sectors as f64 * 100.0).max(0.3);
-            let status_str = match range.status {
-                libfreemkv::verify::SectorStatus::Slow => "slow",
-                libfreemkv::verify::SectorStatus::Recovered => "recovered",
-                libfreemkv::verify::SectorStatus::Bad => "bad",
-                _ => continue,
-            };
-            sector_map.push(SectorMapEntry {
-                offset_pct,
-                width_pct,
-                status: status_str.into(),
-            });
-
-            let gb = range.byte_offset as f64 / 1_073_741_824.0;
-            let ch_str = libfreemkv::verify::VerifyResult::chapter_at_offset(
-                &title_clone.chapters,
-                range.byte_offset,
-                title_clone.duration_secs,
-                title_clone.size_bytes,
-            )
-            .map(|(ch, secs)| {
-                let h = secs as u32 / 3600;
-                let m = (secs as u32 % 3600) / 60;
-                let s = secs as u32 % 60;
-                if h > 0 {
-                    format!("Chapter {}, {}:{:02}:{:02}", ch, h, m, s)
-                } else {
-                    format!("Chapter {}, {:02}:{:02}", ch, m, s)
-                }
-            })
-            .unwrap_or_default();
-
-            bad_ranges.push(BadRange {
-                start_sector: range.start_lba as u64,
-                count: range.count,
-                gb_offset: gb,
-                chapter: ch_str,
-                status: status_str.into(),
-            });
-        }
-
-        let bad_bytes = result.bad * 2048;
-        let bad_mb = bad_bytes as f64 / 1_048_576.0;
-        let bad_secs = bad_bytes as f64 / bytes_per_sec;
-
-        let status = if was_stopped { "stopped" } else { "done" };
-
-        crate::log::device_log(&device, &format!(
+    crate::log::device_log(device, &format!(
             "Verify {}: {:.4}% readable — {} good, {} bad ({:.1} MB, {:.1}s), {} slow, {} recovered",
             status, result.readable_pct(), result.good, result.bad, bad_mb, bad_secs, result.slow, result.recovered,
         ));
 
-        set_state(VerifyState {
-            status: status.into(),
-            disc_name,
-            progress_pct: if was_stopped {
-                result.total_sectors as f64 * 100.0 / total_sectors.max(1) as f64
-            } else {
-                100.0
-            },
-            sectors_done: result.total_sectors,
-            sectors_total: total_sectors,
-            speed_mbs: 0.0,
-            good: result.good,
-            slow: result.slow,
-            recovered: result.recovered,
-            bad: result.bad,
-            bad_mb,
-            bad_secs,
-            sector_map,
-            bad_ranges,
-            elapsed_secs: result.elapsed_secs,
-        });
+    set_state(VerifyState {
+        status: status.into(),
+        disc_name,
+        progress_pct: if was_stopped {
+            result.total_sectors as f64 * 100.0 / total_sectors.max(1) as f64
+        } else {
+            100.0
+        },
+        sectors_done: result.total_sectors,
+        sectors_total: total_sectors,
+        speed_mbs: 0.0,
+        good: result.good,
+        slow: result.slow,
+        recovered: result.recovered,
+        bad: result.bad,
+        bad_mb,
+        bad_secs,
+        sector_map,
+        bad_ranges,
+        elapsed_secs: result.elapsed_secs,
+    });
 }
 
 fn set_state(state: VerifyState) {
