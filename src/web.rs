@@ -101,6 +101,7 @@ tr:hover { background:var(--chip); }
   <div id="actions"></div>
   <div id="steps" style="margin-bottom:16px"></div>
   <div id="err"></div>
+  <div id="bad-ranges"></div>
   <details style="margin-top:16px"><summary style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;cursor:pointer;user-select:none">Log</summary>
   <div id="log" class="log" style="flex:1;max-height:none;margin-top:8px"></div></details>
 </div>
@@ -182,7 +183,25 @@ const ACTIVE_STATES=['ripping','scanning','detecting','verifying'];
 let _lastStatus={};
 let _activeTab=null;
 
-function renderSteps(steps,progress,eta,speed){
+function renderBar(s,p){
+  /* Progress bar with bad-range overlay. Green fill = bytes_good %, red ticks
+     for each bad range at its LBA position. Ticks use min-width 0.3% so
+     single-sector bad regions are still visible on a 72GB UHD. */
+  let html='<div style="flex:1;background:var(--chip);border-radius:3px;height:6px;overflow:hidden;position:relative">';
+  html+='<div style="background:var(--green);height:100%;width:'+p+'%;transition:width 1s"></div>';
+  const total=s&&s.bytes_total_disc||0;
+  const ranges=s&&s.bad_ranges||[];
+  if(total>0&&ranges.length){
+    ranges.forEach(r=>{
+      const offPct=(r.lba*2048)/total*100;
+      const wPct=Math.max((r.count*2048)/total*100,0.3);
+      html+='<div style="position:absolute;left:'+offPct+'%;top:0;width:'+wPct+'%;height:100%;background:var(--red);opacity:0.9"></div>';
+    });
+  }
+  html+='</div>';
+  return html;
+}
+function renderSteps(steps,progress,eta,speed,s){
   if(!steps||!steps.length)return'';
   const icons={done:'\u2713',active:'\u25cf',pending:'\u25cb'};
   const colors={done:'var(--green)',active:'var(--accent)',pending:'var(--text3)'};
@@ -193,11 +212,38 @@ function renderSteps(steps,progress,eta,speed){
       const spdStr=speed?' \u00b7 '+speed:'';
       const etaStr=eta?' \u00b7 '+eta+' remaining':'';
       const label=progress?progress+spdStr+etaStr:speed+(etaStr||'');
-      detail='<div style="display:flex;align-items:center;gap:8px;margin-top:4px">'+(p>0?'<div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+p+'%;transition:width 1s"></div></div>':'')+'<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div>';
+      detail='<div style="display:flex;align-items:center;gap:8px;margin-top:4px">'+(p>0?renderBar(s,p):'')+'<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div>';
     }else if(detail){detail=' \u2014 '+detail}
     const anim=st.status==='active'?';animation:p 1.5s infinite':'';
     return '<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:.8rem"><span style="color:'+colors[st.status]+';font-size:.7rem;width:14px;text-align:center'+anim+'">'+icons[st.status]+'</span><span style="color:'+(st.status==='pending'?'var(--text3)':'var(--text)')+'">'+st.name+detail+'</span></div>';
   }).join('');
+}
+function fmtMs(ms){
+  if(ms==null||!isFinite(ms))return'';
+  if(ms<1)return'<1 ms';
+  if(ms<1000)return ms.toFixed(0)+' ms';
+  return(ms/1000).toFixed(2)+' s';
+}
+function fmtChapterTime(secs){
+  if(secs==null||!isFinite(secs))return'';
+  const h=Math.floor(secs/3600),m=Math.floor((secs%3600)/60),s=Math.floor(secs%60);
+  return h>0?h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0'):m+':'+String(s).padStart(2,'0');
+}
+function renderBadRanges(s){
+  const ranges=s.bad_ranges||[];
+  if(!ranges.length)return'';
+  const n=s.num_bad_ranges||ranges.length;
+  const totMs=s.total_lost_ms||0;
+  const maxMs=s.largest_gap_ms||0;
+  const truncated=s.bad_ranges_truncated||0;
+  const summary=n+' bad range'+(n!==1?'s':'')+' \u00b7 '+fmtMs(totMs)+' total \u00b7 largest '+fmtMs(maxMs);
+  let rows='';
+  ranges.forEach(r=>{
+    const loc=r.chapter?'ch '+r.chapter+(r.time_offset_secs!=null?' @ '+fmtChapterTime(r.time_offset_secs):''):'\u2014';
+    rows+='<tr><td style="font-family:monospace;font-size:.75rem">'+r.lba.toLocaleString()+'</td><td style="font-size:.75rem">'+r.count+'</td><td style="font-size:.75rem">'+fmtMs(r.duration_ms)+'</td><td style="font-size:.75rem;color:var(--text3)">'+loc+'</td></tr>';
+  });
+  if(truncated>0)rows+='<tr><td colspan="4" style="font-size:.75rem;color:var(--text3);padding-top:6px">\u2026 +'+truncated+' smaller</td></tr>';
+  return '<div class="card"><details><summary style="cursor:pointer;font-size:.85rem"><strong>'+summary+'</strong></summary><table style="width:100%;margin-top:8px;border-collapse:collapse"><thead><tr style="color:var(--text3);font-size:.7rem;text-align:left;text-transform:uppercase"><th>LBA</th><th>Sectors</th><th>Duration</th><th>Location</th></tr></thead><tbody>'+rows+'</tbody></table></details></div>';
 }
 
 /* ---- Build steps from state ---- */
@@ -229,7 +275,7 @@ function handleState(data){
   if(!devs.length){
     upd('dtabs','');
     upd('np','<div class="np"><div class="idle-msg">'+D+'<p>No drives detected</p></div></div>');
-    upd('actions','');upd('steps','');upd('err','');
+    upd('actions','');upd('steps','');upd('err','');upd('bad-ranges','');
     return;
   }
   const multi=devs.length>1;
@@ -328,7 +374,7 @@ function renderCurrent(){
   const progressStr=s.progress_pct>0?s.progress_pct+'%':(s.progress_gb>0?s.progress_gb.toFixed(1)+' GB':'');
   const speedStr=s.speed_mbs>=1?s.speed_mbs.toFixed(1)+' MB/s':s.speed_mbs>0?(s.speed_mbs*1024).toFixed(0)+' KB/s':'0 KB/s';
   const etaStr=s.eta||'';
-  upd('steps',renderSteps(steps,progressStr,etaStr,speedStr));
+  upd('steps',renderSteps(steps,progressStr,etaStr,speedStr,s));
 
   /* Error + recovery banner */
   let errHtml='';
@@ -362,6 +408,7 @@ function renderCurrent(){
     errHtml+='<div style="background:var(--blue);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+phase+' pass '+s.pass+'/'+s.total_passes+' \u00b7 '+goodGb+' / '+totalGb+' GB good \u00b7 '+badMb+' MB bad</div>';
   }
   upd('err',errHtml);
+  upd('bad-ranges',renderBadRanges(s));
 
   /* Verify / Disc Health */
   const v=data._verify;
@@ -590,6 +637,10 @@ function renderSettings(s){
       {key:'on_read_error',label:'On Read Error',type:'radio',options:[{value:'stop',label:'Stop'},{value:'skip',label:'Skip (zero-fill)'}],hint:'Stop aborts the rip. Skip zero-fills bad sectors and continues — use after Verify confirms damage is minor.'},
       {key:'output_format',label:'Output Format',type:'radio',options:[{value:'mkv',label:'MKV'},{value:'m2ts',label:'M2TS'},{value:'iso',label:'ISO (disc image)'},{value:'network',label:'Network'}],hint:'Format for ripped files'},
       {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. 192.168.1.100:9000)',indent:true,placeholder:'192.168.1.100:9000',showIf:{key:'output_format',value:'network'}},
+    ]},
+    {title:'Recovery',fields:[
+      {key:'max_retries',label:'Retry Passes',type:'number',hint:'0 = single pass direct disc→MKV (fastest). 1..=10 = disc→ISO pass 1 + N retry passes on bad ranges, then mux. Use 1 by default; raise for physically damaged discs. Retries use full drive recovery — slow per sector but only on ranges that already failed.'},
+      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Preserve the disc→ISO dump + mapfile in staging after MKV is produced. Useful for forensics or re-muxing later; costs ~disc-size of disk per rip.'},
     ]},
     {title:'Output',fields:[
       {key:'output_dir',label:'Output Directory',type:'text',hint:'Where all ripped files go by default'},
@@ -1006,6 +1057,12 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         }
         if let Some(v) = patch.get("port").and_then(|v| v.as_u64()) {
             c.port = v as u16;
+        }
+        if let Some(v) = patch.get("max_retries").and_then(|v| v.as_u64()) {
+            c.max_retries = v.min(10) as u8;
+        }
+        if let Some(v) = patch.get("keep_iso").and_then(|v| v.as_bool()) {
+            c.keep_iso = v;
         }
         if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {
             c.webhook_urls = arr

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.22 (2026-04-24)
+
+### Multi-pass UI completed
+
+Follow-up to 0.11.21 — every item from the original multi-pass design is now shipped. No more "come back later" TODOs on the UI side.
+
+- **Live mapfile stats during passes.** `Disc::copy` and `Disc::patch` now receive a progress callback that re-reads the sidecar mapfile every ~1.5 s and pushes full pass state (bytes_good, bytes_bad, bad_ranges, total_lost_ms, largest_gap_ms) into `RipState`. Pass progress is no longer frozen between pass transitions.
+- **`BadRange` data model.** New serialized struct: `lba`, `count`, `duration_ms`, `chapter`, `time_offset_secs`. Chapter + timestamp come from walking the title's extents and falling through to `VerifyResult::chapter_at_offset` — unreadable regions outside the main feature get `chapter: null`.
+- **Progress bar overlay.** Green fill for `bytes_good / bytes_total_disc`, red ticks at each bad range's LBA position (min 0.3% width so single-sector regions are still visible on a 72 GB UHD).
+- **Collapsible bad-range list.** Below the progress bar: `N bad ranges · M ms total · largest L ms` summary; expands to a table of LBA / sector count / ms duration / chapter+timestamp. Capped at 50 entries with a "+X smaller" footer.
+- **Recovery settings section.** UI controls for `max_retries` (0-10) and `keep_iso` (bool). Persist to `settings.json`; override env vars. No more env-only config.
+- **History record captures multi-pass stats.** `num_bad_ranges` and `largest_gap_ms` now written alongside `errors` and `lost_video_secs`. Both derived from the mapfile in multi-pass mode; falls through to the DiscStream counter for direct rips.
+- **Time formatter** — `fmtMs` adapts: `<1 ms` / `NN ms` / `N.NN s` used consistently in the error banner and bad-range list.
+
+### Version sync
+0.11.22 ecosystem release (libfreemkv + freemkv + bdemu + autorip all on 0.11.22).
+
 ## 0.11.21 (2026-04-24)
 
 ### Multi-pass rip — disc → ISO → patch → ISO → MKV
