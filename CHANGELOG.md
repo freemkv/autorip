@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.13.1 (2026-04-24)
+
+### Self-recover from wedged USB drives + fix `/api/debug` file path
+
+Two fixes uncovered the moment v0.13.0's structured logging went live on
+the BU40N test rig.
+
+- **SCSI reset retry on wedge signature.** Drive::open returning the
+  signature `E4000` (SCSI error) with INQUIRY status `0xff` (kernel
+  "no response from device") is the reliable signature of a wedged USB
+  drive — what an unplug-replug fixes physically. The poll loop now
+  attempts a single `libfreemkv::scsi::reset()` + reopen on that exact
+  signature before falling through to the throttled-warn path. Logs
+  `wedged-drive signature — attempting scsi::reset() + reopen` at info,
+  then either `drive recovered after scsi::reset()` (success) or
+  `reopen still failing after scsi::reset()` (still bad). Lets the
+  daemon self-heal from an entire class of post-upgrade wedges without
+  operator intervention.
+- **`/api/debug` JSONL path fix.** v0.13.0's `observe.rs` initialized
+  the JSONL stream with `tracing_appender::rolling::daily`, which
+  writes to `autorip.jsonl.YYYY-MM-DD`. The `/api/debug` endpoint
+  expected `autorip.jsonl` (no suffix) — first call returned empty
+  because the file didn't exist by that name. Switched the JSONL sink
+  to `rolling::never` (fixed path `autorip.jsonl`). The human-readable
+  `autorip.log` keeps daily rolling — that's an operator-tail file,
+  not an API-served one. JSONL grows unbounded; an external log
+  rotator (or a future autorip self-rotation pass) handles long-term.
+
+### Consume libfreemkv 0.13.0
+- `ScanOptions::with_keydb` removed; three call sites in `ripper.rs`
+  and `verify.rs` migrated to struct literal.
+- `AudioStream` gains `purpose: LabelPurpose` field. `format_codecs`
+  in `ripper.rs` renders purpose + secondary inline (English literals
+  per the autorip i18n stance — moves to `strings::get` once autorip
+  adopts the same locale infrastructure as the freemkv CLI).
+- `SubtitleStream` gains `qualifier: LabelQualifier`. Not currently
+  rendered by autorip's UI (subtitle metadata isn't surfaced).
+
+### Version sync
+0.13.x ecosystem; libfreemkv at 0.13.0, freemkv CLI at 0.13.0, bdemu at
+0.13.0. autorip at 0.13.1 (one ahead because of the two follow-up fixes
+above).
+
 ## 0.13.0 (2026-04-24)
 
 ### Stop being blind: structural observability rebuild

@@ -114,7 +114,9 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
 
     crate::log::device_log(device, "Verify: scanning...");
     let scan_opts = match keydb_path {
-        Some(p) => libfreemkv::ScanOptions::with_keydb(p),
+        Some(p) => libfreemkv::ScanOptions {
+            keydb_path: Some(p.into()),
+        },
         None => libfreemkv::ScanOptions::default(),
     };
     let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
