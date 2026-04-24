@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.18 (2026-04-24)
+
+### Cheap sysfs pre-filter in drive poll loop
+
+USB optical drives re-enumerate between `/dev/sg4` and `/dev/sg5` on reconnect, so the compose can't hardcode the path. The right deployment fix is to bind-mount the host's `/dev` live (`volumes: - /dev:/dev`) instead of an explicit `devices:` list. But that exposes every host sg node — including non-optical ones like RAID controllers — to autorip's poll loop, and `Drive::open` in libfreemkv runs an unconditional 2-second reset sequence on every open. Four PERC disks alone would saturate a 5-second poll cycle with reset sleeps.
+
+- **`drive_poll_loop` now reads `/sys/class/scsi_generic/sg{N}/device/type`** and skips anything that isn't type 5 (CD/DVD/BD). Non-optical sg nodes never reach `Drive::open`, so no reset dance fires for them.
+- **Graceful fallback** — if sysfs can't be read, we proceed to `Drive::open` as before. No regression for setups where `/sys` isn't bind-mounted.
+- **No library change needed** — this is a 2-line guard in autorip.
+
 ## 0.11.17 (2026-04-23)
 
 ### Trustworthy rip feedback during bad-sector recovery
