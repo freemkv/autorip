@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.20 (2026-04-24)
+
+### Stop actually stops + UI shows real adaptive state during stalls
+
+Two bugs in the v0.11.17 state-tracking + watchdog work surfaced during a 12+ hour rip of a damaged UHD disc. Fixing both and wiring the new libfreemkv 0.11.18 halt flag so Stop is effective inside dense bad-sector regions.
+
+- **Wire libfreemkv 0.11.18 `DiscStream::set_halt`**. After `DiscStream::new`, pass the same halt Arc that `Drive::halt_flag()` provides. Stop now interrupts `fill_extents` inside the stream's internal retry loop rather than only at PES-frame boundaries (which may never arrive in a bad zone).
+- **Fix duplicate `wd_last_frame` Arc.** The watchdog thread was reading an Arc that was shadowed by a second declaration inside the watchdog setup block, so event-callback updates (sector skip / recover / batch-size-change) were invisible to the stall detector. One Arc now, used by the event callbacks, main rip loop, and watchdog alike.
+- **Preserve adaptive state through watchdog updates.** The watchdog's `update_state` used `..Default::default()` which wiped `current_batch`, `preferred_batch`, `last_sector`, and `lost_video_secs` every 15 s — so the UI showed 0/0 batch and no forward LBA even while the library was actively working through a bad zone. Now reads these from the current STATE and carries them forward.
+
+### Consumes libfreemkv 0.11.18
+Upgraded the dep pin. No other API changes in the lib.
+
 ## 0.11.19 (2026-04-24)
 
 ### Per-rip log archives + ISO-8601 timestamps
