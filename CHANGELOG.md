@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.19 (2026-04-24)
+
+### Per-rip log archives + ISO-8601 timestamps
+
+The device log is append-only across rips, and uses wall-clock-only `[HH:MM:SS]` timestamps. This broke post-mortem on a 12+h rip that crossed midnight, and the archived history record had yesterday's stalled-forever saga interleaved with tonight's fresh run — hard to tell which was which.
+
+- **Per-rip archive.** On scan start and on eject, the current `logs/device_{dev}.log` is moved to `logs/rips/{dev}_{YYYY-MM-DDTHH-MM-SSZ}.log`. Each rip attempt produces one self-contained file. No retention policy yet — archive dir just grows; simple to prune later.
+- **ISO-8601 timestamps in every log line.** `[2026-04-24T03:54:27Z] msg` instead of `[03:54:27] msg`. Archives sort correctly, midnight is unambiguous.
+- **No library change.** Fully autorip-side — text format is the only public interface and it changed compatibly (older log-parsers looking for wall-clock `[HH:MM:SS]` will need to update).
+- **Failure mode:** archive rename failures log to stderr and continue. A log-system bug can never break a rip.
+
+`archive_device_log` replaces `clear_device_log` at both call sites (`ripper.rs:350` scan start, `ripper.rs:1405` eject). The in-memory 500-line buffer still clears at those points so the web UI "live log" view starts fresh for each rip.
+
 ## 0.11.18 (2026-04-24)
 
 ### Cheap sysfs pre-filter in drive poll loop
