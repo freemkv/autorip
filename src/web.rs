@@ -802,30 +802,48 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     } else if is_get && url.starts_with("/api/logs/") {
         let device = url.trim_start_matches("/api/logs/");
         let device = percent_decode(device);
+        if !is_valid_device_name(&device) {
+            return json_response(request, 400, r#"{"error":"invalid device name"}"#);
+        }
         handle_device_log(request, cfg, &device);
     } else if is_get && url == "/events" {
         handle_sse(request);
     } else if is_post && url.starts_with("/api/scan/") {
         let device = url.trim_start_matches("/api/scan/");
         let device = percent_decode(device);
+        if !is_valid_device_name(&device) {
+            return json_response(request, 400, r#"{"error":"invalid device name"}"#);
+        }
         handle_scan(request, cfg, &device);
     } else if is_post && url.starts_with("/api/rip/") {
         let device = url.trim_start_matches("/api/rip/");
         let device = percent_decode(device);
+        if !is_valid_device_name(&device) {
+            return json_response(request, 400, r#"{"error":"invalid device name"}"#);
+        }
         handle_rip(request, cfg, &device);
     } else if is_post && url == "/api/update-keydb" {
         handle_update_keydb(request, cfg);
     } else if is_post && url.starts_with("/api/eject/") {
         let device = url.trim_start_matches("/api/eject/");
         let device = percent_decode(device);
+        if !is_valid_device_name(&device) {
+            return json_response(request, 400, r#"{"error":"invalid device name"}"#);
+        }
         handle_eject(request, &device);
     } else if is_post && url.starts_with("/api/stop/") {
         let device = url.trim_start_matches("/api/stop/");
         let device = percent_decode(device);
+        if !is_valid_device_name(&device) {
+            return json_response(request, 400, r#"{"error":"invalid device name"}"#);
+        }
         handle_stop(request, &device);
     } else if is_post && url.starts_with("/api/verify/") {
         let device = url.trim_start_matches("/api/verify/");
         let device = percent_decode(device);
+        if !is_valid_device_name(&device) {
+            return json_response(request, 400, r#"{"error":"invalid device name"}"#);
+        }
         let dev_path = format!("/dev/{}", device);
         if crate::verify::is_running() {
             json_response(request, 409, r#"{"error":"verify already running"}"#);
@@ -855,6 +873,45 @@ fn json_response(request: tiny_http::Request, status: u16, body: &str) {
         .with_status_code(StatusCode(status))
         .with_header(header);
     let _ = request.respond(response);
+}
+
+/// Validate that a device name is `sg\d+`. Rejects anything containing slashes
+/// or other characters that would let a malformed URL (e.g. a typo like
+/// `/api/rip/sg4/stop`) hit the rip handler with `device = "sg4/stop"`, which
+/// previously spawned a doomed rip thread and surfaced as a phantom tab in
+/// the UI.
+fn is_valid_device_name(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 || !s.starts_with("sg") {
+        return false;
+    }
+    bytes[2..].iter().all(|b| b.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod web_tests {
+    use super::*;
+
+    #[test]
+    fn device_name_accepts_sg_digits() {
+        assert!(is_valid_device_name("sg0"));
+        assert!(is_valid_device_name("sg4"));
+        assert!(is_valid_device_name("sg15"));
+    }
+
+    #[test]
+    fn device_name_rejects_path_traversal_and_typos() {
+        // The exact bug that created the phantom "sg4/stop" tab.
+        assert!(!is_valid_device_name("sg4/stop"));
+        assert!(!is_valid_device_name("sg4/verify"));
+        assert!(!is_valid_device_name("../etc/passwd"));
+        assert!(!is_valid_device_name("sg4 ")); // trailing space
+        assert!(!is_valid_device_name("sg"));
+        assert!(!is_valid_device_name(""));
+        assert!(!is_valid_device_name("sr0")); // not the SG prefix
+        assert!(!is_valid_device_name("sda"));
+        assert!(!is_valid_device_name("sg0a"));
+    }
 }
 
 fn text_response(request: tiny_http::Request, body: &str) {
