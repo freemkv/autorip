@@ -22,6 +22,8 @@ pub struct RipEvent<'a> {
     pub speed_mbs: f64,
     pub elapsed_secs: f64,
     pub output_path: &'a str,
+    pub errors: u32,
+    pub lost_video_secs: f64,
 }
 
 /// Rich payload with full metadata — used for rip_complete.
@@ -38,6 +40,8 @@ pub fn send_rich(cfg: &Config, ev: &RipEvent) {
         "speed_mbs": (ev.speed_mbs * 10.0).round() / 10.0,
         "elapsed_secs": ev.elapsed_secs.round() as u64,
         "output_path": ev.output_path,
+        "errors": ev.errors,
+        "lost_video_secs": (ev.lost_video_secs * 1000.0).round() / 1000.0,
     });
     fire(cfg, &payload);
 }

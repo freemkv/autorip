@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.11.17 (2026-04-23)
+
+### Trustworthy rip feedback during bad-sector recovery
+
+Real-world trigger: a damaged UHD disc produced 622 skipped sectors over 12+ hours. The UI showed "stalled 15h 0m" the whole time because the watchdog only counted PES frame writes, and there was no way to see how much video was actually being lost. All evidence disappeared on stop — no history record, live counter reset to 0.
+
+- **Watchdog counts sector events, not just frame writes.** Drive and DiscStream event callbacks reset `wd_last_frame` on every event. A long run of skipped sectors no longer falsely reports as stalled — it shows forward motion because it is moving forward.
+- **`lost_video_secs` in `RipState`** — computed from the title's actual bitrate (`size_bytes / duration_secs`), not the old hardcoded `8_250_000` (BD sustained). UHD/DVD/BD all get correct numbers. Web UI prefers this over the client-side approximation.
+- **`last_sector`, `current_batch`, `preferred_batch` in `RipState`** — track forward LBA progress and the adaptive batch sizer's current read size. UI shows a blue "Recovering · batch N/60" banner when the library has shrunk after a read failure, distinguishable from normal "Ripping" and from "stalled".
+- **History record on Stop too** — every rip attempt produces a `{ts}.json` regardless of status. Fields added: `status` ("complete" / "stopped"), `errors`, `lost_video_secs`, `last_sector`. The `.done` marker still only lands on completion (mover gate unchanged).
+- **Final `update_state` preserves `errors` / `lost_video_secs` / `last_sector`** — previously `..Default::default()` wiped the skip count on completion so a damaged-disc rip finished showing 0 errors.
+- **Webhook `rip_complete` payload adds `errors` + `lost_video_secs`** so external systems see the actual loss.
+
+### libfreemkv 0.11.17 — adaptive batch sizer
+- Dep bumped to 0.11.17. Rip recovery now pays the descent cost once per bad region instead of once per bad sector.
+- Match `BatchSizeChanged { new_size, reason }` events from the DiscStream callback; drop the removed `BinarySearch` arm.
+
+### Local dev
+- `libfreemkv` dep now uses `{ version = "0.11", path = "../libfreemkv" }` — matches the README's "clone side-by-side" workflow. Cargo strips the path when publishing.
+
 ## 0.11.16 (2026-04-21)
 
 ### SectorReader API cleanup

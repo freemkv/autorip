@@ -322,14 +322,25 @@ function renderCurrent(){
   const etaStr=s.eta||'';
   upd('steps',renderSteps(steps,progressStr,etaStr,speedStr));
 
-  /* Error banner */
+  /* Error + recovery banner */
   let errHtml='';
   if(s.errors>0&&s.last_error){
     errHtml='<div style="background:var(--red);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u26a0 '+esc(s.last_error)+'</div>';
   }else if(s.errors>0){
     const errMb=(s.errors*2048/1048576).toFixed(1);
-    const errSecs=(s.errors*2048/8250000).toFixed(1);
-    errHtml='<div style="background:var(--yellow);color:#000;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+s.errors+' sector'+(s.errors>1?'s':'')+' skipped ('+errMb+' MB, ~'+errSecs+'s of video)</div>';
+    /* Prefer server-computed lost_video_secs (uses actual title bitrate).
+       Fall back to the old BD-sustained constant only if missing. */
+    const lostSecs=(typeof s.lost_video_secs==='number'&&s.lost_video_secs>=0)?s.lost_video_secs:(s.errors*2048/8250000);
+    const lostStr=lostSecs<1?(lostSecs*1000).toFixed(0)+' ms':lostSecs.toFixed(2)+' s';
+    errHtml='<div style="background:var(--yellow);color:#000;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+s.errors+' sector'+(s.errors>1?'s':'')+' skipped ('+errMb+' MB, ~'+lostStr+' of video)</div>';
+  }
+  /* Adaptive batch recovery state \u2014 only during an active rip.
+     current_batch < preferred_batch means the library shrunk the read size
+     after a failure and is working through a marginal zone. Show a blue
+     banner so the user can tell "recovering" from "stalled". */
+  if(s.status==='ripping'&&s.current_batch>0&&s.preferred_batch>0&&s.current_batch<s.preferred_batch){
+    const lbaStr=s.last_sector>0?' \u00b7 LBA '+s.last_sector.toLocaleString():'';
+    errHtml+='<div style="background:var(--blue);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u21ba Recovering \u00b7 batch '+s.current_batch+' / '+s.preferred_batch+lbaStr+'</div>';
   }
   upd('err',errHtml);
 
