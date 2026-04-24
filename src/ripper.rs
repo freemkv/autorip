@@ -477,23 +477,64 @@ fn build_bad_ranges(
 /// closure so interior mutability keeps the closure `Fn`.
 #[derive(Debug)]
 struct PassProgressState {
-    last_update: std::time::Instant,
-    last_bytes_good: u64,
+    /// Previous sample. `None` until the first `observe` call — required
+    /// because priming the smoothed speed with the first sample would capture
+    /// all bytes already copied (from resume, or from pre-throttle-window
+    /// reads) over a short/arbitrary dt, producing absurd speeds like 2 GB/s
+    /// that then decay very slowly toward the real rate.
+    prev: Option<(std::time::Instant, u64)>,
     smooth_speed_mbs: f64,
-    /// Wall-clock of the last device-log line emitted from this pass. The
-    /// main rip loop logs a progress line every 60 s; multipass passes do
-    /// the same here so a long-running pass doesn't go silent in the log.
+    /// Wall-clock of the last throttled callback. The progress closure
+    /// checks this to skip work when less than 1.5 s have passed.
+    last_update: std::time::Instant,
+    /// Wall-clock of the last device-log line emitted from this pass.
     last_log: std::time::Instant,
 }
 
 impl PassProgressState {
     fn new() -> Self {
-        let t = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let now = std::time::Instant::now();
         Self {
-            last_update: t,
-            last_bytes_good: 0,
+            prev: None,
             smooth_speed_mbs: 0.0,
-            last_log: t,
+            last_update: now,
+            last_log: now,
+        }
+    }
+
+    /// Feed a fresh sample. Returns the smoothed speed in MB/s.
+    ///
+    /// First call returns 0 and just records the sample (no prior dt to
+    /// compute a delta against). Subsequent calls compute an instantaneous
+    /// rate, cap it at a sanity ceiling (1 GB/s — 10× any real BD drive), and
+    /// mix it into the smoothed value with alpha=0.3.
+    fn observe(&mut self, now: std::time::Instant, bytes_good: u64) -> f64 {
+        match self.prev {
+            None => {
+                self.prev = Some((now, bytes_good));
+                0.0
+            }
+            Some((prev_t, prev_b)) => {
+                let dt = now.duration_since(prev_t).as_secs_f64();
+                if dt <= 0.0 {
+                    return self.smooth_speed_mbs;
+                }
+                let delta_bytes = bytes_good.saturating_sub(prev_b);
+                let instant = delta_bytes as f64 / 1_048_576.0 / dt;
+                // Cap wild samples — real optical drives top out around
+                // 70–140 MB/s. 1 GB/s is an order of magnitude above anything
+                // physical, so anything larger is a measurement artifact
+                // (callback jitter, mapfile replay, etc.) and should be
+                // dropped, not smoothed in.
+                let instant = instant.min(1024.0);
+                self.prev = Some((now, bytes_good));
+                self.smooth_speed_mbs = if self.smooth_speed_mbs < 0.01 {
+                    instant
+                } else {
+                    0.7 * self.smooth_speed_mbs + 0.3 * instant
+                };
+                self.smooth_speed_mbs
+            }
         }
     }
 }
@@ -540,22 +581,8 @@ fn push_pass_state(
     let (speed_mbs, eta) = {
         let mut s = state.borrow_mut();
         let now = std::time::Instant::now();
-        let dt = now.duration_since(s.last_update).as_secs_f64();
-        let delta_bytes = stats.bytes_good.saturating_sub(s.last_bytes_good);
-        let instant = if dt > 0.0 {
-            delta_bytes as f64 / 1_048_576.0 / dt
-        } else {
-            0.0
-        };
-        // Exponential smoothing; prime on first sample.
-        s.smooth_speed_mbs = if s.smooth_speed_mbs < 0.01 {
-            instant
-        } else {
-            0.9 * s.smooth_speed_mbs + 0.1 * instant
-        };
+        let speed = s.observe(now, stats.bytes_good);
         s.last_update = now;
-        s.last_bytes_good = stats.bytes_good;
-        let speed = s.smooth_speed_mbs;
         let eta_str = if speed > 0.01 && ctx.bytes_total_disc > stats.bytes_good {
             let rem_mb = (ctx.bytes_total_disc - stats.bytes_good) as f64 / 1_048_576.0;
             let secs = (rem_mb / speed) as u64;
@@ -2351,19 +2378,77 @@ mod tests {
     }
 
     #[test]
-    fn pass_progress_state_speeds_increase_with_bytes() {
-        // Sanity check the speed tracker logic: two successive updates
-        // with positive byte deltas should produce a positive smoothed
-        // speed, not zero. (v0.11.22 shipped with speed always 0 because
-        // this tracker didn't exist — guard against that recurring.)
+    fn pass_progress_first_sample_returns_zero() {
+        // Regression: v0.12.0 shipped with the tracker priming
+        // `smooth_speed_mbs` on the first sample, which included all
+        // already-copied bytes (e.g. from resume). Users saw "2197.8 MB/s" on
+        // a BD rip — impossible. First call must not compute a speed.
         let mut s = PassProgressState::new();
-        s.last_update = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        s.last_bytes_good = 0;
-        // Simulate push: 10 MB read in ~1 second → ~10 MB/s instant.
-        let now = std::time::Instant::now();
-        let dt = now.duration_since(s.last_update).as_secs_f64();
-        let instant = (10 * 1_048_576) as f64 / 1_048_576.0 / dt;
-        s.smooth_speed_mbs = instant;
-        assert!(s.smooth_speed_mbs > 5.0);
+        let t0 = std::time::Instant::now();
+        // A disc is 20 GB in at first callback (e.g. because the 1.5 s
+        // throttle let real ripping happen before we sampled).
+        let speed = s.observe(t0, 20 * 1024 * 1024 * 1024);
+        assert_eq!(speed, 0.0, "first sample must not synthesize a speed");
+        assert_eq!(s.smooth_speed_mbs, 0.0);
+    }
+
+    #[test]
+    fn pass_progress_second_sample_matches_physical_rate() {
+        // 70 MB delta in 1 s → ~70 MB/s. No prior smoothing, so the instant
+        // value becomes the first real smoothed value.
+        let mut s = PassProgressState::new();
+        let t0 = std::time::Instant::now();
+        let _ = s.observe(t0, 1_000_000_000);
+        let speed = s.observe(
+            t0 + std::time::Duration::from_secs(1),
+            1_000_000_000 + 70 * 1_048_576,
+        );
+        assert!((speed - 70.0).abs() < 1.0, "expected ~70 MB/s, got {speed}");
+    }
+
+    #[test]
+    fn pass_progress_caps_absurd_instantaneous() {
+        // If the caller feeds an 80 GB jump in 1 s (e.g. mapfile read of a
+        // resumed disc on the first post-throttle callback), the tracker
+        // must cap the instant to 1 GB/s instead of smoothing in nonsense.
+        let mut s = PassProgressState::new();
+        let t0 = std::time::Instant::now();
+        let _ = s.observe(t0, 0);
+        let speed = s.observe(
+            t0 + std::time::Duration::from_secs(1),
+            80 * 1024 * 1024 * 1024,
+        );
+        assert!(speed <= 1024.0, "speed {speed} MB/s not capped");
+    }
+
+    #[test]
+    fn pass_progress_steady_state_converges() {
+        // Feed 20 samples at a constant 70 MB/s rate. Smoothed value must
+        // converge within ±2 MB/s.
+        let mut s = PassProgressState::new();
+        let mut t = std::time::Instant::now();
+        let mut bytes: u64 = 1_000_000_000;
+        let _ = s.observe(t, bytes);
+        let mut last = 0.0;
+        for _ in 0..20 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            last = s.observe(t, bytes);
+        }
+        assert!(
+            (last - 70.0).abs() < 2.0,
+            "expected ~70 MB/s after convergence, got {last}"
+        );
+    }
+
+    #[test]
+    fn pass_progress_zero_dt_returns_previous() {
+        // Two calls at the same instant must not divide by zero.
+        let mut s = PassProgressState::new();
+        let t0 = std::time::Instant::now();
+        let _ = s.observe(t0, 0);
+        let s1 = s.observe(t0, 100_000_000);
+        let s2 = s.observe(t0, 200_000_000);
+        assert_eq!(s1, s2, "zero-dt sample must not change smoothed speed");
     }
 }

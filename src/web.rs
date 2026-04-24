@@ -889,6 +889,7 @@ fn is_valid_device_name(s: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod web_tests {
     use super::*;
 

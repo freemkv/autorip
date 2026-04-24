@@ -28,6 +28,27 @@ fn main() {
         );
     }
 
+    // Panic hook — log any thread panic to the system log so we can debug
+    // post-mortem without a live stderr. Without this the user just sees "UI
+    // crashed" with no clue which thread or path blew up.
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic>");
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        log::syslog(&format!("PANIC in thread '{thread}' at {loc}: {msg}"));
+    }));
+
     log::syslog("autorip starting");
 
     // Load config
