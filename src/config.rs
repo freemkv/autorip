@@ -15,6 +15,13 @@ pub struct Config {
     pub output_format: String,  // "mkv", "m2ts", "iso"
     pub network_target: String, // e.g. "192.168.1.100:9000" for network output
     pub on_read_error: String,  // "stop", "skip"
+    /// Number of retry passes after the initial disc→ISO pass. 0 = single pass
+    /// (direct disc→MKV, no ISO intermediate). 1..=10 = multi-pass (disc→ISO,
+    /// retry bad ranges N times, then ISO→MKV).
+    pub max_retries: u8,
+    /// Keep the intermediate ISO after mux completes. Defaults to false — the
+    /// ISO is pruned once the MKV is successfully finalized.
+    pub keep_iso: bool,
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,
     pub keydb_url: String,
@@ -52,6 +59,11 @@ pub fn load() -> Arc<RwLock<Config>> {
         output_format: env_or("OUTPUT_FORMAT", "mkv"),
         network_target: env_or("NETWORK_TARGET", ""),
         on_read_error: env_or("ON_READ_ERROR", "stop"),
+        max_retries: env_or("MAX_RETRIES", "1")
+            .parse::<u8>()
+            .unwrap_or(1)
+            .min(10),
+        keep_iso: env_or("KEEP_ISO", "false") == "true",
         tmdb_api_key: env_or("TMDB_API_KEY", ""),
         keydb_path: std::env::var("KEYDB_PATH").ok(),
         keydb_url: env_or("KEYDB_URL", ""),
@@ -104,6 +116,12 @@ fn load_saved(mut cfg: Config) -> Config {
             }
             if let Some(v) = saved.get("on_read_error").and_then(|v| v.as_str()) {
                 cfg.on_read_error = v.to_string();
+            }
+            if let Some(v) = saved.get("max_retries").and_then(|v| v.as_u64()) {
+                cfg.max_retries = (v.min(10)) as u8;
+            }
+            if let Some(v) = saved.get("keep_iso").and_then(|v| v.as_bool()) {
+                cfg.keep_iso = v;
             }
             // Migrate old setting
             if let Some(true) = saved.get("abort_on_error").and_then(|v| v.as_bool()) {

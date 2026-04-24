@@ -77,6 +77,18 @@ pub struct RipState {
     pub current_batch: u16,
     /// Kernel-reported preferred batch size (from detect_max_batch_sectors).
     pub preferred_batch: u16,
+    /// Current pass number (1 = initial disc→ISO copy, 2..=N = retry patches,
+    /// N+1 = mux). Zero when not in multi-pass mode.
+    pub pass: u8,
+    /// Total number of passes in this rip (max_retries + 1 + mux). Zero when
+    /// not in multi-pass mode.
+    pub total_passes: u8,
+    /// Bytes confirmed good across all passes so far (from mapfile stats).
+    pub bytes_good: u64,
+    /// Bytes still unreadable or pending.
+    pub bytes_bad: u64,
+    /// Total disc size in bytes (for pass-relative progress).
+    pub bytes_total_disc: u64,
     pub last_error: String,
     pub output_file: String,
     pub tmdb_title: String,
@@ -104,6 +116,11 @@ impl Default for RipState {
             last_sector: 0,
             current_batch: 0,
             preferred_batch: 0,
+            pass: 0,
+            total_passes: 0,
+            bytes_good: 0,
+            bytes_bad: 0,
+            bytes_total_disc: 0,
             last_error: String::new(),
             output_file: String::new(),
             tmdb_title: String::new(),
@@ -326,6 +343,59 @@ pub fn update_state(device: &str, state: RipState) {
     if let Ok(mut s) = STATE.lock() {
         s.insert(device.to_string(), state);
     }
+}
+
+/// Build a RipState snapshot for a multi-pass rip in a specific pass, with
+/// everything the UI needs to render pass progress. Status is always "ripping"
+/// during the passes; pass=total_passes indicates the mux phase.
+#[allow(clippy::too_many_arguments)]
+fn set_pass_progress(
+    device: &str,
+    display_name: &str,
+    disc_format: &str,
+    tmdb_title: &str,
+    tmdb_year: u16,
+    tmdb_poster: &str,
+    tmdb_overview: &str,
+    duration: &str,
+    codecs: &str,
+    filename: &str,
+    pass: u8,
+    total_passes: u8,
+    bytes_good: u64,
+    bytes_bad: u64,
+    bytes_total_disc: u64,
+) {
+    let pct = if bytes_total_disc > 0 {
+        (bytes_good * 100 / bytes_total_disc).min(100) as u8
+    } else {
+        0
+    };
+    update_state(
+        device,
+        RipState {
+            device: device.to_string(),
+            status: "ripping".to_string(),
+            disc_present: true,
+            disc_name: display_name.to_string(),
+            disc_format: disc_format.to_string(),
+            progress_pct: pct,
+            progress_gb: bytes_good as f64 / 1_073_741_824.0,
+            output_file: filename.to_string(),
+            tmdb_title: tmdb_title.to_string(),
+            tmdb_year,
+            tmdb_poster: tmdb_poster.to_string(),
+            tmdb_overview: tmdb_overview.to_string(),
+            duration: duration.to_string(),
+            codecs: codecs.to_string(),
+            pass,
+            total_passes,
+            bytes_good,
+            bytes_bad,
+            bytes_total_disc,
+            ..Default::default()
+        },
+    );
 }
 
 // ─── Scan ──────────────────────────────────────────────────────────────────
@@ -664,6 +734,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         .as_ref()
         .map(|t| t.overview.clone())
         .unwrap_or_default();
+    // Cloned for use in the finalize block (history record) — after multipass
+    // we drop `session` to release the drive, so we can't borrow session.tmdb
+    // at the tail of this function.
+    let tmdb_media_type = tmdb
+        .as_ref()
+        .map(|t| t.media_type.clone())
+        .unwrap_or_else(|| "unknown".to_string());
 
     let display_name = if tmdb_title.is_empty() {
         disc_name.clone()
@@ -821,8 +898,218 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             _ => {}
         }
     });
-    let mut input =
-        libfreemkv::DiscStream::new(Box::new(session.drive), title, keys, batch, format);
+    // Multi-pass vs direct flow.
+    //
+    // When max_retries > 0, we go through an ISO intermediate: Disc::copy writes
+    // the disc to an ISO (fast skip-forward on failure, ddrescue-style mapfile),
+    // then Disc::patch retries the bad ranges up to max_retries times, then the
+    // mux pipeline reads from the ISO (no drive involvement past this point).
+    //
+    // When max_retries == 0, we keep the existing direct disc→MKV flow —
+    // session.drive is passed to DiscStream::new and sectors stream straight
+    // through decrypt/demux/mux. Fastest path, no ISO overhead, but no retry.
+    let reader: Box<dyn libfreemkv::SectorReader> = if cfg_read.max_retries > 0 {
+        let iso_filename = format!("{}.iso", sanitize_filename(&display_name));
+        let iso_path_str = format!("{}/{}", staging, iso_filename);
+        let iso_path = std::path::Path::new(&iso_path_str);
+        let total_passes = cfg_read.max_retries + 2; // pass 1 + retries + mux
+        let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
+
+        // Pass 1: disc → ISO (fast sweep, skip-forward on failure).
+        let pass_label = format!("Pass 1/{total_passes}: disc → ISO");
+        crate::log::device_log(device, &pass_label);
+        set_pass_progress(
+            device,
+            &display_name,
+            &disc_format,
+            &tmdb_title,
+            tmdb_year,
+            &tmdb_poster,
+            &tmdb_overview,
+            &duration,
+            &codecs,
+            &filename,
+            1,
+            total_passes,
+            0,
+            0,
+            bytes_total_disc,
+        );
+
+        let copy_opts = libfreemkv::disc::CopyOptions {
+            decrypt: false,
+            resume: true,
+            batch_sectors: Some(batch),
+            skip_on_error: true,
+            skip_forward: true,
+            halt: Some(halt.clone()),
+            ..Default::default()
+        };
+        let result = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::log::device_log(device, &format!("Pass 1 failed: {e}"));
+                update_state(
+                    device,
+                    RipState {
+                        device: device.to_string(),
+                        status: "error".to_string(),
+                        disc_present: true,
+                        last_error: format!("{e}"),
+                        disc_name: display_name,
+                        disc_format,
+                        tmdb_title,
+                        tmdb_year,
+                        tmdb_poster,
+                        tmdb_overview,
+                        duration,
+                        codecs,
+                        ..Default::default()
+                    },
+                );
+                if let Ok(mut flags) = HALT_FLAGS.lock() {
+                    flags.remove(device);
+                }
+                return;
+            }
+        };
+        crate::log::device_log(
+            device,
+            &format!(
+                "Pass 1 done: {:.2} GB good, {:.2} MB unreadable, {:.2} MB pending",
+                result.bytes_good as f64 / 1_073_741_824.0,
+                result.bytes_unreadable as f64 / 1_048_576.0,
+                result.bytes_pending as f64 / 1_048_576.0,
+            ),
+        );
+
+        // Track cross-pass state as raw fields, since CopyResult and
+        // PatchResult are distinct types (same semantics, different structs).
+        let mut bytes_good = result.bytes_good;
+        let mut bytes_unreadable = result.bytes_unreadable;
+        let mut bytes_pending = result.bytes_pending;
+        let mut halted = result.halted;
+
+        // Retry passes: Disc::patch until max_retries hit, all clean, or no
+        // progress. Each call is one pass; the mapfile persists across them.
+        for retry_n in 1..=cfg_read.max_retries {
+            if halted || halt.load(Ordering::Relaxed) {
+                break;
+            }
+            if bytes_pending == 0 && bytes_unreadable == 0 {
+                break;
+            }
+            let pass = retry_n + 1;
+            crate::log::device_log(
+                device,
+                &format!("Pass {pass}/{total_passes}: retrying bad ranges"),
+            );
+            set_pass_progress(
+                device,
+                &display_name,
+                &disc_format,
+                &tmdb_title,
+                tmdb_year,
+                &tmdb_poster,
+                &tmdb_overview,
+                &duration,
+                &codecs,
+                &filename,
+                pass,
+                total_passes,
+                bytes_good,
+                bytes_unreadable + bytes_pending,
+                bytes_total_disc,
+            );
+            let patch_opts = libfreemkv::disc::PatchOptions {
+                decrypt: false,
+                full_recovery: true,
+                halt: Some(halt.clone()),
+                ..Default::default()
+            };
+            let prev_good = bytes_good;
+            let pr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {
+                Ok(r) => r,
+                Err(e) => {
+                    crate::log::device_log(device, &format!("Pass {pass} failed: {e}"));
+                    break;
+                }
+            };
+            bytes_good = pr.bytes_good;
+            bytes_unreadable = pr.bytes_unreadable;
+            bytes_pending = pr.bytes_pending;
+            halted = pr.halted;
+            let recovered = bytes_good.saturating_sub(prev_good);
+            crate::log::device_log(
+                device,
+                &format!(
+                    "Pass {pass} done: recovered {:.2} MB; {:.2} MB still unreadable",
+                    recovered as f64 / 1_048_576.0,
+                    bytes_unreadable as f64 / 1_048_576.0,
+                ),
+            );
+            if recovered == 0 {
+                crate::log::device_log(device, "No progress on last pass — stopping retries.");
+                break;
+            }
+        }
+
+        // Close drive — all physical I/O done.
+        crate::log::device_log(device, "Drive released; muxing ISO → MKV.");
+        drop(session);
+
+        // Open the ISO for the mux pipeline.
+        let iso_reader = match libfreemkv::FileSectorReader::open(&iso_path_str) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::log::device_log(device, &format!("Open ISO failed: {e}"));
+                update_state(
+                    device,
+                    RipState {
+                        device: device.to_string(),
+                        status: "error".to_string(),
+                        disc_present: true,
+                        last_error: format!("{e}"),
+                        disc_name: display_name,
+                        disc_format,
+                        tmdb_title,
+                        tmdb_year,
+                        tmdb_poster,
+                        tmdb_overview,
+                        duration,
+                        codecs,
+                        ..Default::default()
+                    },
+                );
+                if let Ok(mut flags) = HALT_FLAGS.lock() {
+                    flags.remove(device);
+                }
+                return;
+            }
+        };
+        set_pass_progress(
+            device,
+            &display_name,
+            &disc_format,
+            &tmdb_title,
+            tmdb_year,
+            &tmdb_poster,
+            &tmdb_overview,
+            &duration,
+            &codecs,
+            &filename,
+            total_passes,
+            total_passes,
+            bytes_good,
+            bytes_unreadable + bytes_pending,
+            bytes_total_disc,
+        );
+        Box::new(iso_reader) as Box<dyn libfreemkv::SectorReader>
+    } else {
+        Box::new(session.drive) as Box<dyn libfreemkv::SectorReader>
+    };
+
+    let mut input = libfreemkv::DiscStream::new(reader, title, keys, batch, format);
     // Wire the same halt flag into DiscStream so Stop interrupts fill_extents'
     // internal retry loop — required for Stop to work during dense bad-sector
     // regions where the outer PES read() loop may never emit a frame.
@@ -1292,13 +1579,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // so damaged-disc attempts are auditable.
     let status_label = if completed { "complete" } else { "stopped" };
     {
-        let tmdb_ref = &session.tmdb;
         let marker = serde_json::json!({
             "title": display_name,
             "disc_name": disc_name,
             "format": disc_format,
             "year": tmdb_year,
-            "media_type": tmdb_ref.as_ref().map(|t| t.media_type.as_str()).unwrap_or("unknown"),
+            "media_type": tmdb_media_type,
             "poster_url": tmdb_poster,
             "overview": tmdb_overview,
             "date": crate::util::format_date(),
@@ -1406,6 +1692,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     if cfg_read.auto_eject {
         eject_drive(device_path);
+    }
+
+    // Prune intermediate ISO + mapfile unless keep_iso is set. Only runs in
+    // multipass mode (max_retries > 0) — direct mode never produced an ISO.
+    if cfg_read.max_retries > 0 && !cfg_read.keep_iso {
+        let iso_filename = format!("{}.iso", sanitize_filename(&display_name));
+        let iso_path_str = format!("{}/{}", staging, iso_filename);
+        let mapfile_path = format!("{iso_path_str}.mapfile");
+        match std::fs::remove_file(&iso_path_str) {
+            Ok(_) => crate::log::device_log(device, "Pruned intermediate ISO"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => crate::log::device_log(device, &format!("ISO prune warning: {e}")),
+        }
+        let _ = std::fs::remove_file(&mapfile_path);
     }
 
     crate::log::device_log(device, "Rip complete");
