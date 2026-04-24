@@ -823,6 +823,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     });
     let mut input =
         libfreemkv::DiscStream::new(Box::new(session.drive), title, keys, batch, format);
+    // Wire the same halt flag into DiscStream so Stop interrupts fill_extents'
+    // internal retry loop — required for Stop to work during dense bad-sector
+    // regions where the outer PES read() loop may never emit a frame.
+    input.set_halt(halt.clone());
     if cfg_read.on_read_error == "skip" {
         input.skip_errors = true;
     }
@@ -957,7 +961,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     }
     let _wd_guard = WatchdogGuard(wd_active.clone());
-    let wd_last_frame = Arc::new(AtomicU64::new(crate::util::epoch_secs()));
+    // `wd_last_frame` is declared earlier (shared with the drive + stream event
+    // callbacks, which reset it on any sector-level event). Don't shadow it —
+    // the watchdog reader and the callback writers must share one Arc.
     let wd_bytes = Arc::new(AtomicU64::new(0));
     {
         let active = wd_active.clone();
@@ -1030,12 +1036,32 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                             format!("{}s", s)
                         }
                     };
-                    // Preserve error count from existing state
-                    let prev_errors = STATE
+                    // Preserve per-rip fields from existing STATE that the
+                    // watchdog would otherwise wipe via Default::default().
+                    // Without this, the UI shows 0/0 batch + no lost_video
+                    // + last_sector=0 during stalls even though the library
+                    // is actively working through bad sectors.
+                    let (
+                        prev_errors,
+                        prev_current_batch,
+                        prev_preferred_batch,
+                        prev_last_sector,
+                        prev_lost_video_secs,
+                    ) = STATE
                         .lock()
                         .ok()
-                        .and_then(|s| s.get(&wd_device).map(|r| r.errors))
-                        .unwrap_or(0);
+                        .and_then(|s| {
+                            s.get(&wd_device).map(|r| {
+                                (
+                                    r.errors,
+                                    r.current_batch,
+                                    r.preferred_batch,
+                                    r.last_sector,
+                                    r.lost_video_secs,
+                                )
+                            })
+                        })
+                        .unwrap_or((0, 0, 0, 0, 0.0));
                     update_state(
                         &wd_device,
                         RipState {
@@ -1049,6 +1075,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                             speed_mbs: 0.0,
                             eta: format!("stalled {}", stall_str),
                             errors: prev_errors,
+                            lost_video_secs: prev_lost_video_secs,
+                            last_sector: prev_last_sector,
+                            current_batch: prev_current_batch,
+                            preferred_batch: prev_preferred_batch,
                             output_file: wd_filename.clone(),
                             tmdb_title: wd_tmdb_title.clone(),
                             tmdb_year: wd_tmdb_year,
