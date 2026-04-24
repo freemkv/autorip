@@ -402,9 +402,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libfreemkv"
-version = "0.11.22"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "376ec7c7ca6952d31a86f6009aa2e7673cc3714c8aab3482227a2c86a9f6b1e2"
+checksum = "3c3c3f4b3be019305d9b1c3fbdb1c103dae644b46158b2e51e59268b21953c40"
 dependencies = [
  "aes",
  "base64",
