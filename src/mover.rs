@@ -176,7 +176,7 @@ fn check_and_move(cfg: &Config) {
 }
 
 fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
-    if let Some(ref result) = tmdb {
+    if let Some(result) = tmdb {
         let safe_title = sanitize_dir_name(&result.title);
         match result.media_type.as_str() {
             "movie" if !cfg.movie_dir.is_empty() => {

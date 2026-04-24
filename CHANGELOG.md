@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.12.0 (2026-04-24)
+
+### Multipass regression fixes observed in live v0.11.22 rip
+
+Everything shipped in 0.11.22 was a display-layer regression: the underlying rip worked, the UI didn't. Each of these is now guarded by a unit test in `ripper::tests` so reintroducing the same class of bug will fail CI.
+
+- **`bytes_bad` semantics.** 0.11.22 summed `Unreadable + NonTried + NonTrimmed + NonScraped`, so the UI showed the entire un-read disc as "bad" during pass 1 (saw ~73 GB "bad" on a 79 GB disc at 6% progress). Now `bytes_bad` is only `Unreadable` — confirmed given-up ranges. `NonTried` = not-yet-attempted (work in progress). Matches user expectation of "bad = lost."
+- **`speed_mbs` / `eta` during passes.** Were always 0 / empty. The main rip loop's speed tracker doesn't run during `Disc::copy` or `Disc::patch`. New `PassProgressState` in the progress callback samples bytes + time per tick, computes smoothed speed + ETA. Shipped with a regression test.
+- **`errors` / `lost_video_secs` during passes.** Weren't populated live — yellow "N sectors skipped" banner never surfaced during multipass. Now read from mapfile on every callback.
+- **Bad-range list in the UI.** Was including `NonTrimmed` / `NonScraped` (work-in-progress), which made the table fill with "bad" rows during pass 1 that hadn't actually been given up on. Now `Unreadable` only.
+
+### UI redesign for multi-pass
+
+0.11.22's blue "Ripping pass N/M · X / Y GB good · Z MB bad" banner duplicated the Rip step's own progress line and was visually noisy. Folded the pass info into the Rip step:
+
+- Rip step shows `● Rip · pass N/M · copying|retrying|muxing` with the progress bar, `GB / total · speed · ETA` stats line, and a small yellow sub-line with unreadable count + ms lost (when > 0).
+- Dropped the separate blue banner.
+- `fmtMs` / `passLabelFor` helpers centralize the formatting.
+
+### History record
+
+- `bad_bytes` now also only counts `Unreadable`, matching UI semantics. Interrupted multipass rips no longer log the unread-but-not-bad portion as lost.
+
+### Testing
+
+- New `ripper::tests` module with 9 tests guarding `build_bad_ranges` (status filtering, sorting, truncation), `byte_offset_in_title` (single/multi-extent/out-of-range), and `PassProgressState` (speed tracker nonzero on positive delta).
+- `cargo test --bin autorip` runs them. CI picks this up automatically.
+
+### Rust 2024 edition
+- Bumped `edition = "2024"`. Match-ergonomics fixes in `ripper.rs` and `mover.rs` (removed redundant `ref` bindings).
+- No behavior change.
+
+### Consumes libfreemkv 0.12.0
+
 ## 0.11.22 (2026-04-24)
 
 ### Multi-pass UI completed

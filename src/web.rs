@@ -201,18 +201,47 @@ function renderBar(s,p){
   html+='</div>';
   return html;
 }
+function passLabelFor(s){
+  /* Resolve the current pass into a human-readable label for the Ripping
+     step. During multipass we show pass number + phase; otherwise "Ripping". */
+  if(s.pass>0&&s.total_passes>0){
+    const phase=s.pass===1?'copying':(s.pass===s.total_passes?'muxing':'retrying');
+    return 'pass '+s.pass+'/'+s.total_passes+' \u00b7 '+phase;
+  }
+  return '';
+}
 function renderSteps(steps,progress,eta,speed,s){
   if(!steps||!steps.length)return'';
   const icons={done:'\u2713',active:'\u25cf',pending:'\u25cb'};
   const colors={done:'var(--green)',active:'var(--accent)',pending:'var(--text3)'};
   return steps.map(st=>{
     let detail=st.detail||'';
-    if(st.status==='active'&&st.name==='Ripping'&&(progress||speed)){
+    if(st.status==='active'&&st.name==='Ripping'){
+      /* Active Ripping step: progress bar on its own line, then a compact
+         stats row with GB/speed/ETA, then optional bad-sector summary. */
       const p=parseInt(progress)||0;
-      const spdStr=speed?' \u00b7 '+speed:'';
-      const etaStr=eta?' \u00b7 '+eta+' remaining':'';
-      const label=progress?progress+spdStr+etaStr:speed+(etaStr||'');
-      detail='<div style="display:flex;align-items:center;gap:8px;margin-top:4px">'+(p>0?renderBar(s,p):'')+'<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div>';
+      const passLbl=passLabelFor(s);
+      const header=passLbl?' \u00b7 '+passLbl:'';
+      const gbStr=(s.bytes_good>0||s.bytes_total_disc>0)
+        ? (s.bytes_good/1073741824).toFixed(1)+' / '+(s.bytes_total_disc/1073741824).toFixed(1)+' GB'
+        : (progress||'');
+      const spdStr=speed&&speed!=='0 KB/s'?' \u00b7 '+speed:'';
+      const etaStr=eta?' \u00b7 ETA '+eta:'';
+      const parts=[gbStr,spdStr.replace(/^ \u00b7 /,''),etaStr.replace(/^ \u00b7 /,'')].filter(Boolean);
+      const stats=parts.join(' \u00b7 ');
+      let badLine='';
+      if(s.num_bad_ranges>0||(s.errors>0)){
+        const n=s.num_bad_ranges||s.errors||0;
+        const lostStr=fmtMs((s.total_lost_ms!=null&&s.total_lost_ms>=0)?s.total_lost_ms:(s.lost_video_secs||0)*1000);
+        badLine='<div style="font-size:.7rem;color:var(--yellow);margin-top:2px">'+n+' unreadable \u00b7 ~'+lostStr+' lost</div>';
+      }
+      detail='<div style="margin-top:4px">'+(p>0?renderBar(s,p):'')
+        +'<div style="font-size:.75rem;color:var(--text2);margin-top:4px">'+stats+'</div>'
+        +badLine+'</div>';
+      /* Fold pass info into the step name so it's obvious at a glance. */
+      if(passLbl){
+        return '<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:.8rem"><span style="color:'+colors[st.status]+';font-size:.7rem;width:14px;text-align:center;animation:p 1.5s infinite">'+icons[st.status]+'</span><span style="color:var(--text)"><strong>Rip</strong>'+header+detail+'</span></div>';
+      }
     }else if(detail){detail=' \u2014 '+detail}
     const anim=st.status==='active'?';animation:p 1.5s infinite':'';
     return '<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:.8rem"><span style="color:'+colors[st.status]+';font-size:.7rem;width:14px;text-align:center'+anim+'">'+icons[st.status]+'</span><span style="color:'+(st.status==='pending'?'var(--text3)':'var(--text)')+'">'+st.name+detail+'</span></div>';
@@ -396,17 +425,7 @@ function renderCurrent(){
     const lbaStr=s.last_sector>0?' \u00b7 LBA '+s.last_sector.toLocaleString():'';
     errHtml+='<div style="background:var(--blue);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u21ba Recovering \u00b7 batch '+s.current_batch+' / '+s.preferred_batch+lbaStr+'</div>';
   }
-  /* Multipass pass progress: show a blue banner during disc\u2192ISO copy and
-     retry passes with good/bad byte counts from the mapfile. The last pass
-     (mux from ISO) is displayed via the statusLabel only \u2014 no drive
-     involvement, no bad-range news to break. */
-  if(s.status==='ripping'&&s.total_passes>0&&s.pass>0&&s.pass<s.total_passes&&s.bytes_total_disc>0){
-    const goodGb=(s.bytes_good/1073741824).toFixed(2);
-    const totalGb=(s.bytes_total_disc/1073741824).toFixed(2);
-    const badMb=(s.bytes_bad/1048576).toFixed(2);
-    const phase=s.pass===1?'Ripping':'Retrying';
-    errHtml+='<div style="background:var(--blue);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+phase+' pass '+s.pass+'/'+s.total_passes+' \u00b7 '+goodGb+' / '+totalGb+' GB good \u00b7 '+badMb+' MB bad</div>';
-  }
+  /* (Pass/phase info lives inside the Ripping step \u2014 no separate banner.) */
   upd('err',errHtml);
   upd('bad-ranges',renderBadRanges(s));
 
