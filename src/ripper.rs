@@ -52,6 +52,18 @@ fn reset_stop_flag(device: &str) -> Arc<AtomicBool> {
     flag
 }
 
+/// One contiguous bad range as seen in the UI. Derived from the mapfile
+/// during a multi-pass rip; chapter/time-offset come from the scanned title's
+/// playlist metadata when the bad region lands in AV content.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BadRange {
+    pub lba: u64,
+    pub count: u32,
+    pub duration_ms: f64,
+    pub chapter: Option<u32>,
+    pub time_offset_secs: Option<f64>,
+}
+
 /// State broadcast for web UI.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RipState {
@@ -89,6 +101,17 @@ pub struct RipState {
     pub bytes_bad: u64,
     /// Total disc size in bytes (for pass-relative progress).
     pub bytes_total_disc: u64,
+    /// Bad sector ranges from the mapfile. Capped at 50 entries (biggest by
+    /// duration) to keep SSE payloads bounded; `bad_ranges_truncated` reports
+    /// how many more exist.
+    pub bad_ranges: Vec<BadRange>,
+    pub num_bad_ranges: u32,
+    pub bad_ranges_truncated: u32,
+    /// Sum of bad-range durations — the actual video time lost to this rip.
+    pub total_lost_ms: f64,
+    /// Largest single contiguous bad range's duration. Tells the difference
+    /// between 1000 × 1ms gaps (unnoticeable) vs 1 × 1s gap (noticeable glitch).
+    pub largest_gap_ms: f64,
     pub last_error: String,
     pub output_file: String,
     pub tmdb_title: String,
@@ -121,6 +144,11 @@ impl Default for RipState {
             bytes_good: 0,
             bytes_bad: 0,
             bytes_total_disc: 0,
+            bad_ranges: Vec::new(),
+            num_bad_ranges: 0,
+            bad_ranges_truncated: 0,
+            total_lost_ms: 0.0,
+            largest_gap_ms: 0.0,
             last_error: String::new(),
             output_file: String::new(),
             tmdb_title: String::new(),
@@ -343,6 +371,157 @@ pub fn update_state(device: &str, state: RipState) {
     if let Ok(mut s) = STATE.lock() {
         s.insert(device.to_string(), state);
     }
+}
+
+/// Shared context for the progress callbacks of a multi-pass rip. Built once
+/// before pass 1, cheaply Arc-cloned per pass so each closure captures the
+/// same immutable values without reallocating every callback.
+#[derive(Clone)]
+struct PassContext {
+    device: String,
+    display_name: String,
+    disc_format: String,
+    tmdb_title: String,
+    tmdb_year: u16,
+    tmdb_poster: String,
+    tmdb_overview: String,
+    duration: String,
+    codecs: String,
+    filename: String,
+    bytes_total_disc: u64,
+}
+
+/// Walk the title's extents to find the byte offset *within the title* for a
+/// given disc LBA. Returns None if the LBA falls outside every extent — meaning
+/// the bad region is in UDF metadata or some other non-AV area, where chapter
+/// mapping doesn't apply.
+fn byte_offset_in_title(lba: u32, title: &libfreemkv::DiscTitle) -> Option<u64> {
+    let mut cumulative = 0u64;
+    for ext in &title.extents {
+        if lba >= ext.start_lba && lba < ext.start_lba + ext.sector_count {
+            return Some(cumulative + (lba - ext.start_lba) as u64 * 2048);
+        }
+        cumulative += ext.sector_count as u64 * 2048;
+    }
+    None
+}
+
+fn range_chapter(lba: u32, title: &libfreemkv::DiscTitle) -> (Option<u32>, Option<f64>) {
+    if let Some(byte_offset) = byte_offset_in_title(lba, title) {
+        if let Some((ch, t)) = libfreemkv::verify::VerifyResult::chapter_at_offset(
+            &title.chapters,
+            byte_offset,
+            title.duration_secs,
+            title.size_bytes,
+        ) {
+            return (Some(ch as u32), Some(t));
+        }
+    }
+    (None, None)
+}
+
+/// Build the UI's bad-range list from the mapfile. Caps at 50 entries by size
+/// (largest first); returns the truncation count so the UI can say "+X more".
+fn build_bad_ranges(
+    map: &libfreemkv::disc::mapfile::Mapfile,
+    title: &libfreemkv::DiscTitle,
+    bps: f64,
+) -> (Vec<BadRange>, u32, u32, f64, f64) {
+    use libfreemkv::disc::mapfile::SectorStatus;
+    // Consider anything not Finished as "bad" from the UI's perspective —
+    // users care about unresolved ranges, regardless of trim/scrape state.
+    let raw = map.ranges_with(&[
+        SectorStatus::Unreadable,
+        SectorStatus::NonTrimmed,
+        SectorStatus::NonScraped,
+    ]);
+    let total_count = raw.len() as u32;
+    let mut ranges: Vec<BadRange> = raw
+        .iter()
+        .map(|(pos, size)| {
+            let lba = pos / 2048;
+            let count = (size / 2048) as u32;
+            let duration_ms = if bps > 0.0 {
+                (*size as f64) / bps * 1000.0
+            } else {
+                0.0
+            };
+            let (chapter, time_offset_secs) = range_chapter(lba as u32, title);
+            BadRange {
+                lba,
+                count,
+                duration_ms,
+                chapter,
+                time_offset_secs,
+            }
+        })
+        .collect();
+    ranges.sort_by(|a, b| {
+        b.duration_ms
+            .partial_cmp(&a.duration_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let total_lost_ms: f64 = ranges.iter().map(|r| r.duration_ms).sum();
+    let largest_gap_ms = ranges.first().map(|r| r.duration_ms).unwrap_or(0.0);
+    let truncated = ranges.len().saturating_sub(50) as u32;
+    ranges.truncate(50);
+    (ranges, total_count, truncated, total_lost_ms, largest_gap_ms)
+}
+
+/// Read the live mapfile and push a fresh RipState snapshot for the current
+/// pass. No-op (quietly) if the mapfile can't be read — the next callback will
+/// try again.
+fn push_pass_state(
+    ctx: &PassContext,
+    title: &libfreemkv::DiscTitle,
+    bps: f64,
+    mapfile_path: &std::path::Path,
+    pass: u8,
+    total_passes: u8,
+) {
+    let map = match libfreemkv::disc::mapfile::Mapfile::load(mapfile_path) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let stats = map.stats();
+    let (ranges, total_count, truncated, total_lost_ms, largest_gap_ms) =
+        build_bad_ranges(&map, title, bps);
+    let bytes_bad = stats.bytes_unreadable + stats.bytes_pending;
+    let pct = if ctx.bytes_total_disc > 0 {
+        (stats.bytes_good * 100 / ctx.bytes_total_disc).min(100) as u8
+    } else {
+        0
+    };
+    update_state(
+        &ctx.device,
+        RipState {
+            device: ctx.device.clone(),
+            status: "ripping".to_string(),
+            disc_present: true,
+            disc_name: ctx.display_name.clone(),
+            disc_format: ctx.disc_format.clone(),
+            progress_pct: pct,
+            progress_gb: stats.bytes_good as f64 / 1_073_741_824.0,
+            output_file: ctx.filename.clone(),
+            tmdb_title: ctx.tmdb_title.clone(),
+            tmdb_year: ctx.tmdb_year,
+            tmdb_poster: ctx.tmdb_poster.clone(),
+            tmdb_overview: ctx.tmdb_overview.clone(),
+            duration: ctx.duration.clone(),
+            codecs: ctx.codecs.clone(),
+            pass,
+            total_passes,
+            bytes_good: stats.bytes_good,
+            bytes_bad,
+            bytes_total_disc: ctx.bytes_total_disc,
+            bad_ranges: ranges,
+            num_bad_ranges: total_count,
+            bad_ranges_truncated: truncated,
+            total_lost_ms,
+            largest_gap_ms,
+            ..Default::default()
+        },
+    );
 }
 
 /// Build a RipState snapshot for a multi-pass rip in a specific pass, with
@@ -915,6 +1094,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let total_passes = cfg_read.max_retries + 2; // pass 1 + retries + mux
         let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
 
+        // Shared pass context + title reference for progress callbacks.
+        let pass_ctx = PassContext {
+            device: device.to_string(),
+            display_name: display_name.clone(),
+            disc_format: disc_format.clone(),
+            tmdb_title: tmdb_title.clone(),
+            tmdb_year,
+            tmdb_poster: tmdb_poster.clone(),
+            tmdb_overview: tmdb_overview.clone(),
+            duration: duration.clone(),
+            codecs: codecs.clone(),
+            filename: filename.clone(),
+            bytes_total_disc,
+        };
+        let title_for_progress = title.clone();
+        let mapfile_path_str = format!("{iso_path_str}.mapfile");
+        let bps_progress = title_bytes_per_sec;
+
         // Pass 1: disc → ISO (fast sweep, skip-forward on failure).
         let pass_label = format!("Pass 1/{total_passes}: disc → ISO");
         crate::log::device_log(device, &pass_label);
@@ -936,6 +1133,23 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             bytes_total_disc,
         );
 
+        // Progress callback — runs every read block (~64 KB). Throttle the
+        // mapfile re-read + state push to once every 1.5 s so we don't pound
+        // the mutex or the filesystem.
+        let pass1_throttle =
+            std::cell::RefCell::new(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        let pass1_ctx = &pass_ctx;
+        let pass1_title = &title_for_progress;
+        let pass1_map = std::path::Path::new(&mapfile_path_str);
+        let pass1_progress = |_bytes_good: u64, _total: u64| {
+            let mut t = pass1_throttle.borrow_mut();
+            if t.elapsed().as_millis() < 1500 {
+                return;
+            }
+            *t = std::time::Instant::now();
+            push_pass_state(pass1_ctx, pass1_title, bps_progress, pass1_map, 1, total_passes);
+        };
+
         let copy_opts = libfreemkv::disc::CopyOptions {
             decrypt: false,
             resume: true,
@@ -943,7 +1157,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             skip_on_error: true,
             skip_forward: true,
             halt: Some(halt.clone()),
-            ..Default::default()
+            on_progress: Some(&pass1_progress),
         };
         let result = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
             Ok(r) => r,
@@ -1021,10 +1235,33 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 bytes_unreadable + bytes_pending,
                 bytes_total_disc,
             );
+            // Per-pass progress callback (same throttle pattern as pass 1).
+            let patch_throttle = std::cell::RefCell::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(2),
+            );
+            let patch_ctx = &pass_ctx;
+            let patch_title = &title_for_progress;
+            let patch_map = std::path::Path::new(&mapfile_path_str);
+            let patch_progress = |_bytes_good: u64, _total: u64| {
+                let mut t = patch_throttle.borrow_mut();
+                if t.elapsed().as_millis() < 1500 {
+                    return;
+                }
+                *t = std::time::Instant::now();
+                push_pass_state(
+                    patch_ctx,
+                    patch_title,
+                    bps_progress,
+                    patch_map,
+                    pass,
+                    total_passes,
+                );
+            };
             let patch_opts = libfreemkv::disc::PatchOptions {
                 decrypt: false,
                 full_recovery: true,
                 halt: Some(halt.clone()),
+                on_progress: Some(&patch_progress),
                 ..Default::default()
             };
             let prev_good = bytes_good;
@@ -1087,22 +1324,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 return;
             }
         };
-        set_pass_progress(
-            device,
-            &display_name,
-            &disc_format,
-            &tmdb_title,
-            tmdb_year,
-            &tmdb_poster,
-            &tmdb_overview,
-            &duration,
-            &codecs,
-            &filename,
+        // Entering mux phase — push final mapfile state so the UI keeps the
+        // bad-range list visible through mux and into the "done" view.
+        push_pass_state(
+            &pass_ctx,
+            &title_for_progress,
+            bps_progress,
+            std::path::Path::new(&mapfile_path_str),
             total_passes,
             total_passes,
-            bytes_good,
-            bytes_unreadable + bytes_pending,
-            bytes_total_disc,
         );
         Box::new(iso_reader) as Box<dyn libfreemkv::SectorReader>
     } else {
@@ -1564,14 +1794,52 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     } else {
         0.0
     };
-    let final_errors = input.errors as u32;
+    let mut final_errors = input.errors as u32;
     let final_last_sector = rip_last_lba.load(Ordering::Relaxed);
     let final_current_batch = rip_current_batch.load(Ordering::Relaxed);
-    let final_lost_secs = if title_bytes_per_sec > 0.0 {
+    let mut final_lost_secs = if title_bytes_per_sec > 0.0 {
         (final_errors as f64) * 2048.0 / title_bytes_per_sec
     } else {
         0.0
     };
+    // In multipass mode the `input.errors` counter above counts ISO→MKV demux
+    // skips (usually zero — ISO reads don't fail). The real bad-sector count
+    // lives in the mapfile sidecar. Prefer that when present.
+    let mut final_num_bad_ranges: u32 = 0;
+    let mut final_largest_gap_ms: f64 = 0.0;
+    if cfg_read.max_retries > 0 {
+        let iso_filename = format!("{}.iso", sanitize_filename(&display_name));
+        let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
+        if let Ok(map) = libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(
+            &mapfile_path_str,
+        )) {
+            let stats = map.stats();
+            let bad_bytes = stats.bytes_unreadable + stats.bytes_pending;
+            final_errors = (bad_bytes / 2048) as u32;
+            final_lost_secs = if title_bytes_per_sec > 0.0 {
+                bad_bytes as f64 / title_bytes_per_sec
+            } else {
+                0.0
+            };
+            use libfreemkv::disc::mapfile::SectorStatus;
+            let bad_ranges = map.ranges_with(&[
+                SectorStatus::Unreadable,
+                SectorStatus::NonTrimmed,
+                SectorStatus::NonScraped,
+            ]);
+            final_num_bad_ranges = bad_ranges.len() as u32;
+            final_largest_gap_ms = bad_ranges
+                .iter()
+                .map(|(_, size)| {
+                    if title_bytes_per_sec > 0.0 {
+                        *size as f64 / title_bytes_per_sec * 1000.0
+                    } else {
+                        0.0
+                    }
+                })
+                .fold(0.0f64, f64::max);
+        }
+    }
 
     // Write a history record for every rip attempt — completed OR stopped.
     // Stopped rips used to leave no persistent trace except the device log,
@@ -1611,6 +1879,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         entry["errors"] = serde_json::json!(final_errors);
         entry["lost_video_secs"] = serde_json::json!((final_lost_secs * 1000.0).round() / 1000.0);
         entry["last_sector"] = serde_json::json!(final_last_sector);
+        entry["num_bad_ranges"] = serde_json::json!(final_num_bad_ranges);
+        entry["largest_gap_ms"] = serde_json::json!(final_largest_gap_ms.round());
         let log_lines = crate::log::get_device_log(device, 500);
         entry["log"] = serde_json::json!(log_lines.join("\n"));
         crate::history::record(&cfg_read.history_dir(), &entry);
