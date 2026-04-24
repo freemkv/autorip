@@ -101,3 +101,134 @@ pub fn archive_device_log(device: &str) {
 pub fn syslog(msg: &str) {
     device_log("system", msg);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Log tests manipulate the process-wide AUTORIP_DIR env var and the
+    // module-global LOGS mutex. Cargo runs tests in parallel by default,
+    // which caused `archive_device_log_moves_to_rips_dir` to fail
+    // intermittently when another test mutated AUTORIP_DIR between our
+    // `device_log` write and our assertion on the file's location. Serialize
+    // all tests in this module through a local mutex so env-and-state setup
+    // is atomic per-test.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "autorip-log-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("logs")).unwrap();
+        d
+    }
+
+    #[test]
+    fn device_log_writes_iso_timestamped_line() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tmpdir("iso_ts");
+        // Route the test's logs to the tempdir.
+        // SAFETY: env access in single-threaded tests.
+        unsafe { std::env::set_var("AUTORIP_DIR", &d); }
+        let dev = format!("test_sg_{}", std::process::id());
+        device_log(&dev, "hello");
+        let content = std::fs::read_to_string(device_log_path(&dev)).unwrap();
+        // Format: [YYYY-MM-DDTHH:MM:SSZ] hello
+        assert!(content.starts_with('['));
+        assert!(content.contains(']'));
+        assert!(content.trim_end().ends_with("hello"));
+        let bracket = &content[1..21]; // 20-char ISO datetime inside brackets
+        assert_eq!(bracket.len(), 20);
+        assert!(bracket.ends_with('Z'));
+        assert_eq!(bracket.as_bytes()[10], b'T');
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn archive_device_log_moves_to_rips_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tmpdir("archive_move");
+        unsafe { std::env::set_var("AUTORIP_DIR", &d); }
+        let dev = format!("test_mv_{}", std::process::id());
+        device_log(&dev, "pre-archive");
+        let live = device_log_path(&dev);
+        assert!(std::path::Path::new(&live).exists());
+
+        archive_device_log(&dev);
+
+        // Live file gone after archive.
+        assert!(!std::path::Path::new(&live).exists());
+
+        // Rips dir has exactly one file matching the device name.
+        let rips_dir = d.join("logs").join("rips");
+        let archived: Vec<_> = std::fs::read_dir(&rips_dir)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(&dev))
+            .collect();
+        assert_eq!(archived.len(), 1, "expected one archived log file");
+
+        let content = std::fs::read_to_string(archived[0].path()).unwrap();
+        assert!(content.contains("pre-archive"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn archive_device_log_no_op_when_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tmpdir("archive_empty");
+        unsafe { std::env::set_var("AUTORIP_DIR", &d); }
+        let dev = format!("test_empty_{}", std::process::id());
+        // Don't call device_log — file doesn't exist yet. archive_device_log
+        // must not panic or create a junk archive entry.
+        archive_device_log(&dev);
+        let rips_dir = d.join("logs").join("rips");
+        if rips_dir.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&rips_dir)
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(&dev))
+                .collect();
+            assert!(entries.is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn archive_device_log_clears_in_memory_buffer() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tmpdir("archive_buf");
+        unsafe { std::env::set_var("AUTORIP_DIR", &d); }
+        let dev = format!("test_buf_{}", std::process::id());
+        device_log(&dev, "first");
+        device_log(&dev, "second");
+        assert!(!get_device_log(&dev, 100).is_empty());
+
+        archive_device_log(&dev);
+        assert!(get_device_log(&dev, 100).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn get_device_log_respects_line_limit() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tmpdir("line_limit");
+        unsafe { std::env::set_var("AUTORIP_DIR", &d); }
+        let dev = format!("test_lim_{}", std::process::id());
+        for i in 0..5 {
+            device_log(&dev, &format!("line {i}"));
+        }
+        let lines = get_device_log(&dev, 3);
+        assert_eq!(lines.len(), 3);
+        // Tail of the buffer — last 3 lines are 2, 3, 4.
+        assert!(lines[2].contains("line 4"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

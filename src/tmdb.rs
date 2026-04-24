@@ -104,3 +104,59 @@ fn urlencoded(s: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_title_title_cases_snake_case() {
+        assert_eq!(clean_title("DUNE_PART_TWO"), "Dune Part Two");
+        assert_eq!(clean_title("V_FOR_VENDETTA"), "V For Vendetta");
+    }
+
+    #[test]
+    fn clean_title_strips_uhd_suffix() {
+        assert_eq!(clean_title("DUNE_PART_TWO_4K_UHD"), "Dune Part Two");
+        assert_eq!(clean_title("DUNE_PART_TWO_4K_ULTRA_HD"), "Dune Part Two");
+    }
+
+    #[test]
+    fn clean_title_strips_bluray_suffix() {
+        assert_eq!(clean_title("THE_MATRIX_BLU_RAY"), "The Matrix");
+        assert_eq!(clean_title("THE_MATRIX_BLURAY"), "The Matrix");
+    }
+
+    #[test]
+    fn clean_title_strips_disc_suffix() {
+        assert_eq!(clean_title("LORD_OF_THE_RINGS_DISC_1"), "Lord Of The Rings");
+    }
+
+    #[test]
+    fn clean_title_handles_hyphens() {
+        assert_eq!(clean_title("SPIDER-MAN"), "Spider Man");
+    }
+
+    #[test]
+    fn clean_title_picks_earliest_suffix_match() {
+        // Multiple suffix candidates — must cut at the earliest one so we
+        // don't leave suffix fragments in the cleaned title.
+        let out = clean_title("MOVIE_4K_UHD_BLURAY");
+        assert!(!out.to_lowercase().contains("uhd"));
+        assert!(!out.to_lowercase().contains("bluray"));
+        assert_eq!(out, "Movie");
+    }
+
+    #[test]
+    fn clean_title_empty_input() {
+        assert_eq!(clean_title(""), "");
+    }
+
+    #[test]
+    fn urlencoded_keeps_allowed_chars() {
+        assert_eq!(urlencoded("hello"), "hello");
+        assert_eq!(urlencoded("hello world"), "hello+world");
+        assert_eq!(urlencoded("name=value"), "name%3Dvalue");
+        assert_eq!(urlencoded("a-b_c.d"), "a-b_c.d");
+    }
+}

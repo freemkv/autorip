@@ -279,3 +279,108 @@ fn sanitize_dir_name(name: &str) -> String {
         .trim()
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_dirs(movie_dir: &str, tv_dir: &str, output_dir: &str) -> Config {
+        Config {
+            port: 8080,
+            staging_dir: "/staging".into(),
+            output_dir: output_dir.into(),
+            movie_dir: movie_dir.into(),
+            tv_dir: tv_dir.into(),
+            min_length_secs: 600,
+            main_feature: true,
+            auto_eject: true,
+            on_insert: "rip".into(),
+            output_format: "mkv".into(),
+            network_target: String::new(),
+            on_read_error: "stop".into(),
+            max_retries: 1,
+            keep_iso: false,
+            tmdb_api_key: String::new(),
+            keydb_path: None,
+            keydb_url: String::new(),
+            webhook_urls: Vec::new(),
+            autorip_dir: "/config".into(),
+        }
+    }
+
+    fn tmdb_movie(title: &str, year: u16) -> tmdb::TmdbResult {
+        tmdb::TmdbResult {
+            title: title.into(),
+            year,
+            poster_url: String::new(),
+            overview: String::new(),
+            media_type: "movie".into(),
+        }
+    }
+
+    #[test]
+    fn sanitize_dir_name_strips_unsafe_characters() {
+        assert_eq!(sanitize_dir_name("Dune: Part Two"), "Dune Part Two");
+        assert_eq!(sanitize_dir_name("M*A*S*H"), "MASH");
+        assert_eq!(sanitize_dir_name("Alien/Predator"), "AlienPredator");
+        assert_eq!(sanitize_dir_name("What's Up, Doc?"), "What's Up Doc");
+    }
+
+    #[test]
+    fn sanitize_dir_name_keeps_allowed_punctuation() {
+        assert_eq!(sanitize_dir_name("Rogue One - A Star Wars Story"), "Rogue One - A Star Wars Story");
+        assert_eq!(sanitize_dir_name("Director_Cut.2019"), "Director_Cut.2019");
+    }
+
+    #[test]
+    fn sanitize_dir_name_trims_whitespace() {
+        assert_eq!(sanitize_dir_name("  spaced title  "), "spaced title");
+    }
+
+    #[test]
+    fn build_destination_movie_with_year() {
+        let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
+        let tmdb = Some(tmdb_movie("Dune Part Two", 2024));
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv");
+        assert_eq!(dest, "/out/Movies/Dune Part Two (2024)/Dune Part Two.mkv");
+    }
+
+    #[test]
+    fn build_destination_movie_without_year_falls_through() {
+        let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
+        let tmdb = Some(tmdb_movie("Unknown Year", 0));
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv");
+        // year=0 skips the "(YEAR)" suffix; mkv name derived from cleaned title.
+        assert_eq!(dest, "/out/Movies/Unknown Year/Unknown Year.mkv");
+    }
+
+    #[test]
+    fn build_destination_tv_uses_season_1_layout() {
+        let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
+        let tmdb = Some(tmdb::TmdbResult {
+            title: "Severance".into(),
+            year: 2022,
+            poster_url: String::new(),
+            overview: String::new(),
+            media_type: "tv".into(),
+        });
+        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv");
+        assert_eq!(dest, "/out/TV/Severance/Season 1/sev_s01e01.mkv");
+    }
+
+    #[test]
+    fn build_destination_no_tmdb_falls_to_output_dir() {
+        let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
+        let dest = build_destination(&cfg, &None, "disc.mkv");
+        assert_eq!(dest, "/out/disc.mkv");
+    }
+
+    #[test]
+    fn build_destination_empty_movie_dir_falls_to_output_dir() {
+        let cfg = cfg_with_dirs("", "/out/TV", "/out");
+        let tmdb = Some(tmdb_movie("Movie", 2020));
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv");
+        // movie_dir empty → fall-through to output_dir + filename.
+        assert_eq!(dest, "/out/disc.mkv");
+    }
+}
