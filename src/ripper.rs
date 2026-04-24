@@ -463,7 +463,13 @@ fn build_bad_ranges(
     let largest_gap_ms = ranges.first().map(|r| r.duration_ms).unwrap_or(0.0);
     let truncated = ranges.len().saturating_sub(50) as u32;
     ranges.truncate(50);
-    (ranges, total_count, truncated, total_lost_ms, largest_gap_ms)
+    (
+        ranges,
+        total_count,
+        truncated,
+        total_lost_ms,
+        largest_gap_ms,
+    )
 }
 
 /// Per-pass speed tracker — bytes delta / wall-clock delta between progress
@@ -1932,9 +1938,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     if cfg_read.max_retries > 0 {
         let iso_filename = format!("{}.iso", sanitize_filename(&display_name));
         let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
-        if let Ok(map) = libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(
-            &mapfile_path_str,
-        )) {
+        if let Ok(map) =
+            libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str))
+        {
             let stats = map.stats();
             // Only Unreadable counts as "lost" — NonTried / NonTrimmed /
             // NonScraped at the END of a rip means the rip was interrupted,
@@ -2227,7 +2233,10 @@ mod tests {
         let (_p, mf) = tmp_map("nontried", 10_000);
         let title = minimal_title();
         let (ranges, count, _trunc, lost, largest) = build_bad_ranges(&mf, &title, 1000.0);
-        assert!(ranges.is_empty(), "no Unreadable yet — list should be empty");
+        assert!(
+            ranges.is_empty(),
+            "no Unreadable yet — list should be empty"
+        );
         assert_eq!(count, 0);
         assert_eq!(lost, 0.0);
         assert_eq!(largest, 0.0);
@@ -2281,7 +2290,8 @@ mod tests {
         // 60 unreadable ranges, all same size. Must truncate to 50 with
         // `bad_ranges_truncated = 10`.
         for i in 0..60u64 {
-            mf.record(i * 10_000, 100, SectorStatus::Unreadable).unwrap();
+            mf.record(i * 10_000, 100, SectorStatus::Unreadable)
+                .unwrap();
         }
         let title = minimal_title();
         let (ranges, count, trunc, ..) = build_bad_ranges(&mf, &title, 1000.0);
@@ -2293,7 +2303,10 @@ mod tests {
     #[test]
     fn byte_offset_in_title_within_single_extent() {
         let title = libfreemkv::DiscTitle {
-            extents: vec![libfreemkv::Extent { start_lba: 1000, sector_count: 500 }],
+            extents: vec![libfreemkv::Extent {
+                start_lba: 1000,
+                sector_count: 500,
+            }],
             ..minimal_title()
         };
         // LBA 1100 is 100 sectors into the extent = 100 * 2048 bytes in title.
@@ -2304,8 +2317,14 @@ mod tests {
     fn byte_offset_in_title_across_multiple_extents() {
         let title = libfreemkv::DiscTitle {
             extents: vec![
-                libfreemkv::Extent { start_lba: 1000, sector_count: 100 },
-                libfreemkv::Extent { start_lba: 5000, sector_count: 200 },
+                libfreemkv::Extent {
+                    start_lba: 1000,
+                    sector_count: 100,
+                },
+                libfreemkv::Extent {
+                    start_lba: 5000,
+                    sector_count: 200,
+                },
             ],
             ..minimal_title()
         };
@@ -2319,7 +2338,10 @@ mod tests {
     #[test]
     fn byte_offset_in_title_returns_none_outside_extents() {
         let title = libfreemkv::DiscTitle {
-            extents: vec![libfreemkv::Extent { start_lba: 1000, sector_count: 100 }],
+            extents: vec![libfreemkv::Extent {
+                start_lba: 1000,
+                sector_count: 100,
+            }],
             ..minimal_title()
         };
         // LBA 200 is before the only extent — probably UDF metadata, no

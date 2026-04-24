@@ -328,7 +328,10 @@ mod tests {
 
     #[test]
     fn sanitize_dir_name_keeps_allowed_punctuation() {
-        assert_eq!(sanitize_dir_name("Rogue One - A Star Wars Story"), "Rogue One - A Star Wars Story");
+        assert_eq!(
+            sanitize_dir_name("Rogue One - A Star Wars Story"),
+            "Rogue One - A Star Wars Story"
+        );
         assert_eq!(sanitize_dir_name("Director_Cut.2019"), "Director_Cut.2019");
     }
 
