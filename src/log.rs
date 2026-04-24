@@ -136,7 +136,9 @@ mod tests {
         let d = tmpdir("iso_ts");
         // Route the test's logs to the tempdir.
         // SAFETY: env access in single-threaded tests.
-        unsafe { std::env::set_var("AUTORIP_DIR", &d); }
+        unsafe {
+            std::env::set_var("AUTORIP_DIR", &d);
+        }
         let dev = format!("test_sg_{}", std::process::id());
         device_log(&dev, "hello");
         let content = std::fs::read_to_string(device_log_path(&dev)).unwrap();
@@ -155,7 +157,9 @@ mod tests {
     fn archive_device_log_moves_to_rips_dir() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tmpdir("archive_move");
-        unsafe { std::env::set_var("AUTORIP_DIR", &d); }
+        unsafe {
+            std::env::set_var("AUTORIP_DIR", &d);
+        }
         let dev = format!("test_mv_{}", std::process::id());
         device_log(&dev, "pre-archive");
         let live = device_log_path(&dev);
@@ -184,7 +188,9 @@ mod tests {
     fn archive_device_log_no_op_when_empty() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tmpdir("archive_empty");
-        unsafe { std::env::set_var("AUTORIP_DIR", &d); }
+        unsafe {
+            std::env::set_var("AUTORIP_DIR", &d);
+        }
         let dev = format!("test_empty_{}", std::process::id());
         // Don't call device_log — file doesn't exist yet. archive_device_log
         // must not panic or create a junk archive entry.
@@ -205,7 +211,9 @@ mod tests {
     fn archive_device_log_clears_in_memory_buffer() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tmpdir("archive_buf");
-        unsafe { std::env::set_var("AUTORIP_DIR", &d); }
+        unsafe {
+            std::env::set_var("AUTORIP_DIR", &d);
+        }
         let dev = format!("test_buf_{}", std::process::id());
         device_log(&dev, "first");
         device_log(&dev, "second");
@@ -220,7 +228,9 @@ mod tests {
     fn get_device_log_respects_line_limit() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tmpdir("line_limit");
-        unsafe { std::env::set_var("AUTORIP_DIR", &d); }
+        unsafe {
+            std::env::set_var("AUTORIP_DIR", &d);
+        }
         let dev = format!("test_lim_{}", std::process::id());
         for i in 0..5 {
             device_log(&dev, &format!("line {i}"));

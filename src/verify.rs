@@ -3,8 +3,8 @@
 //! Opens drive fresh (requires container restart for firmware unlock).
 //! Stoppable via STOP flag. Reports live progress with good/bad/slow counts.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Live verify state, pushed to UI via SSE.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -277,10 +277,20 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
 
     let status = if was_stopped { "stopped" } else { "done" };
 
-    crate::log::device_log(device, &format!(
+    crate::log::device_log(
+        device,
+        &format!(
             "Verify {}: {:.4}% readable — {} good, {} bad ({:.1} MB, {:.1}s), {} slow, {} recovered",
-            status, result.readable_pct(), result.good, result.bad, bad_mb, bad_secs, result.slow, result.recovered,
-        ));
+            status,
+            result.readable_pct(),
+            result.good,
+            result.bad,
+            bad_mb,
+            bad_secs,
+            result.slow,
+            result.recovered,
+        ),
+    );
 
     set_state(VerifyState {
         status: status.into(),
