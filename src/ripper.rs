@@ -327,15 +327,61 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     continue;
                 }
 
-                // Open briefly to check status, then drop immediately. The
-                // pre-0.13 silent `Err(_) => continue` here is what produced
-                // "No drives detected" with no clue why — we now log every
-                // open failure with full error context.
-                let mut drive = match libfreemkv::Drive::open(std::path::Path::new(&path)) {
+                // Open briefly to check status, then drop immediately.
+                //
+                // Pre-0.13 the failure path was a silent `Err(_) => continue`
+                // — what produced "No drives detected" with no clue why.
+                // 0.13.0 added structured logging. 0.13.1 adds a single
+                // `scsi::reset()` retry on the wedge signature (E4000 with
+                // INQUIRY status=0xff) — what an unplug-replug does
+                // physically. Lets the daemon self-recover from an entire
+                // class of post-upgrade wedges without operator intervention.
+                let drive_result = match libfreemkv::Drive::open(std::path::Path::new(&path)) {
+                    Ok(d) => Ok(d),
+                    Err(e) => {
+                        let estr = format!("{e}");
+                        let is_wedge = estr.contains("E4000") && estr.contains("0xff");
+                        if is_wedge {
+                            tracing::info!(
+                                device = %device,
+                                error = %e,
+                                "wedged-drive signature — attempting scsi::reset() + reopen"
+                            );
+                            if let Err(reset_err) =
+                                libfreemkv::scsi::reset(std::path::Path::new(&path))
+                            {
+                                tracing::warn!(
+                                    device = %device,
+                                    error = %reset_err,
+                                    "scsi::reset() failed"
+                                );
+                                Err(e)
+                            } else {
+                                match libfreemkv::Drive::open(std::path::Path::new(&path)) {
+                                    Ok(d2) => {
+                                        tracing::info!(
+                                            device = %device,
+                                            "drive recovered after scsi::reset()"
+                                        );
+                                        Ok(d2)
+                                    }
+                                    Err(e2) => {
+                                        tracing::warn!(
+                                            device = %device,
+                                            error = %e2,
+                                            "reopen still failing after scsi::reset()"
+                                        );
+                                        Err(e2)
+                                    }
+                                }
+                            }
+                        } else {
+                            Err(e)
+                        }
+                    }
+                };
+                let mut drive = match drive_result {
                     Ok(d) => {
-                        // First success after a failure — clear the warned
-                        // flag so a transient error gets a fresh warning if
-                        // it recurs.
                         warned_open_fail.remove(&device);
                         d
                     }
@@ -989,7 +1035,9 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Full scan — titles, streams, AACS keys
     crate::log::device_log(device, "Scanning titles...");
     let scan_opts = match &cfg_read.keydb_path {
-        Some(p) => libfreemkv::ScanOptions::with_keydb(p),
+        Some(p) => libfreemkv::ScanOptions {
+            keydb_path: Some(p.into()),
+        },
         None => libfreemkv::ScanOptions::default(),
     };
     let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
@@ -1161,7 +1209,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             }
 
             let scan_opts = match &cfg_read.keydb_path {
-                Some(p) => libfreemkv::ScanOptions::with_keydb(p),
+                Some(p) => libfreemkv::ScanOptions {
+                    keydb_path: Some(p.into()),
+                },
                 None => libfreemkv::ScanOptions::default(),
             };
             crate::log::device_log(device, "Scanning titles...");
@@ -2359,12 +2409,37 @@ fn format_codecs(title: &libfreemkv::DiscTitle) -> String {
     for s in &title.streams {
         if let libfreemkv::Stream::Audio(a) = s {
             if !a.secondary {
-                parts.push(format!("{} {}", a.codec.name(), a.channels));
+                let mut audio = format!("{} {}", a.codec.name(), a.channels);
+                // autorip is English-only — inline the purpose tags directly.
+                if let Some(tag) = audio_purpose_tag(a.purpose) {
+                    audio.push_str(&format!(" {}", tag));
+                }
+                parts.push(audio);
                 break;
             }
         }
     }
     parts.join(" · ")
+}
+
+/// English purpose label for autorip rendering. None for Normal streams.
+/// libfreemkv keeps strings out of the library; autorip is English-only so we
+/// inline the words here rather than going through i18n.
+#[allow(dead_code)]
+fn audio_purpose_tag(p: libfreemkv::LabelPurpose) -> Option<&'static str> {
+    match p {
+        libfreemkv::LabelPurpose::Commentary => Some("Commentary"),
+        libfreemkv::LabelPurpose::Descriptive => Some("Descriptive Audio"),
+        libfreemkv::LabelPurpose::Score => Some("Score"),
+        libfreemkv::LabelPurpose::Ime => Some("IME"),
+        libfreemkv::LabelPurpose::Normal => None,
+    }
+}
+
+/// English secondary suffix for autorip rendering. Empty when not secondary.
+#[allow(dead_code)]
+fn audio_secondary_suffix(secondary: bool) -> &'static str {
+    if secondary { " (Secondary)" } else { "" }
 }
 
 #[cfg(test)]

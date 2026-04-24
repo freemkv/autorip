@@ -57,6 +57,8 @@ pub fn init() {
 
     let mut guards: Vec<WorkerGuard> = Vec::new();
 
+    // Human-readable log: daily-rolled. Operators tailing for the day's
+    // events get a manageable file size; older days archive to disk.
     let human_appender = rolling::daily(&log_dir, "autorip.log");
     let (human_writer, human_guard) = tracing_appender::non_blocking(human_appender);
     guards.push(human_guard);
@@ -66,7 +68,13 @@ pub fn init() {
         .with_target(true)
         .with_thread_ids(true);
 
-    let json_appender = rolling::daily(&log_dir, "autorip.jsonl");
+    // Machine-readable JSONL: NOT rolled. The web UI / `/api/debug` endpoint
+    // tails this file by a stable path; daily rotation would mean
+    // `autorip.jsonl.YYYY-MM-DD`, breaking lookups (the v0.13.0 file-not-
+    // found regression). We accept unbounded growth here — disk usage is
+    // ~1 KB per event × ~hundreds of events / day = MB/day at most. A
+    // future external `logrotate` (or similar) can rotate it out-of-band.
+    let json_appender = rolling::never(&log_dir, "autorip.jsonl");
     let (json_writer, json_guard) = tracing_appender::non_blocking(json_appender);
     guards.push(json_guard);
     let json_layer = fmt::layer()
