@@ -310,7 +310,15 @@ function renderCurrent(){
   }
   if(discIn&&!active)btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
 
-  const statusLabel=verifying?'verifying':(s.status||'idle');
+  /* Multipass label: show "pass 1/3 copying" etc. when in multipass mode.
+     Last pass is the mux from ISO. Falls back to raw status string otherwise. */
+  let statusLabel=verifying?'verifying':(s.status||'idle');
+  if(s.status==='ripping'&&s.pass>0&&s.total_passes>0){
+    const isMux=s.pass===s.total_passes;
+    const isCopy=s.pass===1;
+    const label=isMux?'muxing':(isCopy?'copying':'retrying');
+    statusLabel='pass '+s.pass+'/'+s.total_passes+' · '+label;
+  }
   const dot=active?'var(--green)':scanned?'var(--accent)':discIn?'var(--yellow)':'var(--text3)';
   const pulse=active?'animation:p 1.5s infinite;':'';
   upd('actions','<div class="actions"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dot+';vertical-align:middle;margin-right:6px;'+pulse+'"></span><span style="font-size:.8rem;color:var(--text2)">'+dev+' \u00b7 '+statusLabel+'</span><span style="margin-left:auto;display:flex;gap:6px">'+btns+'</span></div>');
@@ -341,6 +349,17 @@ function renderCurrent(){
   if(s.status==='ripping'&&s.current_batch>0&&s.preferred_batch>0&&s.current_batch<s.preferred_batch){
     const lbaStr=s.last_sector>0?' \u00b7 LBA '+s.last_sector.toLocaleString():'';
     errHtml+='<div style="background:var(--blue);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u21ba Recovering \u00b7 batch '+s.current_batch+' / '+s.preferred_batch+lbaStr+'</div>';
+  }
+  /* Multipass pass progress: show a blue banner during disc\u2192ISO copy and
+     retry passes with good/bad byte counts from the mapfile. The last pass
+     (mux from ISO) is displayed via the statusLabel only \u2014 no drive
+     involvement, no bad-range news to break. */
+  if(s.status==='ripping'&&s.total_passes>0&&s.pass>0&&s.pass<s.total_passes&&s.bytes_total_disc>0){
+    const goodGb=(s.bytes_good/1073741824).toFixed(2);
+    const totalGb=(s.bytes_total_disc/1073741824).toFixed(2);
+    const badMb=(s.bytes_bad/1048576).toFixed(2);
+    const phase=s.pass===1?'Ripping':'Retrying';
+    errHtml+='<div style="background:var(--blue);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+phase+' pass '+s.pass+'/'+s.total_passes+' \u00b7 '+goodGb+' / '+totalGb+' GB good \u00b7 '+badMb+' MB bad</div>';
   }
   upd('err',errHtml);
 

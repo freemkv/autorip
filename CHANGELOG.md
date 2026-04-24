@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.11.21 (2026-04-24)
+
+### Multi-pass rip — disc → ISO → patch → ISO → MKV
+
+When `max_retries > 0`, autorip now runs the full ddrescue-style multi-pass flow from libfreemkv 0.11.21:
+1. `Disc::copy` with `skip_on_error=true, skip_forward=true` → disc → ISO + ddrescue-format mapfile. 64 KB block reads, exponential skip-forward on failure, zero-fill bad ranges. A damaged disc completes pass 1 in minutes instead of hours.
+2. Up to `max_retries` calls to `Disc::patch` retry each bad range with full drive recovery enabled. Stops early if a pass recovers zero bytes (structure-protected sectors like Dune P2 never yield).
+3. Drive released. ISO muxed to MKV via existing `DiscStream + IsoSectorReader` pipeline.
+4. ISO pruned unless `keep_iso=true`.
+
+When `max_retries == 0`, the existing direct `disc → MKV` flow is unchanged — no ISO intermediate, no retry capability, fastest path.
+
+### New config
+- `MAX_RETRIES` (env, 0..=10, default `1`) — retry passes after pass 1.
+- `KEEP_ISO` (env, bool, default `false`) — preserve the intermediate ISO after mux.
+
+### New RipState fields
+- `pass` / `total_passes` — current pass number and total.
+- `bytes_good` / `bytes_bad` / `bytes_total_disc` — from mapfile stats during each pass.
+
+### UI
+- Status label shows `pass N/M · copying|retrying|muxing`.
+- Pass-progress banner during pass 1 and retries with live good/bad byte counts.
+
+### Version sync
+- 0.11.21 ecosystem release (libfreemkv + freemkv + bdemu + autorip all on 0.11.21).
+
 ## 0.11.20 (2026-04-24)
 
 ### Stop actually stops + UI shows real adaptive state during stalls
