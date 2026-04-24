@@ -29,7 +29,7 @@ fn install_signal_handler() {
             INTERRUPTED.store(true, Ordering::SeqCst);
             1
         }
-        extern "system" {
+        unsafe extern "system" {
             fn SetConsoleCtrlHandler(
                 handler: unsafe extern "system" fn(u32) -> i32,
                 add: i32,
@@ -763,9 +763,5 @@ fn sanitize_name(name: &str) -> String {
         )
         .trim()
         .replace(' ', "_");
-    if s.is_empty() {
-        "disc".to_string()
-    } else {
-        s
-    }
+    if s.is_empty() { "disc".to_string() } else { s }
 }

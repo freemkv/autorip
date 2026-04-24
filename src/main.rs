@@ -393,7 +393,9 @@ fn usage() {
     println!(
         "  freemkv disc:// iso://Disc.iso                     Full disc to ISO (auto-resumes)"
     );
-    println!("  freemkv disc:// iso://Disc.iso --raw               Full disc, no decryption (auto-resumes)");
+    println!(
+        "  freemkv disc:// iso://Disc.iso --raw               Full disc, no decryption (auto-resumes)"
+    );
     println!("  freemkv iso://Disc.iso mkv://Movie.mkv             ISO to MKV");
     println!("  freemkv m2ts://Movie.m2ts mkv://Movie.mkv          Remux m2ts to MKV");
     println!("  freemkv disc:// network://10.1.7.11:9000           Stream to network");
