@@ -3,8 +3,7 @@ services:
     image: ghcr.io/freemkv/autorip:latest
     container_name: autorip
     restart: unless-stopped
-    devices:
-      - /dev/sg4:/dev/sg4
+    privileged: true                    # required for optical SCSI access
     environment:
       - AUTORIP_DIR=/config
       - OUTPUT_DIR=/output
@@ -16,10 +15,10 @@ services:
       - AUTO_EJECT=true
       - ON_INSERT=rip
     volumes:
+      - /dev:/dev                       # live host /dev — handles USB re-enumeration (sg4 ↔ sg5 between reconnects)
       - ./config:/config
       - /mnt/media:/output
       - /tmp/autorip:/staging
       - /sys:/sys:ro
     ports:
       - 8080:8080
-    privileged: true  # Required for disc access
