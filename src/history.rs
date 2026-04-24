@@ -1,9 +1,26 @@
 pub fn record(history_dir: &str, entry: &serde_json::Value) {
-    let _ = std::fs::create_dir_all(history_dir);
-    let timestamp = chrono_timestamp();
-    let path = format!("{}/{}.json", history_dir, timestamp);
-    if let Ok(json) = serde_json::to_string_pretty(entry) {
-        let _ = std::fs::write(&path, json);
+    if let Err(e) = std::fs::create_dir_all(history_dir) {
+        tracing::warn!(path = %history_dir, error = %e, "history: cannot create dir");
+        return;
+    }
+    let timestamp = unix_timestamp_nanos();
+    // Include the device suffix when present so two devices recording in the
+    // same nanosecond (rare, but possible — clock granularity varies) can't
+    // collide. Falls through to plain timestamp when the entry has no device.
+    let device = entry
+        .get("device")
+        .and_then(|v| v.as_str())
+        .unwrap_or("system");
+    let path = format!("{}/{}_{}.json", history_dir, timestamp, device);
+    match serde_json::to_string_pretty(entry) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!(path = %path, error = %e, "history: write failed");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "history: serialize failed");
+        }
     }
 }
 
@@ -29,13 +46,16 @@ pub fn load_recent(history_dir: &str, count: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn chrono_timestamp() -> String {
+/// Unix nanoseconds since epoch. Nanosecond precision so two rapid-fire
+/// rips (or rips on two drives finishing in the same wall-clock second)
+/// don't collide on the same filename. Misnamed `chrono_timestamp` pre-0.13
+/// despite never using the `chrono` crate.
+fn unix_timestamp_nanos() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    format!("{}", secs)
+        .as_nanos()
 }
 
 #[cfg(test)]

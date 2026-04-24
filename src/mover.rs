@@ -19,18 +19,29 @@ pub static MOVE_STATE: once_cell::sync::Lazy<Mutex<Option<MoveState>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 pub fn run(cfg: &Arc<RwLock<Config>>) {
-    loop {
-        let cfg = match cfg.read() {
+    use std::sync::atomic::Ordering;
+    tracing::info!("mover loop starting");
+    while !crate::SHUTDOWN.load(Ordering::Relaxed) {
+        let cfg_snapshot = match cfg.read() {
             Ok(c) => c,
-            Err(_) => {
+            Err(e) => {
+                tracing::warn!(error = %e, "mover: config lock poisoned, retrying");
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 continue;
             }
         };
-        check_and_move(&cfg);
-        drop(cfg);
-        std::thread::sleep(std::time::Duration::from_secs(10));
+        check_and_move(&cfg_snapshot);
+        drop(cfg_snapshot);
+        // SHUTDOWN-responsive sleep — break early on signal so SIGTERM
+        // doesn't have to wait the full 10 s tick.
+        for _ in 0..100 {
+            if crate::SHUTDOWN.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
+    tracing::info!("mover loop stopping");
 }
 
 fn check_and_move(cfg: &Config) {
@@ -177,7 +188,7 @@ fn check_and_move(cfg: &Config) {
 
 fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
     if let Some(result) = tmdb {
-        let safe_title = sanitize_dir_name(&result.title);
+        let safe_title = crate::util::sanitize_path_display(&result.title);
         match result.media_type.as_str() {
             "movie" if !cfg.movie_dir.is_empty() => {
                 let year_str = if result.year > 0 {
@@ -265,20 +276,8 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
     }
 }
 
-fn sanitize_dir_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| {
-            c.is_ascii_alphanumeric()
-                || *c == ' '
-                || *c == '-'
-                || *c == '_'
-                || *c == '.'
-                || *c == '\''
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
+// `sanitize_dir_name` moved to `crate::util::sanitize_path_display` in 0.13.0.
+// Single source of truth shared with the staging path in `ripper`.
 
 #[cfg(test)]
 mod tests {
@@ -320,24 +319,39 @@ mod tests {
 
     #[test]
     fn sanitize_dir_name_strips_unsafe_characters() {
-        assert_eq!(sanitize_dir_name("Dune: Part Two"), "Dune Part Two");
-        assert_eq!(sanitize_dir_name("M*A*S*H"), "MASH");
-        assert_eq!(sanitize_dir_name("Alien/Predator"), "AlienPredator");
-        assert_eq!(sanitize_dir_name("What's Up, Doc?"), "What's Up Doc");
+        assert_eq!(
+            crate::util::sanitize_path_display("Dune: Part Two"),
+            "Dune Part Two"
+        );
+        assert_eq!(crate::util::sanitize_path_display("M*A*S*H"), "MASH");
+        assert_eq!(
+            crate::util::sanitize_path_display("Alien/Predator"),
+            "AlienPredator"
+        );
+        assert_eq!(
+            crate::util::sanitize_path_display("What's Up, Doc?"),
+            "What's Up Doc"
+        );
     }
 
     #[test]
     fn sanitize_dir_name_keeps_allowed_punctuation() {
         assert_eq!(
-            sanitize_dir_name("Rogue One - A Star Wars Story"),
+            crate::util::sanitize_path_display("Rogue One - A Star Wars Story"),
             "Rogue One - A Star Wars Story"
         );
-        assert_eq!(sanitize_dir_name("Director_Cut.2019"), "Director_Cut.2019");
+        assert_eq!(
+            crate::util::sanitize_path_display("Director_Cut.2019"),
+            "Director_Cut.2019"
+        );
     }
 
     #[test]
     fn sanitize_dir_name_trims_whitespace() {
-        assert_eq!(sanitize_dir_name("  spaced title  "), "spaced title");
+        assert_eq!(
+            crate::util::sanitize_path_display("  spaced title  "),
+            "spaced title"
+        );
     }
 
     #[test]

@@ -1,5 +1,143 @@
 # Changelog
 
+## 0.13.0 (2026-04-24)
+
+### Stop being blind: structural observability rebuild
+
+Every commit since 0.11.13 has been a hand-instrumented fix for a thing
+discovered in production because the app told us nothing. Inventory at the
+start of this release: 97 log call sites, 60 silent failure paths, and the
+drive poll loop logged zero of its decisions. Diagnosing today's "No drives
+detected" required reading source + poking `/proc` + reading `/sys`.
+
+This release replaces the ad-hoc `eprintln` + per-device file scheme with
+the `tracing` ecosystem (`tracing` 0.1, `tracing-subscriber` 0.3,
+`tracing-appender` 0.2). Every event is now structured, leveled, optionally
+filtered, and written to three sinks:
+
+- **`{AUTORIP_DIR}/logs/autorip.log`** — daily-rolled, human-readable. The
+  file an operator tails when something is going on.
+- **`{AUTORIP_DIR}/logs/autorip.jsonl`** — daily-rolled, JSON Lines, one
+  event per line. The file you `jq` for post-mortems and the file the new
+  `/api/debug` endpoint streams.
+- **stderr** — captured by Docker as the container log.
+
+Filter via `AUTORIP_LOG_LEVEL` (env-filter syntax). Default
+`autorip=info,libfreemkv=warn`. For deep dives,
+`AUTORIP_LOG_LEVEL=autorip=debug`.
+
+Existing `log::syslog` and `log::device_log` API preserved as shims — the
+97 call sites stay put. They emit a tracing event AND keep writing the
+per-device `.log` files the web UI scrapes via `/api/logs/{device}`.
+
+#### Drive poll loop instrumentation
+
+Every silent skip is now a structured event:
+
+- `Drive::open` failure → `warn!(device, error, …)` once per device, then
+  `debug!` on continued failure (no log spam from a permanently-locked sg).
+- sysfs type-5 reject → `debug!(device, sysfs_type, …)`.
+- `disc inserted` / `disc removed` / `drive present` / `drive disappeared`
+  state transitions all log at info.
+- Spawned scan/rip threads get a `name` (`rip-sg4`) so panic backtraces
+  carry context.
+
+This single change is what makes today's "No drives detected" diagnosable
+in one query: `curl -s host:8080/api/debug?level=warn | jq`.
+
+#### `/api/debug` endpoint
+
+`GET /api/debug?n=N&level=L&device=D&q=substr` tails `autorip.jsonl`,
+filtered. Returns raw JSONL (newline-separated objects), so:
+
+```sh
+curl -s autorip:8080/api/debug?level=warn&device=sg4 | jq .
+```
+
+works as expected. Web UI Debug tab consumes the same endpoint. Default 500
+lines, max 5000.
+
+### Critical / High audit fixes (each one its own ghost)
+
+- **C1: Cron job that spawned `autorip --update-keydb` is removed.** Cron
+  stripped env, ran the binary as a fresh daemon, raced the live process
+  for `/dev/sg*` and port 8080. Cumulative effect after a multi-day uptime
+  was 30+ ghost daemons fighting over the optical drive — the actual root
+  cause of today's "No drives detected." KEYDB updates run from the live
+  process's hourly thread; that's the single source of truth now.
+- **C2: Web bind failure → SHUTDOWN.** Pre-0.13 a port-already-in-use
+  failure left the daemon running with no UI, restart policy oblivious.
+  Now `web::run` flips the SHUTDOWN flag on bind failure so `main` exits
+  non-zero and the container's restart policy recovers us.
+- **C3: `session.disc.take().unwrap()` panic surface eliminated.** Every
+  current code path sets `Some(disc)`, but a future regression would have
+  panicked in a spawned thread. Now an explicit match logs and updates UI
+  state to error.
+- **H1: Version stamped at startup.** `autorip starting (v0.13.0, …)` plus
+  a structured `version=… os=… arch=…` event. Today's incident left logs
+  saying "config.rs:45:52 panic" — a line that doesn't exist in current
+  source — because there was no record of which build emitted it.
+- **H2: Healthcheck.** Dockerfile `HEALTHCHECK` + compose example
+  `healthcheck:` section. Hits `/api/state`. Together with `restart:
+  unless-stopped`, Docker auto-recovers a wedged container.
+- **H3: `update_state_with(device, |s| …)` partial-update helper.** Three
+  past regressions (v0.11.20 watchdog, v0.11.17 errors-on-completion,
+  v0.12.0 pass-progress) were the same shape: `RipState { …,
+  ..Default::default() }` silently zeroed a field the UI was rendering.
+  The watchdog tick now uses the closure form — fields not explicitly set
+  stay where they were.
+- **H5: Drive init failures surfaced.** `let _ = drive.wait_ready()` and
+  `let _ = drive.init()` in scan/rip/verify now log warn events with the
+  underlying error, so degraded-drive scans don't fail later with a
+  cryptic library error.
+
+### Medium fixes
+
+- **M3: sg enumeration via sysfs.** `0..16u8` hardcoded loop replaced with
+  `read_dir("/sys/class/scsi_generic")` so sg16+ are seen and the order
+  doesn't shuffle when sg numbers cross 9 → 10. Falls back to the old
+  probe if `/sys` isn't mounted (dev hosts).
+- **M1+M2: Sanitizer / duration helpers consolidated in `util`.**
+  `sanitize_path_compact` (snake_case for staging filenames) and
+  `sanitize_path_display` (human-readable for library destinations) are
+  now the single source of truth — pre-0.13 there were two slightly
+  different copies in `ripper` and `mover` that drifted (one replaced
+  spaces, the other didn't). Same for `format_duration_hm`.
+- **M4: History filename precision.** `{seconds}.json` could collide
+  between two rapid rips. Now `{nanoseconds}_{device}.json`.
+- **L3: Mover + KEYDB threads respect SHUTDOWN.** Pre-0.13 they slept in
+  10 s / 1 h chunks regardless of signal — SIGTERM had to wait the full
+  tick. Both now break out within ~1 s.
+- **L5: `chrono_timestamp` renamed to `unix_timestamp_nanos`** — there is
+  no `chrono` crate dep; the name was misleading.
+
+### SHUTDOWN-responsive sleeps
+
+`drive_poll_loop` and `mover::run` both moved from monolithic `sleep`
+calls to 100 ms-tick loops that check SHUTDOWN. SIGTERM is now observed in
+~1 s rather than waiting the full poll/move interval.
+
+### What didn't change
+
+`rip_complete` webhook payload still reports `output_path: <staging dir>`
+and `move_complete` reports the final destination. The naming is
+misleading (a Discord/Jellyfin user gets a path their library never sees
+in `rip_complete`) but renaming the field is a webhook contract break and
+isn't worth the churn for a v0.13 — flagged in audit notes for v0.14.
+
+Two known v0.14 follow-ups: in-process mover (replace the `cp`
+subprocess with `std::fs::copy` + chunked progress), and abstracting
+`Drive::open` behind a trait so the poll loop can be unit-tested end-to-end.
+
+### Tests
+
+- `update_state_with_preserves_untouched_fields` — guards the H3 regression class
+- `enumerate_optical_drives_returns_sorted_unique` — guards M3
+- `sanitize_path_compact_*` / `sanitize_path_display_*` — guards M1
+- `format_duration_hm_*` — guards M2
+
+47 → 59 tests.
+
 ## 0.12.5 (2026-04-24)
 
 ### Stop silent resume — every rip starts fresh

@@ -2,6 +2,7 @@ mod config;
 mod history;
 mod log;
 mod mover;
+mod observe;
 mod ripper;
 mod tmdb;
 mod util;
@@ -15,6 +16,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 fn main() {
+    // Tracing FIRST — before any log call, panic hook, or thread spawn.
+    // Sets up stderr + autorip.log + autorip.jsonl sinks. Filter via
+    // AUTORIP_LOG_LEVEL env (default `autorip=info,libfreemkv=warn`).
+    observe::init();
+
     // Signal handler for graceful shutdown
     #[cfg(unix)]
     unsafe {
@@ -46,10 +52,22 @@ fn main() {
             .name()
             .unwrap_or("<unnamed>")
             .to_string();
+        // Both: structured event for the JSONL stream (greppable post-mortem)
+        // AND the legacy syslog line so the per-device file + UI keep working.
+        tracing::error!(thread = %thread, location = %loc, message = %msg, "panic");
         log::syslog(&format!("PANIC in thread '{thread}' at {loc}: {msg}"));
     }));
 
-    log::syslog("autorip starting");
+    log::syslog(&format!(
+        "autorip starting (v{}, edition 2024)",
+        env!("CARGO_PKG_VERSION")
+    ));
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        target = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        "autorip starting"
+    );
 
     // Load config
     let cfg = config::load();
@@ -103,42 +121,54 @@ fn main() {
         move || web::run(&cfg)
     });
 
-    // Start KEYDB auto-update thread
+    // Start KEYDB auto-update thread. Single source of truth for periodic
+    // KEYDB refresh — pre-0.13 there was also a cron entry that spawned a
+    // second `autorip` binary, which raced this thread for /dev/sg* and
+    // port 8080. Cron path was removed; this is now the only daily updater.
     let _keydb_handle = std::thread::spawn({
         let cfg2 = cfg.clone();
-        move || loop {
-            // Check every hour, update once daily
-            for _ in 0..24 {
-                std::thread::sleep(std::time::Duration::from_secs(3600));
-                if SHUTDOWN.load(Ordering::Relaxed) {
-                    return;
-                }
-            }
-            let url = cfg2
-                .read()
-                .ok()
-                .map(|c| c.keydb_url.clone())
-                .unwrap_or_default();
-            if url.is_empty() {
-                continue;
-            }
-            match ureq::get(&url).call() {
-                Ok(resp) => {
-                    let mut buf = Vec::new();
-                    if resp
-                        .into_reader()
-                        .take(100 * 1024 * 1024)
-                        .read_to_end(&mut buf)
-                        .is_ok()
-                    {
-                        match libfreemkv::keydb::save(&buf) {
-                            Ok(r) => log::syslog(&format!("KEYDB updated: {} entries", r.entries)),
-                            Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
-                        }
+        move || {
+            tracing::info!("keydb update thread starting (24h interval)");
+            'outer: loop {
+                // 24h sleep in 1s chunks so SHUTDOWN is observed within ~1s.
+                for _ in 0..(24 * 3600) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if SHUTDOWN.load(Ordering::Relaxed) {
+                        break 'outer;
                     }
                 }
-                Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
+                let url = cfg2
+                    .read()
+                    .ok()
+                    .map(|c| c.keydb_url.clone())
+                    .unwrap_or_default();
+                if url.is_empty() {
+                    continue;
+                }
+                tracing::info!(url = %url, "keydb: starting daily update");
+                match ureq::get(&url).call() {
+                    Ok(resp) => {
+                        let mut buf = Vec::new();
+                        if resp
+                            .into_reader()
+                            .take(100 * 1024 * 1024)
+                            .read_to_end(&mut buf)
+                            .is_ok()
+                        {
+                            match libfreemkv::keydb::save(&buf) {
+                                Ok(r) => {
+                                    log::syslog(&format!("KEYDB updated: {} entries", r.entries))
+                                }
+                                Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
+                            }
+                        } else {
+                            tracing::warn!("keydb: response read failed");
+                        }
+                    }
+                    Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
+                }
             }
+            tracing::info!("keydb update thread stopping");
         }
     });
 
