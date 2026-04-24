@@ -192,6 +192,17 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 if !std::path::Path::new(&path).exists() {
                     continue;
                 }
+                // Cheap sysfs pre-filter: SCSI type 5 = CD/DVD/BD optical.
+                // Avoids Drive::open's 2s reset dance on non-optical sg nodes
+                // (RAID controllers, NVMe passthroughs) when /dev is bind-mounted
+                // live from the host. Falls through on read failure so we don't
+                // accidentally exclude an optical drive if sysfs is unreadable.
+                let type_path = format!("/sys/class/scsi_generic/sg{}/device/type", i);
+                if let Ok(s) = std::fs::read_to_string(&type_path) {
+                    if s.trim() != "5" {
+                        continue;
+                    }
+                }
                 let device = format!("sg{}", i);
 
                 // Don't touch drives that are actively scanning/ripping
