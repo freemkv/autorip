@@ -43,3 +43,53 @@ pub fn format_iso_datetime() -> String {
 pub fn format_iso_datetime_filename() -> String {
     format_iso_datetime().replace(':', "-")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_from_days_epoch() {
+        // Unix epoch day 0 = 1970-01-01.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn civil_from_days_leap_year_march() {
+        // 2024-03-01 is day 19783 from Unix epoch (verified via Python datetime).
+        assert_eq!(civil_from_days(19783), (2024, 3, 1));
+    }
+
+    #[test]
+    fn civil_from_days_far_future() {
+        // 2026-04-24 = day 20567 from epoch.
+        assert_eq!(civil_from_days(20567), (2026, 4, 24));
+    }
+
+    #[test]
+    fn format_iso_datetime_shape() {
+        // Can't assert exact value (depends on wall clock) but can assert shape.
+        let s = format_iso_datetime();
+        assert_eq!(s.len(), 20); // "YYYY-MM-DDTHH:MM:SSZ"
+        assert!(s.ends_with('Z'));
+        assert_eq!(s.as_bytes()[10], b'T');
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[13], b':');
+    }
+
+    #[test]
+    fn format_iso_datetime_filename_no_colons() {
+        // Filesystem-safe variant replaces `:` with `-`.
+        let s = format_iso_datetime_filename();
+        assert!(!s.contains(':'));
+        assert!(s.ends_with('Z'));
+    }
+
+    #[test]
+    fn format_date_shape() {
+        let s = format_date();
+        assert_eq!(s.len(), 10); // "YYYY-MM-DD"
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[7], b'-');
+    }
+}
