@@ -639,8 +639,8 @@ function renderSettings(s){
       {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. 192.168.1.100:9000)',indent:true,placeholder:'192.168.1.100:9000',showIf:{key:'output_format',value:'network'}},
     ]},
     {title:'Recovery',fields:[
-      {key:'max_retries',label:'Retry Passes',type:'number',hint:'0 = single pass direct disc→MKV (fastest). 1..=10 = disc→ISO pass 1 + N retry passes on bad ranges, then mux. Use 1 by default; raise for physically damaged discs. Retries use full drive recovery — slow per sector but only on ranges that already failed.'},
-      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Preserve the disc→ISO dump + mapfile in staging after MKV is produced. Useful for forensics or re-muxing later; costs ~disc-size of disk per rip.'},
+      {key:'max_retries',label:'Retry Passes',type:'number',hint:'Number of retry attempts for bad sectors. 0 = no retry, direct disc→MKV (fastest). 1-10 = rip to ISO first, retry bad ranges, then mux to MKV. Raise if a disc has recoverable damage; leave at default (1) for most.'},
+      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Preserve the disc ISO + mapfile after MKV mux. Off by default to reclaim disk.'},
     ]},
     {title:'Output',fields:[
       {key:'output_dir',label:'Output Directory',type:'text',hint:'Where all ripped files go by default'},
