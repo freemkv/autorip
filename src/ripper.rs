@@ -1,6 +1,7 @@
+use libfreemkv::event::BatchSizeReason;
 use libfreemkv::pes::Stream as PesStream;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::config::Config;
@@ -64,6 +65,18 @@ pub struct RipState {
     pub speed_mbs: f64,
     pub eta: String,
     pub errors: u32,
+    /// Estimated seconds of video lost to skipped sectors. Uses the title's
+    /// actual bitrate, not a hardcoded constant — the UI should prefer this
+    /// over computing from `errors` client-side.
+    pub lost_video_secs: f64,
+    /// Last sector read (LBA). Shows forward motion through a bad zone even
+    /// when bytes_written is stalled waiting for the demuxer.
+    pub last_sector: u64,
+    /// Current adaptive batch size. Equal to `preferred_batch` during clean
+    /// reads; drops on failure, climbs back with sustained success.
+    pub current_batch: u16,
+    /// Kernel-reported preferred batch size (from detect_max_batch_sectors).
+    pub preferred_batch: u16,
     pub last_error: String,
     pub output_file: String,
     pub tmdb_title: String,
@@ -87,6 +100,10 @@ impl Default for RipState {
             speed_mbs: 0.0,
             eta: String::new(),
             errors: 0,
+            lost_video_secs: 0.0,
+            last_sector: 0,
+            current_batch: 0,
+            preferred_batch: 0,
             last_error: String::new(),
             output_file: String::new(),
             tmdb_title: String::new(),
@@ -740,28 +757,58 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         },
     );
 
+    // Per-title bitrate for lost-video-time math. Falls back to 66 Mbps
+    // (sustained BD) if the scanner didn't populate size_bytes/duration.
+    let title_bytes_per_sec: f64 = {
+        let b = title.size_bytes as f64;
+        let d = title.duration_secs;
+        if b > 0.0 && d > 0.0 {
+            b / d
+        } else {
+            8_250_000.0
+        }
+    };
+
+    // Shared state read by event callbacks (no &mut self) and the main
+    // rip loop (which copies atomics into RipState every ~1s). The watchdog
+    // timestamp is updated on ANY sector-level event — not just frame writes —
+    // so a long run of skipped sectors doesn't falsely register as "stalled".
+    let wd_last_frame = Arc::new(AtomicU64::new(crate::util::epoch_secs()));
+    let rip_last_lba = Arc::new(AtomicU64::new(0));
+    let rip_current_batch = Arc::new(AtomicU16::new(batch));
+
     // Create PES stream — same drive session, no re-open
     let halt = session.drive.halt_flag();
     register_halt(device, halt.clone());
     let dev_for_events = device.to_string();
-    session.drive.on_event(move |event| match event.kind {
-        libfreemkv::event::EventKind::ReadError { sector, .. } => {
-            crate::log::device_log(&dev_for_events, &format!("Read error at sector {}", sector));
-        }
-        libfreemkv::event::EventKind::Retry { attempt } => {
-            crate::log::device_log(&dev_for_events, &format!("Retrying (attempt {})", attempt));
-        }
-        libfreemkv::event::EventKind::SectorRecovered { sector } => {
-            crate::log::device_log(&dev_for_events, &format!("Sector {} recovered", sector));
-        }
-        libfreemkv::event::EventKind::SpeedChange { speed_kbs } => {
-            if speed_kbs == 0 {
-                crate::log::device_log(&dev_for_events, "Recovery: min speed");
-            } else {
-                crate::log::device_log(&dev_for_events, "Restoring full speed");
+    let wdf_drive = wd_last_frame.clone();
+    session.drive.on_event(move |event| {
+        // Any drive-level event means something is happening — reset the
+        // watchdog so the "stalled" timer doesn't monotonically climb
+        // while the library is working through recovery.
+        wdf_drive.store(crate::util::epoch_secs(), Ordering::Relaxed);
+        match event.kind {
+            libfreemkv::event::EventKind::ReadError { sector, .. } => {
+                crate::log::device_log(
+                    &dev_for_events,
+                    &format!("Read error at sector {}", sector),
+                );
             }
+            libfreemkv::event::EventKind::Retry { attempt } => {
+                crate::log::device_log(&dev_for_events, &format!("Retrying (attempt {})", attempt));
+            }
+            libfreemkv::event::EventKind::SectorRecovered { sector } => {
+                crate::log::device_log(&dev_for_events, &format!("Sector {} recovered", sector));
+            }
+            libfreemkv::event::EventKind::SpeedChange { speed_kbs } => {
+                if speed_kbs == 0 {
+                    crate::log::device_log(&dev_for_events, "Recovery: min speed");
+                } else {
+                    crate::log::device_log(&dev_for_events, "Restoring full speed");
+                }
+            }
+            _ => {}
         }
-        _ => {}
     });
     let mut input =
         libfreemkv::DiscStream::new(Box::new(session.drive), title, keys, batch, format);
@@ -769,26 +816,41 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         input.skip_errors = true;
     }
     let dev_for_stream_events = device.to_string();
-    input.on_event(move |event| match event.kind {
-        libfreemkv::event::EventKind::BinarySearch { sector, batch_size } => {
-            crate::log::device_log(
-                &dev_for_stream_events,
-                &format!("Binary search at sector {} (batch {})", sector, batch_size),
-            );
+    let wdf_stream = wd_last_frame.clone();
+    let llba_stream = rip_last_lba.clone();
+    let rbs_stream = rip_current_batch.clone();
+    input.on_event(move |event| {
+        // Same rationale as the drive callback — DiscStream events prove
+        // the rip is advancing even if no PES frame has been emitted yet.
+        wdf_stream.store(crate::util::epoch_secs(), Ordering::Relaxed);
+        match event.kind {
+            libfreemkv::event::EventKind::BatchSizeChanged { new_size, reason } => {
+                rbs_stream.store(new_size, Ordering::Relaxed);
+                let label = match reason {
+                    BatchSizeReason::Shrunk => "shrunk",
+                    BatchSizeReason::Probed => "probed up",
+                };
+                crate::log::device_log(
+                    &dev_for_stream_events,
+                    &format!("Batch size → {} ({})", new_size, label),
+                );
+            }
+            libfreemkv::event::EventKind::SectorSkipped { sector } => {
+                llba_stream.store(sector, Ordering::Relaxed);
+                crate::log::device_log(
+                    &dev_for_stream_events,
+                    &format!("Sector {} skipped (zero-filled)", sector),
+                );
+            }
+            libfreemkv::event::EventKind::SectorRecovered { sector } => {
+                llba_stream.store(sector, Ordering::Relaxed);
+                crate::log::device_log(
+                    &dev_for_stream_events,
+                    &format!("Sector {} recovered", sector),
+                );
+            }
+            _ => {}
         }
-        libfreemkv::event::EventKind::SectorSkipped { sector } => {
-            crate::log::device_log(
-                &dev_for_stream_events,
-                &format!("Sector {} skipped (zero-filled)", sector),
-            );
-        }
-        libfreemkv::event::EventKind::SectorRecovered { sector } => {
-            crate::log::device_log(
-                &dev_for_stream_events,
-                &format!("Sector {} recovered via binary search", sector),
-            );
-        }
-        _ => {}
     });
 
     // Read frames until codec headers are ready
@@ -1112,6 +1174,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 }
 
                 let skip_errors = input.errors as u32;
+                let lost_video_secs = if title_bytes_per_sec > 0.0 {
+                    (skip_errors as f64) * 2048.0 / title_bytes_per_sec
+                } else {
+                    0.0
+                };
                 update_state(
                     device,
                     RipState {
@@ -1125,6 +1192,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         speed_mbs: speed,
                         eta,
                         errors: skip_errors,
+                        lost_video_secs,
+                        last_sector: rip_last_lba.load(Ordering::Relaxed),
+                        current_batch: rip_current_batch.load(Ordering::Relaxed),
+                        preferred_batch: batch,
                         output_file: filename.clone(),
                         tmdb_title: tmdb_title.clone(),
                         tmdb_year,
@@ -1165,15 +1236,69 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     } else {
         0.0
     };
+    let final_errors = input.errors as u32;
+    let final_last_sector = rip_last_lba.load(Ordering::Relaxed);
+    let final_current_batch = rip_current_batch.load(Ordering::Relaxed);
+    let final_lost_secs = if title_bytes_per_sec > 0.0 {
+        (final_errors as f64) * 2048.0 / title_bytes_per_sec
+    } else {
+        0.0
+    };
+
+    // Write a history record for every rip attempt — completed OR stopped.
+    // Stopped rips used to leave no persistent trace except the device log,
+    // which gets clobbered on the next scan. Include errors/lost/last_sector
+    // so damaged-disc attempts are auditable.
+    let status_label = if completed { "complete" } else { "stopped" };
+    {
+        let tmdb_ref = &session.tmdb;
+        let marker = serde_json::json!({
+            "title": display_name,
+            "disc_name": disc_name,
+            "format": disc_format,
+            "year": tmdb_year,
+            "media_type": tmdb_ref.as_ref().map(|t| t.media_type.as_str()).unwrap_or("unknown"),
+            "poster_url": tmdb_poster,
+            "overview": tmdb_overview,
+            "date": crate::util::format_date(),
+        });
+        if completed {
+            // Only mark staging as ready-to-move when the rip actually finished.
+            let marker_path = format!("{}/.done", staging);
+            let _ = std::fs::write(
+                &marker_path,
+                serde_json::to_string_pretty(&marker).unwrap_or_default(),
+            );
+        }
+
+        let mut entry = marker.clone();
+        entry["status"] = serde_json::json!(status_label);
+        entry["staging_dir"] = serde_json::json!(staging);
+        entry["size_gb"] =
+            serde_json::json!((bytes_done as f64 / 1_073_741_824.0 * 10.0).round() / 10.0);
+        entry["speed_mbs"] = serde_json::json!((speed * 10.0).round() / 10.0);
+        entry["elapsed_secs"] = serde_json::json!(elapsed.round() as u64);
+        entry["duration"] = serde_json::json!(duration);
+        entry["codecs"] = serde_json::json!(codecs);
+        entry["device"] = serde_json::json!(device);
+        entry["errors"] = serde_json::json!(final_errors);
+        entry["lost_video_secs"] = serde_json::json!((final_lost_secs * 1000.0).round() / 1000.0);
+        entry["last_sector"] = serde_json::json!(final_last_sector);
+        let log_lines = crate::log::get_device_log(device, 500);
+        entry["log"] = serde_json::json!(log_lines.join("\n"));
+        crate::history::record(&cfg_read.history_dir(), &entry);
+    }
 
     if !completed {
         crate::log::device_log(
             device,
             &format!(
-                "Stopped: {:.1} GB in {:.0}s ({:.0} MB/s)",
+                "Stopped: {:.1} GB in {:.0}s ({:.0} MB/s), {} skipped (~{:.3}s lost)",
                 bytes_done as f64 / 1_073_741_824.0,
                 elapsed,
-                speed
+                speed,
+                final_errors,
+                final_lost_secs,
             ),
         );
         update_state(
@@ -1184,6 +1309,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 disc_present: true,
                 disc_name: display_name.clone(),
                 disc_format: disc_format.clone(),
+                errors: final_errors,
+                lost_video_secs: final_lost_secs,
+                last_sector: final_last_sector,
+                current_batch: final_current_batch,
+                preferred_batch: batch,
                 tmdb_title: tmdb_title.clone(),
                 tmdb_year,
                 tmdb_poster: tmdb_poster.clone(),
@@ -1199,46 +1329,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     crate::log::device_log(
         device,
         &format!(
-            "Complete: {:.1} GB in {:.0}s ({:.0} MB/s)",
+            "Complete: {:.1} GB in {:.0}s ({:.0} MB/s), {} skipped (~{:.3}s lost)",
             bytes_done as f64 / 1_073_741_824.0,
             elapsed,
-            speed
+            speed,
+            final_errors,
+            final_lost_secs,
         ),
     );
-
-    // Mark staging as complete — mover picks this up even after restart/stop
-    {
-        let tmdb_ref = &session.tmdb;
-        let marker = serde_json::json!({
-            "title": display_name,
-            "disc_name": disc_name,
-            "format": disc_format,
-            "year": tmdb_year,
-            "media_type": tmdb_ref.as_ref().map(|t| t.media_type.as_str()).unwrap_or("unknown"),
-            "poster_url": tmdb_poster,
-            "overview": tmdb_overview,
-            "date": crate::util::format_date(),
-        });
-        let marker_path = format!("{}/.done", staging);
-        let _ = std::fs::write(
-            &marker_path,
-            serde_json::to_string_pretty(&marker).unwrap_or_default(),
-        );
-
-        // Record history with rip stats
-        let mut entry = marker.clone();
-        entry["staging_dir"] = serde_json::json!(staging);
-        entry["size_gb"] =
-            serde_json::json!((bytes_done as f64 / 1_073_741_824.0 * 10.0).round() / 10.0);
-        entry["speed_mbs"] = serde_json::json!((speed * 10.0).round() / 10.0);
-        entry["elapsed_secs"] = serde_json::json!(elapsed.round() as u64);
-        entry["duration"] = serde_json::json!(duration);
-        entry["codecs"] = serde_json::json!(codecs);
-        entry["device"] = serde_json::json!(device);
-        let log_lines = crate::log::get_device_log(device, 500);
-        entry["log"] = serde_json::json!(log_lines.join("\n"));
-        crate::history::record(&cfg_read.history_dir(), &entry);
-    }
 
     update_state(
         device,
@@ -1249,6 +1347,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             disc_name: display_name.clone(),
             disc_format: disc_format.clone(),
             progress_pct: 100,
+            errors: final_errors,
+            lost_video_secs: final_lost_secs,
+            last_sector: final_last_sector,
+            current_batch: final_current_batch,
+            preferred_batch: batch,
             output_file: staging.clone(),
             tmdb_title: tmdb_title.clone(),
             tmdb_year,
@@ -1279,6 +1382,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             speed_mbs: speed,
             elapsed_secs: elapsed,
             output_path: &staging,
+            errors: final_errors,
+            lost_video_secs: final_lost_secs,
         },
     );
 }
