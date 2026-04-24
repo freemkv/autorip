@@ -44,6 +44,55 @@ pub fn format_iso_datetime_filename() -> String {
     format_iso_datetime().replace(':', "-")
 }
 
+// ─── Filename / display helpers ──────────────────────────────────────────────
+//
+// Pre-0.13 these lived in `ripper::sanitize_filename`, `mover::sanitize_dir_name`,
+// `ripper::format_duration`, and `ripper::format_codecs`. The two sanitizers
+// drifted (one replaced spaces with `_`, the other kept them) and a single rip
+// could produce a `Dune_Part_Two` staging dir but a `Dune Part Two (2024)`
+// destination dir — same logic, two implementations. Consolidated here as
+// the single source of truth.
+
+/// Sanitize a name for use as a filesystem path segment with **no spaces**.
+/// Used for staging directories and file basenames where snake_case is
+/// preferred (so logs and shell commands don't need quoting).
+///
+/// Keeps `[A-Za-z0-9 \-_.]`, drops everything else, then collapses spaces
+/// to underscores.
+pub fn sanitize_path_compact(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '-' || *c == '_' || *c == '.')
+        .collect::<String>()
+        .trim()
+        .replace(' ', "_")
+}
+
+/// Sanitize a name for a user-visible directory (e.g. the final library
+/// destination `Movies/Dune Part Two (2024)/`). Spaces preserved; apostrophes
+/// kept (filesystems handle them, omitting them mangles "What's Up Doc").
+pub fn sanitize_path_display(name: &str) -> String {
+    name.chars()
+        .filter(|c| {
+            c.is_ascii_alphanumeric()
+                || *c == ' '
+                || *c == '-'
+                || *c == '_'
+                || *c == '.'
+                || *c == '\''
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Format a number of seconds as `Xh YYm`. Used by the rip card and the
+/// disc info banner.
+pub fn format_duration_hm(secs: f64) -> String {
+    let h = (secs / 3600.0) as u32;
+    let m = ((secs % 3600.0) / 60.0) as u32;
+    format!("{}h {:02}m", h, m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +140,65 @@ mod tests {
         assert_eq!(s.len(), 10); // "YYYY-MM-DD"
         assert_eq!(s.as_bytes()[4], b'-');
         assert_eq!(s.as_bytes()[7], b'-');
+    }
+
+    // ─── Sanitizer + duration helpers ────────────────────────────────────
+
+    #[test]
+    fn sanitize_path_compact_collapses_spaces_to_underscore() {
+        assert_eq!(sanitize_path_compact("Dune Part Two"), "Dune_Part_Two");
+        assert_eq!(sanitize_path_compact("V for Vendetta"), "V_for_Vendetta");
+    }
+
+    #[test]
+    fn sanitize_path_compact_strips_unsafe_chars() {
+        assert_eq!(sanitize_path_compact("Dune: Part Two"), "Dune_Part_Two");
+        assert_eq!(sanitize_path_compact("M*A*S*H"), "MASH");
+        assert_eq!(sanitize_path_compact("Alien/Predator"), "AlienPredator");
+    }
+
+    #[test]
+    fn sanitize_path_compact_keeps_dots_dashes_underscores() {
+        assert_eq!(sanitize_path_compact("Movie-2024.4K"), "Movie-2024.4K");
+    }
+
+    #[test]
+    fn sanitize_path_display_keeps_spaces_and_apostrophes() {
+        assert_eq!(sanitize_path_display("What's Up Doc"), "What's Up Doc");
+        assert_eq!(
+            sanitize_path_display("Rogue One - A Star Wars Story"),
+            "Rogue One - A Star Wars Story"
+        );
+    }
+
+    #[test]
+    fn sanitize_path_display_strips_unsafe_chars() {
+        assert_eq!(sanitize_path_display("Dune: Part Two"), "Dune Part Two");
+        assert_eq!(sanitize_path_display("M*A*S*H"), "MASH");
+    }
+
+    #[test]
+    fn sanitize_path_display_trims_whitespace() {
+        assert_eq!(sanitize_path_display("  spaced title  "), "spaced title");
+    }
+
+    #[test]
+    fn format_duration_hm_zero() {
+        assert_eq!(format_duration_hm(0.0), "0h 00m");
+    }
+
+    #[test]
+    fn format_duration_hm_under_minute() {
+        assert_eq!(format_duration_hm(30.0), "0h 00m");
+    }
+
+    #[test]
+    fn format_duration_hm_pads_minutes() {
+        assert_eq!(format_duration_hm(3600.0 + 5.0 * 60.0), "1h 05m");
+    }
+
+    #[test]
+    fn format_duration_hm_two_hours() {
+        assert_eq!(format_duration_hm(2.0 * 3600.0 + 30.0 * 60.0), "2h 30m");
     }
 }

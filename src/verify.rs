@@ -105,8 +105,12 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
             return;
         }
     };
-    let _ = drive.wait_ready();
-    let _ = drive.init();
+    if let Err(e) = drive.wait_ready() {
+        tracing::warn!(device = %device, error = %e, "verify: drive wait_ready failed");
+    }
+    if let Err(e) = drive.init() {
+        tracing::warn!(device = %device, error = %e, "verify: drive init failed");
+    }
 
     crate::log::device_log(device, "Verify: scanning...");
     let scan_opts = match keydb_path {

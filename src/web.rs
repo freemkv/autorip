@@ -761,18 +761,37 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
     let server = match Server::http(&addr) {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!("Web server failed to start on {}: {}", addr, e);
+            // Bind failure is unrecoverable for an autorip instance — without
+            // a UI we have a dead daemon. Pre-0.13 this was eprintln + return,
+            // leaving the process alive with no UI and Docker none the wiser.
+            // Now we signal SHUTDOWN so main exits non-zero and the container
+            // restart policy recovers us.
+            crate::log::syslog(&format!(
+                "FATAL: web server bind failed on {}: {} — signalling shutdown",
+                addr, e
+            ));
+            tracing::error!(
+                address = %addr,
+                error = %e,
+                "web bind failed; signalling shutdown so the container restart policy recovers us"
+            );
+            crate::SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
             return;
         }
     };
-    eprintln!("Web UI: http://0.0.0.0:{}", port);
+    crate::log::syslog(&format!("Web server listening on {}", addr));
+    tracing::info!(address = %addr, "web server listening");
 
     for request in server.incoming_requests() {
+        if crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let cfg = Arc::clone(cfg);
         std::thread::spawn(move || {
             handle_request(request, &cfg);
         });
     }
+    tracing::info!("web server stopping");
 }
 
 fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
@@ -810,6 +829,8 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             return json_response(request, 400, r#"{"error":"invalid device name"}"#);
         }
         handle_device_log(request, cfg, &device);
+    } else if is_get && (url == "/api/debug" || url.starts_with("/api/debug?")) {
+        handle_debug_log(request, &url);
     } else if is_get && url == "/events" {
         handle_sse(request);
     } else if is_post && url.starts_with("/api/scan/") {
@@ -1072,6 +1093,101 @@ fn handle_device_log(request: tiny_http::Request, _cfg: &Arc<RwLock<Config>>, de
     }
     let lines = crate::log::get_device_log(device, 200);
     text_response(request, &lines.join("\n"));
+}
+
+/// `GET /api/debug?n=N&level=L&device=D&q=substr` — last N JSONL events.
+///
+/// Tails `{AUTORIP_DIR}/logs/autorip.jsonl` (the structured event stream
+/// emitted by the tracing layer in `observe.rs`). Optional filters:
+///
+/// - `n` (default 500, max 5000) — number of trailing lines to return
+/// - `level` — `error|warn|info|debug|trace` minimum level
+/// - `device` — only events whose `fields.device` matches
+/// - `q` — substring match anywhere in the JSON line (cheap grep)
+///
+/// Output is **raw JSONL** (newline-separated JSON objects), not wrapped
+/// in a JSON array — keeps it streamable, greppable, and easy for shell
+/// tools to consume. Used by the web UI Debug tab and by anyone running
+/// `curl http://autorip:8080/api/debug?level=warn | jq` from a terminal.
+fn handle_debug_log(request: tiny_http::Request, url: &str) {
+    let params = parse_query(url);
+    let n: usize = params
+        .get("n")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500)
+        .min(5000);
+    let level = params.get("level").map(|s| s.to_lowercase());
+    let device = params.get("device").cloned();
+    let q = params.get("q").cloned();
+
+    let path = crate::observe::json_log_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            // Daily-rolled file may not exist on a fresh boot before the
+            // first event flushes. Return empty rather than 404 — UI can
+            // poll without alerting.
+            tracing::debug!(path = %path, error = %e, "debug: jsonl missing");
+            return text_response(request, "");
+        }
+    };
+
+    let levels_at_or_above = |min: &str| -> &'static [&'static str] {
+        match min {
+            "error" => &["ERROR"],
+            "warn" => &["WARN", "ERROR"],
+            "info" => &["INFO", "WARN", "ERROR"],
+            "debug" => &["DEBUG", "INFO", "WARN", "ERROR"],
+            _ => &["TRACE", "DEBUG", "INFO", "WARN", "ERROR"],
+        }
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    let mut out: Vec<String> = Vec::new();
+    for line in &lines[start..] {
+        if let Some(ref l) = level {
+            let allowed = levels_at_or_above(l);
+            // tracing-subscriber JSON format puts the level in `"level":"INFO"`.
+            if !allowed
+                .iter()
+                .any(|lv| line.contains(&format!("\"level\":\"{}\"", lv)))
+            {
+                continue;
+            }
+        }
+        if let Some(ref d) = device {
+            // Match `"device":"sg4"` exactly to avoid `sg40` matching `sg4`.
+            if !line.contains(&format!("\"device\":\"{}\"", d)) {
+                continue;
+            }
+        }
+        if let Some(ref needle) = q {
+            if !line.contains(needle) {
+                continue;
+            }
+        }
+        out.push((*line).to_string());
+    }
+    text_response(request, &out.join("\n"));
+}
+
+/// Parse `?key=value&key2=v2` from a URL into a HashMap. Naive (no
+/// percent-decoding except `+` → space, no array-style keys) — sufficient
+/// for our handful of debug filters and easier to audit than pulling a URL
+/// parser dep.
+fn parse_query(url: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let q = match url.split_once('?') {
+        Some((_, q)) => q,
+        None => return map,
+    };
+    for pair in q.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            map.insert(percent_decode(k), percent_decode(v));
+        }
+    }
+    map
 }
 
 fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {

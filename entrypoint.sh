@@ -20,17 +20,19 @@ rm -rf "$FREEMKV_CFG"
 ln -sfn "$AUTORIP_DIR/freemkv" "$FREEMKV_CFG"
 
 # Save env vars for udev-triggered runs
-env | grep -E '^(TMDB_API_KEY|STAGING_DIR|OUTPUT_DIR|MOVIE_DIR|TV_DIR|MIN_LENGTH|MAIN_FEATURE|AUTO_EJECT|ON_INSERT|ABORT_ON_ERROR|AUTORIP_DIR|PORT|KEYDB_PATH)' > /etc/autorip.env
+env | grep -E '^(TMDB_API_KEY|STAGING_DIR|OUTPUT_DIR|MOVIE_DIR|TV_DIR|MIN_LENGTH|MAIN_FEATURE|AUTO_EJECT|ON_INSERT|ABORT_ON_ERROR|AUTORIP_DIR|PORT|KEYDB_PATH|AUTORIP_LOG_LEVEL)' > /etc/autorip.env
 
 # Setup udev rule for disc detection
 cat > /etc/udev/rules.d/99-autorip.rules << 'UDEV'
 ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA}=="1", ENV{ID_CDROM_MEDIA_STATE}!="blank", RUN+="/usr/local/bin/udev-trigger.sh %k"
 UDEV
 
-# Setup cron for KEYDB update (3am daily)
-echo "0 3 * * * root /usr/local/bin/autorip --update-keydb >> $AUTORIP_DIR/logs/system.log 2>&1" > /etc/cron.d/autorip
-# Log cleanup (4am daily)
-echo "0 4 * * * root find $AUTORIP_DIR/logs -name '*.log' -mtime +${LOG_RETENTION_DAYS:-30} -delete" >> /etc/cron.d/autorip
+# Log cleanup cron (4am daily). KEYDB updates happen inside the live autorip
+# process (main.rs spawns a daily updater thread) — never spawn a second
+# `autorip` binary from cron, it races the live process for /dev/sg* and the
+# web port and silently breaks the UI. See CHANGELOG 0.13.0 for the incident.
+mkdir -p /etc/cron.d
+echo "0 4 * * * root find $AUTORIP_DIR/logs -name '*.log' -mtime +${LOG_RETENTION_DAYS:-30} -delete" > /etc/cron.d/autorip
 
 # Start cron
 service cron start 2>/dev/null || true

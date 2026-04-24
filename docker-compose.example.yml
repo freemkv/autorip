@@ -16,6 +16,11 @@ services:
       - ON_INSERT=rip
       - MAX_RETRIES=1                   # 0..=10; retry passes after fast pass (multi-pass rip)
       - KEEP_ISO=false                  # keep intermediate ISO after MKV mux (forensics)
+      # Tracing filter (env-filter syntax). Default `autorip=info,libfreemkv=warn`.
+      # Crank to debug for deep-dives: `AUTORIP_LOG_LEVEL=autorip=debug`. The
+      # JSON stream lands in /config/logs/autorip.jsonl, human-readable in
+      # /config/logs/autorip.log, both daily-rolled.
+      - AUTORIP_LOG_LEVEL=autorip=info,libfreemkv=warn
     volumes:
       - /dev:/dev                       # live host /dev — handles USB re-enumeration (sg4 ↔ sg5 between reconnects)
       - ./config:/config
@@ -24,6 +29,14 @@ services:
       - /sys:/sys:ro
     ports:
       - 8080:8080
+    healthcheck:
+      # Mirrors the Dockerfile HEALTHCHECK; redeclared here so a user who
+      # builds locally without the image-baked one still gets recovery.
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "4", "http://127.0.0.1:8080/api/state"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
 # Optional: if running autorip behind an existing reverse proxy (Caddy /
 # Traefik / nginx) on a shared Docker network, override the default network

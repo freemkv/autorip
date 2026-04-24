@@ -13,11 +13,20 @@ fn device_log_path(device: &str) -> String {
     format!("{}/logs/device_{}.log", log_dir(), device)
 }
 
-/// Log a message for a specific device. Stored in memory + written to file + stderr.
+/// Log a message for a specific device. Three sinks:
 ///
-/// Line format: `[YYYY-MM-DDTHH:MM:SSZ] msg`. Full ISO-8601 timestamps are
-/// intentional — wall-clock-only `[HH:MM:SS]` breaks across midnight and
-/// makes archived rip logs ambiguous.
+/// - **In-memory ring** (last 500 lines per device) — read by the web UI's
+///   `/api/logs/{device}` endpoint to render the live log view.
+/// - **`{AUTORIP_DIR}/logs/device_{dev}.log`** — per-device file, archived
+///   per-rip via `archive_device_log`. Operators tail when troubleshooting
+///   one drive.
+/// - **Tracing event** at info level with `device` field — flows into
+///   `autorip.log` (everything) and `autorip.jsonl` (machine-greppable).
+///   See `observe.rs`.
+///
+/// Line format in the per-device file: `[YYYY-MM-DDTHH:MM:SSZ] msg`. The
+/// in-memory ring stores the same. ISO-8601 timestamps so rip log archives
+/// sort correctly and midnight isn't ambiguous.
 pub fn device_log(device: &str, msg: &str) {
     let line = format!("[{}] {}", crate::util::format_iso_datetime(), msg);
 
@@ -30,7 +39,7 @@ pub fn device_log(device: &str, msg: &str) {
         }
     }
 
-    // File log
+    // File log — per-device, append-only between archive points.
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -39,7 +48,11 @@ pub fn device_log(device: &str, msg: &str) {
         let _ = writeln!(f, "{}", line);
     }
 
-    eprintln!("[{}] {}", device, msg);
+    // Structured event into the central log stream. The `device` field is
+    // what makes `jq 'select(.fields.device == "sg4")' autorip.jsonl`
+    // possible — the per-device files don't carry that grouping in a single
+    // file the way the JSONL stream does.
+    tracing::info!(device = %device, "{}", msg);
 }
 
 /// Get recent log lines for a device.
@@ -75,7 +88,12 @@ pub fn archive_device_log(device: &str) {
     if should_archive {
         let rips_dir = format!("{}/logs/rips", log_dir());
         if let Err(e) = std::fs::create_dir_all(&rips_dir) {
-            eprintln!("[{}] log archive: create {}: {}", device, rips_dir, e);
+            tracing::warn!(
+                device = %device,
+                path = %rips_dir,
+                error = %e,
+                "log archive: cannot create rips dir"
+            );
         } else {
             let archive = format!(
                 "{}/{}_{}.log",
@@ -84,9 +102,12 @@ pub fn archive_device_log(device: &str) {
                 crate::util::format_iso_datetime_filename(),
             );
             if let Err(e) = std::fs::rename(&current, &archive) {
-                eprintln!(
-                    "[{}] log archive: rename {} -> {}: {}",
-                    device, current, archive, e
+                tracing::warn!(
+                    device = %device,
+                    src = %current,
+                    dst = %archive,
+                    error = %e,
+                    "log archive: rename failed"
                 );
             }
         }

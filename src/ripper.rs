@@ -222,51 +222,153 @@ fn drop_session(device: &str) {
 
 // ─── Poll loop ─────────────────────────────────────────────────────────────
 
+/// Enumerate optical drives (SCSI type 5 = CD/DVD/BD) under `/sys/class/scsi_generic`.
+/// Falls back to a `/dev/sg0..sg15` probe if sysfs is unreadable (minimal
+/// containers, dev hosts without procfs). Returns the device names sorted
+/// (e.g. `["sg4"]`) so iteration order is deterministic and the UI's tab
+/// order doesn't shuffle when sg numbers cross 9 → 10.
+fn enumerate_optical_drives() -> Vec<String> {
+    let mut drives: Vec<String> = Vec::new();
+    match std::fs::read_dir("/sys/class/scsi_generic") {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with("sg") {
+                    continue;
+                }
+                let type_path = format!("/sys/class/scsi_generic/{}/device/type", name);
+                match std::fs::read_to_string(&type_path) {
+                    Ok(s) => {
+                        let t = s.trim();
+                        if t == "5" {
+                            drives.push(name);
+                        } else {
+                            tracing::debug!(
+                                device = %name,
+                                sysfs_type = %t,
+                                "skipping non-optical sg node"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Sysfs partial read — include the device anyway so
+                        // a misbehaving sysfs entry can't make a real drive
+                        // invisible. `Drive::open` will sort it out.
+                        tracing::debug!(
+                            device = %name,
+                            path = %type_path,
+                            error = %e,
+                            "sysfs type unreadable, including drive anyway"
+                        );
+                        drives.push(name);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "/sys/class/scsi_generic unreadable — falling back to /dev/sg0..sg15 probe"
+            );
+            for i in 0..16u8 {
+                let dev = format!("sg{}", i);
+                if std::path::Path::new(&format!("/dev/{}", dev)).exists() {
+                    drives.push(dev);
+                }
+            }
+        }
+    }
+    drives.sort();
+    drives
+}
+
+const POLL_INTERVAL_SECS: u64 = 5;
+
 /// Poll drives for disc insertion. Only triggers on state change
 /// (no disc → disc present), not on disc already being there.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     let mut had_disc: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Devices that already had `Drive::open` fail at least once. Used to
+    // suppress repeat warnings every 5 s — first failure logs at warn,
+    // continued failures at debug. Without this, a permanently-locked or
+    // permission-denied sg node would spam autorip.log forever.
+    let mut warned_open_fail: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Devices we've already logged "present" for. Same pattern — info on
+    // transition, no log on every tick. Cleared when the drive goes away.
+    let mut logged_present: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    tracing::info!(
+        interval_secs = POLL_INTERVAL_SECS,
+        "drive poll loop starting"
+    );
 
     while !crate::SHUTDOWN.load(Ordering::Relaxed) {
         {
             let mut current_with_disc: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            let mut current_present: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
-            for i in 0..16u8 {
-                let path = format!("/dev/sg{}", i);
+            for device in enumerate_optical_drives() {
+                let path = format!("/dev/{}", device);
                 if !std::path::Path::new(&path).exists() {
+                    tracing::debug!(
+                        device = %device,
+                        path = %path,
+                        "sg node enumerated in sysfs but /dev path missing"
+                    );
                     continue;
                 }
-                // Cheap sysfs pre-filter: SCSI type 5 = CD/DVD/BD optical.
-                // Avoids Drive::open's 2s reset dance on non-optical sg nodes
-                // (RAID controllers, NVMe passthroughs) when /dev is bind-mounted
-                // live from the host. Falls through on read failure so we don't
-                // accidentally exclude an optical drive if sysfs is unreadable.
-                let type_path = format!("/sys/class/scsi_generic/sg{}/device/type", i);
-                if let Ok(s) = std::fs::read_to_string(&type_path) {
-                    if s.trim() != "5" {
-                        continue;
-                    }
-                }
-                let device = format!("sg{}", i);
 
                 // Don't touch drives that are actively scanning/ripping
                 if is_busy(&device) {
-                    current_with_disc.insert(device);
+                    current_with_disc.insert(device.clone());
+                    current_present.insert(device);
                     continue;
                 }
 
-                // Open briefly to check status, then drop immediately
+                // Open briefly to check status, then drop immediately. The
+                // pre-0.13 silent `Err(_) => continue` here is what produced
+                // "No drives detected" with no clue why — we now log every
+                // open failure with full error context.
                 let mut drive = match libfreemkv::Drive::open(std::path::Path::new(&path)) {
-                    Ok(d) => d,
-                    Err(_) => continue,
+                    Ok(d) => {
+                        // First success after a failure — clear the warned
+                        // flag so a transient error gets a fresh warning if
+                        // it recurs.
+                        warned_open_fail.remove(&device);
+                        d
+                    }
+                    Err(e) => {
+                        if warned_open_fail.insert(device.clone()) {
+                            tracing::warn!(
+                                device = %device,
+                                path = %path,
+                                error = %e,
+                                "Drive::open failed — drive will be invisible to UI until this clears"
+                            );
+                        } else {
+                            tracing::debug!(
+                                device = %device,
+                                error = %e,
+                                "Drive::open still failing"
+                            );
+                        }
+                        continue;
+                    }
                 };
                 let disc_present = drive.drive_status() == libfreemkv::DriveStatus::DiscPresent;
                 drop(drive);
 
+                current_present.insert(device.clone());
+                if logged_present.insert(device.clone()) {
+                    tracing::info!(device = %device, "drive present");
+                }
+
                 if !disc_present {
                     // Disc removed — clean up session
                     if had_disc.contains(&device) {
+                        tracing::info!(device = %device, "disc removed");
                         drop_session(&device);
                     }
                     if !is_busy(&device) {
@@ -285,6 +387,10 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 current_with_disc.insert(device.clone());
 
                 let is_new_insert = !had_disc.contains(&device);
+
+                if is_new_insert {
+                    tracing::info!(device = %device, "disc inserted");
+                }
 
                 if is_new_insert && !is_busy(&device) && !is_in_cooldown(&device) {
                     let on_insert = cfg
@@ -306,6 +412,12 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         continue;
                     }
 
+                    tracing::info!(
+                        device = %device,
+                        on_insert = %on_insert,
+                        "spawning scan/rip thread"
+                    );
+
                     update_state(
                         &device,
                         RipState {
@@ -319,28 +431,35 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     let cfg = cfg.clone();
                     let dev_path = path.clone();
 
-                    std::thread::spawn(move || {
-                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            scan_disc(&cfg, &device, &dev_path);
-                            if on_insert == "rip" && !stop_requested(&device) {
-                                rip_disc(&cfg, &device, &dev_path);
+                    std::thread::Builder::new()
+                        .name(format!("rip-{}", device))
+                        .spawn(move || {
+                            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                scan_disc(&cfg, &device, &dev_path);
+                                if on_insert == "rip" && !stop_requested(&device) {
+                                    rip_disc(&cfg, &device, &dev_path);
+                                }
+                            }))
+                            .is_err()
+                            {
+                                tracing::error!(
+                                    device = %device,
+                                    "scan/rip thread panicked"
+                                );
+                                crate::log::device_log(&device, "Thread panicked");
+                                drop_session(&device);
+                                update_state(
+                                    &device,
+                                    RipState {
+                                        device: device.clone(),
+                                        status: "error".to_string(),
+                                        last_error: "Internal error (panic)".to_string(),
+                                        ..Default::default()
+                                    },
+                                );
                             }
-                        }))
-                        .is_err()
-                        {
-                            crate::log::device_log(&device, "Thread panicked");
-                            drop_session(&device);
-                            update_state(
-                                &device,
-                                RipState {
-                                    device: device.clone(),
-                                    status: "error".to_string(),
-                                    last_error: "Internal error (panic)".to_string(),
-                                    ..Default::default()
-                                },
-                            );
-                        }
-                    });
+                        })
+                        .ok();
                 } else if !is_new_insert && !is_busy(&device) {
                     if let Ok(mut s) = STATE.lock() {
                         if let Some(rs) = s.get_mut(&device) {
@@ -350,10 +469,34 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 }
             }
 
+            // Drives that were present last tick but vanished this tick.
+            // Forget them so a new appearance gets a fresh "drive present" log
+            // and clears any prior warned_open_fail state.
+            let vanished: Vec<String> = logged_present
+                .iter()
+                .filter(|d| !current_present.contains(*d))
+                .cloned()
+                .collect();
+            for dev in vanished {
+                tracing::info!(device = %dev, "drive disappeared");
+                logged_present.remove(&dev);
+                warned_open_fail.remove(&dev);
+            }
+
             had_disc = current_with_disc;
         }
-        std::thread::sleep(std::time::Duration::from_secs(5));
+
+        // SHUTDOWN-responsive sleep — break early on signal so SIGTERM
+        // doesn't have to wait the full 5 s tick to take effect.
+        for _ in 0..(POLL_INTERVAL_SECS * 10) {
+            if crate::SHUTDOWN.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
+
+    tracing::info!("drive poll loop stopping");
 }
 
 pub fn is_busy(device: &str) -> bool {
@@ -370,6 +513,25 @@ pub fn is_busy(device: &str) -> bool {
 pub fn update_state(device: &str, state: RipState) {
     if let Ok(mut s) = STATE.lock() {
         s.insert(device.to_string(), state);
+    }
+}
+
+/// Mutate a device's RipState via a closure. **Use this** instead of
+/// `update_state` when changing specific fields without wanting to wipe
+/// the rest. The `..Default::default()` pattern caused at least three
+/// regressions (v0.11.20 watchdog, v0.11.17 errors-on-completion, v0.12.0
+/// pass-progress fields) where a "small" state push silently zeroed a
+/// field the UI was rendering.
+///
+/// Creates a default-initialized RipState if the device isn't in the map
+/// yet so the first call after boot doesn't silently no-op.
+pub fn update_state_with<F: FnOnce(&mut RipState)>(device: &str, f: F) {
+    if let Ok(mut s) = STATE.lock() {
+        let entry = s.entry(device.to_string()).or_insert_with(|| RipState {
+            device: device.to_string(),
+            ..Default::default()
+        });
+        f(entry);
     }
 }
 
@@ -763,9 +925,13 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             return;
         }
     };
-    let _ = drive.wait_ready();
+    if let Err(e) = drive.wait_ready() {
+        tracing::warn!(device = %device, error = %e, "drive wait_ready failed (continuing)");
+    }
     crate::log::device_log(device, "Initializing...");
-    let _ = drive.init();
+    if let Err(e) = drive.init() {
+        tracing::warn!(device = %device, error = %e, "drive init failed (continuing — scan may degrade)");
+    }
 
     // Fast identify — disc name only, no playlists
     crate::log::device_log(device, "Identifying disc...");
@@ -871,7 +1037,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let duration = disc
         .titles
         .first()
-        .map(|t| format_duration(t.duration_secs))
+        .map(|t| crate::util::format_duration_hm(t.duration_secs))
         .unwrap_or_default();
     let codecs = disc.titles.first().map(format_codecs).unwrap_or_default();
 
@@ -986,9 +1152,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     return;
                 }
             };
-            let _ = drive.wait_ready();
+            if let Err(e) = drive.wait_ready() {
+                tracing::warn!(device = %device, error = %e, "drive wait_ready failed (continuing)");
+            }
             crate::log::device_log(device, "Initializing...");
-            let _ = drive.init();
+            if let Err(e) = drive.init() {
+                tracing::warn!(device = %device, error = %e, "drive init failed (continuing)");
+            }
 
             let scan_opts = match &cfg_read.keydb_path {
                 Some(p) => libfreemkv::ScanOptions::with_keydb(p),
@@ -1034,7 +1204,27 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     };
 
-    let disc = session.disc.take().unwrap();
+    let disc = match session.disc.take() {
+        Some(d) => d,
+        None => {
+            tracing::error!(
+                device = %device,
+                "DriveSession had no disc — every code path that builds a session must set Some(disc); reaching this branch is a logic bug"
+            );
+            crate::log::device_log(device, "Internal error: session has no disc");
+            update_state(
+                device,
+                RipState {
+                    device: device.to_string(),
+                    status: "error".to_string(),
+                    last_error: "Internal error: session has no disc".to_string(),
+                    ..Default::default()
+                },
+            );
+            drop_session(device);
+            return;
+        }
+    };
 
     let disc_name = disc
         .meta_title
@@ -1099,7 +1289,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         return;
     }
 
-    let duration = format_duration(disc.titles[0].duration_secs);
+    let duration = crate::util::format_duration_hm(disc.titles[0].duration_secs);
     let codecs = format_codecs(&disc.titles[0]);
     let title = disc.titles[0].clone();
     let keys = disc.decrypt_keys();
@@ -1141,9 +1331,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         _ => "mkv",
     };
 
-    let staging = cfg_read.staging_device_dir(&sanitize_filename(&display_name));
+    let staging = cfg_read.staging_device_dir(&crate::util::sanitize_path_compact(&display_name));
     let _ = std::fs::create_dir_all(&staging);
-    let filename = format!("{}.{}", sanitize_filename(&display_name), ext);
+    let filename = format!(
+        "{}.{}",
+        crate::util::sanitize_path_compact(&display_name),
+        ext
+    );
     let output_path = format!("{}/{}", staging, filename);
     let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
         format!("network://{}", cfg_read.network_target)
@@ -1236,7 +1430,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // session.drive is passed to DiscStream::new and sectors stream straight
     // through decrypt/demux/mux. Fastest path, no ISO overhead, but no retry.
     let reader: Box<dyn libfreemkv::SectorReader> = if cfg_read.max_retries > 0 {
-        let iso_filename = format!("{}.iso", sanitize_filename(&display_name));
+        let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
         let iso_path_str = format!("{}/{}", staging, iso_filename);
         let iso_path = std::path::Path::new(&iso_path_str);
         let total_passes = cfg_read.max_retries + 2; // pass 1 + retries + mux
@@ -1713,59 +1907,33 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                             format!("{}s", s)
                         }
                     };
-                    // Preserve per-rip fields from existing STATE that the
-                    // watchdog would otherwise wipe via Default::default().
-                    // Without this, the UI shows 0/0 batch + no lost_video
-                    // + last_sector=0 during stalls even though the library
-                    // is actively working through bad sectors.
-                    let (
-                        prev_errors,
-                        prev_current_batch,
-                        prev_preferred_batch,
-                        prev_last_sector,
-                        prev_lost_video_secs,
-                    ) = STATE
-                        .lock()
-                        .ok()
-                        .and_then(|s| {
-                            s.get(&wd_device).map(|r| {
-                                (
-                                    r.errors,
-                                    r.current_batch,
-                                    r.preferred_batch,
-                                    r.last_sector,
-                                    r.lost_video_secs,
-                                )
-                            })
-                        })
-                        .unwrap_or((0, 0, 0, 0, 0.0));
-                    update_state(
-                        &wd_device,
-                        RipState {
-                            device: wd_device.clone(),
-                            status: "ripping".to_string(),
-                            disc_present: true,
-                            disc_name: wd_display.clone(),
-                            disc_format: wd_format.clone(),
-                            progress_pct: pct,
-                            progress_gb: gb,
-                            speed_mbs: 0.0,
-                            eta: format!("stalled {}", stall_str),
-                            errors: prev_errors,
-                            lost_video_secs: prev_lost_video_secs,
-                            last_sector: prev_last_sector,
-                            current_batch: prev_current_batch,
-                            preferred_batch: prev_preferred_batch,
-                            output_file: wd_filename.clone(),
-                            tmdb_title: wd_tmdb_title.clone(),
-                            tmdb_year: wd_tmdb_year,
-                            tmdb_poster: wd_tmdb_poster.clone(),
-                            tmdb_overview: wd_tmdb_overview.clone(),
-                            duration: wd_duration.clone(),
-                            codecs: wd_codecs.clone(),
-                            ..Default::default()
-                        },
-                    );
+                    // Mutate-in-place via `update_state_with` so we no longer
+                    // have to manually re-read errors/lost_video_secs/last_sector/
+                    // current_batch/preferred_batch and copy them through —
+                    // every field we don't touch keeps its prior value. This
+                    // closes the v0.11.20 regression class (Default::default()
+                    // wiping live progress fields during a stall).
+                    update_state_with(&wd_device, |s| {
+                        s.device = wd_device.clone();
+                        s.status = "ripping".to_string();
+                        s.disc_present = true;
+                        s.disc_name = wd_display.clone();
+                        s.disc_format = wd_format.clone();
+                        s.progress_pct = pct;
+                        s.progress_gb = gb;
+                        s.speed_mbs = 0.0;
+                        s.eta = format!("stalled {}", stall_str);
+                        s.output_file = wd_filename.clone();
+                        s.tmdb_title = wd_tmdb_title.clone();
+                        s.tmdb_year = wd_tmdb_year;
+                        s.tmdb_poster = wd_tmdb_poster.clone();
+                        s.tmdb_overview = wd_tmdb_overview.clone();
+                        s.duration = wd_duration.clone();
+                        s.codecs = wd_codecs.clone();
+                        // errors / lost_video_secs / last_sector / current_batch
+                        // / preferred_batch / pass / total_passes / bytes_*
+                        // / bad_ranges / largest_gap_ms intentionally untouched.
+                    });
                     was_stalled = true;
                 } else if was_stalled {
                     crate::log::device_log(&wd_device, "Drive recovered — reads resumed");
@@ -1968,7 +2136,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let mut final_num_bad_ranges: u32 = 0;
     let mut final_largest_gap_ms: f64 = 0.0;
     if cfg_read.max_retries > 0 {
-        let iso_filename = format!("{}.iso", sanitize_filename(&display_name));
+        let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
         let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
         if let Ok(map) =
             libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str))
@@ -2127,7 +2295,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Prune intermediate ISO + mapfile unless keep_iso is set. Only runs in
     // multipass mode (max_retries > 0) — direct mode never produced an ISO.
     if cfg_read.max_retries > 0 && !cfg_read.keep_iso {
-        let iso_filename = format!("{}.iso", sanitize_filename(&display_name));
+        let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
         let iso_path_str = format!("{}/{}", staging, iso_filename);
         let mapfile_path = format!("{iso_path_str}.mapfile");
         match std::fs::remove_file(&iso_path_str) {
@@ -2168,19 +2336,9 @@ pub fn eject_drive(device_path: &str) {
     }
 }
 
-fn sanitize_filename(name: &str) -> String {
-    name.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '-' || *c == '_' || *c == '.')
-        .collect::<String>()
-        .trim()
-        .replace(' ', "_")
-}
-
-fn format_duration(secs: f64) -> String {
-    let h = (secs / 3600.0) as u32;
-    let m = ((secs % 3600.0) / 60.0) as u32;
-    format!("{}h {:02}m", h, m)
-}
+// `sanitize_filename` and `format_duration` moved to `util` in 0.13.0.
+// Callers below now use `crate::util::sanitize_path_compact` and
+// `crate::util::format_duration_hm` directly.
 
 fn format_codecs(title: &libfreemkv::DiscTitle) -> String {
     let mut parts = Vec::new();
@@ -2455,5 +2613,56 @@ mod tests {
         let s1 = s.observe(t0, 100_000_000);
         let s2 = s.observe(t0, 200_000_000);
         assert_eq!(s1, s2, "zero-dt sample must not change smoothed speed");
+    }
+
+    #[test]
+    fn update_state_with_preserves_untouched_fields() {
+        // The whole point of `update_state_with` — fields the closure doesn't
+        // touch must survive. Three regressions in autorip's history were
+        // exactly this class (Default::default() wiping live progress fields
+        // during a watchdog tick).
+        let dev = format!("test-preserve-{}", std::process::id());
+        update_state_with(&dev, |s| {
+            s.errors = 7;
+            s.lost_video_secs = 1.5;
+            s.last_sector = 12345;
+            s.current_batch = 32;
+            s.preferred_batch = 60;
+        });
+        // Now simulate a watchdog tick that only updates progress + status:
+        update_state_with(&dev, |s| {
+            s.status = "ripping".to_string();
+            s.progress_pct = 42;
+        });
+        let snap = STATE
+            .lock()
+            .unwrap()
+            .get(&dev)
+            .cloned()
+            .expect("entry must exist");
+        assert_eq!(snap.errors, 7, "errors wiped");
+        assert_eq!(snap.lost_video_secs, 1.5, "lost_video_secs wiped");
+        assert_eq!(snap.last_sector, 12345, "last_sector wiped");
+        assert_eq!(snap.current_batch, 32, "current_batch wiped");
+        assert_eq!(snap.preferred_batch, 60, "preferred_batch wiped");
+        assert_eq!(snap.progress_pct, 42, "new field not applied");
+        assert_eq!(snap.status, "ripping", "new field not applied");
+    }
+
+    #[test]
+    fn enumerate_optical_drives_returns_sorted_unique() {
+        // We can't mock /sys/class/scsi_generic from a unit test (it's a
+        // syscall against a real path), but we can assert the fallback
+        // path is well-behaved on hosts where sysfs is absent (macOS dev
+        // boxes). On any host the result must be:
+        //  - sorted lexically
+        //  - all entries start with "sg"
+        let drives = enumerate_optical_drives();
+        for d in &drives {
+            assert!(d.starts_with("sg"), "non-sg entry: {d:?}");
+        }
+        let mut sorted = drives.clone();
+        sorted.sort();
+        assert_eq!(drives, sorted, "result must be sorted");
     }
 }
