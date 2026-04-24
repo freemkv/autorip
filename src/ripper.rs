@@ -1305,9 +1305,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             );
         };
 
+        // Every rip starts fresh — no silent resume of stale ISO+mapfile from
+        // a prior attempt. Pass 1 with resume=false wipes the sidecar mapfile
+        // and recreates the ISO, so progress starts at 0 % and reflects reads
+        // from this invocation only. See CHANGELOG 0.12.5 for the bug this
+        // closes (stale mapfile showing 30 % at 10 s into a cold rip).
         let copy_opts = libfreemkv::disc::CopyOptions {
             decrypt: false,
-            resume: true,
+            resume: false,
             batch_sectors: Some(batch),
             skip_on_error: true,
             skip_forward: true,

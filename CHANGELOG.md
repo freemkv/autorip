@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.12.5 (2026-04-24)
+
+### Stop silent resume — every rip starts fresh
+
+Pass 1 of a multi-pass rip used to open `CopyOptions` with `resume: true`, so
+if a prior run's `*.iso` + `*.iso.mapfile` were still sitting in staging (from
+a Stop, error, eject-mid-rip, or container crash) the next rip inserted the
+same disc silently picked up from the prior mapfile's `bytes_good`. Observed
+on a cold rip of Dune: Part Two as "30 % · 24.0 / 78.8 GB" reported 10 s in.
+
+- `ripper::rip_disc` now calls `Disc::copy` with `resume: false`. The library
+  wipes the mapfile and recreates the ISO, so `bytes_good` starts at 0 and
+  grows only with reads from this invocation. Progress display is truthful.
+- No change to multi-pass semantics within a single run — Pass 1 still
+  produces the ddrescue mapfile, Passes 2..N still patch bad ranges from it,
+  mux still reads the finished ISO.
+
+Resume-across-process-restart capability is gone for now. Trash cleanup of
+stale ISO+mapfile on terminal failures (Stop, error, panic, eject, restart)
+is the follow-up — tracked as a larger staging-lifecycle rework.
+
 ## 0.12.0 (2026-04-24)
 
 ### Multipass regression fixes observed in live v0.11.22 rip
