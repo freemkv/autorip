@@ -347,7 +347,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         },
     );
 
-    crate::log::clear_device_log(device);
+    crate::log::archive_device_log(device);
     crate::log::device_log(device, "Opening drive...");
 
     let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
@@ -1402,7 +1402,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 pub fn eject_drive(device_path: &str) {
     let dev = device_path.rsplit('/').next().unwrap_or("");
     drop_session(dev);
-    crate::log::clear_device_log(dev);
+    crate::log::archive_device_log(dev);
     if let Ok(mut session) = libfreemkv::Drive::open(std::path::Path::new(device_path)) {
         let _ = session.eject();
     }
