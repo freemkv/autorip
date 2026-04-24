@@ -225,9 +225,13 @@ function renderSteps(steps,progress,eta,speed,s){
       const gbStr=(s.bytes_good>0||s.bytes_total_disc>0)
         ? (s.bytes_good/1073741824).toFixed(1)+' / '+(s.bytes_total_disc/1073741824).toFixed(1)+' GB'
         : (progress||'');
-      const spdStr=speed&&speed!=='0 KB/s'?' \u00b7 '+speed:'';
-      const etaStr=eta?' \u00b7 ETA '+eta:'';
-      const parts=[gbStr,spdStr.replace(/^ \u00b7 /,''),etaStr.replace(/^ \u00b7 /,'')].filter(Boolean);
+      /* Leading percent so the user doesn't have to divide GB in their head.
+         Computed from bytes_good/bytes_total_disc, same basis as the bar. */
+      const pctStr=(s.bytes_total_disc>0&&s.bytes_good>=0)
+        ? Math.floor(s.bytes_good*100/s.bytes_total_disc)+'%' : '';
+      const spdStr=speed&&speed!=='0 KB/s'?speed:'';
+      const etaStr=eta?'ETA '+eta:'';
+      const parts=[pctStr,gbStr,spdStr,etaStr].filter(Boolean);
       const stats=parts.join(' \u00b7 ');
       let badLine='';
       if(s.num_bad_ranges>0||(s.errors>0)){
