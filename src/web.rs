@@ -1333,9 +1333,24 @@ fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
             ..Default::default()
         },
     );
-    std::thread::spawn(move || {
-        ripper::scan_disc(&cfg, &dev, &dev_path);
-    });
+    let dev_for_register = dev.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("scan-{}", dev))
+        .spawn(move || {
+            ripper::scan_disc(&cfg, &dev, &dev_path);
+        });
+    match spawn_result {
+        Ok(handle) => ripper::register_rip_thread(&dev_for_register, handle),
+        Err(e) => {
+            tracing::error!(device = %dev_for_register, error = %e, "failed to spawn scan thread");
+            json_response(
+                request,
+                500,
+                r#"{"ok":false,"error":"thread spawn failed"}"#,
+            );
+            return;
+        }
+    }
     json_response(request, 200, r#"{"ok":true}"#);
 }
 
@@ -1373,24 +1388,39 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
             );
         }
     }
-    std::thread::spawn(move || {
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ripper::rip_disc(&cfg, &dev, &dev_path);
-        }))
-        .is_err()
-        {
-            crate::log::device_log(&dev, "Rip thread panicked");
-            ripper::update_state(
-                &dev,
-                ripper::RipState {
-                    device: dev.clone(),
-                    status: "error".to_string(),
-                    last_error: "Internal error (panic)".to_string(),
-                    ..Default::default()
-                },
+    let dev_for_register = dev.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("rip-{}", dev))
+        .spawn(move || {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ripper::rip_disc(&cfg, &dev, &dev_path);
+            }))
+            .is_err()
+            {
+                crate::log::device_log(&dev, "Rip thread panicked");
+                ripper::update_state(
+                    &dev,
+                    ripper::RipState {
+                        device: dev.clone(),
+                        status: "error".to_string(),
+                        last_error: "Internal error (panic)".to_string(),
+                        ..Default::default()
+                    },
+                );
+            }
+        });
+    match spawn_result {
+        Ok(handle) => ripper::register_rip_thread(&dev_for_register, handle),
+        Err(e) => {
+            tracing::error!(device = %dev_for_register, error = %e, "failed to spawn rip thread");
+            json_response(
+                request,
+                500,
+                r#"{"ok":false,"error":"thread spawn failed"}"#,
             );
+            return;
         }
-    });
+    }
 
     json_response(request, 200, r#"{"ok":true}"#);
 }
