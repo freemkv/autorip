@@ -626,6 +626,13 @@ struct PassContext {
     codecs: String,
     filename: String,
     bytes_total_disc: u64,
+    /// Preferred batch size (kernel-reported max sectors per CDB) — surfaced
+    /// in RipState during Pass 1 / Pass 2+ so the UI shows a non-zero
+    /// `preferred_batch` / `current_batch`. Pass 1 never shrinks the batch
+    /// (Disc::copy uses a fixed size); current_batch == preferred_batch
+    /// throughout. The DiscStream batch halver only operates during the
+    /// mux phase and is reported via the direct-mode stream loop.
+    batch: u16,
 }
 
 /// Walk the title's extents to find the byte offset *within the title* for a
@@ -872,6 +879,8 @@ fn push_pass_state(
             bad_ranges_truncated: truncated,
             total_lost_ms,
             largest_gap_ms,
+            preferred_batch: ctx.batch,
+            current_batch: ctx.batch,
             ..Default::default()
         },
     );
@@ -929,6 +938,7 @@ fn set_pass_progress(
     bytes_good: u64,
     bytes_bad: u64,
     bytes_total_disc: u64,
+    batch: u16,
 ) {
     let pct = if bytes_total_disc > 0 {
         (bytes_good * 100 / bytes_total_disc).min(100) as u8
@@ -957,6 +967,8 @@ fn set_pass_progress(
             bytes_good,
             bytes_bad,
             bytes_total_disc,
+            preferred_batch: batch,
+            current_batch: batch,
             ..Default::default()
         },
     );
@@ -1526,6 +1538,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             duration: duration.clone(),
             codecs: codecs.clone(),
             filename: filename.clone(),
+            batch,
             bytes_total_disc,
         };
         let title_for_progress = title.clone();
@@ -1551,6 +1564,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             0,
             0,
             bytes_total_disc,
+            batch,
         );
 
         // Progress callback — runs every read block (~64 KB). Throttle the
@@ -1590,6 +1604,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             skip_forward: true,
             halt: Some(halt.clone()),
             on_progress: Some(&pass1_progress),
+            stall_secs: None, // libfreemkv default (120s)
         };
         let result = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
             Ok(r) => r,
@@ -1677,6 +1692,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 bytes_good,
                 bytes_unreadable + bytes_pending,
                 bytes_total_disc,
+                batch,
             );
             // Per-pass progress callback (same throttle + speed-tracker
             // pattern as pass 1).
