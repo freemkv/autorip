@@ -48,6 +48,7 @@ fn take_rip_thread(device: &str) -> Option<JoinHandle<()>> {
 /// extra channel plumbing of a one-shot signal and keeps the
 /// registration API simple (test code can register a synthetic
 /// thread without producing a paired Receiver).
+#[allow(clippy::result_unit_err)]
 pub fn join_rip_thread(device: &str, timeout: Duration) -> Result<(), ()> {
     let handle = match take_rip_thread(device) {
         Some(h) => h,
