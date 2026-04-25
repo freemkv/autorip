@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.6 (2026-04-25)
+
+### Version sync — consume libfreemkv 0.13.6
+No functional CLI changes. libfreemkv 0.13.6 strips the inline
+retry/reset loop from `Drive::read` and starts emitting
+`EventKind::BytesRead` from `DiscStream` (consumed by autorip's
+direct-mode progress UI); the CLI's `Drive::open` + `Disc::scan` +
+`pipe()` flow is unchanged. Cargo.toml dep pin `0.13.5` → `0.13.6`.
+
 ## 0.13.5 (2026-04-25)
 
 ### Version sync — consume libfreemkv 0.13.5
