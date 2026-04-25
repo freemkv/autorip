@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.13.7 (2026-04-25)
+
+### Fix: /api/rip and /api/scan threads now register for stop-drain
+
+The 0.13.6 stop-drain fix only registered the rip thread when it was
+spawned by the poll-loop on disc-insert (`on_insert=rip`). Threads
+spawned by the HTTP handlers `/api/rip/{dev}` and `/api/scan/{dev}`
+still used the old un-registered `std::thread::spawn(...)` pattern, so
+`handle_stop`'s `join_rip_thread` returned `Err(())` immediately
+(no handle in the map) and the response came back in milliseconds —
+exactly the staging-wipe-races-rip-thread race the 0.13.6 fix was
+supposed to close, just on a different code path.
+
+Live testing on the Dell host with v0.13.6 confirmed the bug:
+`/api/stop/sg4` returned in 27 ms while the rip thread was clearly
+still running (status went to `error` 6 s later as the unfilled file
+write surfaced).
+
+`handle_rip` (web.rs:~1376) and `handle_scan` (web.rs:~1336) now use
+`std::thread::Builder::new().name(...).spawn(...)` and register the
+returned `JoinHandle` via `ripper::register_rip_thread`, matching the
+pattern in the poll-loop spawn site. `handle_stop`'s join logic is
+unchanged; it now actually has a handle to wait on.
+
 ## 0.13.6 (2026-04-25)
 
 ### Real-time direct-mode progress + bounded stop-drain
