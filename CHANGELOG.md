@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.13.4 (2026-04-25)
+
+### Consume libfreemkv 0.13.4 — wedge recovery rolled back
+
+libfreemkv 0.13.4 removes the SCSI-reset + USBDEVFS_RESET escalation
+from `drive_has_disc` after production testing on the LG BU40N
+confirmed no userspace software recovery clears the firmware-level
+wedge class we see in practice. autorip's poll loop now surfaces the
+raw wedge error to the user on the first occurrence (previously hidden
+behind minutes of silent internal retries).
+
+On the UI: `list_drives()` falls back to kernel-cached sysfs identity
+strings when the live INQUIRY returns empty, so a wedged drive still
+shows up with its vendor/model instead of vanishing. No autorip source
+changes; dep pin `0.13.3` → `0.13.4`.
+
 ## 0.13.3 (2026-04-24)
 
 ### Consume libfreemkv 0.13.3 — wedge recovery actually runs now
