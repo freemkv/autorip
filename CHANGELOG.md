@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.2 (2026-04-24)
+
+### Version sync — consume libfreemkv 0.13.2
+No functional changes to the CLI. libfreemkv 0.13.2 added the public
+`list_drives()` / `drive_has_disc()` probes and tightened SCSI
+primitive visibility; the CLI's existing flow (`Drive::open` +
+`Disc::scan`) is unchanged. Cargo.toml dep pin `0.13` → `0.13.2`.
+
 ## 0.13.0 (2026-04-24)
 
 ### Consume libfreemkv 0.13.0 (zero-English audit)
