@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.11 (2026-04-25)
+
+### Version sync — consume libfreemkv 0.13.11
+
+Picks up libfreemkv's revert of the v0.13.10 SgIoTransport timeout
+path. v0.13.10's "fd-dead-after-one-timeout" caused Pass 1 to
+finish in 45 ms with 0 bytes good on Dune 2; v0.13.11 keeps the
+transport alive across timeouts. Stall guard from v0.13.9 still
+caps the worst-case stall at 120 s.
+
 ## 0.13.10 (2026-04-25)
 
 ### Fix: Pass 1 RipState now reports preferred_batch / current_batch
