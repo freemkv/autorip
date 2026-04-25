@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.13.2 (2026-04-24)
+
+### autorip is dumb again — all hardware code moved to libfreemkv
+
+Architectural cleanup. autorip pre-0.13.2 was reimplementing drive
+discovery (sysfs walking, SCSI type-5 filtering, `/dev/sg*` path
+construction) and the wedge-recovery escalation that 0.13.1 added,
+all of which are libfreemkv's job. 0.13.2 deletes those copies and
+calls libfreemkv's new public probes:
+
+- Removed `enumerate_optical_drives()` (sysfs walk + type-5 filter +
+  fallback). Now `libfreemkv::list_drives()`.
+- Removed `try_recover_wedge()`, `is_wedge_signature()`, the wedge
+  signature constants (`WEDGE_ERROR_CODE`, `WEDGE_STATUS_HEX`),
+  `USB_RESET_SETTLE_SECS`. Now folded inside
+  `libfreemkv::drive_has_disc(path)`, hidden from callers.
+- Removed direct calls to `libfreemkv::scsi::reset` / `scsi::usb_reset`
+  — those are `pub(crate)` in 0.13.2 and unreachable from autorip
+  anyway.
+- The poll loop's per-tick `Drive::open` is gone. autorip used to call
+  the 2-second firmware-reset preamble of `Drive::open` 4 times every
+  5 s just to check disc presence — exactly the hot-loop pattern that
+  produced the production wedge at 23:51 UTC. Replaced with
+  `drive_has_disc(path)` (single TEST UNIT READY, ~50 ms).
+
+The poll loop is now a flat iteration over a startup-cached
+`list_drives()` snapshot, with `drive_has_disc` as the per-tick
+probe. ~80 lines deleted, ~30 added; net negative.
+
+### Self-recovery preserved
+
+The wedge that triggered the v0.13.1 emergency hotfix is still
+self-recoverable — `drive_has_disc` does the SCSI reset + USB reset
+escalation internally. autorip never sees a wedge error unless
+recovery has been exhausted; logs say `drive_has_disc failed
+(recovery exhausted)` with full structured fields when that happens.
+
+### Version sync
+0.13.2 ecosystem release (libfreemkv + freemkv + bdemu + autorip all
+on 0.13.2).
+
 ## 0.13.1 (2026-04-24)
 
 ### Self-recover from wedged USB drives + fix `/api/debug` file path

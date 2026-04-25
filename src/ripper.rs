@@ -222,83 +222,60 @@ fn drop_session(device: &str) {
 
 // ─── Poll loop ─────────────────────────────────────────────────────────────
 
-/// Enumerate optical drives (SCSI type 5 = CD/DVD/BD) under `/sys/class/scsi_generic`.
-/// Falls back to a `/dev/sg0..sg15` probe if sysfs is unreadable (minimal
-/// containers, dev hosts without procfs). Returns the device names sorted
-/// (e.g. `["sg4"]`) so iteration order is deterministic and the UI's tab
-/// order doesn't shuffle when sg numbers cross 9 → 10.
-fn enumerate_optical_drives() -> Vec<String> {
-    let mut drives: Vec<String> = Vec::new();
-    match std::fs::read_dir("/sys/class/scsi_generic") {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if !name.starts_with("sg") {
-                    continue;
-                }
-                let type_path = format!("/sys/class/scsi_generic/{}/device/type", name);
-                match std::fs::read_to_string(&type_path) {
-                    Ok(s) => {
-                        let t = s.trim();
-                        if t == "5" {
-                            drives.push(name);
-                        } else {
-                            tracing::debug!(
-                                device = %name,
-                                sysfs_type = %t,
-                                "skipping non-optical sg node"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        // Sysfs partial read — include the device anyway so
-                        // a misbehaving sysfs entry can't make a real drive
-                        // invisible. `Drive::open` will sort it out.
-                        tracing::debug!(
-                            device = %name,
-                            path = %type_path,
-                            error = %e,
-                            "sysfs type unreadable, including drive anyway"
-                        );
-                        drives.push(name);
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                "/sys/class/scsi_generic unreadable — falling back to /dev/sg0..sg15 probe"
-            );
-            for i in 0..16u8 {
-                let dev = format!("sg{}", i);
-                if std::path::Path::new(&format!("/dev/{}", dev)).exists() {
-                    drives.push(dev);
-                }
-            }
-        }
-    }
-    drives.sort();
-    drives
-}
-
 const POLL_INTERVAL_SECS: u64 = 5;
+
+/// Extract the trailing path component (`sg4` from `/dev/sg4`,
+/// `disk2` from `/dev/disk2`, `CdRom0` from `\\.\CdRom0`) for use as a
+/// device key in autorip's state map. autorip's UI / state machine
+/// keys everything by this short name; the lib gives back full
+/// platform paths in `DriveInfo`.
+fn device_key(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
 
 /// Poll drives for disc insertion. Only triggers on state change
 /// (no disc → disc present), not on disc already being there.
+///
+/// **Architectural note (0.13.2):** autorip is dumb — it never touches
+/// hardware paths, sysfs, SCSI, or USB. The lib's `list_drives()` does
+/// the platform-specific enumeration (sg/disk/CdRom paths, peripheral-
+/// type filtering, INQUIRY for vendor/model). The lib's
+/// `drive_has_disc(path)` does the disc-presence probe with internal
+/// wedge-recovery (SCSI reset → USB reset) hidden from the caller.
+/// autorip just iterates the snapshot, tracks logical state
+/// (idle/scanning/ripping/cooldown), and spawns rip threads.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
+    // Cache the drive list at startup. autorip's poll loop iterates
+    // the cache, not the platform — discovery is one-shot, not per-tick.
+    // If a drive is hot-added we'll miss it until restart; in practice
+    // udev-triggered rip events handle insertion and the cache is
+    // refreshed as a side effect of process restarts. Per-poll
+    // re-enumeration is the wrong place to absorb that — that's a
+    // design conversation for 0.14.
+    let drives = libfreemkv::list_drives();
+    let drive_paths: Vec<String> = drives.iter().map(|d| d.path.clone()).collect();
+    for d in &drives {
+        tracing::info!(
+            device = %device_key(&d.path),
+            path = %d.path,
+            vendor = %d.vendor,
+            model = %d.model,
+            firmware = %d.firmware,
+            "drive enumerated"
+        );
+    }
+
     let mut had_disc: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Devices that already had `Drive::open` fail at least once. Used to
-    // suppress repeat warnings every 5 s — first failure logs at warn,
-    // continued failures at debug. Without this, a permanently-locked or
-    // permission-denied sg node would spam autorip.log forever.
-    let mut warned_open_fail: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Devices we've already logged "present" for. Same pattern — info on
-    // transition, no log on every tick. Cleared when the drive goes away.
-    let mut logged_present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Devices that have surfaced a non-recoverable error from
+    // `drive_has_disc`. Used to throttle repeat warnings — first
+    // failure at warn, continued failures at debug. Without this, a
+    // permanently-locked or permission-denied node would spam
+    // autorip.log forever.
+    let mut warned_probe_fail: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     tracing::info!(
         interval_secs = POLL_INTERVAL_SECS,
+        drive_count = drives.len(),
         "drive poll loop starting"
     );
 
@@ -306,110 +283,45 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
         {
             let mut current_with_disc: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            let mut current_present: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
 
-            for device in enumerate_optical_drives() {
-                let path = format!("/dev/{}", device);
-                if !std::path::Path::new(&path).exists() {
-                    tracing::debug!(
-                        device = %device,
-                        path = %path,
-                        "sg node enumerated in sysfs but /dev path missing"
-                    );
-                    continue;
-                }
+            for path in &drive_paths {
+                let device = device_key(path);
 
-                // Don't touch drives that are actively scanning/ripping
+                // Don't touch drives that are actively scanning/ripping —
+                // they hold a Drive instance + sometimes the SCSI bus.
+                // Probing them mid-rip would conflict.
                 if is_busy(&device) {
-                    current_with_disc.insert(device.clone());
-                    current_present.insert(device);
+                    current_with_disc.insert(device);
                     continue;
                 }
 
-                // Open briefly to check status, then drop immediately.
-                //
-                // Pre-0.13 the failure path was a silent `Err(_) => continue`
-                // — what produced "No drives detected" with no clue why.
-                // 0.13.0 added structured logging. 0.13.1 adds a single
-                // `scsi::reset()` retry on the wedge signature (E4000 with
-                // INQUIRY status=0xff) — what an unplug-replug does
-                // physically. Lets the daemon self-recover from an entire
-                // class of post-upgrade wedges without operator intervention.
-                let drive_result = match libfreemkv::Drive::open(std::path::Path::new(&path)) {
-                    Ok(d) => Ok(d),
-                    Err(e) => {
-                        let estr = format!("{e}");
-                        let is_wedge = estr.contains("E4000") && estr.contains("0xff");
-                        if is_wedge {
-                            tracing::info!(
-                                device = %device,
-                                error = %e,
-                                "wedged-drive signature — attempting scsi::reset() + reopen"
-                            );
-                            if let Err(reset_err) =
-                                libfreemkv::scsi::reset(std::path::Path::new(&path))
-                            {
-                                tracing::warn!(
-                                    device = %device,
-                                    error = %reset_err,
-                                    "scsi::reset() failed"
-                                );
-                                Err(e)
-                            } else {
-                                match libfreemkv::Drive::open(std::path::Path::new(&path)) {
-                                    Ok(d2) => {
-                                        tracing::info!(
-                                            device = %device,
-                                            "drive recovered after scsi::reset()"
-                                        );
-                                        Ok(d2)
-                                    }
-                                    Err(e2) => {
-                                        tracing::warn!(
-                                            device = %device,
-                                            error = %e2,
-                                            "reopen still failing after scsi::reset()"
-                                        );
-                                        Err(e2)
-                                    }
-                                }
-                            }
-                        } else {
-                            Err(e)
-                        }
-                    }
-                };
-                let mut drive = match drive_result {
-                    Ok(d) => {
-                        warned_open_fail.remove(&device);
-                        d
+                // The whole hardware probe — discovery, wedge detection,
+                // SCSI reset, USB reset — is one lib call. autorip sees
+                // a `bool` for present/absent, or an `Err` only after
+                // recovery itself failed (drive permanently bricked).
+                let disc_present = match libfreemkv::drive_has_disc(std::path::Path::new(path)) {
+                    Ok(p) => {
+                        warned_probe_fail.remove(&device);
+                        p
                     }
                     Err(e) => {
-                        if warned_open_fail.insert(device.clone()) {
+                        if warned_probe_fail.insert(device.clone()) {
                             tracing::warn!(
                                 device = %device,
                                 path = %path,
                                 error = %e,
-                                "Drive::open failed — drive will be invisible to UI until this clears"
+                                "drive_has_disc failed (recovery exhausted) — drive invisible to UI until this clears"
                             );
                         } else {
                             tracing::debug!(
                                 device = %device,
                                 error = %e,
-                                "Drive::open still failing"
+                                "drive_has_disc still failing"
                             );
                         }
                         continue;
                     }
                 };
-                let disc_present = drive.drive_status() == libfreemkv::DriveStatus::DiscPresent;
-                drop(drive);
-
-                current_present.insert(device.clone());
-                if logged_present.insert(device.clone()) {
-                    tracing::info!(device = %device, "drive present");
-                }
 
                 if !disc_present {
                     // Disc removed — clean up session
@@ -513,20 +425,6 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         }
                     }
                 }
-            }
-
-            // Drives that were present last tick but vanished this tick.
-            // Forget them so a new appearance gets a fresh "drive present" log
-            // and clears any prior warned_open_fail state.
-            let vanished: Vec<String> = logged_present
-                .iter()
-                .filter(|d| !current_present.contains(*d))
-                .cloned()
-                .collect();
-            for dev in vanished {
-                tracing::info!(device = %dev, "drive disappeared");
-                logged_present.remove(&dev);
-                warned_open_fail.remove(&dev);
             }
 
             had_disc = current_with_disc;
@@ -2725,19 +2623,13 @@ mod tests {
     }
 
     #[test]
-    fn enumerate_optical_drives_returns_sorted_unique() {
-        // We can't mock /sys/class/scsi_generic from a unit test (it's a
-        // syscall against a real path), but we can assert the fallback
-        // path is well-behaved on hosts where sysfs is absent (macOS dev
-        // boxes). On any host the result must be:
-        //  - sorted lexically
-        //  - all entries start with "sg"
-        let drives = enumerate_optical_drives();
-        for d in &drives {
-            assert!(d.starts_with("sg"), "non-sg entry: {d:?}");
-        }
-        let mut sorted = drives.clone();
-        sorted.sort();
-        assert_eq!(drives, sorted, "result must be sorted");
+    fn device_key_strips_unix_path() {
+        // autorip keys its state map by the trailing path component
+        // ("sg4", "disk2", "CdRom0"); `device_key` strips the leading
+        // /dev/ or \\.\ prefix the lib returns in DriveInfo.path.
+        assert_eq!(super::device_key("/dev/sg4"), "sg4");
+        assert_eq!(super::device_key("/dev/disk2"), "disk2");
+        assert_eq!(super::device_key("\\\\.\\CdRom0"), "CdRom0");
+        assert_eq!(super::device_key("sg4"), "sg4"); // already a bare name
     }
 }
