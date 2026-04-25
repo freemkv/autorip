@@ -175,6 +175,12 @@ fn main() {
     // Main loop: poll drives (checks SHUTDOWN flag internally)
     ripper::drive_poll_loop(&cfg);
 
+    // Drain any rip threads that are still mid-flight so we don't
+    // exit the process while libfreemkv is holding a SCSI session
+    // and writing into staging. Bounded so a stuck drive can't
+    // pin shutdown indefinitely.
+    ripper::join_all_rip_threads(std::time::Duration::from_secs(35));
+
     log::syslog("autorip stopped");
 }
 

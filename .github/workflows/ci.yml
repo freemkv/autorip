@@ -5,38 +5,26 @@ on:
     branches: [main]
   pull_request:
 
+# autorip depends on libfreemkv from crates.io (see Cargo.toml).
+# No sibling-repo checkout is needed.
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: autorip
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/libfreemkv
-          path: libfreemkv
       - uses: dtolnay/rust-toolchain@1.86.0
         with:
           components: clippy, rustfmt
       - run: cargo fmt --check
-        working-directory: autorip
       - run: cargo clippy -- -D warnings
-        working-directory: autorip
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: autorip
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/libfreemkv
-          path: libfreemkv
       - uses: dtolnay/rust-toolchain@1.86.0
-      - run: cargo test
-        working-directory: autorip
+      - run: cargo test --tests
 
   # autorip targets Linux only (disc access via /dev/sg*)
   # Windows check removed — freemkv CLI covers cross-platform

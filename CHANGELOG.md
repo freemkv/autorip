@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.13.6 (2026-04-25)
+
+### Real-time direct-mode progress + bounded stop-drain
+
+Two production bugs from the v0.13.5 test rig, both resolved here on
+top of libfreemkv 0.13.6's new `BytesRead` event and `Drive::read`
+retry strip.
+
+**Per-device progress in direct mode.** Pre-0.13.6 the per-device UI
+sat at "0 KB/s, 0%" for the entire duration of a direct (no-mapfile)
+rip. Two causes:
+- libfreemkv never emitted `EventKind::BytesRead`. Fixed in 0.13.6 of
+  the lib.
+- The first state update was gated behind a 1 s throttle, so even
+  once events flowed, the cold-start frame was a zero. The
+  smooth-speed seed was an implicit "if 0 then replace" hack that
+  fought the throttle gate.
+
+`Drive::on_event` and `DiscStream::on_event` now consume
+`EventKind::BytesRead` (ripper.rs:1372, 1686) and stash the latest
+cumulative byte count into an `Arc<AtomicU64>`. The main rip loop
+prefers it over `output.bytes_written()` whenever the lib is feeding
+us progress. Cold-start is fixed via a `first_update` flag that
+bypasses the throttle for the first frame and a `seeded_speed` flag
+that replaces the seed-when-zero hack with explicit one-shot
+seeding. UI now goes live within the first read tick.
+
+**Stop is now drain-bounded, not best-effort.** Pre-0.13.6,
+`POST /api/stop/<device>` flipped the rip thread's halt flag and
+returned 200 immediately, then the staging-wipe ran while the rip
+thread was still inside an in-flight CDB — racing the wipe with
+`Disc::copy`'s file writes. On a wedge-class drive this manifested
+as "stop returns OK, files reappear in staging seconds later, next
+rip resumes from corrupt mapfile."
+
+The rip thread is now spawned with a retained `JoinHandle` registered
+into a global `RIP_THREADS` map. `handle_stop` joins the rip thread
+(35 s bounded timeout — covers libfreemkv 0.13.6's 30 s recovery
+timeout plus a small grace) BEFORE wiping staging or resetting state.
+`main`'s SIGTERM / SIGINT handler joins all rip threads before
+exit. `eject_drive` synchronizes with the rip thread before
+`drop_session`. Eject is up to 30 s slower in the worst case but
+no longer races the rip; staging wipes always win.
+
+### Dead match arms removed
+
+`Retry`, `SectorRecovered`, and `SpeedChange` are no longer emitted
+by libfreemkv 0.13.6 (the recovery loop that produced them is gone).
+The corresponding match arms in `Drive::on_event` / `DiscStream::on_event`
+are deleted.
+
+### Tests
+
+- New `src/lib.rs` so integration tests can reach internals;
+  `main.rs` and `lib.rs` compile against the same module graph.
+- New `tests/reporting.rs`, `tests/halt_drain.rs`, `tests/end_to_end.rs`
+  — 9 integration tests covering `BytesRead` state propagation,
+  first-frame publish bypassing throttle, smoothing seed,
+  halt-flag set, stop-drain join, eject sync, JSON state
+  round-trip, route dispatch.
+- 9 integration + 59 unit tests green; no regressions.
+
+### Consumes libfreemkv 0.13.6
+Cargo.toml dep pin `0.13.5` → `0.13.6`.
+
+### Version sync
+0.13.6 ecosystem release (libfreemkv + freemkv + bdemu + autorip all
+on 0.13.6).
+
 ## 0.13.5 (2026-04-25)
 
 ### Stop is a true reset; startup sweeps stale staging
