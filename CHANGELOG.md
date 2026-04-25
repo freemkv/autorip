@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.9 (2026-04-25)
+
+### Cosmetic + version sync
+
+- Warning message "rip thread did not drain within 35s of stop"
+  corrected to "60s" — matches the v0.13.8 drain timeout. Same value
+  in `eject_drive`'s warning. No behavior change.
+- Picks up libfreemkv 0.13.9: `Disc::copy` stall guard + the
+  `SgIoTransport` reopen-after-timeout fix that prevents the silent
+  Pass 1 hang observed on Dune 2 in the v0.13.8 live test.
+
 ## 0.13.8 (2026-04-25)
 
 ### Fix: stop drain races, post-stop "error" leak, hardening
