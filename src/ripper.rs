@@ -1162,6 +1162,13 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     reset_stop_flag(device);
 
+    // Archive the previous rip's per-device log so the live log only
+    // shows events from the current attempt. Mirrors what scan_disc
+    // does; previously rip_disc was missing this so a stop -> rip
+    // cycle left "Stop requested..." / "Pass 1 cancelled" lines from
+    // the prior run mixed into the new one.
+    crate::log::archive_device_log(device);
+
     let cfg_read = match cfg.read() {
         Ok(c) => c,
         Err(_) => return,
@@ -1733,6 +1740,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 crate::log::device_log(device, "No progress on last pass — stopping retries.");
                 break;
             }
+        }
+
+        // If a halt fired during Pass 1 or any retry pass, bail before
+        // muxing. Otherwise we'd attempt to mux a (likely zero-byte or
+        // partial) ISO and surface a confusing "muxing..." -> error
+        // sequence on top of a clean stop. handle_stop has already
+        // reset state to idle; we just clean up and exit.
+        if halted || halt.load(Ordering::Relaxed) {
+            crate::log::device_log(device, "Rip cancelled — skipping mux.");
+            if let Ok(mut flags) = HALT_FLAGS.lock() {
+                flags.remove(device);
+            }
+            return;
         }
 
         // Close drive — all physical I/O done.
@@ -2430,7 +2450,7 @@ pub fn eject_drive(device_path: &str) {
     // libfreemkv call holding the Drive while we yank it.
     request_stop(dev);
     if join_rip_thread(dev, Duration::from_secs(60)).is_err() {
-        tracing::warn!(device = %dev, "rip thread did not drain within 35s of eject");
+        tracing::warn!(device = %dev, "rip thread did not drain within 60s of eject");
     }
     drop_session(dev);
     crate::log::archive_device_log(dev);

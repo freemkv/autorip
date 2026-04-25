@@ -1520,7 +1520,7 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     if ripper::join_rip_thread(device, std::time::Duration::from_secs(60)).is_err() {
         tracing::warn!(
             device = %device,
-            "rip thread did not drain within 35s of stop; staging wipe may race"
+            "rip thread did not drain within 60s of stop; staging wipe may race"
         );
     }
 
