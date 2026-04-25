@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.13.3 (2026-04-24)
+
+### Consume libfreemkv 0.13.3 — wedge recovery actually runs now
+
+autorip 0.13.2 deployed clean but the underlying
+`libfreemkv::drive_has_disc` never escalated to SCSI/USB reset on the
+real production wedge signature (`E4000: 0x00/0xff/0x00`) because
+libfreemkv's `is_wedge_signature` was gated on the INQUIRY opcode.
+The poll loop's "recovery exhausted" warning was firing on the raw
+pass-through error without recovery ever having been attempted.
+
+libfreemkv 0.13.3 drops the opcode gate; any `status=0xff` TUR error
+now triggers the full SCSI reset → USB reset → retry probe chain.
+Cargo.toml dep pin `0.13.2` → `0.13.3`. No autorip source changes.
+
 ## 0.13.2 (2026-04-24)
 
 ### autorip is dumb again — all hardware code moved to libfreemkv
