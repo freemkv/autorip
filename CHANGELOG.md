@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.13.8 (2026-04-25)
+
+### Fix: stop drain races, post-stop "error" leak, hardening
+
+Hotfix for two issues seen during live v0.13.7 validation on the Dell
+host (BU40N) where stop-drain worked but the post-stop UX surfaced as
+"error":
+
+- Drain timeout 35 s -> 60 s (handle_stop, eject_drive, main shutdown).
+  35 s wasn't enough for `Disc::copy`'s in-flight 30 s SCSI READ +
+  unwind on halt; the join timed out and `wipe_staging` raced the
+  rip thread, producing `E5000: No such file or directory`.
+- Halt-aware error handling. `Disc::copy` and `Disc::patch` Err arms
+  now check the halt flag first: an IO error during a stop is logged
+  as "Pass N cancelled (halt)" and does NOT update state to "error",
+  so the post-stop state stays cleanly idle (set by handle_stop). A
+  real (non-halt) error still surfaces as "error" with the underlying
+  message.
+- Structural follow-up to v0.13.7: introduced `ripper::spawn_rip_thread`
+  helper that bundles `Builder::new().name(...).spawn(...) +
+  register_rip_thread` into one call. All three rip-related spawn
+  sites (poll-loop, handle_scan, handle_rip) now use it. New
+  `tests/spawn_registration.rs` pins the contract that v0.13.6 first
+  violated. See the post-mortem follow-up in freemkv-private.
+
 ## 0.13.7 (2026-04-25)
 
 ### Fix: /api/rip and /api/scan threads now register for stop-drain
