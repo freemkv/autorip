@@ -29,8 +29,27 @@ pub fn register_rip_thread(device: &str, handle: JoinHandle<()>) {
     }
 }
 
-fn take_rip_thread(device: &str) -> Option<JoinHandle<()>> {
+pub fn take_rip_thread(device: &str) -> Option<JoinHandle<()>> {
     RIP_THREADS.lock().ok()?.remove(device)
+}
+
+/// Spawn a rip-related worker thread and register its `JoinHandle`
+/// in `RIP_THREADS` atomically. Use this for every code path that
+/// runs scan/rip work — `handle_stop` relies on the registration to
+/// drain the thread before wiping staging. Bypassing this helper
+/// (`std::thread::spawn` directly) reintroduces the v0.13.6 stop bug
+/// where stop returned in 27 ms because no handle was registered.
+///
+/// `role` is a short tag (e.g. "rip", "scan") used for the OS thread
+/// name; `device` is both the registration key and part of the name.
+pub fn spawn_rip_thread<F>(device: &str, role: &str, f: F) -> std::io::Result<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let name = format!("{}-{}", role, device);
+    let handle = std::thread::Builder::new().name(name).spawn(f)?;
+    register_rip_thread(device, handle);
+    Ok(())
 }
 
 /// Wait (up to `timeout`) for the rip thread for `device` to exit.
@@ -498,42 +517,37 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     let dev_path = path.clone();
                     let device_for_thread = device.clone();
 
-                    let spawn_result = std::thread::Builder::new()
-                        .name(format!("rip-{}", device))
-                        .spawn(move || {
-                            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                scan_disc(&cfg, &device_for_thread, &dev_path);
-                                if on_insert == "rip" && !stop_requested(&device_for_thread) {
-                                    rip_disc(&cfg, &device_for_thread, &dev_path);
-                                }
-                            }))
-                            .is_err()
-                            {
-                                tracing::error!(
-                                    device = %device_for_thread,
-                                    "scan/rip thread panicked"
-                                );
-                                crate::log::device_log(&device_for_thread, "Thread panicked");
-                                drop_session(&device_for_thread);
-                                update_state(
-                                    &device_for_thread,
-                                    RipState {
-                                        device: device_for_thread.clone(),
-                                        status: "error".to_string(),
-                                        last_error: "Internal error (panic)".to_string(),
-                                        ..Default::default()
-                                    },
-                                );
+                    if let Err(e) = spawn_rip_thread(&device, "rip", move || {
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            scan_disc(&cfg, &device_for_thread, &dev_path);
+                            if on_insert == "rip" && !stop_requested(&device_for_thread) {
+                                rip_disc(&cfg, &device_for_thread, &dev_path);
                             }
-                        });
-
-                    match spawn_result {
-                        Ok(handle) => register_rip_thread(&device, handle),
-                        Err(e) => tracing::warn!(
+                        }))
+                        .is_err()
+                        {
+                            tracing::error!(
+                                device = %device_for_thread,
+                                "scan/rip thread panicked"
+                            );
+                            crate::log::device_log(&device_for_thread, "Thread panicked");
+                            drop_session(&device_for_thread);
+                            update_state(
+                                &device_for_thread,
+                                RipState {
+                                    device: device_for_thread.clone(),
+                                    status: "error".to_string(),
+                                    last_error: "Internal error (panic)".to_string(),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    }) {
+                        tracing::warn!(
                             device = %device,
                             error = %e,
                             "failed to spawn rip thread"
-                        ),
+                        );
                     }
                 } else if !is_new_insert && !is_busy(&device) {
                     if let Ok(mut s) = STATE.lock() {
@@ -1573,6 +1587,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let result = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
             Ok(r) => r,
             Err(e) => {
+                // If halt is set, the error is the user-initiated stop racing
+                // the worker (e.g. handle_stop wiped staging while disc.copy
+                // was mid-write). Don't surface as "error" — handle_stop has
+                // already cleared state to idle. Just clean up and exit.
+                if halt.load(Ordering::Relaxed) {
+                    crate::log::device_log(device, &format!("Pass 1 cancelled (halt): {e}"));
+                    if let Ok(mut flags) = HALT_FLAGS.lock() {
+                        flags.remove(device);
+                    }
+                    return;
+                }
                 crate::log::device_log(device, &format!("Pass 1 failed: {e}"));
                 update_state(
                     device,
@@ -1677,7 +1702,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             let pr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {
                 Ok(r) => r,
                 Err(e) => {
-                    crate::log::device_log(device, &format!("Pass {pass} failed: {e}"));
+                    // Same halt-vs-error distinction as Pass 1's disc.copy
+                    // arm: if stop was requested, the IO error is the
+                    // staging-wipe racing the worker, not a real failure.
+                    if halt.load(Ordering::Relaxed) {
+                        crate::log::device_log(
+                            device,
+                            &format!("Pass {pass} cancelled (halt): {e}"),
+                        );
+                    } else {
+                        crate::log::device_log(device, &format!("Pass {pass} failed: {e}"));
+                    }
                     break;
                 }
             };
@@ -2394,7 +2429,7 @@ pub fn eject_drive(device_path: &str) {
     // the session — otherwise the rip thread could still be inside a
     // libfreemkv call holding the Drive while we yank it.
     request_stop(dev);
-    if join_rip_thread(dev, Duration::from_secs(35)).is_err() {
+    if join_rip_thread(dev, Duration::from_secs(60)).is_err() {
         tracing::warn!(device = %dev, "rip thread did not drain within 35s of eject");
     }
     drop_session(dev);

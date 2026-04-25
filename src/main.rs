@@ -179,7 +179,7 @@ fn main() {
     // exit the process while libfreemkv is holding a SCSI session
     // and writing into staging. Bounded so a stuck drive can't
     // pin shutdown indefinitely.
-    ripper::join_all_rip_threads(std::time::Duration::from_secs(35));
+    ripper::join_all_rip_threads(std::time::Duration::from_secs(60));
 
     log::syslog("autorip stopped");
 }
