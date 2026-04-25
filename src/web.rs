@@ -1487,11 +1487,24 @@ fn handle_eject(request: tiny_http::Request, device: &str) {
 }
 
 fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
-    // Stop is a reset: signal threads to abort, drop the SCSI session,
-    // wipe staging so the next rip starts on a clean disk, and collapse
-    // the state entry to a fresh idle.
+    // Stop is a reset: signal threads to abort, wait for the rip thread to
+    // drain (so we don't wipe staging out from under a mid-write), drop the
+    // SCSI session, wipe staging so the next rip starts on a clean disk,
+    // and collapse the state entry to a fresh idle.
+    //
+    // The 35 s drain budget covers a 30 s in-flight CDB plus margin. A
+    // timeout is logged but not fatal — the HTTP response still goes out
+    // 200 so the UI doesn't spin. The rip thread will exit on its next
+    // halt-flag check; we just won't have observed it before responding.
     ripper::request_stop(device);
     crate::verify::request_stop();
+
+    if ripper::join_rip_thread(device, std::time::Duration::from_secs(35)).is_err() {
+        tracing::warn!(
+            device = %device,
+            "rip thread did not drain within 35s of stop; staging wipe may race"
+        );
+    }
 
     let existed = ripper::STATE
         .lock()

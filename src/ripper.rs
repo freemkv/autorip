@@ -3,8 +3,85 @@ use libfreemkv::pes::Stream as PesStream;
 
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::config::Config;
+
+/// Global table of rip-thread JoinHandles keyed by device. Populated
+/// when the poll loop spawns the scan/rip thread; consumed by
+/// `join_rip_thread` (called from `handle_stop`, `eject_drive`, and
+/// the shutdown path).
+static RIP_THREADS: once_cell::sync::Lazy<
+    Mutex<std::collections::HashMap<String, JoinHandle<()>>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Register a rip-thread JoinHandle for `device`. Production calls
+/// this from the poll-loop spawn site; the integration tests under
+/// `tests/halt_drain.rs` also call it to plug a synthetic thread
+/// into the same machinery `handle_stop` uses.
+pub fn register_rip_thread(device: &str, handle: JoinHandle<()>) {
+    if let Ok(mut t) = RIP_THREADS.lock() {
+        // If an old entry is still here (e.g. prior thread crashed
+        // without being reaped), drop the stale handle — we only
+        // keep one live handle per device.
+        t.insert(device.to_string(), handle);
+    }
+}
+
+fn take_rip_thread(device: &str) -> Option<JoinHandle<()>> {
+    RIP_THREADS.lock().ok()?.remove(device)
+}
+
+/// Wait (up to `timeout`) for the rip thread for `device` to exit.
+/// Returns `Ok(())` if the thread finished within the window or no
+/// thread was registered. Returns `Err(())` on timeout.
+///
+/// Best-effort drain: callers should treat a timeout as a warning,
+/// not a fatal error. The rip thread's HALT flag was already flipped
+/// by `request_stop`; the thread will exit eventually. The timeout
+/// just bounds how long the HTTP response (or shutdown sequence)
+/// blocks.
+///
+/// Implementation: poll `JoinHandle::is_finished()` every 25 ms
+/// until it returns true or the deadline passes. Polling avoids the
+/// extra channel plumbing of a one-shot signal and keeps the
+/// registration API simple (test code can register a synthetic
+/// thread without producing a paired Receiver).
+pub fn join_rip_thread(device: &str, timeout: Duration) -> Result<(), ()> {
+    let handle = match take_rip_thread(device) {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            // Stash the handle back so a later caller (or shutdown)
+            // can reap it; the thread is still running.
+            if let Ok(mut t) = RIP_THREADS.lock() {
+                t.insert(device.to_string(), handle);
+            }
+            return Err(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = handle.join();
+    Ok(())
+}
+
+/// Drain every known rip thread, each bounded by `timeout`.
+pub fn join_all_rip_threads(timeout: Duration) {
+    let devices: Vec<String> = RIP_THREADS
+        .lock()
+        .ok()
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
+    for device in devices {
+        if join_rip_thread(&device, timeout).is_err() {
+            tracing::warn!(device = %device, "rip thread did not drain within timeout");
+        }
+    }
+}
 
 /// Per-device stop flag. Rip thread checks this and exits if true.
 pub static STOP_FLAGS: once_cell::sync::Lazy<
@@ -418,36 +495,45 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
 
                     let cfg = cfg.clone();
                     let dev_path = path.clone();
+                    let device_for_thread = device.clone();
 
-                    std::thread::Builder::new()
+                    let spawn_result = std::thread::Builder::new()
                         .name(format!("rip-{}", device))
                         .spawn(move || {
                             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                scan_disc(&cfg, &device, &dev_path);
-                                if on_insert == "rip" && !stop_requested(&device) {
-                                    rip_disc(&cfg, &device, &dev_path);
+                                scan_disc(&cfg, &device_for_thread, &dev_path);
+                                if on_insert == "rip" && !stop_requested(&device_for_thread) {
+                                    rip_disc(&cfg, &device_for_thread, &dev_path);
                                 }
                             }))
                             .is_err()
                             {
                                 tracing::error!(
-                                    device = %device,
+                                    device = %device_for_thread,
                                     "scan/rip thread panicked"
                                 );
-                                crate::log::device_log(&device, "Thread panicked");
-                                drop_session(&device);
+                                crate::log::device_log(&device_for_thread, "Thread panicked");
+                                drop_session(&device_for_thread);
                                 update_state(
-                                    &device,
+                                    &device_for_thread,
                                     RipState {
-                                        device: device.clone(),
+                                        device: device_for_thread.clone(),
                                         status: "error".to_string(),
                                         last_error: "Internal error (panic)".to_string(),
                                         ..Default::default()
                                     },
                                 );
                             }
-                        })
-                        .ok();
+                        });
+
+                    match spawn_result {
+                        Ok(handle) => register_rip_thread(&device, handle),
+                        Err(e) => tracing::warn!(
+                            device = %device,
+                            error = %e,
+                            "failed to spawn rip thread"
+                        ),
+                    }
                 } else if !is_new_insert && !is_busy(&device) {
                     if let Ok(mut s) = STATE.lock() {
                         if let Some(rs) = s.get_mut(&device) {
@@ -1361,6 +1447,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // timestamp is updated on ANY sector-level event — not just frame writes —
     // so a long run of skipped sectors doesn't falsely register as "stalled".
     let wd_last_frame = Arc::new(AtomicU64::new(crate::util::epoch_secs()));
+    let latest_bytes_read = Arc::new(AtomicU64::new(0));
     let rip_last_lba = Arc::new(AtomicU64::new(0));
     let rip_current_batch = Arc::new(AtomicU16::new(batch));
 
@@ -1369,30 +1456,21 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     register_halt(device, halt.clone());
     let dev_for_events = device.to_string();
     let wdf_drive = wd_last_frame.clone();
+    let lbr_drive = latest_bytes_read.clone();
     session.drive.on_event(move |event| {
         // Any drive-level event means something is happening — reset the
         // watchdog so the "stalled" timer doesn't monotonically climb
         // while the library is working through recovery.
         wdf_drive.store(crate::util::epoch_secs(), Ordering::Relaxed);
         match event.kind {
+            libfreemkv::event::EventKind::BytesRead { bytes, .. } => {
+                lbr_drive.store(bytes, Ordering::Relaxed);
+            }
             libfreemkv::event::EventKind::ReadError { sector, .. } => {
                 crate::log::device_log(
                     &dev_for_events,
                     &format!("Read error at sector {}", sector),
                 );
-            }
-            libfreemkv::event::EventKind::Retry { attempt } => {
-                crate::log::device_log(&dev_for_events, &format!("Retrying (attempt {})", attempt));
-            }
-            libfreemkv::event::EventKind::SectorRecovered { sector } => {
-                crate::log::device_log(&dev_for_events, &format!("Sector {} recovered", sector));
-            }
-            libfreemkv::event::EventKind::SpeedChange { speed_kbs } => {
-                if speed_kbs == 0 {
-                    crate::log::device_log(&dev_for_events, "Recovery: min speed");
-                } else {
-                    crate::log::device_log(&dev_for_events, "Restoring full speed");
-                }
             }
             _ => {}
         }
@@ -1683,11 +1761,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let wdf_stream = wd_last_frame.clone();
     let llba_stream = rip_last_lba.clone();
     let rbs_stream = rip_current_batch.clone();
+    let lbr_stream = latest_bytes_read.clone();
     input.on_event(move |event| {
         // Same rationale as the drive callback — DiscStream events prove
         // the rip is advancing even if no PES frame has been emitted yet.
         wdf_stream.store(crate::util::epoch_secs(), Ordering::Relaxed);
         match event.kind {
+            libfreemkv::event::EventKind::BytesRead { bytes, .. } => {
+                lbr_stream.store(bytes, Ordering::Relaxed);
+            }
             libfreemkv::event::EventKind::BatchSizeChanged { new_size, reason } => {
                 rbs_stream.store(new_size, Ordering::Relaxed);
                 let label = match reason {
@@ -1704,13 +1786,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 crate::log::device_log(
                     &dev_for_stream_events,
                     &format!("Sector {} skipped (zero-filled)", sector),
-                );
-            }
-            libfreemkv::event::EventKind::SectorRecovered { sector } => {
-                llba_stream.store(sector, Ordering::Relaxed);
-                crate::log::device_log(
-                    &dev_for_stream_events,
-                    &format!("Sector {} recovered", sector),
                 );
             }
             _ => {}
@@ -1797,6 +1872,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let mut last_speed_bytes: u64 = 0;
     let mut last_speed_time = start;
     let mut smooth_speed: f64 = 0.0;
+    let mut first_update: bool = true;
+    let mut seeded_speed: bool = false;
 
     // Watchdog: monitors the rip loop and logs when reads stall.
     // The rip thread updates last_frame_epoch on every frame. The watchdog
@@ -1965,12 +2042,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 wd_bytes.store(output.bytes_written(), Ordering::Relaxed);
 
                 let now = std::time::Instant::now();
-                if now.duration_since(last_update).as_secs_f64() < 1.0 {
+                if !first_update && now.duration_since(last_update).as_secs_f64() < 1.0 {
                     continue;
                 }
+                first_update = false;
                 last_update = now;
 
-                let bytes_done = output.bytes_written();
+                let lbr = latest_bytes_read.load(Ordering::Relaxed);
+                let bytes_done = if lbr > 0 { lbr } else { output.bytes_written() };
                 let pct = if total_bytes > 0 {
                     (bytes_done * 100 / total_bytes).min(100) as u8
                 } else {
@@ -1978,13 +2057,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 };
                 let speed_interval = now.duration_since(last_speed_time).as_secs_f64();
                 let instant_speed = if speed_interval > 0.0 {
-                    (bytes_done - last_speed_bytes) as f64 / (1024.0 * 1024.0) / speed_interval
+                    (bytes_done.saturating_sub(last_speed_bytes)) as f64
+                        / (1024.0 * 1024.0)
+                        / speed_interval
                 } else {
                     0.0
                 };
                 last_speed_bytes = bytes_done;
                 last_speed_time = now;
-                smooth_speed = if smooth_speed < 0.01 {
+                smooth_speed = if !seeded_speed {
+                    seeded_speed = true;
                     instant_speed
                 } else {
                     0.95 * smooth_speed + 0.05 * instant_speed
@@ -2307,6 +2389,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
 pub fn eject_drive(device_path: &str) {
     let dev = device_path.rsplit('/').next().unwrap_or("");
+    // Halt and drain any in-flight rip on this device BEFORE dropping
+    // the session — otherwise the rip thread could still be inside a
+    // libfreemkv call holding the Drive while we yank it.
+    request_stop(dev);
+    if join_rip_thread(dev, Duration::from_secs(35)).is_err() {
+        tracing::warn!(device = %dev, "rip thread did not drain within 35s of eject");
+    }
     drop_session(dev);
     crate::log::archive_device_log(dev);
     if let Ok(mut session) = libfreemkv::Drive::open(std::path::Path::new(device_path)) {
