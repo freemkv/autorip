@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.9 (2026-04-25)
+
+### Version sync — consume libfreemkv 0.13.9
+
+Picks up Disc::copy's new stall guard + SgIoTransport's reopen-after-
+timeout fix. CLI surface unchanged.
+
 ## 0.13.8 (2026-04-25)
 
 ### Version sync — consume libfreemkv 0.13.8
