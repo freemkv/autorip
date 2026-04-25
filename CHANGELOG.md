@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.13.10 (2026-04-25)
+
+### Fix: Pass 1 RipState now reports preferred_batch / current_batch
+
+Previously /api/state showed `batch=0/0` during Pass 1 (Disc::copy):
+the per-pass `set_pass_progress` and `push_pass_state` called
+`update_state` with `..Default::default()`, leaving the batch fields
+at their default 0. The kernel-reported preferred batch (from
+`detect_max_batch_sectors` at ripper.rs:1411) is now threaded
+through `PassContext` and surfaced in RipState during every Pass 1
+and retry-pass progress update.
+
+Pass 1 doesn't shrink the batch (Disc::copy uses a fixed batch
+size), so `current_batch == preferred_batch` throughout. The
+DiscStream adaptive batch halver still runs only during the mux
+phase and is reported by the direct-mode stream loop.
+
+Note: `last_sector` during Pass 1 is still 0 — it requires a
+libfreemkv on_progress signature change (Fn(u64,u64,u64)) and is
+deferred to v0.14.
+
 ## 0.13.9 (2026-04-25)
 
 ### Cosmetic + version sync
