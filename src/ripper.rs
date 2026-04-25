@@ -220,6 +220,27 @@ fn drop_session(device: &str) {
     }
 }
 
+/// Remove every subdirectory under `cfg.staging_dir`. Used on startup (all
+/// prior session state is gone, so anything still on disk is orphaned from
+/// a killed process) and on user-initiated stop (stop == reset — clean
+/// slate so the next rip doesn't accidentally resume stale state).
+///
+/// Best-effort: logs each removal, silently ignores errors on individual
+/// entries. A locked or not-yet-created staging root is not fatal.
+pub fn wipe_staging(staging_dir: &str) {
+    let entries = match std::fs::read_dir(staging_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match std::fs::remove_dir_all(&path) {
+            Ok(_) => tracing::info!(path = %path.display(), "wiped stale staging entry"),
+            Err(e) => tracing::warn!(path = %path.display(), error = %e, "staging wipe skipped"),
+        }
+    }
+}
+
 // ─── Poll loop ─────────────────────────────────────────────────────────────
 
 const POLL_INTERVAL_SECS: u64 = 5;
@@ -252,6 +273,15 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     // refreshed as a side effect of process restarts. Per-poll
     // re-enumeration is the wrong place to absorb that — that's a
     // design conversation for 0.14.
+    // Startup sweep: anything under /staging is orphaned — there are no
+    // live sessions yet. A prior autorip process killed mid-rip leaves its
+    // in-progress ISO / mapfile / partial MKV here, which the old
+    // resume=false path still couldn't guarantee away. Wipe unconditionally
+    // so the next rip always starts clean.
+    if let Ok(c) = cfg.read() {
+        wipe_staging(&c.staging_dir);
+    }
+
     let drives = libfreemkv::list_drives();
     let drive_paths: Vec<String> = drives.iter().map(|d| d.path.clone()).collect();
     for d in &drives {
@@ -310,7 +340,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                                 device = %device,
                                 path = %path,
                                 error = %e,
-                                "drive_has_disc failed (recovery exhausted) — drive invisible to UI until this clears"
+                                "drive_has_disc failed — drive firmware unresponsive; physical reconnect or host reboot required"
                             );
                         } else {
                             tracing::debug!(

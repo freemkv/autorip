@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.13.5 (2026-04-25)
+
+### Stop is a true reset; startup sweeps stale staging
+
+Two bugs surfaced during the 0.13.4 production test of Dune: Part Two and
+are fixed here.
+
+**Startup staging sweep.** Prior autorip processes killed mid-rip leave
+their partial ISO + mapfile + MKV in `/staging/<disc>/`. 0.12.5's
+"every rip starts fresh" logic only cleaned stale data when the *same*
+disc was re-inserted; unrelated orphans (yesterday's MKV, unrelated
+dirs from other discs) accumulated forever. On `drive_poll_loop` entry
+we now wipe every subdirectory of `cfg.staging_dir` unconditionally —
+at startup there are no live sessions, so every entry is orphaned.
+
+**Stop → full reset.** `POST /api/stop/<device>` previously only
+signalled the rip thread to abort and flipped status to `"idle"`. The
+in-progress ISO / mapfile stayed on disk, so the next rip's resume-safe
+path could pick up half-written bytes. Now stop = reset: wipe
+`cfg.staging_dir/*` and collapse the state entry back to a fresh
+`RipState { status: "idle", disc_present, ..Default::default() }`. The
+next rip starts on a clean disk.
+
+**Stale log text.** The `drive_has_disc failed` WARN still referenced
+the 0.13.2/3 "recovery exhausted" wording, which misleadingly implied
+the lib had tried something. libfreemkv 0.13.4 rolled recovery back;
+updated the text to "drive firmware unresponsive; physical reconnect
+or host reboot required".
+
+Dep pin `0.13.4` → `0.13.5` (sync bump; libfreemkv has no functional
+changes).
+
 ## 0.13.4 (2026-04-25)
 
 ### Consume libfreemkv 0.13.4 — wedge recovery rolled back
