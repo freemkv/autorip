@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.13.17 (2026-04-26)
+
+### Fix: hot-plug — autorip picks up unplug/replug without container restart
+
+`drive_poll_loop` cached the drive list at startup ("design conversation
+for 0.14" comment in pre-0.13.17 code). When the user unplugged a wedged
+drive and replugged, the kernel re-enumerated it (often at a new
+`/dev/sg*` slot), but autorip's cached path list never refreshed —
+`/api/state` stayed empty until container restart. Lost ~30 minutes of
+wall time across yesterday's testing alone.
+
+Fix: every 30 s the poll loop calls `libfreemkv::list_drives()` and
+reconciles against the cached path list:
+- New devices → log `"drive enumerated (hot-plug)"` and start polling them.
+- Devices that disappeared → log `"drive removed (hot-unplug)"`,
+  `drop_session`, remove from `STATE` map.
+
+Cross-platform via libfreemkv's existing `list_drives()` (Linux sg/macOS
+disk/Windows CdRom enumeration). No platform-specific udev integration.
+
 ## 0.13.16 (2026-04-26)
 
 ### Fix: UI lies. Bar reads `pass_progress_pct` directly. (RIP_DESIGN.md §16)
