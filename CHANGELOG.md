@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.18 (2026-04-26)
+
+### Sync release — no functional changes
+
+Bumped to satisfy the unified-versioning rule. Actual fix is in autorip
+(`web.rs` two-bar UI — pass and total progress now render as separate
+bars with their own text rows). CLI doesn't render the dashboard, so
+this is a transparent dep bump.
+
 ## 0.13.17 (2026-04-26)
 
 ### Sync release — no functional changes
