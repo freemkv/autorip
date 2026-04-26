@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.13.15 (2026-04-26)
+
+### Fix: 3-arg on_progress for `pipe::run` callers
+
+libfreemkv 0.13.15 changed `CopyOptions::on_progress` to a 3-arg
+signature `Fn(bytes_good, pos, total)`. The CLI's progress callbacks
+in `pipe.rs` are updated to match. No behavior change.
+
+### Sync — consume libfreemkv 0.13.15
+
+Picks up the new `on_progress` 3-arg signature, `PatchOptions::reverse`,
+`wedged_threshold`, `PatchResult::wedged_exit`, plus the autorip-side
+fixes for per-pass cap, mux-on-natural-end, retry strategy, drive
+settle, and pos-based progress display.
+
 ## 0.13.14 (2026-04-25)
 
 ### Sync release — no functional changes

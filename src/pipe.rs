@@ -586,7 +586,10 @@ fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool,
     let start = std::time::Instant::now();
     let last_update = std::cell::Cell::new(start);
 
-    let progress = |done: u64, total: u64| {
+    // libfreemkv 0.13.15: on_progress signature is (bytes_good, pos, total).
+    // For the disc→ISO direct copy path the CLI displays "swept" position,
+    // not just bytes_good — same reason as autorip's UI fix in 0.13.15.
+    let progress = |_bytes_good: u64, pos: u64, total: u64| {
         if out.is_quiet() {
             return;
         }
@@ -595,7 +598,7 @@ fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool,
             return;
         }
         last_update.set(now);
-        print_progress(done, total, 0, &start);
+        print_progress(pos, total, 0, &start);
     };
 
     let batch = libfreemkv::disc::detect_max_batch_sectors(drive.device_path());
