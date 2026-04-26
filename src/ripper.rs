@@ -1336,7 +1336,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         libfreemkv::DiscFormat::Unknown => "unknown",
     }
     .to_string();
-    let total_bytes = disc.titles.first().map(|t| t.size_bytes).unwrap_or(0);
+    // Pass 1 reads the WHOLE DISC (not a single title), so the total must be
+    // disc.capacity_bytes — using titles[0].size_bytes (the chosen movie's
+    // duration-weighted size estimate) was the v0.13.12 bug that made the UI
+    // show "0.0 GB / 0.0 GB" during Pass 1. Mux phase below already
+    // re-derives its own total from the input stream, so we don't lose that.
+    let total_bytes = if disc.capacity_bytes > 0 {
+        disc.capacity_bytes
+    } else {
+        disc.titles.first().map(|t| t.size_bytes).unwrap_or(0)
+    };
 
     let tmdb = &session.tmdb;
     let tmdb_title = tmdb.as_ref().map(|t| t.title.clone()).unwrap_or_default();
