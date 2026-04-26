@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.21 (2026-04-26)
+
+### Sync release — picks up libfreemkv 0.13.21 bisect-on-fail
+
+CLI surface unchanged. Consumes the libfreemkv 0.13.21 fix:
+bisect-on-fail in `Disc::copy` + 10 s caller-side READ timeout. CLI
+disc → ISO copies (`freemkv disc:// iso://path.iso`) now recover
+data the drive can read individually but fails as multi-sector
+blocks.
+
 ## 0.13.20 (2026-04-26)
 
 ### Sync release — no functional changes
