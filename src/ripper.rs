@@ -1488,6 +1488,60 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Create PES stream — same drive session, no re-open
     let halt = session.drive.halt_flag();
     register_halt(device, halt.clone());
+
+    // Wallclock budget watcher per RIP_DESIGN.md §6 Fix 3.
+    // Caps the total rip wallclock at max(disc_runtime, 1h). On expiration
+    // fires the halt flag and writes last_error so the UI surfaces the cause.
+    // 1× disc runtime is the worst-case ceiling: a 3-hour movie should rip
+    // in at most 3 hours; anything longer is unproductive grinding (typically
+    // a SCSI-layer hang the in-pipeline retry path can't recover from).
+    const MIN_RIP_BUDGET_SECS: u64 = 3600;
+    let chosen_runtime_secs: u64 = title.duration_secs.max(0.0) as u64;
+    let max_rip_secs = chosen_runtime_secs.max(MIN_RIP_BUDGET_SECS);
+    let rip_start = std::time::Instant::now();
+    let wallclock_active = Arc::new(AtomicBool::new(true));
+    struct WallclockGuard(Arc<AtomicBool>);
+    impl Drop for WallclockGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+    let _wallclock_guard = WallclockGuard(wallclock_active.clone());
+    {
+        let active = wallclock_active.clone();
+        let halt_for_watcher = halt.clone();
+        let device_for_watcher = device.to_string();
+        std::thread::spawn(move || {
+            while active.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                if !active.load(Ordering::Relaxed) {
+                    return;
+                }
+                if halt_for_watcher.load(Ordering::Relaxed) {
+                    return;
+                }
+                if rip_start.elapsed().as_secs() > max_rip_secs {
+                    let hrs = max_rip_secs / 3600;
+                    let mins = (max_rip_secs % 3600) / 60;
+                    let budget_str = if mins > 0 {
+                        format!("{}h {:02}m", hrs, mins)
+                    } else {
+                        format!("{}h", hrs)
+                    };
+                    crate::log::device_log(
+                        &device_for_watcher,
+                        &format!("Wallclock budget exceeded ({}); halting rip", budget_str),
+                    );
+                    halt_for_watcher.store(true, Ordering::Relaxed);
+                    update_state_with(&device_for_watcher, |s| {
+                        s.last_error = format!("exceeded {} rip budget", budget_str);
+                    });
+                    return;
+                }
+            }
+        });
+    }
+
     let dev_for_events = device.to_string();
     let wdf_drive = wd_last_frame.clone();
     let lbr_drive = latest_bytes_read.clone();
@@ -1604,7 +1658,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             skip_forward: true,
             halt: Some(halt.clone()),
             on_progress: Some(&pass1_progress),
-            stall_secs: None, // libfreemkv default (120s)
         };
         let result = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
             Ok(r) => r,
@@ -1747,9 +1800,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             crate::log::device_log(
                 device,
                 &format!(
-                    "Pass {pass} done: recovered {:.2} MB; {:.2} MB still unreadable",
+                    "Pass {pass} done: recovered {:.2} MB; {:.2} MB still unreadable; \
+                     blocks attempted={} read_ok={} read_failed={}",
                     recovered as f64 / 1_048_576.0,
                     bytes_unreadable as f64 / 1_048_576.0,
+                    pr.blocks_attempted,
+                    pr.blocks_read_ok,
+                    pr.blocks_read_failed,
                 ),
             );
             if recovered == 0 {
