@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.13.13 (2026-04-25)
+
+### Fix: Pass 1 progress total uses `disc.capacity_bytes`, not title size
+
+`ripper.rs:1339` computed `total_bytes` from `disc.titles[0].size_bytes`
+(the chosen movie's playlist size estimate), but Pass 1 reads the WHOLE
+disc and reports progress against that total. With size_bytes=0 (or any
+value smaller than the disc) the UI showed "0.0 GB / 0.0 GB" during
+Pass 1, masking real progress and hiding the v0.13.12 hang. Now uses
+`disc.capacity_bytes`. The mux phase below already overrides via
+`info.size_bytes`, so the title-level total still flows through where
+relevant.
+
+### Version sync — consume libfreemkv 0.13.13
+
+Picks up the new tracing instrumentation in `SgIoTransport::execute`
+(Linux) + `Disc::copy`. All trace events flow through the existing
+tracing subscriber and surface in `/api/debug` JSONL — filter via
+`q=freemkv::scsi` or `q=freemkv::disc` to see per-call timing in flight.
+
 ## 0.13.12 (2026-04-25)
 
 ### Fix: wallclock-budget watcher (RIP_DESIGN.md §6 Fix 3)
