@@ -184,9 +184,9 @@ let _lastStatus={};
 let _activeTab=null;
 
 function renderBar(s,p){
-  /* Progress bar with bad-range overlay. Green fill = bytes_good %, red ticks
-     for each bad range at its LBA position. Ticks use min-width 0.3% so
-     single-sector bad regions are still visible on a 72GB UHD. */
+  /* Per-pass progress bar with bad-range overlay. Green fill = pass_progress_pct,
+     red ticks for each bad range at its LBA position. Ticks use min-width 0.3%
+     so single-sector bad regions are still visible on a 72GB UHD. */
   let html='<div style="flex:1;background:var(--chip);border-radius:3px;height:6px;overflow:hidden;position:relative">';
   html+='<div style="background:var(--green);height:100%;width:'+p+'%;transition:width 1s"></div>';
   const total=s&&s.bytes_total_disc||0;
@@ -200,6 +200,14 @@ function renderBar(s,p){
   }
   html+='</div>';
   return html;
+}
+function renderTotalBar(p){
+  /* v0.13.18: total-progress bar (multipass aggregate). Thinner + dimmer than
+     the pass bar to visually rank pass-progress as primary. No bad-range
+     overlay — that's per-disc and already on the pass bar. */
+  return '<div style="flex:1;background:var(--chip);border-radius:3px;height:4px;overflow:hidden;position:relative;opacity:0.85">'
+    +'<div style="background:var(--accent);height:100%;width:'+p+'%;transition:width 1s"></div>'
+    +'</div>';
 }
 function passLabelFor(s){
   /* Resolve the current pass into a human-readable label for the Ripping
@@ -217,34 +225,35 @@ function renderSteps(steps,progress,eta,speed,s){
   return steps.map(st=>{
     let detail=st.detail||'';
     if(st.status==='active'&&st.name==='Ripping'){
-      /* v0.13.16: read pass_progress_pct + pass_eta + total_progress_pct +
-         total_eta directly from server. JS does NO math; the server is the
-         single source of truth (pre-0.13.16 the JS computed pct from
-         bytes_good while the server computed from work_done \u2014 drift
-         silently). 5 user-visible numbers: pass %, pass ETA, total %,
-         total ETA, recovered. */
-      const p=(typeof s.pass_progress_pct==='number')?s.pass_progress_pct:(parseInt(progress)||0);
+      /* v0.13.18: two distinct bars + their own text rows.
+           [pass bar           ] X% \u00b7 ETA H:MM \u00b7 NN MB/s
+           [total bar          ] Total Y% \u00b7 Total ETA H:MM \u00b7 Recovered A.B / C.D GB
+         Both bars read pass_progress_pct / total_progress_pct directly from
+         the server. JS does NO math. */
+      const passPct=(typeof s.pass_progress_pct==='number')?s.pass_progress_pct:(parseInt(progress)||0);
+      const totalPct=(typeof s.total_progress_pct==='number')?s.total_progress_pct:passPct;
       const passLbl=passLabelFor(s);
       const header=passLbl?' \u00b7 '+passLbl:'';
+      const passPctStr=passPct+'%';
+      const passEtaStr=s.pass_eta?'ETA '+s.pass_eta:'';
+      const spdStr=speed&&speed!=='0 KB/s'?speed:'';
+      const passLine=[passPctStr,passEtaStr,spdStr].filter(Boolean).join(' \u00b7 ');
+      const totalEtaStr=s.total_eta?'Total ETA '+s.total_eta:'';
       const recoveredStr=(s.bytes_good>0||s.bytes_total_disc>0)
         ? 'Recovered '+(s.bytes_good/1073741824).toFixed(1)+' / '+(s.bytes_total_disc/1073741824).toFixed(1)+' GB'
         : '';
-      const passPctStr=(typeof s.pass_progress_pct==='number')?s.pass_progress_pct+'%':'';
-      const passEtaStr=s.pass_eta?'ETA '+s.pass_eta:'';
-      const totalPctStr=(typeof s.total_progress_pct==='number'&&s.total_progress_pct!==s.pass_progress_pct)
-        ?'Total '+s.total_progress_pct+'%':'';
-      const totalEtaStr=s.total_eta?'Total ETA '+s.total_eta:'';
-      const spdStr=speed&&speed!=='0 KB/s'?speed:'';
-      const parts=[passPctStr,passEtaStr,totalPctStr,totalEtaStr,spdStr,recoveredStr].filter(Boolean);
-      const stats=parts.join(' \u00b7 ');
+      const totalLine=['Total '+totalPct+'%',totalEtaStr,recoveredStr].filter(Boolean).join(' \u00b7 ');
       let badLine='';
       if(s.num_bad_ranges>0||(s.errors>0)){
         const n=s.num_bad_ranges||s.errors||0;
         const lostStr=fmtMs((s.total_lost_ms!=null&&s.total_lost_ms>=0)?s.total_lost_ms:(s.lost_video_secs||0)*1000);
         badLine='<div style="font-size:.7rem;color:var(--yellow);margin-top:2px">'+n+' unreadable \u00b7 ~'+lostStr+' lost</div>';
       }
-      detail='<div style="margin-top:4px">'+(p>0?renderBar(s,p):'')
-        +'<div style="font-size:.75rem;color:var(--text2);margin-top:4px">'+stats+'</div>'
+      detail='<div style="margin-top:4px">'
+        +renderBar(s,passPct)
+        +'<div style="font-size:.75rem;color:var(--text2);margin-top:4px">'+passLine+'</div>'
+        +'<div style="margin-top:6px">'+renderTotalBar(totalPct)+'</div>'
+        +'<div style="font-size:.75rem;color:var(--text2);margin-top:4px">'+totalLine+'</div>'
         +badLine+'</div>';
       /* Fold pass info into the step name so it's obvious at a glance. */
       if(passLbl){

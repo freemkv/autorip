@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.13.18 (2026-04-26)
+
+### Fix: UI shows two distinct progress bars (pass + total)
+
+v0.13.16 collapsed pass_progress_pct, total_progress_pct, pass_eta,
+total_eta, speed, and recovered-bytes into a single bar with a single
+text line ("sg5 · pass 1/7 · copying...30% · ETA 1:20 · Total 0% ·
+Total ETA 8:03 · 16.4 MB/s · Recovered 1.7 / 78.8 GB"). User
+correctly identified this as unreadable: the text line ran off-screen
+and there was no visual ranking between current-pass progress and the
+much-longer total progress.
+
+Fix in `web.rs`:
+- Per-pass bar (full-height, `--green`, with bad-range red overlay) +
+  its own text line: `<pct>% · ETA H:MM · NN MB/s`.
+- Total bar (thinner 4 px, `--accent`, opacity 0.85, no overlay) + its
+  own text line: `Total Y% · Total ETA H:MM · Recovered A.B / C.D GB`.
+- New `renderTotalBar(p)` helper. Pass bar continues to use existing
+  `renderBar(s,p)`.
+- JS still does NO math — both percentages and both ETAs are read
+  directly from `RipState`. Speed/recovered formatting unchanged.
+
+This is a UI-only change; backend, ripping logic, and SCSI code are
+untouched. Settings page reorganization from 0.13.16 retained.
+
 ## 0.13.17 (2026-04-26)
 
 ### Fix: hot-plug — autorip picks up unplug/replug without container restart
