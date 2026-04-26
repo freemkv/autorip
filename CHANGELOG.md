@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.13.14 (2026-04-25)
+
+### Fix: enable libfreemkv trace targets in tracing subscriber
+
+The v0.13.13 telemetry from `freemkv::scsi` and `freemkv::disc` was being
+silently dropped because `observe.rs:50`'s default filter was
+`autorip=info,libfreemkv=warn`. Trace events at `target = "freemkv::scsi"`
+got filtered out at warn level. Updated the default filter to
+`autorip=info,libfreemkv=warn,freemkv::scsi=trace,freemkv::disc=trace` so
+the per-call SCSI + Disc::copy events appear in `/api/debug` JSONL during
+a live rip. Override via `AUTORIP_LOG_LEVEL` env var if needed.
+
+### Version sync — consume libfreemkv 0.13.14
+
+No-op consumer bump (libfreemkv 0.13.14 has no functional changes).
+
 ## 0.13.13 (2026-04-25)
 
 ### Fix: Pass 1 progress total uses `disc.capacity_bytes`, not title size
