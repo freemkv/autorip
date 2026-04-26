@@ -46,8 +46,13 @@ pub fn init() {
     let log_dir = log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
 
-    let filter = EnvFilter::try_from_env("AUTORIP_LOG_LEVEL")
-        .unwrap_or_else(|_| EnvFilter::new("autorip=info,libfreemkv=warn"));
+    // libfreemkv is reserved at warn level for general events, but the
+    // freemkv::scsi and freemkv::disc trace targets are explicitly enabled
+    // so we can diagnose the rip pipeline in flight (per RIP_DESIGN.md §11).
+    // Override entire string via AUTORIP_LOG_LEVEL env var if needed.
+    let filter = EnvFilter::try_from_env("AUTORIP_LOG_LEVEL").unwrap_or_else(|_| {
+        EnvFilter::new("autorip=info,libfreemkv=warn,freemkv::scsi=trace,freemkv::disc=trace")
+    });
 
     let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)
