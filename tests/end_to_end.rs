@@ -53,6 +53,10 @@ fn test_state_json_serialization_round_trip() {
         tmdb_overview: "An overview.".to_string(),
         duration: "1h 47m".to_string(),
         codecs: "H.264 1080p / DTS-HD MA 5.1".to_string(),
+        pass_progress_pct: 42,
+        pass_eta: "0:14:23".to_string(),
+        total_progress_pct: 18,
+        total_eta: "1:23:45".to_string(),
     };
 
     // Serialize the same way get_state_json does: serde_json::to_value.

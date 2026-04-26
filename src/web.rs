@@ -217,21 +217,25 @@ function renderSteps(steps,progress,eta,speed,s){
   return steps.map(st=>{
     let detail=st.detail||'';
     if(st.status==='active'&&st.name==='Ripping'){
-      /* Active Ripping step: progress bar on its own line, then a compact
-         stats row with GB/speed/ETA, then optional bad-sector summary. */
-      const p=parseInt(progress)||0;
+      /* v0.13.16: read pass_progress_pct + pass_eta + total_progress_pct +
+         total_eta directly from server. JS does NO math; the server is the
+         single source of truth (pre-0.13.16 the JS computed pct from
+         bytes_good while the server computed from work_done \u2014 drift
+         silently). 5 user-visible numbers: pass %, pass ETA, total %,
+         total ETA, recovered. */
+      const p=(typeof s.pass_progress_pct==='number')?s.pass_progress_pct:(parseInt(progress)||0);
       const passLbl=passLabelFor(s);
       const header=passLbl?' \u00b7 '+passLbl:'';
-      const gbStr=(s.bytes_good>0||s.bytes_total_disc>0)
-        ? (s.bytes_good/1073741824).toFixed(1)+' / '+(s.bytes_total_disc/1073741824).toFixed(1)+' GB'
-        : (progress||'');
-      /* Leading percent so the user doesn't have to divide GB in their head.
-         Computed from bytes_good/bytes_total_disc, same basis as the bar. */
-      const pctStr=(s.bytes_total_disc>0&&s.bytes_good>=0)
-        ? Math.floor(s.bytes_good*100/s.bytes_total_disc)+'%' : '';
+      const recoveredStr=(s.bytes_good>0||s.bytes_total_disc>0)
+        ? 'Recovered '+(s.bytes_good/1073741824).toFixed(1)+' / '+(s.bytes_total_disc/1073741824).toFixed(1)+' GB'
+        : '';
+      const passPctStr=(typeof s.pass_progress_pct==='number')?s.pass_progress_pct+'%':'';
+      const passEtaStr=s.pass_eta?'ETA '+s.pass_eta:'';
+      const totalPctStr=(typeof s.total_progress_pct==='number'&&s.total_progress_pct!==s.pass_progress_pct)
+        ?'Total '+s.total_progress_pct+'%':'';
+      const totalEtaStr=s.total_eta?'Total ETA '+s.total_eta:'';
       const spdStr=speed&&speed!=='0 KB/s'?speed:'';
-      const etaStr=eta?'ETA '+eta:'';
-      const parts=[pctStr,gbStr,spdStr,etaStr].filter(Boolean);
+      const parts=[passPctStr,passEtaStr,totalPctStr,totalEtaStr,spdStr,recoveredStr].filter(Boolean);
       const stats=parts.join(' \u00b7 ');
       let badLine='';
       if(s.num_bad_ranges>0||(s.errors>0)){
@@ -652,16 +656,18 @@ function loadSettings(){
 
 function renderSettings(s){
   const groups=[
-    {title:'Ripping',fields:[
+    {title:'Disc Lifecycle',fields:[
       {key:'on_insert',label:'On Disc Insert',type:'radio',options:[{value:'nothing',label:'Do Nothing'},{value:'scan',label:'Scan'},{value:'rip',label:'Rip'}],hint:'What happens when a disc is inserted'},
+      {key:'auto_eject',label:'Auto Eject',type:'bool',hint:'Eject disc after rip completes'},
+    ]},
+    {title:'Ripping',fields:[
       {key:'main_feature',label:'Main Feature Only',type:'bool',hint:'Rip longest title only'},
       {key:'min_length_secs',label:'Minimum Title Length (seconds)',type:'number',hint:'Shorter titles are skipped (600 = 10 min)'},
-      {key:'auto_eject',label:'Auto Eject',type:'bool',hint:'Eject disc after rip completes'},
-      {key:'on_read_error',label:'On Read Error',type:'radio',options:[{value:'stop',label:'Stop'},{value:'skip',label:'Skip (zero-fill)'}],hint:'Stop aborts the rip. Skip zero-fills bad sectors and continues — use after Verify confirms damage is minor.'},
       {key:'output_format',label:'Output Format',type:'radio',options:[{value:'mkv',label:'MKV'},{value:'m2ts',label:'M2TS'},{value:'iso',label:'ISO (disc image)'},{value:'network',label:'Network'}],hint:'Format for ripped files'},
       {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. 192.168.1.100:9000)',indent:true,placeholder:'192.168.1.100:9000',showIf:{key:'output_format',value:'network'}},
     ]},
     {title:'Recovery',fields:[
+      {key:'on_read_error',label:'On Read Error',type:'radio',options:[{value:'stop',label:'Stop'},{value:'skip',label:'Skip (zero-fill)'}],hint:'Stop aborts the rip. Skip zero-fills bad sectors and continues — use after Verify confirms damage is minor.'},
       {key:'max_retries',label:'Retry Passes',type:'number',hint:'Number of retry attempts for bad sectors. 0 = no retry, direct disc→MKV (fastest). 1-10 = rip to ISO first, retry bad ranges, then mux to MKV. Raise if a disc has recoverable damage; leave at default (1) for most.'},
       {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Preserve the disc ISO + mapfile after MKV mux. Off by default to reclaim disk.'},
     ]},
