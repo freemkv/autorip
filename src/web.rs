@@ -1510,10 +1510,12 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     // SCSI session, wipe staging so the next rip starts on a clean disk,
     // and collapse the state entry to a fresh idle.
     //
-    // The 35 s drain budget covers a 30 s in-flight CDB plus margin. A
-    // timeout is logged but not fatal — the HTTP response still goes out
-    // 200 so the UI doesn't spin. The rip thread will exit on its next
-    // halt-flag check; we just won't have observed it before responding.
+    // The 60 s drain budget covers a 30 s in-flight CDB plus generous margin
+    // (bumped from 35 s in v0.13.8 after live observation of slower drains
+    // under heavy ECC retry on the BU40N). A timeout is logged but not fatal
+    // — the HTTP response still goes out 200 so the UI doesn't spin. After
+    // join_rip_thread returns we DID observe drain (success or timeout); the
+    // pre-v0.13.6 "fire and forget" wording is gone.
     ripper::request_stop(device);
     crate::verify::request_stop();
 

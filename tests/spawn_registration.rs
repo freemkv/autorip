@@ -51,7 +51,10 @@ fn spawn_rip_thread_registers_handle() {
     );
 
     // Drain the worker so it doesn't outlive the test process.
-    handle.unwrap().join().expect("worker thread should join cleanly");
+    handle
+        .unwrap()
+        .join()
+        .expect("worker thread should join cleanly");
 
     // Post-condition: a second take returns None — we already removed
     // the entry above.

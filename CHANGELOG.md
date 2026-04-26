@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.13.12 (2026-04-25)
+
+### Fix: wallclock-budget watcher (RIP_DESIGN.md §6 Fix 3)
+
+`rip_disc` now spawns a watcher thread that fires the halt flag if the
+total rip wallclock exceeds `max(disc_runtime_secs, 3600)`. 1× disc
+runtime is the worst-case ceiling per design — a 3-hour movie should
+rip in at most 3 hours; anything longer is unproductive grinding the
+in-pipeline retry path can't recover from. On expiration:
+
+- Sets `halt` so the in-flight `Disc::copy` / `Disc::patch` exits cleanly.
+- Writes `last_error = "exceeded {N}h {NN}m rip budget"` to RipState
+  for UI surfacing.
+- Logs `Wallclock budget exceeded ({budget}); halting rip` to the
+  per-device log.
+- Self-clears via a `WallclockGuard` Drop on `rip_disc` return.
+
+### Fix: consume libfreemkv 0.13.12 PatchResult counters
+
+Pass 2..N's per-pass log line now includes `blocks attempted=N read_ok=N
+read_failed=N` so the v0.13.11 mystery (Dune 2: "100 minutes recovered 0
+bytes") becomes diagnosable from the live device log.
+
+### Fix: stop drain comment drift
+
+`web.rs:1513` said "35 s drain budget" but the code at `:1520` uses
+`Duration::from_secs(60)`. CHANGELOG 0.13.11 corrected the warning text;
+this corrects the design comment + adds the v0.13.8 rationale (slower
+drains under heavy ECC retry on the BU40N).
+
+### Version sync — consume libfreemkv 0.13.12
+
+Picks up Fix 1 (stall-guard deletion), Fix 2 (async SCSI recovery on
+Linux + cross-platform try_recover on Windows + macOS), Fix 4
+(`PatchResult` instrumentation), and the `PatchOptions::full_recovery`
+honor + `CopyOptions::stall_secs` deletion. Also drops the
+`stall_secs: None` line from autorip's `CopyOptions` construction since
+the field no longer exists upstream.
+
 ## 0.13.11 (2026-04-25)
 
 ### Version sync — consume libfreemkv 0.13.11
