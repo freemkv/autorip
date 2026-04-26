@@ -586,19 +586,30 @@ fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool,
     let start = std::time::Instant::now();
     let last_update = std::cell::Cell::new(start);
 
-    // libfreemkv 0.13.15: on_progress signature is (bytes_good, pos, total).
-    // For the disc→ISO direct copy path the CLI displays "swept" position,
-    // not just bytes_good — same reason as autorip's UI fix in 0.13.15.
-    let progress = |_bytes_good: u64, pos: u64, total: u64| {
-        if out.is_quiet() {
-            return;
+    // libfreemkv 0.13.16: progress is a trait that emits a single
+    // PassProgress struct. CLI just prints work_done / work_total.
+    struct CliProgress<'a> {
+        out: &'a Output,
+        last_update: &'a std::cell::Cell<std::time::Instant>,
+        start: std::time::Instant,
+    }
+    impl<'a> libfreemkv::progress::Progress for CliProgress<'a> {
+        fn report(&self, p: &libfreemkv::progress::PassProgress) {
+            if self.out.is_quiet() {
+                return;
+            }
+            let now = std::time::Instant::now();
+            if now.duration_since(self.last_update.get()).as_secs_f64() < 0.5 {
+                return;
+            }
+            self.last_update.set(now);
+            print_progress(p.work_done, p.work_total, 0, &self.start);
         }
-        let now = std::time::Instant::now();
-        if now.duration_since(last_update.get()).as_secs_f64() < 0.5 {
-            return;
-        }
-        last_update.set(now);
-        print_progress(pos, total, 0, &start);
+    }
+    let progress = CliProgress {
+        out,
+        last_update: &last_update,
+        start,
     };
 
     let batch = libfreemkv::disc::detect_max_batch_sectors(drive.device_path());
@@ -606,7 +617,7 @@ fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool,
         decrypt: !raw,
         resume: true,
         batch_sectors: Some(batch),
-        on_progress: Some(&progress),
+        progress: Some(&progress),
         ..Default::default()
     };
     match disc.copy(&mut drive, &iso_path, &copy_opts) {

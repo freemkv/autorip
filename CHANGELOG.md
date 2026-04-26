@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.13.16 (2026-04-26)
+
+### Fix: pipe.rs disc→ISO progress uses libfreemkv 0.13.16 `Progress` trait
+
+Inline `CliProgress` struct implements `libfreemkv::progress::Progress`,
+replacing the closure that took `Fn(u64, u64, u64)`. Same observable
+behavior — print `work_done / work_total` every 0.5 s — but cleanly
+typed against the new architecture.
+
+### Sync — consume libfreemkv 0.13.16
+
+Picks up the `Progress` trait + `PassProgress` struct architecture.
+
 ## 0.13.15 (2026-04-26)
 
 ### Fix: 3-arg on_progress for `pipe::run` callers
