@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.14 (2026-04-25)
+
+### Sync release — no functional changes
+
+Bumped to satisfy the unified-versioning rule. Actual fix is in autorip
+(tracing-subscriber filter for the new `freemkv::scsi`/`freemkv::disc`
+targets).
+
 ## 0.13.13 (2026-04-25)
 
 ### Version sync — consume libfreemkv 0.13.13
