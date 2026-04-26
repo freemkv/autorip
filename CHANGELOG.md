@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.13.15 (2026-04-26)
+
+### Fix: pos-based progress display (RIP_DESIGN.md §15 Fix C)
+
+`progress_gb` and `progress_pct` now track libfreemkv's `pos` (sweep
+position) rather than `bytes_good` (clean reads). The old display froze
+when Pass 1 hit a bad zone and skip-forwarded the rest — the user saw
+"30 % / 0 KB/s" while Pass 1 was actually marching to end-of-disc. Now
+the bar advances during skip-forward so live state matches reality.
+`bytes_good` remains exposed in RipState for the "real data recovered"
+number. Device-log lines now report both: `swept X GB (Y%) good Z GB`.
+
+### Fix: per-pass wallclock cap (RIP_DESIGN.md §15 Fix A)
+
+Replaced v0.13.12's whole-rip wallclock cap with a per-pass cap:
+each pass (Pass 1 sweep + every retry) gets its own
+`max(disc_runtime_secs, 3600)` budget. New `spawn_pass_watcher` helper
+spawns a per-pass watcher with its own `pass_halt` Arc that the watcher
+forwards user-stop into. On cap-fire: writes
+`last_error = "Pass N exceeded {budget} budget"` and flips a shared
+`cap_fired_any` flag.
+
+### Fix: mux only on natural completion (RIP_DESIGN.md §15 Fix B)
+
+Mux is now skipped — and `status=error` set — if any pass cap-fired
+during the rip. ISO is retained in staging for manual salvage. Mux
+runs only when:
+1. User did NOT press stop, AND
+2. No pass cap-fired, AND
+3. Pass loop exited naturally (max_retries reached, all clean, or
+   recovered=0 on a non-wedged pass).
+
+### Fix: per-pass retry strategy (RIP_DESIGN.md §15 Fix D + G)
+
+Pass 2..N now use:
+- **Block-size taper**: pass `n` (1-indexed retry) uses `batch >> n`
+  sectors, minimum 2. Last retry pass always uses 1 sector.
+  For `batch=60` on the BU40N, `max_retries=4`: `[60, 30, 15, 7, 1]`.
+- **Reverse-direction alternation**: retry 1 = reverse, retry 2 =
+  forward, retry 3 = reverse, ... Reverse walk approaches the
+  post-bad-zone NonTrimmed range from end-of-disc, where the drive
+  hasn't yet wedged on a bad sector.
+
+Both vary per-pass, set via the new `PatchOptions::block_sectors`
++ `PatchOptions::reverse` (libfreemkv 0.13.15).
+
+### Fix: drive-wedged early-exit per pass (RIP_DESIGN.md §15 Fix E)
+
+`PatchOptions::wedged_threshold = 50` — `Disc::patch` exits early if
+50 consecutive failures occur with zero successes in the same pass.
+Saves the wallclock cap for productive retry passes (different
+direction, smaller block). Surfaces via `PatchResult::wedged_exit`,
+which we log as `(drive wedged — abandoned this pass)` in the
+device log.
+
+### Fix: 30 s drive settle between Pass 1 and Pass 2 (RIP_DESIGN.md §15 Fix F)
+
+Sleep 30 s after Pass 1 returns and before Pass 2 spawns, giving the
+drive's internal ECC state time to recover. The BU40N (and other
+Initio-bridge drives) wedge after grinding on bad sectors during
+Pass 1; immediately hammering the same bad zone with Pass 2 retries
+keeps the drive wedged. Cheap insurance.
+
+### Version sync — consume libfreemkv 0.13.15
+
+3-arg `on_progress`, `PatchOptions::reverse`, `wedged_threshold`,
+`PatchResult::wedged_exit`, new trace events.
+
 ## 0.13.14 (2026-04-25)
 
 ### Fix: enable libfreemkv trace targets in tracing subscriber

@@ -733,6 +733,11 @@ struct PassProgressState {
     last_update: std::time::Instant,
     /// Wall-clock of the last device-log line emitted from this pass.
     last_log: std::time::Instant,
+    /// Last `pos` reported by libfreemkv's on_progress callback — the true
+    /// sweep position. Pass 1 uses this for "% swept" (advances even when
+    /// skip-forward is firing); Pass 2..N uses it for "current retry LBA"
+    /// so the UI bar moves through the retry walk.
+    last_pos: u64,
 }
 
 impl PassProgressState {
@@ -743,6 +748,7 @@ impl PassProgressState {
             smooth_speed_mbs: 0.0,
             last_update: now,
             last_log: now,
+            last_pos: 0,
         }
     }
 
@@ -815,8 +821,16 @@ fn push_pass_state(
     // mode. In direct mode this comes from `input.errors`; we overwrite it in
     // the main stream loop for that path.
     let errors = (bytes_bad / 2048) as u32;
+    // progress_pct / progress_gb track the SWEEP POSITION (`pos` from
+    // libfreemkv's on_progress), not `bytes_good`. This is the v0.13.15 fix
+    // for the v0.13.9-stall-guard origin bug: bytes_good freezes during
+    // skip-forward zones (only Finished sectors count) so the UI looked
+    // hung when Pass 1 was actually advancing. `pos` reflects real progress.
+    // The "real data recovered" number is exposed separately in
+    // RipState::bytes_good.
+    let last_pos = state.borrow().last_pos;
     let pct = if ctx.bytes_total_disc > 0 {
-        (stats.bytes_good * 100 / ctx.bytes_total_disc).min(100) as u8
+        (last_pos * 100 / ctx.bytes_total_disc).min(100) as u8
     } else {
         0
     };
@@ -857,7 +871,7 @@ fn push_pass_state(
             disc_name: ctx.display_name.clone(),
             disc_format: ctx.disc_format.clone(),
             progress_pct: pct,
-            progress_gb: stats.bytes_good as f64 / 1_073_741_824.0,
+            progress_gb: last_pos as f64 / 1_073_741_824.0,
             speed_mbs,
             eta,
             errors,
@@ -886,12 +900,16 @@ fn push_pass_state(
     );
 
     // Periodic device-log line so a long pass doesn't go silent. Matches the
-    // 60 s cadence the main stream loop uses in direct mode.
+    // 60 s cadence the main stream loop uses in direct mode. Reports
+    // SWEPT position (pos) prominently — that's what advances during a
+    // skip-forward bad zone — and shows real-data-recovered (bytes_good)
+    // separately so users can see clean-data progress vs sweep progress.
     {
         let mut s = state.borrow_mut();
         if s.last_log.elapsed().as_secs() >= 60 {
             s.last_log = std::time::Instant::now();
-            let gb = stats.bytes_good as f64 / 1_073_741_824.0;
+            let pos_gb = last_pos as f64 / 1_073_741_824.0;
+            let good_gb = stats.bytes_good as f64 / 1_073_741_824.0;
             let total_gb = ctx.bytes_total_disc as f64 / 1_073_741_824.0;
             let speed_str = if speed_mbs >= 1.0 {
                 format!("{speed_mbs:.1} MB/s")
@@ -910,8 +928,8 @@ fn push_pass_state(
             crate::log::device_log(
                 &ctx.device,
                 &format!(
-                    "Pass {pass}/{total_passes}: {:.1} GB / {:.1} GB ({}%) {}{}",
-                    gb, total_gb, pct, speed_str, bad_str
+                    "Pass {pass}/{total_passes}: swept {:.1} GB / {:.1} GB ({}%), good {:.1} GB, {}{}",
+                    pos_gb, total_gb, pct, good_gb, speed_str, bad_str
                 ),
             );
         }
@@ -1498,58 +1516,81 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let halt = session.drive.halt_flag();
     register_halt(device, halt.clone());
 
-    // Wallclock budget watcher per RIP_DESIGN.md §6 Fix 3.
-    // Caps the total rip wallclock at max(disc_runtime, 1h). On expiration
-    // fires the halt flag and writes last_error so the UI surfaces the cause.
-    // 1× disc runtime is the worst-case ceiling: a 3-hour movie should rip
-    // in at most 3 hours; anything longer is unproductive grinding (typically
-    // a SCSI-layer hang the in-pipeline retry path can't recover from).
-    const MIN_RIP_BUDGET_SECS: u64 = 3600;
+    // Per-pass wallclock budget. Each pass (Pass 1 sweep + every retry) gets
+    // its own `max(disc_runtime, 1h)` budget. v0.13.15 made this per-pass
+    // (was total-rip in v0.13.12-14) — a fail-safe to bound a wedged pass,
+    // not a bound on the whole rip. If ANY pass exceeds its budget the rip
+    // ends with status=error (see cap_fired_any tracking below).
+    const MIN_PASS_BUDGET_SECS: u64 = 3600;
     let chosen_runtime_secs: u64 = title.duration_secs.max(0.0) as u64;
-    let max_rip_secs = chosen_runtime_secs.max(MIN_RIP_BUDGET_SECS);
-    let rip_start = std::time::Instant::now();
-    let wallclock_active = Arc::new(AtomicBool::new(true));
+    let max_pass_secs = chosen_runtime_secs.max(MIN_PASS_BUDGET_SECS);
     struct WallclockGuard(Arc<AtomicBool>);
     impl Drop for WallclockGuard {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Relaxed);
         }
     }
-    let _wallclock_guard = WallclockGuard(wallclock_active.clone());
-    {
-        let active = wallclock_active.clone();
-        let halt_for_watcher = halt.clone();
-        let device_for_watcher = device.to_string();
+    // Fires per-pass watcher. Returns a guard that, on drop, stops the
+    // watcher thread. While alive: forwards user_halt → pass_halt; fires
+    // cap_fired (and pass_halt) when wall-clock exceeds max_secs; writes
+    // a per-pass `last_error` for UI surfacing.
+    fn spawn_pass_watcher(
+        pass_label: String,
+        device: String,
+        pass_halt: Arc<AtomicBool>,
+        user_halt: Arc<AtomicBool>,
+        cap_fired: Arc<AtomicBool>,
+        max_secs: u64,
+    ) -> WallclockGuard {
+        let active = Arc::new(AtomicBool::new(true));
+        let active_for_watcher = active.clone();
+        let pass_start = std::time::Instant::now();
         std::thread::spawn(move || {
-            while active.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_secs(30));
-                if !active.load(Ordering::Relaxed) {
+            while active_for_watcher.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if !active_for_watcher.load(Ordering::Relaxed) {
                     return;
                 }
-                if halt_for_watcher.load(Ordering::Relaxed) {
+                if user_halt.load(Ordering::Relaxed) {
+                    pass_halt.store(true, Ordering::Relaxed);
                     return;
                 }
-                if rip_start.elapsed().as_secs() > max_rip_secs {
-                    let hrs = max_rip_secs / 3600;
-                    let mins = (max_rip_secs % 3600) / 60;
+                if pass_halt.load(Ordering::Relaxed) {
+                    return;
+                }
+                if pass_start.elapsed().as_secs() > max_secs {
+                    let hrs = max_secs / 3600;
+                    let mins = (max_secs % 3600) / 60;
                     let budget_str = if mins > 0 {
                         format!("{}h {:02}m", hrs, mins)
                     } else {
                         format!("{}h", hrs)
                     };
                     crate::log::device_log(
-                        &device_for_watcher,
-                        &format!("Wallclock budget exceeded ({}); halting rip", budget_str),
+                        &device,
+                        &format!(
+                            "{} exceeded {} budget; halting pass",
+                            pass_label, budget_str
+                        ),
                     );
-                    halt_for_watcher.store(true, Ordering::Relaxed);
-                    update_state_with(&device_for_watcher, |s| {
-                        s.last_error = format!("exceeded {} rip budget", budget_str);
+                    cap_fired.store(true, Ordering::Relaxed);
+                    pass_halt.store(true, Ordering::Relaxed);
+                    update_state_with(&device, |s| {
+                        s.last_error = format!("{} exceeded {} budget", pass_label, budget_str);
                     });
                     return;
                 }
             }
         });
+        WallclockGuard(active)
     }
+    // True if ANY pass cap-fired during this rip. v0.13.15: when true, mux
+    // is skipped and status=error; ISO is retained in staging for manual
+    // salvage. False = all passes completed naturally → mux normally.
+    let cap_fired_any = Arc::new(AtomicBool::new(false));
+    // The user-stop halt — the existing flag. Pass-specific halts forward
+    // from this via spawn_pass_watcher. Renamed locally for clarity.
+    let user_halt = halt.clone();
 
     let dev_for_events = device.to_string();
     let wdf_drive = wd_last_frame.clone();
@@ -1638,7 +1679,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let pass1_ctx = &pass_ctx;
         let pass1_title = &title_for_progress;
         let pass1_map = std::path::Path::new(&mapfile_path_str);
-        let pass1_progress = |_bytes_good: u64, _total: u64| {
+        let pass1_progress = |_bytes_good: u64, pos: u64, _total: u64| {
+            // Stash pos for push_pass_state to compute true sweep progress.
+            pass1_state.borrow_mut().last_pos = pos;
             // Throttle: only re-read mapfile + push state every 1.5s.
             if pass1_state.borrow().last_update.elapsed().as_millis() < 1500 {
                 return;
@@ -1659,13 +1702,22 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         // and recreates the ISO, so progress starts at 0 % and reflects reads
         // from this invocation only. See CHANGELOG 0.12.5 for the bug this
         // closes (stale mapfile showing 30 % at 10 s into a cold rip).
+        let pass1_halt = Arc::new(AtomicBool::new(false));
+        let _pass1_guard = spawn_pass_watcher(
+            "Pass 1".to_string(),
+            device.to_string(),
+            pass1_halt.clone(),
+            user_halt.clone(),
+            cap_fired_any.clone(),
+            max_pass_secs,
+        );
         let copy_opts = libfreemkv::disc::CopyOptions {
             decrypt: false,
             resume: false,
             batch_sectors: Some(batch),
             skip_on_error: true,
             skip_forward: true,
-            halt: Some(halt.clone()),
+            halt: Some(pass1_halt.clone()),
             on_progress: Some(&pass1_progress),
         };
         let result = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
@@ -1707,6 +1759,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 return;
             }
         };
+        // Drop the Pass 1 watcher so its thread exits before Pass 2 spawns its own.
+        drop(_pass1_guard);
         crate::log::device_log(
             device,
             &format!(
@@ -1722,21 +1776,54 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let mut bytes_good = result.bytes_good;
         let mut bytes_unreadable = result.bytes_unreadable;
         let mut bytes_pending = result.bytes_pending;
-        let mut halted = result.halted;
 
-        // Retry passes: Disc::patch until max_retries hit, all clean, or no
-        // progress. Each call is one pass; the mapfile persists across them.
-        for retry_n in 1..=cfg_read.max_retries {
-            if halted || halt.load(Ordering::Relaxed) {
+        // Retry passes: Disc::patch with per-pass block-size taper and
+        // alternating direction (RIP_DESIGN.md §15). Pass 2 = reverse + half
+        // batch, then alternates F/R while halving block, last pass = 1
+        // sector. Each pass gets its own wallclock cap watcher; cap-fire
+        // marks the rip as failed.
+        let max_retries = cfg_read.max_retries;
+        let mut pass_2_settled = false;
+        for retry_n in 1..=max_retries {
+            // If user hit stop OR a prior pass cap-fired, bail.
+            if user_halt.load(Ordering::Relaxed) || cap_fired_any.load(Ordering::Relaxed) {
                 break;
             }
             if bytes_pending == 0 && bytes_unreadable == 0 {
                 break;
             }
             let pass = retry_n + 1;
+
+            // Settle the drive between Pass 1 and Pass 2 only. Per
+            // RIP_DESIGN.md §15 Fix F: the BU40N (and other Initio-bridge
+            // drives) wedge after grinding on bad sectors. Giving the drive
+            // 30 s of idle BEFORE we hammer it again with retry reads lets
+            // its internal state recover. Cheap insurance.
+            if !pass_2_settled {
+                crate::log::device_log(device, "Settling drive for 30 s before retry pass");
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                pass_2_settled = true;
+                if user_halt.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+
+            // Per-pass block_sectors + direction.
+            // Last retry → 1 sector. Else → batch >> retry_n, min 2.
+            // Direction: retry_n odd = reverse, retry_n even = forward.
+            let block_sectors_pass: u16 = if retry_n == max_retries {
+                1
+            } else {
+                let halved = batch >> retry_n;
+                halved.max(2)
+            };
+            let reverse_pass = (retry_n % 2) == 1;
+            let dir_label = if reverse_pass { "reverse" } else { "forward" };
             crate::log::device_log(
                 device,
-                &format!("Pass {pass}/{total_passes}: retrying bad ranges"),
+                &format!(
+                    "Pass {pass}/{total_passes}: retrying bad ranges ({dir_label}, {block_sectors_pass}-sector blocks)"
+                ),
             );
             set_pass_progress(
                 device,
@@ -1756,13 +1843,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 bytes_total_disc,
                 batch,
             );
-            // Per-pass progress callback (same throttle + speed-tracker
-            // pattern as pass 1).
+
+            // Per-pass progress + watcher.
             let patch_state = std::cell::RefCell::new(PassProgressState::new());
             let patch_ctx = &pass_ctx;
             let patch_title = &title_for_progress;
             let patch_map = std::path::Path::new(&mapfile_path_str);
-            let patch_progress = |_bytes_good: u64, _total: u64| {
+            let patch_progress = |_bytes_good: u64, pos: u64, _total: u64| {
+                patch_state.borrow_mut().last_pos = pos;
                 if patch_state.borrow().last_update.elapsed().as_millis() < 1500 {
                     return;
                 }
@@ -1776,21 +1864,39 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     &patch_state,
                 );
             };
+            let pass_halt = Arc::new(AtomicBool::new(false));
+            let _pass_guard = spawn_pass_watcher(
+                format!("Pass {pass}"),
+                device.to_string(),
+                pass_halt.clone(),
+                user_halt.clone(),
+                cap_fired_any.clone(),
+                max_pass_secs,
+            );
+
+            // Wedged-drive early-exit threshold. After 50 consecutive
+            // failures with zero successes, we conclude the drive is
+            // wedged on the bad zone for THIS pass and bail. Saves the
+            // wallclock cap for productive grinding; the next pass (with
+            // smaller block_sectors and alternated direction) may still
+            // recover.
+            const WEDGED_THRESHOLD: u64 = 50;
+
             let patch_opts = libfreemkv::disc::PatchOptions {
                 decrypt: false,
+                block_sectors: Some(block_sectors_pass),
                 full_recovery: true,
-                halt: Some(halt.clone()),
+                reverse: reverse_pass,
+                wedged_threshold: WEDGED_THRESHOLD,
+                halt: Some(pass_halt.clone()),
                 on_progress: Some(&patch_progress),
-                ..Default::default()
             };
             let prev_good = bytes_good;
             let pr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {
                 Ok(r) => r,
                 Err(e) => {
-                    // Same halt-vs-error distinction as Pass 1's disc.copy
-                    // arm: if stop was requested, the IO error is the
-                    // staging-wipe racing the worker, not a real failure.
-                    if halt.load(Ordering::Relaxed) {
+                    // If user-halt is set, this is a clean stop; exit.
+                    if user_halt.load(Ordering::Relaxed) {
                         crate::log::device_log(
                             device,
                             &format!("Pass {pass} cancelled (halt): {e}"),
@@ -1804,13 +1910,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             bytes_good = pr.bytes_good;
             bytes_unreadable = pr.bytes_unreadable;
             bytes_pending = pr.bytes_pending;
-            halted = pr.halted;
             let recovered = bytes_good.saturating_sub(prev_good);
+            let exit_str = if pr.wedged_exit {
+                " (drive wedged — abandoned this pass)"
+            } else if pr.halted {
+                " (halt)"
+            } else {
+                ""
+            };
             crate::log::device_log(
                 device,
                 &format!(
                     "Pass {pass} done: recovered {:.2} MB; {:.2} MB still unreadable; \
-                     blocks attempted={} read_ok={} read_failed={}",
+                     blocks attempted={} read_ok={} read_failed={}{exit_str}",
                     recovered as f64 / 1_048_576.0,
                     bytes_unreadable as f64 / 1_048_576.0,
                     pr.blocks_attempted,
@@ -1818,19 +1930,45 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     pr.blocks_read_failed,
                 ),
             );
-            if recovered == 0 {
+            // Drop this pass's watcher before next iteration.
+            drop(_pass_guard);
+            // Stop early if user-halt or pass cap-fire happened during the
+            // patch (the watcher set pass_halt + cap_fired_any).
+            if user_halt.load(Ordering::Relaxed) || cap_fired_any.load(Ordering::Relaxed) {
+                break;
+            }
+            // If THIS pass made no progress AND wasn't wedged-aborted, no
+            // future pass with the same drive state will help. Give up
+            // retries early so we still mux on what we have.
+            if recovered == 0 && !pr.wedged_exit {
                 crate::log::device_log(device, "No progress on last pass — stopping retries.");
                 break;
             }
         }
 
-        // If a halt fired during Pass 1 or any retry pass, bail before
-        // muxing. Otherwise we'd attempt to mux a (likely zero-byte or
-        // partial) ISO and surface a confusing "muxing..." -> error
-        // sequence on top of a clean stop. handle_stop has already
-        // reset state to idle; we just clean up and exit.
-        if halted || halt.load(Ordering::Relaxed) {
+        // Mux gating per RIP_DESIGN.md §15 Fix B.
+        // Skip mux + return cleanly if user pressed stop.
+        if user_halt.load(Ordering::Relaxed) {
             crate::log::device_log(device, "Rip cancelled — skipping mux.");
+            if let Ok(mut flags) = HALT_FLAGS.lock() {
+                flags.remove(device);
+            }
+            return;
+        }
+        // Skip mux + status=error if any pass cap-fired (per-pass wallclock
+        // budget exceeded). The ISO is retained in staging for manual
+        // salvage; this is a hard failure signal, not a partial success.
+        if cap_fired_any.load(Ordering::Relaxed) {
+            crate::log::device_log(
+                device,
+                "Pass cap-fired — rip failed; ISO retained in staging, no mux.",
+            );
+            update_state_with(device, |s| {
+                s.status = "error".to_string();
+                if s.last_error.is_empty() {
+                    s.last_error = "rip failed — pass exceeded wallclock budget".to_string();
+                }
+            });
             if let Ok(mut flags) = HALT_FLAGS.lock() {
                 flags.remove(device);
             }
