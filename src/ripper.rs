@@ -217,6 +217,19 @@ pub struct RipState {
     pub tmdb_overview: String,
     pub duration: String,
     pub codecs: String,
+
+    // ── v0.13.16 PipelineStats: the 5 user-visible numbers ────────────────
+    /// Per-pass progress percent (0-100). Computed from libfreemkv's
+    /// `work_done / work_total`. UI bar reads this directly — no math.
+    pub pass_progress_pct: u8,
+    /// Per-pass ETA, formatted as "MM:SS" or "HH:MM:SS". Empty when speed
+    /// is too low to estimate.
+    pub pass_eta: String,
+    /// Total rip progress percent (0-100), summed across all passes +
+    /// estimated retry work + mux. UI total bar reads this directly.
+    pub total_progress_pct: u8,
+    /// Total rip ETA across all remaining passes including mux estimate.
+    pub total_eta: String,
 }
 
 impl Default for RipState {
@@ -254,6 +267,10 @@ impl Default for RipState {
             tmdb_overview: String::new(),
             duration: String::new(),
             codecs: String::new(),
+            pass_progress_pct: 0,
+            pass_eta: String::new(),
+            total_progress_pct: 0,
+            total_eta: String::new(),
         }
     }
 }
@@ -733,11 +750,12 @@ struct PassProgressState {
     last_update: std::time::Instant,
     /// Wall-clock of the last device-log line emitted from this pass.
     last_log: std::time::Instant,
-    /// Last `pos` reported by libfreemkv's on_progress callback — the true
-    /// sweep position. Pass 1 uses this for "% swept" (advances even when
-    /// skip-forward is firing); Pass 2..N uses it for "current retry LBA"
-    /// so the UI bar moves through the retry walk.
-    last_pos: u64,
+    /// Last `work_done` reported by libfreemkv's `Progress` trait — bytes
+    /// processed in this pass so far. Drives `pass_progress_pct`.
+    last_work_done: u64,
+    /// Last `work_total` reported by libfreemkv's `Progress` trait — total
+    /// bytes this pass will process. Drives `pass_progress_pct` denominator.
+    last_work_total: u64,
 }
 
 impl PassProgressState {
@@ -748,7 +766,8 @@ impl PassProgressState {
             smooth_speed_mbs: 0.0,
             last_update: now,
             last_log: now,
-            last_pos: 0,
+            last_work_done: 0,
+            last_work_total: 0,
         }
     }
 
@@ -821,46 +840,88 @@ fn push_pass_state(
     // mode. In direct mode this comes from `input.errors`; we overwrite it in
     // the main stream loop for that path.
     let errors = (bytes_bad / 2048) as u32;
-    // progress_pct / progress_gb track the SWEEP POSITION (`pos` from
-    // libfreemkv's on_progress), not `bytes_good`. This is the v0.13.15 fix
-    // for the v0.13.9-stall-guard origin bug: bytes_good freezes during
-    // skip-forward zones (only Finished sectors count) so the UI looked
-    // hung when Pass 1 was actually advancing. `pos` reflects real progress.
-    // The "real data recovered" number is exposed separately in
-    // RipState::bytes_good.
-    let last_pos = state.borrow().last_pos;
-    let pct = if ctx.bytes_total_disc > 0 {
-        (last_pos * 100 / ctx.bytes_total_disc).min(100) as u8
+    // v0.13.16: pass_progress_pct = work_done / work_total (per-pass).
+    // The legacy progress_pct stays populated as a copy (back-compat for
+    // any consumer reading the old field).
+    let last_pos = state.borrow().last_work_done;
+    let last_work_total = state.borrow().last_work_total;
+    let pass_pct = if last_work_total > 0 {
+        (last_pos * 100 / last_work_total).min(100) as u8
     } else {
         0
     };
+    // Total bar: estimate cumulative work done across all passes.
+    // total_work_estimated = disc_capacity + max_retries × bytes_pending +
+    // mux_estimate (200 MB/s heuristic for unknown mux time).
+    // Pre-Pass-1 done: bytes_pending == 0 (nothing pending yet) so total bar
+    // mirrors Pass 1 + mux. Refines once Pass 1 ends.
+    let mux_estimate_bytes = ctx.bytes_total_disc; // 1× disc capacity at 200 MB/s ≈ 7 min/UHD
+    let bytes_pending = stats.bytes_pending;
+    let max_retries_estimate = 4u64; // Could read from cfg, but 4 retries × pending is the worst case.
+    let total_work_estimated = ctx
+        .bytes_total_disc
+        .saturating_add(max_retries_estimate.saturating_mul(bytes_pending))
+        .saturating_add(mux_estimate_bytes);
+    // Cumulative done = passes already completed (full work_total of those)
+    //                 + current pass work_done
+    // We don't track cross-pass cumulative here precisely; approximate by:
+    //   pass==1: total_done = last_pos
+    //   pass>=2: total_done = bytes_total_disc (Pass 1 fully done) +
+    //                         (pass-2) × bytes_pending (prior retries) +
+    //                         last_pos (this retry pass's work_done)
+    let total_done: u64 = if pass <= 1 {
+        last_pos
+    } else {
+        let prior_retry_count = pass.saturating_sub(2) as u64;
+        ctx.bytes_total_disc
+            .saturating_add(prior_retry_count.saturating_mul(bytes_pending))
+            .saturating_add(last_pos)
+    };
+    let total_pct = if total_work_estimated > 0 {
+        (total_done * 100 / total_work_estimated).min(100) as u8
+    } else {
+        0
+    };
+    // Legacy field — keep populated for back-compat. Equals pass_pct.
+    let pct = pass_pct;
 
-    // Compute smoothed speed + ETA from successive samples.
-    let (speed_mbs, eta) = {
+    // Speed = rate of `last_pos` (work_done) advancement, NOT bytes_good.
+    // v0.13.15 had this wrong: speed_mbs tracked bytes_good rate, so during
+    // skip-forward zones (where work_done advances but bytes_good is frozen)
+    // speed read 0 even though the bar was moving. Now speed reflects what
+    // the bar shows.
+    let (speed_mbs, pass_eta_str, total_eta_str) = {
         let mut s = state.borrow_mut();
         let now = std::time::Instant::now();
-        let speed = s.observe(now, stats.bytes_good);
+        let speed = s.observe(now, last_pos);
         s.last_update = now;
-        let eta_str = if speed > 0.01 && ctx.bytes_total_disc > stats.bytes_good {
-            let rem_mb = (ctx.bytes_total_disc - stats.bytes_good) as f64 / 1_048_576.0;
-            let secs = (rem_mb / speed) as u64;
-            if secs < 360_000 {
-                let h = secs / 3600;
-                let m = (secs % 3600) / 60;
-                let se = secs % 60;
-                if h > 0 {
-                    format!("{h}:{m:02}:{se:02}")
-                } else {
-                    format!("{m}:{se:02}")
-                }
+        let format_secs = |secs: u64| -> String {
+            if secs < 60 {
+                format!("{}s", secs)
+            } else if secs < 3600 {
+                format!("{}:{:02}", secs / 60, secs % 60)
+            } else if secs < 360_000 {
+                format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
             } else {
                 String::new()
             }
+        };
+        let pass_eta = if speed > 0.01 && last_work_total > last_pos {
+            let rem_mb = (last_work_total - last_pos) as f64 / 1_048_576.0;
+            format_secs((rem_mb / speed) as u64)
         } else {
             String::new()
         };
-        (speed, eta_str)
+        let total_eta = if speed > 0.01 && total_work_estimated > total_done {
+            let rem_mb = (total_work_estimated - total_done) as f64 / 1_048_576.0;
+            format_secs((rem_mb / speed) as u64)
+        } else {
+            String::new()
+        };
+        (speed, pass_eta, total_eta)
     };
+    // Back-compat: legacy `eta` mirrors pass_eta.
+    let eta = pass_eta_str.clone();
 
     update_state(
         &ctx.device,
@@ -895,6 +956,10 @@ fn push_pass_state(
             largest_gap_ms,
             preferred_batch: ctx.batch,
             current_batch: ctx.batch,
+            pass_progress_pct: pass_pct,
+            pass_eta: pass_eta_str,
+            total_progress_pct: total_pct,
+            total_eta: total_eta_str,
             ..Default::default()
         },
     );
@@ -1679,9 +1744,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let pass1_ctx = &pass_ctx;
         let pass1_title = &title_for_progress;
         let pass1_map = std::path::Path::new(&mapfile_path_str);
-        let pass1_progress = |_bytes_good: u64, pos: u64, _total: u64| {
-            // Stash pos for push_pass_state to compute true sweep progress.
-            pass1_state.borrow_mut().last_pos = pos;
+        let pass1_progress = |p: &libfreemkv::progress::PassProgress| {
+            // Stash work_done for push_pass_state to compute pass progress.
+            pass1_state.borrow_mut().last_work_done = p.work_done;
+            pass1_state.borrow_mut().last_work_total = p.work_total;
             // Throttle: only re-read mapfile + push state every 1.5s.
             if pass1_state.borrow().last_update.elapsed().as_millis() < 1500 {
                 return;
@@ -1718,7 +1784,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             skip_on_error: true,
             skip_forward: true,
             halt: Some(pass1_halt.clone()),
-            on_progress: Some(&pass1_progress),
+            progress: Some(&pass1_progress),
         };
         let result = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
             Ok(r) => r,
@@ -1849,8 +1915,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             let patch_ctx = &pass_ctx;
             let patch_title = &title_for_progress;
             let patch_map = std::path::Path::new(&mapfile_path_str);
-            let patch_progress = |_bytes_good: u64, pos: u64, _total: u64| {
-                patch_state.borrow_mut().last_pos = pos;
+            let patch_progress = |p: &libfreemkv::progress::PassProgress| {
+                patch_state.borrow_mut().last_work_done = p.work_done;
+                patch_state.borrow_mut().last_work_total = p.work_total;
                 if patch_state.borrow().last_update.elapsed().as_millis() < 1500 {
                     return;
                 }
@@ -1889,7 +1956,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 reverse: reverse_pass,
                 wedged_threshold: WEDGED_THRESHOLD,
                 halt: Some(pass_halt.clone()),
-                on_progress: Some(&patch_progress),
+                progress: Some(&patch_progress),
             };
             let prev_good = bytes_good;
             let pr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {

@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.13.16 (2026-04-26)
+
+### Fix: UI lies. Bar reads `pass_progress_pct` directly. (RIP_DESIGN.md §16)
+
+v0.13.15 shipped a backend `progress_pct = pos/total` fix but the web
+JS still computed `pct = bytes_good/bytes_total_disc` and rendered THAT.
+The UI bar froze at 30% during the bad zone while the backend correctly
+reported 50% (and growing). The user saw "stalled," and we had to query
+the API directly to see the real numbers.
+
+Fixes:
+- New `RipState` fields: `pass_progress_pct`, `pass_eta`,
+  `total_progress_pct`, `total_eta`. Server is the single source of
+  truth; JS reads them directly with NO math.
+- Web UI dashboard renders 5 user-visible numbers: pass %, pass ETA,
+  total %, total ETA, recovered (`bytes_good / bytes_total_disc`).
+- `speed_mbs` now tracks rate of `work_done` advancement (the bar
+  motion) rather than `bytes_good` accrual. v0.13.15 had this wrong
+  too — speed read 0 KB/s during skip-forward zones even though the
+  bar was moving.
+
+### Fix: settings page reorganized into 3 logical groups
+
+`Ripping` was a grab-bag. Split into:
+
+- **Disc Lifecycle**: `on_insert`, `auto_eject` (pre/post disc events)
+- **Ripping**: `main_feature`, `min_length_secs`, `output_format`,
+  `network_target` (what artifact to produce)
+- **Recovery**: `on_read_error`, `max_retries`, `keep_iso` (bad-sector
+  handling)
+
+`on_read_error` is a bad-sector knob — moved out of Ripping into
+Recovery. `auto_eject` is the lifecycle counterpart to `on_insert` —
+moved into Lifecycle.
+
+### Adopt: libfreemkv 0.13.16 `Progress` trait architecture
+
+Both Pass 1 (`Disc::copy`) and retry passes (`Disc::patch`) now use the
+new single-shape callback (`Progress` trait + `PassProgress` struct).
+Per-pass and total ETAs computed from the same speed observation, with
+total ETA factoring in estimated retry work + a 200 MB/s mux estimate.
+
+### Deferred to v0.13.17
+
+- `output_format` matrix (explicit branches for MKV/M2TS/ISO/Network ×
+  multipass/direct).
+- Mux phase as a visible bar phase (DiscStream emits `PassKind::Mux`).
+
 ## 0.13.15 (2026-04-26)
 
 ### Fix: pos-based progress display (RIP_DESIGN.md §15 Fix C)
