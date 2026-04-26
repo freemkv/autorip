@@ -202,10 +202,12 @@ function renderBar(s,p){
   return html;
 }
 function renderTotalBar(p){
-  /* v0.13.18: total-progress bar (multipass aggregate). Thinner + dimmer than
-     the pass bar to visually rank pass-progress as primary. No bad-range
-     overlay — that's per-disc and already on the pass bar. */
-  return '<div style="flex:1;background:var(--chip);border-radius:3px;height:4px;overflow:hidden;position:relative;opacity:0.85">'
+  /* v0.13.19: matches the pass bar's geometry (same height, same border-radius)
+     so the two read as a pair instead of two unrelated components. The accent
+     colour + lower opacity still signal "secondary / aggregate" without making
+     the bar look stylistically different. No bad-range overlay — bad ranges
+     are a per-disc concept and live on the pass bar. */
+  return '<div style="flex:1;background:var(--chip);border-radius:3px;height:6px;overflow:hidden;position:relative;opacity:0.7">'
     +'<div style="background:var(--accent);height:100%;width:'+p+'%;transition:width 1s"></div>'
     +'</div>';
 }
@@ -237,23 +239,27 @@ function renderSteps(steps,progress,eta,speed,s){
       const passPctStr=passPct+'%';
       const passEtaStr=s.pass_eta?'ETA '+s.pass_eta:'';
       const spdStr=speed&&speed!=='0 KB/s'?speed:'';
-      const passLine=[passPctStr,passEtaStr,spdStr].filter(Boolean).join(' \u00b7 ');
+      /* v0.13.19: wider text-row separators (em-spaces around the middle dot)
+         + more vertical breathing room between bars and their text rows so
+         the dashboard doesn't feel cramped. */
+      const SEP=' \u2003\u00b7\u2003 ';
+      const passLine=[passPctStr,passEtaStr,spdStr].filter(Boolean).join(SEP);
       const totalEtaStr=s.total_eta?'Total ETA '+s.total_eta:'';
       const recoveredStr=(s.bytes_good>0||s.bytes_total_disc>0)
         ? 'Recovered '+(s.bytes_good/1073741824).toFixed(1)+' / '+(s.bytes_total_disc/1073741824).toFixed(1)+' GB'
         : '';
-      const totalLine=['Total '+totalPct+'%',totalEtaStr,recoveredStr].filter(Boolean).join(' \u00b7 ');
+      const totalLine=['Total '+totalPct+'%',totalEtaStr,recoveredStr].filter(Boolean).join(SEP);
       let badLine='';
       if(s.num_bad_ranges>0||(s.errors>0)){
         const n=s.num_bad_ranges||s.errors||0;
         const lostStr=fmtMs((s.total_lost_ms!=null&&s.total_lost_ms>=0)?s.total_lost_ms:(s.lost_video_secs||0)*1000);
-        badLine='<div style="font-size:.7rem;color:var(--yellow);margin-top:2px">'+n+' unreadable \u00b7 ~'+lostStr+' lost</div>';
+        badLine='<div style="font-size:.7rem;color:var(--yellow);margin-top:6px">'+n+' unreadable \u00b7 ~'+lostStr+' lost</div>';
       }
-      detail='<div style="margin-top:4px">'
+      detail='<div style="margin-top:6px">'
         +renderBar(s,passPct)
-        +'<div style="font-size:.75rem;color:var(--text2);margin-top:4px">'+passLine+'</div>'
-        +'<div style="margin-top:6px">'+renderTotalBar(totalPct)+'</div>'
-        +'<div style="font-size:.75rem;color:var(--text2);margin-top:4px">'+totalLine+'</div>'
+        +'<div style="font-size:.75rem;color:var(--text2);margin-top:7px">'+passLine+'</div>'
+        +'<div style="margin-top:14px">'+renderTotalBar(totalPct)+'</div>'
+        +'<div style="font-size:.75rem;color:var(--text2);margin-top:7px">'+totalLine+'</div>'
         +badLine+'</div>';
       /* Fold pass info into the step name so it's obvious at a glance. */
       if(passLbl){
@@ -664,6 +670,13 @@ function loadSettings(){
 }
 
 function renderSettings(s){
+  /* v0.13.19: derive a virtual `rip_mode` from `max_retries` so the radio
+     selector renders with the right value on load. The backend stays on
+     `max_retries` (and `keep_iso`) — `saveSettings` translates rip_mode back
+     before POST. */
+  if(typeof s.rip_mode!=='string'){
+    s.rip_mode=(s.max_retries>0)?'multi':'single';
+  }
   const groups=[
     {title:'Disc Lifecycle',fields:[
       {key:'on_insert',label:'On Disc Insert',type:'radio',options:[{value:'nothing',label:'Do Nothing'},{value:'scan',label:'Scan'},{value:'rip',label:'Rip'}],hint:'What happens when a disc is inserted'},
@@ -677,8 +690,9 @@ function renderSettings(s){
     ]},
     {title:'Recovery',fields:[
       {key:'on_read_error',label:'On Read Error',type:'radio',options:[{value:'stop',label:'Stop'},{value:'skip',label:'Skip (zero-fill)'}],hint:'Stop aborts the rip. Skip zero-fills bad sectors and continues — use after Verify confirms damage is minor.'},
-      {key:'max_retries',label:'Retry Passes',type:'number',hint:'Number of retry attempts for bad sectors. 0 = no retry, direct disc→MKV (fastest). 1-10 = rip to ISO first, retry bad ranges, then mux to MKV. Raise if a disc has recoverable damage; leave at default (1) for most.'},
-      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Preserve the disc ISO + mapfile after MKV mux. Off by default to reclaim disk.'},
+      {key:'rip_mode',label:'Rip Mode',type:'radio',options:[{value:'single',label:'Single Pass'},{value:'multi',label:'Multi Pass'}],hint:'Single Pass: stream disc → MKV directly. Fastest, best for healthy discs. Multi Pass: rip an ISO, retry bad sectors with progressively smaller blocks, then mux to MKV. Use for discs with read errors.'},
+      {key:'max_retries',label:'Retry Passes',type:'number',hint:'How many retry passes to run on bad sectors. Each pass uses smaller blocks (60→30→15→7→1 sectors) and alternates direction. Default 5 covers most recoverable damage.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
+      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Preserve the disc ISO + mapfile after MKV mux. Off by default to reclaim disk.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
     ]},
     {title:'Output',fields:[
       {key:'output_dir',label:'Output Directory',type:'text',hint:'Where all ripped files go by default'},
@@ -760,6 +774,15 @@ function saveSettings(){
     if(v)hooks.push(v);
   });
   s.webhook_urls=hooks;
+  /* v0.13.19: translate the virtual `rip_mode` selector back to the backend
+     fields. Single → max_retries=0 + keep_iso=false (no ISO ever exists).
+     Multi → keep whatever max_retries the user set; default to 5 if they
+     flipped to multi without ever touching the count. The `rip_mode` key
+     itself is never persisted — the backend already infers it from
+     max_retries on the next render. */
+  if(s.rip_mode==='single'){s.max_retries=0;s.keep_iso=false}
+  else if(s.rip_mode==='multi'&&(!s.max_retries||s.max_retries<1)){s.max_retries=5}
+  delete s.rip_mode;
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)})
   .then(r=>{if(r.ok){document.getElementById('save-status').textContent='Saved';setTimeout(()=>document.getElementById('save-status').textContent='',2000)}});
 }

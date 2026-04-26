@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.13.20 (2026-04-26)
+
+### Sync release — picks up libfreemkv 0.13.20 architecture changes
+
+Consumes libfreemkv 0.13.20's SCSI rewrite (sync blocking SG_IO,
+no userspace abort/reset, no fd recovery dance). autorip itself
+doesn't touch the SCSI transport directly, so this is a transparent
+dep bump. The full 0.13.19 development bundle below ships in this
+release — 0.13.19 was held during development and never tagged.
+
+Bug fixes + UI changes from the held 0.13.19:
+
+### Fix: total ETA math (multipass)
+
+`push_pass_state` was computing `total_work_estimated = capacity +
+4 × bytes_pending + capacity` with a hardcoded retry count and using
+`bytes_pending` (everything not yet read) instead of `bytes_unreadable`
+(only the *bad* set). At the start of Pass 1, `bytes_pending == capacity`,
+so total work resolved to `~6 × capacity` and the total ETA showed as
+roughly `6 × pass_eta` (e.g., 9 h vs the real 1.5 h).
+
+Now: `total_work = capacity + cfg.max_retries × bytes_unreadable
++ mux_estimate` (mux estimate skipped entirely in single-pass mode where
+no ISO is produced). Cumulative-done formula uses `bytes_unreadable`
+consistently across passes too. New field `PassContext::max_retries` so
+the progress callback no longer needs the cfg lock.
+
+### UI: matching bar styles + breathing room
+
+The pair of progress bars introduced in 0.13.18 looked like two
+unrelated components — different heights, different opacities, cramped
+text rows. Polishing:
+
+- Total bar matches the pass bar's geometry (height 6 px,
+  border-radius 3 px) so they read as a pair. Accent colour + 0.7
+  opacity still flag it as the secondary/aggregate signal.
+- More vertical breathing room: bar → text gap 4 → 7 px;
+  pass-block → total-block 6 → 14 px.
+- Wider horizontal separator between stats (` · ` → `  ·  `).
+
+### Settings: Single Pass / Multi Pass selector (progressive disclosure)
+
+The previous "Retry Passes" (number) + "Keep Intermediate ISO" (bool)
+fields were confusing — Single Pass mode had a "0" sitting in a number
+input and a Keep-ISO toggle that only mattered for Multi Pass. Replaced
+with a `Rip Mode` radio:
+
+- **Single Pass** — direct disc → MKV. No retries, no ISO. Sub-options
+  hidden — minimal UI for the common case.
+- **Multi Pass** — disc → ISO → retry bad sectors → mux. Selecting this
+  reveals retry-pass count + keep-ISO inline.
+
+Implementation is purely UI-side: backend still stores `max_retries`
+(int) and `keep_iso` (bool). `renderSettings` derives a virtual
+`rip_mode` from `max_retries`; `saveSettings` translates back before
+POST. No settings-file migration needed — old `settings.json` keeps
+working unchanged.
+
 ## 0.13.18 (2026-04-26)
 
 ### Fix: UI shows two distinct progress bars (pass + total)
