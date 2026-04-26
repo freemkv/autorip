@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.13.21 (2026-04-26)
+
+### Sync release — picks up libfreemkv 0.13.21 bisect-on-fail + timeout fix
+
+No autorip code changes. Consumes libfreemkv 0.13.21 which:
+- Replaces `Disc::copy`'s skip-forward with bisect-on-fail (recovers
+  data the drive can read individually but fails as multi-sector
+  blocks — empirically the BU40N's bad-zone pattern).
+- Bumps the caller-side READ timeout from 1.5 s → 10 s, fixing the
+  cold-start cancel cycle that wedged the Initio bridge.
+
+This is the v0.13.18-20 wedge fix for real. Pass 1 should now recover
+~99 % of a damaged-disc rip, with multi-pass becoming a fast no-op
+when bisect already cleaned up.
+
 ## 0.13.20 (2026-04-26)
 
 ### Sync release — picks up libfreemkv 0.13.20 architecture changes
