@@ -380,13 +380,12 @@ fn device_key(path: &str) -> String {
 /// autorip just iterates the snapshot, tracks logical state
 /// (idle/scanning/ripping/cooldown), and spawns rip threads.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
-    // Cache the drive list at startup. autorip's poll loop iterates
-    // the cache, not the platform — discovery is one-shot, not per-tick.
-    // If a drive is hot-added we'll miss it until restart; in practice
-    // udev-triggered rip events handle insertion and the cache is
-    // refreshed as a side effect of process restarts. Per-poll
-    // re-enumeration is the wrong place to absorb that — that's a
-    // design conversation for 0.14.
+    // v0.13.17: re-enumerate drives every RESCAN_INTERVAL_SECS so an unplug
+    // + replug at the kernel level (drive moves from /dev/sg4 to /dev/sg5
+    // after USB re-enumeration) is picked up without a container restart.
+    // Pre-0.13.17 enumeration was one-shot at startup — the user had to
+    // restart the autorip container after every replug.
+    const RESCAN_INTERVAL_SECS: u64 = 30;
     // Startup sweep: anything under /staging is orphaned — there are no
     // live sessions yet. A prior autorip process killed mid-rip leaves its
     // in-progress ISO / mapfile / partial MKV here, which the old
@@ -396,9 +395,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
         wipe_staging(&c.staging_dir);
     }
 
-    let drives = libfreemkv::list_drives();
-    let drive_paths: Vec<String> = drives.iter().map(|d| d.path.clone()).collect();
-    for d in &drives {
+    let initial_drives = libfreemkv::list_drives();
+    let mut drive_paths: Vec<String> = initial_drives.iter().map(|d| d.path.clone()).collect();
+    for d in &initial_drives {
         tracing::info!(
             device = %device_key(&d.path),
             path = %d.path,
@@ -408,6 +407,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
             "drive enumerated"
         );
     }
+    let mut last_rescan = std::time::Instant::now();
 
     let mut had_disc: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Devices that have surfaced a non-recoverable error from
@@ -419,11 +419,49 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
 
     tracing::info!(
         interval_secs = POLL_INTERVAL_SECS,
-        drive_count = drives.len(),
+        drive_count = drive_paths.len(),
         "drive poll loop starting"
     );
 
     while !crate::SHUTDOWN.load(Ordering::Relaxed) {
+        // v0.13.17 hot-plug: every RESCAN_INTERVAL_SECS, re-enumerate drives
+        // and reconcile against the cached path list. New devices get logged
+        // and start being polled. Devices that disappeared get their state
+        // cleared (drop_session + remove from STATE) so the UI doesn't show
+        // a phantom drive.
+        if last_rescan.elapsed().as_secs() >= RESCAN_INTERVAL_SECS {
+            last_rescan = std::time::Instant::now();
+            let fresh = libfreemkv::list_drives();
+            let fresh_paths: Vec<String> = fresh.iter().map(|d| d.path.clone()).collect();
+            // Added: in fresh but not in drive_paths.
+            for d in &fresh {
+                if !drive_paths.contains(&d.path) {
+                    tracing::info!(
+                        device = %device_key(&d.path),
+                        path = %d.path,
+                        vendor = %d.vendor,
+                        model = %d.model,
+                        firmware = %d.firmware,
+                        "drive enumerated (hot-plug)"
+                    );
+                }
+            }
+            // Removed: in drive_paths but not in fresh_paths.
+            for path in &drive_paths {
+                if !fresh_paths.contains(path) {
+                    let device = device_key(path);
+                    tracing::info!(device = %device, path = %path, "drive removed (hot-unplug)");
+                    drop_session(&device);
+                    if let Ok(mut s) = STATE.lock() {
+                        s.remove(&device);
+                    }
+                    had_disc.remove(&device);
+                    warned_probe_fail.remove(&device);
+                }
+            }
+            drive_paths = fresh_paths;
+        }
+
         {
             let mut current_with_disc: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
