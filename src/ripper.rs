@@ -688,6 +688,12 @@ struct PassContext {
     /// throughout. The DiscStream batch halver only operates during the
     /// mux phase and is reported via the direct-mode stream loop.
     batch: u16,
+    /// Configured retry-pass count. Used by `push_pass_state` to estimate the
+    /// total-bar workload — only `max_retries × bytes_unreadable` worth of work
+    /// is queued for retry passes (not the entire pending set, which during
+    /// Pass 1 is the whole disc and produced a wildly inflated total ETA).
+    /// 0 = single-pass mode (no ISO, no retries, no separate mux phase).
+    max_retries: u8,
 }
 
 /// Walk the title's extents to find the byte offset *within the title* for a
@@ -889,30 +895,38 @@ fn push_pass_state(
         0
     };
     // Total bar: estimate cumulative work done across all passes.
-    // total_work_estimated = disc_capacity + max_retries × bytes_pending +
-    // mux_estimate (200 MB/s heuristic for unknown mux time).
-    // Pre-Pass-1 done: bytes_pending == 0 (nothing pending yet) so total bar
-    // mirrors Pass 1 + mux. Refines once Pass 1 ends.
-    let mux_estimate_bytes = ctx.bytes_total_disc; // 1× disc capacity at 200 MB/s ≈ 7 min/UHD
-    let bytes_pending = stats.bytes_pending;
-    let max_retries_estimate = 4u64; // Could read from cfg, but 4 retries × pending is the worst case.
+    //
+    // The retry passes (2..N) only re-read the *bad* set (`bytes_unreadable`),
+    // not everything that was pending at the start of Pass 1. Using
+    // `bytes_pending` here was wrong: at the start of Pass 1 the entire disc
+    // is "pending," so the old formula computed total ≈ 6 × capacity and
+    // the total bar showed Pass 1 as ~16% instead of ~50%.
+    //
+    //   total_work = capacity (Pass 1)
+    //              + max_retries × bytes_unreadable (retry passes, shrinks Pass→Pass)
+    //              + mux_estimate (only when there's an ISO intermediate)
+    //
+    // In single-pass mode (max_retries == 0) there is no ISO, no retry passes,
+    // and no separate mux phase, so total_work simplifies to just capacity.
+    let cfg_max_retries = ctx.max_retries as u64;
+    let mux_estimate_bytes = if cfg_max_retries > 0 {
+        ctx.bytes_total_disc // mux re-reads the ISO, ~1× capacity worth of I/O
+    } else {
+        0
+    };
     let total_work_estimated = ctx
         .bytes_total_disc
-        .saturating_add(max_retries_estimate.saturating_mul(bytes_pending))
+        .saturating_add(cfg_max_retries.saturating_mul(bytes_bad))
         .saturating_add(mux_estimate_bytes);
-    // Cumulative done = passes already completed (full work_total of those)
-    //                 + current pass work_done
-    // We don't track cross-pass cumulative here precisely; approximate by:
-    //   pass==1: total_done = last_pos
-    //   pass>=2: total_done = bytes_total_disc (Pass 1 fully done) +
-    //                         (pass-2) × bytes_pending (prior retries) +
-    //                         last_pos (this retry pass's work_done)
+    // Cumulative work done across all passes:
+    //   pass 1: total_done = last_pos
+    //   pass>=2 (retry): total_done = capacity + (pass-2) × bytes_bad + last_pos
     let total_done: u64 = if pass <= 1 {
         last_pos
     } else {
         let prior_retry_count = pass.saturating_sub(2) as u64;
         ctx.bytes_total_disc
-            .saturating_add(prior_retry_count.saturating_mul(bytes_pending))
+            .saturating_add(prior_retry_count.saturating_mul(bytes_bad))
             .saturating_add(last_pos)
     };
     let total_pct = if total_work_estimated > 0 {
@@ -1747,6 +1761,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             filename: filename.clone(),
             batch,
             bytes_total_disc,
+            max_retries: cfg_read.max_retries,
         };
         let title_for_progress = title.clone();
         let mapfile_path_str = format!("{iso_path_str}.mapfile");
