@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.13.24 (2026-04-27)
+
+### `bytes_maybe` excludes NonTried (= ahead of read head)
+
+v0.13.23's `RipState.bytes_maybe` read `mapfile.stats().bytes_pending`
+which conflated `NonTried` (sectors Pass 1 hasn't reached) with
+`NonTrimmed`/`NonScraped` (sectors flagged for Pass 2-N retry). At
+pct=0 the entire 78 GB unread disc surfaced as "Maybe" in the yellow
+pill — wrong UX. v0.13.24 consumes libfreemkv 0.13.24's new
+`MapStats.bytes_retryable` field, which is just NonTrimmed +
+NonScraped. Maybe pill now starts at 0 GB on a clean rip and grows
+in spurts when hysteresis hits a marginal sector. Drops as Pass 2-N
+either recovers (joins Good) or gives up (joins Lost).
+
+### UI polish (web dashboard)
+
+  - `fmtMs` escalates to `H:MM:SS` / `M:SS` for large durations.
+    "10817 s" now renders as "3:00:17". Below 1 s still uses
+    millisecond precision for tight read-trace traces.
+  - Pill row gets the same vertical breathing room (14px margin-top)
+    as the gap between the per-pass and total bars.
+  - Total line drops the redundant "Total ETA" prefix → just "ETA"
+    matching the per-pass line's terse format.
+  - Total line drops "Recovered X / Y GB" — the green Good pill
+    already shows the same number without duplicating it.
+
+### cargo fmt cleanup
+
+Same lint cleanup as libfreemkv 0.13.24 — picks up rustfmt fixes
+that have been red on `main` CI since v0.13.18.
+
 ## 0.13.23 (2026-04-27)
 
 ### Consume libfreemkv 0.13.23 SCSI sense plumbing
