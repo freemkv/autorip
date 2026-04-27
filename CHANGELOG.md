@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.13.22 (2026-04-26)
+
+### Consume libfreemkv 0.13.22 hysteresis Block↔Single recovery
+
+libfreemkv 0.13.22 replaces v0.13.21's bisect-on-fail with a hysteresis
+state machine that drops straight to bpt=1 on a block read failure,
+stays there until 10K consecutive good reads, then returns to Block
+mode. ~3× faster recovery on dense damage clusters; same 100% sector
+recovery rate.
+
+### Drop multi-pass batch taper
+
+Pass 2..N now uses `block_sectors_pass = 1` unconditionally. With
+hysteresis, every NonTrimmed range from Pass 1 is already a single
+sector, so the v0.13.15 taper (60 → 30 → 15 → 7 → 1) was cosmetic —
+`Disc::patch`'s internal min(block_sectors, range.size) capped it to
+1 anyway. Direction alternation (forward/reverse) is preserved.
+
+### Damage severity in RipState + UI
+
+New `damage_severity` field on `RipState`, computed from `errors` and
+`total_lost_ms` via `libfreemkv::classify_damage`:
+
+| Severity  | Bad sectors | Lost playback |
+|-----------|-------------|---------------|
+| Clean     | 0           | 0             |
+| Cosmetic  | 1–50        | <1s           |
+| Moderate  | 51–499      | 1s–30s        |
+| Serious   | ≥500        | ≥30s          |
+
+`update_state` recomputes severity on every push so the UI badge
+stays in sync. The web dashboard renders a colored pill ("Cosmetic" /
+"Moderate" / "Serious") next to the existing "X unreadable · ~Y lost"
+line; clean rips show no pill.
+
+### Wallclock-cadence progress callbacks
+
+Pass 1's progress callback now fires every 2s of wallclock (`PROGRESS_TICK`)
+in addition to the outer-loop iteration boundary. In Single mode the
+outer loop can sit on a single block for 30+ seconds; the wallclock
+tick keeps the UI live.
+
 ## 0.13.21 (2026-04-26)
 
 ### Sync release — picks up libfreemkv 0.13.21 bisect-on-fail + timeout fix

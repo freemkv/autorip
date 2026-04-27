@@ -230,6 +230,13 @@ pub struct RipState {
     pub total_progress_pct: u8,
     /// Total rip ETA across all remaining passes including mux estimate.
     pub total_eta: String,
+
+    /// Damage severity tier (0.13.22). Computed from `errors` (bad
+    /// sector count) and `total_lost_ms` (cumulative playback time lost).
+    /// UI renders a colored badge: clean (green) / cosmetic (yellow) /
+    /// moderate (orange) / serious (red).
+    #[serde(default)]
+    pub damage_severity: String,
 }
 
 impl Default for RipState {
@@ -271,8 +278,20 @@ impl Default for RipState {
             pass_eta: String::new(),
             total_progress_pct: 0,
             total_eta: String::new(),
+            damage_severity: String::new(),
         }
     }
+}
+
+/// Compute the damage-severity badge string from autorip's RipState
+/// fields. Wraps libfreemkv's `classify_damage` so the UI gets a stable
+/// lowercase string ("clean" / "cosmetic" / "moderate" / "serious").
+pub(crate) fn damage_severity_for(errors: u32, total_lost_ms: f64) -> String {
+    let s = libfreemkv::classify_damage(errors as u64, total_lost_ms);
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 // Global state for web UI.
@@ -640,7 +659,10 @@ pub fn is_busy(device: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn update_state(device: &str, state: RipState) {
+pub fn update_state(device: &str, mut state: RipState) {
+    // 0.13.22: derive damage_severity from errors + total_lost_ms on
+    // every push so the UI badge stays in sync with the latest counters.
+    state.damage_severity = damage_severity_for(state.errors, state.total_lost_ms);
     if let Ok(mut s) = STATE.lock() {
         s.insert(device.to_string(), state);
     }
@@ -1928,20 +1950,23 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             }
 
             // Per-pass block_sectors + direction.
-            // Last retry → 1 sector. Else → batch >> retry_n, min 2.
-            // Direction: retry_n odd = reverse, retry_n even = forward.
-            let block_sectors_pass: u16 = if retry_n == max_retries {
-                1
-            } else {
-                let halved = batch >> retry_n;
-                halved.max(2)
-            };
+            //
+            // 0.13.22: All retry passes use bpt=1. Pass 1's hysteresis
+            // already isolated every NonTrimmed range to a single sector
+            // (one bad sector at a time, surrounded by Finished). Disc::patch
+            // caps `block_sectors` to `range.size`, so any taper > 1 is a
+            // no-op — every retry effectively runs at bpt=1 anyway. We drop
+            // the cosmetic taper and just alternate direction across passes
+            // (drive's read state differs forward vs reverse + 30 s settle
+            // between passes is the actual recovery mechanism, not block
+            // size).
+            let block_sectors_pass: u16 = 1;
             let reverse_pass = (retry_n % 2) == 1;
             let dir_label = if reverse_pass { "reverse" } else { "forward" };
             crate::log::device_log(
                 device,
                 &format!(
-                    "Pass {pass}/{total_passes}: retrying bad ranges ({dir_label}, {block_sectors_pass}-sector blocks)"
+                    "Pass {pass}/{total_passes}: retrying bad ranges ({dir_label}, bpt=1)"
                 ),
             );
             set_pass_progress(
