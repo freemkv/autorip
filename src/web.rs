@@ -253,7 +253,15 @@ function renderSteps(steps,progress,eta,speed,s){
       if(s.num_bad_ranges>0||(s.errors>0)){
         const n=s.num_bad_ranges||s.errors||0;
         const lostStr=fmtMs((s.total_lost_ms!=null&&s.total_lost_ms>=0)?s.total_lost_ms:(s.lost_video_secs||0)*1000);
-        badLine='<div style="font-size:.7rem;color:var(--yellow);margin-top:6px">'+n+' unreadable \u00b7 ~'+lostStr+' lost</div>';
+        /* 0.13.22: damage_severity pill \u2014 clean/cosmetic/moderate/serious.
+           Only render when severity is set and non-clean. */
+        const sev=s.damage_severity||'';
+        const sevColors={cosmetic:'var(--yellow)',moderate:'var(--orange,#f0a500)',serious:'var(--red,#e34234)'};
+        const sevLabels={cosmetic:'Cosmetic',moderate:'Moderate',serious:'Serious'};
+        const sevPill=(sev&&sev!=='clean'&&sevColors[sev])
+          ? '<span style="display:inline-block;padding:1px 6px;border-radius:8px;background:'+sevColors[sev]+';color:#000;font-size:.65rem;font-weight:600;margin-right:6px">'+sevLabels[sev]+'</span>'
+          : '';
+        badLine='<div style="font-size:.7rem;color:var(--yellow);margin-top:6px">'+sevPill+n+' unreadable \u00b7 ~'+lostStr+' lost</div>';
       }
       detail='<div style="margin-top:6px">'
         +renderBar(s,passPct)
