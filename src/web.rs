@@ -244,11 +244,13 @@ function renderSteps(steps,progress,eta,speed,s){
          the dashboard doesn't feel cramped. */
       const SEP=' \u2003\u00b7\u2003 ';
       const passLine=[passPctStr,passEtaStr,spdStr].filter(Boolean).join(SEP);
-      const totalEtaStr=s.total_eta?'Total ETA '+s.total_eta:'';
-      const recoveredStr=(s.bytes_good>0||s.bytes_total_disc>0)
-        ? 'Recovered '+(s.bytes_good/1073741824).toFixed(1)+' / '+(s.bytes_total_disc/1073741824).toFixed(1)+' GB'
-        : '';
-      const totalLine=['Total '+totalPct+'%',totalEtaStr,recoveredStr].filter(Boolean).join(SEP);
+      /* 0.13.24: mirror the per-pass line's terse format. Drop the
+         redundant "Total " prefix on ETA (the leading "Total N%" already
+         makes the bar's identity obvious), and drop "Recovered X / Y GB"
+         entirely — the green Good pill carries the same information
+         without duplicating it. */
+      const totalEtaStr=s.total_eta?'ETA '+s.total_eta:'';
+      const totalLine=['Total '+totalPct+'%',totalEtaStr].filter(Boolean).join(SEP);
       /* 0.13.23: three-bucket display.
          GOOD  (green)  \u2014 Finished sectors. Always rendered when bytes_total_disc>0.
          MAYBE (yellow) \u2014 Pending sectors (Pass 2-N may recover). Hidden when 0.
@@ -295,7 +297,10 @@ function renderSteps(steps,progress,eta,speed,s){
                          : 'No chance';
           pills+=pill(sevLabel,'var(--red,#e34234)', fmtBytes(bl)+' \u00b7 ~'+fmtMs(lostMs));
         }
-        if(pills) badLine='<div style="font-size:.7rem;margin-top:6px">'+pills+'</div>';
+        /* 0.13.24: bump margin-top from 6px to 14px so the pill row gets
+           the same visual breathing room as the gap between the per-pass
+           and total bars (matches the v0.13.19 polish on those bars). */
+        if(pills) badLine='<div style="font-size:.7rem;margin-top:14px">'+pills+'</div>';
       }
       detail='<div style="margin-top:6px">'
         +renderBar(s,passPct)
@@ -313,10 +318,20 @@ function renderSteps(steps,progress,eta,speed,s){
   }).join('');
 }
 function fmtMs(ms){
+  /* 0.13.24: escalate to minutes / hours / H:MM:SS for large durations.
+     "10817 s" by itself means nothing — render it as "3:00:17". Below
+     1 s we still want millisecond precision for tight read traces. */
   if(ms==null||!isFinite(ms))return'';
   if(ms<1)return'<1 ms';
   if(ms<1000)return ms.toFixed(0)+' ms';
-  return(ms/1000).toFixed(2)+' s';
+  const totalSecs=ms/1000;
+  if(totalSecs<60)return totalSecs.toFixed(2)+' s';
+  const h=Math.floor(totalSecs/3600);
+  const m=Math.floor((totalSecs%3600)/60);
+  const s=Math.floor(totalSecs%60);
+  return h>0
+    ? h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')
+    : m+':'+String(s).padStart(2,'0');
 }
 function fmtChapterTime(secs){
   if(secs==null||!isFinite(secs))return'';

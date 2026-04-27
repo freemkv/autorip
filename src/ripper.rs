@@ -913,17 +913,21 @@ fn push_pass_state(
     let stats = map.stats();
     let (ranges, total_count, truncated, total_lost_ms, largest_gap_ms) =
         build_bad_ranges(&map, title, bps);
-    // 0.13.23 three-bucket split (mapfile stats):
+    // 0.13.23/0.13.24 three-bucket split (mapfile stats):
     //
     //   GOOD  (bytes_good)  = Finished — terminal success
-    //   MAYBE (bytes_maybe) = Pending  — `NonTrimmed` / `NonScraped`,
-    //                                    Pass 2-N will retry
+    //   MAYBE (bytes_maybe) = NonTrimmed + NonScraped — Pass 2-N will retry
     //   LOST  (bytes_lost)  = Unreadable — terminal failure, no retries left
     //
-    // `NonTried` (unread; the disc remainder during Pass 1) is not in any
-    // bucket — it's still ahead of the read head.
+    // `NonTried` (unread; the disc remainder during Pass 1) is **not**
+    // in any UI bucket — it's still ahead of the read head, neither
+    // confirmed good nor flagged for retry. v0.13.23 mistakenly used
+    // `stats.bytes_pending` (= NonTried + NonTrimmed + NonScraped) here,
+    // so the entire unread disc surfaced as "Maybe" at pct=0. v0.13.24
+    // splits the aggregate via `bytes_retryable` — only the genuine
+    // retry-eligible bytes show up in the yellow pill.
     let bytes_lost = stats.bytes_unreadable;
-    let bytes_maybe = stats.bytes_pending;
+    let bytes_maybe = stats.bytes_retryable;
     // `errors` is the user-visible skipped-sector count: terminal-bad
     // sectors only (`bytes_lost`). Pending bytes are not "errors" — they
     // may still recover.
@@ -1999,9 +2003,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             let dir_label = if reverse_pass { "reverse" } else { "forward" };
             crate::log::device_log(
                 device,
-                &format!(
-                    "Pass {pass}/{total_passes}: retrying bad ranges ({dir_label}, bpt=1)"
-                ),
+                &format!("Pass {pass}/{total_passes}: retrying bad ranges ({dir_label}, bpt=1)"),
             );
             set_pass_progress(
                 device,
@@ -2017,8 +2019,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 pass,
                 total_passes,
                 bytes_good,
-                bytes_pending,     // MAYBE bucket — Pass 2-N may still recover
-                bytes_unreadable,  // LOST bucket — terminal
+                bytes_pending,    // MAYBE bucket — Pass 2-N may still recover
+                bytes_unreadable, // LOST bucket — terminal
                 bytes_total_disc,
                 batch,
             );
