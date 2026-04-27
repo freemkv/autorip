@@ -249,19 +249,53 @@ function renderSteps(steps,progress,eta,speed,s){
         ? 'Recovered '+(s.bytes_good/1073741824).toFixed(1)+' / '+(s.bytes_total_disc/1073741824).toFixed(1)+' GB'
         : '';
       const totalLine=['Total '+totalPct+'%',totalEtaStr,recoveredStr].filter(Boolean).join(SEP);
+      /* 0.13.23: three-bucket display.
+         GOOD  (green)  \u2014 Finished sectors. Always rendered when bytes_total_disc>0.
+         MAYBE (yellow) \u2014 Pending sectors (Pass 2-N may recover). Hidden when 0.
+         LOST  (red)    \u2014 Unreadable sectors (terminal). Hidden when 0.
+         Each pill carries the bucket's video time equivalent, so users can
+         see at a glance "X good \u00b7 2h05m, Y maybe \u00b7 2.4s, Z no chance \u00b7 0s".
+         The damage_severity label appears alongside (Cosmetic / Moderate /
+         Serious) only when there's actual loss. */
       let badLine='';
-      if(s.num_bad_ranges>0||(s.errors>0)){
-        const n=s.num_bad_ranges||s.errors||0;
-        const lostStr=fmtMs((s.total_lost_ms!=null&&s.total_lost_ms>=0)?s.total_lost_ms:(s.lost_video_secs||0)*1000);
-        /* 0.13.22: damage_severity pill \u2014 clean/cosmetic/moderate/serious.
-           Only render when severity is set and non-clean. */
-        const sev=s.damage_severity||'';
-        const sevColors={cosmetic:'var(--yellow)',moderate:'var(--orange,#f0a500)',serious:'var(--red,#e34234)'};
-        const sevLabels={cosmetic:'Cosmetic',moderate:'Moderate',serious:'Serious'};
-        const sevPill=(sev&&sev!=='clean'&&sevColors[sev])
-          ? '<span style="display:inline-block;padding:1px 6px;border-radius:8px;background:'+sevColors[sev]+';color:#000;font-size:.65rem;font-weight:600;margin-right:6px">'+sevLabels[sev]+'</span>'
-          : '';
-        badLine='<div style="font-size:.7rem;color:var(--yellow);margin-top:6px">'+sevPill+n+' unreadable \u00b7 ~'+lostStr+' lost</div>';
+      const bg=s.bytes_good||0, bm=s.bytes_maybe||0, bl=s.bytes_lost||0;
+      const haveAny = bg>0 || bm>0 || bl>0;
+      if(haveAny){
+        const bytesPerMs = (s.bytes_total_disc>0 && s.duration)
+          ? null   // server-computed *_ms is authoritative; we won't recompute
+          : null;
+        void bytesPerMs;
+        const fmtBytes = (b)=> b>=1073741824 ? (b/1073741824).toFixed(2)+' GB'
+                            : b>=1048576    ? (b/1048576).toFixed(1)+' MB'
+                            : b>=1024       ? (b/1024).toFixed(1)+' KB'
+                            : b+' B';
+        const goodMs  = (s.bytes_total_disc>0 && s.duration)
+          ? null  // good time isn't computed server-side; show bytes only
+          : null;
+        void goodMs;
+        const maybeMs = (s.total_maybe_ms!=null && s.total_maybe_ms>=0) ? s.total_maybe_ms : 0;
+        const lostMs  = (s.total_lost_ms!=null  && s.total_lost_ms >=0) ? s.total_lost_ms  : 0;
+        const pill = (label, color, body)=>
+          '<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:'+color
+          +';color:#000;font-size:.65rem;font-weight:600;margin-right:6px">'
+          +label+' '+body+'</span>';
+        let pills='';
+        if(bg>0){
+          pills+=pill('Good','var(--green,#3aaa55)', fmtBytes(bg));
+        }
+        if(bm>0){
+          pills+=pill('Maybe','var(--yellow,#f0c000)', fmtBytes(bm)+' \u00b7 ~'+fmtMs(maybeMs));
+        }
+        if(bl>0){
+          /* damage_severity label only when terminal loss exists. */
+          const sev=s.damage_severity||'';
+          const sevLabel = sev==='serious' ? 'Serious'
+                         : sev==='moderate' ? 'Moderate'
+                         : sev==='cosmetic' ? 'Cosmetic'
+                         : 'No chance';
+          pills+=pill(sevLabel,'var(--red,#e34234)', fmtBytes(bl)+' \u00b7 ~'+fmtMs(lostMs));
+        }
+        if(pills) badLine='<div style="font-size:.7rem;margin-top:6px">'+pills+'</div>';
       }
       detail='<div style="margin-top:6px">'
         +renderBar(s,passPct)

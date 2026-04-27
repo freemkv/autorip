@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.13.23 (2026-04-27)
+
+### Consume libfreemkv 0.13.23 SCSI sense plumbing
+
+libfreemkv 0.13.23 stops discarding the drive's CHECK CONDITION sense
+data — pre-fix every drive-reported error was being misclassified as
+a transport wedge, which made `Disc::copy`'s hysteresis bail before
+it could engage. The library fix unblocks the recovery path on
+damaged discs.
+
+### Three-bucket reporting in RipState + UI
+
+`RipState` now exposes the mapfile state as three explicit buckets:
+
+  - **GOOD** (`bytes_good`) — Finished sectors. Terminal success.
+  - **MAYBE** (`bytes_maybe`) — Pending sectors. Pass 2-N may recover them.
+  - **LOST** (`bytes_lost`) — Unreadable sectors. Terminal failure.
+
+with companion playback-time fields (`total_maybe_ms`,
+`total_lost_ms`). The legacy `bytes_bad` field is replaced by
+`bytes_lost` (terminal-only); pending bytes were previously folded
+into `bytes_bad` which made the UI show pending sectors as "errors"
+even though they were still scheduled for retry.
+
+Web dashboard renders three colored pills:
+
+  - green "Good · X.X GB"
+  - yellow "Maybe · X.X MB · ~Y.Ys"
+  - red "{Severity} · X.X MB · ~Y.Ys" (severity = damage_severity from v0.13.22)
+
+Pills are hidden when the corresponding bucket is empty.
+
+### Pass 2-N: reverse direction + bpt=1 (no behaviour change, just confirmed)
+
+The Pass 2-N reverse-direction alternation (odd retry_n = reverse,
+even = forward) and bpt=1 (from v0.13.22's taper drop) are kept and
+documented as the canonical retry strategy. No multi-attempt retry,
+no read-speed throttling, no USB-layer reset — empirically tested and
+discarded.
+
 ## 0.13.22 (2026-04-26)
 
 ### Consume libfreemkv 0.13.22 hysteresis Block↔Single recovery
