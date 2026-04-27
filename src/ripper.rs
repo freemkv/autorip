@@ -193,9 +193,17 @@ pub struct RipState {
     /// not in multi-pass mode.
     pub total_passes: u8,
     /// Bytes confirmed good across all passes so far (from mapfile stats).
+    /// **Bucket: GOOD** — sectors successfully read at least once.
     pub bytes_good: u64,
-    /// Bytes still unreadable or pending.
-    pub bytes_bad: u64,
+    /// Bytes still pending retry (`NonTrimmed` / `NonScraped` in the
+    /// mapfile). Pass 2-N will revisit these. After the final retry pass,
+    /// any remaining `Pending` bytes are reclassified as `Unreadable`.
+    /// **Bucket: MAYBE** — drive returned a marginal-read sense; smaller
+    /// block size may recover them.
+    pub bytes_maybe: u64,
+    /// Bytes the drive has given up on (`Unreadable` in the mapfile).
+    /// **Bucket: LOST** — terminal; no more retries are scheduled.
+    pub bytes_lost: u64,
     /// Total disc size in bytes (for pass-relative progress).
     pub bytes_total_disc: u64,
     /// Bad sector ranges from the mapfile. Capped at 50 entries (biggest by
@@ -204,8 +212,15 @@ pub struct RipState {
     pub bad_ranges: Vec<BadRange>,
     pub num_bad_ranges: u32,
     pub bad_ranges_truncated: u32,
-    /// Sum of bad-range durations — the actual video time lost to this rip.
+    /// Sum of `Unreadable` ranges' durations — the actual video time
+    /// lost to this rip. Companion to [`Self::bytes_lost`]. UI's red
+    /// "no chance" pill renders this.
     pub total_lost_ms: f64,
+    /// Sum of `Pending` ranges' durations — the video time at risk
+    /// pending Pass 2-N retry. Companion to [`Self::bytes_maybe`]. UI's
+    /// yellow "maybe" pill renders this. Drops as retry passes promote
+    /// pending sectors to `Finished` (recovered) or `Unreadable` (final).
+    pub total_maybe_ms: f64,
     /// Largest single contiguous bad range's duration. Tells the difference
     /// between 1000 × 1ms gaps (unnoticeable) vs 1 × 1s gap (noticeable glitch).
     pub largest_gap_ms: f64,
@@ -259,12 +274,14 @@ impl Default for RipState {
             pass: 0,
             total_passes: 0,
             bytes_good: 0,
-            bytes_bad: 0,
+            bytes_maybe: 0,
+            bytes_lost: 0,
             bytes_total_disc: 0,
             bad_ranges: Vec::new(),
             num_bad_ranges: 0,
             bad_ranges_truncated: 0,
             total_lost_ms: 0.0,
+            total_maybe_ms: 0.0,
             largest_gap_ms: 0.0,
             last_error: String::new(),
             output_file: String::new(),
@@ -896,16 +913,28 @@ fn push_pass_state(
     let stats = map.stats();
     let (ranges, total_count, truncated, total_lost_ms, largest_gap_ms) =
         build_bad_ranges(&map, title, bps);
-    // `bytes_bad` is only `Unreadable` — confirmed-bad ranges where the drive
-    // has exhausted our retry attempts. `NonTried` (unread) and `NonTrimmed` /
-    // `NonScraped` (needs more work) are not "bad" — counting them makes the
-    // UI show the whole disc as bad until pass 1 reaches each byte.
-    let bytes_bad = stats.bytes_unreadable;
-    // Live `errors` (skipped-sector count) from the mapfile so the yellow
-    // "N sectors skipped" banner + lost-video-time readout works in multipass
-    // mode. In direct mode this comes from `input.errors`; we overwrite it in
-    // the main stream loop for that path.
-    let errors = (bytes_bad / 2048) as u32;
+    // 0.13.23 three-bucket split (mapfile stats):
+    //
+    //   GOOD  (bytes_good)  = Finished — terminal success
+    //   MAYBE (bytes_maybe) = Pending  — `NonTrimmed` / `NonScraped`,
+    //                                    Pass 2-N will retry
+    //   LOST  (bytes_lost)  = Unreadable — terminal failure, no retries left
+    //
+    // `NonTried` (unread; the disc remainder during Pass 1) is not in any
+    // bucket — it's still ahead of the read head.
+    let bytes_lost = stats.bytes_unreadable;
+    let bytes_maybe = stats.bytes_pending;
+    // `errors` is the user-visible skipped-sector count: terminal-bad
+    // sectors only (`bytes_lost`). Pending bytes are not "errors" — they
+    // may still recover.
+    let errors = (bytes_lost / 2048) as u32;
+    // MAYBE-bucket time equivalent (yellow pill in the UI). Mirrors the
+    // existing `total_lost_ms` (red pill) computed from per-range durations.
+    let total_maybe_ms = if bps > 0.0 {
+        bytes_maybe as f64 * 1000.0 / bps
+    } else {
+        0.0
+    };
     // v0.13.16: pass_progress_pct = work_done / work_total (per-pass).
     // The legacy progress_pct stays populated as a copy (back-compat for
     // any consumer reading the old field).
@@ -938,17 +967,17 @@ fn push_pass_state(
     };
     let total_work_estimated = ctx
         .bytes_total_disc
-        .saturating_add(cfg_max_retries.saturating_mul(bytes_bad))
+        .saturating_add(cfg_max_retries.saturating_mul(bytes_lost))
         .saturating_add(mux_estimate_bytes);
     // Cumulative work done across all passes:
     //   pass 1: total_done = last_pos
-    //   pass>=2 (retry): total_done = capacity + (pass-2) × bytes_bad + last_pos
+    //   pass>=2 (retry): total_done = capacity + (pass-2) × bytes_lost + last_pos
     let total_done: u64 = if pass <= 1 {
         last_pos
     } else {
         let prior_retry_count = pass.saturating_sub(2) as u64;
         ctx.bytes_total_disc
-            .saturating_add(prior_retry_count.saturating_mul(bytes_bad))
+            .saturating_add(prior_retry_count.saturating_mul(bytes_lost))
             .saturating_add(last_pos)
     };
     let total_pct = if total_work_estimated > 0 {
@@ -1021,12 +1050,14 @@ fn push_pass_state(
             pass,
             total_passes,
             bytes_good: stats.bytes_good,
-            bytes_bad,
+            bytes_maybe,
+            bytes_lost,
             bytes_total_disc: ctx.bytes_total_disc,
             bad_ranges: ranges,
             num_bad_ranges: total_count,
             bad_ranges_truncated: truncated,
             total_lost_ms,
+            total_maybe_ms,
             largest_gap_ms,
             preferred_batch: ctx.batch,
             current_batch: ctx.batch,
@@ -1055,11 +1086,11 @@ fn push_pass_state(
             } else {
                 format!("{:.0} KB/s", speed_mbs * 1024.0)
             };
-            let bad_str = if bytes_bad > 0 {
+            let bad_str = if bytes_lost > 0 {
                 format!(
                     ", {} skipped ({:.2} MB)",
                     errors,
-                    bytes_bad as f64 / 1_048_576.0
+                    bytes_lost as f64 / 1_048_576.0
                 )
             } else {
                 String::new()
@@ -1093,7 +1124,8 @@ fn set_pass_progress(
     pass: u8,
     total_passes: u8,
     bytes_good: u64,
-    bytes_bad: u64,
+    bytes_maybe: u64,
+    bytes_lost: u64,
     bytes_total_disc: u64,
     batch: u16,
 ) {
@@ -1122,7 +1154,8 @@ fn set_pass_progress(
             pass,
             total_passes,
             bytes_good,
-            bytes_bad,
+            bytes_maybe,
+            bytes_lost,
             bytes_total_disc,
             preferred_batch: batch,
             current_batch: batch,
@@ -1805,8 +1838,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             &filename,
             1,
             total_passes,
-            0,
-            0,
+            0, // bytes_good
+            0, // bytes_maybe
+            0, // bytes_lost
             bytes_total_disc,
             batch,
         );
@@ -1983,7 +2017,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 pass,
                 total_passes,
                 bytes_good,
-                bytes_unreadable + bytes_pending,
+                bytes_pending,     // MAYBE bucket — Pass 2-N may still recover
+                bytes_unreadable,  // LOST bucket — terminal
                 bytes_total_disc,
                 batch,
             );

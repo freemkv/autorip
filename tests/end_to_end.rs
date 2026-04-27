@@ -32,7 +32,8 @@ fn test_state_json_serialization_round_trip() {
         pass: 1,
         total_passes: 3,
         bytes_good: 14_500_000_000,
-        bytes_bad: 1024,
+        bytes_maybe: 4096,
+        bytes_lost: 1024,
         bytes_total_disc: 25_000_000_000,
         bad_ranges: vec![BadRange {
             lba: 1000,
@@ -44,6 +45,7 @@ fn test_state_json_serialization_round_trip() {
         num_bad_ranges: 1,
         bad_ranges_truncated: 0,
         total_lost_ms: 12.5,
+        total_maybe_ms: 50.0,
         largest_gap_ms: 12.5,
         last_error: String::new(),
         output_file: "TEST DISC.mkv".to_string(),
