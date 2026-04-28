@@ -310,7 +310,13 @@ function renderSteps(steps,progress,eta,speed,s){
         +badLine+'</div>';
       /* Fold pass info into the step name so it's obvious at a glance. */
       if(passLbl){
-        return '<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:.8rem"><span style="color:'+colors[st.status]+';font-size:.7rem;width:14px;text-align:center;animation:p 1.5s infinite">'+icons[st.status]+'</span><span style="color:var(--text)"><strong>Rip</strong>'+header+detail+'</span></div>';
+        /* 0.13.25: flex:1 + min-width:0 on the content span pins it to
+           the remaining row width regardless of inner text length. Without
+           this the span sizes to its content, so a longer header
+           ("Pass 2/7: retrying bad ranges") makes the bar inside `detail`
+           wider than a shorter one ("pass 1/7 · copying"), producing
+           visible width wobble as the rip moves through phases. */
+        return '<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:.8rem"><span style="color:'+colors[st.status]+';font-size:.7rem;width:14px;text-align:center;flex-shrink:0;animation:p 1.5s infinite">'+icons[st.status]+'</span><span style="color:var(--text);flex:1;min-width:0">Rip'+header+detail+'</span></div>';
       }
     }else if(detail){detail=' \u2014 '+detail}
     const anim=st.status==='active'?';animation:p 1.5s infinite':'';
