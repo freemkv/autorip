@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.13.26 (2026-04-27)
+
+### Sync release — picks up libfreemkv 0.13.26 (DiscRead SCSI status/sense)
+
+New error format now shows SCSI status and sense in errors:
+- `E6000: sector 0x{status}/0x{sense_key}/0x{asc}`
+- Enables recovery loop to distinguish drive wedge from bad sectors
+
+## 0.13.25 (2026-04-27)
+
+### Sync release — picks up libfreemkv 0.13.25 (dead-code cleanup)
+
+No autorip functional changes.
+
 ## 0.13.24 (2026-04-27)
 
 ### `bytes_maybe` excludes NonTried (= ahead of read head)
