@@ -20,3 +20,18 @@ cargo test
 ## License
 
 AGPL-3.0
+
+## Release Process
+
+Release triggers Docker image build to GHCR. Requires a semver tag:
+
+```bash
+git tag -a v0.13.27 -m "v0.13.27"
+git push origin v0.13.27
+```
+
+The Release workflow builds and pushes:
+- `ghcr.io/freemkv/autorip:latest`
+- `ghcr.io/freemkv/autorip:0.13.27`
+
+Watchtower on classe auto-pulls every ~30 min and restarts the container.
