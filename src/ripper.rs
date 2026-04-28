@@ -1692,6 +1692,40 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let halt = session.drive.halt_flag();
     register_halt(device, halt.clone());
 
+    // Rip-level wallclock budget (Fix 3). Caps the ENTIRE rip — all passes
+    // combined — at max(disc_runtime, 1h). Implemented as a background thread
+    // that sleeps for the budget then fires halt if the rip hasn't finished.
+    // Per-pass caps (spawn_pass_watcher) still apply as a finer-grained
+    // safety net; this is the backstop so a rip can't run forever even if
+    // individual passes keep resetting their timers.
+    let rip_budget_secs = {
+        let disc_capacity_bytes = disc.capacity_bytes.max(1);
+        let estimated_secs = disc_capacity_bytes / 50_000_000; // ~50 MB/s realistic
+        std::cmp::max(estimated_secs, 3600u64)
+    };
+    let halt_rip_watcher = halt.clone();
+    let device_rip_watcher = device.to_string();
+    let _rip_watcher_guard = std::thread::spawn(move || {
+        tracing::info!(
+            device = %device_rip_watcher,
+            rip_budget_secs,
+            "Rip-level wallclock watcher started"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(rip_budget_secs));
+        if !halt_rip_watcher.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                device = %device_rip_watcher,
+                rip_budget_secs,
+                "Rip budget exceeded — firing halt flag"
+            );
+            halt_rip_watcher.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::log::device_log(
+                &device_rip_watcher,
+                &format!("exceeded {}-second rip budget", rip_budget_secs),
+            );
+        }
+    });
+
     // Per-pass wallclock budget. Each pass (Pass 1 sweep + every retry) gets
     // its own `max(disc_runtime, 1h)` budget. v0.13.15 made this per-pass
     // (was total-rip in v0.13.12-14) — a fail-safe to bound a wedged pass,
