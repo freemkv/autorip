@@ -904,6 +904,12 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         serve_html(request);
     } else if is_get && url == "/api/state" {
         json_response(request, 200, &get_state_json());
+    } else if is_get && url == "/api/version" {
+        json_response(
+            request,
+            200,
+            &format!("{{\"version\":\"{}\"}}", env!("CARGO_PKG_VERSION")),
+        );
     } else if is_get && url == "/api/history" {
         let history_dir = cfg.read().map(|c| c.history_dir()).unwrap_or_default();
         let items = history::load_recent(&history_dir, 50);
