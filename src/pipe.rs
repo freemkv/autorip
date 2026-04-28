@@ -593,7 +593,7 @@ fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool,
         last_update: &'a std::cell::Cell<std::time::Instant>,
         start: std::time::Instant,
     }
-    impl<'a> libfreemkv::progress::Progress for CliProgress<'a> {
+    impl libfreemkv::progress::Progress for CliProgress<'_> {
         fn report(&self, p: &libfreemkv::progress::PassProgress) {
             if self.out.is_quiet() {
                 return;
