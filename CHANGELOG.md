@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.25 (2026-04-27)
+
+### Fix `clippy::needless_lifetimes` in `pipe.rs::CliProgress`
+
+`impl<'a> Progress for CliProgress<'a>` → `impl Progress for
+CliProgress<'_>`. Same effect; clippy 1.86 rejects the explicit
+lifetime, clippy 1.94 doesn't, so the lint slipped past local checks
+on the Mac. v0.13.25's `precommit.sh` (in freemkv-private) pins 1.86
+so this kind of drift can't reach `main` again.
+
+Picks up libfreemkv 0.13.25 (drops dead `device_path_owned`).
+
 ## 0.13.24 (2026-04-27)
 
 ### Sync release — picks up libfreemkv 0.13.24 MapStats split + fmt cleanup
