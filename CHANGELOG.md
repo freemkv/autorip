@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.13.39 (2026-04-28)
+
+### ECC-block sweep, multi-pass recovery, USB bridge crash fix
+
+Picks up libfreemkv 0.13.39 with the new Pass 1 ECC-block sweep and
+mapfile-based recovery pipeline.
+
+- Pass 1 reads 32-sector batches, skips bad ECC blocks (NonTrimmed), never
+  retries — prevents Initio INIC-1618L USB bridge crash.
+- Pass 2+ recovers NonTrimmed sectors one at a time via Disc::patch().
+- 60-second hot-plug grace period for freshly inserted drives.
+- `/api/version` endpoint for deploy verification.
+- Removed `skip_forward`, `cautious_pause_ms`, and `BPT1_EXIT_THRESHOLD` from
+  ripper configuration — all handled by libfreemkv now.
+
 ## 0.13.26 (2026-04-27)
 
 ### Sync release — picks up libfreemkv 0.13.26 (DiscRead SCSI status/sense)
