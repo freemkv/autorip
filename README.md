@@ -104,6 +104,44 @@ libfreemkv (Rust library)
         └── Webhooks
 ```
 
+## API Reference
+
+All endpoints are served on port 8080 (configurable via `PORT`). The web UI is a thin client over these same endpoints -- full programmatic control is possible.
+
+`{device}` is the SCSI device name (e.g. `sg5`).
+
+### General
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` or `/index.html` | Serve dashboard HTML |
+| GET | `/api/state` | Current state for all devices (JSON) |
+| GET | `/api/version` | `{"version":"X.Y.Z"}` |
+| GET | `/api/settings` | Full config as JSON |
+| POST | `/api/settings` | Partial JSON merge of config fields |
+| GET | `/api/system` | KEYDB status, move queue, syslog (last 50 lines) |
+| GET | `/events` | SSE stream pushing same JSON as `/api/state` every 1s |
+
+### History & Logs
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/history` | Last 50 history entries |
+| GET | `/api/history/{file}` | Download single history JSON file |
+| GET | `/api/logs/{device}` | Last 200 lines of device log (plain text) |
+| GET | `/api/debug[?n=&level=&device=&q=]` | Filtered JSONL debug events |
+
+### Device Actions
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/scan/{device}` | Scan disc metadata |
+| POST | `/api/rip/{device}` | Start a full rip |
+| POST | `/api/stop/{device}` | Stop rip/verify, wipe staging, reset to idle |
+| POST | `/api/eject/{device}` | Eject disc tray, reset state |
+| POST | `/api/verify/{device}` | Start disc health verification |
+| POST | `/api/update-keydb` | Download KEYDB.cfg from configured URL |
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
