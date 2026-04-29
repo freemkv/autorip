@@ -1944,7 +1944,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             resume: false,
             batch_sectors: Some(batch),
             skip_on_error: true,
-            skip_forward: true,
             halt: Some(pass1_halt.clone()),
             progress: Some(&pass1_progress),
         };
