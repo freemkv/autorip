@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.13.39 (2026-04-28)
+## 0.13.40 (2026-04-28)
 
 ### ECC-block sweep, multi-pass recovery, USB bridge crash fix
 
