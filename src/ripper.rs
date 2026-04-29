@@ -446,12 +446,16 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     let mut last_rescan = std::time::Instant::now();
 
     let mut had_disc: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Devices that have surfaced a non-recoverable error from
-    // `drive_has_disc`. Used to throttle repeat warnings — first
-    // failure at warn, continued failures at debug. Without this, a
-    // permanently-locked or permission-denied node would spam
-    // autorip.log forever.
     let mut warned_probe_fail: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut device_first_seen: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
+    for d in &initial_drives {
+        let key = device_key(&d.path);
+        device_first_seen.insert(
+            key,
+            std::time::Instant::now() - std::time::Duration::from_secs(60),
+        );
+    }
 
     tracing::info!(
         interval_secs = POLL_INTERVAL_SECS,
@@ -472,6 +476,10 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
             // Added: in fresh but not in drive_paths.
             for d in &fresh {
                 if !drive_paths.contains(&d.path) {
+                    let key = device_key(&d.path);
+                    device_first_seen
+                        .entry(key)
+                        .or_insert(std::time::Instant::now());
                     tracing::info!(
                         device = %device_key(&d.path),
                         path = %d.path,
@@ -509,7 +517,14 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 // they hold a Drive instance + sometimes the SCSI bus.
                 // Probing them mid-rip would conflict.
                 if is_busy(&device) {
-                    current_with_disc.insert(device);
+                    current_with_disc.insert(device.clone());
+                    continue;
+                }
+
+                if device_first_seen
+                    .get(&device)
+                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60))
+                {
                     continue;
                 }
 
