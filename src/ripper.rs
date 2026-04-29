@@ -348,6 +348,7 @@ struct DriveSession {
     scanned: bool,
     probed: bool,
     tmdb: Option<crate::tmdb::TmdbResult>,
+    device_path: String,
 }
 
 /// Global drive sessions — one per device.
@@ -368,6 +369,34 @@ fn drop_session(device: &str) {
     if let Ok(mut s) = SESSIONS.lock() {
         s.remove(device);
     }
+}
+
+/// After a USB re-enumeration (bridge crash), the sg device number may
+/// change. Probe the original path and its neighbors to find the drive
+/// that still has the disc. Returns the new device path (e.g. "/dev/sg5").
+fn rediscover_drive(device: &str, original_path: &str) -> Option<String> {
+    let sg_num = original_path
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.strip_prefix("sg").and_then(|n| n.parse::<i32>().ok()))
+        .unwrap_or(-1);
+
+    for delta in [0i32, -1, 1, -2, 2, -3, 3] {
+        let probe_num = sg_num + delta;
+        if probe_num < 0 {
+            continue;
+        }
+        let path = format!("/dev/sg{probe_num}");
+        if libfreemkv::drive_has_disc(std::path::Path::new(&path)).unwrap_or(false) {
+            tracing::info!(
+                device = %device,
+                new_path = %path,
+                "rediscovered drive after USB re-enumeration"
+            );
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Remove every subdirectory under `cfg.staging_dir`. Used on startup (all
@@ -1348,6 +1377,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             scanned: true,
             probed: false,
             tmdb: tmdb.clone(),
+            device_path: device_path.to_string(),
         },
     );
 
@@ -1507,6 +1537,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 scanned: true,
                 probed: false,
                 tmdb,
+                device_path: device_path.to_string(),
             }
         }
     };
@@ -1925,11 +1956,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             );
         };
 
-        // Every rip starts fresh — no silent resume of stale ISO+mapfile from
-        // a prior attempt. Pass 1 with resume=false wipes the sidecar mapfile
-        // and recreates the ISO, so progress starts at 0 % and reflects reads
-        // from this invocation only. See CHANGELOG 0.12.5 for the bug this
-        // closes (stale mapfile showing 30 % at 10 s into a cold rip).
+        // Pass 1: disc → ISO with transport-failure recovery.
+        //
+        // The Initio USB-SATA bridge crashes when reading damaged sectors,
+        // causing a USB re-enumeration (sg device changes number). The copy
+        // aborts, but the mapfile captures all progress. We retry with
+        // resume=true after re-opening the drive on its new device path.
         let pass1_halt = Arc::new(AtomicBool::new(false));
         let _pass1_guard = spawn_pass_watcher(
             "Pass 1".to_string(),
@@ -1939,44 +1971,145 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             cap_fired_any.clone(),
             max_pass_secs,
         );
-        let copy_opts = libfreemkv::disc::CopyOptions {
-            decrypt: false,
-            resume: false,
-            batch_sectors: Some(batch),
-            skip_on_error: true,
-            halt: Some(pass1_halt.clone()),
-            progress: Some(&pass1_progress),
-        };
-        let result = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
-            Ok(r) => r,
-            Err(e) => {
-                // If halt is set, the error is the user-initiated stop racing
-                // the worker (e.g. handle_stop wiped staging while disc.copy
-                // was mid-write). Don't surface as "error" — handle_stop has
-                // already cleared state to idle. Just clean up and exit.
-                if halt.load(Ordering::Relaxed) {
-                    crate::log::device_log(device, &format!("Pass 1 cancelled (halt): {e}"));
-                    if let Ok(mut flags) = HALT_FLAGS.lock() {
-                        flags.remove(device);
-                    }
-                    return;
+
+        const MAX_PASS1_ATTEMPTS: u32 = 10;
+        let mut attempt = 0;
+        let mut resume = false;
+        let mut result = None;
+
+        'pass1: loop {
+            attempt += 1;
+            if attempt > MAX_PASS1_ATTEMPTS {
+                crate::log::device_log(device, "Pass 1: max attempts reached");
+                break;
+            }
+
+            let copy_opts = libfreemkv::disc::CopyOptions {
+                decrypt: false,
+                resume,
+                batch_sectors: Some(batch),
+                skip_on_error: true,
+                halt: Some(pass1_halt.clone()),
+                progress: Some(&pass1_progress),
+            };
+
+            match disc.copy(&mut session.drive, iso_path, &copy_opts) {
+                Ok(r) => {
+                    result = Some(r);
+                    break 'pass1;
                 }
-                crate::log::device_log(device, &format!("Pass 1 failed: {e}"));
+                Err(e) => {
+                    if halt.load(Ordering::Relaxed) {
+                        crate::log::device_log(device, &format!("Pass 1 cancelled (halt): {e}"));
+                        if let Ok(mut flags) = HALT_FLAGS.lock() {
+                            flags.remove(device);
+                        }
+                        return;
+                    }
+
+                    let is_transport = e.is_scsi_transport_failure();
+
+                    if !is_transport {
+                        crate::log::device_log(device, &format!("Pass 1 failed: {e}"));
+                        update_state(
+                            device,
+                            RipState {
+                                device: device.to_string(),
+                                status: "error".to_string(),
+                                disc_present: true,
+                                last_error: format!("{e}"),
+                                disc_name: display_name.clone(),
+                                disc_format: disc_format.clone(),
+                                tmdb_title: tmdb_title.clone(),
+                                tmdb_year,
+                                tmdb_poster: tmdb_poster.clone(),
+                                tmdb_overview: tmdb_overview.clone(),
+                                duration: duration.clone(),
+                                codecs: codecs.clone(),
+                                ..Default::default()
+                            },
+                        );
+                        if let Ok(mut flags) = HALT_FLAGS.lock() {
+                            flags.remove(device);
+                        }
+                        return;
+                    }
+
+                    // Transport failure — bridge crashed. Drop stale drive,
+                    // wait for USB re-enumeration, re-open on new path.
+                    crate::log::device_log(
+                        device,
+                        &format!(
+                            "Pass 1 attempt {attempt}: transport failure (bridge crash), waiting 15 s for USB re-enumeration"
+                        ),
+                    );
+                    drop_session(device);
+                    resume = true;
+
+                    std::thread::sleep(std::time::Duration::from_secs(15));
+
+                    // Re-discover the device. The poll loop may have already
+                    // found it; if not, try probing the original path and its
+                    // neighbors (sg numbers shift by ±1 on re-enumeration).
+                    let new_path = rediscover_drive(device, device_path);
+                    let new_path = match new_path {
+                        Some(p) => p,
+                        None => {
+                            crate::log::device_log(
+                                device,
+                                "Pass 1: could not re-discover drive after transport failure",
+                            );
+                            break 'pass1;
+                        }
+                    };
+
+                    let mut drive = match libfreemkv::Drive::open(std::path::Path::new(&new_path)) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            crate::log::device_log(
+                                device,
+                                &format!("Pass 1: cannot re-open drive: {e}"),
+                            );
+                            break 'pass1;
+                        }
+                    };
+                    let _ = drive.wait_ready();
+                    let _ = drive.init();
+                    session.drive = drive;
+                    session.device_path = new_path;
+
+                    crate::log::device_log(
+                        device,
+                        &format!(
+                            "Pass 1 attempt {}/{}: resuming from mapfile",
+                            attempt + 1,
+                            MAX_PASS1_ATTEMPTS
+                        ),
+                    );
+                }
+            }
+        }
+
+        let result = match result {
+            Some(r) => r,
+            None => {
+                // All attempts exhausted or unrecoverable.
                 update_state(
                     device,
                     RipState {
                         device: device.to_string(),
                         status: "error".to_string(),
                         disc_present: true,
-                        last_error: format!("{e}"),
-                        disc_name: display_name,
-                        disc_format,
-                        tmdb_title,
+                        last_error: "Pass 1 failed: transport failure recovery exhausted"
+                            .to_string(),
+                        disc_name: display_name.clone(),
+                        disc_format: disc_format.clone(),
+                        tmdb_title: tmdb_title.clone(),
                         tmdb_year,
-                        tmdb_poster,
-                        tmdb_overview,
-                        duration,
-                        codecs,
+                        tmdb_poster: tmdb_poster.clone(),
+                        tmdb_overview: tmdb_overview.clone(),
+                        duration: duration.clone(),
+                        codecs: codecs.clone(),
                         ..Default::default()
                     },
                 );
