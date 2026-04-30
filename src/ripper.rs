@@ -1669,7 +1669,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         session.probed = true;
     }
 
-    let batch = libfreemkv::disc::detect_max_batch_sectors(device_path);
+    let batch = 1u16;
     let format = disc.content_format;
 
     let output_format = cfg_read.output_format.clone();
@@ -1984,10 +1984,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 break;
             }
 
+            let retry_batch = if resume { 1u16 } else { batch };
             let copy_opts = libfreemkv::disc::CopyOptions {
                 decrypt: false,
                 resume,
-                batch_sectors: Some(batch),
+                batch_sectors: Some(retry_batch),
                 skip_on_error: true,
                 halt: Some(pass1_halt.clone()),
                 progress: Some(&pass1_progress),
