@@ -95,20 +95,14 @@ pub fn run(source: &str, dest: &str, args: &[String]) -> bool {
     let parsed_source = libfreemkv::parse_url(source);
     let parsed_dest = libfreemkv::parse_url(dest);
 
-    // Disc → ISO: not a stream, use Disc::copy()
+    // Disc → ISO or Disc → null: use Disc::copy() (not a stream)
     if matches!(parsed_source, libfreemkv::StreamUrl::Disc { .. })
-        && matches!(parsed_dest, libfreemkv::StreamUrl::Iso { .. })
+        && matches!(
+            parsed_dest,
+            libfreemkv::StreamUrl::Iso { .. } | libfreemkv::StreamUrl::Null
+        )
     {
         disc_to_iso(source, dest, &keydb_path, raw, multipass, &out);
-        return true;
-    }
-
-    // ISO → ISO + --multipass: patch bad ranges from the mapfile
-    if matches!(parsed_source, libfreemkv::StreamUrl::Iso { .. })
-        && matches!(parsed_dest, libfreemkv::StreamUrl::Iso { .. })
-        && multipass
-    {
-        iso_patch(dest, raw, &out);
         return true;
     }
 
@@ -523,6 +517,7 @@ fn pipe(
 
 fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool, multipass: bool, out: &Output) {
     let parsed_source = libfreemkv::parse_url(source);
+    let parsed_dest = libfreemkv::parse_url(dest);
     let device = match &parsed_source {
         libfreemkv::StreamUrl::Disc { device: Some(p) } => Some(p.clone()),
         _ => None,
@@ -570,8 +565,12 @@ fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool,
     };
 
     let disc_name = sanitize_name(disc.meta_title.as_deref().unwrap_or(&disc.volume_id));
-    let iso_path = match libfreemkv::parse_url(dest) {
-        libfreemkv::StreamUrl::Iso { ref path } => path.clone(),
+    let (iso_path, is_null) = match &parsed_dest {
+        libfreemkv::StreamUrl::Iso { path } => (path.clone(), false),
+        libfreemkv::StreamUrl::Null => {
+            let p = std::path::PathBuf::from("/dev/null");
+            (p, true)
+        }
         _ => unreachable!(),
     };
 
@@ -589,10 +588,12 @@ fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool,
             ],
         ),
     );
-    out.raw(
-        Normal,
-        &strings::fmt("rip.output", &[("path", &iso_path.display().to_string())]),
-    );
+    if !is_null {
+        out.raw(
+            Normal,
+            &strings::fmt("rip.output", &[("path", &iso_path.display().to_string())]),
+        );
+    }
     out.blank(Normal);
 
     drive.lock_tray();
@@ -606,6 +607,7 @@ fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool,
         last_update: &'a std::cell::Cell<std::time::Instant>,
         last_work_done: &'a std::cell::Cell<Option<u64>>,
         last_speed_time: &'a std::cell::Cell<std::time::Instant>,
+        bytes_per_sec: f64,
     }
     impl libfreemkv::progress::Progress for CliProgress<'_> {
         fn report(&self, p: &libfreemkv::progress::PassProgress) {
@@ -640,26 +642,28 @@ fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool,
                 p.bytes_bad_total,
                 p.bytes_total_disc,
                 inst_speed,
+                self.bytes_per_sec,
             );
         }
     }
+    let bytes_per_sec = disc.titles.first().map(|t| {
+        if t.duration_secs > 0.0 {
+            t.size_bytes as f64 / t.duration_secs
+        } else {
+            0.0
+        }
+    }).unwrap_or(0.0);
     let progress = CliProgress {
         out,
         last_update: &last_update,
         last_work_done: &last_work_done,
         last_speed_time: &last_speed_time,
+        bytes_per_sec,
     };
 
-    let batch = if multipass {
-        libfreemkv::disc::ecc_sectors(disc.format)
-    } else {
-        libfreemkv::disc::detect_max_batch_sectors(drive.device_path())
-    };
     let copy_opts = libfreemkv::disc::CopyOptions {
         decrypt: !raw,
-        resume: true,
-        batch_sectors: Some(batch),
-        skip_on_error: multipass,
+        multipass,
         halt: None,
         progress: Some(&progress),
     };
@@ -706,154 +710,6 @@ fn disc_to_iso(source: &str, dest: &str, keydb_path: &Option<String>, raw: bool,
     }
 
     drive.unlock_tray();
-}
-
-// ── ISO patch (retry pass) ──────────────────────────────────────────────────
-
-fn iso_patch(dest: &str, raw: bool, out: &Output) {
-    let iso_path = match libfreemkv::parse_url(dest) {
-        libfreemkv::StreamUrl::Iso { ref path } => path.clone(),
-        _ => unreachable!(),
-    };
-
-    let mapfile_path = libfreemkv::disc::mapfile_path_for(&iso_path);
-    let map = match libfreemkv::disc::mapfile::Mapfile::load(&mapfile_path) {
-        Ok(m) => m,
-        Err(e) => {
-            out.raw(Normal, &fmt_err(&e));
-            return;
-        }
-    };
-    let stats = map.stats();
-    let bad_bytes = stats.bytes_pending + stats.bytes_unreadable;
-    if bad_bytes == 0 {
-        out.raw(Normal, &strings::get("rip.nothing_to_patch"));
-        return;
-    }
-
-    out.raw(
-        Normal,
-        &strings::fmt(
-            "rip.patch_start",
-            &[
-                ("good", &format!("{:.2}", stats.bytes_good as f64 / 1_073_741_824.0)),
-                ("unreadable", &format!("{:.1}", stats.bytes_unreadable as f64 / 1_048_576.0)),
-                ("pending", &format!("{:.1}", stats.bytes_pending as f64 / 1_048_576.0)),
-            ],
-        ),
-    );
-
-    let start = std::time::Instant::now();
-    let last_update = std::cell::Cell::new(start);
-    let last_work_done = std::cell::Cell::new(None::<u64>);
-    let last_speed_time = std::cell::Cell::new(start);
-
-    struct CliProgress<'a> {
-        out: &'a Output,
-        last_update: &'a std::cell::Cell<std::time::Instant>,
-        last_work_done: &'a std::cell::Cell<Option<u64>>,
-        last_speed_time: &'a std::cell::Cell<std::time::Instant>,
-    }
-    impl libfreemkv::progress::Progress for CliProgress<'_> {
-        fn report(&self, p: &libfreemkv::progress::PassProgress) {
-            if self.out.is_quiet() {
-                return;
-            }
-            let now = std::time::Instant::now();
-            if now.duration_since(self.last_update.get()).as_secs_f64() < 0.5 {
-                return;
-            }
-            self.last_update.set(now);
-
-            let inst_speed = match self.last_work_done.get() {
-                Some(prev) => {
-                    let prev_time = self.last_speed_time.get();
-                    let dt = now.duration_since(prev_time).as_secs_f64();
-                    if dt > 0.0 {
-                        (p.work_done.saturating_sub(prev) as f64 / 1_048_576.0) / dt
-                    } else {
-                        0.0
-                    }
-                }
-                None => 0.0,
-            };
-            self.last_work_done.set(Some(p.work_done));
-            self.last_speed_time.set(now);
-
-            print_disc_progress(
-                p.work_done,
-                p.work_total,
-                p.bytes_good_total,
-                p.bytes_bad_total,
-                p.bytes_total_disc,
-                inst_speed,
-            );
-        }
-    }
-    let progress = CliProgress {
-        out,
-        last_update: &last_update,
-        last_work_done: &last_work_done,
-        last_speed_time: &last_speed_time,
-    };
-
-    let mut reader = match libfreemkv::find_drive() {
-        Some(d) => d,
-        None => {
-            out.raw(Normal, &strings::get("error.no_drive"));
-            return;
-        }
-    };
-
-    let scan_opts = libfreemkv::ScanOptions::default();
-    let disc = match libfreemkv::Disc::scan(&mut reader, &scan_opts) {
-        Ok(d) => d,
-        Err(e) => {
-            out.raw(Normal, &fmt_err(&e));
-            return;
-        }
-    };
-
-    let patch_opts = libfreemkv::disc::PatchOptions {
-        decrypt: !raw,
-        block_sectors: Some(1),
-        full_recovery: true,
-        reverse: false,
-        wedged_threshold: 50,
-        halt: None,
-        progress: Some(&progress),
-    };
-
-    match disc.patch(&mut reader, &iso_path, &patch_opts) {
-        Ok(pr) => {
-            if !out.is_quiet() {
-                eprint!("\r                                                                    \r");
-            }
-            let elapsed = start.elapsed().as_secs_f64();
-            let recovered = pr.bytes_recovered_this_pass;
-            let speed = if elapsed > 0.0 {
-                recovered as f64 / 1_048_576.0 / elapsed
-            } else {
-                0.0
-            };
-            out.raw(
-                Normal,
-                &strings::fmt(
-                    "rip.patch_done",
-                    &[
-                        ("recovered", &format!("{:.1}", recovered as f64 / 1_048_576.0)),
-                        ("unreadable", &format!("{:.1}", pr.bytes_unreadable as f64 / 1_048_576.0)),
-                        ("pending", &format!("{:.1}", pr.bytes_pending as f64 / 1_048_576.0)),
-                        ("time", &format!("{elapsed:.0}")),
-                        ("speed", &format!("{speed:.0}")),
-                    ],
-                ),
-            );
-        }
-        Err(e) => {
-            out.raw(Normal, &fmt_err(&e));
-        }
-    }
 }
 
 // ── Title scanning ──────────────────────────────────────────────────────────
@@ -942,6 +798,7 @@ fn print_disc_progress(
     bytes_bad: u64,
     bytes_disc: u64,
     inst_speed_mbps: f64,
+    bytes_per_sec: f64,
 ) {
     if work_total == 0 || bytes_disc == 0 {
         return;
@@ -949,24 +806,32 @@ fn print_disc_progress(
     let pct = (work_done as f64 / work_total as f64 * 100.0).min(100.0);
     let gb_done = work_done as f64 / 1_073_741_824.0;
     let gb_total = work_total as f64 / 1_073_741_824.0;
-    let processed = bytes_good.saturating_add(bytes_bad);
-    let readable_pct = if processed > 0 {
-        bytes_good as f64 / processed as f64 * 100.0
-    } else {
-        100.0
-    };
     let eta = if inst_speed_mbps > 0.01 {
         let s = (work_total - work_done) as f64 / 1_048_576.0 / inst_speed_mbps;
         fmt_eta(s)
     } else {
         "?:??".into()
     };
+    let unreadable = if bytes_bad > 0 && bytes_per_sec > 0.0 {
+        let secs = bytes_bad as f64 / bytes_per_sec;
+        if secs >= 3600.0 {
+            format!("{:.1}h unreadable", secs / 3600.0)
+        } else if secs >= 60.0 {
+            format!("{:.0}m unreadable", secs / 60.0)
+        } else if secs >= 1.0 {
+            format!("{:.0}s unreadable", secs)
+        } else {
+            format!("{:.0}ms unreadable", secs * 1000.0)
+        }
+    } else {
+        "0ms unreadable".into()
+    };
     eprint!(
-        "\r  {:.1}/{:.1} GB ({:.1}%)  {}  ETA {}    {:.1}% readable    ",
+        "\r  {:.1}/{:.1} GB ({:.1}%)  {}  ETA {}    {}    ",
         gb_done, gb_total, pct,
         fmt_speed(inst_speed_mbps),
         eta,
-        readable_pct,
+        unreadable,
     );
     let _ = std::io::stderr().flush();
 }
