@@ -1974,7 +1974,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
         const MAX_PASS1_ATTEMPTS: u32 = 10;
         let mut attempt = 0;
-        let mut resume = false;
         let mut result = None;
 
         'pass1: loop {
@@ -1984,12 +1983,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 break;
             }
 
-            let retry_batch = if resume { 1u16 } else { batch };
             let copy_opts = libfreemkv::disc::CopyOptions {
                 decrypt: false,
-                resume,
-                batch_sectors: Some(retry_batch),
-                skip_on_error: true,
+                multipass: true,
                 halt: Some(pass1_halt.clone()),
                 progress: Some(&pass1_progress),
             };
@@ -2045,7 +2041,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         ),
                     );
                     drop_session(device);
-                    resume = true;
 
                     std::thread::sleep(std::time::Duration::from_secs(15));
 
@@ -2132,16 +2127,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             ),
         );
 
-        // Track cross-pass state as raw fields, since CopyResult and
-        // PatchResult are distinct types (same semantics, different structs).
+        // Track cross-pass state from CopyResult.
         let mut bytes_good = result.bytes_good;
         let mut bytes_unreadable = result.bytes_unreadable;
         let mut bytes_pending = result.bytes_pending;
 
-        // Retry passes: Disc::patch with per-pass block-size taper and
-        // alternating direction (RIP_DESIGN.md §15). Pass 2 = reverse + half
-        // batch, then alternates F/R while halving block, last pass = 1
-        // sector. Each pass gets its own wallclock cap watcher; cap-fire
+        // Retry passes: Disc::copy with multipass=true re-reads only bad
+        // ranges (patch) sector-by-sector with full drive-level recovery.
+        // Each pass gets its own wallclock cap watcher; cap-fire
         // marks the rip as failed.
         let max_retries = cfg_read.max_retries;
         let mut pass_2_settled = false;
@@ -2169,23 +2162,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 }
             }
 
-            // Per-pass block_sectors + direction.
-            //
-            // 0.13.22: All retry passes use bpt=1. Pass 1's hysteresis
-            // already isolated every NonTrimmed range to a single sector
-            // (one bad sector at a time, surrounded by Finished). Disc::patch
-            // caps `block_sectors` to `range.size`, so any taper > 1 is a
-            // no-op — every retry effectively runs at bpt=1 anyway. We drop
-            // the cosmetic taper and just alternate direction across passes
-            // (drive's read state differs forward vs reverse + 30 s settle
-            // between passes is the actual recovery mechanism, not block
-            // size).
-            let block_sectors_pass: u16 = 1;
-            let reverse_pass = (retry_n % 2) == 1;
-            let dir_label = if reverse_pass { "reverse" } else { "forward" };
             crate::log::device_log(
                 device,
-                &format!("Pass {pass}/{total_passes}: retrying bad ranges ({dir_label}, bpt=1)"),
+                &format!("Pass {pass}/{total_passes}: retrying bad ranges (bpt=1)"),
             );
             set_pass_progress(
                 device,
@@ -2238,28 +2217,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 max_pass_secs,
             );
 
-            // Wedged-drive early-exit threshold. After 50 consecutive
-            // failures with zero successes, we conclude the drive is
-            // wedged on the bad zone for THIS pass and bail. Saves the
-            // wallclock cap for productive grinding; the next pass (with
-            // smaller block_sectors and alternated direction) may still
-            // recover.
-            const WEDGED_THRESHOLD: u64 = 50;
-
-            let patch_opts = libfreemkv::disc::PatchOptions {
+            let copy_opts = libfreemkv::disc::CopyOptions {
                 decrypt: false,
-                block_sectors: Some(block_sectors_pass),
-                full_recovery: true,
-                reverse: reverse_pass,
-                wedged_threshold: WEDGED_THRESHOLD,
+                multipass: true,
                 halt: Some(pass_halt.clone()),
                 progress: Some(&patch_progress),
             };
-            let prev_good = bytes_good;
-            let pr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {
+            let cr = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
                 Ok(r) => r,
                 Err(e) => {
-                    // If user-halt is set, this is a clean stop; exit.
                     if user_halt.load(Ordering::Relaxed) {
                         crate::log::device_log(
                             device,
@@ -2271,13 +2237,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     break;
                 }
             };
-            bytes_good = pr.bytes_good;
-            bytes_unreadable = pr.bytes_unreadable;
-            bytes_pending = pr.bytes_pending;
-            let recovered = bytes_good.saturating_sub(prev_good);
-            let exit_str = if pr.wedged_exit {
-                " (drive wedged — abandoned this pass)"
-            } else if pr.halted {
+            bytes_good = cr.bytes_good;
+            bytes_unreadable = cr.bytes_unreadable;
+            bytes_pending = cr.bytes_pending;
+            let recovered = cr.recovered_this_pass;
+            let exit_str = if cr.halted {
                 " (halt)"
             } else {
                 ""
@@ -2285,13 +2249,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             crate::log::device_log(
                 device,
                 &format!(
-                    "Pass {pass} done: recovered {:.2} MB; {:.2} MB still unreadable; \
-                     blocks attempted={} read_ok={} read_failed={}{exit_str}",
+                    "Pass {pass} done: recovered {:.2} MB; {:.2} MB still unreadable{exit_str}",
                     recovered as f64 / 1_048_576.0,
                     bytes_unreadable as f64 / 1_048_576.0,
-                    pr.blocks_attempted,
-                    pr.blocks_read_ok,
-                    pr.blocks_read_failed,
                 ),
             );
             // Drop this pass's watcher before next iteration.
@@ -2301,10 +2261,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             if user_halt.load(Ordering::Relaxed) || cap_fired_any.load(Ordering::Relaxed) {
                 break;
             }
-            // If THIS pass made no progress AND wasn't wedged-aborted, no
-            // future pass with the same drive state will help. Give up
-            // retries early so we still mux on what we have.
-            if recovered == 0 && !pr.wedged_exit {
+            // If THIS pass made no progress, no future pass with the same
+            // drive state will help. Give up retries early so we still
+            // mux on what we have.
+            if recovered == 0 {
                 crate::log::device_log(device, "No progress on last pass — stopping retries.");
                 break;
             }
