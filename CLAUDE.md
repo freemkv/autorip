@@ -14,8 +14,21 @@ All user-facing text comes from `strings.rs` (locale JSON files). Never hardcode
 - **CLI is dumb.** All logic lives in libfreemkv. CLI only handles I/O, display, and flag parsing.
 - **PES pipeline.** `pipe()` uses `input()` / `output()` — PES frames flow through.
 - **disc.copy() for ISO.** `disc_to_iso()` calls `Disc::copy()`, not a stream.
+- **Multipass: one invocation = one pass.** `--multipass` enables mapfile
+  read/write. The caller runs the CLI N times for N passes:
+  ```
+  freemkv disc:// iso://out.iso --multipass        # Pass 1: sweep
+  freemkv iso://out.iso iso://out.iso --multipass   # Pass 2+: patch
+  freemkv iso://out.iso mkv://Movie.mkv             # Mux
+  ```
+  No retry loop in the CLI or the lib. Autorip orchestrates its own loop.
 - **No process::exit in pipe.** Functions return bool/Result. Only `main()` exits.
-- **Progress is a CLI concern.** Library returns `DiscTitle.size_bytes`. CLI calculates and displays progress.
+- **Progress is a CLI concern.** Library emits `PassProgress` via trait. CLI formats display.
+- **Progress display**: `GB/GB (%)  speed  ETA  % readable` — smart unit scaling (B/s, KB/s, MB/s, stalled), instantaneous speed (windowed), and `% readable` = good/(good+bad).
+
+## Tracing
+
+Set `RUST_LOG=warn` (or `info`, `debug`, `trace`) to enable structured logging. The CLI initializes `tracing_subscriber::fmt` only when `RUST_LOG` is set.
 
 ## Public repo rules
 
