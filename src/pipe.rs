@@ -805,34 +805,21 @@ fn print_disc_progress(
     if bytes_disc == 0 {
         return;
     }
-    let (gb_done, gb_total, pct) = match kind {
+    let gb_done = match kind {
         libfreemkv::progress::PassKind::Sweep | libfreemkv::progress::PassKind::Mux => {
-            let gb = work_done as f64 / 1_073_741_824.0;
-            let total = work_total as f64 / 1_073_741_824.0;
-            let p = (work_done as f64 / work_total as f64 * 100.0).min(100.0);
-            (gb, total, p)
+            work_done as f64 / 1_073_741_824.0
         }
-        _ => {
-            let gb = bytes_good as f64 / 1_073_741_824.0;
-            let total = bytes_disc as f64 / 1_073_741_824.0;
-            let p = if work_total > 0 {
-                work_done as f64 / work_total as f64 * 100.0
-            } else {
-                0.0
-            };
-            (gb, total, p)
-        }
+        _ => bytes_good as f64 / 1_073_741_824.0,
     };
-    let eta = if inst_speed_mbps > 0.01 {
-        let remaining = match kind {
-            libfreemkv::progress::PassKind::Sweep | libfreemkv::progress::PassKind::Mux => {
-                work_total.saturating_sub(work_done) as f64 / 1_048_576.0
-            }
-            _ => {
-                work_total.saturating_sub(work_done) as f64 / 1_048_576.0
-            }
-        };
-        fmt_eta(remaining / inst_speed_mbps)
+    let gb_total = bytes_disc as f64 / 1_073_741_824.0;
+    let pct = if work_total > 0 {
+        (work_done as f64 / work_total as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let eta = if inst_speed_mbps > 0.01 && work_total > work_done {
+        let remaining_mb = (work_total - work_done) as f64 / 1_048_576.0;
+        fmt_eta(remaining_mb / inst_speed_mbps)
     } else {
         "?:??".into()
     };
