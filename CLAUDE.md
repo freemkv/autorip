@@ -15,12 +15,14 @@ All user-facing text comes from `strings.rs` (locale JSON files). Never hardcode
 - **PES pipeline.** `pipe()` uses `input()` / `output()` — PES frames flow through.
 - **disc.copy() for ISO.** `disc_to_iso()` calls `Disc::copy()`, not a stream.
 - **Multipass: one invocation = one pass.** `--multipass` enables mapfile
-  read/write. The caller runs the CLI N times for N passes:
+  read/write. Same command for all passes — library auto-detects from mapfile:
   ```
-  freemkv disc:// iso://out.iso --multipass        # Pass 1: sweep
-  freemkv iso://out.iso iso://out.iso --multipass   # Pass 2+: patch
-  freemkv iso://out.iso mkv://Movie.mkv             # Mux
+  freemkv disc:// iso://out.iso --multipass        # Pass 1: sweep (no mapfile)
+  freemkv disc:// iso://out.iso --multipass        # Pass 2+: patch (mapfile with bad ranges)
+  freemkv disc:// iso://out.iso --multipass        # Done (mapfile clean → exit)
+  freemkv iso://out.iso mkv://Movie.mkv            # Mux
   ```
+  Also supports `disc:// null:// --multipass` for algorithm testing without disk space.
   No retry loop in the CLI or the lib. Autorip orchestrates its own loop.
 - **No process::exit in pipe.** Functions return bool/Result. Only `main()` exits.
 - **Progress is a CLI concern.** Library emits `PassProgress` via trait. CLI formats display.
