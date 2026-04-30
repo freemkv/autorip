@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.16.0 (2026-04-30)
+
+### Bump libfreemkv to 0.16.0
+
+- IOKit registry-based drive enumeration (no more unmount blast on macOS).
+- BSD name → IOBDServices matching for multi-drive systems.
+- Reverse patch default (hits good data at gap tails first).
+
+## 0.15.0 (2026-04-30)
+
+### Multipass autorip via Disc::copy()
+
+- Autorip passes 1 + retries both use `Disc::copy()` with `multipass: true`.
+- Library auto-detects sweep vs patch from mapfile state.
+
+## 0.14.0 (2026-04-30)
+
+### Bump libfreemkv to 0.14.0
+
+- Damage-jump algorithm, bridge degradation detection.
+
 ## 0.13.43 (2026-04-29)
 
 ### Pass 1 transport-failure recovery loop
