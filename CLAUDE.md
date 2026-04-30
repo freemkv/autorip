@@ -26,7 +26,11 @@ All user-facing text comes from `strings.rs` (locale JSON files). Never hardcode
   No retry loop in the CLI or the lib. Autorip orchestrates its own loop.
 - **No process::exit in pipe.** Functions return bool/Result. Only `main()` exits.
 - **Progress is a CLI concern.** Library emits `PassProgress` via trait. CLI formats display.
-- **Progress display**: `GB/GB (%)  speed  ETA  % readable` — smart unit scaling (B/s, KB/s, MB/s, stalled), instantaneous speed (windowed), and `% readable` = good/(good+bad).
+- **Progress display**: `GB/GB (%)  speed  ETA  Xs unreadable` — unified for all pass types:
+  - **Sweep**: `work_done/disc_total` as GB, `work_done/work_total` as %. Positional progress.
+  - **Patch/Trim/Scrape**: `bytes_good/disc_total` as GB (grows when sectors recovered), `work_done/work_total` as % (always moves, even if nothing recovered). `Xs unreadable` = `bytes_bad / bytes_per_sec` (declines as data is recovered).
+  - Smart unit scaling for speed (B/s, KB/s, MB/s, stalled) and unreadable time (ms, s, m, h).
+  - Pass progress (%) is independent of disc health (GB/unreadable). % always advances as we work through bad ranges.
 
 ## Tracing
 
