@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.16.1 (2026-04-30)
+
+### Unified progress display for sweep and patch passes
+
+- Patch passes show `bytes_good/disc_total` as GB (grows when sectors recovered), pass `%` uses `work_done/work_total` (always moves), `Xs unreadable` declines as data recovered. Same UI for all pass types.
+
+## 0.16.0 (2026-04-30)
+
+### Bump libfreemkv to 0.16.0
+
+- IOKit registry-based drive enumeration, BSD name matching, reverse patch default.
+
+## 0.15.0 (2026-04-30)
+
+### Multipass CLI surface
+
+- `--multipass` flag enables mapfile-based multi-pass rip.
+- `disc:// null:// --multipass` for algorithm testing without disk space.
+- Same command for all passes: library auto-detects from mapfile state.
+
+## 0.14.0 (2026-04-30)
+
+### Bump libfreemkv to 0.14.0
+
+- Damage-jump algorithm, bridge degradation detection, ecc_sectors().
+
 ## 0.13.43 (2026-04-29)
 
 ### Pass 1 transport-failure recovery loop
