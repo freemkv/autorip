@@ -25,6 +25,7 @@ jobs:
   build:
     needs: verify
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
