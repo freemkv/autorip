@@ -2241,11 +2241,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             bytes_unreadable = cr.bytes_unreadable;
             bytes_pending = cr.bytes_pending;
             let recovered = cr.recovered_this_pass;
-            let exit_str = if cr.halted {
-                " (halt)"
-            } else {
-                ""
-            };
+            let exit_str = if cr.halted { " (halt)" } else { "" };
             crate::log::device_log(
                 device,
                 &format!(
