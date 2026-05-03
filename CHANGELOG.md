@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.16.3 (2026-04-30)
+
+### i18n damage display
+
+- Web UI shows "in movie" instead of "of video" for consistency with CLI
+- Damage display aligned with CLI: "Xs lost (Y in movie)"
+
+## 0.16.2 (2026-04-30)
+
+### Bump libfreemkv to 0.16.2
+
 ## 0.16.0 (2026-04-30)
 
 ### Bump libfreemkv to 0.16.0
