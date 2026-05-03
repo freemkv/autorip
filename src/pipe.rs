@@ -615,34 +615,34 @@ fn disc_to_iso(
         last_work_done: &'a std::cell::Cell<Option<u64>>,
         last_speed_time: &'a std::cell::Cell<std::time::Instant>,
         bytes_per_sec: f64,
+        halt: &'a std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
     impl libfreemkv::progress::Progress for CliProgress<'_> {
-        fn report(&self, p: &libfreemkv::progress::PassProgress) {
-            if self.out.is_quiet() {
-                return;
-            }
-            let now = std::time::Instant::now();
-            if now.duration_since(self.last_update.get()).as_secs_f64() < 0.5 {
-                return;
-            }
-            self.last_update.set(now);
+        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+            if !self.out.is_quiet() {
+                let now = std::time::Instant::now();
+                if now.duration_since(self.last_update.get()).as_secs_f64() >= 0.5 {
+                    self.last_update.set(now);
 
-            let inst_speed = match self.last_work_done.get() {
-                Some(prev) => {
-                    let prev_time = self.last_speed_time.get();
-                    let dt = now.duration_since(prev_time).as_secs_f64();
-                    if dt > 0.0 {
-                        (p.work_done.saturating_sub(prev) as f64 / 1_048_576.0) / dt
-                    } else {
-                        0.0
-                    }
+                    let inst_speed = match self.last_work_done.get() {
+                        Some(prev) => {
+                            let prev_time = self.last_speed_time.get();
+                            let dt = now.duration_since(prev_time).as_secs_f64();
+                            if dt > 0.0 {
+                                (p.work_done.saturating_sub(prev) as f64 / 1_048_576.0) / dt
+                            } else {
+                                0.0
+                            }
+                        }
+                        None => 0.0,
+                    };
+                    self.last_work_done.set(Some(p.work_done));
+                    self.last_speed_time.set(now);
+
+                    print_disc_progress(p, inst_speed, self.bytes_per_sec);
                 }
-                None => 0.0,
-            };
-            self.last_work_done.set(Some(p.work_done));
-            self.last_speed_time.set(now);
-
-            print_disc_progress(p, inst_speed, self.bytes_per_sec);
+            }
+            self.halt.load(Ordering::Relaxed) == 0
         }
     }
     let bytes_per_sec = disc
@@ -662,6 +662,7 @@ fn disc_to_iso(
         last_work_done: &last_work_done,
         last_speed_time: &last_speed_time,
         bytes_per_sec,
+        halt: &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     let copy_opts = libfreemkv::disc::CopyOptions {
@@ -694,6 +695,30 @@ fn disc_to_iso(
                 let gb_good = r.bytes_good as f64 / 1_073_741_824.0;
                 let mb_bad = r.bytes_unreadable as f64 / 1_048_576.0;
                 let mb_pending = r.bytes_pending as f64 / 1_048_576.0;
+                let mapfile_path = disc.mapfile_for(&iso_path);
+                let main_title_bad = disc
+                    .titles
+                    .first()
+                    .map(|t| disc.bytes_bad_in_title(&mapfile_path, t))
+                    .unwrap_or(0);
+                let total_bad = r.bytes_unreadable + r.bytes_pending;
+                let disc_dur = disc.titles.first().map(|t| t.duration_secs).unwrap_or(0.0);
+                let disc_size = disc.capacity_bytes;
+                let lost_secs = if total_bad > 0 && disc_size > 0 && disc_dur > 0.0 {
+                    total_bad as f64 / disc_size as f64 * disc_dur
+                } else {
+                    0.0
+                };
+                let main_lost_secs = if main_title_bad > 0 && disc_size > 0 && disc_dur > 0.0 {
+                    let main_size = disc
+                        .titles
+                        .first()
+                        .map(|t| t.size_bytes)
+                        .unwrap_or(disc_size);
+                    main_title_bad as f64 / main_size as f64 * disc_dur
+                } else {
+                    0.0
+                };
                 out.raw(
                     Normal,
                     &strings::fmt(
@@ -705,6 +730,29 @@ fn disc_to_iso(
                         ],
                     ),
                 );
+                if lost_secs > 0.0 {
+                    let lost_str = fmt_damage_time(lost_secs);
+                    if main_lost_secs > 0.0 && main_lost_secs < lost_secs * 0.99 {
+                        let main_str = fmt_damage_time(main_lost_secs);
+                        out.raw(
+                            Normal,
+                            &strings::fmt(
+                                "rip.damage_lost",
+                                &[("time", &lost_str), ("movie_time", &main_str)],
+                            ),
+                        );
+                    } else if main_lost_secs > 0.0 {
+                        out.raw(
+                            Normal,
+                            &strings::fmt("rip.damage_lost_movie", &[("time", &lost_str)]),
+                        );
+                    } else {
+                        out.raw(
+                            Normal,
+                            &strings::fmt("rip.damage_lost_simple", &[("time", &lost_str)]),
+                        );
+                    }
+                }
             }
         }
         Err(e) => {
@@ -779,6 +827,20 @@ fn fmt_eta(secs: f64) -> String {
     }
 }
 
+fn fmt_damage_time(secs: f64) -> String {
+    if secs >= 3600.0 {
+        format!("{:.1}h", secs / 3600.0)
+    } else if secs >= 60.0 {
+        format!("{:.0}m", secs / 60.0)
+    } else if secs >= 1.0 {
+        format!("{:.0}s", secs)
+    } else if secs >= 0.01 {
+        format!("{:.2}s", secs)
+    } else {
+        format!("{:.0}ms", secs * 1000.0)
+    }
+}
+
 fn print_disc_progress(
     p: &libfreemkv::progress::PassProgress,
     inst_speed_mbps: f64,
@@ -788,17 +850,28 @@ fn print_disc_progress(
     if bytes_disc == 0 {
         return;
     }
+    // For Patch modes (Trim/Scrape), show work_done/work_total percentage.
+    // bytes_good_total doesn't advance until sectors are recovered, leaving
+    // progress stuck at 0% even though patch is working through bad ranges.
     let gb_done = match p.kind {
         libfreemkv::progress::PassKind::Sweep | libfreemkv::progress::PassKind::Mux => {
             p.work_done as f64 / 1_073_741_824.0
         }
+        libfreemkv::progress::PassKind::Trim { .. } | libfreemkv::progress::PassKind::Scrape { .. } => {
+            // Show progress through bad ranges, not just recovered data
+            let pct = p.work_pct();
+            (pct / 100.0) * (bytes_disc as f64 / 1_073_741_824.0)
+        }
         _ => p.bytes_good_total as f64 / 1_073_741_824.0,
     };
     let gb_total = bytes_disc as f64 / 1_073_741_824.0;
-    let pct = if p.work_total > 0 {
-        (p.work_done as f64 / p.work_total as f64 * 100.0).min(100.0)
-    } else {
-        0.0
+    // For patch modes, show work percentage (progress through bad ranges)
+    // instead of good percentage (which stays at 0% until recovery succeeds)
+    let pct = match p.kind {
+        libfreemkv::progress::PassKind::Trim { .. } | libfreemkv::progress::PassKind::Scrape { .. } => {
+            p.work_pct()
+        }
+        _ => (p.work_done as f64 / p.work_total as f64 * 100.0).min(100.0),
     };
     let eta = if inst_speed_mbps > 0.01 && p.work_total > p.work_done {
         let remaining_mb = (p.work_total - p.work_done) as f64 / 1_048_576.0;
@@ -824,34 +897,15 @@ fn print_disc_progress(
         None
     };
 
-    fn fmt_damage_time(secs: f64) -> String {
-        if secs >= 3600.0 {
-            format!("{:.1}h", secs / 3600.0)
-        } else if secs >= 60.0 {
-            format!("{:.0}m", secs / 60.0)
-        } else if secs >= 1.0 {
-            format!("{:.0}s", secs)
-        } else if secs >= 0.01 {
-            format!("{:.2}s", secs)
-        } else {
-            format!("{:.0}ms", secs * 1000.0)
-        }
-    }
-
     let damage = if bytes_worst_case > 0 {
         let disc_str = fmt_damage_time(disc_damage_secs);
-        if let Some(title_secs) = title_damage_secs {
-            if title_secs < disc_damage_secs * 0.99 {
-                let title_str = fmt_damage_time(title_secs);
-                strings::fmt(
-                    "rip.damage_lost",
-                    &[("time", &disc_str), ("movie_time", &title_str)],
-                )
-            } else {
+        match title_damage_secs {
+            Some(ms) if ms > 0.0 && ms < disc_damage_secs * 0.99 => {
+                strings::fmt("rip.damage_lost", &[("time", &disc_str), ("movie_time", &fmt_damage_time(ms))])
+            }
+            Some(_) | None => {
                 strings::fmt("rip.damage_lost_movie", &[("time", &disc_str)])
             }
-        } else {
-            strings::fmt("rip.damage_lost_simple", &[("time", &disc_str)])
         }
     } else {
         strings::get("rip.damage_none")

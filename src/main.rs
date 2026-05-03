@@ -265,30 +265,28 @@ fn verify_cmd(args: &[String]) {
         &mut drive,
         title,
         batch,
-        Some(Box::new(move |done, total, status| {
+        Some(&|p: &libfreemkv::progress::PassProgress| {
             let mut lp = last_print.lock().unwrap();
-            if lp.elapsed().as_secs_f64() >= 1.0 || done == total {
-                let pct = if total > 0 { done * 100 / total } else { 0 };
+            if lp.elapsed().as_secs_f64() >= 1.0 || p.work_done == p.work_total {
+                let pct = if p.work_total > 0 {
+                    p.work_done * 100 / p.work_total
+                } else {
+                    0
+                };
                 let elapsed = start.elapsed().as_secs_f64();
                 let speed = if elapsed > 0.0 {
-                    done as f64 * 2048.0 / (1024.0 * 1024.0) / elapsed
+                    p.bytes_good_total as f64 / (1024.0 * 1024.0) / elapsed
                 } else {
                     0.0
                 };
-                let marker = match status {
-                    libfreemkv::verify::SectorStatus::Good => "",
-                    libfreemkv::verify::SectorStatus::Slow => " [SLOW]",
-                    libfreemkv::verify::SectorStatus::Recovered => " [RECOVERED]",
-                    libfreemkv::verify::SectorStatus::Bad => " [BAD]",
-                };
                 eprint!(
-                    "\r  {}% · {:.1} MB/s · {} / {}{}",
-                    pct, speed, done, total, marker
+                    "\r  {}% · {:.1} MB/s · {} / {} sectors",
+                    pct, speed, p.work_done, p.work_total
                 );
                 *lp = std::time::Instant::now();
             }
             true // continue
-        })),
+        }),
     );
     eprintln!(); // newline after progress
 
