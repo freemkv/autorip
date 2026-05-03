@@ -216,6 +216,11 @@ pub struct RipState {
     /// lost to this rip. Companion to [`Self::bytes_lost`]. UI's red
     /// "no chance" pill renders this.
     pub total_lost_ms: f64,
+    /// Sum of `Unreadable` ranges' durations that fall within the
+    /// main-feature title's extents. Mirrors `total_lost_ms` but
+    /// scoped to the longest title only — enables the UI to render
+    /// "(Xs in main movie)".
+    pub main_lost_ms: f64,
     /// Sum of `Pending` ranges' durations — the video time at risk
     /// pending Pass 2-N retry. Companion to [`Self::bytes_maybe`]. UI's
     /// yellow "maybe" pill renders this. Drops as retry passes promote
@@ -281,6 +286,7 @@ impl Default for RipState {
             num_bad_ranges: 0,
             bad_ranges_truncated: 0,
             total_lost_ms: 0.0,
+            main_lost_ms: 0.0,
             total_maybe_ms: 0.0,
             largest_gap_ms: 0.0,
             last_error: String::new(),
@@ -957,6 +963,19 @@ fn push_pass_state(
     let stats = map.stats();
     let (ranges, total_count, truncated, total_lost_ms, largest_gap_ms) =
         build_bad_ranges(&map, title, bps);
+    // Main-title-only lost time: intersect Unreadable ranges with the
+    // main feature's extents, then convert to ms using the same bps.
+    let main_title_bad = map.ranges_with(&[
+        libfreemkv::disc::mapfile::SectorStatus::NonTrimmed,
+        libfreemkv::disc::mapfile::SectorStatus::Unreadable,
+        libfreemkv::disc::mapfile::SectorStatus::NonScraped,
+    ]);
+    let main_title_bad_bytes = libfreemkv::disc::bytes_bad_in_title(title, &main_title_bad);
+    let main_lost_ms = if bps > 0.0 {
+        main_title_bad_bytes as f64 * 1000.0 / bps
+    } else {
+        0.0
+    };
     // 0.13.23/0.13.24 three-bucket split (mapfile stats):
     //
     //   GOOD  (bytes_good)  = Finished — terminal success
@@ -1105,6 +1124,7 @@ fn push_pass_state(
             num_bad_ranges: total_count,
             bad_ranges_truncated: truncated,
             total_lost_ms,
+            main_lost_ms,
             total_maybe_ms,
             largest_gap_ms,
             preferred_batch: ctx.batch,
@@ -1937,13 +1957,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let pass1_ctx = &pass_ctx;
         let pass1_title = &title_for_progress;
         let pass1_map = std::path::Path::new(&mapfile_path_str);
-        let pass1_progress = |p: &libfreemkv::progress::PassProgress| {
+        let pass1_progress = |p: &libfreemkv::progress::PassProgress| -> bool {
             // Stash work_done for push_pass_state to compute pass progress.
             pass1_state.borrow_mut().last_work_done = p.work_done;
             pass1_state.borrow_mut().last_work_total = p.work_total;
             // Throttle: only re-read mapfile + push state every 1.5s.
             if pass1_state.borrow().last_update.elapsed().as_millis() < 1500 {
-                return;
+                return true;
             }
             push_pass_state(
                 pass1_ctx,
@@ -1954,6 +1974,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 total_passes,
                 &pass1_state,
             );
+            true
         };
 
         // Pass 1: disc → ISO with transport-failure recovery.
@@ -2191,11 +2212,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             let patch_ctx = &pass_ctx;
             let patch_title = &title_for_progress;
             let patch_map = std::path::Path::new(&mapfile_path_str);
-            let patch_progress = |p: &libfreemkv::progress::PassProgress| {
+            let patch_progress = |p: &libfreemkv::progress::PassProgress| -> bool {
                 patch_state.borrow_mut().last_work_done = p.work_done;
                 patch_state.borrow_mut().last_work_total = p.work_total;
                 if patch_state.borrow().last_update.elapsed().as_millis() < 1500 {
-                    return;
+                    return true;
                 }
                 push_pass_state(
                     patch_ctx,
@@ -2206,6 +2227,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     total_passes,
                     &patch_state,
                 );
+                true
             };
             let pass_halt = Arc::new(AtomicBool::new(false));
             let _pass_guard = spawn_pass_watcher(

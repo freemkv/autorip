@@ -45,6 +45,7 @@ fn test_state_json_serialization_round_trip() {
         num_bad_ranges: 1,
         bad_ranges_truncated: 0,
         total_lost_ms: 12.5,
+        main_lost_ms: 8.0,
         total_maybe_ms: 50.0,
         largest_gap_ms: 12.5,
         last_error: String::new(),
