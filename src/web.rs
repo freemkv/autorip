@@ -500,8 +500,15 @@ function renderCurrent(){
     /* Prefer server-computed lost_video_secs (uses actual title bitrate).
        Fall back to the old BD-sustained constant only if missing. */
     const lostSecs=(typeof s.lost_video_secs==='number'&&s.lost_video_secs>=0)?s.lost_video_secs:(s.errors*2048/8250000);
-    const lostStr=lostSecs<1?(lostSecs*1000).toFixed(0)+' ms':lostSecs.toFixed(2)+' s';
-    errHtml='<div style="background:var(--yellow);color:#000;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+s.errors+' sector'+(s.errors>1?'s':'')+' skipped ('+errMb+' MB, ~'+lostStr+' in movie)</div>';
+   const lostStr=lostSecs<1?(lostSecs*1000).toFixed(0)+' ms':lostSecs.toFixed(2)+' s';
+    /* 0.13.26: show main-movie-specific lost time when available. */
+    const mainMs=(typeof s.main_lost_ms==='number'&&s.main_lost_ms>0)?s.main_lost_ms:null;
+    let mainStr='';
+    if(mainMs!=null){
+      const mStr=mainMs<1?(mainMs*1000).toFixed(0)+' ms':mainMs.toFixed(2)+' s';
+      mainStr=' ('+mStr+' in main movie)';
+    }
+    errHtml+='<div style="background:var(--yellow);color:#000;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+s.errors+' sector'+(s.errors>1?'s':'')+' skipped ('+errMb+' MB, ~'+lostStr+' in movie'+mainStr+')</div>';
   }
   /* Adaptive batch recovery state \u2014 only during an active rip.
      current_batch < preferred_batch means the library shrunk the read size

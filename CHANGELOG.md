@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.0 (2026-05-04)
+
+### Code quality improvements, unified versioning
+
+Sync release across all freemkv crates to version 0.17.0. No autorip functional changes. See [libfreemkv CHANGELOG](https://github.com/freemkv/libfreemkv/blob/main/CHANGELOG.md#0170-2026-05-04) for details on libfreemkv improvements.
+
 ## 0.16.3 (2026-04-30)
 
 ### i18n damage display
