@@ -1384,7 +1384,11 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
             c.abort_on_lost_secs = v;
         }
         if let Some(rip_mode) = patch.get("rip_mode").and_then(|v| v.as_str()) {
-            c.max_retries = if rip_mode == "single" { 0 } else { c.max_retries };
+            c.max_retries = if rip_mode == "single" {
+                0
+            } else {
+                c.max_retries
+            };
             c.keep_iso = rip_mode == "multi";
         }
         if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {

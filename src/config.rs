@@ -14,7 +14,7 @@ pub struct Config {
     pub on_insert: String,      // "nothing", "identify", "rip"
     pub output_format: String,  // "mkv", "m2ts", "iso"
     pub network_target: String, // e.g. "192.168.1.100:9000" for network output
-   pub on_read_error: String,  // "stop", "skip"
+    pub on_read_error: String,  // "stop", "skip"
     /// Number of retry passes after the initial disc→ISO pass. 0 = single pass
     /// (direct disc→MKV, no ISO intermediate). 1..=10 = multi-pass (disc→ISO,
     /// retry bad ranges N times, then mux to MKV).
