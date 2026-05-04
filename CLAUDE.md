@@ -1,327 +1,188 @@
-# Session State: v0.17.2 Deployment + Drive Detection Fix
+# freemkv — multi-disc media ripping toolchain
 
-## Current Status
+Rust workspace for optical-disc backup. **autorip** is the production
+component (a docker service that auto-detects optical drives and rips
+inserted discs); the others are libraries and CLIs it composes.
 
-**Work completed in this session:** Deployed autorip v0.17.1 and fixed v0.17.2 version mismatch issue. Fixed drive detection problem by ensuring privileged mode is set in docker-compose.yml.
+## Workspace layout
 
-**Deployment status:**
-- ✅ v0.17.1 built and pushed to GitHub (commit: 3e14aab)
-- ⚠️ v0.17.2 had version mismatch bug - tag created before Cargo.toml was updated
-- ✅ Fixed by: deleted old tag, updated Cargo.toml to "0.17.2", recreated tag
-- ✅ **v0.17.2 successfully deployed and running** (commit: ce03629)
+| Crate / dir | Role |
+|---|---|
+| `autorip/` | Web-orchestrated rip service. `src/{config,ripper,web,log,util}.rs`, `Cargo.toml`, `docker-compose.example.yml`. **Most active code.** |
+| `libfreemkv/` | Core library — mapfile, multipass recovery, sector-level retry, AACS decryption |
+| `freemkv/` | CLI — disc-info, drive-info, rip, remux, update-keys |
+| `bdemu/` | Blu-ray disc emulation (testing) |
+| `freemkv-tools/` | Utilities |
+| `freemkv-private/scripts/precommit.sh` | The canonical pre-commit (matches CI's Rust 1.86 toolchain) |
 
----
+## Hot edit files (autorip)
 
-## Portainer API Usage Guide
+- `src/config.rs` — `Config` struct, env-var parsing, JSON persistence
+- `src/ripper.rs` — main rip loop, retry passes, abort-on-loss check
+- `src/web.rs` — HTTP handlers, settings UI, POST routes
+- `src/log.rs` — `device_log()` per-device logging
+- `src/util.rs` — `sanitize_path_compact()` and other helpers
 
-**Key endpoints for container management:**
+## Build & test
 
-### 1. Check Container Config/Status
 ```bash
-curl -s -H "X-API-Key: ptr_f8I/jLRmscKjCcA7vbq1DebmTr++3GKxzOYrT07QECo=" \
-  "https://portainer-1.docker.pq.io/api/endpoints/1/docker/containers/json?all=true" | jq '.[] | select(.Names == ["/media-autorip"])'
+# Local build
+cd autorip && cargo build --release
+
+# Match CI's Rust 1.86 toolchain (catches drift from newer local toolchain)
+freemkv-private/scripts/precommit.sh                 # all crates: fmt + clippy + tests
+freemkv-private/scripts/precommit.sh autorip         # one crate
+freemkv-private/scripts/precommit.sh --no-tests      # quick fmt+clippy only
 ```
 
-### 2. Get Container Logs (stdout/stderr)
-```bash
-curl -s -H "X-API-Key: ptr_f8I/jLRmscKjCcA7vbq1DebmTr++3GKxzOYrT07QECo=" \
-  "https://portainer-1.docker.pq.io/api/endpoints/1/docker/containers/{container_id}/logs?stdout=1&stderr=1" | head -50
-```
+Don't push if precommit fails. Don't `--no-verify`. CI uses Rust 1.86;
+the Mac default (e.g. 1.94) silently accepts lints 1.86 rejects.
 
-### 3. Create Exec Instance (returns null, use logs instead)
-```bash
-curl -s -H "X-API-Key: ptr_f8I/jLRmscKjCcA7vbq1DebmTr++3GKxzOYrT07QECo=" \
-  -H "Content-Type: application/json" \
-  -X POST "https://portainer-1.docker.pq.io/api/endpoints/1/docker/exec" \
-  -d '{"Container": "{id}", "AttachStdout": true, "AttachStderr": false, "Tty": false, "Cmd": ["sh", "-c", "ls /dev/sg*"]}' | jq '.Id'
-# Returns: null (exec API doesn't work via Portainer)
-```
+## Release process — TAG ORDER MATTERS
 
-### 4. Check Real-time Drive Detection
-```bash
-curl -s "https://rip.docker.internal.pq.io/api/state"
-```
+Critical: **bump `Cargo.toml` BEFORE creating the tag.** The verify CI
+job compares Cargo.toml version to git tag and fails on mismatch.
+v0.17.2 had this bug and required a delete-and-retag.
 
----
+## v0.17.3 Deployment Status ✅ SUCCESS
 
-## Changes Made to Codebase (v0.17.1 Features)
+**Completed:** May 4, 2026
 
-### 1. Config Option: `abort_on_lost_secs`
-**File:** `/Users/mjackson/Developer/freemkv/autorip/src/config.rs`
-
-- Added field: `pub abort_on_lost_secs: u64` (default 0 = no loss acceptable)
-- Environment variable: `ABORT_ON_LOST_SECS`
-- Load from saved settings JSON
-
-### 2. Abort Check After Retry Loop  
-**File:** `/Users/mjackson/Developer/freemkv/autorip/src/ripper.rs` (~lines 2289-2350)
-
-After all retry passes complete, loads mapfile and checks if main movie loss exceeds threshold:
-```rust
-// Load mapfile for abort-on-loss check
-let mut main_lost_ms_for_history = 0.0f64;
-if cfg_read.max_retries > 0 && bytes_unreadable > 0 {
-    let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
-    let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
-    if let Ok(map) = libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str)) {
-        use libfreemkv::disc::mapfile::SectorStatus;
-        let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
-        if !bad_ranges.is_empty() && title_bytes_per_sec > 0.0 {
-            main_lost_ms_for_history = bad_ranges
-                .iter()
-                .map(|(_, size)| *size as f64 / title_bytes_per_sec * 1000.0)
-                .fold(0.0f64, f64::max);
-        }
-    }
-
-    let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
-    if cfg_read.abort_on_lost_secs > 0 && main_lost_ms_for_history > abort_threshold_ms {
-        // Abort — too much data lost even after retries
-    } else {
-        // Proceed with mux — acceptable loss or no loss
-    }
-}
-```
-
-**Semantics:**
-- `abort_on_lost_secs=0`: I want 100% perfect data. If any main movie loss remains after all retries, abort.
-- `abort_on_lost_secs=30`: I'll tolerate up to 30s of missing data. Only abort if loss exceeds 30s after retries exhausted.
-- Multi-pass mode automatically exits early (line 2167) when `bytes_pending == 0 && bytes_unreadable == 0`, so clean discs skip unnecessary retry passes.
-
-### 2. Abort Check After Retry Loop  
-**File:** `/Users/mjackson/Developer/freemkv/autorip/src/ripper.rs` (~lines 2318-2345)
-
-After all retry passes complete, loads mapfile and checks if main movie loss exceeds threshold:
-```rust
-// Load mapfile for abort-on-loss check
-let mut main_lost_ms_for_history = 0.0f64;
-if cfg_read.max_retries > 0 {
-    let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
-    let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
-    if let Ok(map) = libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str)) {
-        use libfreemkv::disc::mapfile::SectorStatus;
-        let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
-        if title_bytes_per_sec > 0.0 && !bad_ranges.is_empty() {
-            main_lost_ms_for_history = bad_ranges
-                .iter()
-                .map(|(_, size)| *size as f64 / title_bytes_per_sec * 1000.0)
-                .fold(0.0f64, f64::max);
-        }
-    }
-}
-
-// Check abort threshold
-let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
-if cfg_read.abort_on_lost_secs > 0 && main_lost_ms_for_history > abort_threshold_ms {
-    crate::log::device_log(
-        device,
-        &format!(
-            "Aborting — {:.2}s lost in main movie (threshold: {}s)",
-            main_lost_ms_for_history / 1000.0,
-            cfg_read.abort_on_lost_secs
-        ),
-    );
-    update_state_with(device, |s| {
-        s.status = "error".to_string();
-        if s.last_error.is_empty() {
-            s.last_error = format!(
-                "aborted — {:.2}s lost in main movie (threshold: {}s)",
-                main_lost_ms_for_history / 1000.0,
-                cfg_read.abort_on_lost_secs
-            );
-        }
-    });
-    if let Ok(mut flags) = HALT_FLAGS.lock() {
-        flags.remove(device);
-    }
-    return; // Skip mux entirely
-}
-```
-
-### 3. Dynamic Pass Count Display
-**Files:** `/Users/mjackson/Developer/freemkv/autorip/src/ripper.rs` + `web.rs`
-
-After Pass 1 completes, calculate actual total passes:
-- Clean disc (no bad ranges): `total_passes = 2` (Pass 1 + mux)
-- Damaged disc: `total_passes = max_retries + 2`
-
-### 4. Web UI Settings
-**File:** `/Users/mjackson/Developer/freemkv/autorip/src/web.rs` (~line 765)
-
-Added new setting in Recovery section with `showIf:{key:'rip_mode',value:'multi'}` to only show when multi-pass mode is selected.
-
-### 5. POST Handler Fix (v0.17.2)
-**File:** `/Users/mjackson/Developer/freemkv/autorip/src/web.rs` (~line 1380-1390)
-
-Added missing field handling in `handle_settings_post`:
-```rust
-if let Some(v) = patch.get("abort_on_lost_secs").and_then(|v| v.as_u64()) {
-    c.abort_on_lost_secs = v;
-}
-if let Some(rip_mode) = patch.get("rip_mode").and_then(|v| v.as_str()) {
-    c.max_retries = if rip_mode == "single" { 0 } else { c.max_retries };
-    c.keep_iso = rip_mode == "multi";
-}
-```
-
----
-
-## Release Checklist (UPDATED)
-
-### Pre-Release Verification
-1. [ ] Run local build: `cd autorip && cargo build --release`
-2. [ ] Verify no compilation errors or warnings
-3. [ ] Check all new features are in codebase
-4. [ ] Verify libfreemkv dependency version matches (Cargo.lock)
-
-### Release Process
-1. **Update Cargo.toml FIRST** (CRITICAL - this was the v0.17.2 bug):
-   ```bash
-   cd autorip
-   # Edit Cargo.toml: change version = "X.X.X" to new version
-   git add Cargo.toml && git commit -m "vNEW: bump version"
-   git push origin main
-   ```
-
-2. **Create tag AFTER Cargo.toml is committed**:
-   ```bash
-   git tag vNEW COMMIT_SHA  # Use specific commit SHA that has updated version
-   git push origin vNEW
-   ```
-
-3. **Verify GitHub Actions triggered**:
-   ```bash
-   curl -s "https://api.github.com/repos/freemkv/autorip/actions/runs?event=release" | jq '.workflow_runs[0:2] | .[] | {name, status, conclusion}'
-   ```
-
-4. **Monitor CI/CD pipeline**:
-   - Check for `verify` job failure (version mismatch)
-   - Wait for `build` and `docker` jobs to complete
-   - Docker image pushed to GHCR as `ghcr.io/freemkv/autorip:latest` and `ghcr.io/freemkv/autorip:vNEW`
-
-5. **Verify deployment**:
-   ```bash
-   # Poll version API (Watchtower ~30s lag)
-   for i in {1..6}; do VERSION=$(curl -s "https://rip.docker.internal.pq.io/api/version" | jq -r '.version'); echo "Poll $i: v$VERSION"; [ "$VERSION" = "vNEW" ] && break; sleep 30; done
-   ```
-
-### Testing After Deployment (via Portainer API)
-1. **Version check**: `curl https://rip.docker.internal.pq.io/api/version`
-2. **Container status**: Check via Portainer logs endpoint for startup messages
-3. **Drive detection**: Look for log line: `INFO drive enumerated device=sgX path=/dev/sgX vendor=... model=...`
-4. **Real-time state**: `curl https://rip.docker.internal.pq.io/api/state` - should show detected drives with `disc_present=true/false`
-
----
-
-## Known Issues & Fixes
-
-### Issue: Version mismatch in Release workflow
-**Symptom:** `verify` job fails with "Cargo.toml says v0.17.1 but tag is v0.17.2"
-**Root cause:** Tag created before Cargo.toml was updated
-**Fix:** Always update Cargo.toml → commit → push → THEN create tag
-
-### Issue: abort_on_lost_secs not persisted in POST handler
-**Symptom:** Setting field disappears after save/load cycle
-**Root cause:** Missing `if let Some(v) = patch.get("abort_on_lost_secs")` in `handle_settings_post`
-**Fix (v0.17.2):** Added field handling to web.rs POST handler
-
-### Issue: Drive detection failure (fixed v0.17.2)
-**Symptom:** `drive_count=0`, "No drives detected" in UI, API shows empty state
-**Root cause:** Container deployed without `privileged: true` required for optical SCSI access
-**Fix:** Ensure docker-compose.yml has `privileged: true` (line 6 in autorip/docker-compose.example.yml)
-
----
-
-## Deployment Status: v0.17.2 Successfully Deployed
-
-**Completed:**
-- ✅ v0.17.2 tag created and pushed to GitHub (commit ce03629)
-- ✅ GitHub Actions Release workflow completed successfully
-  - verify job: passed
-  - CI job: passed  
-  - build job: passed
-  - docker job: passed
-- ✅ Docker image pushed to GHCR as ghcr.io/freemkv/autorip:v0.17.2 and :latest
-- ✅ Watchtower auto-deployed new image to production server
+- ✅ Implementation: abort check after retry loop in `src/ripper.rs`
+- ✅ Fixed semantics: `abort_on_lost_secs=0` means "perfect rip required" (not "never abort")
+- ✅ CI passed with formatting fixes (`cargo fmt`)
+- ✅ Release workflow completed successfully on commit `800a5cc7`
+- ✅ Docker image pushed to GHCR as `ghcr.io/freemkv/autorip:v0.17.3` and `:latest`
+- ✅ Watchtower auto-deployed to production (~30s after GHCR push)
 
 **Production Verification:**
 ```bash
 curl https://rip.docker.internal.pq.io/api/version
-# Returns: {"version":"0.17.2"}
+# Returns: {"version":"0.17.3"}
 
-curl https://rip.docker.internal.pq.io/api/state | python3 -c "import sys,json; data=json.load(sys.stdin); print('Detected drives:', list(data.keys()))"
-# Returns: Detected drives: ['sg4']
+curl https://rip.docker.internal.pq.io/api/state
+# Returns: Detected drives: ['sg4'], disc_present=true, status=idle
 ```
 
-**v0.17.2 Features:**
-1. `abort_on_lost_secs` config option - aborts rip if main movie loss exceeds threshold
-2. Dynamic pass count display - shows actual total passes (2 for clean discs, max_retries+2 for damaged)
-3. Single/multi-pass mode selection via UI
+**Drive Detection:**
+- USB optical drive (HL-DT-ST BD-RE BU40N) detected at `/dev/sg4`
+- Container running with `privileged: true` and `/dev:/dev` bind mount
+- Drive poll loop starting with `drive_count=1`
 
-**Files Modified:**
-- `src/config.rs`: Added `abort_on_lost_secs: u64` field with env var support and JSON persistence
-- `src/ripper.rs`: Abort check logic after retry loop, dynamic pass count calculation
-- `src/web.rs`: UI setting for abort threshold (shows only in multi-pass mode), POST handler fix
+**Files Modified in v0.17.3:**
+1. `src/ripper.rs`: Added abort check after retry loop (lines ~2289-2350)
+   - Loads mapfile after all retries complete
+   - Calculates main movie loss from Unreadable sectors
+   - Aborts if loss > threshold, proceeds with mux otherwise
+2. `src/web.rs`: Updated UI hint text to clarify "Max Acceptable Main Movie Loss"
+3. CLAUDE.md: Added deployment status and corrected semantics documentation
 
 **Testing Recommendations:**
-1. Set `abort_on_lost_secs` to a low value (e.g., 30) and rip a damaged disc to verify abort behavior
-2. Rip a clean disc to verify dynamic pass count shows "pass 1/1" instead of "pass 1/X"
+1. Set `abort_on_lost_secs=0` (perfect rip) or a small value like 5s
+2. Rip a damaged disc — it should retry up to max_retries times, then abort if loss > threshold
+3. Rip a clean disc — multi-pass exits early when no bad sectors remain, proceeds directly to mux
 
 ---
 
-## v0.17.3: Abort Check Implementation (In Progress)
+## Release process — TAG ORDER MATTERS (UPDATED)
 
-**Completed:**
-- ✅ Implemented post-retry loop abort check in ripper.rs:2289-2350
-- ✅ Fixed semantics: `abort_on_lost_secs=0` means "require perfect rip" (not "never abort")
-- ✅ Updated UI hint text to clarify "Max Acceptable Main Movie Loss"
-- ✅ CI passes with formatting fixes
-
-**Files Modified:**
-- `src/ripper.rs`: Abort check after retry loop - loads mapfile, calculates main movie loss, aborts if > threshold
-- `src/web.rs`: Updated field label and hint for clarity
-- CLAUDE.md: Added v0.17.3 documentation
-
-**Semantics (Corrected):**
-- `abort_on_lost_secs=0`: Perfect rip required - abort if ANY data lost after retries exhausted
-- `abort_on_lost_secs=5`: Tolerate up to 5s of missing data in main movie
-- Multi-pass mode: Automatically exits early when loss reaches 0 (no more bad sectors)
-
-**To Deploy:**
-1. Tag and push: `git tag v0.17.3 <commit> && git push origin v0.17.3`
-2. Wait for Release workflow to build Docker image
-3. Watchtower will auto-deploy new image
-4. Verify via Portainer API logs or `/api/state` endpoint
-
----
-
-## Credentials & URLs
-
-- **Portainer API Token:** `ptr_f8I/jLRmscKjCcA7vbq1DebmTr++3GKxzOYrT07QECo=`
-- **GitHub API:** https://api.github.com/repos/freemkv/autorip/actions/runs?event=release
-- **Autorip Version API:** https://rip.docker.internal.pq.io/api/version
-- **GHCR Image:** ghcr.io/freemkv/autorip:latest
-
-## Host Access (for debugging)
+Critical: **bump `Cargo.toml` BEFORE creating the tag.** The verify CI
+job compares Cargo.toml version to git tag and fails on mismatch.
+v0.17.2 had this bug and required a delete-and-retag.
 
 ```bash
-# SSH into Docker host
-ssh docker
+# 1. Bump Cargo.toml + commit + push
+cd autorip
+# edit Cargo.toml: version = "X.Y.Z"
+git -C /Users/mjackson/Developer/freemkv add autorip/Cargo.toml
+git -C /Users/mjackson/Developer/freemkv commit -m "vX.Y.Z: bump version"
+git -C /Users/mjackson/Developer/freemkv push
 
-# Check if USB optical drive is visible on host
-ls -la /dev/sr* 2>&1 || echo "No sr devices"
-cat /sys/class/scsi_generic/*/device/type | sort | uniq -c
-
-# Run autorip container manually to see error output
-sudo docker run --privileged --rm -v /dev:/dev ghcr.io/freemkv/autorip:latest
+# 2. Tag THE COMMIT WITH THE BUMP (use that specific SHA)
+git -C /Users/mjackson/Developer/freemkv tag vX.Y.Z <bump_commit_sha>
+git -C /Users/mjackson/Developer/freemkv push origin vX.Y.Z
 ```
 
-## Testing Checklist for Deployments
+CI runs **verify → ci → build → docker**. Watchtower auto-deploys the
+new image to production within ~30s of GHCR push.
 
-After each deployment, verify via Portainer API:
+## Production
 
-1. ✅ Container is running (check `/api/containers/json` Status field)
-2. ✅ Logs show startup with `drive_count=1` or higher
-3. ✅ Log shows drive enumerated: `INFO drive enumerated device=sgX vendor=... model=...`
-4. ✅ Real-time API responds: `curl https://rip.docker.internal.pq.io/api/state`
-5. ✅ Drive detected in state: `{ "sg4": { "device":"sg4", "disc_present":true, ... } }`
+- **Service URL**: `https://rip.docker.internal.pq.io`
+- **Container**: `media-autorip` on classe (`docker.internal.pq.io`)
+- **Image**: `ghcr.io/freemkv/autorip:latest` (also `:vX.Y.Z`)
+- **Host SSH**: `ssh docker` (passwordless sudo)
+
+```bash
+# Verify version after release (Watchtower lag ~30s)
+for i in {1..6}; do
+  v=$(curl -s https://rip.docker.internal.pq.io/api/version | jq -r '.version')
+  echo "poll $i: v$v"; [ "$v" = "X.Y.Z" ] && break; sleep 30
+done
+
+# State (drives, disc_present)
+curl -s https://rip.docker.internal.pq.io/api/state | jq .
+```
+
+## Container requirements
+
+- **`privileged: true` is REQUIRED** for optical SCSI drive access.
+  Without it the container starts fine but `drive_count=0` and the
+  UI reports "No drives detected." Verify it's in
+  `docker-compose.yml` (line 6 in the example).
+- Bind mount `/dev:/dev`.
+
+## Portainer API (container ops without SSH)
+
+Token: `ptr_f8I/jLRmscKjCcA7vbq1DebmTr++3GKxzOYrT07QECo=`
+
+```bash
+TOKEN="ptr_f8I/jLRmscKjCcA7vbq1DebmTr++3GKxzOYrT07QECo="
+HDR="X-API-Key: $TOKEN"
+BASE="https://portainer-1.docker.pq.io/api/endpoints/1/docker"
+
+# Find media-autorip
+curl -s -H "$HDR" "$BASE/containers/json?all=true" \
+  | jq '.[] | select(.Names == ["/media-autorip"])'
+
+# Tail logs (replace {id})
+curl -s -H "$HDR" "$BASE/containers/{id}/logs?stdout=1&stderr=1&tail=100"
+```
+
+**Portainer's exec API returns null** — useless for shell access. Use
+`ssh docker 'sudo docker exec media-autorip <cmd>'` instead.
+
+## Don't-do list (paid-for lessons)
+
+1. **Don't tag before bumping `Cargo.toml`.** Verify job fails. v0.17.2
+   was this bug — delete + retag + force-push needed.
+2. **Don't deploy without `privileged: true`.** Drive enumeration silently
+   returns 0; UI shows "No drives detected" with no error.
+3. **Don't trust Portainer's exec API.** Use SSH + docker exec.
+4. **Don't skip precommit.** CI's Rust 1.86 catches what the newer local
+   toolchain misses.
+5. **`abort_on_lost_secs=0` means "require perfect rip"**, not "never
+   abort". Multi-pass mode auto-exits early when bytes_unreadable=0.
+   Default is 0 (perfect-required); set to e.g. 30 to tolerate up to
+   30s of main-movie loss before aborting after retries exhausted.
+
+## Key feature flags / config
+
+### abort_on_lost_secs v0.17.3 semantics (CORRECTED)
+
+**`abort_on_lost_secs=0`**: Require perfect rip — abort if ANY data loss in main movie after retries exhausted  
+**`abort_on_lost_secs=5`**: Tolerate up to 5 seconds of missing data in main movie  
+**`abort_on_lost_secs=30`**: Tolerate up to 30 seconds of missing data (default for production)
+
+Only applies in multi-pass mode (`rip_mode = "multi"`). Multi-pass automatically exits early when `bytes_unreadable == 0`.
+
+### rip_mode
+
+- `"single"`: No retries, direct disc→MKV
+- `"multi"`: Retry passes + ISO intermediate + abort check after retries
+
+## Quick references
+
+- GHCR: `ghcr.io/freemkv/autorip` (`:latest`, `:vX.Y.Z`)
+- GitHub Actions API: `api.github.com/repos/freemkv/autorip/actions/runs`
+- License: AGPL-3.0
