@@ -269,6 +269,32 @@ curl https://rip.docker.internal.pq.io/api/state | python3 -c "import sys,json; 
 
 ---
 
+## v0.17.3: Abort Check Implementation (In Progress)
+
+**Completed:**
+- ✅ Implemented post-retry loop abort check in ripper.rs:2289-2350
+- ✅ Fixed semantics: `abort_on_lost_secs=0` means "require perfect rip" (not "never abort")
+- ✅ Updated UI hint text to clarify "Max Acceptable Main Movie Loss"
+- ✅ CI passes with formatting fixes
+
+**Files Modified:**
+- `src/ripper.rs`: Abort check after retry loop - loads mapfile, calculates main movie loss, aborts if > threshold
+- `src/web.rs`: Updated field label and hint for clarity
+- CLAUDE.md: Added v0.17.3 documentation
+
+**Semantics (Corrected):**
+- `abort_on_lost_secs=0`: Perfect rip required - abort if ANY data lost after retries exhausted
+- `abort_on_lost_secs=5`: Tolerate up to 5s of missing data in main movie
+- Multi-pass mode: Automatically exits early when loss reaches 0 (no more bad sectors)
+
+**To Deploy:**
+1. Tag and push: `git tag v0.17.3 <commit> && git push origin v0.17.3`
+2. Wait for Release workflow to build Docker image
+3. Watchtower will auto-deploy new image
+4. Verify via Portainer API logs or `/api/state` endpoint
+
+---
+
 ## Credentials & URLs
 
 - **Portainer API Token:** `ptr_f8I/jLRmscKjCcA7vbq1DebmTr++3GKxzOYrT07QECo=`
