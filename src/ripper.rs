@@ -2288,6 +2288,63 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             }
         }
 
+        // Abort check: load mapfile and calculate main movie loss after all retries.
+        // If loss exceeds configured threshold, abort instead of muxing damaged content.
+        let mut main_lost_ms_for_history = 0.0f64;
+        if cfg_read.max_retries > 0 && bytes_unreadable > 0 {
+            let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
+            let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
+            if let Ok(map) = libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str)) {
+                use libfreemkv::disc::mapfile::SectorStatus;
+                let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
+                if !bad_ranges.is_empty() && title_bytes_per_sec > 0.0 {
+                    main_lost_ms_for_history = bad_ranges
+                        .iter()
+                        .map(|(_, size)| *size as f64 / title_bytes_per_sec * 1000.0)
+                        .fold(0.0f64, f64::max);
+                }
+            }
+
+            let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
+            if cfg_read.abort_on_lost_secs > 0 && main_lost_ms_for_history > abort_threshold_ms {
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "Aborting — {:.2}s lost in main movie (threshold: {}s)",
+                        main_lost_ms_for_history / 1000.0,
+                        cfg_read.abort_on_lost_secs
+                    ),
+                );
+                update_state_with(device, |s| {
+                    s.status = "error".to_string();
+                    if s.last_error.is_empty() {
+                        s.last_error = format!(
+                            "aborted — {:.2}s lost in main movie (threshold: {}s)",
+                            main_lost_ms_for_history / 1000.0,
+                            cfg_read.abort_on_lost_secs
+                        );
+                    }
+                });
+                if let Ok(mut flags) = HALT_FLAGS.lock() {
+                    flags.remove(device);
+                }
+                return; // Skip mux entirely
+            }
+
+            if main_lost_ms_for_history > 0.0 {
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "Main movie loss after retries: {:.2}s (threshold: {}s)",
+                        main_lost_ms_for_history / 1000.0,
+                        cfg_read.abort_on_lost_secs
+                    ),
+                );
+            } else {
+                crate::log::device_log(device, "All data recovered — proceeding with mux.");
+            }
+        }
+
         // Mux gating per RIP_DESIGN.md §15 Fix B.
         // Skip mux + return cleanly if user pressed stop.
         if user_halt.load(Ordering::Relaxed) {
