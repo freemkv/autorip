@@ -212,14 +212,18 @@ function renderTotalBar(p){
     +'</div>';
 }
 function passLabelFor(s){
-  /* Resolve the current pass into a human-readable label for the Ripping
-     step. During multipass we show pass number + phase; otherwise "Ripping". */
-  if(s.pass>0&&s.total_passes>0){
-    const phase=s.pass===1?'copying':(s.pass===s.total_passes?'muxing':'retrying');
-    return 'pass '+s.pass+'/'+s.total_passes+' \u00b7 '+phase;
-  }
-  return '';
-}
+   /* Resolve the current pass into a human-readable label for the Ripping
+      step. During multipass we show pass number + phase; otherwise "Ripping". */
+   if(s.pass>0&&s.total_passes>0){
+     const phase=s.pass===1?'copying':(s.pass===s.total_passes?'muxing':'retrying');
+     return 'pass '+s.pass+'/'+s.total_passes+' \u00b7 '+phase;
+   }
+   /* If pass=1 and no total_passes set, this is a clean disc — skip to mux. */
+   if(s.pass===1&&s.total_passes===0){
+     return 'pass 1/1 · copying';
+   }
+   return '';
+ }
 function renderSteps(steps,progress,eta,speed,s){
   if(!steps||!steps.length)return'';
   const icons={done:'\u2713',active:'\u25cf',pending:'\u25cb'};
@@ -760,9 +764,10 @@ function renderSettings(s){
     ]},
     {title:'Recovery',fields:[
       {key:'on_read_error',label:'On Read Error',type:'radio',options:[{value:'stop',label:'Stop'},{value:'skip',label:'Skip (zero-fill)'}],hint:'Stop aborts the rip. Skip zero-fills bad sectors and continues — use after Verify confirms damage is minor.'},
-      {key:'rip_mode',label:'Rip Mode',type:'radio',options:[{value:'single',label:'Single Pass'},{value:'multi',label:'Multi Pass'}],hint:'Single Pass: stream disc → MKV directly. Fastest, best for healthy discs. Multi Pass: rip an ISO, retry bad sectors with progressively smaller blocks, then mux to MKV. Use for discs with read errors.'},
-      {key:'max_retries',label:'Retry Passes',type:'number',hint:'How many retry passes to run on bad sectors. Each pass uses smaller blocks (60→30→15→7→1 sectors) and alternates direction. Default 5 covers most recoverable damage.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
-      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Preserve the disc ISO + mapfile after MKV mux. Off by default to reclaim disk.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
+     {key:'rip_mode',label:'Rip Mode',type:'radio',options:[{value:'single',label:'Single Pass'},{value:'multi',label:'Multi Pass'}],hint:'Single Pass: stream disc → MKV directly. Fastest, best for healthy discs. Multi Pass: rip an ISO, retry bad sectors with progressively smaller blocks, then mux to MKV. Use for discs with read errors.'},
+       {key:'max_retries',label:'Retry Passes',type:'number',hint:'How many retry passes to run on bad sectors. Each pass uses smaller blocks (60→30→15→7→1 sectors) and alternates direction. Default 5 covers most recoverable damage.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
+       {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Preserve the disc ISO + mapfile after MKV mux. Off by default to reclaim disk.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
+       {key:'abort_on_lost_secs',label:'Abort on Main Movie Loss',type:'number',hint:'Seconds of main movie loss before aborting rip entirely. 0 = never abort (continue anyway). Applies to multi-pass mode only.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
     ]},
     {title:'Output',fields:[
       {key:'output_dir',label:'Output Directory',type:'text',hint:'Where all ripped files go by default'},
@@ -844,15 +849,15 @@ function saveSettings(){
     if(v)hooks.push(v);
   });
   s.webhook_urls=hooks;
-  /* v0.13.19: translate the virtual `rip_mode` selector back to the backend
-     fields. Single → max_retries=0 + keep_iso=false (no ISO ever exists).
-     Multi → keep whatever max_retries the user set; default to 5 if they
-     flipped to multi without ever touching the count. The `rip_mode` key
-     itself is never persisted — the backend already infers it from
-     max_retries on the next render. */
-  if(s.rip_mode==='single'){s.max_retries=0;s.keep_iso=false}
-  else if(s.rip_mode==='multi'&&(!s.max_retries||s.max_retries<1)){s.max_retries=5}
-  delete s.rip_mode;
+ /* v0.13.19: translate the virtual `rip_mode` selector back to the backend
+      fields. Single → max_retries=0 + keep_iso=false (no ISO ever exists).
+      Multi → keep whatever max_retries the user set; default to 5 if they
+      flipped to multi without ever touching the count. The `rip_mode` key
+      itself is never persisted — the backend already infers it from
+      max_retries on the next render. */
+   if(s.rip_mode==='single'){s.max_retries=0;s.keep_iso=false;s.abort_on_lost_secs=0}
+   else if(s.rip_mode==='multi'&&(!s.max_retries||s.max_retries<1)){s.max_retries=5}
+   delete s.rip_mode;
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)})
   .then(r=>{if(r.ok){document.getElementById('save-status').textContent='Saved';setTimeout(()=>document.getElementById('save-status').textContent='',2000)}});
 }
@@ -1374,6 +1379,13 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         }
         if let Some(v) = patch.get("keep_iso").and_then(|v| v.as_bool()) {
             c.keep_iso = v;
+        }
+        if let Some(v) = patch.get("abort_on_lost_secs").and_then(|v| v.as_u64()) {
+            c.abort_on_lost_secs = v;
+        }
+        if let Some(rip_mode) = patch.get("rip_mode").and_then(|v| v.as_str()) {
+            c.max_retries = if rip_mode == "single" { 0 } else { c.max_retries };
+            c.keep_iso = rip_mode == "multi";
         }
         if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {
             c.webhook_urls = arr
