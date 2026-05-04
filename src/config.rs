@@ -14,14 +14,16 @@ pub struct Config {
     pub on_insert: String,      // "nothing", "identify", "rip"
     pub output_format: String,  // "mkv", "m2ts", "iso"
     pub network_target: String, // e.g. "192.168.1.100:9000" for network output
-    pub on_read_error: String,  // "stop", "skip"
+   pub on_read_error: String,  // "stop", "skip"
     /// Number of retry passes after the initial disc→ISO pass. 0 = single pass
     /// (direct disc→MKV, no ISO intermediate). 1..=10 = multi-pass (disc→ISO,
-    /// retry bad ranges N times, then ISO→MKV).
+    /// retry bad ranges N times, then mux to MKV).
     pub max_retries: u8,
     /// Keep the intermediate ISO after mux completes. Defaults to false — the
     /// ISO is pruned once the MKV is successfully finalized.
     pub keep_iso: bool,
+    /// Abort rip if main movie loss exceeds N seconds. 0 = never abort (continue anyway).
+    pub abort_on_lost_secs: u64,
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,
     pub keydb_url: String,
@@ -64,6 +66,9 @@ pub fn load() -> Arc<RwLock<Config>> {
             .unwrap_or(1)
             .min(10),
         keep_iso: env_or("KEEP_ISO", "false") == "true",
+        abort_on_lost_secs: env_or("ABORT_ON_LOST_SECS", "0")
+            .parse::<u64>()
+            .unwrap_or(0),
         tmdb_api_key: env_or("TMDB_API_KEY", ""),
         keydb_path: std::env::var("KEYDB_PATH").ok(),
         keydb_url: env_or("KEYDB_URL", ""),
@@ -122,6 +127,9 @@ fn load_saved(mut cfg: Config) -> Config {
             }
             if let Some(v) = saved.get("keep_iso").and_then(|v| v.as_bool()) {
                 cfg.keep_iso = v;
+            }
+            if let Some(v) = saved.get("abort_on_lost_secs").and_then(|v| v.as_u64()) {
+                cfg.abort_on_lost_secs = v;
             }
             // Migrate old setting
             if let Some(true) = saved.get("abort_on_error").and_then(|v| v.as_bool()) {
