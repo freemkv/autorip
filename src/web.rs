@@ -767,7 +767,7 @@ function renderSettings(s){
      {key:'rip_mode',label:'Rip Mode',type:'radio',options:[{value:'single',label:'Single Pass'},{value:'multi',label:'Multi Pass'}],hint:'Single Pass: stream disc → MKV directly. Fastest, best for healthy discs. Multi Pass: rip an ISO, retry bad sectors with progressively smaller blocks, then mux to MKV. Use for discs with read errors.'},
        {key:'max_retries',label:'Retry Passes',type:'number',hint:'How many retry passes to run on bad sectors. Each pass uses smaller blocks (60→30→15→7→1 sectors) and alternates direction. Default 5 covers most recoverable damage.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
        {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Preserve the disc ISO + mapfile after MKV mux. Off by default to reclaim disk.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
-       {key:'abort_on_lost_secs',label:'Abort on Main Movie Loss',type:'number',hint:'Seconds of main movie loss before aborting rip entirely. 0 = never abort (continue anyway). Applies to multi-pass mode only.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
+       {key:'abort_on_lost_secs',label:'Max Acceptable Main Movie Loss',type:'number',hint:'Seconds of missing data I will tolerate. 0 = perfect rip required (abort if any loss after retries). Applies to multi-pass mode only.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
     ]},
     {title:'Output',fields:[
       {key:'output_dir',label:'Output Directory',type:'text',hint:'Where all ripped files go by default'},
