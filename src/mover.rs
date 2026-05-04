@@ -299,6 +299,7 @@ mod tests {
             on_read_error: "stop".into(),
             max_retries: 1,
             keep_iso: false,
+            abort_on_lost_secs: 0,
             tmdb_api_key: String::new(),
             keydb_path: None,
             keydb_url: String::new(),
