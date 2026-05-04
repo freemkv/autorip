@@ -2294,7 +2294,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         if cfg_read.max_retries > 0 && bytes_unreadable > 0 {
             let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
             let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
-            if let Ok(map) = libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str)) {
+            if let Ok(map) =
+                libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str))
+            {
                 use libfreemkv::disc::mapfile::SectorStatus;
                 let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
                 if !bad_ranges.is_empty() && title_bytes_per_sec > 0.0 {
