@@ -1,14 +1,22 @@
-# Session State: Autorip Abort-on-Loss Feature + Dynamic Pass Count
+# Session State: v0.17.1/v0.17.2 Deployment + Release Checklist Updates
 
 ## Current Status
 
-**Work completed in this session:** Added `abort_on_lost_secs` config option, dynamic pass count display, and abort check after retry loop.
+**Work completed in this session:** Deployed autorip v0.17.1 and fixed v0.17.2 version mismatch issue.
 
-**Compilation status:** Workspace appears incomplete (no git commits, network unreachable). Files modified but not yet tested via compilation or live run.
+**Deployment status:**
+- ✅ v0.17.1 built and pushed to GitHub (commit: 3e14aab)
+- ⚠️ v0.17.2 had version mismatch bug - tag created before Cargo.toml was updated
+- ✅ Fixed by: deleted old tag, updated Cargo.toml to "0.17.2", recreated tag
+
+**Key findings from deployment attempt:**
+1. GitHub Actions Release workflow triggers on `push` event with tags matching `'v*'`
+2. Verify job checks that `Cargo.toml` version matches git tag name - MUST update Cargo.toml BEFORE creating tag
+3. Container auto-updates via Watchtower (~30s after new image pushed to GHCR)
 
 ---
 
-## Changes Made to Codebase
+## Changes Made to Codebase (v0.17.1 Features)
 
 ### 1. Config Option: `abort_on_lost_secs`
 **File:** `/Users/mjackson/Developer/freemkv/autorip/src/config.rs`
@@ -17,22 +25,10 @@
 - Environment variable: `ABORT_ON_LOST_SECS`
 - Load from saved settings JSON
 
-**Code added:**
-```rust
-pub abort_on_lost_secs: u64,  // seconds of main movie loss before aborting rip entirely
-...
-abort_on_lost_secs: env_or("ABORT_ON_LOST_SECS", "0")
-    .parse::<u64>()
-    .unwrap_or(0),
-```
-
----
-
 ### 2. Abort Check After Retry Loop  
 **File:** `/Users/mjackson/Developer/freemkv/autorip/src/ripper.rs` (~lines 2318-2345)
 
 After all retry passes complete, loads mapfile and checks if main movie loss exceeds threshold:
-
 ```rust
 // Load mapfile for abort-on-loss check
 let mut main_lost_ms_for_history = 0.0f64;
@@ -79,161 +75,144 @@ if cfg_read.abort_on_lost_secs > 0 && main_lost_ms_for_history > abort_threshold
 }
 ```
 
----
-
 ### 3. Dynamic Pass Count Display
 **Files:** `/Users/mjackson/Developer/freemkv/autorip/src/ripper.rs` + `web.rs`
 
-#### ripper.rs changes (~line 2151-2160):
 After Pass 1 completes, calculate actual total passes:
-```rust
-let mut bytes_good = result.bytes_good;
-let mut bytes_unreadable = result.bytes_unreadable;
-let mut bytes_pending = result.bytes_pending;
-
-// Dynamic total_passes: if Pass 1 complete with no bad ranges, only need mux (total=2)
-let actual_total_passes = if bytes_pending == 0 && bytes_unreadable == 0 {
-    2 // Pass 1 + mux, no retries needed
-} else {
-    cfg_read.max_retries + 2
-};
-```
-
-Then use `actual_total_passes` instead of `total_passes` in:
-- Log messages (~line 2188)
-- `push_pass_state()` calls (~lines 2221, 2404)
-
-#### web.rs changes (~line 214):
-Simplified pass label for clean discs:
-```javascript
-function passLabelFor(s){
-   if(s.pass>0&&s.total_passes>0){
-     const phase=s.pass===1?'copying':(s.pass===s.total_passes?'muxing':'retrying');
-     return 'pass '+s.pass+'/'+s.total_passes+' \u00b7 '+phase;
-   }
-   // If pass=1 and no total_passes set, this is a clean disc — skip to mux.
-   if(s.pass===1&&s.total_passes===0){
-     return 'pass 1/1 · copying';
-   }
-   return '';
-}
-```
-
----
+- Clean disc (no bad ranges): `total_passes = 2` (Pass 1 + mux)
+- Damaged disc: `total_passes = max_retries + 2`
 
 ### 4. Web UI Settings
 **File:** `/Users/mjackson/Developer/freemkv/autorip/src/web.rs` (~line 765)
 
-Added new setting in Recovery section:
-```javascript
-{key:'abort_on_lost_secs',label:'Abort on Main Movie Loss',type:'number',hint:'Seconds of main movie loss before aborting rip entirely. 0 = never abort (continue anyway). Applies to multi-pass mode only.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
-```
+Added new setting in Recovery section with `showIf:{key:'rip_mode',value:'multi'}` to only show when multi-pass mode is selected.
 
-Also updated save logic (~line 854) to reset this when switching to single pass:
-```javascript
-if(s.rip_mode==='single'){s.max_retries=0;s.keep_iso=false;s.abort_on_lost_secs=0}
-```
+### 5. POST Handler Fix (v0.17.2)
+**File:** `/Users/mjackson/Developer/freemkv/autorip/src/web.rs` (~line 1380-1390)
 
----
-
-### 5. History Record Enhancement
-**File:** `/Users/mjackson/Developer/freemkv/autorip/src/ripper.rs` (~line 2946)
-
-Added `main_lost_ms` to history JSON:
+Added missing field handling in `handle_settings_post`:
 ```rust
-entry["main_lost_ms"] = serde_json::json!(main_lost_ms_for_history.round());
-```
-
----
-
-### 6. Library Enhancement
-**File:** `/Users/mjackson/Developer/freemkv/libfreemkv/src/disc/mapfile.rs` (~line 78)
-
-Added fields to `MapStats`:
-```rust
-pub struct MapStats {
-    // ... existing fields ...
-    pub num_bad_ranges: u32,      // Number of unreadable ranges
-    pub main_lost_ms: f64,        // Largest gap among unreadable ranges in ms
+if let Some(v) = patch.get("abort_on_lost_secs").and_then(|v| v.as_u64()) {
+    c.abort_on_lost_secs = v;
+}
+if let Some(rip_mode) = patch.get("rip_mode").and_then(|v| v.as_str()) {
+    c.max_retries = if rip_mode == "single" { 0 } else { c.max_retries };
+    c.keep_iso = rip_mode == "multi";
 }
 ```
 
 ---
 
-## What Still Needs Testing
+## Release Checklist (UPDATED)
 
-### Test Scenarios:
+### Pre-Release Verification
+1. [ ] Run local build: `cd autorip && cargo build --release`
+2. [ ] Verify no compilation errors or warnings
+3. [ ] Check all new features are in codebase
+4. [ ] Verify libfreemkv dependency version matches (Cargo.lock)
 
-1. **Clean disc (most common case)**
-   - Set `max_retries=5` in UI
-   - Rip a healthy UHD/Blu-ray disc
-   - Expected: Pass 1 completes, UI shows "pass 1/1 · copying", then mux starts immediately
-   - Total time should be ~Pass 1 duration + mux time (no retry passes)
+### Release Process
+1. **Update Cargo.toml FIRST** (CRITICAL - this was the v0.17.2 bug):
+   ```bash
+   cd autorip
+   # Edit Cargo.toml: change version = "X.X.X" to new version
+   git add Cargo.toml && git commit -m "vNEW: bump version"
+   git push origin main
+   ```
 
-2. **Abort on loss = 0 (strict mode)**
-   - Set `abort_on_lost_secs=0` in UI  
-   - Rip a damaged disc with any bad sectors in main movie
-   - Expected: After all retries, if `main_lost_ms > 0`, rip aborts with status="error"
-   - ISO retained in staging for manual salvage
+2. **Create tag AFTER Cargo.toml is committed**:
+   ```bash
+   git tag vNEW COMMIT_SHA  # Use specific commit SHA that has updated version
+   git push origin vNEW
+   ```
 
-3. **Abort on loss = 60 (lenient mode)**
-   - Set `abort_on_lost_secs=60` in UI
-   - Rip a damaged disc with <60 seconds of main movie loss
-   - Expected: Rip completes normally despite damage
-   - Rip a damaged disc with >60 seconds of main movie loss  
-   - Expected: Rip aborts after retries
+3. **Verify GitHub Actions triggered**:
+   ```bash
+   curl -s "https://api.github.com/repos/freemkv/autorip/actions/runs?event=release" | jq '.workflow_runs[0:2] | .[] | {name, status, conclusion}'
+   ```
 
-4. **Dynamic pass count**
-   - Clean disc → should see "pass 1/1" not "pass 1/7"
-   - Damaged disc that recovers fully by Pass 2 → should show "pass 2/2" then mux
-   - Damaged disc with partial recovery → should show actual pass count dynamically
+4. **Monitor CI/CD pipeline**:
+   - Check for `verify` job failure (version mismatch)
+   - Wait for `build` and `docker` jobs to complete
+   - Docker image pushed to GHCR as `ghcr.io/freemkv/autorip:latest` and `ghcr.io/freemkv/autorip:vNEW`
+
+5. **Verify deployment**:
+   ```bash
+   # Poll version API (Watchtower ~30s lag)
+   for i in {1..6}; do VERSION=$(curl -s "https://rip.docker.internal.pq.io/api/version" | jq -r '.version'); echo "Poll $i: v$VERSION"; [ "$VERSION" = "vNEW" ] && break; sleep 30; done
+   ```
+
+### Testing After Deployment
+1. **Version check**: `curl https://rip.docker.internal.pq.io/api/version`
+2. **Config API test**: 
+   - POST new settings with `abort_on_lost_secs` field
+   - GET `/api/settings` and verify field persists
+3. **Dynamic pass count**: Monitor UI during clean disc rip (should show "pass 1/1")
 
 ---
 
-## Next Steps When Resuming Session
+## Known Issues & Fixes
 
-1. **Verify compilation:**
-   ```bash
-   cd /Users/mjackson/Developer/freemkv/autorip && cargo check
-   cd /Users/mjackson/Developer/freemkv/libfreemkv && cargo check
-   ```
+### Issue: Version mismatch in Release workflow
+**Symptom:** `verify` job fails with "Cargo.toml says v0.17.1 but tag is v0.17.2"
+**Root cause:** Tag created before Cargo.toml was updated
+**Fix:** Always update Cargo.toml → commit → push → THEN create tag
 
-2. **Fix any compilation errors** (workspace appears incomplete - may need to restore from backup or fetch from remote)
-
-3. **Build and deploy:**
-   ```bash
-   cd /Users/mjackson/Developer/freemkv/autorip && cargo build --release
-   docker cp target/release/autorip autorip:/app/autorip
-   docker restart autorip
-   ```
-
-4. **Test on live rig:**
-   - SSH into Linux server where autorip is running
-   - Check Portainer (`https://portainer-1.docker.pq.io`) for container status
-   - Test with clean disc first (should see dynamic pass count)
-   - Then test with damaged disc and various abort thresholds
-
-5. **If compilation fails:**
-   - Try restoring `autorip/src/ripper.rs` from backup or remote
-   - Check if workspace is incomplete and needs fresh clone/fetch
-   - Network issue with gitea.pq.io may require alternative source
+### Issue: abort_on_lost_secs not persisted in POST handler
+**Symptom:** Setting field disappears after save/load cycle
+**Root cause:** Missing `if let Some(v) = patch.get("abort_on_lost_secs")` in `handle_settings_post`
+**Fix (v0.17.2):** Added field handling to web.rs POST handler
 
 ---
 
 ## Files Modified Summary
 
-| File | Changes |
-|------|---------|
-| `autorip/src/config.rs` | Added `abort_on_lost_secs: u64`, env var, load from settings |
-| `autorip/src/ripper.rs` | Abort check logic, dynamic pass count, history record enhancement |
-| `autorip/src/web.rs` | New UI setting for abort threshold, save logic update |
-| `libfreemkv/src/disc/mapfile.rs` | Added `num_bad_ranges`, `main_lost_ms` to `MapStats` |
+| File | Changes | Version |
+|------|---------|---------|
+| `autorip/src/config.rs` | Added `abort_on_lost_secs: u64`, env var, load from settings | v0.17.1 |
+| `autorip/src/ripper.rs` | Abort check logic, dynamic pass count calculation | v0.17.1 |
+| `autorip/src/web.rs` | UI setting for abort threshold, POST handler fix | v0.17.2 |
+| `autorip/Cargo.toml` | Version bump from 0.17.0 → 0.17.1 → 0.17.2 | Both |
 
 ---
 
-## Notes for Next Session
+## Deployment Status: v0.17.2 Successfully Deployed
 
-- User wants: "zero seconds of lost movie = abort" but configurable per user
-- Clean discs should finish in 1 pass (not waste time on 5 retries)
-- UI must show actual progress, not fixed "X/7" when only 2 passes needed
-- Abort is hard failure — ISO retained for manual salvage if needed
+**Completed:**
+- ✅ v0.17.2 tag created and pushed to GitHub (commit ce03629)
+- ✅ GitHub Actions Release workflow completed successfully
+  - verify job: passed
+  - CI job: passed  
+  - build job: passed
+  - docker job: passed
+- ✅ Docker image pushed to GHCR as ghcr.io/freemkv/autorip:v0.17.2 and :latest
+- ✅ Watchtower auto-deployed new image to production server
+
+**Production Verification:**
+```bash
+curl https://rip.docker.internal.pq.io/api/version
+# Returns: {"version":"0.17.2"}
+```
+
+**v0.17.2 Features:**
+1. `abort_on_lost_secs` config option - aborts rip if main movie loss exceeds threshold
+2. Dynamic pass count display - shows actual total passes (2 for clean discs, max_retries+2 for damaged)
+3. Single/multi-pass mode selection via UI
+
+**Files Modified:**
+- `src/config.rs`: Added `abort_on_lost_secs: u64` field with env var support and JSON persistence
+- `src/ripper.rs`: Abort check logic after retry loop, dynamic pass count calculation
+- `src/web.rs`: UI setting for abort threshold (shows only in multi-pass mode), POST handler fix
+
+**Testing Recommendations:**
+1. Set `abort_on_lost_secs` to a low value (e.g., 30) and rip a damaged disc to verify abort behavior
+2. Rip a clean disc to verify dynamic pass count shows "pass 1/1" instead of "pass 1/X"
+
+---
+
+## Credentials & URLs
+
+- **Portainer API Token:** `ptr_f8I/jLRmscKjCcA7vbq1DebmTr++3GKxzOYrT07QECo=`
+- **GitHub API:** https://api.github.com/repos/freemkv/autorip/actions/runs?event=release
+- **Autorip Version API:** https://rip.docker.internal.pq.io/api/version
+- **GHCR Image:** ghcr.io/freemkv/autorip:latest
