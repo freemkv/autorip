@@ -2058,51 +2058,309 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     crate::log::device_log(
                         device,
                         &format!(
-                            "Pass 1 attempt {attempt}: transport failure (bridge crash), waiting 15 s for USB re-enumeration"
+                            "Pass 1 attempt {attempt}: transport failure (bridge crash), waiting 30 s for USB re-enumeration"
                         ),
                     );
                     drop_session(device);
 
-                    std::thread::sleep(std::time::Duration::from_secs(15));
+                    std::thread::sleep(std::time::Duration::from_secs(30));
 
                     // Re-discover the device. The poll loop may have already
                     // found it; if not, try probing the original path and its
                     // neighbors (sg numbers shift by ±1 on re-enumeration).
                     let new_path = rediscover_drive(device, device_path);
-                    let new_path = match new_path {
-                        Some(p) => p,
-                        None => {
+                    match (new_path.as_deref(), &device_path) {
+                        (Some(p), _) if p != device_path => {
                             crate::log::device_log(
                                 device,
-                                "Pass 1: could not re-discover drive after transport failure",
+                                &format!(
+                                    "Pass 1 attempt {attempt}: drive rediscovered at {p} (original={}), attempting re-open",
+                                    device_path
+                                ),
                             );
-                            break 'pass1;
-                        }
-                    };
 
-                    let mut drive = match libfreemkv::Drive::open(std::path::Path::new(&new_path)) {
-                        Ok(d) => d,
-                        Err(e) => {
+                            let mut drive = match libfreemkv::Drive::open(std::path::Path::new(&p))
+                            {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    crate::log::device_log(
+                                        device,
+                                        &format!(
+                                            "Pass 1 attempt {attempt}: Drive::open({}) failed strategy=transport_failure_recovery error={} sense_key={:?} ASC={:?} — recovery path exhausted",
+                                            p,
+                                            e.code(),
+                                            e.scsi_sense().map(|s| s.sense_key),
+                                            e.scsi_sense().map(|s| s.asc)
+                                        ),
+                                    );
+
+                                    // Categorize failure for debugging
+                                    let failure_category = if e.code() == 4000 {
+                                        "SCSI_ERROR"
+                                    } else if e.code() >= 1000 && e.code() < 2000 {
+                                        "DEVICE_ERROR"
+                                    } else {
+                                        &format!("ERROR_CODE_{}", e.code())
+                                    };
+
+                                    crate::log::device_log(
+                                        device,
+                                        &format!(
+                                            "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::open category={} error_code={}",
+                                            failure_category,
+                                            e.code()
+                                        ),
+                                    );
+
+                                    break 'pass1;
+                                }
+                            };
+
+                            if let Err(e) = drive.wait_ready() {
+                                crate::log::device_log(
+                                    device,
+                                    &format!(
+                                        "Pass 1 attempt {attempt}: Drive::wait_ready({}) failed strategy=transport_failure_recovery error={} — recovery path exhausted",
+                                        p,
+                                        e.code()
+                                    ),
+                                );
+
+                                let failure_category = if e.code() == 4000 {
+                                    "SCSI_ERROR"
+                                } else {
+                                    &format!("ERROR_CODE_{}", e.code())
+                                };
+
+                                crate::log::device_log(
+                                    device,
+                                    &format!(
+                                        "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::wait_ready category={} error_code={}",
+                                        failure_category,
+                                        e.code()
+                                    ),
+                                );
+
+                                break 'pass1;
+                            }
+
+                            if let Err(e) = drive.init() {
+                                crate::log::device_log(
+                                    device,
+                                    &format!(
+                                        "Pass 1 attempt {attempt}: Drive::init({}) failed strategy=transport_failure_recovery error={} sense_key={:?} ASC={:?} — recovery path exhausted",
+                                        p,
+                                        e.code(),
+                                        e.scsi_sense().map(|s| s.sense_key),
+                                        e.scsi_sense().map(|s| s.asc)
+                                    ),
+                                );
+
+                                // Special handling for ILLEGAL REQUEST (0x20/0x00) which indicates wedged firmware
+                                let is_wedged_firmware = e.code() == 4000
+                                    && e.scsi_sense().map(|s| s.asc == 0x20).unwrap_or(false);
+
+                                if is_wedged_firmware {
+                                    crate::log::device_log(
+                                        device,
+                                        "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::init with ILLEGAL_REQUEST (ASC=0x20) — drive firmware wedged",
+                                    );
+
+                                    // Log user action required
+                                    crate::log::device_log(
+                                        device,
+                                        "USER_ACTION_REQUIRED: Eject disc and physically power-cycle USB optical drive to clear firmware state before retrying",
+                                    );
+                                } else {
+                                    let failure_category = if e.code() == 4000 {
+                                        "SCSI_ERROR"
+                                    } else {
+                                        &format!("ERROR_CODE_{}", e.code())
+                                    };
+
+                                    crate::log::device_log(
+                                        device,
+                                        &format!(
+                                            "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::init category={} error_code={}",
+                                            failure_category,
+                                            e.code()
+                                        ),
+                                    );
+                                }
+
+                                break 'pass1;
+                            }
+
+                            session.drive = drive;
+                            session.device_path = p.to_string();
+
                             crate::log::device_log(
                                 device,
-                                &format!("Pass 1: cannot re-open drive: {e}"),
+                                &format!(
+                                    "PASS 1/{}: transport_failure_recovery SUCCESS — resuming from mapfile at {}",
+                                    attempt + 1,
+                                    p
+                                ),
                             );
+                        }
+
+                        (Some(p), _) if p == device_path => {
+                            crate::log::device_log(
+                                device,
+                                &format!(
+                                    "Pass 1 attempt {attempt}: drive still at original path {}, attempting re-open",
+                                    p
+                                ),
+                            );
+
+                            let mut drive = match libfreemkv::Drive::open(std::path::Path::new(&p))
+                            {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    crate::log::device_log(
+                                        device,
+                                        &format!(
+                                            "Pass 1 attempt {attempt}: Drive::open({}) failed strategy=transport_failure_recovery error={} — recovery path exhausted",
+                                            p,
+                                            e.code()
+                                        ),
+                                    );
+
+                                    let failure_category = if e.code() == 4000 {
+                                        "SCSI_ERROR"
+                                    } else {
+                                        &format!("ERROR_CODE_{}", e.code())
+                                    };
+
+                                    crate::log::device_log(
+                                        device,
+                                        &format!(
+                                            "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::open category={} error_code={}",
+                                            failure_category,
+                                            e.code()
+                                        ),
+                                    );
+
+                                    break 'pass1;
+                                }
+                            };
+
+                            if let Err(e) = drive.wait_ready() {
+                                crate::log::device_log(
+                                    device,
+                                    &format!(
+                                        "Pass 1 attempt {attempt}: Drive::wait_ready({}) failed strategy=transport_failure_recovery error={} — recovery path exhausted",
+                                        p,
+                                        e.code()
+                                    ),
+                                );
+
+                                let failure_category = if e.code() == 4000 {
+                                    "SCSI_ERROR"
+                                } else {
+                                    &format!("ERROR_CODE_{}", e.code())
+                                };
+
+                                crate::log::device_log(
+                                    device,
+                                    &format!(
+                                        "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::wait_ready category={} error_code={}",
+                                        failure_category,
+                                        e.code()
+                                    ),
+                                );
+
+                                break 'pass1;
+                            }
+
+                            if let Err(e) = drive.init() {
+                                crate::log::device_log(
+                                    device,
+                                    &format!(
+                                        "Pass 1 attempt {attempt}: Drive::init({}) failed strategy=transport_failure_recovery error={} — recovery path exhausted",
+                                        p,
+                                        e.code()
+                                    ),
+                                );
+
+                                let failure_category = if e.code() == 4000 {
+                                    "SCSI_ERROR"
+                                } else {
+                                    &format!("ERROR_CODE_{}", e.code())
+                                };
+
+                                crate::log::device_log(
+                                    device,
+                                    &format!(
+                                        "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::init category={} error_code={}",
+                                        failure_category,
+                                        e.code()
+                                    ),
+                                );
+
+                                break 'pass1;
+                            }
+
+                            session.drive = drive;
+                            session.device_path = p.to_string();
+
+                            crate::log::device_log(
+                                device,
+                                &format!(
+                                    "PASS 1/{}: transport_failure_recovery SUCCESS — resuming from mapfile at {}",
+                                    attempt + 1,
+                                    p
+                                ),
+                            );
+                        }
+
+                        (None, _) => {
+                            crate::log::device_log(
+                                device,
+                                "Pass 1: could not re-discover drive after transport failure strategy=usb_re_enumeration FAILED",
+                            );
+
+                            // Log detailed breakdown of what was tried
+                            let sg_num = device_path
+                                .rsplit('/')
+                                .next()
+                                .and_then(|s| {
+                                    s.strip_prefix("sg").and_then(|n| n.parse::<i32>().ok())
+                                })
+                                .unwrap_or(-1);
+
+                            crate::log::device_log(
+                                device,
+                                &format!(
+                                    "usb_re_enumeration strategy tried probe paths: sg{} (original), sg{}, sg{}, sg{}, sg{}, sg{}, sg{}",
+                                    sg_num,
+                                    sg_num - 1,
+                                    sg_num + 1,
+                                    sg_num - 2,
+                                    sg_num + 2,
+                                    sg_num - 3,
+                                    sg_num + 3
+                                ),
+                            );
+
+                            crate::log::device_log(
+                                device,
+                                "STRATEGY_FAILURE: usb_re_enumeration FAILED — no valid drive path found after USB re-enumeration",
+                            );
+
                             break 'pass1;
                         }
-                    };
-                    let _ = drive.wait_ready();
-                    let _ = drive.init();
-                    session.drive = drive;
-                    session.device_path = new_path;
 
-                    crate::log::device_log(
-                        device,
-                        &format!(
-                            "Pass 1 attempt {}/{}: resuming from mapfile",
-                            attempt + 1,
-                            MAX_PASS1_ATTEMPTS
-                        ),
-                    );
+                        // Fallback for any other case (shouldn't happen but compiler requires exhaustiveness)
+                        _ => {
+                            crate::log::device_log(
+                                device,
+                                "STRATEGY_FAILURE: usb_re_enumeration FAILED — unexpected match state",
+                            );
+
+                            break 'pass1;
+                        }
+                    }
                 }
             }
         }
@@ -2111,14 +2369,34 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             Some(r) => r,
             None => {
                 // All attempts exhausted or unrecoverable.
+
+                // Determine which recovery strategy failed and why
+                let failure_reason = if attempt >= MAX_PASS1_ATTEMPTS {
+                    "transport_failure_recovery_exhausted".to_string()
+                } else {
+                    "unrecoverable_error".to_string()
+                };
+
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "Pass 1: recovery failed at attempt {}/{}, strategy={}",
+                        attempt + 1,
+                        MAX_PASS1_ATTEMPTS,
+                        failure_reason
+                    ),
+                );
+
                 update_state(
                     device,
                     RipState {
                         device: device.to_string(),
                         status: "error".to_string(),
                         disc_present: true,
-                        last_error: "Pass 1 failed: transport failure recovery exhausted"
-                            .to_string(),
+                        last_error: format!(
+                            "Pass 1 failed: {} — see logs for detailed error breakdown",
+                            failure_reason
+                        ),
                         disc_name: display_name.clone(),
                         disc_format: disc_format.clone(),
                         tmdb_title: tmdb_title.clone(),
@@ -2130,6 +2408,28 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         ..Default::default()
                     },
                 );
+
+                // Log recovery guidance for user action based on failure type
+                if failure_reason == "transport_failure_recovery_exhausted" {
+                    crate::log::device_log(
+                        device,
+                        &format!(
+                            "RECOVERY_GUIDANCE: Transport failure recovery exhausted after {} attempts. Check logs for specific error category (SCSI_ERROR, DEVICE_ERROR). If ILLEGAL REQUEST errors present, drive firmware wedged — eject disc and power-cycle USB drive before retrying.",
+                            MAX_PASS1_ATTEMPTS
+                        ),
+                    );
+
+                    crate::log::device_log(
+                        device,
+                        "NEXT_STEPS: 1) Check /api/logs/sg4 for STRATEGY_FAILURE entries. 2) Identify which phase failed (Drive::open/wait_ready/init). 3) If firmware wedged, power-cycle drive. 4) Reprogram autorip and retry rip.",
+                    );
+                } else {
+                    crate::log::device_log(
+                        device,
+                        "RECOVERY_GUIDANCE: Unrecoverable error occurred before transport failure recovery could complete. Check logs for first ERROR entry to identify root cause.",
+                    );
+                }
+
                 if let Ok(mut flags) = HALT_FLAGS.lock() {
                     flags.remove(device);
                 }
@@ -2157,16 +2457,45 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         // ranges (patch) sector-by-sector with full drive-level recovery.
         // Each pass gets its own wallclock cap watcher; cap-fire
         // marks the rip as failed.
+
         let max_retries = cfg_read.max_retries;
+
+        crate::log::device_log(
+            device,
+            &format!(
+                "PASS 2-{}: retry loop starting max_retries={} bytes_pending={} bytes_unreadable={}",
+                max_retries, max_retries, bytes_pending, bytes_unreadable
+            ),
+        );
         let mut pass_2_settled = false;
         for retry_n in 1..=max_retries {
             // If user hit stop OR a prior pass cap-fired, bail.
             if user_halt.load(Ordering::Relaxed) || cap_fired_any.load(Ordering::Relaxed) {
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "PASS {} STOPPED: user halt={}/cap_fired={} before retry pass",
+                        retry_n + 1,
+                        user_halt.load(Ordering::Relaxed),
+                        cap_fired_any.load(Ordering::Relaxed)
+                    ),
+                );
                 break;
             }
+
             if bytes_pending == 0 && bytes_unreadable == 0 {
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "PASS {} SKIPPED: no pending ({}) or unreadable ({}) sectors",
+                        retry_n + 1,
+                        bytes_pending,
+                        bytes_unreadable
+                    ),
+                );
                 break;
             }
+
             let pass = retry_n + 1;
 
             // Settle the drive between Pass 1 and Pass 2 only. Per
@@ -2179,14 +2508,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 pass_2_settled = true;
                 if user_halt.load(Ordering::Relaxed) {
+                    crate::log::device_log(device, "PASS 2 STOPPED: user halt during drive settle");
                     break;
                 }
             }
 
             crate::log::device_log(
                 device,
-                &format!("Pass {pass}/{total_passes}: retrying bad ranges (bpt=1)"),
+                &format!(
+                    "PASS {}/{total_passes}: retrying bad ranges (bpt=1) bytes_pending={} bytes_unreadable={}",
+                    pass, bytes_pending, bytes_unreadable
+                ),
             );
+
             set_pass_progress(
                 device,
                 &display_name,
@@ -2248,14 +2582,86 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             let cr = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
                 Ok(r) => r,
                 Err(e) => {
+                    // Categorize the failure for debugging
+                    let error_category = if e.code() == 4000 {
+                        "SCSI_ERROR"
+                    } else if e.code() >= 6000 && e.code() < 7000 {
+                        "DISC_READ_ERROR"
+                    } else if e.code() >= 1000 && e.code() < 2000 {
+                        "DEVICE_ERROR"
+                    } else {
+                        &format!("ERROR_CODE_{}", e.code())
+                    };
+
+                    let sense_info = e.scsi_sense().map(|s| {
+                        format!(
+                            "sense_key={:02x} ASC={:02x} ASCQ={:02x}",
+                            s.sense_key, s.asc, s.ascq
+                        )
+                    });
+
                     if user_halt.load(Ordering::Relaxed) {
                         crate::log::device_log(
                             device,
-                            &format!("Pass {pass} cancelled (halt): {e}"),
+                            &format!(
+                                "PASS {} CANCELLED: user halt category={} error_code={}",
+                                pass,
+                                error_category,
+                                e.code()
+                            ),
                         );
+
+                        if let Some(info) = sense_info {
+                            crate::log::device_log(device, &info);
+                        }
                     } else {
-                        crate::log::device_log(device, &format!("Pass {pass} failed: {e}"));
+                        crate::log::device_log(
+                            device,
+                            &format!(
+                                "PASS {} FAILED: strategy=patch_recovery category={} error_code={} {}",
+                                pass,
+                                error_category,
+                                e.code(),
+                                sense_info.unwrap_or_default()
+                            ),
+                        );
+
+                        // Log which recovery phase failed
+                        crate::log::device_log(
+                            device,
+                            &format!(
+                                "STRATEGY_FAILURE: patch_recovery FAILED at disc.copy() with category={} (sense_key={:?}, ASC={:?})",
+                                error_category,
+                                e.scsi_sense().map(|s| s.sense_key),
+                                e.scsi_sense().map(|s| s.asc)
+                            ),
+                        );
+
+                        // Provide actionable guidance based on error type
+                        if e.code() == 4000 && e.is_scsi_transport_failure() {
+                            crate::log::device_log(
+                                device,
+                                "ACTION_REQUIRED: Transport failure detected — USB bridge crashed. Eject disc and power-cycle drive before retrying.",
+                            );
+                        } else if e.code() >= 6000
+                            && e.scsi_sense()
+                                .map(|s| s.is_hardware_error())
+                                .unwrap_or(false)
+                        {
+                            crate::log::device_log(
+                                device,
+                                "ACTION_REQUIRED: Drive hardware error detected — drive may be failing. Consider replacing optical drive.",
+                            );
+                        } else if e.code() == 4000
+                            && e.scsi_sense().map(|s| s.asc == 0x20).unwrap_or(false)
+                        {
+                            crate::log::device_log(
+                                device,
+                                "ACTION_REQUIRED: ILLEGAL REQUEST (ASC=0x20) — drive firmware wedged. Power-cycle USB drive to clear state.",
+                            );
+                        }
                     }
+
                     break;
                 }
             };
@@ -2283,7 +2689,25 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             // drive state will help. Give up retries early so we still
             // mux on what we have.
             if recovered == 0 {
-                crate::log::device_log(device, "No progress on last pass — stopping retries.");
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "PASS {} STOPPED: strategy=patch_recovery exhausted — no progress (recovered={} MB) after all retry attempts",
+                        pass,
+                        recovered as f64 / 1_048_576.0
+                    ),
+                );
+
+                crate::log::device_log(
+                    device,
+                    "STRATEGY_FAILURE: patch_recovery exhausted — drive cannot recover more data from bad sectors with current settings",
+                );
+
+                crate::log::device_log(
+                    device,
+                    "RECOVERY_GUIDANCE: Consider increasing max_retries or abort_on_lost_secs if tolerating some data loss is acceptable.",
+                );
+
                 break;
             }
         }
@@ -2312,10 +2736,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 crate::log::device_log(
                     device,
                     &format!(
-                        "Aborting — {:.2}s lost in main movie (threshold: {}s)",
+                        "ABORT: strategy=abort_check triggered — {:.2}s lost in main movie (threshold: {}s)",
                         main_lost_ms_for_history / 1000.0,
                         cfg_read.abort_on_lost_secs
                     ),
+                );
+
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "STRATEGY_FAILURE: abort_check FAILED — data loss ({:.2}s) exceeds threshold ({}s)",
+                        main_lost_ms_for_history / 1000.0,
+                        cfg_read.abort_on_lost_secs
+                    ),
+                );
+
+                crate::log::device_log(
+                    device,
+                    "RECOVERY_GUIDANCE: To allow this rip to complete with data loss, increase abort_on_lost_secs in settings or set to 0 for perfect-rip-only mode.",
                 );
                 update_state_with(device, |s| {
                     s.status = "error".to_string();
