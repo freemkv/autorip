@@ -2732,7 +2732,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             }
 
             let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
-            if cfg_read.abort_on_lost_secs > 0 && main_lost_ms_for_history > abort_threshold_ms {
+            if main_lost_ms_for_history >= abort_threshold_ms {
                 crate::log::device_log(
                     device,
                     &format!(
