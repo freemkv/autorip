@@ -24,6 +24,12 @@ pub struct Config {
     pub keep_iso: bool,
     /// Abort rip if main movie loss exceeds N seconds. 0 = never abort (continue anyway).
     pub abort_on_lost_secs: u64,
+    /// Maximum total time for entire rip across all passes (seconds). Prevents infinite hangs.
+    pub max_rip_duration_secs: u64,
+    /// Minimum per-pass wallclock budget (seconds), used when disc runtime is unknown.
+    pub min_pass_budget_secs: u64,
+    /// Transport failure recovery: delay after USB re-enumeration before retrying open (seconds).
+    pub transport_recovery_delay_secs: u64,
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,
     pub keydb_url: String,
@@ -69,6 +75,15 @@ pub fn load() -> Arc<RwLock<Config>> {
         abort_on_lost_secs: env_or("ABORT_ON_LOST_SECS", "0")
             .parse::<u64>()
             .unwrap_or(0),
+        max_rip_duration_secs: env_or("MAX_RIP_DURATION_SECS", "7200")
+            .parse::<u64>()
+            .unwrap_or(7200), // 2 hours default for UHD with damage recovery
+        min_pass_budget_secs: env_or("MIN_PASS_BUDGET_SECS", "3600")
+            .parse::<u64>()
+            .unwrap_or(3600), // 1 hour per pass default
+        transport_recovery_delay_secs: env_or("TRANSPORT_RECOVERY_DELAY_SECS", "5")
+            .parse::<u64>()
+            .unwrap_or(5), // 5 seconds delay after USB re-enumeration
         tmdb_api_key: env_or("TMDB_API_KEY", ""),
         keydb_path: std::env::var("KEYDB_PATH").ok(),
         keydb_url: env_or("KEYDB_URL", ""),
@@ -130,6 +145,18 @@ fn load_saved(mut cfg: Config) -> Config {
             }
             if let Some(v) = saved.get("abort_on_lost_secs").and_then(|v| v.as_u64()) {
                 cfg.abort_on_lost_secs = v;
+            }
+            if let Some(v) = saved.get("max_rip_duration_secs").and_then(|v| v.as_u64()) {
+                cfg.max_rip_duration_secs = v;
+            }
+            if let Some(v) = saved.get("min_pass_budget_secs").and_then(|v| v.as_u64()) {
+                cfg.min_pass_budget_secs = v;
+            }
+            if let Some(v) = saved
+                .get("transport_recovery_delay_secs")
+                .and_then(|v| v.as_u64())
+            {
+                cfg.transport_recovery_delay_secs = v;
             }
             // Migrate old setting
             if let Some(true) = saved.get("abort_on_error").and_then(|v| v.as_bool()) {

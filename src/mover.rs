@@ -305,6 +305,9 @@ mod tests {
             keydb_url: String::new(),
             webhook_urls: Vec::new(),
             autorip_dir: "/config".into(),
+            max_rip_duration_secs: 7200,
+            min_pass_budget_secs: 3600,
+            transport_recovery_delay_secs: 5,
         }
     }
 
