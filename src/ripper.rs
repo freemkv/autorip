@@ -1763,12 +1763,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // that sleeps for the budget then fires halt if the rip hasn't finished.
     // Per-pass caps (spawn_pass_watcher) still apply as a finer-grained
     // safety net; this is the backstop so a rip can't run forever even if
-    // individual passes keep resetting their timers.
-    let rip_budget_secs = {
-        let disc_capacity_bytes = disc.capacity_bytes.max(1);
-        let estimated_secs = disc_capacity_bytes / 50_000_000; // ~50 MB/s realistic
-        std::cmp::max(estimated_secs, 3600u64)
-    };
+    // individual passes keep resetting their timers. Configurable via
+    // MAX_RIP_DURATION_SECS env var or settings.json.
+    let cfg = cfg.read().unwrap();
+    let rip_budget_secs = cfg.max_rip_duration_secs;
     let halt_rip_watcher = halt.clone();
     let device_rip_watcher = device.to_string();
     let _rip_watcher_guard = std::thread::spawn(move || {
@@ -1793,13 +1791,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     });
 
     // Per-pass wallclock budget. Each pass (Pass 1 sweep + every retry) gets
-    // its own `max(disc_runtime, 1h)` budget. v0.13.15 made this per-pass
-    // (was total-rip in v0.13.12-14) — a fail-safe to bound a wedged pass,
-    // not a bound on the whole rip. If ANY pass exceeds its budget the rip
-    // ends with status=error (see cap_fired_any tracking below).
-    const MIN_PASS_BUDGET_SECS: u64 = 3600;
+    // its own `max(disc_runtime, min_budget)` budget. Configurable via
+    // MIN_PASS_BUDGET_SECS env var or settings.json. If ANY pass exceeds
+    // its budget the rip ends with status=error (see cap_fired_any tracking below).
     let chosen_runtime_secs: u64 = title.duration_secs.max(0.0) as u64;
-    let max_pass_secs = chosen_runtime_secs.max(MIN_PASS_BUDGET_SECS);
+    let max_pass_secs = chosen_runtime_secs.max(cfg.min_pass_budget_secs);
     struct WallclockGuard(Arc<AtomicBool>);
     impl Drop for WallclockGuard {
         fn drop(&mut self) {
@@ -2058,12 +2054,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     crate::log::device_log(
                         device,
                         &format!(
-                            "Pass 1 attempt {attempt}: transport failure (bridge crash), waiting 30 s for USB re-enumeration"
+                            "Pass 1 attempt {attempt}: transport failure (bridge crash), waiting for USB re-enumeration"
                         ),
                     );
                     drop_session(device);
 
-                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    // Wait for USB re-enumeration with configurable delay.
+                    // `cfg` already holds the read guard from the outer scope.
+                    std::thread::sleep(std::time::Duration::from_secs(
+                        cfg.transport_recovery_delay_secs,
+                    ));
 
                     // Re-discover the device. The poll loop may have already
                     // found it; if not, try probing the original path and its
@@ -2079,41 +2079,69 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                                 ),
                             );
 
-                            let mut drive = match libfreemkv::Drive::open(std::path::Path::new(&p))
-                            {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    crate::log::device_log(
-                                        device,
-                                        &format!(
-                                            "Pass 1 attempt {attempt}: Drive::open({}) failed strategy=transport_failure_recovery error={} sense_key={:?} ASC={:?} — recovery path exhausted",
-                                            p,
-                                            e.code(),
-                                            e.scsi_sense().map(|s| s.sense_key),
-                                            e.scsi_sense().map(|s| s.asc)
-                                        ),
-                                    );
+                            // Retry Drive::open with exponential backoff (firmware may not be ready yet).
+                            let mut drive = None;
+                            for retry in 0..3 {
+                                match libfreemkv::Drive::open(std::path::Path::new(&p)) {
+                                    Ok(d) => {
+                                        drive = Some(d);
+                                        break;
+                                    }
+                                    Err(e) if retry < 2 => {
+                                        let backoff_secs =
+                                            cfg.transport_recovery_delay_secs * (1u64 << retry);
+                                        crate::log::device_log(
+                                            device,
+                                            &format!(
+                                                "Pass 1 attempt {attempt}: Drive::open({}) failed, retrying in {}s: error={} sense_key={:?} ASC={:?}",
+                                                p,
+                                                backoff_secs,
+                                                e.code(),
+                                                e.scsi_sense().map(|s| s.sense_key),
+                                                e.scsi_sense().map(|s| s.asc)
+                                            ),
+                                        );
+                                        std::thread::sleep(std::time::Duration::from_secs(
+                                            backoff_secs,
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        crate::log::device_log(
+                                            device,
+                                            &format!(
+                                                "Pass 1 attempt {attempt}: Drive::open({}) failed strategy=transport_failure_recovery error={} sense_key={:?} ASC={:?} — recovery path exhausted",
+                                                p,
+                                                e.code(),
+                                                e.scsi_sense().map(|s| s.sense_key),
+                                                e.scsi_sense().map(|s| s.asc)
+                                            ),
+                                        );
 
-                                    // Categorize failure for debugging
-                                    let failure_category = if e.code() == 4000 {
-                                        "SCSI_ERROR"
-                                    } else if e.code() >= 1000 && e.code() < 2000 {
-                                        "DEVICE_ERROR"
-                                    } else {
-                                        &format!("ERROR_CODE_{}", e.code())
-                                    };
+                                        let failure_category = if e.code() == 4000 {
+                                            "SCSI_ERROR"
+                                        } else if e.code() >= 1000 && e.code() < 2000 {
+                                            "DEVICE_ERROR"
+                                        } else {
+                                            &format!("ERROR_CODE_{}", e.code())
+                                        };
 
-                                    crate::log::device_log(
-                                        device,
-                                        &format!(
-                                            "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::open category={} error_code={}",
-                                            failure_category,
-                                            e.code()
-                                        ),
-                                    );
+                                        crate::log::device_log(
+                                            device,
+                                            &format!(
+                                                "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::open category={} error_code={}",
+                                                failure_category,
+                                                e.code()
+                                            ),
+                                        );
 
-                                    break 'pass1;
+                                        break 'pass1;
+                                    }
                                 }
+                            }
+
+                            let mut drive = match drive {
+                                Some(d) => d,
+                                None => continue 'pass1,
                             };
 
                             if let Err(e) = drive.wait_ready() {
