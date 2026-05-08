@@ -1867,7 +1867,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         session.probed = true;
     }
 
-    let batch = 1u16;
+    // Detect the kernel-reported max batch size (aligned to AACS unit
+    // boundaries). Fall back to libfreemkv's documented default of 60
+    // sectors if detection fails. Pre-fix this was hardcoded to 1,
+    // which:
+    //   - made the API display `current_batch: 1` (misleading — it
+    //     suggested the rip was reading sector-by-sector during sweep,
+    //     but the actual sweep batch is determined inside libfreemkv's
+    //     Disc::copy and is unaffected by this value)
+    //   - made the mux phase read the ISO **one sector at a time**
+    //     (2 KB chunks) via DiscStream::new(reader, title, keys, batch,
+    //     format) — a real perf bug on the mux read path
+    let batch = libfreemkv::disc::detect_max_batch_sectors(device_path);
     let format = disc.content_format;
 
     let output_format = cfg_read.output_format.clone();
