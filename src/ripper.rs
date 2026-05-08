@@ -891,8 +891,20 @@ fn build_bad_ranges(
 struct PassProgressState {
     /// Sliding window of `(observation_time, bytes_good)`. Oldest at the
     /// front, newest at the back. Pruned to the last `SPEED_WINDOW_SECS`
-    /// on each `observe` call.
+    /// on each `observe` call. Drives the *displayed* speed.
     samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+    /// Wall-clock of this pass's first observation. Set on the first
+    /// `observe` call (not `new()`) so a cold-start delay between
+    /// PassProgressState construction and the first byte arriving doesn't
+    /// stretch the running-average denominator. Used by
+    /// [`Self::eta_speed_mbs`] for ETA — long-average rate that doesn't
+    /// jump around on transient slow regions.
+    pass_start: Option<std::time::Instant>,
+    /// `bytes_good` at the moment of the first observation. Lets the
+    /// running average measure *bytes ripped during this pass* rather
+    /// than total bytes_good (which on Pass 2-N starts from a non-zero
+    /// baseline, since the previous pass already wrote some bytes).
+    pass_start_bytes: u64,
     /// Wall-clock of the last throttled callback. The progress closure
     /// checks this to skip work when less than 1.5 s have passed.
     last_update: std::time::Instant,
@@ -907,12 +919,20 @@ struct PassProgressState {
 }
 
 const SPEED_WINDOW_SECS: f64 = 10.0;
+/// Minimum elapsed time before the pass-start running average is
+/// trustworthy enough to use for ETA. Below this threshold the running
+/// average is noisy (small denominator, first-sample artefacts) so we
+/// fall back to the displayed speed. 10 s ≈ a few callbacks at the
+/// 1.5 s throttle, enough to settle.
+const ETA_WARMUP_SECS: f64 = 10.0;
 
 impl PassProgressState {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Self {
             samples: std::collections::VecDeque::with_capacity(16),
+            pass_start: None,
+            pass_start_bytes: 0,
             last_update: now,
             last_log: now,
             last_work_done: 0,
@@ -920,13 +940,20 @@ impl PassProgressState {
         }
     }
 
-    /// Feed a fresh sample. Returns the windowed speed in MB/s.
+    /// Feed a fresh sample. Returns the windowed speed in MB/s for the
+    /// display. Also anchors the pass-start clock + byte counter on the
+    /// first observation so [`Self::eta_speed_mbs`] can compute a stable
+    /// running average.
     ///
     /// Drops samples older than `SPEED_WINDOW_SECS`, pushes the new one,
     /// then computes `(newest_bytes - oldest_bytes) / (newest_t - oldest_t)`.
     /// Returns 0 when the window holds fewer than 2 samples (we need at
     /// least one prior point to compute a rate).
     fn observe(&mut self, now: std::time::Instant, bytes_good: u64) -> f64 {
+        if self.pass_start.is_none() {
+            self.pass_start = Some(now);
+            self.pass_start_bytes = bytes_good;
+        }
         let cutoff = now.checked_sub(std::time::Duration::from_secs_f64(SPEED_WINDOW_SECS));
         if let Some(cutoff) = cutoff {
             while let Some(&(t, _)) = self.samples.front() {
@@ -953,6 +980,41 @@ impl PassProgressState {
         // Sanity cap. Real optical drives top out around 70–140 MB/s;
         // 1 GB/s would be a measurement artifact (clock jitter, mapfile
         // replay, monotonic-clock anomaly). Drop rather than display.
+        mbs.min(1024.0)
+    }
+
+    /// Long-average rate for ETA — bytes ripped this pass divided by
+    /// elapsed-this-pass. Stable; transient stalls barely move it (a
+    /// 12 s stall after 5 minutes of healthy ripping shifts the average
+    /// by less than 5 %). Adapts slowly to sustained speed changes
+    /// (e.g. a drive throttling on a damaged region).
+    ///
+    /// The displayed `speed_mbs` (10 s window) tells the user "what's
+    /// happening right now"; the ETA tells them "when will this finish".
+    /// They're different questions and should use different rates.
+    /// Pre-2026-05-08 they shared the windowed speed and a 12 s stall
+    /// made the displayed ETA jump from 1:30:00 to 30:00:00 — which is
+    /// not when the rip will finish, just where the slope of the last
+    /// 10 s would put it.
+    ///
+    /// Falls back to `display_speed` during the first `ETA_WARMUP_SECS`
+    /// so the ETA isn't garbage early in the pass.
+    fn eta_speed_mbs(&self, now: std::time::Instant, display_speed: f64) -> f64 {
+        let Some(start) = self.pass_start else {
+            return display_speed;
+        };
+        let elapsed = now.duration_since(start).as_secs_f64();
+        if elapsed < ETA_WARMUP_SECS {
+            return display_speed;
+        }
+        let Some(&(_, latest_bytes)) = self.samples.back() else {
+            return display_speed;
+        };
+        let bytes = latest_bytes.saturating_sub(self.pass_start_bytes);
+        if bytes == 0 {
+            return display_speed;
+        }
+        let mbs = bytes as f64 / 1_048_576.0 / elapsed;
         mbs.min(1024.0)
     }
 }
@@ -1079,7 +1141,16 @@ fn push_pass_state(
     let (speed_mbs, pass_eta_str, total_eta_str) = {
         let mut s = state.borrow_mut();
         let now = std::time::Instant::now();
-        let speed = s.observe(now, last_pos);
+        let display_speed = s.observe(now, last_pos);
+        // ETA uses the long-running average (bytes ripped this pass /
+        // elapsed-this-pass), NOT the displayed 10 s window. A transient
+        // 12 s slow region can swing the windowed speed from 15 MB/s to
+        // 1 MB/s; if ETA used that, it would jump from "1:30:00" to
+        // "30:00:00" mid-rip and back. The user wants ETA = "when will
+        // this finish" — that's a question about the whole pass's
+        // average rate. Falls back to display_speed during the first
+        // ETA_WARMUP_SECS while the running average is still noisy.
+        let eta_speed = s.eta_speed_mbs(now, display_speed);
         s.last_update = now;
         let format_secs = |secs: u64| -> String {
             if secs < 60 {
@@ -1092,19 +1163,19 @@ fn push_pass_state(
                 String::new()
             }
         };
-        let pass_eta = if speed > 0.01 && last_work_total > last_pos {
+        let pass_eta = if eta_speed > 0.01 && last_work_total > last_pos {
             let rem_mb = (last_work_total - last_pos) as f64 / 1_048_576.0;
-            format_secs((rem_mb / speed) as u64)
+            format_secs((rem_mb / eta_speed) as u64)
         } else {
             String::new()
         };
-        let total_eta = if speed > 0.01 && total_work_estimated > total_done {
+        let total_eta = if eta_speed > 0.01 && total_work_estimated > total_done {
             let rem_mb = (total_work_estimated - total_done) as f64 / 1_048_576.0;
-            format_secs((rem_mb / speed) as u64)
+            format_secs((rem_mb / eta_speed) as u64)
         } else {
             String::new()
         };
-        (speed, pass_eta, total_eta)
+        (display_speed, pass_eta, total_eta)
     };
     // Back-compat: legacy `eta` mirrors pass_eta.
     let eta = pass_eta_str.clone();
@@ -3912,6 +3983,65 @@ mod tests {
             "speed must return to ~70 MB/s once stall samples age out of \
              the window; got {recovered} MB/s"
         );
+    }
+
+    #[test]
+    fn eta_speed_stays_stable_through_a_stall() {
+        // Companion to pass_progress_stall_drops_out_within_window: the
+        // displayed speed CAN dip during a stall, but the ETA must not.
+        // Old behaviour (eta = remaining / display_speed) made a 12 s
+        // stall flip the displayed ETA from 1:30:00 to 30:00:00. The
+        // running average from pass start barely moves (a 12 s stall
+        // after 5 minutes of healthy rip changes the average by < 5 %).
+        let mut s = PassProgressState::new();
+        let mut t = std::time::Instant::now();
+        let mut bytes: u64 = 0;
+        let _ = s.observe(t, bytes);
+        // 5 minutes of healthy ripping at 70 MB/s
+        for _ in 0..300 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let display_before = s.observe(t, bytes);
+        let eta_before = s.eta_speed_mbs(t, display_before);
+        assert!(
+            (eta_before - 70.0).abs() < 2.0,
+            "ETA speed before stall should be ~70 MB/s, got {eta_before}"
+        );
+
+        // 12 s stall — drive only delivers 1 MB/s.
+        for _ in 0..12 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let display_during_stall = s.observe(t, bytes);
+        let eta_during_stall = s.eta_speed_mbs(t, display_during_stall);
+        assert!(
+            display_during_stall < 30.0,
+            "displayed speed must dip during stall (got {display_during_stall} MB/s)"
+        );
+        // ETA speed should barely have moved — 12 s of slow on top of
+        // 5 min of healthy still averages close to 70 MB/s.
+        assert!(
+            (eta_during_stall - 70.0).abs() < 5.0,
+            "ETA speed during stall must stay close to true average, got \
+             {eta_during_stall} MB/s (display was {display_during_stall} MB/s)"
+        );
+    }
+
+    #[test]
+    fn eta_falls_back_to_display_during_warmup() {
+        // Before ETA_WARMUP_SECS of pass elapsed, the running average is
+        // noisy (small denominator). Use the displayed speed instead.
+        let mut s = PassProgressState::new();
+        let t0 = std::time::Instant::now();
+        let _ = s.observe(t0, 0);
+        // 2 s elapsed — well below warmup
+        let display = s.observe(t0 + std::time::Duration::from_secs(2), 100 * 1_048_576);
+        let eta = s.eta_speed_mbs(t0 + std::time::Duration::from_secs(2), display);
+        assert_eq!(eta, display, "ETA must fall back to display before warmup");
     }
 
     #[test]
