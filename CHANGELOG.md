@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.17.8 (2026-05-08)
+
+### Hotfix: read batch size was hardcoded to 1 sector
+
+`rip_disc` had `let batch = 1u16;` (ripper.rs:1870). Effects:
+
+- **Mux phase read the ISO one sector at a time** (2 KB per read).
+  `DiscStream::new(reader, title, keys, batch, format)` propagates
+  this value into the libfreemkv mux pipeline; with batch=1 every
+  ISO read was a single SCSI/file syscall. Real perf bug on the
+  mux read path.
+- **API display `current_batch: 1` was misleading** — it suggested
+  the Pass 1 sweep was reading sector-by-sector, but the actual
+  sweep batch is determined inside libfreemkv's `Disc::copy` and is
+  unaffected by autorip's value here. Users seeing `current_batch:
+  1` during a healthy multi-sector sweep have been told a lie since
+  v0.13.
+
+Fix: call `libfreemkv::disc::detect_max_batch_sectors(device_path)`
+to get the kernel-reported max batch (aligned to AACS unit
+boundary, typically ~60 sectors on the BU40N) and use that. Falls
+back to libfreemkv's `DEFAULT_BATCH_SECTORS` (60) on any sysfs read
+failure.
+
+This fixes mux speed and API display. **Does not affect Pass 1
+sweep speed** — that's determined by libfreemkv internally and was
+already at 60 sectors per read regardless of this autorip value.
+
 ## 0.17.7 (2026-05-08)
 
 ### Pre-flight disk-space + UI smoothness + audit fixes
