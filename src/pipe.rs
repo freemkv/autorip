@@ -857,7 +857,8 @@ fn print_disc_progress(
         libfreemkv::progress::PassKind::Sweep | libfreemkv::progress::PassKind::Mux => {
             p.work_done as f64 / 1_073_741_824.0
         }
-        libfreemkv::progress::PassKind::Trim { .. } | libfreemkv::progress::PassKind::Scrape { .. } => {
+        libfreemkv::progress::PassKind::Trim { .. }
+        | libfreemkv::progress::PassKind::Scrape { .. } => {
             // Show progress through bad ranges, not just recovered data
             let pct = p.work_pct();
             (pct / 100.0) * (bytes_disc as f64 / 1_073_741_824.0)
@@ -868,9 +869,8 @@ fn print_disc_progress(
     // For patch modes, show work percentage (progress through bad ranges)
     // instead of good percentage (which stays at 0% until recovery succeeds)
     let pct = match p.kind {
-        libfreemkv::progress::PassKind::Trim { .. } | libfreemkv::progress::PassKind::Scrape { .. } => {
-            p.work_pct()
-        }
+        libfreemkv::progress::PassKind::Trim { .. }
+        | libfreemkv::progress::PassKind::Scrape { .. } => p.work_pct(),
         _ => (p.work_done as f64 / p.work_total as f64 * 100.0).min(100.0),
     };
     let eta = if inst_speed_mbps > 0.01 && p.work_total > p.work_done {
@@ -900,12 +900,11 @@ fn print_disc_progress(
     let damage = if bytes_worst_case > 0 {
         let disc_str = fmt_damage_time(disc_damage_secs);
         match title_damage_secs {
-            Some(ms) if ms > 0.0 && ms < disc_damage_secs * 0.99 => {
-                strings::fmt("rip.damage_lost", &[("time", &disc_str), ("movie_time", &fmt_damage_time(ms))])
-            }
-            Some(_) | None => {
-                strings::fmt("rip.damage_lost_movie", &[("time", &disc_str)])
-            }
+            Some(ms) if ms > 0.0 && ms < disc_damage_secs * 0.99 => strings::fmt(
+                "rip.damage_lost",
+                &[("time", &disc_str), ("movie_time", &fmt_damage_time(ms))],
+            ),
+            Some(_) | None => strings::fmt("rip.damage_lost_movie", &[("time", &disc_str)]),
         }
     } else {
         strings::get("rip.damage_none")
