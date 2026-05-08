@@ -2598,14 +2598,66 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 break;
             }
 
-            if bytes_pending == 0 && bytes_unreadable == 0 {
+            // Skip remaining retry passes once the *muxable* scope is
+            // 100 % recovered. The user setting that decides scope:
+            //   - output_format = "iso"  → whole disc must be clean
+            //                              (every sector is part of what
+            //                              gets handed off; nothing to
+            //                              skip elsewhere)
+            //   - output_format = "mkv"/"m2ts" → only the title that
+            //                              actually gets muxed needs to
+            //                              be clean. Bad ranges that
+            //                              fall outside that title's
+            //                              extents (deleted scenes,
+            //                              menus, trailers) are not
+            //                              going into the output and
+            //                              do not earn additional retry
+            //                              passes.
+            //
+            // Note: `abort_on_lost_secs` is *not* the trigger here. That
+            // setting is the user's tolerance for content that ends up
+            // in the MKV; it gates abort vs. mux at the END of all
+            // retries. The skip-passes check is strictly "is everything
+            // we'll mux now Finished in the mapfile?". A disc with 5 s
+            // of loss when the threshold allows 10 s does NOT earn a
+            // skip — there's still recoverable damage in the muxed
+            // scope, so we keep trying.
+            let mux_scope_bad = match libfreemkv::disc::mapfile::Mapfile::load(
+                std::path::Path::new(&mapfile_path_str),
+            ) {
+                Ok(map) => {
+                    use libfreemkv::disc::mapfile::SectorStatus;
+                    let bad = map.ranges_with(&[
+                        SectorStatus::NonTried,
+                        SectorStatus::NonTrimmed,
+                        SectorStatus::NonScraped,
+                        SectorStatus::Unreadable,
+                    ]);
+                    if cfg_read.output_format == "iso" {
+                        bad.iter().map(|(_, sz)| *sz).sum::<u64>()
+                    } else {
+                        libfreemkv::disc::bytes_bad_in_title(&title_for_progress, &bad)
+                    }
+                }
+                Err(_) => {
+                    // Conservative fallback if we can't read the mapfile —
+                    // fall back to the whole-disc check so we don't skip
+                    // a needed pass on a transient read error.
+                    bytes_pending + bytes_unreadable
+                }
+            };
+            if mux_scope_bad == 0 {
+                let scope_label = if cfg_read.output_format == "iso" {
+                    "whole disc"
+                } else {
+                    "muxed title"
+                };
                 crate::log::device_log(
                     device,
                     &format!(
-                        "PASS {} SKIPPED: no pending ({}) or unreadable ({}) sectors",
+                        "PASS {} SKIPPED: {} is 100% recovered in mapfile — proceeding to mux",
                         retry_n + 1,
-                        bytes_pending,
-                        bytes_unreadable
+                        scope_label
                     ),
                 );
                 break;
