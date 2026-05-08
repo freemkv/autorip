@@ -757,10 +757,15 @@ function renderSettings(s){
       {key:'auto_eject',label:'Auto Eject',type:'bool',hint:'Eject disc after rip completes'},
     ]},
     {title:'Ripping',fields:[
-      {key:'main_feature',label:'Main Feature Only',type:'bool',hint:'Rip longest title only'},
-      {key:'min_length_secs',label:'Minimum Title Length (seconds)',type:'number',hint:'Shorter titles are skipped (600 = 10 min)'},
-      {key:'output_format',label:'Output Format',type:'radio',options:[{value:'mkv',label:'MKV'},{value:'m2ts',label:'M2TS'},{value:'iso',label:'ISO (disc image)'},{value:'network',label:'Network'}],hint:'Format for ripped files'},
+      // Output format is the parent setting — title-filtering only
+      // makes sense when the rip ends in a mux step. ISO is a
+      // whole-disc image; the title filters below have nothing to
+      // act on, so they hide. Network output is a streamed mux, so
+      // the title filters still apply.
+      {key:'output_format',label:'Output Format',type:'radio',options:[{value:'mkv',label:'MKV'},{value:'m2ts',label:'M2TS'},{value:'iso',label:'ISO (disc image)'},{value:'network',label:'Network'}],hint:'Format for ripped files. ISO copies the whole disc; the other formats mux selected titles.'},
       {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. 192.168.1.100:9000)',indent:true,placeholder:'192.168.1.100:9000',showIf:{key:'output_format',value:'network'}},
+      {key:'main_feature',label:'Main Feature Only',type:'bool',hint:'Rip longest title only',indent:true,hideIf:{key:'output_format',value:'iso'}},
+      {key:'min_length_secs',label:'Minimum Title Length (seconds)',type:'number',hint:'Shorter titles are skipped (600 = 10 min)',indent:true,hideIf:{key:'output_format',value:'iso'}},
     ]},
     {title:'Recovery',fields:[
       {key:'on_read_error',label:'On Read Error',type:'radio',options:[{value:'stop',label:'Stop'},{value:'skip',label:'Skip (zero-fill)'}],hint:'Stop aborts the rip. Skip zero-fills bad sectors and continues — use after Verify confirms damage is minor.'},
@@ -786,8 +791,10 @@ function renderSettings(s){
       const v=s[f.key]!=null?s[f.key]:'';
       const indent=f.indent?'margin-left:20px;border-left:2px solid var(--border);padding-left:12px':'';
       const ph=f.placeholder?' placeholder="'+f.placeholder+'"':'';
-      const hide=f.showIf&&s[f.showIf.key]!==f.showIf.value?'display:none;':'';
-      const showAttr=f.showIf?' data-show-key="'+f.showIf.key+'" data-show-value="'+f.showIf.value+'"':'';
+      const hideShow=f.showIf&&s[f.showIf.key]!==f.showIf.value;
+      const hideHide=f.hideIf&&s[f.hideIf.key]===f.hideIf.value;
+      const hide=(hideShow||hideHide)?'display:none;':'';
+      const showAttr=f.showIf?' data-show-key="'+f.showIf.key+'" data-show-value="'+f.showIf.value+'"':(f.hideIf?' data-hide-key="'+f.hideIf.key+'" data-hide-value="'+f.hideIf.value+'"':'');
       if(f.type==='radio'){
         const opts=f.options.map(o=>'<label style="font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-right:16px"><input type="radio" name="'+f.key+'" data-key="'+f.key+'" value="'+o.value+'" style="width:14px;height:14px;margin:0;accent-color:var(--accent)" onchange="toggleConditional()" '+(v===o.value?'checked':'')+'>'+o.label+'</label>').join('');
         html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label>'+f.label+'</label><div style="margin-top:4px">'+opts+'</div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
@@ -820,6 +827,14 @@ function toggleConditional(){
     const k=el.dataset.showKey,v=el.dataset.showValue;
     const radio=document.querySelector('input[data-key="'+k+'"]:checked');
     el.style.display=radio&&radio.value===v?'':'none';
+  });
+  // hideIf: hide when the referenced field has the given value
+  // (inverse of showIf). Used to gate title-filtering settings on
+  // output formats that actually have a mux step.
+  document.querySelectorAll('[data-hide-key]').forEach(el=>{
+    const k=el.dataset.hideKey,v=el.dataset.hideValue;
+    const radio=document.querySelector('input[data-key="'+k+'"]:checked');
+    el.style.display=radio&&radio.value===v?'none':'';
   });
 }
 
