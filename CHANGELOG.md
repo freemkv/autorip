@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.17.6 (2026-05-08)
+
+### UI: speed display uses a 10 s sliding window, not EWMA
+
+Live observation on a real rip: the BU40N hit a transient ~12 s slow
+region around LBA 230 K on a UHD disc (drive briefly slow before
+recovering). The drive itself was fine — `dd /dev/sr0` confirmed full
+speed at the same LBA — but the rip *display* showed the slow rate for
+several minutes after the drive had recovered. The EWMA smoother
+(`0.7 × prev + 0.3 × instant`, alpha=0.3) has a long memory tail: it
+takes ~30 s of subsequent samples to decay a single bad sample below
+1 % influence on the displayed value. Net effect: a 12 s stall
+presented as a 3 minute "the rip is stuck" UI even after the drive
+had been at full speed for >2 minutes.
+
+Replaced with a sliding window of `(Instant, bytes_good)` samples over
+the last 10 s. Speed is the average rate across the oldest and newest
+in-window samples. After stall recovery, the slow samples age out of
+the window completely within 10 s and the display reflects the true
+rate. Updates remain fast (every callback recomputes from the freshest
+window) and smooth (each new sample shifts only one slot of the ~6-7
+sample window — no 20 → 7 → 13 → 20 jitter).
+
+Regression test `pass_progress_stall_drops_out_within_window`
+encodes this behaviour directly: 10 s healthy → 12 s stall → 12 s
+recovery, asserts the displayed speed returns to within 2 MB/s of
+the pre-stall rate within `SPEED_WINDOW_SECS` of recovery.
+
 ## 0.17.5 (2026-05-08)
 
 ### Sync release — picks up libfreemkv 0.17.5 Pass N recovery improvements
