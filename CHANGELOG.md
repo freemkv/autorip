@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.17.7 (2026-05-08)
+
+### Pre-flight disk-space + UI smoothness + audit fixes
+
+Fixes a real production failure tonight: a UHD rip ran 30 min before
+ENOSPC because staging only had 43 GB free for an 80 GB disc, then
+left a 45 GB partial ISO behind that filled the host root volume.
+
+- **Pre-flight disk-space check.** Before opening the ISO file,
+  `statvfs(staging)` against `disc.capacity_bytes × 2` (one for ISO,
+  one for MKV being written by mux). Refuse with a clear `E5000`
+  error if short. No drive grinding, no half-written staging.
+
+- **Atomic `settings.json` write.** `config::save` now writes to
+  `.tmp` + `rename` instead of `fs::write` (which truncates). With
+  Watchtower restarting the container on every release, an
+  interrupted write would silently revert all persisted user
+  settings on next boot.
+
+- **`wipe_staging` respects `.done` marker.** Completed rips
+  waiting for the mover thread are now preserved across container
+  restarts. Pre-fix, a Watchtower deploy between rip-finished and
+  mover-finished destroyed 90 minutes of UHD work.
+
+- **Display speed: adaptive sliding window.** Replaces the fixed
+  10 s window with a 3-phase curve (10 s warmup → linear growth →
+  60 s cap). Steady-state jitter (single-sample 1.5 s blips)
+  contributes ~2.5 % weight in the cap window vs ~14 % in the
+  fixed-10s window — visibly smoother without losing stall
+  visibility.
+
+- **ETA decoupled from displayed speed.** ETA now uses a long-
+  running average from pass start; transient stalls don't make it
+  jump from "1:30:00" to "30:00:00" mid-rip.
+
+- **Skip Pass N when muxable scope is 100 % recovered.** With
+  `output_format = "mkv" / "m2ts"`, the retry loop short-circuits
+  once the muxed title is fully Finished — no more burning retries
+  on bad sectors in deleted-scene tracks. With `output_format =
+  "iso"`, the existing whole-disc check still applies.
+
+- **Settings UI: Output Format is the parent of title-filter
+  options.** Main Feature Only and Min Title Length hide when
+  output is ISO (the disc-image path has no mux step to filter).
+
+Audit findings #1, #2, #3, #5, #6, #7, #8-12, #14-20 deferred to
+follow-up releases.
+
 ## 0.17.6 (2026-05-08)
 
 ### UI: speed display uses a 10 s sliding window, not EWMA
