@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.5 (2026-05-08)
+
+### Sync release — picks up libfreemkv 0.17.5 Pass N recovery improvements
+
+Sync release across all freemkv crates to version 0.17.5. autorip's multi-pass orchestration now drives a much more capable patch primitive: kernel-driven `/dev/sr0` pread fallback (Linux), per-range watchdog fix, per-sector range budget, and `consecutive_failures` reset per range. On the BU40N + UHD test bed, pass 1 recovered 28% of formerly-bad data (94.6 MB / 11 s of main-title content) where v0.17.4 could not progress past the first slow range. See [libfreemkv CHANGELOG](https://github.com/freemkv/libfreemkv/blob/main/CHANGELOG.md#0175-2026-05-08) for the full breakdown.
+
 ## 0.17.0 (2026-05-04)
 
 ### Code quality improvements, unified versioning
