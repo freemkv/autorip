@@ -13,12 +13,8 @@ git push origin v0.13.27
 # 3. Wait for CI + Release (~3 min)
 gh run list --repo freemkv/autorip --limit 1
 
-# 4. Watchtower pulls automatically (~30 min)
-#    Or force restart on classe:
-cd /srv/media-autorip && sudo docker compose up -d
-
-# 5. Verify
-curl http://rip.docker.internal.pq.io/api/state
+# 4. Pull the new image on your deployment host
+docker compose pull && docker compose up -d
 ```
 
 ## Detailed Steps
@@ -70,33 +66,14 @@ push tag → CI workflow (lint + test) → Release workflow (docker build + push
 
 Expected: ~3 min total.
 
-### Step 4: Deploy to Server
+### Step 4: Deploy
 
-Watchtower on classe auto-pulls every ~30 min. To force immediate update:
-
-```bash
-# SSH to docker server
-ssh docker.internal.pq.io
-
-# Pull latest and restart
-cd /srv/media-autorip
-sudo docker compose pull
-sudo docker compose up -d
-```
-
-Or just restart:
-```bash
-sudo docker compose restart
-```
-
-### Step 5: Verify
+Pull the new image on your deployment host:
 
 ```bash
-# Check API responds
-curl http://rip.docker.internal.pq.io/api/state
-
-# Check version (if exposed)
-curl http://rip.docker.internal.pq.io/api/system
+cd /path/to/your/autorip/compose
+docker compose pull
+docker compose up -d
 ```
 
 ## Troubleshooting
@@ -106,12 +83,8 @@ curl http://rip.docker.internal.pq.io/api/system
 - CI must pass before Release runs
 
 ### Container still running old version
-- Force pull: `sudo docker compose pull`
-- Force restart: `sudo docker compose up -d`
-
-### Can't SSH to docker server
-- Use Portainer UI: https://portainer.docker.internal.pq.io
-- Or ask for SSH access
+- Force pull: `docker compose pull`
+- Force restart: `docker compose up -d`
 
 ## GitHub Actions Status
 
