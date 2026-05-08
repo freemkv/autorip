@@ -416,7 +416,14 @@ fn rediscover_drive(device: &str, original_path: &str) -> Option<String> {
 /// Returns None on any error (path missing, not POSIX, syscall failure).
 /// Used by the pre-flight check in `rip_disc` to refuse rips that would
 /// run out of space mid-stream.
+///
+/// `clippy::unnecessary_cast` allowed here intentionally: libc's
+/// `f_bavail` / `f_frsize` are `c_ulong` which is u64 on
+/// x86_64 Linux (so clippy on x86_64 sees the cast as a no-op) but
+/// u32 on some 32-bit / BSD targets (where the cast is required).
+/// Drop the cast and the build breaks on the latter.
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
 fn staging_free_bytes(path: &str) -> Option<u64> {
     use std::ffi::CString;
     let cpath = CString::new(path).ok()?;
@@ -428,7 +435,7 @@ fn staging_free_bytes(path: &str) -> Option<u64> {
     // f_bavail = blocks available to non-superuser. Multiply by frsize
     // (fundamental block size). Saturate to avoid overflow on 32-bit
     // platforms with absurdly large filesystems.
-    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize))
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
 #[cfg(not(unix))]
