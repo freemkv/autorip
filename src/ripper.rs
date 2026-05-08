@@ -412,6 +412,30 @@ fn rediscover_drive(device: &str, original_path: &str) -> Option<String> {
 ///
 /// Best-effort: logs each removal, silently ignores errors on individual
 /// entries. A locked or not-yet-created staging root is not fatal.
+/// Available bytes at the given path's filesystem, via `statvfs(3)`.
+/// Returns None on any error (path missing, not POSIX, syscall failure).
+/// Used by the pre-flight check in `rip_disc` to refuse rips that would
+/// run out of space mid-stream.
+#[cfg(unix)]
+fn staging_free_bytes(path: &str) -> Option<u64> {
+    use std::ffi::CString;
+    let cpath = CString::new(path).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
+    if r != 0 {
+        return None;
+    }
+    // f_bavail = blocks available to non-superuser. Multiply by frsize
+    // (fundamental block size). Saturate to avoid overflow on 32-bit
+    // platforms with absurdly large filesystems.
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize))
+}
+
+#[cfg(not(unix))]
+fn staging_free_bytes(_path: &str) -> Option<u64> {
+    None
+}
+
 pub fn wipe_staging(staging_dir: &str) {
     let entries = match std::fs::read_dir(staging_dir) {
         Ok(e) => e,
@@ -419,6 +443,17 @@ pub fn wipe_staging(staging_dir: &str) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // Skip directories that contain a `.done` marker — those are
+        // completed rips waiting for the mover thread to relocate them
+        // to their final destination. A Watchtower-triggered container
+        // restart between "rip finished" and "mover finished" must not
+        // delete a completed UHD rip from staging (90 minutes of work
+        // lost). Genuinely-orphaned in-flight rips (no .done) still get
+        // wiped as before.
+        if path.join(".done").exists() {
+            tracing::info!(path = %path.display(), "preserving staging entry — .done marker present (mover will handle)");
+            continue;
+        }
         match std::fs::remove_dir_all(&path) {
             Ok(_) => tracing::info!(path = %path.display(), "wiped stale staging entry"),
             Err(e) => tracing::warn!(path = %path.display(), error = %e, "staging wipe skipped"),
@@ -2037,6 +2072,40 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let iso_path = std::path::Path::new(&iso_path_str);
         let total_passes = cfg_read.max_retries + 2; // pass 1 + retries + mux
         let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
+
+        // Pre-flight disk-space check. Multipass needs:
+        //   - one disc-sized ISO in staging (Pass 1 sweep target)
+        //   - one MKV being written by mux (~25-50 % of disc; counted as
+        //     1× to be conservative — the ISO is removed mid-mux when
+        //     keep_iso=false but only AFTER the MKV completes)
+        // → require at least 2× capacity_bytes free at staging.
+        // Without this, a UHD rip on a too-small disk runs ~30 minutes
+        // before ENOSPC at the boundary; user loses the time and the
+        // staging dir is left half-full of partial ISO (cleanup on
+        // ENOSPC failure isn't perfect — see audit finding #13).
+        if bytes_total_disc > 0 {
+            let required = bytes_total_disc.saturating_mul(2);
+            if let Some(avail) = staging_free_bytes(&staging) {
+                if avail < required {
+                    let msg = format!(
+                        "E5000: insufficient staging disk space — need ≥ {:.1} GB free at {} (2× disc capacity), have {:.1} GB. Free up space or point STAGING_DIR at a larger volume.",
+                        required as f64 / 1_073_741_824.0,
+                        &staging,
+                        avail as f64 / 1_073_741_824.0,
+                    );
+                    crate::log::device_log(device, &msg);
+                    update_state_with(device, |s| {
+                        s.status = "error".to_string();
+                        s.last_error = msg.clone();
+                    });
+                    if let Ok(mut flags) = HALT_FLAGS.lock() {
+                        flags.remove(device);
+                    }
+                    drop_session(device);
+                    return;
+                }
+            }
+        }
 
         // Shared pass context + title reference for progress callbacks.
         let pass_ctx = PassContext {
