@@ -866,18 +866,33 @@ fn build_bad_ranges(
     )
 }
 
-/// Per-pass speed tracker — bytes delta / wall-clock delta between progress
-/// callbacks, smoothed exponentially. Held in a RefCell inside the callback
-/// closure so interior mutability keeps the closure `Fn`.
+/// Per-pass speed tracker — sliding window of `(Instant, bytes_good)`
+/// samples over the last `SPEED_WINDOW_SECS`. Speed is the average rate
+/// across the oldest and newest in-window samples. Held in a RefCell
+/// inside the callback closure so interior mutability keeps the closure
+/// `Fn`.
+///
+/// **Why a sliding window, not EWMA**: the previous design used
+/// `0.7 × prev + 0.3 × instant`. Alpha=0.3 has a long memory tail — a
+/// 12 s stall (drive briefly slow at a marginal LBA region, common on
+/// damaged or boundary discs) drags the displayed speed for ~30 s after
+/// recovery. Empirically this presents as "the rip looks dead for
+/// minutes" when the drive recovered seconds ago. The sliding window
+/// bounds the stall's influence on the display: at most
+/// `SPEED_WINDOW_SECS` after recovery the slow samples have aged out
+/// and the display reflects the true rate.
+///
+/// **Why this isn't just averaging**: with 1.5 s callback throttling,
+/// the window holds ~6-7 samples. Each new sample shifts only one slot,
+/// so the displayed value moves smoothly (20 → 19 → 18 → 17 instead of
+/// 20 → 7 → 13 → 20 → 2 → 17 jitter). Updates are still fast — every
+/// callback recomputes from the freshest window contents.
 #[derive(Debug)]
 struct PassProgressState {
-    /// Previous sample. `None` until the first `observe` call — required
-    /// because priming the smoothed speed with the first sample would capture
-    /// all bytes already copied (from resume, or from pre-throttle-window
-    /// reads) over a short/arbitrary dt, producing absurd speeds like 2 GB/s
-    /// that then decay very slowly toward the real rate.
-    prev: Option<(std::time::Instant, u64)>,
-    smooth_speed_mbs: f64,
+    /// Sliding window of `(observation_time, bytes_good)`. Oldest at the
+    /// front, newest at the back. Pruned to the last `SPEED_WINDOW_SECS`
+    /// on each `observe` call.
+    samples: std::collections::VecDeque<(std::time::Instant, u64)>,
     /// Wall-clock of the last throttled callback. The progress closure
     /// checks this to skip work when less than 1.5 s have passed.
     last_update: std::time::Instant,
@@ -891,12 +906,13 @@ struct PassProgressState {
     last_work_total: u64,
 }
 
+const SPEED_WINDOW_SECS: f64 = 10.0;
+
 impl PassProgressState {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Self {
-            prev: None,
-            smooth_speed_mbs: 0.0,
+            samples: std::collections::VecDeque::with_capacity(16),
             last_update: now,
             last_log: now,
             last_work_done: 0,
@@ -904,40 +920,40 @@ impl PassProgressState {
         }
     }
 
-    /// Feed a fresh sample. Returns the smoothed speed in MB/s.
+    /// Feed a fresh sample. Returns the windowed speed in MB/s.
     ///
-    /// First call returns 0 and just records the sample (no prior dt to
-    /// compute a delta against). Subsequent calls compute an instantaneous
-    /// rate, cap it at a sanity ceiling (1 GB/s — 10× any real BD drive), and
-    /// mix it into the smoothed value with alpha=0.3.
+    /// Drops samples older than `SPEED_WINDOW_SECS`, pushes the new one,
+    /// then computes `(newest_bytes - oldest_bytes) / (newest_t - oldest_t)`.
+    /// Returns 0 when the window holds fewer than 2 samples (we need at
+    /// least one prior point to compute a rate).
     fn observe(&mut self, now: std::time::Instant, bytes_good: u64) -> f64 {
-        match self.prev {
-            None => {
-                self.prev = Some((now, bytes_good));
-                0.0
-            }
-            Some((prev_t, prev_b)) => {
-                let dt = now.duration_since(prev_t).as_secs_f64();
-                if dt <= 0.0 {
-                    return self.smooth_speed_mbs;
-                }
-                let delta_bytes = bytes_good.saturating_sub(prev_b);
-                let instant = delta_bytes as f64 / 1_048_576.0 / dt;
-                // Cap wild samples — real optical drives top out around
-                // 70–140 MB/s. 1 GB/s is an order of magnitude above anything
-                // physical, so anything larger is a measurement artifact
-                // (callback jitter, mapfile replay, etc.) and should be
-                // dropped, not smoothed in.
-                let instant = instant.min(1024.0);
-                self.prev = Some((now, bytes_good));
-                self.smooth_speed_mbs = if self.smooth_speed_mbs < 0.01 {
-                    instant
+        let cutoff = now.checked_sub(std::time::Duration::from_secs_f64(SPEED_WINDOW_SECS));
+        if let Some(cutoff) = cutoff {
+            while let Some(&(t, _)) = self.samples.front() {
+                if t < cutoff {
+                    self.samples.pop_front();
                 } else {
-                    0.7 * self.smooth_speed_mbs + 0.3 * instant
-                };
-                self.smooth_speed_mbs
+                    break;
+                }
             }
         }
+        self.samples.push_back((now, bytes_good));
+
+        if self.samples.len() < 2 {
+            return 0.0;
+        }
+        let &(oldest_t, oldest_b) = self.samples.front().unwrap();
+        let &(newest_t, newest_b) = self.samples.back().unwrap();
+        let dt = newest_t.duration_since(oldest_t).as_secs_f64();
+        if dt <= 0.0 {
+            return 0.0;
+        }
+        let bytes = newest_b.saturating_sub(oldest_b);
+        let mbs = bytes as f64 / 1_048_576.0 / dt;
+        // Sanity cap. Real optical drives top out around 70–140 MB/s;
+        // 1 GB/s would be a measurement artifact (clock jitter, mapfile
+        // replay, monotonic-clock anomaly). Drop rather than display.
+        mbs.min(1024.0)
     }
 }
 
@@ -3777,17 +3793,20 @@ mod tests {
 
     #[test]
     fn pass_progress_first_sample_returns_zero() {
-        // Regression: v0.12.0 shipped with the tracker priming
-        // `smooth_speed_mbs` on the first sample, which included all
-        // already-copied bytes (e.g. from resume). Users saw "2197.8 MB/s" on
-        // a BD rip — impossible. First call must not compute a speed.
+        // Regression: v0.12.0 shipped with the tracker priming the speed
+        // on the first sample, which included all already-copied bytes
+        // (e.g. from resume). Users saw "2197.8 MB/s" on a BD rip —
+        // impossible. First call must not compute a speed; we need at
+        // least two samples to compute a delta over time.
         let mut s = PassProgressState::new();
         let t0 = std::time::Instant::now();
-        // A disc is 20 GB in at first callback (e.g. because the 1.5 s
-        // throttle let real ripping happen before we sampled).
         let speed = s.observe(t0, 20 * 1024 * 1024 * 1024);
         assert_eq!(speed, 0.0, "first sample must not synthesize a speed");
-        assert_eq!(s.smooth_speed_mbs, 0.0);
+        assert_eq!(
+            s.samples.len(),
+            1,
+            "first sample must be recorded for the next call"
+        );
     }
 
     #[test]
@@ -3836,6 +3855,62 @@ mod tests {
         assert!(
             (last - 70.0).abs() < 2.0,
             "expected ~70 MB/s after convergence, got {last}"
+        );
+    }
+
+    #[test]
+    fn pass_progress_stall_drops_out_within_window() {
+        // The reason the EWMA was replaced. Real-world scenario from
+        // 2026-05-08: BU40N reading a UHD disc, drive briefly slow at a
+        // marginal LBA region (transient drop from 15 MB/s to ~0.5 MB/s
+        // for ~12 s, then full recovery). With the prior EWMA design
+        // (alpha=0.3), the stall sample dragged the displayed speed for
+        // 30+ s after the drive had recovered, presenting as "the rip is
+        // stuck" in the UI when it actually wasn't.
+        //
+        // Sliding window guarantee: at most SPEED_WINDOW_SECS after
+        // recovery, the slow samples have aged out and the displayed
+        // speed reflects the current rate.
+        let mut s = PassProgressState::new();
+        let mut t = std::time::Instant::now();
+        let mut bytes: u64 = 0;
+        let _ = s.observe(t, bytes);
+        // 10 s of healthy ripping at 70 MB/s
+        for _ in 0..10 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let healthy = s.observe(t, bytes);
+        assert!(
+            (healthy - 70.0).abs() < 2.0,
+            "pre-stall speed should be ~70 MB/s, got {healthy}"
+        );
+
+        // 12 s stall — drive only delivers 1 MB/s.
+        for _ in 0..12 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let during_stall = s.observe(t, bytes);
+        assert!(
+            during_stall < 20.0,
+            "stall must visibly drop the displayed speed (got {during_stall} MB/s)"
+        );
+
+        // Recovery — drive back to 70 MB/s. Within SPEED_WINDOW_SECS, the
+        // stall samples should have aged out of the window entirely.
+        for _ in 0..(SPEED_WINDOW_SECS as i32 + 2) {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let recovered = s.observe(t, bytes);
+        assert!(
+            (recovered - 70.0).abs() < 2.0,
+            "speed must return to ~70 MB/s once stall samples age out of \
+             the window; got {recovered} MB/s"
         );
     }
 
