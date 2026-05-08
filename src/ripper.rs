@@ -412,6 +412,30 @@ fn rediscover_drive(device: &str, original_path: &str) -> Option<String> {
 ///
 /// Best-effort: logs each removal, silently ignores errors on individual
 /// entries. A locked or not-yet-created staging root is not fatal.
+/// Available bytes at the given path's filesystem, via `statvfs(3)`.
+/// Returns None on any error (path missing, not POSIX, syscall failure).
+/// Used by the pre-flight check in `rip_disc` to refuse rips that would
+/// run out of space mid-stream.
+#[cfg(unix)]
+fn staging_free_bytes(path: &str) -> Option<u64> {
+    use std::ffi::CString;
+    let cpath = CString::new(path).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
+    if r != 0 {
+        return None;
+    }
+    // f_bavail = blocks available to non-superuser. Multiply by frsize
+    // (fundamental block size). Saturate to avoid overflow on 32-bit
+    // platforms with absurdly large filesystems.
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize))
+}
+
+#[cfg(not(unix))]
+fn staging_free_bytes(_path: &str) -> Option<u64> {
+    None
+}
+
 pub fn wipe_staging(staging_dir: &str) {
     let entries = match std::fs::read_dir(staging_dir) {
         Ok(e) => e,
@@ -419,6 +443,17 @@ pub fn wipe_staging(staging_dir: &str) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // Skip directories that contain a `.done` marker — those are
+        // completed rips waiting for the mover thread to relocate them
+        // to their final destination. A Watchtower-triggered container
+        // restart between "rip finished" and "mover finished" must not
+        // delete a completed UHD rip from staging (90 minutes of work
+        // lost). Genuinely-orphaned in-flight rips (no .done) still get
+        // wiped as before.
+        if path.join(".done").exists() {
+            tracing::info!(path = %path.display(), "preserving staging entry — .done marker present (mover will handle)");
+            continue;
+        }
         match std::fs::remove_dir_all(&path) {
             Ok(_) => tracing::info!(path = %path.display(), "wiped stale staging entry"),
             Err(e) => tracing::warn!(path = %path.display(), error = %e, "staging wipe skipped"),
@@ -891,8 +926,20 @@ fn build_bad_ranges(
 struct PassProgressState {
     /// Sliding window of `(observation_time, bytes_good)`. Oldest at the
     /// front, newest at the back. Pruned to the last `SPEED_WINDOW_SECS`
-    /// on each `observe` call.
+    /// on each `observe` call. Drives the *displayed* speed.
     samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+    /// Wall-clock of this pass's first observation. Set on the first
+    /// `observe` call (not `new()`) so a cold-start delay between
+    /// PassProgressState construction and the first byte arriving doesn't
+    /// stretch the running-average denominator. Used by
+    /// [`Self::eta_speed_mbs`] for ETA — long-average rate that doesn't
+    /// jump around on transient slow regions.
+    pass_start: Option<std::time::Instant>,
+    /// `bytes_good` at the moment of the first observation. Lets the
+    /// running average measure *bytes ripped during this pass* rather
+    /// than total bytes_good (which on Pass 2-N starts from a non-zero
+    /// baseline, since the previous pass already wrote some bytes).
+    pass_start_bytes: u64,
     /// Wall-clock of the last throttled callback. The progress closure
     /// checks this to skip work when less than 1.5 s have passed.
     last_update: std::time::Instant,
@@ -906,13 +953,63 @@ struct PassProgressState {
     last_work_total: u64,
 }
 
-const SPEED_WINDOW_SECS: f64 = 10.0;
+/// Display-speed sliding-window size, adapted to elapsed pass time:
+///
+/// - `0..STATIC_PHASE_SECS` → fixed at `STATIC_WINDOW_SECS` (10 s).
+///   Early in a pass we have little history; small window stays
+///   responsive while ETA hasn't settled yet.
+/// - `STATIC_PHASE_SECS..STATIC_PHASE_SECS+GROWTH_PHASE_SECS` → linear
+///   growth from `STATIC_WINDOW_SECS` to `MAX_WINDOW_SECS` over
+///   `GROWTH_PHASE_SECS` of elapsed time. Smooths progressively as we
+///   accumulate enough samples for a longer window to be reliable.
+/// - `STATIC_PHASE_SECS+GROWTH_PHASE_SECS..` → fixed at
+///   `MAX_WINDOW_SECS` (60 s). Steady-state averaging window: enough
+///   samples (~40 at the 1.5 s callback throttle) that single-sample
+///   jitter contributes ~2.5 % weight, but a real stall still shows up
+///   within the window and recovers within `MAX_WINDOW_SECS` of return
+///   to full speed.
+///
+/// Resulting schedule (1.5 s callback ⇒ ~40 samples in a 60 s window):
+/// ```
+///   t+ 30 s → 10 s window
+///   t+ 60 s → 10 s window (start of growth phase)
+///   t+210 s → 35 s window
+///   t+360 s → 60 s window (cap reached)
+///   t+1 h  → 60 s window
+/// ```
+const STATIC_PHASE_SECS: f64 = 60.0;
+const STATIC_WINDOW_SECS: f64 = 10.0;
+const GROWTH_PHASE_SECS: f64 = 300.0;
+const MAX_WINDOW_SECS: f64 = 60.0;
+
+/// Compute the appropriate sliding-window size for the displayed speed
+/// given how long the pass has been running. See [`STATIC_PHASE_SECS`]
+/// docs above for the curve shape.
+fn display_window_secs(elapsed_pass_secs: f64) -> f64 {
+    if elapsed_pass_secs < STATIC_PHASE_SECS {
+        STATIC_WINDOW_SECS
+    } else if elapsed_pass_secs < STATIC_PHASE_SECS + GROWTH_PHASE_SECS {
+        let t = elapsed_pass_secs - STATIC_PHASE_SECS;
+        STATIC_WINDOW_SECS + (MAX_WINDOW_SECS - STATIC_WINDOW_SECS) * (t / GROWTH_PHASE_SECS)
+    } else {
+        MAX_WINDOW_SECS
+    }
+}
+
+/// Minimum elapsed time before the pass-start running average is
+/// trustworthy enough to use for ETA. Below this threshold the running
+/// average is noisy (small denominator, first-sample artefacts) so we
+/// fall back to the displayed speed. 10 s ≈ a few callbacks at the
+/// 1.5 s throttle, enough to settle.
+const ETA_WARMUP_SECS: f64 = 10.0;
 
 impl PassProgressState {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Self {
             samples: std::collections::VecDeque::with_capacity(16),
+            pass_start: None,
+            pass_start_bytes: 0,
             last_update: now,
             last_log: now,
             last_work_done: 0,
@@ -920,14 +1017,28 @@ impl PassProgressState {
         }
     }
 
-    /// Feed a fresh sample. Returns the windowed speed in MB/s.
+    /// Feed a fresh sample. Returns the windowed speed in MB/s for the
+    /// display. Also anchors the pass-start clock + byte counter on the
+    /// first observation so [`Self::eta_speed_mbs`] can compute a stable
+    /// running average.
     ///
-    /// Drops samples older than `SPEED_WINDOW_SECS`, pushes the new one,
-    /// then computes `(newest_bytes - oldest_bytes) / (newest_t - oldest_t)`.
+    /// Drops samples older than the *current* window size (which grows
+    /// with elapsed pass time per [`display_window_secs`]), pushes the
+    /// new one, then computes
+    /// `(newest_bytes - oldest_bytes) / (newest_t - oldest_t)`.
     /// Returns 0 when the window holds fewer than 2 samples (we need at
     /// least one prior point to compute a rate).
     fn observe(&mut self, now: std::time::Instant, bytes_good: u64) -> f64 {
-        let cutoff = now.checked_sub(std::time::Duration::from_secs_f64(SPEED_WINDOW_SECS));
+        if self.pass_start.is_none() {
+            self.pass_start = Some(now);
+            self.pass_start_bytes = bytes_good;
+        }
+        let elapsed_pass = self
+            .pass_start
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+        let window_secs = display_window_secs(elapsed_pass);
+        let cutoff = now.checked_sub(std::time::Duration::from_secs_f64(window_secs));
         if let Some(cutoff) = cutoff {
             while let Some(&(t, _)) = self.samples.front() {
                 if t < cutoff {
@@ -953,6 +1064,41 @@ impl PassProgressState {
         // Sanity cap. Real optical drives top out around 70–140 MB/s;
         // 1 GB/s would be a measurement artifact (clock jitter, mapfile
         // replay, monotonic-clock anomaly). Drop rather than display.
+        mbs.min(1024.0)
+    }
+
+    /// Long-average rate for ETA — bytes ripped this pass divided by
+    /// elapsed-this-pass. Stable; transient stalls barely move it (a
+    /// 12 s stall after 5 minutes of healthy ripping shifts the average
+    /// by less than 5 %). Adapts slowly to sustained speed changes
+    /// (e.g. a drive throttling on a damaged region).
+    ///
+    /// The displayed `speed_mbs` (10 s window) tells the user "what's
+    /// happening right now"; the ETA tells them "when will this finish".
+    /// They're different questions and should use different rates.
+    /// Pre-2026-05-08 they shared the windowed speed and a 12 s stall
+    /// made the displayed ETA jump from 1:30:00 to 30:00:00 — which is
+    /// not when the rip will finish, just where the slope of the last
+    /// 10 s would put it.
+    ///
+    /// Falls back to `display_speed` during the first `ETA_WARMUP_SECS`
+    /// so the ETA isn't garbage early in the pass.
+    fn eta_speed_mbs(&self, now: std::time::Instant, display_speed: f64) -> f64 {
+        let Some(start) = self.pass_start else {
+            return display_speed;
+        };
+        let elapsed = now.duration_since(start).as_secs_f64();
+        if elapsed < ETA_WARMUP_SECS {
+            return display_speed;
+        }
+        let Some(&(_, latest_bytes)) = self.samples.back() else {
+            return display_speed;
+        };
+        let bytes = latest_bytes.saturating_sub(self.pass_start_bytes);
+        if bytes == 0 {
+            return display_speed;
+        }
+        let mbs = bytes as f64 / 1_048_576.0 / elapsed;
         mbs.min(1024.0)
     }
 }
@@ -1079,7 +1225,16 @@ fn push_pass_state(
     let (speed_mbs, pass_eta_str, total_eta_str) = {
         let mut s = state.borrow_mut();
         let now = std::time::Instant::now();
-        let speed = s.observe(now, last_pos);
+        let display_speed = s.observe(now, last_pos);
+        // ETA uses the long-running average (bytes ripped this pass /
+        // elapsed-this-pass), NOT the displayed 10 s window. A transient
+        // 12 s slow region can swing the windowed speed from 15 MB/s to
+        // 1 MB/s; if ETA used that, it would jump from "1:30:00" to
+        // "30:00:00" mid-rip and back. The user wants ETA = "when will
+        // this finish" — that's a question about the whole pass's
+        // average rate. Falls back to display_speed during the first
+        // ETA_WARMUP_SECS while the running average is still noisy.
+        let eta_speed = s.eta_speed_mbs(now, display_speed);
         s.last_update = now;
         let format_secs = |secs: u64| -> String {
             if secs < 60 {
@@ -1092,19 +1247,19 @@ fn push_pass_state(
                 String::new()
             }
         };
-        let pass_eta = if speed > 0.01 && last_work_total > last_pos {
+        let pass_eta = if eta_speed > 0.01 && last_work_total > last_pos {
             let rem_mb = (last_work_total - last_pos) as f64 / 1_048_576.0;
-            format_secs((rem_mb / speed) as u64)
+            format_secs((rem_mb / eta_speed) as u64)
         } else {
             String::new()
         };
-        let total_eta = if speed > 0.01 && total_work_estimated > total_done {
+        let total_eta = if eta_speed > 0.01 && total_work_estimated > total_done {
             let rem_mb = (total_work_estimated - total_done) as f64 / 1_048_576.0;
-            format_secs((rem_mb / speed) as u64)
+            format_secs((rem_mb / eta_speed) as u64)
         } else {
             String::new()
         };
-        (speed, pass_eta, total_eta)
+        (display_speed, pass_eta, total_eta)
     };
     // Back-compat: legacy `eta` mirrors pass_eta.
     let eta = pass_eta_str.clone();
@@ -1918,6 +2073,40 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let total_passes = cfg_read.max_retries + 2; // pass 1 + retries + mux
         let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
 
+        // Pre-flight disk-space check. Multipass needs:
+        //   - one disc-sized ISO in staging (Pass 1 sweep target)
+        //   - one MKV being written by mux (~25-50 % of disc; counted as
+        //     1× to be conservative — the ISO is removed mid-mux when
+        //     keep_iso=false but only AFTER the MKV completes)
+        // → require at least 2× capacity_bytes free at staging.
+        // Without this, a UHD rip on a too-small disk runs ~30 minutes
+        // before ENOSPC at the boundary; user loses the time and the
+        // staging dir is left half-full of partial ISO (cleanup on
+        // ENOSPC failure isn't perfect — see audit finding #13).
+        if bytes_total_disc > 0 {
+            let required = bytes_total_disc.saturating_mul(2);
+            if let Some(avail) = staging_free_bytes(&staging) {
+                if avail < required {
+                    let msg = format!(
+                        "E5000: insufficient staging disk space — need ≥ {:.1} GB free at {} (2× disc capacity), have {:.1} GB. Free up space or point STAGING_DIR at a larger volume.",
+                        required as f64 / 1_073_741_824.0,
+                        &staging,
+                        avail as f64 / 1_073_741_824.0,
+                    );
+                    crate::log::device_log(device, &msg);
+                    update_state_with(device, |s| {
+                        s.status = "error".to_string();
+                        s.last_error = msg.clone();
+                    });
+                    if let Ok(mut flags) = HALT_FLAGS.lock() {
+                        flags.remove(device);
+                    }
+                    drop_session(device);
+                    return;
+                }
+            }
+        }
+
         // Shared pass context + title reference for progress callbacks.
         let pass_ctx = PassContext {
             device: device.to_string(),
@@ -2527,14 +2716,66 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 break;
             }
 
-            if bytes_pending == 0 && bytes_unreadable == 0 {
+            // Skip remaining retry passes once the *muxable* scope is
+            // 100 % recovered. The user setting that decides scope:
+            //   - output_format = "iso"  → whole disc must be clean
+            //                              (every sector is part of what
+            //                              gets handed off; nothing to
+            //                              skip elsewhere)
+            //   - output_format = "mkv"/"m2ts" → only the title that
+            //                              actually gets muxed needs to
+            //                              be clean. Bad ranges that
+            //                              fall outside that title's
+            //                              extents (deleted scenes,
+            //                              menus, trailers) are not
+            //                              going into the output and
+            //                              do not earn additional retry
+            //                              passes.
+            //
+            // Note: `abort_on_lost_secs` is *not* the trigger here. That
+            // setting is the user's tolerance for content that ends up
+            // in the MKV; it gates abort vs. mux at the END of all
+            // retries. The skip-passes check is strictly "is everything
+            // we'll mux now Finished in the mapfile?". A disc with 5 s
+            // of loss when the threshold allows 10 s does NOT earn a
+            // skip — there's still recoverable damage in the muxed
+            // scope, so we keep trying.
+            let mux_scope_bad = match libfreemkv::disc::mapfile::Mapfile::load(
+                std::path::Path::new(&mapfile_path_str),
+            ) {
+                Ok(map) => {
+                    use libfreemkv::disc::mapfile::SectorStatus;
+                    let bad = map.ranges_with(&[
+                        SectorStatus::NonTried,
+                        SectorStatus::NonTrimmed,
+                        SectorStatus::NonScraped,
+                        SectorStatus::Unreadable,
+                    ]);
+                    if cfg_read.output_format == "iso" {
+                        bad.iter().map(|(_, sz)| *sz).sum::<u64>()
+                    } else {
+                        libfreemkv::disc::bytes_bad_in_title(&title_for_progress, &bad)
+                    }
+                }
+                Err(_) => {
+                    // Conservative fallback if we can't read the mapfile —
+                    // fall back to the whole-disc check so we don't skip
+                    // a needed pass on a transient read error.
+                    bytes_pending + bytes_unreadable
+                }
+            };
+            if mux_scope_bad == 0 {
+                let scope_label = if cfg_read.output_format == "iso" {
+                    "whole disc"
+                } else {
+                    "muxed title"
+                };
                 crate::log::device_log(
                     device,
                     &format!(
-                        "PASS {} SKIPPED: no pending ({}) or unreadable ({}) sectors",
+                        "PASS {} SKIPPED: {} is 100% recovered in mapfile — proceeding to mux",
                         retry_n + 1,
-                        bytes_pending,
-                        bytes_unreadable
+                        scope_label
                     ),
                 );
                 break;
@@ -3868,9 +4109,10 @@ mod tests {
         // 30+ s after the drive had recovered, presenting as "the rip is
         // stuck" in the UI when it actually wasn't.
         //
-        // Sliding window guarantee: at most SPEED_WINDOW_SECS after
-        // recovery, the slow samples have aged out and the displayed
-        // speed reflects the current rate.
+        // Sliding window guarantee: at most STATIC_WINDOW_SECS after
+        // recovery (in the early-pass static phase used here), the slow
+        // samples have aged out and the displayed speed reflects the
+        // current rate.
         let mut s = PassProgressState::new();
         let mut t = std::time::Instant::now();
         let mut bytes: u64 = 0;
@@ -3899,9 +4141,9 @@ mod tests {
             "stall must visibly drop the displayed speed (got {during_stall} MB/s)"
         );
 
-        // Recovery — drive back to 70 MB/s. Within SPEED_WINDOW_SECS, the
+        // Recovery — drive back to 70 MB/s. Within STATIC_WINDOW_SECS, the
         // stall samples should have aged out of the window entirely.
-        for _ in 0..(SPEED_WINDOW_SECS as i32 + 2) {
+        for _ in 0..(STATIC_WINDOW_SECS as i32 + 2) {
             t += std::time::Duration::from_secs(1);
             bytes += 70 * 1_048_576;
             let _ = s.observe(t, bytes);
@@ -3912,6 +4154,121 @@ mod tests {
             "speed must return to ~70 MB/s once stall samples age out of \
              the window; got {recovered} MB/s"
         );
+    }
+
+    #[test]
+    fn display_window_grows_with_elapsed_time() {
+        // Schedule sanity: warmup at 10 s, growth from 60-360 s, cap at 60 s.
+        assert_eq!(display_window_secs(0.0), 10.0);
+        assert_eq!(display_window_secs(30.0), 10.0);
+        assert_eq!(display_window_secs(59.9), 10.0);
+        assert_eq!(display_window_secs(60.0), 10.0); // start of growth
+        assert!((display_window_secs(210.0) - 35.0).abs() < 0.1); // mid growth
+        assert!((display_window_secs(360.0) - 60.0).abs() < 0.1); // cap reached
+        assert_eq!(display_window_secs(3600.0), 60.0); // long after cap
+    }
+
+    #[test]
+    fn display_speed_is_smoother_in_steady_state() {
+        // Run long enough for the adaptive window to reach the 60 s cap,
+        // then inject a single-sample blip and assert the displayed
+        // speed barely moves. Demonstrates that steady-state jitter
+        // (a single 1.5 s sample of bad rate) contributes only ~2.5 %
+        // weight in a 60 s window of ~40 samples.
+        let mut s = PassProgressState::new();
+        let mut t = std::time::Instant::now();
+        let mut bytes: u64 = 0;
+        let _ = s.observe(t, bytes);
+        // 7 minutes of steady 70 MB/s — past STATIC_PHASE + GROWTH_PHASE,
+        // so the window has reached the 60 s cap.
+        for _ in 0..420 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let steady = s.observe(t, bytes);
+        assert!(
+            (steady - 70.0).abs() < 1.5,
+            "steady-state speed should be ~70 MB/s after 7 min, got {steady}"
+        );
+        // Inject one slow second.
+        t += std::time::Duration::from_secs(1);
+        bytes += 1_048_576;
+        let after_blip = s.observe(t, bytes);
+        // Single slow sample in a 60 s / ~40-sample window: contribution
+        // ≤ ~2 MB/s drop. Pre-adaptive 10 s window would have dropped
+        // the displayed speed by ~7 MB/s (10 % of window weight).
+        assert!(
+            (steady - after_blip) < 3.0,
+            "single-sample blip shouldn't move displayed speed by > 3 MB/s \
+             in a steady-state 60 s window: before {steady}, after {after_blip}"
+        );
+    }
+
+    #[test]
+    fn eta_speed_stays_stable_through_a_stall() {
+        // Companion to pass_progress_stall_drops_out_within_window: the
+        // displayed speed CAN dip during a stall, but the ETA must not.
+        // Old behaviour (eta = remaining / display_speed) made a 12 s
+        // stall flip the displayed ETA from 1:30:00 to 30:00:00. The
+        // running average from pass start barely moves (a 12 s stall
+        // after 5 minutes of healthy rip changes the average by < 5 %).
+        let mut s = PassProgressState::new();
+        let mut t = std::time::Instant::now();
+        let mut bytes: u64 = 0;
+        let _ = s.observe(t, bytes);
+        // 5 minutes of healthy ripping at 70 MB/s
+        for _ in 0..300 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let display_before = s.observe(t, bytes);
+        let eta_before = s.eta_speed_mbs(t, display_before);
+        assert!(
+            (eta_before - 70.0).abs() < 2.0,
+            "ETA speed before stall should be ~70 MB/s, got {eta_before}"
+        );
+
+        // 12 s stall — drive only delivers 1 MB/s.
+        for _ in 0..12 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let display_during_stall = s.observe(t, bytes);
+        let eta_during_stall = s.eta_speed_mbs(t, display_during_stall);
+        // After 5 min, the adaptive display window has grown to ~50 s,
+        // so a 12 s stall is only ~24 % of the window — display dips
+        // visibly but not catastrophically. The point of this test is
+        // that ETA stays stable, not that display crashes; the prior
+        // fixed-10s window dropped display to <2 MB/s here, but with
+        // the adaptive window dilution the stall registers as a
+        // moderate dip (which is *better* UX).
+        assert!(
+            display_during_stall < 65.0,
+            "displayed speed must visibly dip during stall (got {display_during_stall} MB/s)"
+        );
+        // ETA speed should barely have moved — 12 s of slow on top of
+        // 5 min of healthy still averages close to 70 MB/s.
+        assert!(
+            (eta_during_stall - 70.0).abs() < 5.0,
+            "ETA speed during stall must stay close to true average, got \
+             {eta_during_stall} MB/s (display was {display_during_stall} MB/s)"
+        );
+    }
+
+    #[test]
+    fn eta_falls_back_to_display_during_warmup() {
+        // Before ETA_WARMUP_SECS of pass elapsed, the running average is
+        // noisy (small denominator). Use the displayed speed instead.
+        let mut s = PassProgressState::new();
+        let t0 = std::time::Instant::now();
+        let _ = s.observe(t0, 0);
+        // 2 s elapsed — well below warmup
+        let display = s.observe(t0 + std::time::Duration::from_secs(2), 100 * 1_048_576);
+        let eta = s.eta_speed_mbs(t0 + std::time::Duration::from_secs(2), display);
+        assert_eq!(eta, display, "ETA must fall back to display before warmup");
     }
 
     #[test]

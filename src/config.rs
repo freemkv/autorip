@@ -176,7 +176,25 @@ fn load_saved(mut cfg: Config) -> Config {
 
 pub fn save(cfg: &Config) {
     let path = cfg.settings_file();
-    if let Ok(json) = serde_json::to_string_pretty(cfg) {
-        let _ = std::fs::write(&path, json);
+    let Ok(json) = serde_json::to_string_pretty(cfg) else {
+        return;
+    };
+    // Write atomically: a SIGKILL or container OOM mid-`fs::write` would
+    // truncate settings.json to zero or partial bytes; on next start
+    // `load_saved` would silently reset every persisted field
+    // (TMDB key, output dirs, max_retries, abort_on_lost_secs, …) to
+    // env-var defaults. Watchtower restarts the container on every
+    // release, so this isn't theoretical. Write to a sibling temp file,
+    // fsync, then rename — POSIX rename is atomic within a filesystem.
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, json.as_bytes()).is_err() {
+        return;
+    }
+    if let Ok(f) = std::fs::File::open(&tmp) {
+        let _ = f.sync_all();
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(error = %e, "settings rename failed; settings.json unchanged");
     }
 }
