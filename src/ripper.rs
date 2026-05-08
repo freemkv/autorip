@@ -918,7 +918,49 @@ struct PassProgressState {
     last_work_total: u64,
 }
 
-const SPEED_WINDOW_SECS: f64 = 10.0;
+/// Display-speed sliding-window size, adapted to elapsed pass time:
+///
+/// - `0..STATIC_PHASE_SECS` → fixed at `STATIC_WINDOW_SECS` (10 s).
+///   Early in a pass we have little history; small window stays
+///   responsive while ETA hasn't settled yet.
+/// - `STATIC_PHASE_SECS..STATIC_PHASE_SECS+GROWTH_PHASE_SECS` → linear
+///   growth from `STATIC_WINDOW_SECS` to `MAX_WINDOW_SECS` over
+///   `GROWTH_PHASE_SECS` of elapsed time. Smooths progressively as we
+///   accumulate enough samples for a longer window to be reliable.
+/// - `STATIC_PHASE_SECS+GROWTH_PHASE_SECS..` → fixed at
+///   `MAX_WINDOW_SECS` (60 s). Steady-state averaging window: enough
+///   samples (~40 at the 1.5 s callback throttle) that single-sample
+///   jitter contributes ~2.5 % weight, but a real stall still shows up
+///   within the window and recovers within `MAX_WINDOW_SECS` of return
+///   to full speed.
+///
+/// Resulting schedule (1.5 s callback ⇒ ~40 samples in a 60 s window):
+/// ```
+///   t+ 30 s → 10 s window
+///   t+ 60 s → 10 s window (start of growth phase)
+///   t+210 s → 35 s window
+///   t+360 s → 60 s window (cap reached)
+///   t+1 h  → 60 s window
+/// ```
+const STATIC_PHASE_SECS: f64 = 60.0;
+const STATIC_WINDOW_SECS: f64 = 10.0;
+const GROWTH_PHASE_SECS: f64 = 300.0;
+const MAX_WINDOW_SECS: f64 = 60.0;
+
+/// Compute the appropriate sliding-window size for the displayed speed
+/// given how long the pass has been running. See [`STATIC_PHASE_SECS`]
+/// docs above for the curve shape.
+fn display_window_secs(elapsed_pass_secs: f64) -> f64 {
+    if elapsed_pass_secs < STATIC_PHASE_SECS {
+        STATIC_WINDOW_SECS
+    } else if elapsed_pass_secs < STATIC_PHASE_SECS + GROWTH_PHASE_SECS {
+        let t = elapsed_pass_secs - STATIC_PHASE_SECS;
+        STATIC_WINDOW_SECS + (MAX_WINDOW_SECS - STATIC_WINDOW_SECS) * (t / GROWTH_PHASE_SECS)
+    } else {
+        MAX_WINDOW_SECS
+    }
+}
+
 /// Minimum elapsed time before the pass-start running average is
 /// trustworthy enough to use for ETA. Below this threshold the running
 /// average is noisy (small denominator, first-sample artefacts) so we
@@ -945,8 +987,10 @@ impl PassProgressState {
     /// first observation so [`Self::eta_speed_mbs`] can compute a stable
     /// running average.
     ///
-    /// Drops samples older than `SPEED_WINDOW_SECS`, pushes the new one,
-    /// then computes `(newest_bytes - oldest_bytes) / (newest_t - oldest_t)`.
+    /// Drops samples older than the *current* window size (which grows
+    /// with elapsed pass time per [`display_window_secs`]), pushes the
+    /// new one, then computes
+    /// `(newest_bytes - oldest_bytes) / (newest_t - oldest_t)`.
     /// Returns 0 when the window holds fewer than 2 samples (we need at
     /// least one prior point to compute a rate).
     fn observe(&mut self, now: std::time::Instant, bytes_good: u64) -> f64 {
@@ -954,7 +998,12 @@ impl PassProgressState {
             self.pass_start = Some(now);
             self.pass_start_bytes = bytes_good;
         }
-        let cutoff = now.checked_sub(std::time::Duration::from_secs_f64(SPEED_WINDOW_SECS));
+        let elapsed_pass = self
+            .pass_start
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+        let window_secs = display_window_secs(elapsed_pass);
+        let cutoff = now.checked_sub(std::time::Duration::from_secs_f64(window_secs));
         if let Some(cutoff) = cutoff {
             while let Some(&(t, _)) = self.samples.front() {
                 if t < cutoff {
@@ -3991,9 +4040,10 @@ mod tests {
         // 30+ s after the drive had recovered, presenting as "the rip is
         // stuck" in the UI when it actually wasn't.
         //
-        // Sliding window guarantee: at most SPEED_WINDOW_SECS after
-        // recovery, the slow samples have aged out and the displayed
-        // speed reflects the current rate.
+        // Sliding window guarantee: at most STATIC_WINDOW_SECS after
+        // recovery (in the early-pass static phase used here), the slow
+        // samples have aged out and the displayed speed reflects the
+        // current rate.
         let mut s = PassProgressState::new();
         let mut t = std::time::Instant::now();
         let mut bytes: u64 = 0;
@@ -4022,9 +4072,9 @@ mod tests {
             "stall must visibly drop the displayed speed (got {during_stall} MB/s)"
         );
 
-        // Recovery — drive back to 70 MB/s. Within SPEED_WINDOW_SECS, the
+        // Recovery — drive back to 70 MB/s. Within STATIC_WINDOW_SECS, the
         // stall samples should have aged out of the window entirely.
-        for _ in 0..(SPEED_WINDOW_SECS as i32 + 2) {
+        for _ in 0..(STATIC_WINDOW_SECS as i32 + 2) {
             t += std::time::Duration::from_secs(1);
             bytes += 70 * 1_048_576;
             let _ = s.observe(t, bytes);
@@ -4034,6 +4084,55 @@ mod tests {
             (recovered - 70.0).abs() < 2.0,
             "speed must return to ~70 MB/s once stall samples age out of \
              the window; got {recovered} MB/s"
+        );
+    }
+
+    #[test]
+    fn display_window_grows_with_elapsed_time() {
+        // Schedule sanity: warmup at 10 s, growth from 60-360 s, cap at 60 s.
+        assert_eq!(display_window_secs(0.0), 10.0);
+        assert_eq!(display_window_secs(30.0), 10.0);
+        assert_eq!(display_window_secs(59.9), 10.0);
+        assert_eq!(display_window_secs(60.0), 10.0); // start of growth
+        assert!((display_window_secs(210.0) - 35.0).abs() < 0.1); // mid growth
+        assert!((display_window_secs(360.0) - 60.0).abs() < 0.1); // cap reached
+        assert_eq!(display_window_secs(3600.0), 60.0); // long after cap
+    }
+
+    #[test]
+    fn display_speed_is_smoother_in_steady_state() {
+        // Run long enough for the adaptive window to reach the 60 s cap,
+        // then inject a single-sample blip and assert the displayed
+        // speed barely moves. Demonstrates that steady-state jitter
+        // (a single 1.5 s sample of bad rate) contributes only ~2.5 %
+        // weight in a 60 s window of ~40 samples.
+        let mut s = PassProgressState::new();
+        let mut t = std::time::Instant::now();
+        let mut bytes: u64 = 0;
+        let _ = s.observe(t, bytes);
+        // 7 minutes of steady 70 MB/s — past STATIC_PHASE + GROWTH_PHASE,
+        // so the window has reached the 60 s cap.
+        for _ in 0..420 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let steady = s.observe(t, bytes);
+        assert!(
+            (steady - 70.0).abs() < 1.5,
+            "steady-state speed should be ~70 MB/s after 7 min, got {steady}"
+        );
+        // Inject one slow second.
+        t += std::time::Duration::from_secs(1);
+        bytes += 1_048_576;
+        let after_blip = s.observe(t, bytes);
+        // Single slow sample in a 60 s / ~40-sample window: contribution
+        // ≤ ~2 MB/s drop. Pre-adaptive 10 s window would have dropped
+        // the displayed speed by ~7 MB/s (10 % of window weight).
+        assert!(
+            (steady - after_blip) < 3.0,
+            "single-sample blip shouldn't move displayed speed by > 3 MB/s \
+             in a steady-state 60 s window: before {steady}, after {after_blip}"
         );
     }
 
@@ -4070,9 +4169,16 @@ mod tests {
         }
         let display_during_stall = s.observe(t, bytes);
         let eta_during_stall = s.eta_speed_mbs(t, display_during_stall);
+        // After 5 min, the adaptive display window has grown to ~50 s,
+        // so a 12 s stall is only ~24 % of the window — display dips
+        // visibly but not catastrophically. The point of this test is
+        // that ETA stays stable, not that display crashes; the prior
+        // fixed-10s window dropped display to <2 MB/s here, but with
+        // the adaptive window dilution the stall registers as a
+        // moderate dip (which is *better* UX).
         assert!(
-            display_during_stall < 30.0,
-            "displayed speed must dip during stall (got {display_during_stall} MB/s)"
+            display_during_stall < 65.0,
+            "displayed speed must visibly dip during stall (got {display_during_stall} MB/s)"
         );
         // ETA speed should barely have moved — 12 s of slow on top of
         // 5 min of healthy still averages close to 70 MB/s.
