@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.10 (2026-05-09)
+
+### Pick up libfreemkv 0.17.10 (bounded-cache writeback)
+
+Sweep no longer dips from ~15 MB/s to ~1 MB/s every ~30 s on hosts
+with default Linux dirty-page settings. The fix lives in libfreemkv's
+new `crate::io::Writer`, which drains dirty pages continuously at
+32 MB granularity instead of letting the kernel accumulate hundreds
+of MB and burst-flush. See libfreemkv 0.17.10 CHANGELOG for the full
+analysis. autorip carries no source changes — only the dep bump.
+
 ## 0.17.9 (2026-05-09)
 
 ### Diagnostic env var: AUTORIP_SKIP_DISKCHECK=1
