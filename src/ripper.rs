@@ -2101,7 +2101,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         // before ENOSPC at the boundary; user loses the time and the
         // staging dir is left half-full of partial ISO (cleanup on
         // ENOSPC failure isn't perfect — see audit finding #13).
-        if bytes_total_disc > 0 {
+        // Escape hatch: AUTORIP_SKIP_DISKCHECK=1 bypasses the pre-flight
+        // check. Used to deliberately rip onto a smaller volume than 2×
+        // disc capacity for diagnostics (speed isolation, partial ISO
+        // tests). The rip will run and predictably ENOSPC mid-stream;
+        // the operator accepts that. Don't use in production.
+        if bytes_total_disc > 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
             let required = bytes_total_disc.saturating_mul(2);
             if let Some(avail) = staging_free_bytes(&staging) {
                 if avail < required {
