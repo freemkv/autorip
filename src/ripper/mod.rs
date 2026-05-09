@@ -46,11 +46,8 @@ pub use state::{BadRange, RipState, STATE, is_busy, set_stop_cooldown, update_st
 // file. Sub-module-private helpers (`pub(super)`) are reachable from
 // here because we are the parent of `state` / `session` / `staging`.
 use libfreemkv::event::BatchSizeReason;
-// Aliased to dodge the bare `Stream` collision with libfreemkv's other
-// stream types in scope; brings `.read()` / `.write()` into scope here.
-use libfreemkv::pes::Stream as PesStream;
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -2080,34 +2077,35 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         drop(session);
 
         // Open the ISO for the mux pipeline.
-        let iso_reader = match libfreemkv::FileSectorReader::open(&iso_path_str) {
-            Ok(r) => r,
-            Err(e) => {
-                crate::log::device_log(device, &format!("Open ISO failed: {e}"));
-                update_state(
-                    device,
-                    RipState {
-                        device: device.to_string(),
-                        status: "error".to_string(),
-                        disc_present: true,
-                        last_error: format!("{e}"),
-                        disc_name: display_name,
-                        disc_format,
-                        tmdb_title,
-                        tmdb_year,
-                        tmdb_poster,
-                        tmdb_overview,
-                        duration,
-                        codecs,
-                        ..Default::default()
-                    },
-                );
-                if let Ok(mut flags) = HALT_FLAGS.lock() {
-                    flags.remove(device);
+        let iso_reader =
+            match libfreemkv::FileSectorReader::open(std::path::Path::new(&iso_path_str)) {
+                Ok(r) => r,
+                Err(e) => {
+                    crate::log::device_log(device, &format!("Open ISO failed: {e}"));
+                    update_state(
+                        device,
+                        RipState {
+                            device: device.to_string(),
+                            status: "error".to_string(),
+                            disc_present: true,
+                            last_error: format!("{e}"),
+                            disc_name: display_name,
+                            disc_format,
+                            tmdb_title,
+                            tmdb_year,
+                            tmdb_poster,
+                            tmdb_overview,
+                            duration,
+                            codecs,
+                            ..Default::default()
+                        },
+                    );
+                    if let Ok(mut flags) = HALT_FLAGS.lock() {
+                        flags.remove(device);
+                    }
+                    return;
                 }
-                return;
-            }
-        };
+            };
         // Entering mux phase — push final mapfile state so the UI keeps the
         // bad-range list visible through mux and into the "done" view.
         let mux_state = std::cell::RefCell::new(PassProgressState::new());
@@ -2168,417 +2166,71 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     });
 
-    // Read frames until codec headers are ready
-    let mut buffered = Vec::new();
-    let mut header_reads = 0u32;
-    while !input.headers_ready() {
-        if stop_requested(device) {
-            crate::log::device_log(device, "Stop requested during header read");
-            if let Ok(mut flags) = HALT_FLAGS.lock() {
-                flags.remove(device);
-            }
-            return;
-        }
-        match input.read() {
-            Ok(Some(frame)) => {
-                header_reads += 1;
-                if header_reads <= 3 || header_reads % 100 == 0 {
-                    crate::log::device_log(
-                        device,
-                        &format!(
-                            "Header frame {} track={} len={}",
-                            header_reads,
-                            frame.track,
-                            frame.data.len()
-                        ),
-                    );
-                }
-                buffered.push(frame);
-            }
-            Ok(None) => {
-                crate::log::device_log(device, "EOF during header read");
-                break;
-            }
-            Err(e) => {
-                crate::log::device_log(device, &format!("Header error: {}", e));
-                break;
-            }
-        }
-    }
-    crate::log::device_log(
-        device,
-        &format!("Headers ready, {} frames buffered", buffered.len()),
+    // 0.18 round 2 #2: the headers-ready buffering, the spawning of
+    // the consumer thread, the watchdog, and the per-frame
+    // `update_state` cadence all live in `mux::run_mux`. Round 1
+    // shipped the mux module as a placeholder; this is the lift onto
+    // libfreemkv's `Pipeline` + `Sink` primitive. See
+    // `freemkv-private/memory/0_18_redesign.md` § "Module layout".
+    //
+    // The producer side of `run_mux` checks the existing
+    // `HALT_FLAGS`-backed `stop_requested` at the top of each frame
+    // iteration; round 2's `Halt`-token migration is a separate slice
+    // tracked in the redesign doc.
+    let mux_input_errors = Arc::new(AtomicU32::new(0));
+    let mux_outcome = mux::run_mux(
+        mux::MuxInputs {
+            device,
+            display_name: display_name.clone(),
+            disc_format: disc_format.clone(),
+            tmdb_title: tmdb_title.clone(),
+            tmdb_year,
+            tmdb_poster: tmdb_poster.clone(),
+            tmdb_overview: tmdb_overview.clone(),
+            duration: duration.clone(),
+            codecs: codecs.clone(),
+            filename: filename.clone(),
+            total_bytes,
+            title_bytes_per_sec,
+            total_passes,
+            dest_url: dest_url.clone(),
+            batch,
+            skip_errors: cfg_read.on_read_error == "skip",
+        },
+        input,
+        mux::MuxAtomics {
+            latest_bytes_read: latest_bytes_read.clone(),
+            rip_last_lba: rip_last_lba.clone(),
+            rip_current_batch: rip_current_batch.clone(),
+            wd_last_frame: wd_last_frame.clone(),
+            wd_bytes: Arc::new(AtomicU64::new(0)),
+            input_errors: mux_input_errors,
+        },
     );
 
-    let info = input.info().clone();
-    let mut out_title = info.clone();
-    out_title.playlist = display_name.clone();
-    out_title.codec_privates = (0..info.streams.len())
-        .map(|i| input.codec_private(i))
-        .collect();
-    let total_bytes = if total_bytes > 0 {
-        total_bytes
-    } else {
-        info.size_bytes
-    };
-
-    crate::log::device_log(device, &format!("Opening output: {}", dest_url));
-    let raw_output = match libfreemkv::output(&dest_url, &out_title) {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("Open output failed: {}", e);
-            crate::log::device_log(device, &msg);
-            update_state(
-                device,
-                RipState {
-                    device: device.to_string(),
-                    status: "error".to_string(),
-                    last_error: msg,
-                    ..Default::default()
-                },
-            );
-            return;
+    // Output never opened (stop during headers, or `libfreemkv::output`
+    // failed): the pre-split code returned early without writing a
+    // history record. Preserve that.
+    if !mux_outcome.output_opened {
+        if let Ok(mut flags) = HALT_FLAGS.lock() {
+            flags.remove(device);
         }
-    };
-    let mut output = libfreemkv::pes::CountingStream::new(raw_output);
-
-    let start = std::time::Instant::now();
-    let mut last_update = start;
-    let mut last_log = start;
-    let mut last_speed_bytes: u64 = 0;
-    let mut last_speed_time = start;
-    let mut smooth_speed: f64 = 0.0;
-    let mut first_update: bool = true;
-    let mut seeded_speed: bool = false;
-
-    // Watchdog: monitors the rip loop and logs when reads stall.
-    // The rip thread updates last_frame_epoch on every frame. The watchdog
-    // checks every 15s and logs if no frame has arrived in 30+ seconds.
-    let wd_active = Arc::new(AtomicBool::new(true));
-    // Drop guard: stops watchdog on return OR panic (catch_unwind unwinds stack)
-    struct WatchdogGuard(Arc<AtomicBool>);
-    impl Drop for WatchdogGuard {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::Relaxed);
-        }
+        return;
     }
-    let _wd_guard = WatchdogGuard(wd_active.clone());
-    // `wd_last_frame` is declared earlier (shared with the drive + stream event
-    // callbacks, which reset it on any sector-level event). Don't shadow it —
-    // the watchdog reader and the callback writers must share one Arc.
-    let wd_bytes = Arc::new(AtomicU64::new(0));
-    {
-        let active = wd_active.clone();
-        let last_frame = wd_last_frame.clone();
-        let wbytes = wd_bytes.clone();
-        let wd_device = device.to_string();
-        let wd_display = display_name.clone();
-        let wd_format = disc_format.clone();
-        let wd_tmdb_title = tmdb_title.clone();
-        let wd_tmdb_poster = tmdb_poster.clone();
-        let wd_tmdb_overview = tmdb_overview.clone();
-        let wd_duration = duration.clone();
-        let wd_codecs = codecs.clone();
-        let wd_total = total_bytes;
-        let wd_tmdb_year = tmdb_year;
-        let wd_filename = filename.clone();
-        std::thread::spawn(move || {
-            let mut was_stalled = false;
-            let mut last_log_secs: u64 = 0;
-            while active.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_secs(15));
-                if !active.load(Ordering::Relaxed) {
-                    break;
-                }
-                let now = crate::util::epoch_secs();
-                let last = last_frame.load(Ordering::Relaxed);
-                let stall_secs = now.saturating_sub(last);
-
-                if stall_secs >= 30 {
-                    // Log on first detection, then every 60s
-                    let should_log = !was_stalled || stall_secs >= last_log_secs + 60;
-                    if should_log {
-                        last_log_secs = stall_secs;
-                        let bytes = wbytes.load(Ordering::Relaxed);
-                        let gb = bytes as f64 / 1_073_741_824.0;
-                        let pct = if wd_total > 0 {
-                            (bytes * 100 / wd_total).min(100) as u8
-                        } else {
-                            0
-                        };
-                        let mins = stall_secs / 60;
-                        let secs = stall_secs % 60;
-                        let stall_str = if mins > 0 {
-                            format!("{}m {:02}s", mins, secs)
-                        } else {
-                            format!("{}s", secs)
-                        };
-                        crate::log::device_log(
-                            &wd_device,
-                            &format!(
-                                "Drive stalled at {:.1} GB ({}%) — waiting for read ({})",
-                                gb, pct, stall_str
-                            ),
-                        );
-                    }
-                    // Update UI state every cycle — keep speed/eta current
-                    let bytes = wbytes.load(Ordering::Relaxed);
-                    let gb = bytes as f64 / 1_073_741_824.0;
-                    let pct = if wd_total > 0 {
-                        (bytes * 100 / wd_total).min(100) as u8
-                    } else {
-                        0
-                    };
-                    let stall_str = {
-                        let m = stall_secs / 60;
-                        let s = stall_secs % 60;
-                        if m > 0 {
-                            format!("{}m {:02}s", m, s)
-                        } else {
-                            format!("{}s", s)
-                        }
-                    };
-                    // Mutate-in-place via `update_state_with` so we no longer
-                    // have to manually re-read errors/lost_video_secs/last_sector/
-                    // current_batch/preferred_batch and copy them through —
-                    // every field we don't touch keeps its prior value. This
-                    // closes the v0.11.20 regression class (Default::default()
-                    // wiping live progress fields during a stall).
-                    update_state_with(&wd_device, |s| {
-                        s.device = wd_device.clone();
-                        s.status = "ripping".to_string();
-                        s.disc_present = true;
-                        s.disc_name = wd_display.clone();
-                        s.disc_format = wd_format.clone();
-                        s.progress_pct = pct;
-                        s.progress_gb = gb;
-                        s.speed_mbs = 0.0;
-                        s.eta = format!("stalled {}", stall_str);
-                        s.output_file = wd_filename.clone();
-                        s.tmdb_title = wd_tmdb_title.clone();
-                        s.tmdb_year = wd_tmdb_year;
-                        s.tmdb_poster = wd_tmdb_poster.clone();
-                        s.tmdb_overview = wd_tmdb_overview.clone();
-                        s.duration = wd_duration.clone();
-                        s.codecs = wd_codecs.clone();
-                        // errors / lost_video_secs / last_sector / current_batch
-                        // / preferred_batch / pass / total_passes / bytes_*
-                        // / bad_ranges / largest_gap_ms intentionally untouched.
-                    });
-                    was_stalled = true;
-                } else if was_stalled {
-                    crate::log::device_log(&wd_device, "Drive recovered — reads resumed");
-                    was_stalled = false;
-                    last_log_secs = 0;
-                }
-            }
-        });
-    }
-
-    // Write buffered frames
-    let mut buffered_ok = true;
-    for frame in &buffered {
-        if stop_requested(device) {
-            crate::log::device_log(device, "Stop requested during buffered write");
-            buffered_ok = false;
-            break;
-        }
-        if let Err(e) = output.write(frame) {
-            crate::log::device_log(device, &format!("Write error (buffered): {}", e));
-            buffered_ok = false;
-            break;
-        }
-        // Update watchdog so it doesn't falsely report stall
-        wd_last_frame.store(crate::util::epoch_secs(), Ordering::Relaxed);
-        wd_bytes.store(output.bytes_written(), Ordering::Relaxed);
-    }
-
-    // Stream remaining frames
-    let mut completed = false;
-    if !buffered_ok {
-        crate::log::device_log(device, "Skipping stream loop — buffered write failed");
-    }
-    loop {
-        if !buffered_ok {
-            break;
-        }
-        if stop_requested(device) {
-            crate::log::device_log(device, "Stop requested");
-            break;
-        }
-        match input.read() {
-            Ok(Some(frame)) => {
-                if let Err(e) = output.write(&frame) {
-                    crate::log::device_log(device, &format!("Write error: {}", e));
-                    break;
-                }
-
-                // Signal watchdog: frame received
-                wd_last_frame.store(crate::util::epoch_secs(), Ordering::Relaxed);
-                wd_bytes.store(output.bytes_written(), Ordering::Relaxed);
-
-                let now = std::time::Instant::now();
-                if !first_update && now.duration_since(last_update).as_secs_f64() < 1.0 {
-                    continue;
-                }
-                first_update = false;
-                last_update = now;
-
-                let lbr = latest_bytes_read.load(Ordering::Relaxed);
-                let bytes_done = if lbr > 0 { lbr } else { output.bytes_written() };
-                let pct = if total_bytes > 0 {
-                    (bytes_done * 100 / total_bytes).min(100) as u8
-                } else {
-                    0
-                };
-                let speed_interval = now.duration_since(last_speed_time).as_secs_f64();
-                let instant_speed = if speed_interval > 0.0 {
-                    (bytes_done.saturating_sub(last_speed_bytes)) as f64
-                        / (1024.0 * 1024.0)
-                        / speed_interval
-                } else {
-                    0.0
-                };
-                last_speed_bytes = bytes_done;
-                last_speed_time = now;
-                smooth_speed = if !seeded_speed {
-                    seeded_speed = true;
-                    instant_speed
-                } else {
-                    0.95 * smooth_speed + 0.05 * instant_speed
-                };
-                let speed = smooth_speed;
-                let eta = if speed > 0.0 && total_bytes > bytes_done {
-                    let secs =
-                        ((total_bytes - bytes_done) as f64 / (1024.0 * 1024.0) / speed) as u32;
-                    if secs > 359999 {
-                        // > 99 hours — ETA is meaningless
-                        String::new()
-                    } else {
-                        let h = secs / 3600;
-                        let m = (secs % 3600) / 60;
-                        let s = secs % 60;
-                        if h > 0 {
-                            format!("{}:{:02}:{:02}", h, m, s)
-                        } else {
-                            format!("{}:{:02}", m, s)
-                        }
-                    }
-                } else {
-                    String::new()
-                };
-
-                if now.duration_since(last_log).as_secs() >= 60 {
-                    last_log = now;
-                    let gb = bytes_done as f64 / 1_073_741_824.0;
-                    let speed_str = if speed >= 1.0 {
-                        format!("{:.1} MB/s", speed)
-                    } else {
-                        format!("{:.0} KB/s", speed * 1024.0)
-                    };
-                    let eta_str = if eta.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ETA {}", eta)
-                    };
-                    if total_bytes > 0 {
-                        let total_gb = total_bytes as f64 / 1_073_741_824.0;
-                        crate::log::device_log(
-                            device,
-                            &format!(
-                                "{:.1} GB / {:.1} GB ({}%) {}{}",
-                                gb, total_gb, pct, speed_str, eta_str
-                            ),
-                        );
-                    } else {
-                        crate::log::device_log(device, &format!("{:.1} GB {}", gb, speed_str));
-                    }
-                }
-
-                let skip_errors = input.errors as u32;
-                let lost_video_secs = if title_bytes_per_sec > 0.0 {
-                    (skip_errors as f64) * 2048.0 / title_bytes_per_sec
-                } else {
-                    0.0
-                };
-                update_state(
-                    device,
-                    RipState {
-                        device: device.to_string(),
-                        status: "ripping".to_string(),
-                        disc_present: true,
-                        disc_name: display_name.clone(),
-                        disc_format: disc_format.clone(),
-                        progress_pct: pct,
-                        progress_gb: bytes_done as f64 / 1_073_741_824.0,
-                        speed_mbs: speed,
-                        eta: eta.clone(),
-                        errors: skip_errors,
-                        lost_video_secs,
-                        last_sector: rip_last_lba.load(Ordering::Relaxed),
-                        current_batch: rip_current_batch.load(Ordering::Relaxed),
-                        preferred_batch: batch,
-                        output_file: filename.clone(),
-                        tmdb_title: tmdb_title.clone(),
-                        tmdb_year,
-                        tmdb_poster: tmdb_poster.clone(),
-                        tmdb_overview: tmdb_overview.clone(),
-                        duration: duration.clone(),
-                        codecs: codecs.clone(),
-                        // Carry the multipass identity through every per-frame
-                        // update so the UI doesn't snap back to a "fresh rip"
-                        // view when mux starts. pass == total_passes is the
-                        // established convention for "we're on the mux pass";
-                        // pass/total bars and ETAs mirror local mux progress
-                        // (sweep + retries are already 100% by the time we're
-                        // here — total_progress reflects the work that's left).
-                        pass: total_passes,
-                        total_passes,
-                        pass_progress_pct: pct,
-                        pass_eta: eta.clone(),
-                        total_progress_pct: pct,
-                        total_eta: eta,
-                        ..Default::default()
-                    },
-                );
-            }
-            Ok(None) => {
-                completed = true;
-                break;
-            }
-            Err(e) => {
-                crate::log::device_log(device, &format!("Read error: {}", e));
-                break;
-            }
-        }
-    }
-
-    // Watchdog stops automatically via _wd_guard Drop
 
     // Clean up halt flag
     if let Ok(mut flags) = HALT_FLAGS.lock() {
         flags.remove(device);
     }
 
-    if let Err(e) = output.finish() {
-        crate::log::device_log(device, &format!("Output finish error: {}", e));
-    }
-
-    let bytes_done = output.bytes_written();
-    let elapsed = start.elapsed().as_secs_f64();
-    let speed = if elapsed > 0.0 {
-        bytes_done as f64 / (1024.0 * 1024.0) / elapsed
-    } else {
-        0.0
-    };
-    let mut final_errors = input.errors as u32;
+    let completed = mux_outcome.completed;
+    let bytes_done = mux_outcome.bytes_done;
+    let elapsed = mux_outcome.elapsed_secs;
+    let speed = mux_outcome.speed_mbs;
+    let mut final_errors = mux_outcome.errors;
     let final_last_sector = rip_last_lba.load(Ordering::Relaxed);
     let final_current_batch = rip_current_batch.load(Ordering::Relaxed);
-    let mut final_lost_secs = if title_bytes_per_sec > 0.0 {
-        (final_errors as f64) * 2048.0 / title_bytes_per_sec
-    } else {
-        0.0
-    };
+    let mut final_lost_secs = mux_outcome.lost_video_secs;
     // In multipass mode the `input.errors` counter above counts ISO→MKV demux
     // skips (usually zero — ISO reads don't fail). The real bad-sector count
     // lives in the mapfile sidecar. Prefer that when present.
