@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.17.13 (2026-05-09)
+
+### Pick up libfreemkv 0.17.13 (writer consistency in patch + mux)
+
+libfreemkv now uses `crate::io::Writer` (bounded-cache writeback
+pipeline) for `Disc::patch`'s ISO writes and the MKV / M2TS mux
+output streams — eliminating the last raw-File big-write paths that
+could hit dirty-page burst pathology on slow staging. autorip carries
+no source changes — dep bump only.
+
 ## 0.17.12 (2026-05-09)
 
 ### Pick up libfreemkv 0.17.12 (mapfile time-batched persistence)
