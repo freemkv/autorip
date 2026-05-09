@@ -1028,11 +1028,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // When max_retries == 0, we keep the existing direct disc→MKV flow —
     // session.drive is passed to DiscStream::new and sectors stream straight
     // through decrypt/demux/mux. Fastest path, no ISO overhead, but no retry.
+    // Lifted out of the multipass branch below so the mux progress loop
+    // (which lives in the outer scope) can reference it. Single-pass mode
+    // (max_retries == 0) has no multipass concept; the mux loop's checks
+    // gate on `total_passes > 0` before threading it into UI state.
+    let total_passes: u8 = if cfg_read.max_retries > 0 {
+        cfg_read.max_retries + 2 // pass 1 + retries + mux
+    } else {
+        0
+    };
     let reader: Box<dyn libfreemkv::SectorReader> = if cfg_read.max_retries > 0 {
         let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
         let iso_path_str = format!("{}/{}", staging, iso_filename);
         let iso_path = std::path::Path::new(&iso_path_str);
-        let total_passes = cfg_read.max_retries + 2; // pass 1 + retries + mux
         let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
 
         // Pre-flight disk-space check. Multipass needs:
@@ -2503,7 +2511,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         progress_pct: pct,
                         progress_gb: bytes_done as f64 / 1_073_741_824.0,
                         speed_mbs: speed,
-                        eta,
+                        eta: eta.clone(),
                         errors: skip_errors,
                         lost_video_secs,
                         last_sector: rip_last_lba.load(Ordering::Relaxed),
@@ -2516,6 +2524,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         tmdb_overview: tmdb_overview.clone(),
                         duration: duration.clone(),
                         codecs: codecs.clone(),
+                        // Carry the multipass identity through every per-frame
+                        // update so the UI doesn't snap back to a "fresh rip"
+                        // view when mux starts. pass == total_passes is the
+                        // established convention for "we're on the mux pass";
+                        // pass/total bars and ETAs mirror local mux progress
+                        // (sweep + retries are already 100% by the time we're
+                        // here — total_progress reflects the work that's left).
+                        pass: total_passes,
+                        total_passes,
+                        pass_progress_pct: pct,
+                        pass_eta: eta.clone(),
+                        total_progress_pct: pct,
+                        total_eta: eta,
                         ..Default::default()
                     },
                 );
