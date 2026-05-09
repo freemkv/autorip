@@ -57,7 +57,7 @@ cargo build --release
 | `MIN_LENGTH` | `600` | Minimum title length (seconds) |
 | `MAIN_FEATURE` | `true` | Rip longest title only |
 | `AUTO_EJECT` | `true` | Eject after rip |
-| `ON_INSERT` | `rip` | `nothing` / `identify` / `rip` |
+| `ON_INSERT` | `scan` | `nothing` / `scan` / `rip` |
 | `ON_READ_ERROR` | `stop` | `stop` (abort on bad sector) or `skip` (zero-fill and continue) — direct mode only |
 | `MAX_RETRIES` | `1` | Retry passes after the initial disc→ISO pass. `0` = single-pass direct disc→MKV (fastest, no retry). `1..=10` = multi-pass |
 | `KEEP_ISO` | `false` | Preserve the intermediate ISO + mapfile in staging after MKV mux |
@@ -98,7 +98,7 @@ libfreemkv (Rust library)
         ├── Drive watcher (udev + polling)
         ├── Rip engine (direct library API)
         │   ├── Direct path: DiscStream(drive) → MKV
-        │   └── Multi-pass: Disc::copy + Disc::patch → ISO → DiscStream(ISO) → MKV
+        │   └── Multi-pass: Disc::sweep + Disc::patch → ISO → DiscStream(ISO) → MKV
         ├── File organizer (TMDB → Movies/Title/)
         ├── Web dashboard (embedded HTTP + SSE)
         └── Webhooks

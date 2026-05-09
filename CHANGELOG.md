@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.18.1 (2026-05-09)
+
+### Round 1 — `ripper/` module split
+
+The 3700-line `src/ripper.rs` is now `src/ripper/` with `mod.rs`,
+`state.rs`, `sweep.rs`, `mux.rs`, `staging.rs`, `session.rs`. Each
+file has a single role; the mux state-preservation bug class that
+prompted this split is no longer reachable.
+
+### Round 2 — mux on `Pipeline` + `MuxSink`
+
+The mux frame loop runs on libfreemkv's generic `Pipeline` primitive
+with a `MuxSink` consumer thread. NFS-staged UHD now sustains
+~16 MB/s through mux vs ~12 MB/s pre-round-2 — measured on the same
+disc, drive, and target on the docker-2 test bed. Local LVM is
+unchanged (already CPU-bound).
+
+The global `HALT_FLAGS` registry is gone. A single `Halt` token is
+threaded through every cancellable phase (sweep, patch, mux, watchdog).
+Ctrl-C now stops every phase from one place.
+
+### Round 3 — direct `Disc::sweep` + `Disc::patch` dispatch
+
+autorip no longer calls `Disc::copy` (deprecated in libfreemkv 0.18.1,
+removal in 0.18.2). The multipass loop lives in autorip's orchestrator,
+which invokes `Disc::sweep` for pass 1 and `Disc::patch` for retries
+directly. Round-2 design principle: the library exposes primitives,
+orchestration is application code.
+
+Side-effect bug fix: the previous `Disc::copy` always called
+`sweep_internal(resume=false)`, so a transport-failure retry on Pass 1
+silently restarted from sector 0. The new direct dispatch passes
+`resume: attempt > 1`, so behaviour now matches the doc-comment intent.
+
 ## 0.17.13 (2026-05-09)
 
 ### Pick up libfreemkv 0.17.13 (writer consistency in patch + mux)
