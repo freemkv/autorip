@@ -167,7 +167,7 @@ impl Default for RipState {
 /// Compute the damage-severity badge string from autorip's RipState
 /// fields. Wraps libfreemkv's `classify_damage` so the UI gets a stable
 /// lowercase string ("clean" / "cosmetic" / "moderate" / "serious").
-pub(crate) fn damage_severity_for(errors: u32, total_lost_ms: f64) -> String {
+pub(super) fn damage_severity_for(errors: u32, total_lost_ms: f64) -> String {
     let s = libfreemkv::classify_damage(errors as u64, total_lost_ms);
     serde_json::to_value(s)
         .ok()
@@ -180,8 +180,9 @@ pub static STATE: once_cell::sync::Lazy<Mutex<std::collections::HashMap<String, 
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// Stop cooldowns: device -> epoch seconds when cooldown expires.
-pub static STOP_COOLDOWNS: once_cell::sync::Lazy<Mutex<std::collections::HashMap<String, u64>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+pub(super) static STOP_COOLDOWNS: once_cell::sync::Lazy<
+    Mutex<std::collections::HashMap<String, u64>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 const STOP_COOLDOWN_SECS: u64 = 5;
 
@@ -853,4 +854,462 @@ pub(super) fn set_pass_progress(
             ..Default::default()
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression guards for the multi-pass progress helpers.
+    //!
+    //! These tests exist because v0.11.22 shipped several UI regressions
+    //! (bytes_bad counted NonTried as bad, speed_mbs was zero, errors=0
+    //! during multipass) that would have been caught by basic assertions
+    //! on push_pass_state's outputs. Keep this module lightweight but
+    //! comprehensive enough that each new progress field gets a "does the
+    //! right thing for the right status" check.
+
+    use super::*;
+    use libfreemkv::disc::mapfile::{Mapfile, SectorStatus};
+
+    fn tmp_map(tag: &str, total: u64) -> (std::path::PathBuf, Mapfile) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "autorip-ripper-test-{}-{}-{}.mapfile",
+            std::process::id(),
+            tag,
+            n
+        ));
+        let _ = std::fs::remove_file(&path);
+        let map = Mapfile::create(&path, total, "test").unwrap();
+        (path, map)
+    }
+
+    fn minimal_title() -> libfreemkv::DiscTitle {
+        // Build an almost-empty DiscTitle — enough for the helpers that
+        // only touch extents, chapters, duration_secs, size_bytes.
+        libfreemkv::DiscTitle {
+            playlist: String::new(),
+            playlist_id: 0,
+            duration_secs: 0.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: Vec::new(),
+            content_format: libfreemkv::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_bad_ranges_excludes_not_yet_tried() {
+        // Regression from v0.11.22: an empty rip (everything NonTried)
+        // was reporting the entire disc as "bad" because bytes_pending
+        // (including NonTried) was summed into bytes_bad. This test
+        // guards the specific invariant: the list of "bad" ranges must
+        // include only `-` (Unreadable), never `?`/`*`/`/`.
+        let (_p, mf) = tmp_map("nontried", 10_000);
+        let title = minimal_title();
+        let (ranges, count, _trunc, lost, largest) = build_bad_ranges(&mf, &title, 1000.0);
+        assert!(
+            ranges.is_empty(),
+            "no Unreadable yet — list should be empty"
+        );
+        assert_eq!(count, 0);
+        assert_eq!(lost, 0.0);
+        assert_eq!(largest, 0.0);
+    }
+
+    #[test]
+    fn build_bad_ranges_ignores_non_trimmed_and_non_scraped() {
+        // Post pass-1 on a damaged disc: some ranges become NonTrimmed or
+        // NonScraped — meaning "pass 1 failed, pass 2 needs to retry."
+        // Those MUST NOT appear in the UI's bad-range list yet; patch may
+        // still recover them. Only `-` counts as confirmed bad.
+        let (_p, mut mf) = tmp_map("trim_scrape", 10_000);
+        mf.record(1000, 200, SectorStatus::NonTrimmed).unwrap();
+        mf.record(3000, 100, SectorStatus::NonScraped).unwrap();
+        let title = minimal_title();
+        let (ranges, count, ..) = build_bad_ranges(&mf, &title, 1000.0);
+        assert!(ranges.is_empty());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn build_bad_ranges_includes_unreadable() {
+        let (_p, mut mf) = tmp_map("unreadable", 10_000);
+        mf.record(2000, 100, SectorStatus::Unreadable).unwrap();
+        let title = minimal_title();
+        // bps = 2048 bytes/sec → a 100-byte range is 50 ms.
+        let (ranges, count, _trunc, lost, largest) = build_bad_ranges(&mf, &title, 2048.0);
+        assert_eq!(count, 1);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].lba, 2000 / 2048);
+        assert!((lost - 100.0 / 2048.0 * 1000.0).abs() < 0.001);
+        assert!((largest - lost).abs() < 0.001);
+    }
+
+    #[test]
+    fn build_bad_ranges_sorts_by_duration_desc() {
+        let (_p, mut mf) = tmp_map("sort", 100_000);
+        mf.record(1000, 100, SectorStatus::Unreadable).unwrap(); // small
+        mf.record(20_000, 1000, SectorStatus::Unreadable).unwrap(); // big
+        mf.record(50_000, 500, SectorStatus::Unreadable).unwrap(); // medium
+        let title = minimal_title();
+        let (ranges, ..) = build_bad_ranges(&mf, &title, 1000.0);
+        assert_eq!(ranges.len(), 3);
+        assert!(ranges[0].duration_ms > ranges[1].duration_ms);
+        assert!(ranges[1].duration_ms > ranges[2].duration_ms);
+    }
+
+    #[test]
+    fn build_bad_ranges_truncates_to_50() {
+        let (_p, mut mf) = tmp_map("truncate", 10_000_000);
+        // 60 unreadable ranges, all same size. Must truncate to 50 with
+        // `bad_ranges_truncated = 10`.
+        for i in 0..60u64 {
+            mf.record(i * 10_000, 100, SectorStatus::Unreadable)
+                .unwrap();
+        }
+        let title = minimal_title();
+        let (ranges, count, trunc, ..) = build_bad_ranges(&mf, &title, 1000.0);
+        assert_eq!(count, 60);
+        assert_eq!(ranges.len(), 50);
+        assert_eq!(trunc, 10);
+    }
+
+    #[test]
+    fn byte_offset_in_title_within_single_extent() {
+        let title = libfreemkv::DiscTitle {
+            extents: vec![libfreemkv::Extent {
+                start_lba: 1000,
+                sector_count: 500,
+            }],
+            ..minimal_title()
+        };
+        // LBA 1100 is 100 sectors into the extent = 100 * 2048 bytes in title.
+        assert_eq!(byte_offset_in_title(1100, &title), Some(100 * 2048));
+    }
+
+    #[test]
+    fn byte_offset_in_title_across_multiple_extents() {
+        let title = libfreemkv::DiscTitle {
+            extents: vec![
+                libfreemkv::Extent {
+                    start_lba: 1000,
+                    sector_count: 100,
+                },
+                libfreemkv::Extent {
+                    start_lba: 5000,
+                    sector_count: 200,
+                },
+            ],
+            ..minimal_title()
+        };
+        // LBA 5050 is 50 sectors into the 2nd extent; first extent is 100*2048.
+        assert_eq!(
+            byte_offset_in_title(5050, &title),
+            Some(100 * 2048 + 50 * 2048)
+        );
+    }
+
+    #[test]
+    fn byte_offset_in_title_returns_none_outside_extents() {
+        let title = libfreemkv::DiscTitle {
+            extents: vec![libfreemkv::Extent {
+                start_lba: 1000,
+                sector_count: 100,
+            }],
+            ..minimal_title()
+        };
+        // LBA 200 is before the only extent — probably UDF metadata, no
+        // chapter mapping possible.
+        assert_eq!(byte_offset_in_title(200, &title), None);
+        assert_eq!(byte_offset_in_title(50_000, &title), None);
+    }
+
+    #[test]
+    fn pass_progress_first_sample_returns_zero() {
+        // Regression: v0.12.0 shipped with the tracker priming the speed
+        // on the first sample, which included all already-copied bytes
+        // (e.g. from resume). Users saw "2197.8 MB/s" on a BD rip —
+        // impossible. First call must not compute a speed; we need at
+        // least two samples to compute a delta over time.
+        let mut s = PassProgressState::new();
+        let t0 = std::time::Instant::now();
+        let speed = s.observe(t0, 20 * 1024 * 1024 * 1024);
+        assert_eq!(speed, 0.0, "first sample must not synthesize a speed");
+        assert_eq!(
+            s.samples.len(),
+            1,
+            "first sample must be recorded for the next call"
+        );
+    }
+
+    #[test]
+    fn pass_progress_second_sample_matches_physical_rate() {
+        // 70 MB delta in 1 s → ~70 MB/s. No prior smoothing, so the instant
+        // value becomes the first real smoothed value.
+        let mut s = PassProgressState::new();
+        let t0 = std::time::Instant::now();
+        let _ = s.observe(t0, 1_000_000_000);
+        let speed = s.observe(
+            t0 + std::time::Duration::from_secs(1),
+            1_000_000_000 + 70 * 1_048_576,
+        );
+        assert!((speed - 70.0).abs() < 1.0, "expected ~70 MB/s, got {speed}");
+    }
+
+    #[test]
+    fn pass_progress_caps_absurd_instantaneous() {
+        // If the caller feeds an 80 GB jump in 1 s (e.g. mapfile read of a
+        // resumed disc on the first post-throttle callback), the tracker
+        // must cap the instant to 1 GB/s instead of smoothing in nonsense.
+        let mut s = PassProgressState::new();
+        let t0 = std::time::Instant::now();
+        let _ = s.observe(t0, 0);
+        let speed = s.observe(
+            t0 + std::time::Duration::from_secs(1),
+            80 * 1024 * 1024 * 1024,
+        );
+        assert!(speed <= 1024.0, "speed {speed} MB/s not capped");
+    }
+
+    #[test]
+    fn pass_progress_steady_state_converges() {
+        // Feed 20 samples at a constant 70 MB/s rate. Smoothed value must
+        // converge within ±2 MB/s.
+        let mut s = PassProgressState::new();
+        let mut t = std::time::Instant::now();
+        let mut bytes: u64 = 1_000_000_000;
+        let _ = s.observe(t, bytes);
+        let mut last = 0.0;
+        for _ in 0..20 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            last = s.observe(t, bytes);
+        }
+        assert!(
+            (last - 70.0).abs() < 2.0,
+            "expected ~70 MB/s after convergence, got {last}"
+        );
+    }
+
+    #[test]
+    fn pass_progress_stall_drops_out_within_window() {
+        // The reason the EWMA was replaced. Real-world scenario from
+        // 2026-05-08: BU40N reading a UHD disc, drive briefly slow at a
+        // marginal LBA region (transient drop from 15 MB/s to ~0.5 MB/s
+        // for ~12 s, then full recovery). With the prior EWMA design
+        // (alpha=0.3), the stall sample dragged the displayed speed for
+        // 30+ s after the drive had recovered, presenting as "the rip is
+        // stuck" in the UI when it actually wasn't.
+        //
+        // Sliding window guarantee: at most STATIC_WINDOW_SECS after
+        // recovery (in the early-pass static phase used here), the slow
+        // samples have aged out and the displayed speed reflects the
+        // current rate.
+        let mut s = PassProgressState::new();
+        let mut t = std::time::Instant::now();
+        let mut bytes: u64 = 0;
+        let _ = s.observe(t, bytes);
+        // 10 s of healthy ripping at 70 MB/s
+        for _ in 0..10 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let healthy = s.observe(t, bytes);
+        assert!(
+            (healthy - 70.0).abs() < 2.0,
+            "pre-stall speed should be ~70 MB/s, got {healthy}"
+        );
+
+        // 12 s stall — drive only delivers 1 MB/s.
+        for _ in 0..12 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let during_stall = s.observe(t, bytes);
+        assert!(
+            during_stall < 20.0,
+            "stall must visibly drop the displayed speed (got {during_stall} MB/s)"
+        );
+
+        // Recovery — drive back to 70 MB/s. Within STATIC_WINDOW_SECS, the
+        // stall samples should have aged out of the window entirely.
+        for _ in 0..(STATIC_WINDOW_SECS as i32 + 2) {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let recovered = s.observe(t, bytes);
+        assert!(
+            (recovered - 70.0).abs() < 2.0,
+            "speed must return to ~70 MB/s once stall samples age out of \
+             the window; got {recovered} MB/s"
+        );
+    }
+
+    #[test]
+    fn display_window_grows_with_elapsed_time() {
+        // Schedule sanity: warmup at 10 s, growth from 60-360 s, cap at 60 s.
+        assert_eq!(display_window_secs(0.0), 10.0);
+        assert_eq!(display_window_secs(30.0), 10.0);
+        assert_eq!(display_window_secs(59.9), 10.0);
+        assert_eq!(display_window_secs(60.0), 10.0); // start of growth
+        assert!((display_window_secs(210.0) - 35.0).abs() < 0.1); // mid growth
+        assert!((display_window_secs(360.0) - 60.0).abs() < 0.1); // cap reached
+        assert_eq!(display_window_secs(3600.0), 60.0); // long after cap
+    }
+
+    #[test]
+    fn display_speed_is_smoother_in_steady_state() {
+        // Run long enough for the adaptive window to reach the 60 s cap,
+        // then inject a single-sample blip and assert the displayed
+        // speed barely moves. Demonstrates that steady-state jitter
+        // (a single 1.5 s sample of bad rate) contributes only ~2.5 %
+        // weight in a 60 s window of ~40 samples.
+        let mut s = PassProgressState::new();
+        let mut t = std::time::Instant::now();
+        let mut bytes: u64 = 0;
+        let _ = s.observe(t, bytes);
+        // 7 minutes of steady 70 MB/s — past STATIC_PHASE + GROWTH_PHASE,
+        // so the window has reached the 60 s cap.
+        for _ in 0..420 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let steady = s.observe(t, bytes);
+        assert!(
+            (steady - 70.0).abs() < 1.5,
+            "steady-state speed should be ~70 MB/s after 7 min, got {steady}"
+        );
+        // Inject one slow second.
+        t += std::time::Duration::from_secs(1);
+        bytes += 1_048_576;
+        let after_blip = s.observe(t, bytes);
+        // Single slow sample in a 60 s / ~40-sample window: contribution
+        // ≤ ~2 MB/s drop. Pre-adaptive 10 s window would have dropped
+        // the displayed speed by ~7 MB/s (10 % of window weight).
+        assert!(
+            (steady - after_blip) < 3.0,
+            "single-sample blip shouldn't move displayed speed by > 3 MB/s \
+             in a steady-state 60 s window: before {steady}, after {after_blip}"
+        );
+    }
+
+    #[test]
+    fn eta_speed_stays_stable_through_a_stall() {
+        // Companion to pass_progress_stall_drops_out_within_window: the
+        // displayed speed CAN dip during a stall, but the ETA must not.
+        // Old behaviour (eta = remaining / display_speed) made a 12 s
+        // stall flip the displayed ETA from 1:30:00 to 30:00:00. The
+        // running average from pass start barely moves (a 12 s stall
+        // after 5 minutes of healthy rip changes the average by < 5 %).
+        let mut s = PassProgressState::new();
+        let mut t = std::time::Instant::now();
+        let mut bytes: u64 = 0;
+        let _ = s.observe(t, bytes);
+        // 5 minutes of healthy ripping at 70 MB/s
+        for _ in 0..300 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 70 * 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let display_before = s.observe(t, bytes);
+        let eta_before = s.eta_speed_mbs(t, display_before);
+        assert!(
+            (eta_before - 70.0).abs() < 2.0,
+            "ETA speed before stall should be ~70 MB/s, got {eta_before}"
+        );
+
+        // 12 s stall — drive only delivers 1 MB/s.
+        for _ in 0..12 {
+            t += std::time::Duration::from_secs(1);
+            bytes += 1_048_576;
+            let _ = s.observe(t, bytes);
+        }
+        let display_during_stall = s.observe(t, bytes);
+        let eta_during_stall = s.eta_speed_mbs(t, display_during_stall);
+        // After 5 min, the adaptive display window has grown to ~50 s,
+        // so a 12 s stall is only ~24 % of the window — display dips
+        // visibly but not catastrophically. The point of this test is
+        // that ETA stays stable, not that display crashes; the prior
+        // fixed-10s window dropped display to <2 MB/s here, but with
+        // the adaptive window dilution the stall registers as a
+        // moderate dip (which is *better* UX).
+        assert!(
+            display_during_stall < 65.0,
+            "displayed speed must visibly dip during stall (got {display_during_stall} MB/s)"
+        );
+        // ETA speed should barely have moved — 12 s of slow on top of
+        // 5 min of healthy still averages close to 70 MB/s.
+        assert!(
+            (eta_during_stall - 70.0).abs() < 5.0,
+            "ETA speed during stall must stay close to true average, got \
+             {eta_during_stall} MB/s (display was {display_during_stall} MB/s)"
+        );
+    }
+
+    #[test]
+    fn eta_falls_back_to_display_during_warmup() {
+        // Before ETA_WARMUP_SECS of pass elapsed, the running average is
+        // noisy (small denominator). Use the displayed speed instead.
+        let mut s = PassProgressState::new();
+        let t0 = std::time::Instant::now();
+        let _ = s.observe(t0, 0);
+        // 2 s elapsed — well below warmup
+        let display = s.observe(t0 + std::time::Duration::from_secs(2), 100 * 1_048_576);
+        let eta = s.eta_speed_mbs(t0 + std::time::Duration::from_secs(2), display);
+        assert_eq!(eta, display, "ETA must fall back to display before warmup");
+    }
+
+    #[test]
+    fn pass_progress_zero_dt_returns_previous() {
+        // Two calls at the same instant must not divide by zero.
+        let mut s = PassProgressState::new();
+        let t0 = std::time::Instant::now();
+        let _ = s.observe(t0, 0);
+        let s1 = s.observe(t0, 100_000_000);
+        let s2 = s.observe(t0, 200_000_000);
+        assert_eq!(s1, s2, "zero-dt sample must not change smoothed speed");
+    }
+
+    #[test]
+    fn update_state_with_preserves_untouched_fields() {
+        // The whole point of `update_state_with` — fields the closure doesn't
+        // touch must survive. Three regressions in autorip's history were
+        // exactly this class (Default::default() wiping live progress fields
+        // during a watchdog tick).
+        let dev = format!("test-preserve-{}", std::process::id());
+        update_state_with(&dev, |s| {
+            s.errors = 7;
+            s.lost_video_secs = 1.5;
+            s.last_sector = 12345;
+            s.current_batch = 32;
+            s.preferred_batch = 60;
+        });
+        // Now simulate a watchdog tick that only updates progress + status:
+        update_state_with(&dev, |s| {
+            s.status = "ripping".to_string();
+            s.progress_pct = 42;
+        });
+        let snap = STATE
+            .lock()
+            .unwrap()
+            .get(&dev)
+            .cloned()
+            .expect("entry must exist");
+        assert_eq!(snap.errors, 7, "errors wiped");
+        assert_eq!(snap.lost_video_secs, 1.5, "lost_video_secs wiped");
+        assert_eq!(snap.last_sector, 12345, "last_sector wiped");
+        assert_eq!(snap.current_batch, 32, "current_batch wiped");
+        assert_eq!(snap.preferred_batch, 60, "preferred_batch wiped");
+        assert_eq!(snap.progress_pct, 42, "new field not applied");
+        assert_eq!(snap.status, "ripping", "new field not applied");
+    }
 }
