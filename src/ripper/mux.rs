@@ -13,10 +13,10 @@
 //!
 //! The producer half (`run_mux`) owns the input stream, the
 //! single-threaded headers-ready buffering, the watchdog thread, and
-//! the existing `HALT_FLAGS` halt-flag check. The consumer half
-//! (`MuxSink`) owns the output stream, the smoothed-speed estimator,
-//! and the per-frame `update_state` call (the morning's "fresh-rip
-//! snap-back" fix is preserved verbatim).
+//! the per-device `Halt`-token poll. The consumer half (`MuxSink`)
+//! owns the output stream, the smoothed-speed estimator, and the
+//! per-frame `update_state` call (the morning's "fresh-rip snap-back"
+//! fix is preserved verbatim).
 //!
 //! Round 2 doesn't migrate to `FrameSource` / `FrameSink` — that's a
 //! separate slice. autorip stays on the deprecated `pes::Stream`
@@ -35,8 +35,18 @@ use std::time::Instant;
 use libfreemkv::pes::Stream as PesStream;
 use libfreemkv::{DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, Sink};
 
-use super::session::stop_requested;
+use super::session::device_halt;
 use super::state::{RipState, update_state};
+
+/// True if the device's registered `Halt` token has been cancelled
+/// (e.g. by the HTTP `/api/stop/{device}` handler in `web.rs`).
+/// Returns `false` when no token is registered — matches the old
+/// `stop_requested` semantics so producer-loop checks behave the same.
+fn halt_requested(device: &str) -> bool {
+    device_halt(device)
+        .map(|h| h.is_cancelled())
+        .unwrap_or(false)
+}
 
 /// Inputs to `run_mux` that come from the orchestrator. Bundled into a
 /// struct because the pre-split inline mux block referenced ~25
@@ -414,9 +424,13 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
 ///   thread): writes the frame to `output`, updates `wd_bytes`, and
 ///   pushes per-frame `update_state` at most once per second.
 ///
-/// Halt handling is the existing `HALT_FLAGS` global (checked via
-/// `stop_requested(device)`) — round 2's `Halt`-token migration is
-/// a separate slice.
+/// Halt handling: each producer-loop iteration polls the per-device
+/// `Halt` token via `halt_requested(device)`. Cancelling the same
+/// token (HTTP /api/stop, eject, panic-recovery) breaks the loop on
+/// the next read. The DiscStream itself was constructed with
+/// `with_halt(...)` upstream so `fill_extents` also bails on the same
+/// signal — so a Stop during a dense bad-sector region observes
+/// cancellation inside libfreemkv even before the next frame yields.
 pub(super) fn run_mux(
     inputs: MuxInputs<'_>,
     mut input: libfreemkv::DiscStream,
@@ -431,7 +445,7 @@ pub(super) fn run_mux(
     let mut buffered = Vec::new();
     let mut header_reads = 0u32;
     while !input.headers_ready() {
-        if stop_requested(inputs.device) {
+        if halt_requested(inputs.device) {
             crate::log::device_log(inputs.device, "Stop requested during header read");
             return MuxOutcome {
                 completed: false,
@@ -700,7 +714,7 @@ pub(super) fn run_mux(
     // the bytes_written it got.
     let mut producer_ok = true;
     for frame in buffered {
-        if stop_requested(inputs.device) {
+        if halt_requested(inputs.device) {
             crate::log::device_log(inputs.device, "Stop requested during buffered write");
             producer_ok = false;
             break;
@@ -724,7 +738,7 @@ pub(super) fn run_mux(
     let mut completed = false;
     if producer_ok {
         loop {
-            if stop_requested(inputs.device) {
+            if halt_requested(inputs.device) {
                 crate::log::device_log(inputs.device, "Stop requested");
                 break;
             }
