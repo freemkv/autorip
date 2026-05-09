@@ -105,7 +105,7 @@ pub fn join_all_rip_threads(timeout: Duration) {
 }
 
 /// Per-device stop flag. Rip thread checks this and exits if true.
-pub static STOP_FLAGS: once_cell::sync::Lazy<
+pub(super) static STOP_FLAGS: once_cell::sync::Lazy<
     Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 

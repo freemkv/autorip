@@ -3,13 +3,6 @@
 //! Lifted verbatim from the monolithic `ripper.rs` as part of the 0.18
 //! prep split — no semantic changes.
 
-/// Remove every subdirectory under `cfg.staging_dir`. Used on startup (all
-/// prior session state is gone, so anything still on disk is orphaned from
-/// a killed process) and on user-initiated stop (stop == reset — clean
-/// slate so the next rip doesn't accidentally resume stale state).
-///
-/// Best-effort: logs each removal, silently ignores errors on individual
-/// entries. A locked or not-yet-created staging root is not fatal.
 /// Available bytes at the given path's filesystem, via `statvfs(3)`.
 /// Returns None on any error (path missing, not POSIX, syscall failure).
 /// Used by the pre-flight check in `rip_disc` to refuse rips that would
@@ -41,6 +34,13 @@ pub(super) fn staging_free_bytes(_path: &str) -> Option<u64> {
     None
 }
 
+/// Remove every subdirectory under `cfg.staging_dir`. Used on startup (all
+/// prior session state is gone, so anything still on disk is orphaned from
+/// a killed process) and on user-initiated stop (stop == reset — clean
+/// slate so the next rip doesn't accidentally resume stale state).
+///
+/// Best-effort: logs each removal, silently ignores errors on individual
+/// entries. A locked or not-yet-created staging root is not fatal.
 pub fn wipe_staging(staging_dir: &str) {
     let entries = match std::fs::read_dir(staging_dir) {
         Ok(e) => e,
