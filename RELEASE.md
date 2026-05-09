@@ -7,8 +7,8 @@
 cd freemkv && freemkv-private/scripts/precommit.sh [libfreemkv|autorip]
 
 # 2. Tag and push
-git tag -a v0.13.27 -m "v0.13.27"
-git push origin v0.13.27
+git tag -a v0.18.1 -m "v0.18.1"
+git push origin v0.18.1
 
 # 3. Wait for CI + Release (~3 min)
 gh run list --repo freemkv/autorip --limit 1
@@ -44,10 +44,10 @@ git add -A
 git commit -m "description"
 
 # Tag with semver
-git tag -a v0.13.27 -m "v0.13.27"
+git tag -a v0.18.1 -m "v0.18.1"
 
 # Push commit AND tag
-git push origin main v0.13.27
+git push origin main v0.18.1
 ```
 
 **Important:** Push the tag! Release workflow only runs when a tag is pushed, not on every commit.
@@ -79,7 +79,7 @@ docker compose up -d
 ## Troubleshooting
 
 ### Release didn't build
-- Check the tag was pushed: `git tag` and `git push origin v0.13.27`
+- Check the tag was pushed: `git tag` and `git push origin v0.18.1`
 - CI must pass before Release runs
 
 ### Container still running old version
@@ -98,5 +98,5 @@ docker compose up -d
 | Push | Image |
 |------|-------|
 | `main` branch | Not built |
-| `v0.13.27` tag | `ghcr.io/freemkv/autorip:0.13.27` |
+| `v0.18.1` tag | `ghcr.io/freemkv/autorip:0.18.1` |
 | Tag push | `ghcr.io/freemkv/autorip:latest` + tag |
