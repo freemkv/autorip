@@ -1,7 +1,8 @@
 //! Integration tests for stop / halt / drain semantics.
 //!
 //! Verifies that:
-//!   - request_stop sets the per-device halt flag (immediate path).
+//!   - cancelling the per-device `Halt` token flips the same bit a
+//!     rip-thread clone polls (immediate path).
 //!   - handle_stop waits for the rip thread to drain before
 //!     returning (TDD-red: today the join handle is dropped).
 //!   - eject + rip-exit don't double-drop the underlying Drive
@@ -12,34 +13,42 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use freemkv_autorip::ripper;
+use libfreemkv::Halt;
 
 #[test]
-fn test_request_stop_sets_halt_flag() {
-    // Register a halt flag for a synthetic device, then call
-    // request_stop and assert the flag flipped to true. This is
-    // the production path: the rip thread registers its drive's
-    // halt flag, the UI calls /api/stop which calls request_stop,
-    // and the next sector read sees `halt = true` and unwinds.
+fn test_cancel_halt_propagates_to_rip_clones() {
+    // Register a per-device `Halt` token (the same call rip_disc
+    // makes at its top); look it up via `device_halt` (the same call
+    // the HTTP /api/stop handler in web.rs makes); cancel it; assert
+    // the original Halt observes cancellation. Models the production
+    // path: the rip thread holds clones threaded through sweep /
+    // patch / mux / DiscStream, the UI calls /api/stop, the handler
+    // calls device_halt(device).cancel(), every clone observes the
+    // flip on its next is_cancelled() poll.
     let device = "sg_halt_test";
-    let halt = Arc::new(AtomicBool::new(false));
+    let halt = Halt::new();
     ripper::register_halt(device, halt.clone());
 
-    assert!(!halt.load(Ordering::Relaxed), "halt should start false");
+    assert!(!halt.is_cancelled(), "halt should start uncancelled");
 
-    ripper::request_stop(device);
+    let registered = ripper::device_halt(device).expect("halt registered");
+    registered.cancel();
 
     assert!(
-        halt.load(Ordering::Relaxed),
-        "request_stop must flip the registered halt flag to true"
+        halt.is_cancelled(),
+        "cancel via the registered token must propagate to every clone"
     );
 }
 
-/// Mirrors what handle_stop now does in production (web.rs:1489):
-///   - request_stop(device)
+/// Mirrors what handle_stop now does in production (web.rs):
+///   - cancel the device's `Halt` token (the new replacement for
+///     the deleted `request_stop` helper).
 ///   - join_rip_thread(device, timeout) — best-effort drain so the
 ///     caller doesn't return while the rip thread is mid-write.
 fn handle_stop_today(device: &str) {
-    ripper::request_stop(device);
+    if let Some(halt) = ripper::device_halt(device) {
+        halt.cancel();
+    }
     let _ = ripper::join_rip_thread(device, Duration::from_secs(35));
 }
 
@@ -66,7 +75,7 @@ fn test_handle_stop_waits_for_thread_drain() {
     // Once handle_stop is fixed to join: update handle_stop_today
     // to also join (with a timeout) and the assert flips to GREEN.
     let device = "sg_drain_test";
-    let halt = Arc::new(AtomicBool::new(false));
+    let halt = Halt::new();
     ripper::register_halt(device, halt.clone());
 
     let exited = Arc::new(AtomicBool::new(false));
@@ -78,7 +87,7 @@ fn test_handle_stop_waits_for_thread_drain() {
             // Halt-aware loop with a realistic drain delay — simulates
             // the rip thread finishing its current sector batch and
             // closing the output file before exiting.
-            while !halt_t.load(Ordering::Relaxed) {
+            while !halt_t.is_cancelled() {
                 std::thread::sleep(Duration::from_millis(10));
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -105,7 +114,7 @@ fn test_handle_stop_waits_for_thread_drain() {
     let _ = stop_elapsed;
     assert!(
         exited.load(Ordering::Relaxed),
-        "rip thread didn't reach its exit branch — halt flag not observed or \
+        "rip thread didn't reach its exit branch — Halt token not observed or \
          handle_stop returned before join completed"
     );
 }

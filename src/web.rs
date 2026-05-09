@@ -1723,7 +1723,9 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     // — the HTTP response still goes out 200 so the UI doesn't spin. After
     // join_rip_thread returns we DID observe drain (success or timeout); the
     // pre-v0.13.6 "fire and forget" wording is gone.
-    ripper::request_stop(device);
+    if let Some(halt) = ripper::device_halt(device) {
+        halt.cancel();
+    }
     crate::verify::request_stop();
 
     if ripper::join_rip_thread(device, std::time::Duration::from_secs(60)).is_err() {

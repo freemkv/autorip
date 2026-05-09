@@ -1,11 +1,17 @@
 //! Per-device drive sessions, halt/stop bookkeeping, and the registry
 //! of in-flight rip threads.
 //!
-//! Lifted verbatim from the monolithic `ripper.rs` as part of the 0.18
-//! prep split — no semantic changes.
+//! 0.18 round 2: the old `HALT_FLAGS` + `STOP_FLAGS` + `register_halt`
+//! / `request_stop` / `stop_requested` / `reset_stop_flag` machinery
+//! is gone. Each rip-thread spawn site now allocates a single
+//! [`libfreemkv::Halt`] token, registers it in [`HALTS`] keyed by
+//! device, and threads `halt.clone()` through every cancellable phase
+//! (sweep / patch / mux). The HTTP `/api/stop/{device}` handler looks
+//! up the device's `Halt` and calls `.cancel()`; phase loops poll
+//! `halt.is_cancelled()` at their tops.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use libfreemkv::Halt;
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -58,10 +64,10 @@ where
 /// thread was registered. Returns `Err(())` on timeout.
 ///
 /// Best-effort drain: callers should treat a timeout as a warning,
-/// not a fatal error. The rip thread's HALT flag was already flipped
-/// by `request_stop`; the thread will exit eventually. The timeout
-/// just bounds how long the HTTP response (or shutdown sequence)
-/// blocks.
+/// not a fatal error. The rip thread's `Halt` token was already
+/// cancelled by the stop path before this is called; the thread will
+/// exit eventually. The timeout just bounds how long the HTTP
+/// response (or shutdown sequence) blocks.
 ///
 /// Implementation: poll `JoinHandle::is_finished()` every 25 ms
 /// until it returns true or the deadline passes. Polling avoids the
@@ -104,50 +110,41 @@ pub fn join_all_rip_threads(timeout: Duration) {
     }
 }
 
-/// Per-device stop flag. Rip thread checks this and exits if true.
-pub(super) static STOP_FLAGS: once_cell::sync::Lazy<
-    Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
-> = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+/// Per-device cooperative-cancel tokens. The rip thread spawn site
+/// allocates one [`Halt`] per rip and stashes its clone here so the
+/// HTTP stop handler in `web.rs` (and `eject_drive`) can find it.
+///
+/// Replaces the 0.17 `HALT_FLAGS` + `STOP_FLAGS` pair (two parallel
+/// `Arc<AtomicBool>` registries that the old `request_stop` flipped
+/// in lockstep). One token, one bit, one source of truth — every
+/// phase that holds a clone observes Stop on its next poll.
+static HALTS: once_cell::sync::Lazy<Mutex<std::collections::HashMap<String, Halt>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// Drive halt flags — set by request_stop to interrupt Drive::read() recovery.
-pub(super) static HALT_FLAGS: once_cell::sync::Lazy<
-    Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
-> = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-
-pub fn register_halt(device: &str, flag: Arc<AtomicBool>) {
-    if let Ok(mut flags) = HALT_FLAGS.lock() {
-        flags.insert(device.to_string(), flag);
+/// Stash the rip thread's [`Halt`] for later lookup by the stop /
+/// eject paths. Called once at the top of every rip; any prior token
+/// for the same device is dropped.
+pub fn register_halt(device: &str, halt: Halt) {
+    if let Ok(mut halts) = HALTS.lock() {
+        halts.insert(device.to_string(), halt);
     }
 }
 
-pub fn request_stop(device: &str) {
-    if let Ok(flags) = STOP_FLAGS.lock() {
-        if let Some(flag) = flags.get(device) {
-            flag.store(true, Ordering::Relaxed);
-        }
-    }
-    // Also halt the drive to break out of recovery loops
-    if let Ok(flags) = HALT_FLAGS.lock() {
-        if let Some(flag) = flags.get(device) {
-            flag.store(true, Ordering::Relaxed);
-        }
-    }
+/// Look up the device's currently-registered [`Halt`]. Returns `None`
+/// if no rip thread is registered for `device`. Cloning the returned
+/// token is cheap (Arc bump) — clones share the underlying flag with
+/// the rip-side clones already threaded into sweep / patch / mux.
+pub fn device_halt(device: &str) -> Option<Halt> {
+    HALTS.lock().ok().and_then(|h| h.get(device).cloned())
 }
 
-pub(super) fn stop_requested(device: &str) -> bool {
-    STOP_FLAGS
-        .lock()
-        .ok()
-        .and_then(|f| f.get(device).map(|flag| flag.load(Ordering::Relaxed)))
-        .unwrap_or(false)
-}
-
-pub(super) fn reset_stop_flag(device: &str) -> Arc<AtomicBool> {
-    let flag = Arc::new(AtomicBool::new(false));
-    if let Ok(mut flags) = STOP_FLAGS.lock() {
-        flags.insert(device.to_string(), flag.clone());
+/// Drop the device's registered [`Halt`]. Called from the rip-thread
+/// cleanup paths (every early-return branch in `rip_disc`) so a
+/// subsequent rip on the same device starts with a fresh token.
+pub fn unregister_halt(device: &str) {
+    if let Ok(mut halts) = HALTS.lock() {
+        halts.remove(device);
     }
-    flag
 }
 
 // ─── Per-device drive session ──────────────────────────────────────────────
