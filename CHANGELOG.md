@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.9 (2026-05-09)
+
+### Diagnostic env var: AUTORIP_SKIP_DISKCHECK=1
+
+Bypasses the pre-flight staging-space check from v0.17.7. Allows
+intentional under-capacity rips for diagnostics (speed isolation
+on smaller scratch volumes, partial-ISO experiments). The rip
+will run normally and predictably ENOSPC mid-stream once the
+volume fills; cleanup is the operator's job. Don't set this in
+production.
+
 ## 0.17.8 (2026-05-08)
 
 ### Hotfix: read batch size was hardcoded to 1 sector
