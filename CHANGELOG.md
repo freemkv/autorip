@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.17.12 (2026-05-09)
+
+### Pick up libfreemkv 0.17.12 (mapfile time-batched persistence)
+
+NFS-staged rips were observed at ~1.5 MB/s vs ~11 MB/s on local LVM
+on the same drive / same disc / same code path. Root cause: every
+sector batch triggered `Mapfile::record()` → tempfile-create + write
++ atomic-rename, and on NFS each of those is multiple RPCs through
+the unraid user-share fuse layer. libfreemkv 0.17.12 batches mapfile
+persistence to once per second, with explicit flush at sweep / patch
+finalisation and a Drop-impl safety net. autorip carries no source
+changes — dep bump only. Target: NFS sustained throughput within ±3%
+of the local LVM number for the same rip.
+
 ## 0.17.11 (2026-05-09)
 
 ### Pick up libfreemkv 0.17.11 (sweep producer/consumer split)
