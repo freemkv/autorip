@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.17.11 (2026-05-09)
+
+### Pick up libfreemkv 0.17.11 (sweep producer/consumer split)
+
+Sweep now overlaps drive read with file write + mapfile record on a
+worker thread. On the BU40N + UHD inner zone the goal is closing
+the gap from ~10-12 MB/s sustained to the ~14-16 MB/s drive ceiling.
+See libfreemkv 0.17.11 CHANGELOG for the full mechanism. autorip
+carries no source changes — only the dep bump.
+
 ## 0.17.10 (2026-05-09)
 
 ### Pick up libfreemkv 0.17.10 (bounded-cache writeback)
