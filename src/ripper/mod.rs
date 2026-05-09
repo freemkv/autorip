@@ -26,8 +26,8 @@ mod sweep;
 
 // Re-export every symbol the rest of the crate (and integration tests)
 // addresses as `crate::ripper::*`. Names that aren't reached for
-// outside the ripper module (e.g. STOP_FLAGS, STOP_COOLDOWNS) stay
-// `pub(super)` in their owning sub-module and don't appear here.
+// outside the ripper module (e.g. STOP_COOLDOWNS) stay `pub(super)`
+// in their owning sub-module and don't appear here.
 //
 // `#[allow(unused_imports)]` is retained because the binary build
 // (`mod ripper;` is private in `main.rs`) doesn't itself reach for
@@ -35,8 +35,8 @@ mod sweep;
 // integration tests under `tests/` do, so the re-exports must stay.
 #[allow(unused_imports)]
 pub use session::{
-    join_all_rip_threads, join_rip_thread, register_halt, register_rip_thread, request_stop,
-    spawn_rip_thread, take_rip_thread,
+    device_halt, join_all_rip_threads, join_rip_thread, register_halt, register_rip_thread,
+    spawn_rip_thread, take_rip_thread, unregister_halt,
 };
 pub use staging::wipe_staging;
 #[allow(unused_imports)]
@@ -53,10 +53,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-use session::{
-    DriveSession, HALT_FLAGS, drop_session, rediscover_drive, reset_stop_flag, stop_requested,
-    store_session, take_session,
-};
+use session::{DriveSession, drop_session, rediscover_drive, store_session, take_session};
 use staging::staging_free_bytes;
 use state::{
     PassContext, PassProgressState, is_in_cooldown, push_pass_state, set_pass_progress,
@@ -295,11 +292,27 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     let dev_path = path.clone();
                     let device_for_thread = device.clone();
 
+                    // Allocate the rip's single `Halt` token at the spawn
+                    // site so the HTTP /api/stop/{device} handler can find
+                    // it via `device_halt(device).cancel()` even before
+                    // `rip_disc` starts (e.g. while `scan_disc` is still
+                    // running). `rip_disc` and the in-thread cleanup paths
+                    // call `unregister_halt(device)` on exit.
+                    register_halt(&device, libfreemkv::Halt::new());
+
                     if let Err(e) = spawn_rip_thread(&device, "rip", move || {
                         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             scan_disc(&cfg, &device_for_thread, &dev_path);
-                            if on_insert == "rip" && !stop_requested(&device_for_thread) {
+                            let cancelled = device_halt(&device_for_thread)
+                                .map(|h| h.is_cancelled())
+                                .unwrap_or(false);
+                            if on_insert == "rip" && !cancelled {
                                 rip_disc(&cfg, &device_for_thread, &dev_path);
+                            } else {
+                                // scan-only or scan+stop: clear the
+                                // registered token so the next insert
+                                // starts fresh.
+                                unregister_halt(&device_for_thread);
                             }
                         }))
                         .is_err()
@@ -310,6 +323,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                             );
                             crate::log::device_log(&device_for_thread, "Thread panicked");
                             drop_session(&device_for_thread);
+                            unregister_halt(&device_for_thread);
                             update_state(
                                 &device_for_thread,
                                 RipState {
@@ -551,7 +565,14 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 /// Rip a disc. Reuses the existing drive session from scan_disc.
 /// If no session exists, opens fresh (for on_insert=rip).
 pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
-    reset_stop_flag(device);
+    // The poll-loop spawn site already registered a fresh `Halt` for
+    // this device (so an HTTP stop during scan has something to flip).
+    // Replace it with a Halt backed by the drive's halt-flag once the
+    // drive is open below — that way Stop also pre-empts in-flight
+    // `Drive::read` calls inside libfreemkv. Until then a stale halt
+    // from a prior rip on the same device must NOT survive into this
+    // rip's checks.
+    register_halt(device, libfreemkv::Halt::new());
 
     // Archive the previous rip's per-device log so the live log only
     // shows events from the current attempt. Mirrors what scan_disc
@@ -885,9 +906,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let rip_last_lba = Arc::new(AtomicU64::new(0));
     let rip_current_batch = Arc::new(AtomicU16::new(batch));
 
-    // Create PES stream — same drive session, no re-open
-    let halt = session.drive.halt_flag();
-    register_halt(device, halt.clone());
+    // Wire the drive's halt-flag into the per-device `Halt` token.
+    // Before this point the registered token was a placeholder
+    // (allocated at the top of `rip_disc` so a stop click had
+    // *something* to cancel); now we swap it for a `Halt` that views
+    // the same `Arc<AtomicBool>` the drive's internal recovery loops
+    // poll on — so `device_halt(device).cancel()` simultaneously
+    // propagates to libfreemkv's `Drive::read` and every phase loop
+    // here in autorip that holds a `halt.clone()`.
+    let drive_halt_arc = session.drive.halt_flag();
+    let halt_token = libfreemkv::Halt::from_arc(drive_halt_arc.clone());
+    register_halt(device, halt_token.clone());
+    // Local alias: pre-existing call sites refer to `halt` as the
+    // legacy `Arc<AtomicBool>`. Keep the same name so the watcher
+    // helpers (which still take `Arc<AtomicBool>`) compile unchanged
+    // — this is the deprecated bridge documented in
+    // freemkv-private/memory/0_18_round3_migration_audit.md and is
+    // dropped together with `Disc::copy()` in round 3.
+    let halt = drive_halt_arc;
 
     // Rip-level wallclock budget (Fix 3). Caps the ENTIRE rip — all passes
     // combined — at max(disc_runtime, 1h). Implemented as a background thread
@@ -1071,9 +1107,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         s.status = "error".to_string();
                         s.last_error = msg.clone();
                     });
-                    if let Ok(mut flags) = HALT_FLAGS.lock() {
-                        flags.remove(device);
-                    }
+                    unregister_halt(device);
                     drop_session(device);
                     return;
                 }
@@ -1193,9 +1227,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 Err(e) => {
                     if halt.load(Ordering::Relaxed) {
                         crate::log::device_log(device, &format!("Pass 1 cancelled (halt): {e}"));
-                        if let Ok(mut flags) = HALT_FLAGS.lock() {
-                            flags.remove(device);
-                        }
+                        unregister_halt(device);
                         return;
                     }
 
@@ -1221,9 +1253,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                                 ..Default::default()
                             },
                         );
-                        if let Ok(mut flags) = HALT_FLAGS.lock() {
-                            flags.remove(device);
-                        }
+                        unregister_halt(device);
                         return;
                     }
 
@@ -1636,9 +1666,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     );
                 }
 
-                if let Ok(mut flags) = HALT_FLAGS.lock() {
-                    flags.remove(device);
-                }
+                unregister_halt(device);
                 return;
             }
         };
@@ -2023,9 +2051,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         );
                     }
                 });
-                if let Ok(mut flags) = HALT_FLAGS.lock() {
-                    flags.remove(device);
-                }
+                unregister_halt(device);
                 return; // Skip mux entirely
             }
 
@@ -2047,9 +2073,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         // Skip mux + return cleanly if user pressed stop.
         if user_halt.load(Ordering::Relaxed) {
             crate::log::device_log(device, "Rip cancelled — skipping mux.");
-            if let Ok(mut flags) = HALT_FLAGS.lock() {
-                flags.remove(device);
-            }
+            unregister_halt(device);
             return;
         }
         // Skip mux + status=error if any pass cap-fired (per-pass wallclock
@@ -2066,9 +2090,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     s.last_error = "rip failed — pass exceeded wallclock budget".to_string();
                 }
             });
-            if let Ok(mut flags) = HALT_FLAGS.lock() {
-                flags.remove(device);
-            }
+            unregister_halt(device);
             return;
         }
 
@@ -2100,9 +2122,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                             ..Default::default()
                         },
                     );
-                    if let Ok(mut flags) = HALT_FLAGS.lock() {
-                        flags.remove(device);
-                    }
+                    unregister_halt(device);
                     return;
                 }
             };
@@ -2123,11 +2143,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         Box::new(session.drive) as Box<dyn libfreemkv::SectorReader>
     };
 
-    let mut input = libfreemkv::DiscStream::new(reader, title, keys, batch, format);
-    // Wire the same halt flag into DiscStream so Stop interrupts fill_extents'
-    // internal retry loop — required for Stop to work during dense bad-sector
-    // regions where the outer PES read() loop may never emit a frame.
-    input.set_halt(halt.clone());
+    // 0.18 round 2: DiscStream gets the per-device `Halt` at
+    // construction via the new `with_halt(...)` builder. Stop
+    // interrupts `fill_extents` at the next retry boundary on the
+    // same signal that breaks sweep, patch, and the mux frame loop —
+    // required for Stop to work during dense bad-sector regions
+    // where the outer PES read() loop may never emit a frame.
+    let mut input = libfreemkv::DiscStream::new(reader, title, keys, batch, format)
+        .with_halt(halt_token.clone());
     if cfg_read.on_read_error == "skip" {
         input.skip_errors = true;
     }
@@ -2173,10 +2196,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // libfreemkv's `Pipeline` + `Sink` primitive. See
     // `freemkv-private/memory/0_18_redesign.md` § "Module layout".
     //
-    // The producer side of `run_mux` checks the existing
-    // `HALT_FLAGS`-backed `stop_requested` at the top of each frame
-    // iteration; round 2's `Halt`-token migration is a separate slice
-    // tracked in the redesign doc.
+    // The producer side of `run_mux` polls the per-device `Halt`
+    // token (looked up via `device_halt(device)`) at the top of each
+    // frame iteration — same token the orchestrator threaded through
+    // sweep / patch and the same one the HTTP /api/stop handler
+    // cancels.
     let mux_input_errors = Arc::new(AtomicU32::new(0));
     let mux_outcome = mux::run_mux(
         mux::MuxInputs {
@@ -2212,16 +2236,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // failed): the pre-split code returned early without writing a
     // history record. Preserve that.
     if !mux_outcome.output_opened {
-        if let Ok(mut flags) = HALT_FLAGS.lock() {
-            flags.remove(device);
-        }
+        unregister_halt(device);
         return;
     }
 
     // Clean up halt flag
-    if let Ok(mut flags) = HALT_FLAGS.lock() {
-        flags.remove(device);
-    }
+    unregister_halt(device);
 
     let completed = mux_outcome.completed;
     let bytes_done = mux_outcome.bytes_done;
@@ -2433,11 +2453,14 @@ pub fn eject_drive(device_path: &str) {
     // Halt and drain any in-flight rip on this device BEFORE dropping
     // the session — otherwise the rip thread could still be inside a
     // libfreemkv call holding the Drive while we yank it.
-    request_stop(dev);
+    if let Some(halt) = device_halt(dev) {
+        halt.cancel();
+    }
     if join_rip_thread(dev, Duration::from_secs(60)).is_err() {
         tracing::warn!(device = %dev, "rip thread did not drain within 60s of eject");
     }
     drop_session(dev);
+    unregister_halt(dev);
     crate::log::archive_device_log(dev);
     if let Ok(mut session) = libfreemkv::Drive::open(std::path::Path::new(device_path)) {
         let _ = session.eject();
