@@ -17,11 +17,16 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   --bg:#f6f8fa; --border:#d0d7de; --text:#1f2328; --text2:#4d5560; --text3:#656d76;
   --accent:#0969da; --green:#1a7f37; --yellow:#9a6700; --red:#cf222e; --blue:#0969da;
   --card:#fff; --log-bg:#fff; --log-text:#24292f; --log-border:#d0d7de; --chip:#eaeef2; --poster-bg:#e1e4e8;
+  /* Light-mode pill backgrounds (--green / --yellow / --red) are all
+     saturated/dark — pair them with white pill text. Dark mode flips
+     to lighter pill backgrounds, which want black text instead. */
+  --pill-fg:#fff;
 }
 body.dark {
   --bg:#0d1117; --border:#3d444d; --text:#f0f6fc; --text2:#d1d9e0; --text3:#9198a1;
   --accent:#79c0ff; --green:#56d364; --yellow:#e3b341; --red:#ff7b72; --blue:#79c0ff;
   --card:#151b23; --log-bg:#151b23; --log-text:#d1d9e0; --log-border:#3d444d; --chip:#262c36; --poster-bg:#262c36;
+  --pill-fg:#000;
 }
 * { margin:0; padding:0; box-sizing:border-box; }
 body { font-family:-apple-system,system-ui,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; flex-direction:column; }
@@ -240,21 +245,37 @@ function renderSteps(steps,progress,eta,speed,s){
       const totalPct=(typeof s.total_progress_pct==='number')?s.total_progress_pct:passPct;
       const passLbl=passLabelFor(s);
       const header=passLbl?' \u00b7 '+passLbl:'';
-      const passPctStr=passPct+'%';
-      const passEtaStr=s.pass_eta?'ETA '+s.pass_eta:'';
-      const spdStr=speed&&speed!=='0 KB/s'?speed:'';
+      /* Three fixed-width columns + tabular-nums so the per-pass and
+         total rows align visually: digits stack vertically across rows
+         instead of shifting as the value width changes ("9%" -> "10%",
+         "ETA 1:30:45" -> "ETA 0:05"). Empty slots reserve their column
+         width so the totalLine doesn't drift right when speed is blank. */
+      const TAB='font-variant-numeric:tabular-nums;display:inline-block;';
+      const col=(body,minPx,align)=>
+        '<span style="'+TAB+'min-width:'+minPx+'px;text-align:'+align+'">'+body+'</span>';
+      const passPctStr=col(passPct+'%',45,'right');
+      const passEtaStr=col(s.pass_eta?'ETA '+s.pass_eta:'',95,'left');
+      const spdStr=col((speed&&speed!=='0 KB/s')?speed:'',85,'left');
       /* v0.13.19: wider text-row separators (em-spaces around the middle dot)
          + more vertical breathing room between bars and their text rows so
          the dashboard doesn't feel cramped. */
       const SEP=' \u2003\u00b7\u2003 ';
-      const passLine=[passPctStr,passEtaStr,spdStr].filter(Boolean).join(SEP);
+      /* Don't filter empty slots — they're already wrapped in fixed-width
+         spans and need to keep their column position. Always join all 3. */
+      const passLine=[passPctStr,passEtaStr,spdStr].join(SEP);
       /* 0.13.24: mirror the per-pass line's terse format. Drop the
          redundant "Total " prefix on ETA (the leading "Total N%" already
          makes the bar's identity obvious), and drop "Recovered X / Y GB"
          entirely — the green Good pill carries the same information
          without duplicating it. */
-      const totalEtaStr=s.total_eta?'ETA '+s.total_eta:'';
-      const totalLine=['Total '+totalPct+'%',totalEtaStr].filter(Boolean).join(SEP);
+      /* Identical column structure to passLine — the "Total " prefix is
+         gone now that a "Total Progress:" label sits above the bar (just
+         like "Rip · pass N/M" sits above the per-pass bar). Third column
+         is reserved with an empty body so the layout doesn't reflow. */
+      const totalPctStr=col(totalPct+'%',45,'right');
+      const totalEtaStr=col(s.total_eta?'ETA '+s.total_eta:'',95,'left');
+      const totalSpdStr=col('',85,'left');
+      const totalLine=[totalPctStr,totalEtaStr,totalSpdStr].join(SEP);
       /* 0.13.23: three-bucket display.
          GOOD  (green)  \u2014 Finished sectors. Always rendered when bytes_total_disc>0.
          MAYBE (yellow) \u2014 Pending sectors (Pass 2-N may recover). Hidden when 0.
@@ -281,16 +302,22 @@ function renderSteps(steps,progress,eta,speed,s){
         void goodMs;
         const maybeMs = (s.total_maybe_ms!=null && s.total_maybe_ms>=0) ? s.total_maybe_ms : 0;
         const lostMs  = (s.total_lost_ms!=null  && s.total_lost_ms >=0) ? s.total_lost_ms  : 0;
-        const pill = (label, color, body)=>
+        /* Fixed-width per pill type: each pill's content can grow as
+           values change ("864 MB" \u2192 "12.5 GB", "~3s" \u2192 "~01:23:45"),
+           and an inline-block grows with content unless we pin it.
+           Per-type min-widths sized for each pill's worst case so the
+           Good chip doesn't waste space matching Maybe/Bad. */
+        const pill = (label, color, body, minPx)=>
           '<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:'+color
-          +';color:#000;font-size:.65rem;font-weight:600;margin-right:6px">'
+          +';color:var(--pill-fg);font-size:.65rem;font-weight:600;margin-right:6px;'
+          +'min-width:'+minPx+'px;text-align:center;font-variant-numeric:tabular-nums">'
           +label+' '+body+'</span>';
         let pills='';
         if(bg>0){
-          pills+=pill('Good','var(--green,#3aaa55)', fmtBytes(bg));
+          pills+=pill('Good','var(--green,#3aaa55)', fmtBytes(bg), 90);
         }
         if(bm>0){
-          pills+=pill('Maybe','var(--yellow,#f0c000)', fmtBytes(bm)+' \u00b7 ~'+fmtMs(maybeMs));
+          pills+=pill('Maybe','var(--yellow,#f0c000)', fmtBytes(bm)+' \u00b7 ~'+fmtMs(maybeMs), 170);
         }
         if(bl>0){
           /* damage_severity label only when terminal loss exists. */
@@ -299,7 +326,7 @@ function renderSteps(steps,progress,eta,speed,s){
                          : sev==='moderate' ? 'Moderate'
                          : sev==='cosmetic' ? 'Cosmetic'
                          : 'No chance';
-          pills+=pill(sevLabel,'var(--red,#e34234)', fmtBytes(bl)+' \u00b7 ~'+fmtMs(lostMs));
+          pills+=pill(sevLabel,'var(--red,#e34234)', fmtBytes(bl)+' \u00b7 ~'+fmtMs(lostMs), 195);
         }
         /* 0.13.24: bump margin-top from 6px to 14px so the pill row gets
            the same visual breathing room as the gap between the per-pass
@@ -309,7 +336,13 @@ function renderSteps(steps,progress,eta,speed,s){
       detail='<div style="margin-top:6px">'
         +renderBar(s,passPct)
         +'<div style="font-size:.75rem;color:var(--text2);margin-top:7px">'+passLine+'</div>'
-        +'<div style="margin-top:14px">'+renderTotalBar(totalPct)+'</div>'
+        /* "Total Progress:" label mirrors the "Rip · pass N/M" header
+           that's rendered above the per-pass bar (outside this `detail`
+           string) — both bars now have a small caption above them so a
+           glance at the dashboard tells you which is which. The 18px
+           top-margin gives breathing room from the per-pass speed line. */
+        +'<div style="font-size:.7rem;color:var(--text3);margin-top:18px">Total Progress:</div>'
+        +'<div style="margin-top:6px">'+renderTotalBar(totalPct)+'</div>'
         +'<div style="font-size:.75rem;color:var(--text2);margin-top:7px">'+totalLine+'</div>'
         +badLine+'</div>';
       /* Fold pass info into the step name so it's obvious at a glance. */
@@ -475,18 +508,13 @@ function renderCurrent(){
   }
   if(discIn&&!active)btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
 
-  /* Multipass label: show "pass 1/3 copying" etc. when in multipass mode.
-     Last pass is the mux from ISO. Falls back to raw status string otherwise. */
-  let statusLabel=verifying?'verifying':(s.status||'idle');
-  if(s.status==='ripping'&&s.pass>0&&s.total_passes>0){
-    const isMux=s.pass===s.total_passes;
-    const isCopy=s.pass===1;
-    const label=isMux?'muxing':(isCopy?'copying':'retrying');
-    statusLabel='pass '+s.pass+'/'+s.total_passes+' · '+label;
-  }
   const dot=active?'var(--green)':scanned?'var(--accent)':discIn?'var(--yellow)':'var(--text3)';
   const pulse=active?'animation:p 1.5s infinite;':'';
-  upd('actions','<div class="actions"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dot+';vertical-align:middle;margin-right:6px;'+pulse+'"></span><span style="font-size:.8rem;color:var(--text2)">'+dev+' \u00b7 '+statusLabel+'</span><span style="margin-left:auto;display:flex;gap:6px">'+btns+'</span></div>');
+  /* statusLabel intentionally not shown here \u2014 it's already in the
+     Ripping step header below ("Rip \u00b7 pass N/M \u00b7 copying") and the tab
+     strip identifies which device this panel is for. Keep just the
+     colored dot + dev name + action buttons in this row. */
+  upd('actions','<div class="actions"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+dot+';vertical-align:middle;margin-right:6px;'+pulse+'"></span><span style="font-size:.8rem;color:var(--text2)">'+dev+'</span><span style="margin-left:auto;display:flex;gap:6px">'+btns+'</span></div>');
 
   /* Steps */
   const steps=buildSteps(s);
@@ -873,8 +901,42 @@ function saveSettings(){
    if(s.rip_mode==='single'){s.max_retries=0;s.keep_iso=false;s.abort_on_lost_secs=0}
    else if(s.rip_mode==='multi'&&(!s.max_retries||s.max_retries<1)){s.max_retries=5}
    delete s.rip_mode;
+  /* Loud, hard-to-miss feedback on save. The previous version flashed
+     "Saved" in a small green span next to the button for 2 s and did
+     nothing at all on error — easy to miss and silent on failure.
+     Now: the button itself transitions through Saving… → ✓ Saved (green
+     fill) → original label, and the adjacent status span carries any
+     error message in red. */
+  const btn=document.getElementById('savebtn');
+  const status=document.getElementById('save-status');
+  const origLabel=btn.textContent;
+  btn.disabled=true;
+  btn.textContent='Saving…';
+  status.textContent='';
+  status.style.color='var(--green)';
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)})
-  .then(r=>{if(r.ok){document.getElementById('save-status').textContent='Saved';setTimeout(()=>document.getElementById('save-status').textContent='',2000)}});
+    .then(r=>{
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      btn.textContent='✓ Saved';
+      btn.style.background='var(--green)';
+      btn.style.color='#fff';
+      btn.style.borderColor='var(--green)';
+      status.textContent='Saved';
+      setTimeout(()=>{
+        btn.disabled=false;
+        btn.textContent=origLabel;
+        btn.style.background='';
+        btn.style.color='';
+        btn.style.borderColor='';
+        status.textContent='';
+      },2000);
+    })
+    .catch(e=>{
+      btn.disabled=false;
+      btn.textContent=origLabel;
+      status.style.color='var(--red)';
+      status.textContent='Save failed: '+e.message;
+    });
 }
 
 /* ---- Init ---- */
