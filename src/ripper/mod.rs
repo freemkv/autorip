@@ -1212,14 +1212,23 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 break;
             }
 
-            let copy_opts = libfreemkv::disc::CopyOptions {
+            // 0.18 round 3: Pass 1 calls Disc::sweep directly. The old
+            // disc.copy(opts.multipass=true) dispatched to sweep_internal
+            // which forwarded {decrypt, skip_on_error=multipass} to
+            // SweepOptions. resume=true on retry attempts so the existing
+            // mapfile state continues where the bridge crash left it
+            // (matches the pre-existing implicit resume behaviour: the
+            // first attempt is fresh and each retry resumes from mapfile).
+            let sweep_opts = libfreemkv::SweepOptions {
                 decrypt: false,
-                multipass: true,
-                halt: Some(pass1_halt.clone()),
+                resume: attempt > 1,
+                batch_sectors: None,
+                skip_on_error: true,
                 progress: Some(&pass1_progress),
+                halt: Some(pass1_halt.clone()),
             };
 
-            match disc.copy(&mut session.drive, iso_path, &copy_opts) {
+            match disc.sweep(&mut session.drive, iso_path, &sweep_opts) {
                 Ok(r) => {
                     result = Some(r);
                     break 'pass1;
@@ -1687,10 +1696,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let mut bytes_unreadable = result.bytes_unreadable;
         let mut bytes_pending = result.bytes_pending;
 
-        // Retry passes: Disc::copy with multipass=true re-reads only bad
-        // ranges (patch) sector-by-sector with full drive-level recovery.
-        // Each pass gets its own wallclock cap watcher; cap-fire
-        // marks the rip as failed.
+        // Retry passes: Disc::patch re-reads only the bad ranges
+        // recorded in the mapfile sector-by-sector with full
+        // drive-level recovery. Each pass gets its own wallclock cap
+        // watcher; cap-fire marks the rip as failed.
 
         let max_retries = cfg_read.max_retries;
 
@@ -1859,13 +1868,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 max_pass_secs,
             );
 
-            let copy_opts = libfreemkv::disc::CopyOptions {
+            // 0.18 round 3: Pass 2..N calls Disc::patch directly. The old
+            // disc.copy(opts.multipass=true) dispatched to patch_internal
+            // when the mapfile already had retryable bytes; these PatchOptions
+            // mirror what patch_internal was constructing internally.
+            let patch_opts = libfreemkv::PatchOptions {
                 decrypt: false,
-                multipass: true,
-                halt: Some(pass_halt.clone()),
+                block_sectors: Some(1),
+                full_recovery: true,
+                reverse: true,
+                wedged_threshold: 50,
                 progress: Some(&patch_progress),
+                halt: Some(pass_halt.clone()),
             };
-            let cr = match disc.copy(&mut session.drive, iso_path, &copy_opts) {
+            let cr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {
                 Ok(r) => r,
                 Err(e) => {
                     // Categorize the failure for debugging
@@ -1916,7 +1932,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                         crate::log::device_log(
                             device,
                             &format!(
-                                "STRATEGY_FAILURE: patch_recovery FAILED at disc.copy() with category={} (sense_key={:?}, ASC={:?})",
+                                "STRATEGY_FAILURE: patch_recovery FAILED at disc.patch() with category={} (sense_key={:?}, ASC={:?})",
                                 error_category,
                                 e.scsi_sense().map(|s| s.sense_key),
                                 e.scsi_sense().map(|s| s.asc)
@@ -1954,7 +1970,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             bytes_good = cr.bytes_good;
             bytes_unreadable = cr.bytes_unreadable;
             bytes_pending = cr.bytes_pending;
-            let recovered = cr.recovered_this_pass;
+            // PatchOutcome renames recovered_this_pass → bytes_recovered_this_pass.
+            let recovered = cr.bytes_recovered_this_pass;
             let exit_str = if cr.halted { " (halt)" } else { "" };
             crate::log::device_log(
                 device,
