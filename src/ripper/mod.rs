@@ -370,8 +370,12 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
 
 /// Scan a disc — open, init, identify, TMDB, full scan. Stores session for rip.
 pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
+    // Snapshot Config (it's Clone) and drop the read guard immediately —
+    // see rip_disc for the full rationale. Scans can take 10-30s on
+    // damaged discs; that's long enough to noticeably block any
+    // settings POST that races with a scan.
     let cfg_read = match cfg.read() {
-        Ok(c) => c,
+        Ok(c) => c.clone(),
         Err(_) => return,
     };
 
@@ -581,8 +585,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // the prior run mixed into the new one.
     crate::log::archive_device_log(device);
 
+    // Snapshot the Config struct (it's Clone) and drop the read guard
+    // immediately. Holding the guard across the rip body would block
+    // any settings POST (Auto Eject, on_read_error, max_retries, …)
+    // for the rip's full duration, and Linux's writer-priority RwLock
+    // would queue all subsequent GETs behind the pending writer —
+    // the live observed bug where /api/settings, /api/history, and
+    // /api/system stopped responding mid-rip until the rip ended.
     let cfg_read = match cfg.read() {
-        Ok(c) => c,
+        Ok(c) => c.clone(),
         Err(_) => return,
     };
 
@@ -932,8 +943,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // safety net; this is the backstop so a rip can't run forever even if
     // individual passes keep resetting their timers. Configurable via
     // MAX_RIP_DURATION_SECS env var or settings.json.
-    let cfg = cfg.read().unwrap();
-    let rip_budget_secs = cfg.max_rip_duration_secs;
+    // Snapshot every cfg field the rip needs upfront, then drop the read
+    // lock immediately. Pre-fix this binding shadowed the outer `cfg`
+    // RwLock<Config> with the read guard for the entire `rip_disc` body,
+    // holding the lock for the whole 60+ minute rip. The settings POST
+    // handler takes a write lock, so a user toggling Auto Eject (or any
+    // setting) hung on `cfg.write()` for the duration; once a writer is
+    // queued, Linux's writer-priority RwLock blocks subsequent reads
+    // too — so `/api/settings`, `/api/history`, `/api/system` all stop
+    // responding until the rip ends. `/api/state` survived because it
+    // uses a separate lock.
+    let (rip_budget_secs, min_pass_budget_secs, transport_recovery_delay_secs) = {
+        let c = cfg.read().unwrap();
+        (
+            c.max_rip_duration_secs,
+            c.min_pass_budget_secs,
+            c.transport_recovery_delay_secs,
+        )
+    };
     let halt_rip_watcher = halt.clone();
     let device_rip_watcher = device.to_string();
     let _rip_watcher_guard = std::thread::spawn(move || {
@@ -962,7 +989,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // MIN_PASS_BUDGET_SECS env var or settings.json. If ANY pass exceeds
     // its budget the rip ends with status=error (see cap_fired_any tracking below).
     let chosen_runtime_secs: u64 = title.duration_secs.max(0.0) as u64;
-    let max_pass_secs = chosen_runtime_secs.max(cfg.min_pass_budget_secs);
+    let max_pass_secs = chosen_runtime_secs.max(min_pass_budget_secs);
     struct WallclockGuard(Arc<AtomicBool>);
     impl Drop for WallclockGuard {
         fn drop(&mut self) {
@@ -1284,9 +1311,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     drop_session(device);
 
                     // Wait for USB re-enumeration with configurable delay.
-                    // `cfg` already holds the read guard from the outer scope.
+                    // Value snapshotted at the top of `rip_disc`; we no
+                    // longer hold the cfg read guard here.
                     std::thread::sleep(std::time::Duration::from_secs(
-                        cfg.transport_recovery_delay_secs,
+                        transport_recovery_delay_secs,
                     ));
 
                     // Re-discover the device. The poll loop may have already
@@ -1313,7 +1341,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                                     }
                                     Err(e) if retry < 2 => {
                                         let backoff_secs =
-                                            cfg.transport_recovery_delay_secs * (1u64 << retry);
+                                            transport_recovery_delay_secs * (1u64 << retry);
                                         crate::log::device_log(
                                             device,
                                             &format!(
