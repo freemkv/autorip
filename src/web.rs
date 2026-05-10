@@ -803,6 +803,7 @@ function renderSettings(s){
        {key:'abort_on_lost_secs',label:'Max Acceptable Main Movie Loss',type:'number',hint:'Seconds of missing data I will tolerate. 0 = perfect rip required (abort if any loss after retries). Applies to multi-pass mode only.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
     ]},
     {title:'Output',fields:[
+      {key:'staging_dir',label:'Staging Directory',type:'text',hint:'Where rips are written before being moved to the final destination. Use a fast local disk for performance; the finished MKV is moved to the output directory on completion.'},
       {key:'output_dir',label:'Output Directory',type:'text',hint:'Where all ripped files go by default'},
       {key:'movie_dir',label:'Movies',type:'text',hint:'',indent:true,placeholder:'Same as output directory'},
       {key:'tv_dir',label:'TV Series',type:'text',hint:'',indent:true,placeholder:'Same as output directory'},
