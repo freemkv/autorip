@@ -731,6 +731,21 @@ function renderMoves(){
     });
   }
   if(!hasContent)html='<div style="color:var(--text3);font-size:.8rem">No pending moves</div>';
+  /* Stuck-move errors that need user action (orphaned staging dirs etc.) */
+  if(window._moveErrors&&window._moveErrors.length){
+    html+='<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--chip)">';
+    window._moveErrors.forEach(e=>{
+      html+='<div style="padding:6px 0;font-size:.8rem">'
+        +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">'
+        +'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);flex-shrink:0"></span>'
+        +'<span style="font-weight:500;color:var(--red)">'+esc(e.path||'')+'</span>'
+        +'</div>'
+        +'<div style="margin-left:16px;color:var(--text2)">'+esc(e.reason||'')+'</div>'
+        +(e.hint?'<div style="margin-left:16px;color:var(--text3);font-size:.75rem;margin-top:2px">'+esc(e.hint)+'</div>':'')
+        +'</div>';
+    });
+    html+='</div>';
+  }
   upd('moves',html);
 }
 
@@ -754,6 +769,7 @@ function loadSystem(){
     }
     /* Move queue — store for renderMoves, then render */
     window._moveQueue=data.move_queue||[];
+    window._moveErrors=data.move_errors||[];
     renderMoves();
     /* System log */
     const logEl=document.getElementById('syslog');
@@ -1267,6 +1283,12 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         })
         .unwrap_or_default();
 
+    // Mover errors: stuck staging dirs the user needs to act on.
+    let move_errors: Vec<crate::mover::MoverError> = crate::mover::MOVE_ERRORS
+        .lock()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+
     // System log: last 50 lines
     let syslog_path = format!("{}/device_system.log", cfg.log_dir());
     let syslog = std::fs::read_to_string(&syslog_path)
@@ -1280,6 +1302,7 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     let body = serde_json::json!({
         "files": files_json,
         "move_queue": move_queue,
+        "move_errors": move_errors,
         "syslog": syslog,
     });
 

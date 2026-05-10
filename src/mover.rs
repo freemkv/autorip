@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::tmdb;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -17,6 +18,62 @@ pub struct MoveState {
 
 pub static MOVE_STATE: once_cell::sync::Lazy<Mutex<Option<MoveState>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+/// Per-staging-dir error surfaced to the System page so the user can act
+/// on it (e.g. orphaned source files that the container can't unlink due
+/// to NFS squash perms). Keyed by staging dir path; updates are
+/// idempotent — same `reason` for the same path is a no-op (no log spam).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MoverError {
+    pub path: String,
+    pub reason: String,
+    pub hint: String,
+}
+
+pub static MOVE_ERRORS: once_cell::sync::Lazy<Mutex<BTreeMap<String, MoverError>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(BTreeMap::new()));
+
+fn record_error(path: &str, reason: &str, hint: &str) {
+    let Ok(mut m) = MOVE_ERRORS.lock() else {
+        return;
+    };
+    let same_reason = m.get(path).map(|e| e.reason == reason).unwrap_or(false);
+    m.insert(
+        path.to_string(),
+        MoverError {
+            path: path.to_string(),
+            reason: reason.to_string(),
+            hint: hint.to_string(),
+        },
+    );
+    if !same_reason {
+        crate::log::syslog(&format!("Move blocked: {} — {}", path, reason));
+    }
+}
+
+fn clear_error(path: &str) {
+    if let Ok(mut m) = MOVE_ERRORS.lock() {
+        m.remove(path);
+    }
+}
+
+/// Outcome of moving a single file. Distinguishes between an active move
+/// (Moved / MovedDirty) and a no-op re-check (Skipped) so the caller can
+/// suppress webhook spam and log noise on subsequent loop ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveOutcome {
+    /// Dest already exists with the same size as src — already moved on
+    /// a previous tick. Source may or may not still be present.
+    Skipped,
+    /// Atomic rename succeeded — src is gone, dest has the bytes.
+    Moved,
+    /// Copy succeeded but unlink of src failed (perm/NFS issue). Dest has
+    /// the bytes. Caller should record an error and stop trying to clean
+    /// the staging dir; subsequent ticks will Skip.
+    MovedDirty,
+    /// Copy itself failed. Caller can retry on the next tick.
+    Failed,
+}
 
 pub fn run(cfg: &Arc<RwLock<Config>>) {
     use std::sync::atomic::Ordering;
@@ -104,11 +161,7 @@ fn check_and_move(cfg: &Config) {
             continue;
         }
 
-        crate::log::syslog(&format!(
-            "Moving: {} ({} files)",
-            display_name,
-            ripped_files.len()
-        ));
+        let dir_str = dir.to_string_lossy().to_string();
 
         // Build destination paths
         let mut planned_moves: Vec<(std::path::PathBuf, String)> = Vec::new();
@@ -127,7 +180,11 @@ fn check_and_move(cfg: &Config) {
         for (_, dest) in &planned_moves {
             if let Some(parent) = Path::new(dest).parent() {
                 if std::fs::create_dir_all(parent).is_err() {
-                    crate::log::syslog(&format!("Cannot create directory: {:?}", parent));
+                    record_error(
+                        &dir_str,
+                        &format!("cannot create destination directory {}", parent.display()),
+                        "check write permissions on the output / movie / tv directory",
+                    );
                     dest_ok = false;
                 }
             }
@@ -137,9 +194,9 @@ fn check_and_move(cfg: &Config) {
         }
 
         // Move files
-        let mut all_moved = true;
+        let mut outcomes: Vec<MoveOutcome> = Vec::new();
+        let mut announced_moving = false;
         for (src, dest) in &planned_moves {
-            crate::log::syslog(&format!("Copying {} to {}", src.display(), dest));
             let name_for_progress = display_name.clone();
             let on_progress = move |pct: u8, gb: f64, total_gb: f64, speed: f64| {
                 let eta = if speed > 1.0 && total_gb > gb {
@@ -161,27 +218,95 @@ fn check_and_move(cfg: &Config) {
                     });
                 }
             };
-            if move_file(src, Path::new(dest), &on_progress) {
-                crate::log::syslog(&format!("Moved to {}", dest));
-            } else {
-                crate::log::syslog(&format!("Failed to move {:?} to {}", src, dest));
-                all_moved = false;
+            let outcome = move_file(src, Path::new(dest), &on_progress);
+            outcomes.push(outcome);
+            match outcome {
+                MoveOutcome::Skipped => {
+                    // Quiet — already moved on a prior tick; no log noise.
+                }
+                MoveOutcome::Moved => {
+                    if !announced_moving {
+                        crate::log::syslog(&format!(
+                            "Moving: {} ({} files)",
+                            display_name,
+                            ripped_files.len()
+                        ));
+                        announced_moving = true;
+                    }
+                    crate::log::syslog(&format!("Moved to {}", dest));
+                }
+                MoveOutcome::MovedDirty => {
+                    if !announced_moving {
+                        crate::log::syslog(&format!(
+                            "Moving: {} ({} files)",
+                            display_name,
+                            ripped_files.len()
+                        ));
+                        announced_moving = true;
+                    }
+                    crate::log::syslog(&format!(
+                        "Moved to {} but source could not be removed",
+                        dest
+                    ));
+                }
+                MoveOutcome::Failed => {
+                    crate::log::syslog(&format!("Failed to move {:?} to {}", src, dest));
+                }
             }
         }
 
-        if all_moved {
-            // Remove staging directory (including .done marker)
-            let _ = std::fs::remove_dir_all(&dir);
-            crate::log::syslog(&format!("Move complete: {}", display_name));
+        let any_failed = outcomes.iter().any(|o| matches!(o, MoveOutcome::Failed));
+        let any_dirty = outcomes
+            .iter()
+            .any(|o| matches!(o, MoveOutcome::MovedDirty));
+        let any_actively_moved = outcomes
+            .iter()
+            .any(|o| matches!(o, MoveOutcome::Moved | MoveOutcome::MovedDirty));
 
-            // Webhook: move_complete
+        if any_failed {
+            // Leave the dir alone; mover will retry next tick.
+            // Surface a summary error so the UI shows what's failing.
+            record_error(
+                &dir_str,
+                "copy to destination failed",
+                "see device_system.log for the underlying error",
+            );
+            continue;
+        }
+
+        // All files are accounted for (Skipped / Moved / MovedDirty). Try to
+        // tear down the staging dir; if it can't be removed (typically
+        // because the orphan source files can't be unlinked), surface the
+        // dir on the UI with a remediation hint.
+        let cleanup_err = std::fs::remove_dir_all(&dir).err();
+
+        if cleanup_err.is_none() {
+            clear_error(&dir_str);
+            crate::log::syslog(&format!("Move complete: {}", display_name));
+        } else if any_dirty {
+            record_error(
+                &dir_str,
+                "destination has the file but source could not be removed",
+                "manually `rm -rf` the staging dir from a host that can write to the staging share, or fix the NFS export so the container can unlink files there",
+            );
+        } else if let Some(e) = cleanup_err {
+            record_error(
+                &dir_str,
+                &format!("staging cleanup failed: {}", e),
+                "manually `rm -rf` the staging dir",
+            );
+        }
+
+        // Webhook: only fire on cycles where we actually moved bits.
+        // Skipped-only ticks are no-ops and must not re-notify.
+        if any_actively_moved {
             let dest_path = planned_moves.last().map(|(_, d)| d.as_str()).unwrap_or("");
             crate::webhook::send_move(cfg, &display_name, dest_path);
+        }
 
-            // Clear move state
-            if let Ok(mut ms) = MOVE_STATE.lock() {
-                *ms = None;
-            }
+        // Clear move state
+        if let Ok(mut ms) = MOVE_STATE.lock() {
+            *ms = None;
         }
     }
 }
@@ -213,19 +338,55 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
     }
 }
 
-/// Move a file: try rename first, fall back to cp in a child process.
-/// Child process prevents NFS/CIFS stalls from blocking the main autorip process.
-/// Calls on_progress(pct, gb_done, gb_total, speed_mbs) every few seconds.
-fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -> bool {
-    if std::fs::rename(src, dest).is_ok() {
-        return true;
+/// Move a file with idempotent retry semantics.
+///
+/// 1. **Pre-flight**: if `dest` is a regular file with the same size as
+///    `src`, treat the move as already done (`Skipped`). This is the
+///    circuit breaker for the "cp succeeded but unlink failed" loop —
+///    on the next tick we re-detect the completed dest and don't
+///    re-copy 50+ GB across the network.
+///
+/// 2. **Atomic path**: try `rename(2)`. On the same filesystem this is
+///    instant and unlinks src for free.
+///
+/// 3. **Cross-fs / fallback**: shell out to `cp -f --` (force, no flag
+///    parsing of the path), then try to unlink src. If unlink fails
+///    (typical NFS squash-perm scenario where the staging dir is owned
+///    by an identity the container can't write into), return
+///    `MovedDirty` so the caller can surface the orphan to the UI.
+///
+/// Child process prevents NFS/CIFS stalls from blocking the main
+/// autorip process. Calls `on_progress(pct, gb_done, gb_total,
+/// speed_mbs)` every few seconds while cp is running.
+fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -> MoveOutcome {
+    let src_meta = std::fs::metadata(src);
+    let dest_meta = std::fs::metadata(dest);
+
+    // Pre-flight: dest already has matching content. Stops the infinite
+    // re-copy loop when src can't be unlinked.
+    if let (Ok(s), Ok(d)) = (&src_meta, &dest_meta) {
+        if s.is_file() && d.is_file() && s.len() == d.len() && s.len() > 0 {
+            return MoveOutcome::Skipped;
+        }
     }
+    // Pre-flight: src missing but dest present — earlier rename succeeded.
+    if let (Err(_), Ok(d)) = (&src_meta, &dest_meta) {
+        if d.is_file() && d.len() > 0 {
+            return MoveOutcome::Moved;
+        }
+    }
+
+    if std::fs::rename(src, dest).is_ok() {
+        return MoveOutcome::Moved;
+    }
+
     let src_str = src.to_string_lossy().to_string();
     let dest_str = dest.to_string_lossy().to_string();
-    let src_size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    let src_size = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let total_gb = src_size as f64 / 1_073_741_824.0;
 
     let mut child = match std::process::Command::new("cp")
+        .arg("-f")
         .arg("--")
         .arg(&src_str)
         .arg(&dest_str)
@@ -234,7 +395,7 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
         Ok(c) => c,
         Err(e) => {
             crate::log::syslog(&format!("Failed to spawn cp: {}", e));
-            return false;
+            return MoveOutcome::Failed;
         }
     };
 
@@ -244,11 +405,13 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             Ok(Some(status)) => {
                 if status.success() {
                     on_progress(100, total_gb, total_gb, 0.0);
-                    let _ = std::fs::remove_file(src);
-                    return true;
+                    return match std::fs::remove_file(src) {
+                        Ok(_) => MoveOutcome::Moved,
+                        Err(_) => MoveOutcome::MovedDirty,
+                    };
                 } else {
                     crate::log::syslog(&format!("cp failed with {}", status));
-                    return false;
+                    return MoveOutcome::Failed;
                 }
             }
             Ok(None) => {
@@ -270,7 +433,7 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             }
             Err(e) => {
                 crate::log::syslog(&format!("Failed to wait on cp: {}", e));
-                return false;
+                return MoveOutcome::Failed;
             }
         }
     }
@@ -403,5 +566,79 @@ mod tests {
         let dest = build_destination(&cfg, &tmdb, "disc.mkv");
         // movie_dir empty → fall-through to output_dir + filename.
         assert_eq!(dest, "/out/disc.mkv");
+    }
+
+    fn noop_progress(_: u8, _: f64, _: f64, _: f64) {}
+
+    #[test]
+    fn move_file_skips_when_dest_size_matches() {
+        // Circuit breaker: a prior tick already cp'd the file but
+        // couldn't unlink src. Re-detecting the same-size dest must NOT
+        // recopy — that's the bug this fix exists for.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.mkv");
+        let dest = tmp.path().join("b.mkv");
+        std::fs::write(&src, b"hello world").unwrap();
+        std::fs::write(&dest, b"hello world").unwrap();
+        let outcome = move_file(&src, &dest, &noop_progress);
+        assert_eq!(outcome, MoveOutcome::Skipped);
+        assert!(src.exists(), "src must remain untouched on Skipped");
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn move_file_moves_when_dest_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.mkv");
+        let dest = tmp.path().join("sub/b.mkv");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"data data data").unwrap();
+        let outcome = move_file(&src, &dest, &noop_progress);
+        assert_eq!(outcome, MoveOutcome::Moved);
+        assert!(!src.exists(), "rename consumes src");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"data data data");
+    }
+
+    #[test]
+    fn move_file_overwrites_when_dest_size_differs() {
+        // A partial dest from a previous failed cp must NOT cause a
+        // permanent stall — the new full src should overwrite it.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.mkv");
+        let dest = tmp.path().join("b.mkv");
+        std::fs::write(&src, b"new full content").unwrap();
+        std::fs::write(&dest, b"partial").unwrap();
+        let outcome = move_file(&src, &dest, &noop_progress);
+        assert_eq!(outcome, MoveOutcome::Moved);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new full content");
+    }
+
+    #[test]
+    fn move_file_returns_moved_when_src_missing_but_dest_present() {
+        // Earlier atomic rename succeeded; src is gone, dest is fine.
+        // Re-entering move_file (e.g. on next tick before staging
+        // cleanup) must not error out.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.mkv");
+        let dest = tmp.path().join("b.mkv");
+        std::fs::write(&dest, b"already there").unwrap();
+        let outcome = move_file(&src, &dest, &noop_progress);
+        assert_eq!(outcome, MoveOutcome::Moved);
+    }
+
+    #[test]
+    fn record_error_dedups_same_reason_without_logging_again() {
+        // Same path + same reason twice → second insert is a no-op
+        // logger-wise (the syslog call is gated on reason change).
+        // We assert state by checking the map snapshot.
+        let path = "/tmp/fakemover-dedup-test";
+        record_error(path, "stuck", "do thing");
+        record_error(path, "stuck", "do thing");
+        let m = MOVE_ERRORS.lock().unwrap();
+        let entry = m.get(path).expect("error recorded");
+        assert_eq!(entry.reason, "stuck");
+        drop(m);
+        clear_error(path);
+        assert!(MOVE_ERRORS.lock().unwrap().get(path).is_none());
     }
 }
