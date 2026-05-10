@@ -42,6 +42,38 @@ use super::state::{RipState, update_state};
 /// (e.g. by the HTTP `/api/stop/{device}` handler in `web.rs`).
 /// Returns `false` when no token is registered — matches the old
 /// `stop_requested` semantics so producer-loop checks behave the same.
+/// Compute the Total Progress percentage for the mux phase.
+///
+/// Multipass mode (total_passes >= 2): the prior `total_passes - 1`
+/// passes are 100% complete by the time mux runs; mux contributes
+/// `pct` over a `1/total_passes` share. So:
+///
+///     total = ((total_passes - 1) × 100 + pct) / total_passes
+///
+/// Examples (total_passes = 7):
+///   mux just started (pct=0):    total = 600/7 = 85%
+///   mux halfway (pct=50):        total = 650/7 = 92%
+///   mux done (pct=100):          total = 700/7 = 100%
+///
+/// Single-pass / direct-mux mode (total_passes < 2): no prior passes —
+/// total tracks the current 1:1.
+///
+/// Caveat: `total_passes` is the *planned* maximum (max_retries + 2)
+/// not the actual count of passes that ran. On a clean disc that
+/// short-circuits past retries, this overstates how much work
+/// happened — but the bar still moves monotonically forward through
+/// mux, which is the property we care about. Refining
+/// `total_passes` to the actual pass count at mux time is a 0.18.3+
+/// follow-up.
+fn total_pct(total_passes: u8, pct: u8) -> u8 {
+    if total_passes >= 2 {
+        let pp = total_passes as u32;
+        (((pp - 1) * 100 + pct as u32) / pp).min(100) as u8
+    } else {
+        pct
+    }
+}
+
 fn halt_requested(device: &str) -> bool {
     device_halt(device)
         .map(|h| h.is_cancelled())
@@ -266,15 +298,35 @@ impl MuxSink {
                 // Carry the multipass identity through every per-frame
                 // update so the UI doesn't snap back to a "fresh rip"
                 // view when mux starts. pass == total_passes is the
-                // established convention for "we're on the mux pass";
-                // pass/total bars and ETAs mirror local mux progress
-                // (sweep + retries are already 100% by the time we're
-                // here — total_progress reflects the work that's left).
+                // established convention for "we're on the mux pass".
+                //
+                // Total progress: in multipass mode (total_passes >= 2) the
+                // prior (total_passes - 1) passes are 100% complete by the
+                // time mux runs; the mux contributes its `pct` over a
+                // 1/total_passes share. So:
+                //
+                //     total_pct = ((total_passes - 1) × 100 + pct) / total_passes
+                //
+                // For total_passes=7 mux at pct=0:   total = 6×100 / 7 = 85%.
+                // For total_passes=7 mux at pct=100: total = 700 / 7 = 100%.
+                //
+                // 0.18.1/0.18.2 set total_progress_pct = pct (same as
+                // pass), which made the Total bar visually reset on the
+                // sweep→mux handoff. Pass-equal-weight is a coarse
+                // approximation (sweep + each retry is treated as one
+                // 1/total_passes "step") but it preserves monotonic
+                // forward motion across the handoff, which is what the
+                // user wants to see. Sweep/patch use a byte-weighted
+                // formula in `state.rs` — the two can drift slightly
+                // at the transition but neither goes backward.
+                //
+                // Single-pass / direct-mux mode (total_passes < 2) has
+                // no prior passes — total tracks current 1:1.
                 pass: self.ui.total_passes,
                 total_passes: self.ui.total_passes,
                 pass_progress_pct: pct,
                 pass_eta: eta.clone(),
-                total_progress_pct: pct,
+                total_progress_pct: total_pct(self.ui.total_passes, pct),
                 total_eta: eta,
                 ..Default::default()
             },
@@ -821,4 +873,44 @@ pub(super) struct MuxAtomics {
     pub(super) wd_last_frame: Arc<AtomicU64>,
     pub(super) wd_bytes: Arc<AtomicU64>,
     pub(super) input_errors: Arc<AtomicU32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the "Total bar resets at sweep→mux" bug
+    /// (0.18.1/0.18.2): mux pushed `total_progress_pct = pct`, so on
+    /// pass 7 of 7 with pct=19 the Total bar showed 19% instead of
+    /// the correct ~88%. The pass-weighted helper restores the
+    /// design.
+    #[test]
+    fn total_pct_aggregates_across_passes() {
+        // 7-pass plan, mux just started → 6 prior passes done = 6/7.
+        assert_eq!(total_pct(7, 0), 85);
+        // Pass 7 of 7 at pct=19 (the live observed bug case) → ~88%.
+        assert_eq!(total_pct(7, 19), 88);
+        // Mux done → 100.
+        assert_eq!(total_pct(7, 100), 100);
+        // 2-pass plan (sweep + mux, no retries) at mux start → 50%.
+        assert_eq!(total_pct(2, 0), 50);
+        assert_eq!(total_pct(2, 50), 75);
+    }
+
+    /// Direct-mux / single-pass mode has no prior passes —
+    /// total tracks current 1:1.
+    #[test]
+    fn total_pct_passthrough_in_single_pass_mode() {
+        assert_eq!(total_pct(0, 0), 0);
+        assert_eq!(total_pct(0, 42), 42);
+        assert_eq!(total_pct(1, 73), 73);
+    }
+
+    /// Bound check — total never exceeds 100 even on edge inputs.
+    #[test]
+    fn total_pct_clamps_at_100() {
+        assert_eq!(total_pct(7, 100), 100);
+        // Defensive: pct overshoot shouldn't push total past 100.
+        assert_eq!(total_pct(2, 200), 100);
+    }
 }
