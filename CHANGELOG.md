@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.18.2 (2026-05-09)
+
+### Picks up
+
+- libfreemkv 0.18.2 — nav-file scramble bug fix during AACS rip. Multi-pass
+  rips (`rip_mode = "multi"`) now produce ISOs that re-mux cleanly; 0.18.1
+  multi-pass rips on AACS-encrypted UHDs produced ISOs with corrupted
+  MPLS/CLPI navigation files, breaking the subsequent ISO → MKV step
+  with E6009 NoStreams. Single-pass mode (`rip_mode = "single"`) was not
+  affected.
+
 ## 0.18.1 (2026-05-09)
 
 ### Round 1 — `ripper/` module split

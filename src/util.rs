@@ -68,7 +68,7 @@ pub fn sanitize_path_compact(name: &str) -> String {
 }
 
 /// Sanitize a name for a user-visible directory (e.g. the final library
-/// destination `Movies/Dune Part Two (2024)/`). Spaces preserved; apostrophes
+/// destination `movies/Dune Part Two (2024)/`). Spaces preserved; apostrophes
 /// kept (filesystems handle them, omitting them mangles "What's Up Doc").
 pub fn sanitize_path_display(name: &str) -> String {
     name.chars()
