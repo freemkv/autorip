@@ -214,6 +214,33 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                                 error = %e,
                                 "drive_has_disc failed — drive firmware unresponsive; physical reconnect or host reboot required"
                             );
+                            // Surface the wedge in the UI. Pre-fix:
+                            // drive_has_disc Err -> continue, no
+                            // update_state, drive never enters STATE
+                            // and /api/state returns {} as if no
+                            // drives existed. The drive was visible
+                            // only as a one-time "drive enumerated"
+                            // INFO log at startup that scrolled away.
+                            // Now: drive appears in STATE with status
+                            // "error" + a last_error explaining the
+                            // wedge and the recovery action. Once
+                            // drive_has_disc starts succeeding again
+                            // (post power-cycle), the warned_probe_fail
+                            // removal at the Ok(_) arm clears the
+                            // state and the idle/disc-present path
+                            // takes over.
+                            update_state(
+                                &device,
+                                RipState {
+                                    device: device.clone(),
+                                    status: "error".to_string(),
+                                    last_error: format!(
+                                        "Drive firmware unresponsive ({}). Power-cycle drive or host required.",
+                                        e
+                                    ),
+                                    ..Default::default()
+                                },
+                            );
                         } else {
                             tracing::debug!(
                                 device = %device,
