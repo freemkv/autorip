@@ -1071,6 +1071,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     } else {
         0
     };
+    // Captured from the multipass branch so the mux call site (which is
+    // outside that branch) can pass it into MuxInputs for total-progress
+    // weighting. Stays at 0 in direct (single-pass) mode — the mux's
+    // total_pct helper falls through to mux-pct passthrough when
+    // max_retries == 0 anyway.
+    let mut bytes_unreadable_at_mux: u64 = 0;
+
     let reader: Box<dyn libfreemkv::SectorReader> = if cfg_read.max_retries > 0 {
         let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
         let iso_path_str = format!("{}/{}", staging, iso_filename);
@@ -2143,6 +2150,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     return;
                 }
             };
+        // Capture the final bytes_unreadable for the mux call site (which
+        // is outside this multipass branch). Used by `total_pct_byte_weight`
+        // to size the total-progress denominator. By this point retries
+        // are done and the abort check has passed (we're entering mux).
+        bytes_unreadable_at_mux = bytes_unreadable;
+
         // Entering mux phase — push final mapfile state so the UI keeps the
         // bad-range list visible through mux and into the "done" view.
         let mux_state = std::cell::RefCell::new(PassProgressState::new());
@@ -2234,9 +2247,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             total_bytes,
             title_bytes_per_sec,
             total_passes,
+            bytes_total_disc: disc.capacity_bytes,
+            max_retries: cfg_read.max_retries,
+            bytes_unreadable_at_mux,
             dest_url: dest_url.clone(),
             batch,
-            skip_errors: cfg_read.on_read_error == "skip",
+            // In multi-pass mode (max_retries > 0) the on_read_error setting is
+            // hidden from the UI: sweep always skips by design, retries always
+            // retry, and the post-retry abort decision is `abort_on_lost_secs`
+            // (time-based). The only place on_read_error could touch behaviour
+            // is here at mux — file-read / demux glitches on the local ISO.
+            // Force skip in multi-pass so the user's stale single-pass setting
+            // doesn't trip a spurious abort on a near-finished rip; the
+            // accepted-loss intent is already encoded in abort_on_lost_secs.
+            skip_errors: cfg_read.max_retries > 0 || cfg_read.on_read_error == "skip",
         },
         input,
         mux::MuxAtomics {

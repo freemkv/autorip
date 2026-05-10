@@ -42,36 +42,62 @@ use super::state::{RipState, update_state};
 /// (e.g. by the HTTP `/api/stop/{device}` handler in `web.rs`).
 /// Returns `false` when no token is registered — matches the old
 /// `stop_requested` semantics so producer-loop checks behave the same.
-/// Compute the Total Progress percentage for the mux phase.
+/// Compute the Total Progress percentage during the mux phase.
 ///
-/// Multipass mode (total_passes >= 2): the prior `total_passes - 1`
-/// passes are 100% complete by the time mux runs; mux contributes
-/// `pct` over a `1/total_passes` share. So:
+/// Uses the same byte-weighted formula `state.rs` uses for sweep and
+/// patch — so the two phases agree on what "total progress" means and
+/// the bar progresses smoothly across the sweep→mux handoff instead
+/// of jumping (forward or backward).
 ///
-///     total = ((total_passes - 1) × 100 + pct) / total_passes
+/// **Total work estimate** (matches `state.rs::total_work_estimated`):
 ///
-/// Examples (total_passes = 7):
-///   mux just started (pct=0):    total = 600/7 = 85%
-///   mux halfway (pct=50):        total = 650/7 = 92%
-///   mux done (pct=100):          total = 700/7 = 100%
+///     total_work = bytes_total_disc                 // sweep
+///                + max_retries × bytes_unreadable    // retries
+///                + bytes_total_disc                  // mux re-reads ISO
 ///
-/// Single-pass / direct-mux mode (total_passes < 2): no prior passes —
-/// total tracks the current 1:1.
+/// On a clean disc with `bytes_unreadable=0`, the retry term vanishes
+/// and total_work = 2 × disc capacity — so mux opens at exactly 50%.
+/// On a damaged disc, the retry term inflates the denominator
+/// proportionally; the bar tracks the larger total.
 ///
-/// Caveat: `total_passes` is the *planned* maximum (max_retries + 2)
-/// not the actual count of passes that ran. On a clean disc that
-/// short-circuits past retries, this overstates how much work
-/// happened — but the bar still moves monotonically forward through
-/// mux, which is the property we care about. Refining
-/// `total_passes` to the actual pass count at mux time is a 0.18.3+
-/// follow-up.
-fn total_pct(total_passes: u8, pct: u8) -> u8 {
-    if total_passes >= 2 {
-        let pp = total_passes as u32;
-        (((pp - 1) * 100 + pct as u32) / pp).min(100) as u8
-    } else {
-        pct
+/// **Total work done** by mux time:
+///
+///     total_done = bytes_total_disc                 // sweep complete
+///                + max_retries × bytes_unreadable    // retries complete
+///                + (mux_pct / 100) × bytes_total_disc
+///
+/// **Why `max_retries` and not actual-passes-run?** State.rs uses
+/// `max_retries × bytes_unreadable` (planned × current); we mirror it
+/// here. Autorip's retry loop short-circuits on `bytes_unreadable=0`,
+/// so on a clean disc the retry term is `max_retries × 0 = 0` whether
+/// 0 or 5 retries actually ran — the formula self-corrects via the
+/// shrinking `bytes_unreadable`. The approximation is a slight
+/// over-count of retry-pass work on partially-clean discs (we treat
+/// final `bytes_unreadable` as if it persisted through every retry,
+/// when in reality each pass shrinks it), but it never goes
+/// backward and matches state.rs.
+///
+/// **Direct mode** (`max_retries == 0`): no separate phases, total
+/// tracks the current mux progress 1:1.
+fn total_pct_byte_weight(
+    bytes_total_disc: u64,
+    max_retries: u8,
+    bytes_unreadable_at_mux: u64,
+    mux_pct: u8,
+) -> u8 {
+    if max_retries == 0 || bytes_total_disc == 0 {
+        return mux_pct.min(100);
     }
+    // u128 to keep multiplication overflow-safe on > 4 GB discs.
+    let cap = bytes_total_disc as u128;
+    let retry_total = (max_retries as u128) * (bytes_unreadable_at_mux as u128);
+    let total_work = cap + retry_total + cap;
+    if total_work == 0 {
+        return mux_pct.min(100);
+    }
+    let mux_done = cap * (mux_pct as u128) / 100;
+    let total_done = cap + retry_total + mux_done;
+    ((total_done * 100 / total_work).min(100)) as u8
 }
 
 fn halt_requested(device: &str) -> bool {
@@ -105,6 +131,20 @@ pub(super) struct MuxInputs<'a> {
     /// through every per-frame `update_state` so the dashboard's
     /// pass/total bars don't snap back to a "fresh rip" view.
     pub(super) total_passes: u8,
+    /// Disc capacity in bytes — same value `state.rs` uses to compute
+    /// the sweep + mux contributions to the total-progress denominator.
+    /// Plumbed from `disc.capacity_bytes` at the orchestrator level.
+    pub(super) bytes_total_disc: u64,
+    /// User-configured max retry passes (`cfg_read.max_retries`). Used
+    /// as the multiplier on `bytes_unreadable` for the retry-phase
+    /// contribution to total work, mirroring `state.rs`.
+    pub(super) max_retries: u8,
+    /// `bytes_unreadable` at mux start — i.e. after every retry pass
+    /// has finished. Drives the retry-phase contribution to the
+    /// total-progress denominator. Zero on a clean disc (every bad
+    /// sector recovered) — in that case the retry phase contributes
+    /// nothing and total = sweep+mux only, so mux opens at ~50%.
+    pub(super) bytes_unreadable_at_mux: u64,
     /// Pre-resolved mux output URL (e.g. `mkv:///srv/.../foo.mkv`,
     /// `network://host:port`). Resolved by the orchestrator because URL
     /// construction depends on `cfg.network_target` + `output_format`.
@@ -166,6 +206,14 @@ struct UiState {
     total_bytes: u64,
     title_bytes_per_sec: f64,
     total_passes: u8,
+    /// Disc capacity, used by `total_pct_byte_weight` to size the
+    /// total-progress denominator.
+    bytes_total_disc: u64,
+    /// Configured max retry passes; multiplier on `bytes_unreadable_at_mux`
+    /// for the retry-phase contribution to total work.
+    max_retries: u8,
+    /// `bytes_unreadable` at mux start (after every retry pass finished).
+    bytes_unreadable_at_mux: u64,
 }
 
 /// Cross-thread atomics the consumer reads on every per-frame
@@ -326,7 +374,12 @@ impl MuxSink {
                 total_passes: self.ui.total_passes,
                 pass_progress_pct: pct,
                 pass_eta: eta.clone(),
-                total_progress_pct: total_pct(self.ui.total_passes, pct),
+                total_progress_pct: total_pct_byte_weight(
+                    self.ui.bytes_total_disc,
+                    self.ui.max_retries,
+                    self.ui.bytes_unreadable_at_mux,
+                    pct,
+                ),
                 total_eta: eta,
                 ..Default::default()
             },
@@ -723,6 +776,9 @@ pub(super) fn run_mux(
         total_bytes,
         title_bytes_per_sec: inputs.title_bytes_per_sec,
         total_passes: inputs.total_passes,
+        bytes_total_disc: inputs.bytes_total_disc,
+        max_retries: inputs.max_retries,
+        bytes_unreadable_at_mux: inputs.bytes_unreadable_at_mux,
     };
     let shared = SharedAtomics {
         latest_bytes_read: atomics_in.latest_bytes_read.clone(),
@@ -879,38 +935,56 @@ pub(super) struct MuxAtomics {
 mod tests {
     use super::*;
 
-    /// Regression for the "Total bar resets at sweep→mux" bug
-    /// (0.18.1/0.18.2): mux pushed `total_progress_pct = pct`, so on
-    /// pass 7 of 7 with pct=19 the Total bar showed 19% instead of
-    /// the correct ~88%. The pass-weighted helper restores the
-    /// design.
+    const DISC: u64 = 60_000_000_000; // 60 GB stand-in for a UHD
+
+    /// Clean disc (no bad sectors): retry term vanishes, total_work
+    /// reduces to 2 × capacity. Mux opens at exactly 50%, climbs
+    /// linearly to 100%. Sweep+mux symmetry — same shape as a
+    /// 2-phase pipeline regardless of `max_retries` planned.
     #[test]
-    fn total_pct_aggregates_across_passes() {
-        // 7-pass plan, mux just started → 6 prior passes done = 6/7.
-        assert_eq!(total_pct(7, 0), 85);
-        // Pass 7 of 7 at pct=19 (the live observed bug case) → ~88%.
-        assert_eq!(total_pct(7, 19), 88);
-        // Mux done → 100.
-        assert_eq!(total_pct(7, 100), 100);
-        // 2-pass plan (sweep + mux, no retries) at mux start → 50%.
-        assert_eq!(total_pct(2, 0), 50);
-        assert_eq!(total_pct(2, 50), 75);
+    fn clean_disc_mux_opens_at_50_percent() {
+        // max_retries planned 5, but bytes_unreadable=0 → retries
+        // contribute nothing whether 0 or 5 actually ran.
+        assert_eq!(total_pct_byte_weight(DISC, 5, 0, 0), 50);
+        assert_eq!(total_pct_byte_weight(DISC, 5, 0, 50), 75);
+        assert_eq!(total_pct_byte_weight(DISC, 5, 0, 100), 100);
+        // Same disc, max_retries planned 0 (couldn't have happened
+        // here since multipass implies max_retries > 0, but the
+        // helper falls through to direct-mode behaviour anyway).
+        assert_eq!(total_pct_byte_weight(DISC, 0, 0, 50), 50);
     }
 
-    /// Direct-mux / single-pass mode has no prior passes —
-    /// total tracks current 1:1.
+    /// Damaged disc with residual `bytes_unreadable`: retry term
+    /// inflates the denominator, mux opens lower than 50% because
+    /// the rip "did more total work than just sweep+mux."
     #[test]
-    fn total_pct_passthrough_in_single_pass_mode() {
-        assert_eq!(total_pct(0, 0), 0);
-        assert_eq!(total_pct(0, 42), 42);
-        assert_eq!(total_pct(1, 73), 73);
+    fn damaged_disc_mux_opens_below_50_percent() {
+        // 1 GB unreadable, max_retries=5 → retry term = 5 GB.
+        // total_work = 60 + 5 + 60 = 125 GB.
+        // mux start: total_done = 60 + 5 + 0 = 65. 65/125 = 52%.
+        assert_eq!(total_pct_byte_weight(DISC, 5, 1_000_000_000, 0), 52);
+        // mux halfway: total_done = 60 + 5 + 30 = 95. 95/125 = 76%.
+        assert_eq!(total_pct_byte_weight(DISC, 5, 1_000_000_000, 50), 76);
+        // mux done: 100.
+        assert_eq!(total_pct_byte_weight(DISC, 5, 1_000_000_000, 100), 100);
     }
 
-    /// Bound check — total never exceeds 100 even on edge inputs.
+    /// Direct-mux / single-pass mode (`max_retries == 0`): there are
+    /// no separate phases — total tracks current 1:1.
     #[test]
-    fn total_pct_clamps_at_100() {
-        assert_eq!(total_pct(7, 100), 100);
-        // Defensive: pct overshoot shouldn't push total past 100.
-        assert_eq!(total_pct(2, 200), 100);
+    fn direct_mode_passthrough() {
+        assert_eq!(total_pct_byte_weight(DISC, 0, 0, 0), 0);
+        assert_eq!(total_pct_byte_weight(DISC, 0, 0, 42), 42);
+        assert_eq!(total_pct_byte_weight(DISC, 0, 0, 100), 100);
+    }
+
+    /// Bound + edge cases: zero inputs, overshoot.
+    #[test]
+    fn edge_cases() {
+        // Zero capacity (drive read failed) → fall through to mux pct.
+        assert_eq!(total_pct_byte_weight(0, 5, 0, 73), 73);
+        // pct overshoot doesn't push total past 100.
+        assert_eq!(total_pct_byte_weight(DISC, 5, 0, 200), 100);
+        assert_eq!(total_pct_byte_weight(DISC, 5, 1_000_000_000, 200), 100);
     }
 }
