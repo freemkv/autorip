@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.18.4 (2026-05-09)
+
+### Build / CI hardening
+
+- `Dockerfile` and `.github/workflows/*.yml` now use `cargo build
+  --locked --release`. The 0.18.3 docker image was built linking
+  against the previous-published `libfreemkv v0.18.2` instead of
+  the just-tagged `libfreemkv v0.18.3` because cargo silently
+  re-resolved when 0.18.3 hadn't yet published. With `--locked`,
+  the build hard-fails with "package not in registry" and we
+  retrigger after upstream lands. See libfreemkv 0.18.4 for full
+  rationale.
+
 ## 0.18.3 (2026-05-09)
 
 ### Bug fixes
