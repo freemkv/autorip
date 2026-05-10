@@ -1305,13 +1305,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
                     if !is_transport {
                         crate::log::device_log(device, &format!("Pass 1 failed: {e}"));
+                        let user_msg = format_pass_error("Pass 1", &e);
                         update_state(
                             device,
                             RipState {
                                 device: device.to_string(),
                                 status: "error".to_string(),
                                 disc_present: true,
-                                last_error: format!("{e}"),
+                                last_error: user_msg,
                                 disc_name: display_name.clone(),
                                 disc_format: disc_format.clone(),
                                 tmdb_title: tmdb_title.clone(),
@@ -2619,10 +2620,159 @@ fn audio_secondary_suffix(secondary: bool) -> &'static str {
     if secondary { " (Secondary)" } else { "" }
 }
 
+/// Translate a libfreemkv read-error into a user-facing message for
+/// /api/state's last_error field. Raw libfreemkv errors like
+/// `E6000: 19965280 0x02/0x04/0x3e` are diagnostic-grade — fine for
+/// logs, terrible for the UI. This helper renders the same condition
+/// as e.g.: "Pass 1 failed at 40.7 GB (sector 19,965,280) — drive
+/// firmware unresponsive (HARDWARE_ERROR). Power-cycle the drive and
+/// retry the rip."
+fn format_pass_error(pass_label: &str, e: &libfreemkv::Error) -> String {
+    // Pull sector + sense out of the structured error variants.
+    let sector = match e {
+        libfreemkv::Error::DiscRead { sector, .. } => Some(*sector),
+        _ => None,
+    };
+    let sense = e.scsi_sense();
+
+    let location = match sector {
+        Some(s) => format!(
+            " at {:.1} GB (sector {})",
+            (s as f64 * 2048.0) / 1_000_000_000.0,
+            s
+        ),
+        None => String::new(),
+    };
+
+    let Some(sense) = sense else {
+        // Non-SCSI error (transport / IO / other) — append the raw
+        // error string; less common path, fewer user complaints.
+        return format!("{}{} failed: {}", pass_label, location, e);
+    };
+
+    // SCSI sense-key reference (SPC-4 §4.5):
+    //   2 NOT_READY, 3 MEDIUM_ERROR, 4 HARDWARE_ERROR,
+    //   5 ILLEGAL_REQUEST, 6 UNIT_ATTENTION, 7 DATA_PROTECT, ...
+    let (cause, action) = match (sense.sense_key, sense.asc) {
+        // MEDIUM_ERROR — physical media damage.
+        (3, 0x11) => (
+            "bad sector (media damage)",
+            "rip will skip this region and retry in Pass 2",
+        ),
+        (3, 0x02) | (3, 0x03) => (
+            "head positioning failure (media damage)",
+            "rip will skip this region and retry in Pass 2",
+        ),
+        (3, _) => (
+            "media error (physical damage)",
+            "rip will skip this region and retry in Pass 2",
+        ),
+        // HARDWARE_ERROR — drive firmware-level fault.
+        (4, 0x3E) => (
+            "drive firmware unresponsive (LOGICAL UNIT NOT CONFIGURED)",
+            "power-cycle the drive and retry the rip",
+        ),
+        (4, _) => (
+            "drive hardware error",
+            "power-cycle the drive and retry the rip",
+        ),
+        // ILLEGAL_REQUEST — drive refuses the command. Almost
+        // always wedge-state on this drive class.
+        (5, 0x24) => (
+            "drive rejected command (Invalid Field in CDB — wedge state)",
+            "power-cycle the drive and retry the rip",
+        ),
+        (5, _) => (
+            "drive rejected command",
+            "power-cycle the drive and retry the rip",
+        ),
+        // NOT_READY — usually transient, but if we got here it's
+        // persistent enough that retries already failed.
+        (2, _) => (
+            "drive reports not ready",
+            "wait a few seconds and retry; if it persists, power-cycle the drive",
+        ),
+        _ => (
+            "drive read error",
+            "see autorip logs for the full SCSI sense breakdown",
+        ),
+    };
+
+    format!("{}{} failed: {} — {}", pass_label, location, cause, action)
+}
+
 #[cfg(test)]
 mod tests {
     //! Tests for orchestrator-level helpers that live in this file.
     //! State-only helpers and their tests live in `state.rs`.
+
+    use super::format_pass_error;
+    use libfreemkv::{Error, ScsiSense};
+
+    #[test]
+    fn format_pass_error_hardware_wedge() {
+        let e = Error::DiscRead {
+            sector: 19_965_280,
+            status: Some(2),
+            sense: Some(ScsiSense {
+                sense_key: 4,
+                asc: 0x3E,
+                ascq: 0,
+            }),
+        };
+        let s = format_pass_error("Pass 1", &e);
+        assert!(s.contains("40.9 GB") || s.contains("40.8 GB") || s.contains("40.7 GB"));
+        assert!(s.contains("sector 19965280"));
+        assert!(s.to_lowercase().contains("firmware unresponsive"));
+        assert!(s.to_lowercase().contains("power-cycle"));
+        // No raw "E6000" / hex-tuple cruft.
+        assert!(!s.contains("E6000"));
+        assert!(!s.contains("0x04/0x3e"));
+    }
+
+    #[test]
+    fn format_pass_error_medium_error_advises_pass2() {
+        let e = Error::DiscRead {
+            sector: 1_000_000,
+            status: Some(2),
+            sense: Some(ScsiSense {
+                sense_key: 3,
+                asc: 0x11,
+                ascq: 0,
+            }),
+        };
+        let s = format_pass_error("Pass 1", &e);
+        assert!(s.to_lowercase().contains("bad sector"));
+        assert!(s.to_lowercase().contains("pass 2"));
+    }
+
+    #[test]
+    fn format_pass_error_illegal_request_advises_powercycle() {
+        let e = Error::DiscRead {
+            sector: 1_000,
+            status: Some(2),
+            sense: Some(ScsiSense {
+                sense_key: 5,
+                asc: 0x24,
+                ascq: 0,
+            }),
+        };
+        let s = format_pass_error("Pass 1", &e);
+        assert!(s.to_lowercase().contains("rejected command"));
+        assert!(s.to_lowercase().contains("power-cycle"));
+    }
+
+    #[test]
+    fn format_pass_error_no_sense_keeps_raw() {
+        // Non-SCSI errors (e.g. transport) pass through the original
+        // error display so we don't lose information.
+        let e = Error::IoError {
+            source: std::io::Error::other("io test"),
+        };
+        let s = format_pass_error("Pass 1", &e);
+        assert!(s.contains("Pass 1"));
+        assert!(s.contains("io test"));
+    }
 
     #[test]
     fn device_key_strips_unix_path() {
