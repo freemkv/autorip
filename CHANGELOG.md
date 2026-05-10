@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.18.3 (2026-05-09)
+
+### Bug fixes
+
+- **Settings save no longer hangs during a rip** (`ripper/mod.rs`).
+  `rip_disc` and `scan_disc` were holding a `cfg.read()` guard for the
+  entire rip duration via a binding that lived to function-end. The
+  settings POST handler takes a write lock, so toggling Auto Eject
+  (or any setting) during a rip blocked on `cfg.write()` for the
+  rip's full duration; Linux's writer-priority `RwLock` then queued
+  all subsequent reads behind the pending writer, so `/api/settings`,
+  `/api/history`, and `/api/system` also stopped responding. Fix:
+  snapshot the `Config` struct (it's `Clone`) at lock acquisition,
+  drop the read guard immediately. Behavioural consequence (correct):
+  in-flight rips run against a config snapshot taken at rip-start —
+  mid-rip settings changes don't affect the running rip.
+
+- **Total Progress bar correctly aggregates across pipeline phases.**
+  0.18.1/0.18.2 set `total_progress_pct = pass_progress_pct` during
+  mux, so on `pass 7/7 at pct=19` the Total bar showed 19% instead
+  of ~88%. Fix replaces the mirror with a byte-weighted formula
+  matching `state.rs::total_work_estimated`: `total_work = capacity +
+  max_retries × bytes_unreadable + capacity` (clean disc → mux opens
+  at 50%; damaged disc → opens lower as the retry term inflates the
+  denominator). Plumbed through MuxInputs.
+
+### Behaviour changes (picked up from libfreemkv 0.18.3)
+
+- **Default-title selection on branching UHDs** — autorip's
+  main-feature picker now lands on the actual movie instead of the
+  4-hour play-all virtual playlist. The fix is in libfreemkv's
+  `Disc::canonical_title_order`; autorip's existing
+  `disc.titles.first()` call automatically gets the corrected title.
+  See libfreemkv 0.18.3 changelog for the rationale and the live
+  observed *The Amateur (2025)* example.
+
+### Settings UI
+
+- **Staging Directory** field added to the Output group — was missing,
+  the backend already supported it.
+- **Recovery group reorganised** around `rip_mode`. Single-pass and
+  multi-pass have fundamentally different error philosophies and now
+  expose different knobs:
+  - Single-pass: `On Read Error` (Stop / Skip) — drive read error
+    policy. Only shown when `rip_mode = single`.
+  - Multi-pass: `Retry Passes` + `Max Acceptable Main Movie Loss`
+    (time-based abort threshold). Only shown when `rip_mode = multi`.
+  Backend forces `skip_errors = true` in multi-pass mux to prevent a
+  stale single-pass "stop" setting from biting a near-finished rip.
+- **Main Feature Only** hint dropped — was "Rip longest title only"
+  which is no longer accurate after the canonical-title-order fix.
+
 ## 0.18.2 (2026-05-09)
 
 ### Picks up
