@@ -7,8 +7,8 @@ services:
     environment:
       - AUTORIP_DIR=/config
       - OUTPUT_DIR=/output
-      - MOVIE_DIR=/output/Movies
-      - TV_DIR=/output/TV
+      - MOVIE_DIR=/output/movies
+      - TV_DIR=/output/tv
       - STAGING_DIR=/staging
       - TMDB_API_KEY=your_tmdb_api_key
       - MIN_LENGTH=600
