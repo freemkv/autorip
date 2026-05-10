@@ -2,7 +2,14 @@ FROM rust:1.86-slim AS builder
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release
+# --locked: refuse to modify Cargo.lock during build. If the lock-pinned
+# libfreemkv version isn't yet on crates.io (race with the upstream
+# release CI), the build hard-fails with a visible error instead of
+# silently re-resolving to the previous published version. Hit at
+# 0.18.3: docker built against libfreemkv 0.18.2 because 0.18.3
+# hadn't published yet and cargo silently fell back. Now: hard
+# fail, retrigger after upstream lands.
+RUN cargo build --locked --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
