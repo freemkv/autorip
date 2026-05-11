@@ -24,29 +24,18 @@ The toolchain composes:
 Production wrapper (`autorip`) orchestrates this on disc insert via a
 docker container; manual control via the `freemkv` CLI.
 
-## Current focus (2026-05-08)
+## Current focus (2026-05-11)
 
-**Make Pass N's recovery rate match `dd`-via-`/dev/sr0`.**
+**v0.18.16 deployed with timeout + batch sizing improvements.**
 
-Background: libfreemkv reads via `/dev/sg1` (raw SCSI generic, direct
-CDB). dd via `/dev/sr0` goes through the kernel `sr_mod` driver which
-auto-retries failed reads (~5×) within a single SCSI command budget.
-libfreemkv's `Drive::read` is single-shot by design — the comment at
-`drive/mod.rs:420` explains inline retries were removed in 0.13.6 to
-avoid wedging the BU40N+Initio USB bridge. **That wedge concern was
-USB-Initio-specific; direct SATA has no bridge in path.**
+Changes in v0.18.16:
+- Rip budget increased to 8h (`MAX_RIP_DURATION_SECS=28800`) for large UHD discs with many bad sectors
+- Per-pass budget increased to 90m (`MIN_PASS_BUDGET_SECS=5400`)
+- Optical vs block batch sizing: optical drives use 60-sector batches for adaptive error handling; ISO files/use non-optical storage use 8192-sector (16 MB) batches
 
-Approach being explored:
-1. Add inline retry loop in `Disc::patch` read path (single-sector
-   only, count==1).
-2. Lower `READ_RECOVERY_TIMEOUT_MS` from 60s → 2s per attempt to match
-   dd's ~300ms/attempt × 5 retry pattern.
-3. Validate via synthetic `SectorReader` test (next session).
+See `freemkv-private/memory/v0_18_16_release_notes.md` for full details.
 
-In-flight uncommitted (in `libfreemkv/src/{disc,scsi}/mod.rs`) — not
-yet pushed; needs synthetic-test validation before going to crates.io.
-
-Detailed handoff: `freemkv-private/memory/session_pass_n_vs_dd.md`.
+Legacy exploration (Pass N recovery vs dd via `/dev/sr0`) is now deployed and being tested on live discs. Next steps depend on empirical results from current rip in progress.
 
 ## Workspace layout
 
@@ -77,7 +66,7 @@ Detailed handoff: `freemkv-private/memory/session_pass_n_vs_dd.md`.
 
 - Ubuntu 24.04, BU40N drive on **direct SATA** at `/dev/sg1` / `/dev/sr0`
 - Disc loaded: Dune Part Two UHD, 78.8 GB
-- autorip running as `:latest` (currently 0.17.4) via Watchtower auto-deploy
+- autorip running as `:latest` (v0.18.16) via Watchtower auto-deploy
 - Persistent data:
   - `/srv/autorip/staging/` — ISO output
   - `/srv/autorip/config/` — settings.json, logs, history
@@ -91,6 +80,24 @@ The drive at `/dev/sg1` is the **only** physical test target. There is
 no other freemkv-related host. Old infrastructure (gitea.pq.io,
 docker.internal.pq.io, classe, Portainer) is decommissioned — do not
 reference.
+
+## Monitoring autorip during rip
+
+API endpoints at `http://rip1.docker.internal.pq.io/`:
+
+- `/api/version` — returns `{"version":"0.18.16"}` (current version)
+- `/api/state` — JSON with status, disc path, pass name
+
+Simple monitor:
+```bash
+while true; do
+  echo "$(date '+%H:%M:%S') $(curl -s http://rip1.docker.internal.pq.io/api/version)"
+  curl -s http://rip1.docker.internal.pq.io/api/state | jq '.status, .pass_name'
+  sleep 10
+done
+```
+
+Watchtower auto-deploys from `ghcr.io/freemkv/autorip:latest` every ~30s.
 
 ## Hard rules (paid-for lessons)
 
