@@ -533,25 +533,38 @@ function renderCurrent(){
        Fall back to the old BD-sustained constant only if missing. */
     const lostSecs=(typeof s.lost_video_secs==='number'&&s.lost_video_secs>=0)?s.lost_video_secs:(s.errors*2048/8250000);
    const lostStr=lostSecs<1?(lostSecs*1000).toFixed(0)+' ms':lostSecs.toFixed(2)+' s';
-    /* Split "lost forever" (Cosmetic) from "at risk" (Maybe — still
-       retrying). Pre-2026-05-11 these were conflated into one
-       "lost in main movie" number that was also unit-buggy (ms
-       displayed as s).
-       - total_lost_ms = Cosmetic (Unreadable in mapfile, irrecoverable)
-       - total_maybe_ms = Maybe (NonTrimmed in mapfile, retry pending)
-       Both are in milliseconds. */
+    /* Display model (2026-05-11 design call): bytes are Good or Maybe
+       UNTIL all retry passes complete. The "lost forever" (Cosmetic)
+       label only applies AFTER the end-of-recovery promotion fires —
+       which the autorip orchestrator does post-final-pass. So:
+        - DURING a rip (status=ripping/scanning AND pass < total_passes):
+          combine total_lost_ms + total_maybe_ms into one "at risk"
+          number — even if mapfile has some Unreadable bytes from
+          legacy code, we keep hope until passes are exhausted.
+        - AFTER all retries: total_maybe_ms should be 0 post-promotion;
+          show total_lost_ms as "lost" only.
+       Both fields are in milliseconds. */
     const fmtTime=(ms)=>{
-      const s=ms/1000;
-      return s<1?Math.round(ms)+' ms':s.toFixed(2)+' s';
+      const sec=ms/1000;
+      return sec<1?Math.round(ms)+' ms':sec.toFixed(2)+' s';
     };
     const lostMs=(typeof s.total_lost_ms==='number')?s.total_lost_ms:0;
     const maybeMs=(typeof s.total_maybe_ms==='number')?s.total_maybe_ms:0;
+    const totalPasses=(typeof s.total_passes==='number')?s.total_passes:0;
+    const curPass=(typeof s.pass==='number')?s.pass:0;
+    const inRetryPhase=(s.status==='ripping'||s.status==='scanning')
+                      &&(totalPasses===0||curPass<totalPasses);
     let detailStr='';
     if(lostMs>0||maybeMs>0){
-      const parts=[];
-      if(lostMs>0)parts.push(fmtTime(lostMs)+' lost');
-      if(maybeMs>0)parts.push(fmtTime(maybeMs)+' at risk');
-      detailStr=' — '+parts.join(', ');
+      if(inRetryPhase){
+        const atRisk=lostMs+maybeMs;
+        if(atRisk>0)detailStr=' — '+fmtTime(atRisk)+' at risk';
+      }else{
+        const parts=[];
+        if(lostMs>0)parts.push(fmtTime(lostMs)+' lost');
+        if(maybeMs>0)parts.push(fmtTime(maybeMs)+' at risk');
+        if(parts.length>0)detailStr=' — '+parts.join(', ');
+      }
     }
     errHtml+='<div style="background:var(--yellow);color:#000;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+s.errors+' sector'+(s.errors>1?'s':'')+' skipped ('+errMb+' MB)'+detailStr+'</div>';
   }
