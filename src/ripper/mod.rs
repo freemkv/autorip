@@ -841,14 +841,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let keys = disc.decrypt_keys();
 
     if disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None) {
-        let msg = "Disc is encrypted but no decryption keys found (check KEYDB)";
-        crate::log::device_log(device, msg);
+        let msg = aacs_failure_message(disc.aacs_error.as_ref());
+        crate::log::device_log(device, &msg);
         update_state(
             device,
             RipState {
                 device: device.to_string(),
                 status: "error".to_string(),
-                last_error: msg.to_string(),
+                last_error: msg,
                 disc_name: display_name,
                 disc_format,
                 tmdb_title,
@@ -2700,6 +2700,44 @@ fn audio_purpose_tag(p: libfreemkv::LabelPurpose) -> Option<&'static str> {
 #[allow(dead_code)]
 fn audio_secondary_suffix(secondary: bool) -> &'static str {
     if secondary { " (Secondary)" } else { "" }
+}
+
+/// User-facing message for the "encrypted disc, no keys resolved" failure.
+/// Switches on the libfreemkv error surfaced via `Disc::aacs_error` so the
+/// UI tells the user *which* failure they're looking at instead of always
+/// printing the same generic "check KEYDB" line.
+fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
+    match err {
+        Some(libfreemkv::Error::KeydbLoad { path }) if path == "<no keydb in search paths>" => {
+            "Disc is encrypted but no KEYDB.cfg found. Set the path in Settings \
+             or click \"Update KEYDB\" to download one."
+                .to_string()
+        }
+        Some(libfreemkv::Error::KeydbLoad { path }) => {
+            format!(
+                "Disc is encrypted; KEYDB at {path} failed to load (E{}). \
+                 File may be corrupt — click \"Update KEYDB\" to re-download.",
+                libfreemkv::error::E_KEYDB_LOAD
+            )
+        }
+        Some(libfreemkv::Error::AacsNoKeys) => format!(
+            "Disc is encrypted; KEYDB loaded but this disc's key couldn't be \
+             resolved (E{}). The disc hash isn't in KEYDB and the MKB/PK/DK \
+             fallback paths all failed. Try \"Update KEYDB\".",
+            libfreemkv::error::E_AACS_NO_KEYS
+        ),
+        Some(e) => format!(
+            "Disc is encrypted; AACS resolution failed: E{} ({e:?}). Check \
+             /api/debug for details.",
+            e.code()
+        ),
+        None => {
+            // Defensive fallback. scan_with always sets aacs_error when
+            // encrypted && aacs.is_none(); if we land here something is
+            // structurally off (e.g. callers building Disc by hand).
+            "Disc is encrypted but no decryption keys found (check KEYDB)".to_string()
+        }
+    }
 }
 
 /// Translate a libfreemkv read-error into a user-facing message for

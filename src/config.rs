@@ -75,10 +75,10 @@ pub fn load() -> Arc<RwLock<Config>> {
         abort_on_lost_secs: env_or("ABORT_ON_LOST_SECS", "0")
             .parse::<u64>()
             .unwrap_or(0),
-        max_rip_duration_secs: env_or("MAX_RIP_DURATION_SECS", "7200")
+        max_rip_duration_secs: env_or("MAX_RIP_DURATION_SECS", "28800")
             .parse::<u64>()
             .unwrap_or(7200), // 2 hours default for UHD with damage recovery
-        min_pass_budget_secs: env_or("MIN_PASS_BUDGET_SECS", "3600")
+        min_pass_budget_secs: env_or("MIN_PASS_BUDGET_SECS", "5400")
             .parse::<u64>()
             .unwrap_or(3600), // 1 hour per pass default
         transport_recovery_delay_secs: env_or("TRANSPORT_RECOVERY_DELAY_SECS", "5")
