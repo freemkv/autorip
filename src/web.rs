@@ -533,20 +533,27 @@ function renderCurrent(){
        Fall back to the old BD-sustained constant only if missing. */
     const lostSecs=(typeof s.lost_video_secs==='number'&&s.lost_video_secs>=0)?s.lost_video_secs:(s.errors*2048/8250000);
    const lostStr=lostSecs<1?(lostSecs*1000).toFixed(0)+' ms':lostSecs.toFixed(2)+' s';
-    /* 0.13.26: show main-movie-specific lost time when available.
-       NOTE: main_lost_ms is in MILLISECONDS — convert to seconds
-       before applying the <1s ? ms : s formatting branch. Pre-fix
-       this line passed the raw ms value to the same formatter, so
-       displays like "39143.52 s in main movie" (which is actually
-       39 SECONDS, not 39000) shipped to users. Caught 2026-05-11. */
-    const mainMs=(typeof s.main_lost_ms==='number'&&s.main_lost_ms>0)?s.main_lost_ms:null;
-    let mainStr='';
-    if(mainMs!=null){
-      const mainSecs=mainMs/1000;
-      const mStr=mainSecs<1?Math.round(mainMs)+' ms':mainSecs.toFixed(2)+' s';
-      mainStr=' ('+mStr+' in main movie)';
+    /* Split "lost forever" (Cosmetic) from "at risk" (Maybe — still
+       retrying). Pre-2026-05-11 these were conflated into one
+       "lost in main movie" number that was also unit-buggy (ms
+       displayed as s).
+       - total_lost_ms = Cosmetic (Unreadable in mapfile, irrecoverable)
+       - total_maybe_ms = Maybe (NonTrimmed in mapfile, retry pending)
+       Both are in milliseconds. */
+    const fmtTime=(ms)=>{
+      const s=ms/1000;
+      return s<1?Math.round(ms)+' ms':s.toFixed(2)+' s';
+    };
+    const lostMs=(typeof s.total_lost_ms==='number')?s.total_lost_ms:0;
+    const maybeMs=(typeof s.total_maybe_ms==='number')?s.total_maybe_ms:0;
+    let detailStr='';
+    if(lostMs>0||maybeMs>0){
+      const parts=[];
+      if(lostMs>0)parts.push(fmtTime(lostMs)+' lost');
+      if(maybeMs>0)parts.push(fmtTime(maybeMs)+' at risk');
+      detailStr=' — '+parts.join(', ');
     }
-    errHtml+='<div style="background:var(--yellow);color:#000;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+s.errors+' sector'+(s.errors>1?'s':'')+' skipped ('+errMb+' MB, ~'+lostStr+' in movie'+mainStr+')</div>';
+    errHtml+='<div style="background:var(--yellow);color:#000;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+s.errors+' sector'+(s.errors>1?'s':'')+' skipped ('+errMb+' MB)'+detailStr+'</div>';
   }
   /* Adaptive batch recovery state \u2014 only during an active rip.
      current_batch < preferred_batch means the library shrunk the read size
