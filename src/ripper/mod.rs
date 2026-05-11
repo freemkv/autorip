@@ -2078,6 +2078,53 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             }
         }
 
+        // End-of-recovery promotion: walk the mapfile and promote any
+        // still-NonTrimmed bytes to Unreadable. This is the "good or
+        // maybe until all passes are done, then it's gone" step that
+        // libfreemkv's patch loop intentionally defers to the
+        // orchestrator (see PatchItem::NonTrimmed doc + libfreemkv
+        // commit 863e04c). Pre-promotion: failed Pass-N bytes are
+        // still "maybe" in the mapfile. Post-promotion: they're
+        // confirmed lost, feeding the abort_on_lost_secs check below
+        // and the final Cosmetic-vs-Maybe display.
+        //
+        // Only runs in multi-pass mode (max_retries > 0); single-pass
+        // rips don't have a "final pass" boundary and rely on the
+        // sweep behavior (sweep never marks Unreadable either, but
+        // single-pass mode skips abort_on_lost_secs entirely).
+        if cfg_read.max_retries > 0 {
+            let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
+            let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
+            let mapfile_path = std::path::Path::new(&mapfile_path_str);
+            if let Ok(mut map) = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path) {
+                use libfreemkv::disc::mapfile::SectorStatus;
+                let nontrimmed_ranges = map.ranges_with(&[SectorStatus::NonTrimmed]);
+                let total_promoted: u64 = nontrimmed_ranges.iter().map(|(_, sz)| *sz).sum();
+                let n_ranges = nontrimmed_ranges.len();
+                for (pos, size) in nontrimmed_ranges {
+                    if let Err(e) = map.record(pos, size, SectorStatus::Unreadable) {
+                        tracing::warn!(
+                            device = %device,
+                            error = %e,
+                            "end_of_recovery_promote: failed to mark range Unreadable"
+                        );
+                    }
+                }
+                tracing::info!(
+                    device = %device,
+                    ranges_promoted = n_ranges,
+                    bytes_promoted = total_promoted,
+                    "end_of_recovery_promote: NonTrimmed -> Unreadable after final retry pass"
+                );
+                // Refresh bytes_unreadable from the promoted mapfile so
+                // the abort check below sees the post-promotion total
+                // (the rip-loop's local copy reflected only what the
+                // last pass produced, which was zero now that patch
+                // never marks Unreadable mid-multipass).
+                bytes_unreadable = map.stats().bytes_unreadable;
+            }
+        }
+
         // Abort check: load mapfile and calculate main movie loss after all retries.
         // If loss exceeds configured threshold, abort instead of muxing damaged content.
         let mut main_lost_ms_for_history = 0.0f64;
