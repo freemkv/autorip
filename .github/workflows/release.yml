@@ -94,9 +94,11 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
           cargo install cross --version 0.2.5
 
-      - name: Check
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo check --locked
+      # 0.18.13: dropped the redundant `cargo check --locked` step.
+      # `cargo build --release` below does typechecking already; the
+      # check step was pure waste (~30-45s) and only saved time when
+      # type errors were caught before the codegen pass — but on a
+      # tagged release, the local precommit hook already caught those.
 
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
@@ -112,11 +114,24 @@ jobs:
           tar czf "../../../autorip-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" autorip
           tar czf "../../../autorip-${{ matrix.target }}.tar.gz" autorip
 
-      - name: Upload
+      - name: Upload tarball to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             *.tar.gz
+
+      # 0.18.13: hand the musl-static binary off to the docker job
+      # via an artifact instead of having that job re-run the same
+      # cargo build inside the Dockerfile. Saves the docker job ~1-2
+      # min of duplicated compile work — it now just COPYs the
+      # binary into a slim Debian base and pushes to GHCR.
+      - name: Upload binary artifact for docker job
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        uses: actions/upload-artifact@v4
+        with:
+          name: autorip-binary-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/autorip
+          retention-days: 1
 
   docker:
     needs: build
@@ -126,6 +141,15 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v5
+
+      # Pull the prebuilt musl binary from the build job into the
+      # docker build context. Dockerfile.ci consumes ./autorip from
+      # the context root (no in-container cargo build).
+      - name: Download binary from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: autorip-binary-x86_64-unknown-linux-musl
+          path: .
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -138,13 +162,17 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.ci
           push: true
           tags: |
             ghcr.io/freemkv/autorip:latest
             ghcr.io/freemkv/autorip:${{ github.ref_name }}
 
+  # 0.18.13: only needs `verify` (the version-match check). It does
+  # NOT need the binary, so it runs in parallel with `build` and
+  # `docker` instead of blocking on either.
   update-homepage:
-    needs: build
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - name: Update org README with new version

@@ -1,0 +1,29 @@
+# CI-only Dockerfile. Skips the in-container cargo build by reusing
+# the musl-static binary the Release workflow's `build` job already
+# produced. Saves ~1-2 min per release vs the multi-stage Dockerfile.
+#
+# Expects the binary at ./autorip in the build context. The release
+# workflow's `docker` job downloads the `autorip-x86_64-unknown-linux-musl`
+# artifact uploaded by the `build` job into the context root before
+# running `docker build`.
+#
+# Local developers building from source should keep using the regular
+# Dockerfile (multi-stage cargo build).
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y \
+    libssl3 cron curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY autorip /usr/local/bin/autorip
+RUN chmod +x /usr/local/bin/autorip
+COPY entrypoint.sh /entrypoint.sh
+COPY udev-trigger.sh /usr/local/bin/udev-trigger.sh
+RUN chmod +x /entrypoint.sh /usr/local/bin/udev-trigger.sh
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl --fail --silent --max-time 4 http://127.0.0.1:8080/api/state > /dev/null || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]
