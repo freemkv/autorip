@@ -988,28 +988,63 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             c.transport_recovery_delay_secs,
         )
     };
+    // Rip-level wallclock watcher. Cancellable via `rip_complete` —
+    // when the main rip thread finishes (success or graceful eject),
+    // it flips this flag and the watcher exits silently. Without this,
+    // the thread sleeps blindly for `rip_budget_secs` and fires the
+    // "budget exceeded" warning long after the rip already succeeded
+    // — empirically 2026-05-11 Top Gun Maverick: rip done at 13:27,
+    // false warning at 13:31. Now: poll every 5s, bail early when
+    // rip_complete is set.
     let halt_rip_watcher = halt.clone();
     let device_rip_watcher = device.to_string();
+    let rip_complete = Arc::new(AtomicBool::new(false));
+    let rip_complete_watcher = rip_complete.clone();
     let _rip_watcher_guard = std::thread::spawn(move || {
         tracing::info!(
             device = %device_rip_watcher,
             rip_budget_secs,
             "Rip-level wallclock watcher started"
         );
-        std::thread::sleep(std::time::Duration::from_secs(rip_budget_secs));
-        if !halt_rip_watcher.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::warn!(
-                device = %device_rip_watcher,
-                rip_budget_secs,
-                "Rip budget exceeded — firing halt flag"
-            );
-            halt_rip_watcher.store(true, std::sync::atomic::Ordering::Relaxed);
-            crate::log::device_log(
-                &device_rip_watcher,
-                &format!("exceeded {}-second rip budget", rip_budget_secs),
-            );
+        let start = std::time::Instant::now();
+        let budget = std::time::Duration::from_secs(rip_budget_secs);
+        while start.elapsed() < budget {
+            // Coarse poll — 5s granularity is fine for a multi-hour
+            // budget. Smaller intervals would just burn wakeups.
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if rip_complete_watcher.load(std::sync::atomic::Ordering::Relaxed) {
+                // Rip ended on its own. Exit silently — no warning,
+                // no halt flag mutation. The rip succeeded (or was
+                // halted by some other path that already set state).
+                return;
+            }
+            if halt_rip_watcher.load(std::sync::atomic::Ordering::Relaxed) {
+                // External halt (user, transport failure, etc.).
+                // Same exit: don't double-warn.
+                return;
+            }
         }
+        // Genuine budget exceeded.
+        tracing::warn!(
+            device = %device_rip_watcher,
+            rip_budget_secs,
+            "Rip budget exceeded — firing halt flag"
+        );
+        halt_rip_watcher.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::log::device_log(
+            &device_rip_watcher,
+            &format!("exceeded {}-second rip budget", rip_budget_secs),
+        );
     });
+    // Drop guard that signals rip_complete on scope exit (rip
+    // function returns). The watcher polls this and exits cleanly.
+    struct RipCompleteGuard(Arc<AtomicBool>);
+    impl Drop for RipCompleteGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _rip_complete_guard = RipCompleteGuard(rip_complete);
 
     // Per-pass wallclock budget. Each pass (Pass 1 sweep + every retry) gets
     // its own `max(disc_runtime, min_budget)` budget. Configurable via
