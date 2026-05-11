@@ -82,6 +82,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.86.0
         with:
           targets: ${{ matrix.target }}
+      # Cache cargo registry + target/ across release runs. The
+      # registry index download alone is ~30-60s per run; with the
+      # cache it's near-zero on subsequent releases that don't bump
+      # Cargo.lock. target/ caching also helps when the lockfile is
+      # stable (frequent in our unified-version cadence).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: autorip-release-${{ matrix.target }}
 
       - name: Install musl tools
         run: |

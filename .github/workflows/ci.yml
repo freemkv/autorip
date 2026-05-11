@@ -16,6 +16,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.86.0
         with:
           components: clippy, rustfmt
+      # Cache ~/.cargo/registry + target/ across runs. Saves ~30-60s
+      # of crates.io index download per job; incremental compilation
+      # helps on re-runs that don't bump Cargo.lock.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: autorip-ci
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
 
@@ -24,6 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: autorip-ci
       - run: cargo test --locked --tests
 
   # autorip targets Linux only (disc access via /dev/sg*)
