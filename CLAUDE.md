@@ -24,18 +24,35 @@ The toolchain composes:
 Production wrapper (`autorip`) orchestrates this on disc insert via a
 docker container; manual control via the `freemkv` CLI.
 
-## Current focus (2026-05-11)
+## Current focus (2026-05-12)
 
-**v0.18.17/18 deployed with threaded mux pipeline + log capture improvements.**
+**v0.18.23 deployed with debug logging for mux stall diagnostics.**
 
-Changes in v0.18.17:
-- Threaded ISO reader spawns `freemkv-mux-producer` thread for parallel reading/writing, cutting mux duration by ~30% (Civil War: 2412s → ~1700s projected)
-- See `freemkv-private/memory/v0_18_17_release_notes.md`
+Changes in v0.18.23:
+- Added comprehensive eprintln! debug logging to mux pipeline when `FREEMKV_DEBUG=1` or `/api/debug POST` toggle enabled
+- Logs producer frame reads (track, pts, keyframe, size), consumer frame processing count, progress state updates at every stage
+- Diagnoses 80% stall issue: distinguishes between UI reporting failure vs. actual mux loop early termination
 
-Changes in v0.18.18:
-- Device log capture increased from 500 to 2000 lines in `/api/logs/{device}` UI endpoint; captures full mux completion messages
+Changes in v0.18.22:
+- See CI build for full changelog
 
-Civil War UHD re-rip in progress at ~29% on Pass 1 sweep (v0.18.17) — comparing mux speed against v0.18.16 baseline (~2412s / 18 MB/s). Expected: threaded ISO reader cuts mux to ~1700s at 25+ MB/s.
+Deploying debug builds (faster than waiting on Watchtower):
+```bash
+# Build locally (takes ~15s)
+cd /Users/mjackson/Developer/freemkv/autorip && cargo +1.86 build --release
+
+# Deploy to rip1
+scp target/release/autorip rip@rip1.docker.internal.pq.io:/tmp/autorip-debug
+ssh rip@rip1.docker.internal.pq.io 'sudo docker cp /tmp/autorip-debug autorip:/app/autorip && sudo docker restart autorip'
+
+# Enable debug logging via API
+curl -X POST http://rip1.docker.internal.pq.io/api/debug -H "Content-Type: application/json" -d '{"enabled":true}'
+
+# Monitor logs during rip
+ssh rip@rip1.docker.internal.pq.io 'docker logs autorip --tail=500 -f'
+```
+
+Civil War UHD re-rip in progress at ~29% on Pass 1 sweep (v0.18.23) — comparing mux speed against v0.18.16 baseline (~2412s / 18 MB/s). Expected: threaded ISO reader cuts mux to ~1700s at 25+ MB/s, with debug logs confirming no stalls at 80%.
 
 Legacy exploration (Pass N recovery vs dd via `/dev/sr0`) deployed and tested on live discs.
 
