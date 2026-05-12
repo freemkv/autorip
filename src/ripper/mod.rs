@@ -2263,7 +2263,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         // Open the ISO for the mux pipeline.
         let iso_reader =
             match libfreemkv::FileSectorReader::open(std::path::Path::new(&iso_path_str)) {
-                Ok(r) => r,
+                Ok(r) => {
+                    use libfreemkv::SectorReader;
+                    crate::log::device_log(device, &format!("ISO opened successfully: {} sectors", r.capacity_sectors()));
+                    r
+                }
                 Err(e) => {
                     crate::log::device_log(device, &format!("Open ISO failed: {e}"));
                     update_state(
@@ -2309,7 +2313,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         Box::new(iso_reader) as Box<dyn libfreemkv::SectorReader>
     } else {
         Box::new(session.drive) as Box<dyn libfreemkv::SectorReader>
-    };
+   };
+
+    // Debug log reader type for mux - confirms ISO vs drive source
+    tracing::debug!(target: "mux", " mux using reader: {}", if cfg_read.max_retries > 0 { "ISO file (multipass)" } else { "physical drive" });
 
     // 0.18 round 2: DiscStream gets the per-device `Halt` at
     // construction via the new `with_halt(...)` builder. Stop
