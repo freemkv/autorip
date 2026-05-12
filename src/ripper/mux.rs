@@ -929,14 +929,12 @@ pub(super) fn run_mux(
                     track
                 );
             }
-        } else {
-            if pipe.send(frame).is_err() {
-                crate::log::device_log(
-                    &device_str_for_loop,
-                    "Mux consumer aborted (pipeline closed)",
-                );
-                break;
-            }
+        } else if pipe.send(frame).is_err() {
+            crate::log::device_log(
+                &device_str_for_loop,
+                "Mux consumer aborted (pipeline closed)",
+            );
+            break;
         }
     }
 
