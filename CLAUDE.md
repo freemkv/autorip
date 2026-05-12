@@ -24,20 +24,47 @@ The toolchain composes:
 Production wrapper (`autorip`) orchestrates this on disc insert via a
 docker container; manual control via the `freemkv` CLI.
 
-## Current focus (2026-05-12)
+## Release process — verify before tag!
 
-**v0.18.23 deployed with debug logging for mux stall diagnostics.**
+**CRITICAL: Always run these checks BEFORE tagging a release:**
 
-Changes in v0.18.23:
-- Added comprehensive eprintln! debug logging to mux pipeline when `FREEMKV_DEBUG=1` or `/api/debug POST` toggle enabled
-- Logs producer frame reads (track, pts, keyframe, size), consumer frame processing count, progress state updates at every stage
-- Diagnoses 80% stall issue: distinguishes between UI reporting failure vs. actual mux loop early termination
-
-Changes in v0.18.22:
-- See CI build for full changelog
-
-Deploying debug builds (faster than waiting on Watchtower):
 ```bash
+# 1. Bump version in Cargo.toml first (NOT after tagging)
+cd autorip && cargo edit --version X.Y.Z  # or manual edit
+
+# 2. Verify clippy passes with -D warnings (catches cfg issues, etc.)
+cargo +1.86 clippy --locked -- -D warnings
+if [ $? -ne 0 ]; then echo "CLIPPY FAILED - DO NOT TAG"; exit 1; fi
+
+# 3. Run tests locally
+cargo +1.86 test --locked --tests
+
+# 4. Build release binary for all targets CI will use
+cargo +1.86 build --release --target x86_64-unknown-linux-musl
+cargo +1.86 build --release --target aarch64-unknown-linux-musl
+
+# 5. Commit version bump + Cargo.lock
+git add Cargo.toml Cargo.lock && git commit -m "vX.Y.Z: bump version"
+git push origin main
+
+# 6. ONLY THEN create tag (pointing to the commit with bumped version)
+git tag -a vX.Y.Z -m "vX.Y.Z" <commit_sha>
+git push origin vX.Y.Z
+
+# CI will verify Cargo.toml matches tag, then build all targets
+```
+
+**Common failure modes:**
+- `cargo clippy --locked` fails: Missing Cargo.lock commit or unexpected cfg values (e.g., `cfg!(feature = "debug")`)
+- Version mismatch: Tag doesn't match Cargo.toml version (CI verify job catches this)
+- Clippy warnings treated as errors: Always run `-D warnings` locally before pushing
+
+**If CI fails:**
+1. Check workflow logs at https://github.com/freemkv/autorip/actions
+2. Fix the issue locally
+3. Commit to main (NOT amend the tagged commit)
+4. Delete old tag, recreate with new SHA: `git tag -d vX.Y.Z && git tag -a vX.Y.Z <new_sha>`
+5. Force push tag: `git push origin vX.Y.Z --force`
 # Build locally (takes ~15s)
 cd /Users/mjackson/Developer/freemkv/autorip && cargo +1.86 build --release
 
