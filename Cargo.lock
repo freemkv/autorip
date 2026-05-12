@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-autorip"
-version = "0.18.24"
+version = "0.18.25"
 dependencies = [
  "libc",
  "libfreemkv",
@@ -525,9 +525,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libfreemkv"
-version = "0.18.24"
+version = "0.18.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffb57cc97aaf698278b0734381f0755a573691710b52b1d96eb8231a281a4dcf"
+checksum = "aff5d1b5d2aa0b6837b8ac6366c17dcb0e834d54794db38631d79b3230b8c565"
 dependencies = [
  "aes",
  "base64",
