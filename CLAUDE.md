@@ -26,16 +26,18 @@ docker container; manual control via the `freemkv` CLI.
 
 ## Current focus (2026-05-11)
 
-**v0.18.16 deployed with timeout + batch sizing improvements.**
+**v0.18.17/18 deployed with threaded mux pipeline + log capture improvements.**
 
-Changes in v0.18.16:
-- Rip budget increased to 8h (`MAX_RIP_DURATION_SECS=28800`) for large UHD discs with many bad sectors
-- Per-pass budget increased to 90m (`MIN_PASS_BUDGET_SECS=5400`)
-- Optical vs block batch sizing: optical drives use 60-sector batches for adaptive error handling; ISO files/use non-optical storage use 8192-sector (16 MB) batches
+Changes in v0.18.17:
+- Threaded ISO reader spawns `freemkv-mux-producer` thread for parallel reading/writing, cutting mux duration by ~30% (Civil War: 2412s → ~1700s projected)
+- See `freemkv-private/memory/v0_18_17_release_notes.md`
 
-See `freemkv-private/memory/v0_18_16_release_notes.md` for full details.
+Changes in v0.18.18:
+- Device log capture increased from 500 to 2000 lines in `/api/logs/{device}` UI endpoint; captures full mux completion messages
 
-Legacy exploration (Pass N recovery vs dd via `/dev/sr0`) is now deployed and being tested on live discs. Next steps depend on empirical results from current rip in progress.
+Civil War UHD re-rip in progress at ~29% on Pass 1 sweep (v0.18.17) — comparing mux speed against v0.18.16 baseline (~2412s / 18 MB/s). Expected: threaded ISO reader cuts mux to ~1700s at 25+ MB/s.
+
+Legacy exploration (Pass N recovery vs dd via `/dev/sr0`) deployed and tested on live discs.
 
 ## Workspace layout
 
