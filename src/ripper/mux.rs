@@ -917,7 +917,10 @@ pub(super) fn run_mux(
 
                 crate::log::device_log(
                     &device_str_for_loop,
-                    &format!("Mux SEND STALLED {:.1}s (channel full)", elapsed.as_secs_f64()),
+                    &format!(
+                        "Mux SEND STALLED {:.1}s (channel full)",
+                        elapsed.as_secs_f64()
+                    ),
                 );
             } else {
                 tracing::debug!(
