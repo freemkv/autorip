@@ -896,12 +896,53 @@ pub(super) fn run_mux(
 
     let completed = false;
     for frame in frame_rx {
-        if pipe.send(frame).is_err() {
-            crate::log::device_log(
-                &device_str_for_loop,
-                "Mux consumer aborted (pipeline closed)",
+        if debug_enabled() {
+            let channel_len = pipe.tx.len();
+            let channel_cap = pipe.tx.capacity();
+            tracing::debug!(
+                "Mux send: frame track={}, len={} bytes, channel={}/{}",
+                frame.track,
+                frame.data.len(),
+                channel_len,
+                channel_cap
             );
-            break;
+
+            let start = std::time::Instant::now();
+            if pipe.send(frame).is_err() {
+                crate::log::device_log(
+                    &device_str_for_loop,
+                    "Mux consumer aborted (pipeline closed)",
+                );
+                break;
+            }
+            let elapsed = start.elapsed();
+
+            if elapsed > std::time::Duration::from_millis(10) {
+                tracing::debug!(
+                    "Mux send BLOCKED {:.2}s: channel full={}, frame={}",
+                    elapsed.as_secs_f64(),
+                    pipe.tx.len(),
+                    frame.track
+                );
+
+                crate::log::device_log(
+                    &device_str_for_loop,
+                    &format!("Mux SEND STALLED {:.1}s (channel full)", elapsed.as_secs_f64()),
+                );
+            } else if debug_enabled() {
+                tracing::debug!(
+                    "Mux send: OK in {:.3}ms",
+                    elapsed.as_micros()
+                );
+            }
+        } else {
+            if pipe.send(frame).is_err() {
+                crate::log::device_log(
+                    &device_str_for_loop,
+                    "Mux consumer aborted (pipeline closed)",
+                );
+                break;
+            }
         }
     }
 
