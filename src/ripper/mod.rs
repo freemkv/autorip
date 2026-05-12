@@ -2369,6 +2369,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // frame iteration — same token the orchestrator threaded through
     // sweep / patch and the same one the HTTP /api/stop handler
     // cancels.
+    let _mux_span = tracing::span!(tracing::Level::TRACE, "rip_disc::run_mux", device=%device, total_bytes).entered();
     let mux_input_errors = Arc::new(AtomicU32::new(0));
     let mux_outcome = mux::run_mux(
         mux::MuxInputs {

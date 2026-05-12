@@ -4,6 +4,10 @@ use crate::ripper;
 use std::io::{Read as _, Write as _};
 use std::sync::{Arc, RwLock};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
+use once_cell::sync::Lazy;
+
+/// Runtime debug flag - toggled via /api/debug POST. Overrides FREEMKV_DEBUG env var.
+pub static DEBUG_ENABLED: Lazy<Arc<RwLock<bool>>> = Lazy::new(|| Arc::new(RwLock::new(false)));
 
 /// Embedded single-page HTML dashboard — full parity with Python autorip web UI.
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
@@ -1072,6 +1076,8 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             return json_response(request, 400, r#"{"error":"invalid device name"}"#);
         }
         handle_device_log(request, cfg, &device);
+    } else if is_post && url == "/api/debug" {
+        handle_debug_toggle(request);
     } else if is_get && (url == "/api/debug" || url.starts_with("/api/debug?")) {
         handle_debug_log(request, &url);
     } else if is_get && url == "/events" {
@@ -1855,4 +1861,24 @@ fn format_epoch_datetime(secs: u64) -> String {
     let hh = time_of_day / 3600;
     let mm = (time_of_day % 3600) / 60;
     format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hh, mm)
+}
+
+/// Toggle debug logging on/off at runtime. POST body can be empty or contain {"enabled":true/false}.
+fn handle_debug_toggle(mut request: tiny_http::Request) {
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        json_response(request, 400, r#"{"ok":false,"error":"bad body"}"#);
+        return;
+    }
+
+    // Parse JSON body for explicit enable/disable, or default to toggle
+    let enabled = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(true),
+        Err(_) => true, // Default: turn on if no valid JSON
+    };
+
+    *DEBUG_ENABLED.write().expect("debug lock poisoned") = enabled;
+    
+    tracing::info!(enabled, "debug logging toggled");
+    json_response(request, 200, &serde_json::json!({"ok": true, "enabled": enabled}).to_string());
 }

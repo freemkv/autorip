@@ -322,6 +322,10 @@ impl MuxSink {
         lost_video_secs: f64,
         errors: u32,
     ) {
+        if std::env::var("FREEMKV_DEBUG").is_ok() {
+            eprintln!("[DEBUG] MuxSink::push_state: pct={}, bytes_done={:.2}GB, speed={}MB/s", 
+                pct, bytes_done as f64 / 1_073_741_824.0, speed);
+        }
         update_state(
             &self.ui.device,
             RipState {
@@ -858,6 +862,10 @@ pub(super) fn run_mux(
                 match local_input.read() {
                     Ok(Some(frame)) => {
                         input_errors_for_thread.store(local_input.errors as u32, Ordering::Relaxed);
+                        if std::env::var("FREEMKV_DEBUG").is_ok() {
+                            eprintln!("[DEBUG] Producer: track={}, pts={}, keyframe={}, size={} bytes", 
+                                frame.track, frame.pts, frame.keyframe, frame.data.len());
+                        }
                         if frame_tx_for_closure.send(frame).is_err() {
                             crate::log::device_log(
                                 &device_str,
@@ -867,6 +875,9 @@ pub(super) fn run_mux(
                         }
                     }
                     Ok(None) => {
+                        if std::env::var("FREEMKV_DEBUG").is_ok() {
+                            eprintln!("[DEBUG] Producer: EOF reached, returning");
+                        }
                         return;
                     }
                     Err(e) => {
@@ -895,9 +906,11 @@ pub(super) fn run_mux(
     };
 
     let completed = false;
+    let mut frame_count = 0u64;
     for frame in frame_rx {
         let track = frame.track;
-        if libfreemkv::io::pipeline::debug_enabled() {
+        frame_count += 1;
+        if libfreemkv::io::pipeline::debug_enabled() || std::env::var("FREEMKV_DEBUG").is_ok() {
             let start = std::time::Instant::now();
             if pipe.send(frame).is_err() {
                 crate::log::device_log(
@@ -936,6 +949,9 @@ pub(super) fn run_mux(
             );
             break;
         }
+    }
+    if std::env::var("FREEMKV_DEBUG").is_ok() {
+        eprintln!("[DEBUG] Consumer: Finished processing {} frames", frame_count);
     }
 
     let errors = atomics_in.input_errors.load(Ordering::Relaxed);
