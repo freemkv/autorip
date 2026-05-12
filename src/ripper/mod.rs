@@ -2509,7 +2509,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         entry["last_sector"] = serde_json::json!(final_last_sector);
         entry["num_bad_ranges"] = serde_json::json!(final_num_bad_ranges);
         entry["largest_gap_ms"] = serde_json::json!(final_largest_gap_ms.round());
-        let log_lines = crate::log::get_device_log(device, 500);
+        let log_lines = crate::log::get_device_log(device, 2000);
         entry["log"] = serde_json::json!(log_lines.join("\n"));
         crate::history::record(&cfg_read.history_dir(), &entry);
     }
