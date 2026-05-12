@@ -1341,7 +1341,7 @@ fn handle_device_log(request: tiny_http::Request, _cfg: &Arc<RwLock<Config>>, de
         text_response(request, "invalid device");
         return;
     }
-    let lines = crate::log::get_device_log(device, 200);
+    let lines = crate::log::get_device_log(device, 2000);
     text_response(request, &lines.join("\n"));
 }
 
