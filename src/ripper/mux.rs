@@ -7,9 +7,10 @@
 //! `output.write()` is latency-bound. Running them on the same thread
 //! sums those latencies; running them through libfreemkv's generic
 //! `Pipeline` + `Sink` primitive overlaps them via a bounded channel.
-//! Channel depth is `DEFAULT_PIPELINE_DEPTH` (4) — frames are typically
-//! a few-MB video keyframes, so 4 in flight ≈ 16 MB max buffered, far
-//! below any concerning RAM cost.
+//! Channel depth is `READ_PIPELINE_DEPTH` (32) for ISO reader → buffer,
+//! `WRITE_PIPELINE_DEPTH` (16) for buffer → mux writer — larger read
+//! buffer compensates for drive variability and NFS stalls, smaller
+//! write buffer reduces backpressure risk when sync_file_range blocks.
 //!
 //! The producer half (`run_mux`) owns the input stream, the
 //! single-threaded headers-ready buffering, the watchdog thread, and
@@ -35,7 +36,7 @@ use std::time::Instant;
 
 use libfreemkv::pes::PesFrame;
 use libfreemkv::pes::Stream as PesStream;
-use libfreemkv::{DEFAULT_PIPELINE_DEPTH, Flow, Pipeline, Sink};
+use libfreemkv::{Flow, Pipeline, READ_PIPELINE_DEPTH, Sink, WRITE_PIPELINE_DEPTH};
 
 use super::session::device_halt;
 use super::state::{RipState, update_state};
@@ -794,7 +795,7 @@ pub(super) fn run_mux(
     let device_str_for_sink = inputs.device.to_string();
     let sink = MuxSink::new(output, ui, shared, start);
 
-    let pipe = match Pipeline::spawn_named("freemkv-mux-consumer", DEFAULT_PIPELINE_DEPTH, sink) {
+    let pipe = match Pipeline::spawn_named("freemkv-mux-consumer", WRITE_PIPELINE_DEPTH, sink) {
         Ok(p) => p,
         Err(e) => {
             crate::log::device_log(&device_str_for_sink, &format!("Pipeline spawn failed: {e}"));
@@ -823,7 +824,7 @@ pub(super) fn run_mux(
     // ISO reading with mux writing. This overlaps the latency-bound NFS write
     // path with the next ISO read, cutting total mux duration by ~30% on large
     // UHD rips (Civil War: 2412s → ~1700s projected).
-    let (frame_tx, frame_rx) = sync_channel::<PesFrame>(DEFAULT_PIPELINE_DEPTH);
+    let (frame_tx, frame_rx) = sync_channel::<PesFrame>(READ_PIPELINE_DEPTH);
 
     let _latest_bytes_read = atomics_in.latest_bytes_read.clone();
     let _rip_last_lba = atomics_in.rip_last_lba.clone();
