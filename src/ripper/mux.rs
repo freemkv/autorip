@@ -791,7 +791,7 @@ pub(super) fn run_mux(
         input_errors: atomics_in.input_errors.clone(),
     };
     let start = Instant::now();
-let device_str_for_sink = inputs.device.to_string();
+    let device_str_for_sink = inputs.device.to_string();
     let sink = MuxSink::new(output, ui, shared, start);
 
     let pipe = match Pipeline::spawn_named("freemkv-mux-consumer", DEFAULT_PIPELINE_DEPTH, sink) {
@@ -846,8 +846,7 @@ let device_str_for_sink = inputs.device.to_string();
                     return;
                 }
                 let _ = frame_tx_for_closure.send(frame);
-                input_errors_for_thread
-                    .store(local_input.errors as u32, Ordering::Relaxed);
+                input_errors_for_thread.store(local_input.errors as u32, Ordering::Relaxed);
             }
 
             loop {
@@ -857,8 +856,7 @@ let device_str_for_sink = inputs.device.to_string();
                 }
                 match local_input.read() {
                     Ok(Some(frame)) => {
-                        input_errors_for_thread
-                            .store(local_input.errors as u32, Ordering::Relaxed);
+                        input_errors_for_thread.store(local_input.errors as u32, Ordering::Relaxed);
                         if frame_tx_for_closure.send(frame).is_err() {
                             crate::log::device_log(
                                 &device_str,
@@ -877,22 +875,25 @@ let device_str_for_sink = inputs.device.to_string();
                 }
             }
         }) {
-            Ok(h) => h,
-            Err(e) => {
-                crate::log::device_log(&device_str_for_loop, &format!("Failed to spawn ISO reader thread: {e}"));
-                return MuxOutcome {
-                    completed: false,
-                    bytes_done: 0,
-                    elapsed_secs: 0.0,
-                    speed_mbs: 0.0,
-                    errors: input_errors_clone.load(Ordering::Relaxed),
-                    lost_video_secs: 0.0,
-                    output_opened: true,
-                };
-            }
-        };
+        Ok(h) => h,
+        Err(e) => {
+            crate::log::device_log(
+                &device_str_for_loop,
+                &format!("Failed to spawn ISO reader thread: {e}"),
+            );
+            return MuxOutcome {
+                completed: false,
+                bytes_done: 0,
+                elapsed_secs: 0.0,
+                speed_mbs: 0.0,
+                errors: input_errors_clone.load(Ordering::Relaxed),
+                lost_video_secs: 0.0,
+                output_opened: true,
+            };
+        }
+    };
 
-let completed = false;
+    let completed = false;
     for frame in frame_rx {
         if pipe.send(frame).is_err() {
             crate::log::device_log(
@@ -956,7 +957,6 @@ pub(super) struct MuxAtomics {
     pub(super) wd_bytes: Arc<AtomicU64>,
     pub(super) input_errors: Arc<AtomicU32>,
 }
-
 
 #[cfg(test)]
 mod tests {
