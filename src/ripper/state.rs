@@ -481,10 +481,10 @@ impl PassProgressState {
     /// `(newest_bytes - oldest_bytes) / (newest_t - oldest_t)`.
     /// Returns 0 when the window holds fewer than 2 samples (we need at
     /// least one prior point to compute a rate).
-    pub(super) fn observe(&mut self, now: std::time::Instant, bytes_good: u64) -> f64 {
+    pub(super) fn observe(&mut self, now: std::time::Instant, bytes_done: u64) -> f64 {
         if self.pass_start.is_none() {
             self.pass_start = Some(now);
-            self.pass_start_bytes = bytes_good;
+            self.pass_start_bytes = bytes_done;
         }
         let elapsed_pass = self
             .pass_start
@@ -501,7 +501,7 @@ impl PassProgressState {
                 }
             }
         }
-        self.samples.push_back((now, bytes_good));
+        self.samples.push_back((now, bytes_done));
 
         if self.samples.len() < 2 {
             return 0.0;

@@ -1,13 +1,18 @@
 use crate::config::{self, Config};
 use crate::history;
 use crate::ripper;
+use once_cell::sync::Lazy;
 use std::io::{Read as _, Write as _};
 use std::sync::{Arc, RwLock};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
-use once_cell::sync::Lazy;
 
-/// Runtime debug flag - toggled via /api/debug POST. Overrides FREEMKV_DEBUG env var.
+/// Runtime debug flag - toggled via /api/debug POST.
 pub static DEBUG_ENABLED: Lazy<Arc<RwLock<bool>>> = Lazy::new(|| Arc::new(RwLock::new(false)));
+
+/// Check if debug logging is enabled.
+pub fn debug_enabled() -> bool {
+    *DEBUG_ENABLED.read().unwrap()
+}
 
 /// Embedded single-page HTML dashboard — full parity with Python autorip web UI.
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
@@ -1878,7 +1883,11 @@ fn handle_debug_toggle(mut request: tiny_http::Request) {
     };
 
     *DEBUG_ENABLED.write().expect("debug lock poisoned") = enabled;
-    
+
     tracing::info!(enabled, "debug logging toggled");
-    json_response(request, 200, &serde_json::json!({"ok": true, "enabled": enabled}).to_string());
+    json_response(
+        request,
+        200,
+        &serde_json::json!({"ok": true, "enabled": enabled}).to_string(),
+    );
 }
