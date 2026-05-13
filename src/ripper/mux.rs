@@ -276,12 +276,8 @@ struct MuxSink {
     output: SendStream,
     ui: UiState,
     atomics: SharedAtomics,
+    progress: crate::ripper::state::PassProgressState,
     last_update: Instant,
-    last_speed_bytes: u64,
-    last_speed_time: Instant,
-    smooth_speed: f64,
-    seeded_speed: bool,
-    first_update: bool,
     /// Periodic 60s log line — separate cadence from `update_state`.
     last_log: Instant,
 }
@@ -297,12 +293,8 @@ impl MuxSink {
             output: SendStream(output),
             ui,
             atomics,
+            progress: crate::ripper::state::PassProgressState::new(),
             last_update: start,
-            last_speed_bytes: 0,
-            last_speed_time: start,
-            smooth_speed: 0.0,
-            seeded_speed: false,
-            first_update: true,
             last_log: start,
         }
     }
@@ -322,9 +314,13 @@ impl MuxSink {
         lost_video_secs: f64,
         errors: u32,
     ) {
-        if std::env::var("FREEMKV_DEBUG").is_ok() {
-            eprintln!("[DEBUG] MuxSink::push_state: pct={}, bytes_done={:.2}GB, speed={}MB/s", 
-                pct, bytes_done as f64 / 1_073_741_824.0, speed);
+        if crate::web::debug_enabled() {
+            eprintln!(
+                "[DEBUG] MuxSink::push_state: pct={}, bytes_done={:.2}GB, speed={}MB/s",
+                pct,
+                bytes_done as f64 / 1_073_741_824.0,
+                speed
+            );
         }
         update_state(
             &self.ui.device,
@@ -421,10 +417,9 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
         // because frames here are large (multi-MB keyframes); 1 frame
         // per second is already plentiful for the dashboard.
         let now = Instant::now();
-        if !self.first_update && now.duration_since(self.last_update).as_secs_f64() < 1.0 {
+        if now.duration_since(self.last_update).as_secs_f64() < 1.0 {
             return Ok(Flow::Continue);
         }
-        self.first_update = false;
         self.last_update = now;
 
         let lbr = self.atomics.latest_bytes_read.load(Ordering::Relaxed);
@@ -438,26 +433,13 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
         } else {
             0
         };
-        let speed_interval = now.duration_since(self.last_speed_time).as_secs_f64();
-        let instant_speed = if speed_interval > 0.0 {
-            (bytes_done.saturating_sub(self.last_speed_bytes)) as f64
+        let display_speed = self.progress.observe(now, bytes_done);
+        let speed = display_speed;
+        let speed_for_eta = self.progress.eta_speed_mbs(now, display_speed);
+        let eta = if speed_for_eta > 0.0 && self.ui.total_bytes > bytes_done {
+            let secs = ((self.ui.total_bytes - bytes_done) as f64
                 / (1024.0 * 1024.0)
-                / speed_interval
-        } else {
-            0.0
-        };
-        self.last_speed_bytes = bytes_done;
-        self.last_speed_time = now;
-        self.smooth_speed = if !self.seeded_speed {
-            self.seeded_speed = true;
-            instant_speed
-        } else {
-            0.95 * self.smooth_speed + 0.05 * instant_speed
-        };
-        let speed = self.smooth_speed;
-        let eta = if speed > 0.0 && self.ui.total_bytes > bytes_done {
-            let secs =
-                ((self.ui.total_bytes - bytes_done) as f64 / (1024.0 * 1024.0) / speed) as u32;
+                / speed_for_eta) as u32;
             if secs > 359999 {
                 // > 99 hours — ETA is meaningless
                 String::new()
@@ -862,9 +844,14 @@ pub(super) fn run_mux(
                 match local_input.read() {
                     Ok(Some(frame)) => {
                         input_errors_for_thread.store(local_input.errors as u32, Ordering::Relaxed);
-                        if std::env::var("FREEMKV_DEBUG").is_ok() {
-                            eprintln!("[DEBUG] Producer: track={}, pts={}, keyframe={}, size={} bytes", 
-                                frame.track, frame.pts, frame.keyframe, frame.data.len());
+                        if crate::web::debug_enabled() {
+                            eprintln!(
+                                "[DEBUG] Producer: track={}, pts={}, keyframe={}, size={} bytes",
+                                frame.track,
+                                frame.pts,
+                                frame.keyframe,
+                                frame.data.len()
+                            );
                         }
                         if frame_tx_for_closure.send(frame).is_err() {
                             crate::log::device_log(
@@ -910,7 +897,7 @@ pub(super) fn run_mux(
     for frame in frame_rx {
         let track = frame.track;
         frame_count += 1;
-        if libfreemkv::io::pipeline::debug_enabled() || std::env::var("FREEMKV_DEBUG").is_ok() {
+        if libfreemkv::io::pipeline::debug_enabled() || crate::web::debug_enabled() {
             let start = std::time::Instant::now();
             if pipe.send(frame).is_err() {
                 crate::log::device_log(
@@ -950,8 +937,11 @@ pub(super) fn run_mux(
             break;
         }
     }
-    if std::env::var("FREEMKV_DEBUG").is_ok() {
-        eprintln!("[DEBUG] Consumer: Finished processing {} frames", frame_count);
+    if crate::web::debug_enabled() {
+        eprintln!(
+            "[DEBUG] Consumer: Finished processing {} frames",
+            frame_count
+        );
     }
 
     let errors = atomics_in.input_errors.load(Ordering::Relaxed);

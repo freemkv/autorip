@@ -2264,8 +2264,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let iso_reader =
             match libfreemkv::FileSectorReader::open(std::path::Path::new(&iso_path_str)) {
                 Ok(r) => {
-                    use libfreemkv::SectorReader;
-                    crate::log::device_log(device, &format!("ISO opened successfully: {} sectors", r.capacity_sectors()));
+                    use libfreemkv::sector::SectorSource;
+                    crate::log::device_log(
+                        device,
+                        &format!("ISO opened successfully: {} sectors", r.capacity_sectors()),
+                    );
                     r
                 }
                 Err(e) => {
@@ -2313,7 +2316,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         Box::new(iso_reader) as Box<dyn libfreemkv::SectorReader>
     } else {
         Box::new(session.drive) as Box<dyn libfreemkv::SectorReader>
-   };
+    };
 
     // Debug log reader type for mux - confirms ISO vs drive source
     tracing::debug!(target: "mux", " mux using reader: {}", if cfg_read.max_retries > 0 { "ISO file (multipass)" } else { "physical drive" });
@@ -2376,7 +2379,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // frame iteration — same token the orchestrator threaded through
     // sweep / patch and the same one the HTTP /api/stop handler
     // cancels.
-    let _mux_span = tracing::span!(tracing::Level::TRACE, "rip_disc::run_mux", device=%device, total_bytes).entered();
+    let _mux_span =
+        tracing::span!(tracing::Level::TRACE, "rip_disc::run_mux", device=%device, total_bytes)
+            .entered();
     let mux_input_errors = Arc::new(AtomicU32::new(0));
     let mux_outcome = mux::run_mux(
         mux::MuxInputs {
