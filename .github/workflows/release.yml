@@ -13,9 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true
+          fetch-depth: 0
       - name: Verify Cargo.toml version matches tag
         run: |
-          CARGO_VER="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          CARGO_VER="v$(grep '^version' autorip/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
           if [ "$CARGO_VER" != "${{ github.ref_name }}" ]; then
             echo "::error::Cargo.toml says $CARGO_VER but tag is ${{ github.ref_name }}"
             exit 1
@@ -29,7 +32,7 @@ jobs:
           import sys, re
           tag = sys.argv[1]
           try:
-              with open("Cargo.lock") as f:
+              with open("autorip/Cargo.lock") as f:
                   text = f.read()
           except FileNotFoundError:
               print("::error::Cargo.lock not found")
@@ -113,19 +116,16 @@ jobs:
         run: |
           export CC=x86_64-linux-gnu-gcc
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-gnu-gcc
-          cargo build --locked --release --target ${{ matrix.target }}
+          cd autorip && cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cross build --locked --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cross build --locked --release --target ${{ matrix.target }}
+        run: |
+          cd autorip && cross build --locked --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
-          cd target/${{ matrix.target }}/release
+          cd autorip/target/${{ matrix.target }}/release
           tar czf "../../../autorip-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" autorip
           tar czf "../../../autorip-${{ matrix.target }}.tar.gz" autorip
 
@@ -145,43 +145,45 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: autorip-binary-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/autorip
+          path: autorip/target/${{ matrix.target }}/release/autorip
           retention-days: 1
 
-  docker:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v5
+   docker:
+     needs: build
+     runs-on: ubuntu-latest
+     permissions:
+       contents: read
+       packages: write
+     steps:
+       - uses: actions/checkout@v5
+         with:
+           submodules: true
 
-      # Pull the prebuilt musl binary from the build job into the
-      # docker build context. Dockerfile.ci consumes ./autorip from
-      # the context root (no in-container cargo build).
-      - name: Download binary from build job
-        uses: actions/download-artifact@v4
-        with:
-          name: autorip-binary-x86_64-unknown-linux-musl
-          path: .
+       # Pull the prebuilt musl binary from the build job into the
+       # docker build context. Dockerfile.ci consumes ./autorip from
+       # the context root (no in-container cargo build).
+       - name: Download binary from build job
+         uses: actions/download-artifact@v4
+         with:
+           name: autorip-binary-x86_64-unknown-linux-musl
+           path: .
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+       - name: Log in to GHCR
+         uses: docker/login-action@v3
+         with:
+           registry: ghcr.io
+           username: ${{ github.actor }}
+           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.ci
-          push: true
-          tags: |
-            ghcr.io/freemkv/autorip:latest
-            ghcr.io/freemkv/autorip:${{ github.ref_name }}
+       - name: Build and push Docker image
+         uses: docker/build-push-action@v6
+         with:
+           context: .
+           file: Dockerfile.ci
+           push: true
+           tags: |
+             ghcr.io/freemkv/autorip:latest
+             ghcr.io/freemkv/autorip:${{ github.ref_name }}
 
   # 0.18.13: only needs `verify` (the version-match check). It does
   # NOT need the binary, so it runs in parallel with `build` and
