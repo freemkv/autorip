@@ -115,6 +115,17 @@ pub struct RipState {
     /// moderate (orange) / serious (red).
     #[serde(default)]
     pub damage_severity: String,
+
+    /// Operator-readable failure reason for `status == "failed"`.
+    /// Populated when the resume-on-startup logic finds a `.failed`
+    /// marker in a disc's staging dir (e.g. "restart loop detected at
+    /// patch phase"). Distinct from `last_error` because `last_error`
+    /// gets overwritten on every transient hiccup; this one survives
+    /// across renders for the operator-decision view. Optional /
+    /// `skip_serializing_if = "Option::is_none"` so older dashboards
+    /// that don't know the field don't see a stray `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 impl Default for RipState {
@@ -160,6 +171,7 @@ impl Default for RipState {
             total_progress_pct: 0,
             total_eta: String::new(),
             damage_severity: String::new(),
+            failure_reason: None,
         }
     }
 }
