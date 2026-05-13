@@ -18,7 +18,7 @@ jobs:
           fetch-depth: 0
       - name: Verify Cargo.toml version matches tag
         run: |
-          CARGO_VER="v$(grep '^version' autorip/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          CARGO_VER="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
           if [ "$CARGO_VER" != "${{ github.ref_name }}" ]; then
             echo "::error::Cargo.toml says $CARGO_VER but tag is ${{ github.ref_name }}"
             exit 1
@@ -32,7 +32,7 @@ jobs:
           import sys, re
           tag = sys.argv[1]
           try:
-              with open("autorip/Cargo.lock") as f:
+              with open("Cargo.lock") as f:
                   text = f.read()
           except FileNotFoundError:
               print("::error::Cargo.lock not found")
@@ -111,21 +111,20 @@ jobs:
       # type errors were caught before the codegen pass — but on a
       # tagged release, the local precommit hook already caught those.
 
-      - name: Build (native musl)
+    - name: Build (native musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           export CC=x86_64-linux-gnu-gcc
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-gnu-gcc
-          cd autorip && cargo build --locked --release --target ${{ matrix.target }}
+          cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          cd autorip && cross build --locked --release --target ${{ matrix.target }}
+        run: cross build --locked --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
-          cd autorip/target/${{ matrix.target }}/release
+          cd target/${{ matrix.target }}/release
           tar czf "../../../autorip-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" autorip
           tar czf "../../../autorip-${{ matrix.target }}.tar.gz" autorip
 
@@ -139,13 +138,13 @@ jobs:
       # via an artifact instead of having that job re-run the same
       # cargo build inside the Dockerfile. Saves the docker job ~1-2
       # min of duplicated compile work — it now just COPYs the
-      # binary into a slim Debian base and pushes to GHCR.
+
       - name: Upload binary artifact for docker job
         if: matrix.target == 'x86_64-unknown-linux-musl'
         uses: actions/upload-artifact@v4
         with:
           name: autorip-binary-${{ matrix.target }}
-          path: autorip/target/${{ matrix.target }}/release/autorip
+          path: target/${{ matrix.target }}/release/autorip
           retention-days: 1
 
    docker:
@@ -156,8 +155,6 @@ jobs:
        packages: write
      steps:
        - uses: actions/checkout@v5
-         with:
-           submodules: true
 
        # Pull the prebuilt musl binary from the build job into the
        # docker build context. Dockerfile.ci consumes ./autorip from
