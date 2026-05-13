@@ -13,9 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-        with:
-          submodules: true
-          fetch-depth: 0
       - name: Verify Cargo.toml version matches tag
         run: |
           CARGO_VER="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
@@ -111,12 +108,16 @@ jobs:
       # type errors were caught before the codegen pass — but on a
       # tagged release, the local precommit hook already caught those.
 
-    - name: Build (native musl)
+      - name: Build (native musl with x86_64-linux-gnu-gcc)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           export CC=x86_64-linux-gnu-gcc
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-gnu-gcc
           cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --locked --release --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.target == 'aarch64-unknown-linux-musl'
@@ -138,7 +139,7 @@ jobs:
       # via an artifact instead of having that job re-run the same
       # cargo build inside the Dockerfile. Saves the docker job ~1-2
       # min of duplicated compile work — it now just COPYs the
-
+      # binary into a slim Debian base and pushes to GHCR.
       - name: Upload binary artifact for docker job
         if: matrix.target == 'x86_64-unknown-linux-musl'
         uses: actions/upload-artifact@v4
@@ -147,40 +148,40 @@ jobs:
           path: target/${{ matrix.target }}/release/autorip
           retention-days: 1
 
-   docker:
-     needs: build
-     runs-on: ubuntu-latest
-     permissions:
-       contents: read
-       packages: write
-     steps:
-       - uses: actions/checkout@v5
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
 
-       # Pull the prebuilt musl binary from the build job into the
-       # docker build context. Dockerfile.ci consumes ./autorip from
-       # the context root (no in-container cargo build).
-       - name: Download binary from build job
-         uses: actions/download-artifact@v4
-         with:
-           name: autorip-binary-x86_64-unknown-linux-musl
-           path: .
+      # Pull the prebuilt musl binary from the build job into the
+      # docker build context. Dockerfile.ci consumes ./autorip from
+      # the context root (no in-container cargo build).
+      - name: Download binary from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: autorip-binary-x86_64-unknown-linux-musl
+          path: .
 
-       - name: Log in to GHCR
-         uses: docker/login-action@v3
-         with:
-           registry: ghcr.io
-           username: ${{ github.actor }}
-           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-       - name: Build and push Docker image
-         uses: docker/build-push-action@v6
-         with:
-           context: .
-           file: Dockerfile.ci
-           push: true
-           tags: |
-             ghcr.io/freemkv/autorip:latest
-             ghcr.io/freemkv/autorip:${{ github.ref_name }}
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ci
+          push: true
+          tags: |
+            ghcr.io/freemkv/autorip:latest
+            ghcr.io/freemkv/autorip:${{ github.ref_name }}
 
   # 0.18.13: only needs `verify` (the version-match check). It does
   # NOT need the binary, so it runs in parallel with `build` and
