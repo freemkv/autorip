@@ -21,6 +21,7 @@
 //!
 //! See `freemkv-private/memory/0_18_redesign.md` § "Module layout".
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
@@ -32,6 +33,22 @@ use libfreemkv::{Flow, Pipeline, READ_PIPELINE_DEPTH, Sink, WRITE_PIPELINE_DEPTH
 
 use super::session::device_halt;
 use super::state::{RipState, update_state};
+
+/// Hard watchdog escalation threshold. When the producer's
+/// "last frame / drive activity" timestamp hasn't moved in this many
+/// seconds, the mux consumer thread is presumed stuck inside an
+/// unkillable syscall (a hung NFS write, a wedged decryption thread,
+/// a kernel-side ioctl that never returns). At that point graceful
+/// teardown is impossible — the only escape is to exit the process and
+/// rely on Docker `restart: unless-stopped` to bring autorip back,
+/// after which `resume_or_quarantine_staging` decides whether to retry
+/// or quarantine the disc via `.failed`.
+///
+/// 5 minutes was chosen as the smallest value comfortably above
+/// libfreemkv's per-read recovery timeout (60s) and above the soft
+/// "drive stalled" 30s warning. Anything under 60s would race with
+/// normal slow-recovery reads.
+pub const HARD_WATCHDOG_STALL_SECS: u64 = 300;
 
 /// True if the device's registered `Halt` token has been cancelled
 /// (e.g. by the HTTP `/api/stop/{device}` handler in `web.rs`).
@@ -151,6 +168,11 @@ pub(super) struct MuxInputs<'a> {
     /// is true so demux failures during mux yield zero-filled frames
     /// instead of aborting.
     pub(super) skip_errors: bool,
+    /// Per-disc staging directory (e.g. `/staging/MyDisc/`). Used by
+    /// the hard watchdog to bump `.restart_count` before
+    /// `std::process::exit(1)` so the post-restart resume logic can
+    /// promote the disc to `.failed` once `RESTART_LIMIT` is reached.
+    pub(super) staging_disc_dir: PathBuf,
 }
 
 /// Outcome of `run_mux`, used by the orchestrator to drive the
@@ -634,6 +656,7 @@ pub(super) fn run_mux(
         let wd_total = total_bytes;
         let wd_tmdb_year = inputs.tmdb_year;
         let wd_filename = inputs.filename.clone();
+        let wd_staging_disc_dir = inputs.staging_disc_dir.clone();
         std::thread::spawn(move || {
             let mut was_stalled = false;
             let mut last_log_secs: u64 = 0;
@@ -645,6 +668,48 @@ pub(super) fn run_mux(
                 let now = crate::util::epoch_secs();
                 let last = last_frame.load(Ordering::Relaxed);
                 let stall_secs = now.saturating_sub(last);
+
+                // Hard watchdog escalation. When the consumer / reader
+                // is stuck this far past the soft warning, graceful
+                // cleanup is impossible — the offending thread is
+                // inside a syscall that the kernel won't return from
+                // (hung NFS, wedged decrypt, frozen device ioctl).
+                // Bump the disc's `.restart_count` so post-restart
+                // resume can promote to `.failed` once the limit is
+                // reached, then `exit(1)` and let Docker
+                // `restart: unless-stopped` bring us back.
+                //
+                // No graceful join, no halt-token flip — those have
+                // already failed for 5 minutes by definition.
+                if stall_secs >= HARD_WATCHDOG_STALL_SECS {
+                    let bytes_good = wbytes.load(Ordering::Relaxed);
+                    let msg = format!(
+                        "hard watchdog escalating: stalled {}s at {:.2} GB; exiting process for container restart",
+                        stall_secs,
+                        bytes_good as f64 / 1_073_741_824.0,
+                    );
+                    crate::log::device_log(&wd_device, &msg);
+                    tracing::error!(
+                        target: "mux",
+                        device = %wd_device,
+                        bytes_good,
+                        stall_secs,
+                        staging = %wd_staging_disc_dir.display(),
+                        "hard watchdog escalating; exiting process for container restart"
+                    );
+                    // Best-effort: bump the restart counter so the
+                    // resume detector knows this disc has wedged the
+                    // process before. Errors are intentionally ignored
+                    // — we're about to exit(1) anyway and Docker will
+                    // get us back. clear_restart_count happens on
+                    // success / failed path elsewhere; on this path it
+                    // stays bumped so RESTART_LIMIT can engage.
+                    let _ = crate::ripper::staging::increment_restart_count(&wd_staging_disc_dir);
+                    // No `drop(_wd_guard)` — that's the producer's
+                    // local; we're a detached watchdog thread. The
+                    // OS will tear down every thread on exit(1).
+                    std::process::exit(1);
+                }
 
                 if stall_secs >= 30 {
                     let should_log = !was_stalled || stall_secs >= last_log_secs + 60;

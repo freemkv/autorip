@@ -82,13 +82,28 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     // Pre-0.13.17 enumeration was one-shot at startup — the user had to
     // restart the autorip container after every replug.
     const RESCAN_INTERVAL_SECS: u64 = 30;
-    // Startup sweep: anything under /staging is orphaned — there are no
-    // live sessions yet. A prior autorip process killed mid-rip leaves its
-    // in-progress ISO / mapfile / partial MKV here, which the old
-    // resume=false path still couldn't guarantee away. Wipe unconditionally
-    // so the next rip always starts clean.
+    // Startup safety net (0.20.7): walk staging and decide per-disc
+    // what to do — preserve partial rips for restart-loop accounting,
+    // wipe genuinely-empty stragglers, leave `.completed` / `.failed`
+    // markers in place. Pre-0.20.7 unconditionally wiped on startup,
+    // which threw away every in-flight ISO / mapfile when the
+    // container restarted mid-rip (Watchtower deploy, OOM, hard
+    // watchdog escalation — any of which now should resume, not lose
+    // half a UHD rip). See `staging::resume_or_quarantine_staging`.
     if let Ok(c) = cfg.read() {
-        wipe_staging(&c.staging_dir);
+        let hints = staging::resume_or_quarantine_staging(&c.staging_dir);
+        tracing::info!(
+            staging_dir = %c.staging_dir,
+            entries = hints.len(),
+            "staging resume scan complete"
+        );
+        for hint in &hints {
+            tracing::info!(
+                dir = %hint.dir.display(),
+                action = ?hint.action,
+                "staging resume hint"
+            );
+        }
     }
 
     let initial_drives = libfreemkv::list_drives();
@@ -557,11 +572,24 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         },
     );
 
+    // 0.20.7: if the resume-on-startup detector flipped this disc's
+    // staging dir to `.failed` (restart loop), surface that here so
+    // the operator sees "failed: restart loop detected" on the
+    // dashboard before triggering a fresh rip. `failure_reason`
+    // overrides the normal idle status when present.
+    let staging_disc =
+        cfg_read.staging_device_dir(&crate::util::sanitize_path_compact(&display_name));
+    let failure_reason = staging::read_failed_reason(std::path::Path::new(&staging_disc));
+    let (status_str, last_error_str, failure_field) = match failure_reason.as_ref() {
+        Some(r) => ("failed".to_string(), r.clone(), Some(r.clone())),
+        None => ("idle".to_string(), String::new(), None),
+    };
+
     update_state(
         device,
         RipState {
             device: device.to_string(),
-            status: "idle".to_string(),
+            status: status_str,
             disc_present: true,
             disc_name: display_name,
             disc_format,
@@ -577,6 +605,8 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 .unwrap_or_default(),
             duration,
             codecs,
+            last_error: last_error_str,
+            failure_reason: failure_field,
             ..Default::default()
         },
     );
@@ -2403,6 +2433,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             // doesn't trip a spurious abort on a near-finished rip; the
             // accepted-loss intent is already encoded in abort_on_lost_secs.
             skip_errors: cfg_read.max_retries > 0 || cfg_read.on_read_error == "skip",
+            // Hand the mux watchdog the per-disc staging dir so its
+            // hard-escalation path (5-minute stall → exit + Docker
+            // restart) can bump `.restart_count` before exiting.
+            staging_disc_dir: std::path::PathBuf::from(&staging),
         },
         input,
         mux::MuxAtomics {
@@ -2496,6 +2530,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 &marker_path,
                 serde_json::to_string_pretty(&marker).unwrap_or_default(),
             );
+            // 0.20.7: also write `.completed` (and clear `.restart_count`)
+            // so the resume-on-startup detector knows this disc finished
+            // cleanly even if the mover hasn't run yet. `.done` and
+            // `.completed` are independent: `.done` is the mover's
+            // hand-off marker (consumed when the file is relocated);
+            // `.completed` is the process-level success marker (stays
+            // put so post-restart the dir is recognised as terminal).
+            let staging_disc_path = std::path::Path::new(&staging);
+            staging::write_completed_marker(staging_disc_path);
+            staging::clear_restart_count(staging_disc_path);
         }
 
         let mut entry = marker.clone();
