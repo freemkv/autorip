@@ -8,15 +8,6 @@
 //! sub-modules exist as placeholders for the 0.18 trait-migration
 //! commit that will lift those loops out of `rip_disc`. See
 //! `freemkv-private/memory/0_18_redesign.md`.
-//!
-//! 0.18 also splits libfreemkv's `pes::Stream` (combined read+write)
-//! into `FrameSource` / `FrameSink`. autorip is *intentionally* kept
-//! on the deprecated `Stream` API in this slice — the migration to
-//! the typed traits happens after the trait-migration commit lifts
-//! the mux loop into `mux.rs`. The file-scope allow below is the
-//! marker for that intentional, time-bounded deprecation use.
-
-#![allow(deprecated)]
 
 mod mux;
 mod session;

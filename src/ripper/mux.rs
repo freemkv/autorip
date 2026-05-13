@@ -19,15 +19,7 @@
 //! per-frame `update_state` call (the morning's "fresh-rip snap-back"
 //! fix is preserved verbatim).
 //!
-//! Round 2 doesn't migrate to `FrameSource` / `FrameSink` — that's a
-//! separate slice. autorip stays on the deprecated `pes::Stream`
-//! API for now; the file-scope allow below is the marker for that
-//! intentional, time-bounded deprecation use, mirroring the same
-//! allow at the top of `ripper/mod.rs`.
-//!
 //! See `freemkv-private/memory/0_18_redesign.md` § "Module layout".
-
-#![allow(deprecated)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -246,34 +238,12 @@ struct SharedAtomics {
     input_errors: Arc<AtomicU32>,
 }
 
-/// `Send` wrapper around the libfreemkv `CountingStream`. The
-/// deprecated `pes::Stream` trait does not require `Send`
-/// (`Box<dyn Stream>` is `Box<dyn Stream + ?Send>`), so
-/// `CountingStream` — which holds `Box<dyn Stream>` — is not `Send`
-/// either. The actual concrete impls returned by `libfreemkv::output`
-/// (`MkvStream`, `M2tsStream`, `NetworkStream`, `StdioStream`,
-/// `NullStream`) all carry `Box<dyn WriteSeek + Send>` or
-/// equivalent — see the comment at `libfreemkv/src/pes.rs:182-200`
-/// explaining why `Stream: Send` was deliberately *not* promoted to a
-/// supertrait. The 0.18 migration target is `FrameSink` (which is
-/// `Send`), but autorip is staying on the deprecated `Stream` for
-/// this slice. This wrapper is the bridge: a one-line
-/// `unsafe impl Send` is sound because every concrete stream
-/// constructed by `libfreemkv::output` already only holds
-/// `Send`-compliant state internally.
-struct SendStream(libfreemkv::pes::CountingStream);
-
-// SAFETY: see SendStream's docstring — `libfreemkv::output` always
-// returns a stream backed by Send-compliant internals; the
-// non-`Send`-ness of `Box<dyn Stream>` is a trait-object limitation,
-// not a property of any concrete type we construct here.
-unsafe impl Send for SendStream {}
-
 /// Consumer side of the mux pipeline. Owns the output stream, the
 /// smoothed-speed estimator, the rate-limited `update_state` cadence,
-/// and the bytes-written counter that the watchdog reads.
+/// and the bytes-written counter that the watchdog reads. `Stream: Send`
+/// is a supertrait, so `CountingStream` is `Send` directly — no wrapper.
 struct MuxSink {
-    output: SendStream,
+    output: libfreemkv::pes::CountingStream,
     ui: UiState,
     atomics: SharedAtomics,
     progress: crate::ripper::state::PassProgressState,
@@ -290,7 +260,7 @@ impl MuxSink {
         start: Instant,
     ) -> Self {
         Self {
-            output: SendStream(output),
+            output,
             ui,
             atomics,
             progress: crate::ripper::state::PassProgressState::new(),
@@ -394,7 +364,7 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
     type Output = u64;
 
     fn apply(&mut self, frame: libfreemkv::pes::PesFrame) -> Result<Flow, libfreemkv::Error> {
-        if let Err(e) = self.output.0.write(&frame) {
+        if let Err(e) = self.output.write(&frame) {
             crate::log::device_log(&self.ui.device, &format!("Write error: {e}"));
             // Stop the pipeline cleanly — `close()` still runs and
             // surfaces whatever bytes_written we got to the orchestrator
@@ -410,7 +380,7 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
             .store(crate::util::epoch_secs(), Ordering::Relaxed);
         self.atomics
             .wd_bytes
-            .store(self.output.0.bytes_written(), Ordering::Relaxed);
+            .store(self.output.bytes_written(), Ordering::Relaxed);
 
         // 1-second `update_state` cadence — same throttle as the
         // pre-split inline loop. Not also gating on a frame-count tick
@@ -426,7 +396,7 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
         let bytes_done = if lbr > 0 {
             lbr
         } else {
-            self.output.0.bytes_written()
+            self.output.bytes_written()
         };
         let pct = if self.ui.total_bytes > 0 {
             (bytes_done * 100 / self.ui.total_bytes).min(100) as u8
@@ -499,10 +469,10 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
         // Surface a finalize error to the device log but always return
         // the bytes_written we got — the orchestrator uses that for the
         // history record and the "moving" status push.
-        if let Err(e) = self.output.0.finish() {
+        if let Err(e) = self.output.finish() {
             crate::log::device_log(&self.ui.device, &format!("Output finish error: {e}"));
         }
-        Ok(self.output.0.bytes_written())
+        Ok(self.output.bytes_written())
     }
 }
 
