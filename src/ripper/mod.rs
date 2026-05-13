@@ -1158,7 +1158,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // max_retries == 0 anyway.
     let mut bytes_unreadable_at_mux: u64 = 0;
 
-    let reader: Box<dyn libfreemkv::SectorReader> = if cfg_read.max_retries > 0 {
+    let reader: Box<dyn libfreemkv::SectorSource> = if cfg_read.max_retries > 0 {
         let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
         let iso_path_str = format!("{}/{}", staging, iso_filename);
         let iso_path = std::path::Path::new(&iso_path_str);
@@ -2253,7 +2253,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
         // Open the ISO for the mux pipeline.
         let iso_reader =
-            match libfreemkv::FileSectorReader::open(std::path::Path::new(&iso_path_str)) {
+            match libfreemkv::FileSectorSource::open(std::path::Path::new(&iso_path_str)) {
                 Ok(r) => {
                     use libfreemkv::sector::SectorSource;
                     crate::log::device_log(
@@ -2304,9 +2304,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             total_passes,
             &mux_state,
         );
-        Box::new(iso_reader) as Box<dyn libfreemkv::SectorReader>
+        Box::new(iso_reader) as Box<dyn libfreemkv::SectorSource>
     } else {
-        Box::new(session.drive) as Box<dyn libfreemkv::SectorReader>
+        Box::new(session.drive) as Box<dyn libfreemkv::SectorSource>
     };
 
     // Debug log reader type for mux - confirms ISO vs drive source
