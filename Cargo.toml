@@ -23,6 +23,11 @@ once_cell = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
+# Same kernel-wakeup channel primitive libfreemkv uses for Pipeline.
+# Replaces the producer's `std::sync::mpsc::sync_channel` + 50 ms
+# poll-loop in `ripper/mux.rs` so the producer thread blocks on
+# consumer drain instead of pacing at 20 frames/sec.
+crossbeam-channel = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
