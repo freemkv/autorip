@@ -2577,6 +2577,26 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     }
 
+    // Emit a final mux summary line so the history record's captured log
+    // ends with a clean terminal event instead of whatever the last 60s
+    // progress tick happened to be. Without this, a mux that finishes
+    // within 60s of its last tick freezes the log at e.g. "(84%) 21.8 MB/s
+    // ETA 9:27" — visibly truncated even though the rip completed cleanly.
+    // History snapshot below captures whatever's in LOGS, so write here.
+    if completed {
+        crate::log::device_log(
+            device,
+            &format!(
+                "Mux complete: {:.1} GB in {}s ({:.1} MB/s avg)",
+                bytes_done as f64 / 1_073_741_824.0,
+                elapsed.round() as u64,
+                speed
+            ),
+        );
+    } else if let Some(reason) = finalize_error.as_ref() {
+        crate::log::device_log(device, &format!("Mux failed: {reason}"));
+    }
+
     // Write a history record for every rip attempt — completed OR stopped.
     // Stopped rips used to leave no persistent trace except the device log,
     // which gets clobbered on the next scan. Include errors/lost/last_sector
