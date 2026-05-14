@@ -25,7 +25,6 @@ use crossbeam_channel::{SendTimeoutError as CbSendTimeoutError, bounded as cb_bo
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::sync_channel;
 use std::time::Instant;
 
 use libfreemkv::pes::PesFrame;
