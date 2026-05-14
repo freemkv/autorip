@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
+use crossbeam_channel::{bounded as cb_bounded, SendTimeoutError as CbSendTimeoutError};
 use std::time::Instant;
 
 use libfreemkv::pes::PesFrame;
@@ -934,7 +935,7 @@ pub(super) fn run_mux(
     // ISO reading with mux writing. This overlaps the latency-bound NFS write
     // path with the next ISO read, cutting total mux duration by ~30% on large
     // UHD rips (Civil War: 2412s → ~1700s projected).
-    let (frame_tx, frame_rx) = sync_channel::<PesFrame>(READ_PIPELINE_DEPTH);
+    let (frame_tx, frame_rx) = cb_bounded::<PesFrame>(READ_PIPELINE_DEPTH);
 
     let _latest_bytes_read = atomics_in.latest_bytes_read.clone();
     let _rip_last_lba = atomics_in.rip_last_lba.clone();
@@ -950,35 +951,47 @@ pub(super) fn run_mux(
     let _input_handle = match std::thread::Builder::new()
         .name("freemkv-mux-producer".to_string())
         .spawn(move || {
-            // Halt-aware send helper for the raw `mpsc::SyncSender`
-            // bridge between the ISO reader and the pipeline-feeder
-            // loop. Polls `try_send` on 50 ms slices; bails out if the
-            // halt fires or `deadline` elapses. Returns Ok on land,
-            // Err on disconnect / halt / timeout — caller treats all
-            // three as "stop reading". 60 s mirrors
-            // MUX_SEND_DEADLINE_SECS on the consumer-bridge side.
+            // Halt-aware send helper for the ISO reader → pipeline-
+            // feeder bridge channel. Uses
+            // `crossbeam_channel::Sender::send_timeout` so the producer
+            // BLOCKS on consumer drain (kernel-wakeup) rather than
+            // polling. The pre-0.21.7 version polled `try_send` on
+            // 50 ms slices, which capped producer throughput at
+            // ~20 frames/sec ≈ 1 MB/s whenever the consumer back-
+            // pressured — see freemkv-private/memory/
+            // feedback_send_with_halt_poll_throttle.md.
+            //
+            // The 250 ms halt-check cadence is just for stop-button
+            // responsiveness; on the happy path the producer is woken
+            // the instant the consumer drains a slot, so this primitive
+            // imposes no throughput cap at any storage / network speed.
             fn send_with_halt_raw(
-                tx: &std::sync::mpsc::SyncSender<PesFrame>,
+                tx: &crossbeam_channel::Sender<PesFrame>,
                 halt: &libfreemkv::Halt,
-                mut item: PesFrame,
+                item: PesFrame,
                 deadline: std::time::Duration,
             ) -> Result<(), PesFrame> {
-                use std::sync::mpsc::TrySendError;
                 let end = std::time::Instant::now() + deadline;
+                let halt_check = std::time::Duration::from_millis(250);
+                let mut pending = item;
                 loop {
-                    match tx.try_send(item) {
+                    if halt.is_cancelled() {
+                        return Err(pending);
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= end {
+                        return Err(pending);
+                    }
+                    let slice = halt_check.min(end.saturating_duration_since(now));
+                    match tx.send_timeout(pending, slice) {
                         Ok(()) => return Ok(()),
-                        Err(TrySendError::Full(returned)) => {
-                            item = returned;
-                            if halt.is_cancelled() {
-                                return Err(item);
-                            }
-                            if std::time::Instant::now() >= end {
-                                return Err(item);
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        Err(CbSendTimeoutError::Timeout(returned)) => {
+                            pending = returned;
+                            // loop: re-check halt + deadline, then park again
                         }
-                        Err(TrySendError::Disconnected(returned)) => return Err(returned),
+                        Err(CbSendTimeoutError::Disconnected(returned)) => {
+                            return Err(returned);
+                        }
                     }
                 }
             }
