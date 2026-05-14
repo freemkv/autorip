@@ -181,6 +181,28 @@ pub(super) struct MuxInputs<'a> {
 /// read error. The bytes/elapsed are filled even on early exit so
 /// the history record reflects partial progress.
 pub(super) struct MuxOutcome {
+    /// True iff the read loop drained `frame_rx` to natural EOF
+    /// (producer dropped its `frame_tx` after either EOF on the input
+    /// stream or an unrecoverable read error logged via `device_log`)
+    /// AND the post-loop `pipe.finish_with_halt(...)` returned `Ok`.
+    ///
+    /// 0.20.8 post-validation-audit semantics: `completed=true` is the
+    /// orchestrator's gate for writing `.done` / `.completed` markers
+    /// in `staging` (see `rip_disc` in `mod.rs` around the
+    /// `status_label = if completed { "complete" } else { "stopped" }`
+    /// branch). It is therefore the on-disk success signal for the
+    /// resume-on-startup detector and for the mover thread.
+    ///
+    /// Set to `false` on any of:
+    /// - halt during header read (early return),
+    /// - `libfreemkv::output(...)` open failure (early return),
+    /// - `Pipeline::spawn_named` failure (early return),
+    /// - producer thread spawn failure (early return),
+    /// - `break` out of the consumer-bridge loop because
+    ///   `pipe.send_with_halt` returned Err (halt or send deadline),
+    /// - `pipe.finish_with_halt` returning Err (consumer wedged or
+    ///   `MuxSink::close` propagated a finalize error from
+    ///   `output.finish()` — see `finalize_error`).
     pub(super) completed: bool,
     pub(super) bytes_done: u64,
     pub(super) elapsed_secs: f64,
@@ -203,6 +225,16 @@ pub(super) struct MuxOutcome {
     /// the output is open leave a partial MKV in staging and a
     /// "stopped" history record describing it.
     pub(super) output_opened: bool,
+    /// Set when `MuxSink::close()` failed to finalise the MKV (most
+    /// commonly: the Cues seek-back at EBML close raised an I/O error,
+    /// leaving an unseekable / structurally-invalid output). Carries
+    /// the formatted error so the orchestrator can put it in the
+    /// `.failed` marker reason. `Some(_)` implies `completed == false`.
+    ///
+    /// Pre-0.20.8 the close error was swallowed (logged only) and
+    /// `.done` / `.completed` got written for unseekable MKVs — the
+    /// validation audit's #1 "Reasonable tier" item.
+    pub(super) finalize_error: Option<String>,
 }
 
 /// Per-frame UI state that the consumer needs to fill in the
@@ -488,11 +520,26 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
     }
 
     fn close(mut self) -> Result<u64, libfreemkv::Error> {
-        // Surface a finalize error to the device log but always return
-        // the bytes_written we got — the orchestrator uses that for the
-        // history record and the "moving" status push.
+        // 0.20.8 validation-audit fix #1: propagate `output.finish()`
+        // errors instead of swallowing them. The finalize step writes
+        // the Cues block and seeks back to patch the segment-info
+        // size header; failure there leaves an unseekable / invalid
+        // MKV. Pre-0.20.8 we logged and returned Ok, which let the
+        // orchestrator write `.done` / `.completed` for a broken file.
+        // Now the error surfaces through `pipe.finish_with_halt(...)`
+        // back into `run_mux`, where it's captured into
+        // `MuxOutcome.finalize_error` and the orchestrator writes a
+        // `.failed` marker instead. We still log here so the device
+        // log retains the same diagnostic on the device-log page.
+        //
+        // `CountingStream::finish()` returns `std::io::Error`; wrap it
+        // into the surrounding pipeline's `libfreemkv::Error` variant
+        // so the `Pipeline::finish_with_halt` error channel can carry
+        // it back to the caller. `Error::IoError` is the dedicated
+        // pass-through for std `io::Error`s.
         if let Err(e) = self.output.finish() {
             crate::log::device_log(&self.ui.device, &format!("Output finish error: {e}"));
+            return Err(libfreemkv::Error::IoError { source: e });
         }
         Ok(self.output.bytes_written())
     }
@@ -541,6 +588,7 @@ pub(super) fn run_mux(
                 errors: input.errors as u32,
                 lost_video_secs: 0.0,
                 output_opened: false,
+                finalize_error: None,
             };
         }
         match input.read() {
@@ -614,6 +662,7 @@ pub(super) fn run_mux(
                 errors: input.errors as u32,
                 lost_video_secs: 0.0,
                 output_opened: false,
+                finalize_error: None,
             };
         }
     };
@@ -688,7 +737,14 @@ pub(super) fn run_mux(
                         stall_secs,
                         bytes_good as f64 / 1_073_741_824.0,
                     );
-                    crate::log::device_log(&wd_device, &msg);
+                    // CRITICAL: do NOT call `device_log` here. The log
+                    // file lives on the same NFS-mounted `/config`
+                    // that's quite possibly the exact mount we're
+                    // escalating because it's wedged. `eprintln!` and
+                    // `tracing::error!` both go to docker logs /
+                    // journald — no NFS, no filesystem dependency, so
+                    // they can't block `exit(1)` from firing.
+                    eprintln!("[mux/{}] {}", wd_device, msg);
                     tracing::error!(
                         target: "mux",
                         device = %wd_device,
@@ -704,7 +760,39 @@ pub(super) fn run_mux(
                     // get us back. clear_restart_count happens on
                     // success / failed path elsewhere; on this path it
                     // stays bumped so RESTART_LIMIT can engage.
-                    let _ = crate::ripper::staging::increment_restart_count(&wd_staging_disc_dir);
+                    //
+                    // 0.20.8 hardening: wrap the counter bump in a
+                    // local bounded-syscall pattern (5 s deadline) so
+                    // even if staging shares the wedged NFS mount with
+                    // `/config`, we still proceed to `exit(1)`. If the
+                    // bump times out, the next restart sees count N-1
+                    // instead of N — at worst one extra retry, vastly
+                    // better than never exiting.
+                    // `libfreemkv::io::bounded::bounded_syscall` is
+                    // `pub(crate)` so it's not reachable from autorip;
+                    // we hand-roll the equivalent pattern (15 lines)
+                    // here.
+                    {
+                        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+                        let bump_dir = wd_staging_disc_dir.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("autorip-watchdog-counter-bump".into())
+                            .spawn(move || {
+                                let _ = crate::ripper::staging::increment_restart_count(&bump_dir);
+                                let _ = tx.send(());
+                            });
+                        if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+                            eprintln!(
+                                "[mux/{}] watchdog: counter bump timed out; proceeding to exit anyway",
+                                wd_device
+                            );
+                            tracing::error!(
+                                target: "mux",
+                                device = %wd_device,
+                                "watchdog: counter bump timed out; proceeding to exit anyway"
+                            );
+                        }
+                    }
                     // No `drop(_wd_guard)` — that's the producer's
                     // local; we're a detached watchdog thread. The
                     // OS will tear down every thread on exit(1).
@@ -832,6 +920,7 @@ pub(super) fn run_mux(
                 // we treat it like a write error: history record
                 // gets written, status=stopped.
                 output_opened: true,
+                finalize_error: None,
             };
         }
     };
@@ -861,13 +950,54 @@ pub(super) fn run_mux(
     let _input_handle = match std::thread::Builder::new()
         .name("freemkv-mux-producer".to_string())
         .spawn(move || {
+            // Halt-aware send helper for the raw `mpsc::SyncSender`
+            // bridge between the ISO reader and the pipeline-feeder
+            // loop. Polls `try_send` on 50 ms slices; bails out if the
+            // halt fires or `deadline` elapses. Returns Ok on land,
+            // Err on disconnect / halt / timeout — caller treats all
+            // three as "stop reading". 60 s mirrors
+            // MUX_SEND_DEADLINE_SECS on the consumer-bridge side.
+            fn send_with_halt_raw(
+                tx: &std::sync::mpsc::SyncSender<PesFrame>,
+                halt: &libfreemkv::Halt,
+                mut item: PesFrame,
+                deadline: std::time::Duration,
+            ) -> Result<(), PesFrame> {
+                use std::sync::mpsc::TrySendError;
+                let end = std::time::Instant::now() + deadline;
+                loop {
+                    match tx.try_send(item) {
+                        Ok(()) => return Ok(()),
+                        Err(TrySendError::Full(returned)) => {
+                            item = returned;
+                            if halt.is_cancelled() {
+                                return Err(item);
+                            }
+                            if std::time::Instant::now() >= end {
+                                return Err(item);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(TrySendError::Disconnected(returned)) => return Err(returned),
+                    }
+                }
+            }
+            let producer_deadline = std::time::Duration::from_secs(60);
             let mut local_input = input;
             for frame in buffered {
                 if halt_token.is_cancelled() {
                     crate::log::device_log(&device_str, "Producer: Stop during buffered drain");
                     return;
                 }
-                let _ = frame_tx_for_closure.send(frame);
+                if send_with_halt_raw(&frame_tx_for_closure, &halt_token, frame, producer_deadline)
+                    .is_err()
+                {
+                    crate::log::device_log(
+                        &device_str,
+                        "Producer: buffered drain aborted (channel closed or halted)",
+                    );
+                    return;
+                }
                 input_errors_for_thread.store(local_input.errors as u32, Ordering::Relaxed);
             }
 
@@ -879,27 +1009,36 @@ pub(super) fn run_mux(
                 match local_input.read() {
                     Ok(Some(frame)) => {
                         input_errors_for_thread.store(local_input.errors as u32, Ordering::Relaxed);
-                        if crate::web::debug_enabled() {
-                            eprintln!(
-                                "[DEBUG] Producer: track={}, pts={}, keyframe={}, size={} bytes",
-                                frame.track,
-                                frame.pts,
-                                frame.keyframe,
-                                frame.data.len()
-                            );
-                        }
-                        if frame_tx_for_closure.send(frame).is_err() {
+                        // Producer per-frame log is the developer firehose
+                        // (~hundreds of frames/sec on a UHD rip). Lives at
+                        // `trace` so a normal /api/debug toggle (which raises
+                        // to `debug`) doesn't drown the useful events. Enable
+                        // explicitly with AUTORIP_LOG_LEVEL=stream=trace.
+                        tracing::trace!(
+                            target: "stream",
+                            track = frame.track,
+                            pts = frame.pts,
+                            keyframe = frame.keyframe,
+                            size = frame.data.len(),
+                            "Producer: frame"
+                        );
+                        if send_with_halt_raw(
+                            &frame_tx_for_closure,
+                            &halt_token,
+                            frame,
+                            producer_deadline,
+                        )
+                        .is_err()
+                        {
                             crate::log::device_log(
                                 &device_str,
-                                "Producer: Channel closed (consumer aborted)",
+                                "Producer: Channel closed or halted (consumer aborted)",
                             );
                             break;
                         }
                     }
                     Ok(None) => {
-                        if std::env::var("FREEMKV_DEBUG").is_ok() {
-                            eprintln!("[DEBUG] Producer: EOF reached, returning");
-                        }
+                        tracing::trace!(target: "stream", "Producer: EOF reached, returning");
                         return;
                     }
                     Err(e) => {
@@ -923,22 +1062,49 @@ pub(super) fn run_mux(
                 errors: input_errors_clone.load(Ordering::Relaxed),
                 lost_video_secs: 0.0,
                 output_opened: true,
+                finalize_error: None,
             };
         }
     };
 
-    let completed = false;
+    // 0.20.8 validation-audit fix #2: track whether the consumer-bridge
+    // loop drained the producer channel to natural EOF. The loop below
+    // exits cleanly when `frame_rx` runs dry (producer dropped its
+    // `frame_tx` after EOF on the input stream or after a read error
+    // it already logged). On either `break` in the loop body (halt or
+    // send deadline) we set `loop_drained_naturally = false`, which
+    // joins with a clean `pipe.finish_with_halt` to flip `completed`
+    // to true. Pre-0.20.8 `completed` was hardcoded `false`, so no
+    // rip ever got `.done` / `.completed` written — only the test bed's
+    // tolerance for that asymmetry kept it from being noticed earlier.
+    let mut loop_drained_naturally = true;
     let mut frame_count = 0u64;
+    // Halt-aware send deadline for the consumer-bridge loop. Chosen
+    // longer than the mux soft-stall warning (30 s) but well under the
+    // hard watchdog (300 s) so a wedged pipeline-consumer surfaces here
+    // as a per-frame timeout rather than wedging the whole mux phase.
+    // On `Err` we treat it identically to "consumer closed" — log and
+    // break out; the hard watchdog handles the broader case.
+    const MUX_SEND_DEADLINE_SECS: u64 = 60;
+    let mux_halt = device_halt(inputs.device).expect("Halt token must exist for mux send loop");
     for frame in frame_rx {
         let track = frame.track;
         frame_count += 1;
         if libfreemkv::io::pipeline::debug_enabled() || crate::web::debug_enabled() {
             let start = std::time::Instant::now();
-            if pipe.send(frame).is_err() {
+            if pipe
+                .send_with_halt(
+                    frame,
+                    &mux_halt,
+                    std::time::Duration::from_secs(MUX_SEND_DEADLINE_SECS),
+                )
+                .is_err()
+            {
                 crate::log::device_log(
                     &device_str_for_loop,
-                    "Mux consumer aborted (pipeline closed)",
+                    "Mux consumer aborted (pipeline closed or halted)",
                 );
+                loop_drained_naturally = false;
                 break;
             }
             let elapsed = start.elapsed();
@@ -964,11 +1130,19 @@ pub(super) fn run_mux(
                     track
                 );
             }
-        } else if pipe.send(frame).is_err() {
+        } else if pipe
+            .send_with_halt(
+                frame,
+                &mux_halt,
+                std::time::Duration::from_secs(MUX_SEND_DEADLINE_SECS),
+            )
+            .is_err()
+        {
             crate::log::device_log(
                 &device_str_for_loop,
-                "Mux consumer aborted (pipeline closed)",
+                "Mux consumer aborted (pipeline closed or halted)",
             );
+            loop_drained_naturally = false;
             break;
         }
     }
@@ -982,17 +1156,41 @@ pub(super) fn run_mux(
     let errors = atomics_in.input_errors.load(Ordering::Relaxed);
 
     // Drop the producer-side channel and join the consumer.
-    // `finish()` blocks until the consumer drains every queued frame
-    // and runs `close()` (or until the consumer returned `Flow::Stop`
-    // on a write error, in which case any still-queued frames are
-    // dropped on the consumer side without being written). Either way
-    // the bytes_written returned reflects what actually made it to
-    // the output.
-    let bytes_done = match pipe.finish() {
-        Ok(b) => b,
+    // `finish_with_halt` polls `is_finished()` on a 250 ms cadence so
+    // the rip thread is never trapped inside `JoinHandle::join` if the
+    // consumer wedged inside an unkillable syscall (hung NFS write,
+    // wedged decrypt). On halt or `JOIN_TIMEOUT_SECS` (10 min) the
+    // consumer is intentionally leaked — same trade-off
+    // `bounded_syscall` makes — and the hard watchdog at 5 min
+    // typically fires first and exits the process for a Docker restart.
+    // 0.20.8 validation-audit fix #1 (close-error propagation) +
+    // fix #2 (real completion signal):
+    //
+    // `pipe.finish_with_halt(...)` can return Err for four reasons:
+    //   (a) MuxSink::close()'s `output.finish()` propagated an Err
+    //       (NEW in 0.20.8 — pre-audit it was logged and swallowed).
+    //       Display string is the libfreemkv `Error` Display.
+    //   (b) the consumer thread panicked → "pipeline consumer panicked".
+    //   (c) the halt token fired while we waited → "pipeline join halted".
+    //   (d) `JOIN_TIMEOUT_SECS` (10 min) elapsed → "pipeline join timed out".
+    //
+    // Buckets (b)/(c)/(d) are wedge / user-stop cases: existing
+    // behaviour treated them as "stopped" (no `.failed` marker), and
+    // we preserve that. Bucket (a) is a structurally-invalid MKV and
+    // the orchestrator MUST write `.failed` so the disc gets quarantined
+    // instead of advancing to `.done` / `.completed`. The three wedge
+    // prefixes are matched by literal string — same convention
+    // `Pipeline::finish_with_halt`'s doc-comment exposes for callers.
+    let (bytes_done, finalize_error, pipe_ok) = match pipe.finish_with_halt(Some(&mux_halt)) {
+        Ok(b) => (b, None, true),
         Err(e) => {
-            crate::log::device_log(&device_str_for_sink, &format!("Mux pipeline failed: {e}"));
-            0
+            let msg = format!("{e}");
+            crate::log::device_log(&device_str_for_sink, &format!("Mux pipeline failed: {msg}"));
+            let is_wedge = msg.contains("pipeline consumer panicked")
+                || msg.contains("pipeline join halted")
+                || msg.contains("pipeline join timed out");
+            let finalize = if is_wedge { None } else { Some(msg) };
+            (0, finalize, false)
         }
     };
     let elapsed_secs = start.elapsed().as_secs_f64();
@@ -1007,6 +1205,13 @@ pub(super) fn run_mux(
         0.0
     };
 
+    // `completed` is the orchestrator's gate for writing `.done` /
+    // `.completed`. It requires BOTH (a) the consumer-bridge loop
+    // drained the producer channel to natural EOF (no break on
+    // halt / send deadline) AND (b) the pipeline joined cleanly with
+    // no sink error. Either side false → "stopped" / "failed".
+    let completed = loop_drained_naturally && pipe_ok && finalize_error.is_none();
+
     MuxOutcome {
         completed,
         bytes_done,
@@ -1015,6 +1220,7 @@ pub(super) fn run_mux(
         errors,
         lost_video_secs,
         output_opened: true,
+        finalize_error,
     }
 }
 

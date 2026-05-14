@@ -73,6 +73,65 @@ enum MoveOutcome {
     MovedDirty,
     /// Copy itself failed. Caller can retry on the next tick.
     Failed,
+    /// 0.20.8 validation-audit fix #3: `cp` reported success but the
+    /// post-copy size check found dst != src. Surfaces as a distinct
+    /// error reason on the System page so a half-copied destination
+    /// (e.g. NFS server ran out of space mid-cp without returning an
+    /// error to the cp process) isn't silently treated as a successful
+    /// move + source unlink. Caller leaves the staging dir alone — the
+    /// dst is the broken copy, src is the source of truth.
+    SizeMismatch,
+}
+
+/// 0.20.8 validation-audit fix #3: errors that bubble up from the
+/// post-copy validation step inside `move_file`. Kept distinct from
+/// `MoveOutcome` because the outcome is the move-loop's view (Skipped /
+/// Moved / Failed / SizeMismatch), whereas `MoveError` is the
+/// validation-helper's view of *why* the cp result was rejected. The
+/// helper is unit-testable in isolation (see `check_post_copy_sizes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MoveError {
+    /// The post-copy `stat()` of src and dst disagreed on length. `cp`
+    /// returned 0 but the destination is short (or, in pathological
+    /// cases, longer than src) — typically a silent NFS short-write,
+    /// out-of-space without an error code, or a remote ENOSPC the cp
+    /// implementation swallowed. Reported via the same `record_error`
+    /// path that surfaces other move failures on the System page.
+    SizeDoesNotMatch { src_size: u64, dst_size: u64 },
+}
+
+impl std::fmt::Display for MoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MoveError::SizeDoesNotMatch { src_size, dst_size } => write!(
+                f,
+                "post-cp size mismatch: src={} bytes, dst={} bytes",
+                src_size, dst_size
+            ),
+        }
+    }
+}
+
+/// Validate that `dst` has exactly the same byte count as `src` after a
+/// successful `cp(1)` exit. Pulled into its own function for two reasons:
+/// (1) the same check might be wanted on the rename path later (today
+/// the kernel's atomic rename obviates it — rename either succeeds with
+/// byte equality or doesn't move at all — so we only call this on the
+/// `cp` branch), and (2) it's the only piece of the move that's
+/// reasonably unit-testable without spawning a real subprocess.
+///
+/// Returns `Ok(())` on byte equality, `Err(MoveError::SizeDoesNotMatch)`
+/// otherwise. Surfaces any `fs::metadata` failure as a SizeDoesNotMatch
+/// with `0` for the unreadable side — same UI surfacing path, and
+/// "we can't stat the file we just claimed to copy" is itself a serious
+/// post-copy condition that warrants quarantine.
+pub(crate) fn check_post_copy_sizes(src: &Path, dst: &Path) -> Result<(), MoveError> {
+    let src_size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    let dst_size = std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0);
+    if src_size != dst_size {
+        return Err(MoveError::SizeDoesNotMatch { src_size, dst_size });
+    }
+    Ok(())
 }
 
 pub fn run(cfg: &Arc<RwLock<Config>>) {
@@ -252,16 +311,42 @@ fn check_and_move(cfg: &Config) {
                 MoveOutcome::Failed => {
                     crate::log::syslog(&format!("Failed to move {:?} to {}", src, dest));
                 }
+                MoveOutcome::SizeMismatch => {
+                    crate::log::syslog(&format!(
+                        "Move blocked (post-cp size mismatch): {:?} -> {}",
+                        src, dest
+                    ));
+                }
             }
         }
 
         let any_failed = outcomes.iter().any(|o| matches!(o, MoveOutcome::Failed));
+        let any_size_mismatch = outcomes
+            .iter()
+            .any(|o| matches!(o, MoveOutcome::SizeMismatch));
         let any_dirty = outcomes
             .iter()
             .any(|o| matches!(o, MoveOutcome::MovedDirty));
         let any_actively_moved = outcomes
             .iter()
             .any(|o| matches!(o, MoveOutcome::Moved | MoveOutcome::MovedDirty));
+
+        // 0.20.8 validation-audit fix #3: surface size-mismatch through
+        // the same `record_error` UI path the other failures use, but
+        // with a distinct reason so the operator knows the destination
+        // is the short / broken side (src is intact, dst should be
+        // discarded). Checked BEFORE `any_failed` so a mixed batch
+        // (one Failed, one SizeMismatch) still surfaces the more
+        // diagnostic message — both lead to "leave dir alone, retry
+        // next tick", so ordering only affects the surfaced reason.
+        if any_size_mismatch {
+            record_error(
+                &dir_str,
+                "post-cp validation failed: destination size does not match source",
+                "check the destination filesystem for ENOSPC / short writes; remove the partial dst file and the mover will retry",
+            );
+            continue;
+        }
 
         if any_failed {
             // Leave the dir alone; mover will retry next tick.
@@ -405,6 +490,24 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             Ok(Some(status)) => {
                 if status.success() {
                     on_progress(100, total_gb, total_gb, 0.0);
+                    // 0.20.8 validation-audit fix #3: even though cp
+                    // returned 0, double-check that dst byte-count
+                    // matches src. Silent NFS short-writes, out-of-space
+                    // conditions some cp implementations swallow, and
+                    // I/O glitches that surface as truncation all leave
+                    // the kernel cp happy but the destination short.
+                    // Catching it here — before we unlink src — keeps
+                    // the source bytes intact so the operator can retry
+                    // / investigate. Skipped on the rename fast-path
+                    // above (kernel atomic rename guarantees byte
+                    // equality on success).
+                    if let Err(e) = check_post_copy_sizes(src, Path::new(&dest_str)) {
+                        crate::log::syslog(&format!(
+                            "Post-cp validation failed for {}: {}",
+                            dest_str, e
+                        ));
+                        return MoveOutcome::SizeMismatch;
+                    }
                     return match std::fs::remove_file(src) {
                         Ok(_) => MoveOutcome::Moved,
                         Err(_) => MoveOutcome::MovedDirty,
@@ -624,6 +727,58 @@ mod tests {
         std::fs::write(&dest, b"already there").unwrap();
         let outcome = move_file(&src, &dest, &noop_progress);
         assert_eq!(outcome, MoveOutcome::Moved);
+    }
+
+    #[test]
+    fn check_post_copy_sizes_passes_on_equal_sizes() {
+        // Happy path: src and dst with identical content (and so
+        // identical byte counts) → Ok.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.mkv");
+        let dst = tmp.path().join("b.mkv");
+        std::fs::write(&src, b"identical bytes here").unwrap();
+        std::fs::write(&dst, b"identical bytes here").unwrap();
+        assert!(check_post_copy_sizes(&src, &dst).is_ok());
+    }
+
+    #[test]
+    fn check_post_copy_sizes_returns_size_mismatch_on_short_dst() {
+        // The bug this fix exists for: cp returned 0 but the
+        // destination is short (silent NFS short-write, swallowed
+        // ENOSPC). The validation helper must catch it BEFORE the
+        // caller unlinks src.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.mkv");
+        let dst = tmp.path().join("dst.mkv");
+        std::fs::write(&src, vec![0u8; 4096]).unwrap();
+        std::fs::write(&dst, vec![0u8; 1024]).unwrap();
+        let err = check_post_copy_sizes(&src, &dst).unwrap_err();
+        assert_eq!(
+            err,
+            MoveError::SizeDoesNotMatch {
+                src_size: 4096,
+                dst_size: 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn check_post_copy_sizes_returns_size_mismatch_when_dst_missing() {
+        // `fs::metadata` on a missing dst falls back to len=0 — same
+        // surfacing as a truncated dst. The point of the helper is
+        // "don't unlink src unless dst is verifiably the same size",
+        // so a missing dst should NOT pass.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.mkv");
+        let dst = tmp.path().join("never_created.mkv");
+        std::fs::write(&src, b"some bytes").unwrap();
+        let err = check_post_copy_sizes(&src, &dst).unwrap_err();
+        match err {
+            MoveError::SizeDoesNotMatch { src_size, dst_size } => {
+                assert_eq!(src_size, "some bytes".len() as u64);
+                assert_eq!(dst_size, 0);
+            }
+        }
     }
 
     #[test]
