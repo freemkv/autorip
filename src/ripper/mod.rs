@@ -10,6 +10,7 @@
 //! `freemkv-private/memory/0_18_redesign.md`.
 
 mod mux;
+pub mod resume;
 mod session;
 pub mod staging;
 pub mod state;
@@ -90,6 +91,15 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     // container restarted mid-rip (Watchtower deploy, OOM, hard
     // watchdog escalation — any of which now should resume, not lose
     // half a UHD rip). See `staging::resume_or_quarantine_staging`.
+    // 0.20.8: classify each preserved hint once at startup. Keyed on
+    // the staging dir's `file_name()` (== sanitized display_name).
+    // The disc-insertion branch consults this map after `scan_disc`
+    // produces its own display_name and either routes into the
+    // auto-resume re-mux path or falls through to `rip_disc` as
+    // before. Map is `BTreeMap` for deterministic logging order;
+    // size is bounded by the number of staging subdirs (small).
+    let mut resume_map: std::collections::BTreeMap<String, resume::ResumeClass> =
+        std::collections::BTreeMap::new();
     if let Ok(c) = cfg.read() {
         let hints = staging::resume_or_quarantine_staging(&c.staging_dir);
         tracing::info!(
@@ -103,8 +113,24 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 action = ?hint.action,
                 "staging resume hint"
             );
+            let key = hint
+                .dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if key.is_empty() {
+                continue;
+            }
+            let class = resume::classify_resume(hint, c.abort_on_lost_secs);
+            tracing::info!(
+                dir = %hint.dir.display(),
+                classification = ?class,
+                "resume classification"
+            );
+            resume_map.insert(key, class);
         }
     }
+    let resume_map = Arc::new(resume_map);
 
     let initial_drives = libfreemkv::list_drives();
     let mut drive_paths: Vec<String> = initial_drives.iter().map(|d| d.path.clone()).collect();
@@ -324,6 +350,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     let cfg = cfg.clone();
                     let dev_path = path.clone();
                     let device_for_thread = device.clone();
+                    let resume_map_thread = resume_map.clone();
 
                     // Allocate the rip's single `Halt` token at the spawn
                     // site so the HTTP /api/stop/{device} handler can find
@@ -340,6 +367,41 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                                 .map(|h| h.is_cancelled())
                                 .unwrap_or(false);
                             if on_insert == "rip" && !cancelled {
+                                // 0.20.8: if the staging-resume map has
+                                // a `Remux` entry for this disc's
+                                // sanitized display_name, skip the
+                                // disc-side rip entirely and just
+                                // re-mux from the existing ISO. The
+                                // map was populated once at startup
+                                // (see drive_poll_loop top). `disc_name`
+                                // on the post-scan state is the TMDB-
+                                // resolved title; sanitize it the same
+                                // way the rip path does to match the
+                                // staging dir's file_name().
+                                let scanned_display = STATE
+                                    .lock()
+                                    .ok()
+                                    .and_then(|s| {
+                                        s.get(&device_for_thread).map(|rs| rs.disc_name.clone())
+                                    })
+                                    .unwrap_or_default();
+                                let sanitized =
+                                    crate::util::sanitize_path_compact(&scanned_display);
+                                if let Some(class) = resume_map_thread.get(&sanitized) {
+                                    if matches!(class, resume::ResumeClass::Remux { .. }) {
+                                        resume::resume_remux(
+                                            &cfg,
+                                            &device_for_thread,
+                                            class.clone(),
+                                        );
+                                        // Drop the scanned session so a
+                                        // subsequent rip on the same
+                                        // device starts fresh.
+                                        drop_session(&device_for_thread);
+                                        unregister_halt(&device_for_thread);
+                                        return;
+                                    }
+                                }
                                 rip_disc(&cfg, &device_for_thread, &dev_path);
                             } else {
                                 // scan-only or scan+stop: clear the
@@ -2464,6 +2526,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let bytes_done = mux_outcome.bytes_done;
     let elapsed = mux_outcome.elapsed_secs;
     let speed = mux_outcome.speed_mbs;
+    // 0.20.8 validation-audit fix #1: if `MuxSink::close` failed inside
+    // `output.finish()`, the MKV is structurally invalid (unseekable —
+    // Cues never landed and the segment-info length header wasn't
+    // patched). Quarantine the staging dir with `.failed` and report
+    // status=failed in the history record. Skipped here for halt /
+    // timeout / panic — those are wedge cases handled by the existing
+    // "stopped" path so the user can retry.
+    let finalize_error = mux_outcome.finalize_error.clone();
     let mut final_errors = mux_outcome.errors;
     let final_last_sector = rip_last_lba.load(Ordering::Relaxed);
     let final_current_batch = rip_current_batch.load(Ordering::Relaxed);
@@ -2511,7 +2581,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Stopped rips used to leave no persistent trace except the device log,
     // which gets clobbered on the next scan. Include errors/lost/last_sector
     // so damaged-disc attempts are auditable.
-    let status_label = if completed { "complete" } else { "stopped" };
+    //
+    // 0.20.8 status labels:
+    //   - `completed=true`                                → "complete"
+    //   - `finalize_error.is_some()` (broken MKV)         → "failed"
+    //   - else (halt / timeout / write error / wedge)     → "stopped"
+    let status_label = if completed {
+        "complete"
+    } else if finalize_error.is_some() {
+        "failed"
+    } else {
+        "stopped"
+    };
     {
         let marker = serde_json::json!({
             "title": display_name,
@@ -2540,6 +2621,28 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             let staging_disc_path = std::path::Path::new(&staging);
             staging::write_completed_marker(staging_disc_path);
             staging::clear_restart_count(staging_disc_path);
+        } else if let Some(reason) = finalize_error.as_ref() {
+            // 0.20.8 validation-audit fix #1: post-mux validation gate.
+            // `MuxSink::close()` propagated a `output.finish()` error,
+            // which means the MKV's Cues / segment-size header didn't
+            // get written. The file on disk is unseekable / invalid;
+            // shipping it to the user's library would surface as a
+            // broken playback later. Quarantine the staging dir with
+            // `.failed` so:
+            //   1. The mover never writes a half-baked file into the
+            //      output dir (no `.done`, so `mover.rs::check_and_move`
+            //      skips this staging entry entirely).
+            //   2. The resume-on-startup detector recognises the dir as
+            //      terminal-failed instead of bumping `.restart_count`
+            //      and trying to "resume" a broken rip.
+            //   3. The UI surfaces the reason in `last_error` via the
+            //      same path used by `resume_or_quarantine_staging`.
+            let staging_disc_path = std::path::Path::new(&staging);
+            staging::write_failed_marker(
+                staging_disc_path,
+                &format!("mux finalize failed: {reason}"),
+            );
+            staging::clear_restart_count(staging_disc_path);
         }
 
         let mut entry = marker.clone();
@@ -2563,10 +2666,26 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     }
 
     if !completed {
+        // 0.20.8 validation-audit fix #1: a finalize error means the
+        // MKV is broken. Log + surface `status="failed"` so the device
+        // tile flips red with the underlying reason; otherwise fall
+        // through to the pre-existing "stopped → idle" behaviour
+        // (halt / write error / wedge).
+        let (log_prefix, ui_status, ui_failure_reason) =
+            if let Some(reason) = finalize_error.as_ref() {
+                (
+                    format!("Failed (mux finalize): {reason}"),
+                    "failed".to_string(),
+                    Some(format!("mux finalize failed: {reason}")),
+                )
+            } else {
+                ("Stopped".to_string(), "idle".to_string(), None)
+            };
         crate::log::device_log(
             device,
             &format!(
-                "Stopped: {:.1} GB in {:.0}s ({:.0} MB/s), {} skipped (~{:.3}s lost)",
+                "{}: {:.1} GB in {:.0}s ({:.0} MB/s), {} skipped (~{:.3}s lost)",
+                log_prefix,
                 bytes_done as f64 / 1_073_741_824.0,
                 elapsed,
                 speed,
@@ -2578,7 +2697,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             device,
             RipState {
                 device: device.to_string(),
-                status: "idle".to_string(),
+                status: ui_status,
                 disc_present: true,
                 disc_name: display_name.clone(),
                 disc_format: disc_format.clone(),
@@ -2593,6 +2712,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 tmdb_overview: tmdb_overview.clone(),
                 duration: duration.clone(),
                 codecs: codecs.clone(),
+                last_error: ui_failure_reason.clone().unwrap_or_default(),
+                failure_reason: ui_failure_reason,
                 ..Default::default()
             },
         );

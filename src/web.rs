@@ -720,7 +720,7 @@ function loadHistory(){
       html+='</div>';
       if(stats)html+='<div style="font-size:.75rem;color:var(--text2);margin-top:2px">'+esc(stats)+'</div>';
       if(codecs)html+='<div style="font-size:.7rem;color:var(--text3);margin-top:2px">'+esc(codecs)+'</div>';
-      if(hasLog)html+='<details style="margin-top:6px"><summary style="font-size:.7rem;color:var(--text3);cursor:pointer;user-select:none">Log</summary><div class="log" style="margin-top:4px;max-height:200px;font-size:.7rem">'+esc(i.log)+'</div></details>';
+      if(hasLog)html+='<details style="margin-top:6px"><summary style="font-size:.7rem;color:var(--text3);cursor:pointer;user-select:none">Log</summary><div class="log" style="margin-top:4px;max-height:none;font-size:.7rem">'+esc(i.log)+'</div></details>';
       html+='</div></div>';
     });
     document.getElementById('hi').innerHTML=html;
@@ -1451,6 +1451,14 @@ fn parse_query(url: &str) -> std::collections::HashMap<String, String> {
     map
 }
 
+/// Deadline for the bounded settings-save on the HTTP handler thread.
+/// 15 s is well above any reasonable NFS write latency on a healthy
+/// mount but short enough that a wedged `/config` doesn't permanently
+/// block the API thread. On timeout we return 503; the previous
+/// settings file remains intact because we always write to a temp
+/// file and only rename on success.
+const SETTINGS_SAVE_DEADLINE_SECS: u64 = 15;
+
 fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     let mut body = String::new();
     if request.as_reader().read_to_string(&mut body).is_err() {
@@ -1465,7 +1473,15 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         }
     };
 
-    {
+    // 0.20.8 fix (Finding 22): mutate the Config inside the write guard,
+    // then snapshot+drop the guard BEFORE calling `config::save`. The
+    // previous code held the write guard across `fs::write` +
+    // `fs::rename` on `/config/settings.json` — on NFS those calls can
+    // hang indefinitely, blocking every concurrent reader of the lock
+    // (the whole `/api/*` surface, since most handlers `cfg.read()`).
+    // The clone is cheap (a handful of Strings + small primitives),
+    // and the write-lock window now covers only in-memory mutation.
+    let snapshot: Config = {
         let mut c = match cfg.write() {
             Ok(c) => c,
             Err(_) => return json_response(request, 500, "{}"),
@@ -1540,10 +1556,41 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
                 .filter(|s| !s.is_empty())
                 .collect();
         }
-        config::save(&c);
-    }
+        c.clone()
+    }; // <-- write guard dropped here; readers unblock immediately
 
-    json_response(request, 200, r#"{"ok":true}"#);
+    // Bounded-syscall pattern, hand-rolled because
+    // `libfreemkv::io::bounded::bounded_syscall` is `pub(crate)` and
+    // not reachable from autorip. Same shape: spawn a worker, await on
+    // a 0-capacity channel with `recv_timeout`. On timeout the worker
+    // is intentionally leaked — the eventual `fs::write` / `fs::rename`
+    // will unwind whenever NFS does, but the API thread is no longer
+    // trapped. `config::save` writes `settings.json.tmp` then renames
+    // it atomically; if either step wedges the prior settings.json is
+    // left intact (the timeout aborts before rename completes
+    // observably).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+    let _ = std::thread::Builder::new()
+        .name("autorip-settings-save".into())
+        .spawn(move || {
+            config::save(&snapshot);
+            let _ = tx.send(());
+        });
+    match rx.recv_timeout(std::time::Duration::from_secs(SETTINGS_SAVE_DEADLINE_SECS)) {
+        Ok(()) => json_response(request, 200, r#"{"ok":true}"#),
+        Err(_) => {
+            tracing::error!(
+                target: "web",
+                "settings save timed out after {SETTINGS_SAVE_DEADLINE_SECS}s; \
+                 in-memory config updated, on-disk settings.json unchanged"
+            );
+            json_response(
+                request,
+                503,
+                r#"{"ok":false,"error":"settings save timed out"}"#,
+            )
+        }
+    }
 }
 
 fn handle_sse(request: tiny_http::Request) {
@@ -1884,10 +1931,23 @@ fn handle_debug_toggle(mut request: tiny_http::Request) {
 
     *DEBUG_ENABLED.write().expect("debug lock poisoned") = enabled;
 
-    tracing::info!(enabled, "debug logging toggled");
+    // Swap the EnvFilter so libfreemkv's `tracing::debug!` events
+    // (target: "mux" writeback seeks, WAIT_AFTER latency, fill_extents
+    // stalls) actually surface in docker logs while debug is on. Without
+    // this the toggle only flips autorip-internal `debug_enabled()`
+    // checks and the library stays at warn — the user-reported
+    // "max-debug shows nothing useful" symptom.
+    let filter_swapped = crate::observe::set_debug(enabled);
+
+    tracing::info!(enabled, filter_swapped, "debug logging toggled");
     json_response(
         request,
         200,
-        &serde_json::json!({"ok": true, "enabled": enabled}).to_string(),
+        &serde_json::json!({
+            "ok": true,
+            "enabled": enabled,
+            "filter_swapped": filter_swapped,
+        })
+        .to_string(),
     );
 }
