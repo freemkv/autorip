@@ -28,21 +28,23 @@ use tracing_subscriber::reload;
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// EnvFilter directive used when /api/debug is OFF (the normal state).
-/// `autorip=info` for the binary's own narration, `libfreemkv=warn` to
-/// suppress the library's chatter, and `freemkv::scsi`/`freemkv::disc`
-/// at trace because they're the rip-pipeline diagnostics we always want
-/// even in normal operation (per RIP_DESIGN.md §11).
-const FILTER_OFF: &str = "autorip=info,libfreemkv=warn,freemkv::scsi=trace,freemkv::disc=trace";
+/// `autorip=info` for the binary's own narration, `libfreemkv=warn` so
+/// the library is quiet — warnings + errors only. Two modes, one flag:
+/// prod = warnings only; dev = full debug (see FILTER_ON).
+const FILTER_OFF: &str = "autorip=info,libfreemkv=warn";
 
 /// EnvFilter directive used when /api/debug is ON. `debug` globally,
 /// plus `mux=debug` and `stream=debug` so the `target: "mux"` /
 /// `target: "stream"` events (writeback seeks, WAIT_AFTER latency,
 /// fill_extents stalls — the events the user actually wants when
-/// diagnosing a jumpy mux) are visible. Producer's per-frame log is at
-/// `trace` and stays muted here on purpose; raise to `stream=trace` via
-/// AUTORIP_LOG_LEVEL if you really want it.
-const FILTER_ON: &str =
-    "autorip=debug,libfreemkv=debug,freemkv::scsi=trace,freemkv::disc=trace,mux=debug,stream=debug";
+/// diagnosing a jumpy mux) are visible. `freemkv::scsi` / `freemkv::disc`
+/// inherit `libfreemkv=debug` here so SCSI CDB events surface at debug
+/// (not the per-CDB trace firehose — ~800 lines/sec during sweep would
+/// drown the useful signal and could itself slow throughput via stdout
+/// contention; raise to `freemkv::scsi=trace` via AUTORIP_LOG_LEVEL if
+/// you need per-CDB forensics for a drive issue). Producer's per-frame
+/// log is at `trace` and stays muted here on purpose.
+const FILTER_ON: &str = "autorip=debug,libfreemkv=debug,mux=debug,stream=debug";
 
 /// Worker guards for the non-blocking file appenders. Must outlive the
 /// process — flushed on drop. Stored in a static so `init()` can be called
