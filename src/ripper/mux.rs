@@ -21,11 +21,11 @@
 //!
 //! See `freemkv-private/memory/0_18_redesign.md` § "Module layout".
 
+use crossbeam_channel::{SendTimeoutError as CbSendTimeoutError, bounded as cb_bounded};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
-use crossbeam_channel::{bounded as cb_bounded, SendTimeoutError as CbSendTimeoutError};
 use std::time::Instant;
 
 use libfreemkv::pes::PesFrame;
