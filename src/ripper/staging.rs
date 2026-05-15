@@ -167,21 +167,48 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
     // or `.m2ts`. We don't know the exact display_name from the disc
     // dir name (which IS the sanitised display_name), so we just scan
     // for any matching extension.
+    //
+    // NFS cache-coherency defense: at container startup the kernel
+    // NFS attribute cache may not be primed yet, and a fresh
+    // `read_dir` against a recently-written share can return 0
+    // entries even when the dir contains files. Observed empirically
+    // 2026-05-15: Watchtower restart -> new container's startup scan
+    // ran `read_dir` immediately, got 0 entries, wiped an 85 GB ISO
+    // + partial MKV that genuinely existed on the server. Retry up to
+    // 3 times with a 500 ms gap before trusting an empty result.
     let mut has_iso = false;
     let mut has_mapfile = false;
     let mut has_mkv = false;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".iso") {
-                has_iso = true;
-            } else if name.ends_with(".iso.mapfile") || name.ends_with(".mapfile") {
-                has_mapfile = true;
-            } else if name.ends_with(".mkv") || name.ends_with(".m2ts") {
-                has_mkv = true;
+    let mut saw_any_entries = false;
+    for attempt in 0..3 {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut empty_this_pass = true;
+            for entry in entries.flatten() {
+                empty_this_pass = false;
+                saw_any_entries = true;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".iso") {
+                    has_iso = true;
+                } else if name.ends_with(".iso.mapfile") || name.ends_with(".mapfile") {
+                    has_mapfile = true;
+                } else if name.ends_with(".mkv") || name.ends_with(".m2ts") {
+                    has_mkv = true;
+                }
+            }
+            if !empty_this_pass {
+                break;
             }
         }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    if !saw_any_entries {
+        tracing::warn!(
+            path = %dir.display(),
+            "staging dir read_dir returned 0 entries on all 3 retries — treating as empty"
+        );
     }
 
     Some(StagingSnapshot {
