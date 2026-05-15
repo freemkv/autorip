@@ -1824,17 +1824,31 @@ fn handle_eject(request: tiny_http::Request, device: &str) {
 }
 
 fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
-    // Stop is a reset: signal threads to abort, wait for the rip thread to
-    // drain (so we don't wipe staging out from under a mid-write), drop the
-    // SCSI session, wipe staging so the next rip starts on a clean disk,
-    // and collapse the state entry to a fresh idle.
+    // Stop signals threads to abort, waits for the rip thread to drain,
+    // drops the SCSI session, and collapses the state entry to idle.
+    //
+    // **Stop preserves partial staging state for resume.** Earlier behaviour
+    // (pre-0.21.10) called `wipe_staging` here, on the premise that stop ==
+    // reset. That conflicts with auto-resume (introduced in 0.20.8): if a
+    // user presses Stop because mux throughput looks slow and expects to
+    // resume on the next disc-insert or container restart, wiping the
+    // staging dir destroys the ISO and partial MKV they meant to keep.
+    // Observed 2026-05-15 — stop during a 0.21.9 mux nuked an 85 GB ISO +
+    // mapfile + 50 GB partial MKV, forcing a full re-rip from disc.
+    //
+    // Stop now = halt the rip thread and reset the in-memory state. The
+    // on-disk staging dir is left as-is. Auto-resume on next disc-insert
+    // (when the resume_map has a matching Remux entry) or on next container
+    // restart picks up the partial state automatically. Operators who
+    // genuinely want a clean slate can delete the per-disc staging
+    // subdirectory by hand; there is no longer a one-button API path for
+    // destructive reset.
     //
     // The 60 s drain budget covers a 30 s in-flight CDB plus generous margin
     // (bumped from 35 s in v0.13.8 after live observation of slower drains
     // under heavy ECC retry on the BU40N). A timeout is logged but not fatal
-    // — the HTTP response still goes out 200 so the UI doesn't spin. After
-    // join_rip_thread returns we DID observe drain (success or timeout); the
-    // pre-v0.13.6 "fire and forget" wording is gone.
+    // — the HTTP response still goes out 200 so the UI doesn't spin.
+    let _ = cfg;
     if let Some(halt) = ripper::device_halt(device) {
         halt.cancel();
     }
@@ -1843,7 +1857,7 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     if ripper::join_rip_thread(device, std::time::Duration::from_secs(60)).is_err() {
         tracing::warn!(
             device = %device,
-            "rip thread did not drain within 60s of stop; staging wipe may race"
+            "rip thread did not drain within 60s of stop"
         );
     }
 
@@ -1865,10 +1879,6 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
             }
         })
         .unwrap_or(false);
-
-    if let Ok(c) = cfg.read() {
-        ripper::wipe_staging(&c.staging_dir);
-    }
 
     if existed {
         ripper::set_stop_cooldown(device);
