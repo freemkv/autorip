@@ -366,17 +366,43 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                                 .map(|h| h.is_cancelled())
                                 .unwrap_or(false);
                             if on_insert == "rip" && !cancelled {
-                                // 0.20.8: if the staging-resume map has
-                                // a `Remux` entry for this disc's
-                                // sanitized display_name, skip the
-                                // disc-side rip entirely and just
-                                // re-mux from the existing ISO. The
-                                // map was populated once at startup
-                                // (see drive_poll_loop top). `disc_name`
-                                // on the post-scan state is the TMDB-
-                                // resolved title; sanitize it the same
-                                // way the rip path does to match the
-                                // staging dir's file_name().
+                                // If the staging-resume map has a
+                                // `Remux` entry for this disc, skip
+                                // the disc-side rip entirely and just
+                                // re-mux from the existing ISO. The map
+                                // was populated once at startup (see
+                                // drive_poll_loop top).
+                                //
+                                // Matching is not a single exact key
+                                // because the staging-dir basename is
+                                // produced from `display_name` at the
+                                // time of the original rip, and
+                                // `display_name` is `TMDB-title or
+                                // id_name` (see scan_disc) — i.e. it
+                                // shifts based on whether TMDB
+                                // resolved on a given run. The same
+                                // disc can therefore yield two
+                                // different dir names across runs
+                                // (e.g. "Civil_War" when TMDB hit vs
+                                // "Civil_War_-_Ultra_HD_Blu-ray" when
+                                // it missed). To survive that:
+                                //
+                                //   1. Try exact match on
+                                //      sanitize_path_compact(scanned
+                                //      display).
+                                //   2. Fall back to prefix-match in
+                                //      either direction. The shorter
+                                //      of the two names is always a
+                                //      prefix of the longer because
+                                //      TMDB only ever strips trailing
+                                //      "edition" suffixes (UHD, 4K,
+                                //      etc.) from the raw disc name —
+                                //      it never reorders or rewrites
+                                //      the title body.
+                                //   3. Among matches, require the
+                                //      candidate to be a Remux class
+                                //      (skip AlreadyCompleted /
+                                //      AlreadyFailed / NotEligible).
                                 let scanned_display = STATE
                                     .lock()
                                     .ok()
@@ -386,7 +412,34 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                                     .unwrap_or_default();
                                 let sanitized =
                                     crate::util::sanitize_path_compact(&scanned_display);
-                                if let Some(class) = resume_map_thread.get(&sanitized) {
+                                let found = resume_map_thread.get(&sanitized).or_else(|| {
+                                    // Fallback: prefix-match in either
+                                    // direction. Pick the first Remux
+                                    // hit — on a single-drive rig
+                                    // there is only one inserted disc
+                                    // at a time and at most one
+                                    // matching staging dir.
+                                    resume_map_thread.iter().find_map(|(k, v)| {
+                                        if !matches!(v, resume::ResumeClass::Remux { .. }) {
+                                            return None;
+                                        }
+                                        let key_match = !sanitized.is_empty()
+                                            && (k.starts_with(&sanitized)
+                                                || sanitized.starts_with(k));
+                                        if key_match {
+                                            tracing::info!(
+                                                device = %device_for_thread,
+                                                scanned = %sanitized,
+                                                staging_key = %k,
+                                                "resume_map prefix-match (display_name shifted between rip and resume)"
+                                            );
+                                            Some(v)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                });
+                                if let Some(class) = found {
                                     if matches!(class, resume::ResumeClass::Remux { .. }) {
                                         resume::resume_remux(
                                             &cfg,
