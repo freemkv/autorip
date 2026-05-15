@@ -1,11 +1,11 @@
-//! Staging-directory bookkeeping: free-space probe, wipe, marker files
+//! Staging-directory bookkeeping: free-space probe + marker files
 //! (`.done`, `.completed`, `.failed`, `.restart_count`).
 //!
 //! Marker files live at the per-disc subdirectory level
 //! (`<staging_dir>/<disc_name>/<marker>`):
 //!
 //! - `.done` — hand-off marker for the mover thread (set on successful
-//!   rip; preserved across `wipe_staging`). Pre-existing.
+//!   rip). The mover relocates the dir to its final destination.
 //! - `.completed` — process-level "this rip finished cleanly" marker.
 //!   Independent of `.done`; consumed by the 0.20.7 restart-loop
 //!   detector so the orchestrator can skip already-finished discs on
@@ -221,45 +221,6 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
     })
 }
 
-/// Remove every subdirectory under `cfg.staging_dir`. Used on
-/// user-initiated stop (stop == reset — clean slate so the next rip
-/// doesn't accidentally resume stale state).
-///
-/// **Not used on startup any more (v0.20.7).** Startup goes through
-/// `resume_or_quarantine_staging` which preserves partial state for
-/// the restart-loop detector and only wipes if the dir is already
-/// terminal. The old behaviour deleted in-flight ISO/mapfile pairs
-/// the moment the container restarted — exactly what 0.20.7 is trying
-/// to defend against.
-///
-/// Best-effort: logs each removal, silently ignores errors on
-/// individual entries. A locked or not-yet-created staging root is not
-/// fatal.
-pub fn wipe_staging(staging_dir: &str) {
-    let entries = match std::fs::read_dir(staging_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // Skip directories that contain a `.done` marker — those are
-        // completed rips waiting for the mover thread to relocate them
-        // to their final destination. A Watchtower-triggered container
-        // restart between "rip finished" and "mover finished" must not
-        // delete a completed UHD rip from staging (90 minutes of work
-        // lost). Genuinely-orphaned in-flight rips (no .done) still get
-        // wiped as before.
-        if path.join(DONE_MARKER).exists() {
-            tracing::info!(path = %path.display(), "preserving staging entry — .done marker present (mover will handle)");
-            continue;
-        }
-        match std::fs::remove_dir_all(&path) {
-            Ok(_) => tracing::info!(path = %path.display(), "wiped stale staging entry"),
-            Err(e) => tracing::warn!(path = %path.display(), error = %e, "staging wipe skipped"),
-        }
-    }
-}
-
 /// Startup safety net: walk `<staging_dir>/*` and classify each
 /// per-disc subdirectory. Decisions:
 ///
@@ -310,10 +271,9 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
             continue;
         }
         if !snap.has_partial_state() {
-            // Truly empty subdir with no markers — old-style wipe is
-            // safe here. Preserves the `.done` carve-out from the
-            // legacy logic (handled inside `wipe_staging`'s
-            // per-entry path but rechecked here for clarity).
+            // Truly empty subdir with no markers — safe to wipe. The
+            // `.done` marker carve-out keeps a completed-but-not-yet-
+            // moved rip alive for the mover thread to pick up.
             if path.join(DONE_MARKER).exists() {
                 hints.push(StagingResumeHint {
                     dir: snap.dir,
