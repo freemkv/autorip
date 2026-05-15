@@ -30,7 +30,6 @@ pub use session::{
     device_halt, join_all_rip_threads, join_rip_thread, register_halt, register_rip_thread,
     spawn_rip_thread, take_rip_thread, unregister_halt,
 };
-pub use staging::wipe_staging;
 #[allow(unused_imports)]
 pub use state::{BadRange, RipState, STATE, is_busy, set_stop_cooldown, update_state};
 
