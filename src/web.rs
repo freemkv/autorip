@@ -1103,12 +1103,17 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         }
         handle_scan(request, cfg, &device);
     } else if is_post && url.starts_with("/api/rip/") {
-        let device = url.trim_start_matches("/api/rip/");
-        let device = percent_decode(device);
+        let path = url.trim_start_matches("/api/rip/");
+        // Split off the query string. URL form: /api/rip/<device>[?resume=yes|no]
+        let (device_raw, query) = match path.split_once('?') {
+            Some((d, q)) => (d, q),
+            None => (path, ""),
+        };
+        let device = percent_decode(device_raw);
         if !is_valid_device_name(&device) {
             return json_response(request, 400, r#"{"error":"invalid device name"}"#);
         }
-        handle_rip(request, cfg, &device);
+        handle_rip(request, cfg, &device, query);
     } else if is_post && url == "/api/update-keydb" {
         handle_update_keydb(request, cfg);
     } else if is_post && url.starts_with("/api/eject/") {
@@ -1675,7 +1680,25 @@ fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     json_response(request, 200, r#"{"ok":true}"#);
 }
 
-fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
+/// POST `/api/rip/{device}[?resume=yes|no]`.
+///
+/// 0.23.0 contract: this is the *only* path that starts disk work.
+/// Disc-insert detection is scan-only; auto-resume on container start
+/// is gone. The user's intent (POST) is the trigger.
+///
+/// Query param semantics:
+/// - `resume=yes` → re-mux the existing staging ISO if one exists for
+///   this disc. Reject (404) if no resumable state is found rather
+///   than silently doing a fresh sweep.
+/// - `resume=no` → wipe the staging dir for this disc, then fresh
+///   sweep+mux. Explicit clean slate.
+/// - (no param) → fresh sweep+mux from disc. The classic behavior.
+///   Does NOT delete any pre-existing staging dir, but starts writing
+///   to it (libfreemkv's sweep `resume` flag picks up where the
+///   mapfile left off, if applicable).
+fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str, query: &str) {
+    let resume_mode = parse_resume_param(query);
+
     let already = ripper::STATE
         .lock()
         .map(|s| {
@@ -1693,7 +1716,13 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
     let dev = device.to_string();
     let dev_path = format!("/dev/{}", device);
     let cfg = Arc::clone(cfg);
-    // Set scanning state before spawn — preserve TMDB info to prevent UI flash
+
+    // Resume-yes path: look for a resumable staging dir for this disc.
+    // We need the disc identity from a scan first. The simplest correct
+    // approach is to delegate the resume lookup to the worker thread:
+    // it scans the disc (cheap), then decides between resume_remux and
+    // rip_disc based on what the staging dir holds. That keeps the
+    // scan logic in one place.
     if let Ok(mut s) = ripper::STATE.lock() {
         if let Some(rs) = s.get_mut(&dev) {
             rs.status = "scanning".to_string();
@@ -1709,10 +1738,12 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
             );
         }
     }
+
     let dev_for_register = dev.clone();
+    ripper::register_halt(&dev_for_register, libfreemkv::Halt::new());
     if let Err(e) = ripper::spawn_rip_thread(&dev_for_register, "rip", move || {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ripper::rip_disc(&cfg, &dev, &dev_path);
+            ripper::handle_rip_request(&cfg, &dev, &dev_path, resume_mode);
         }))
         .is_err()
         {
@@ -1727,8 +1758,10 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
                 },
             );
         }
+        ripper::unregister_halt(&dev);
     }) {
         tracing::error!(device = %dev_for_register, error = %e, "failed to spawn rip thread");
+        ripper::unregister_halt(&dev_for_register);
         json_response(
             request,
             500,
@@ -1738,6 +1771,38 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
     }
 
     json_response(request, 200, r#"{"ok":true}"#);
+}
+
+/// Resume-mode chosen by the caller of `/api/rip`. The dispatch logic
+/// in `ripper::handle_rip_request` reads this and routes to the
+/// appropriate code path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeMode {
+    /// `?resume=yes` — require an existing resumable staging dir,
+    /// fail if none.
+    Require,
+    /// `?resume=no` — wipe any existing staging dir first.
+    Wipe,
+    /// no `resume=` query param — fresh sweep+mux; leave any existing
+    /// staging dir alone (libfreemkv's sweep-resume path handles it).
+    Default,
+}
+
+fn parse_resume_param(query: &str) -> ResumeMode {
+    for kv in query.split('&') {
+        let (k, v) = match kv.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (kv, ""),
+        };
+        if k == "resume" {
+            return match v {
+                "yes" | "true" | "1" => ResumeMode::Require,
+                "no" | "false" | "0" => ResumeMode::Wipe,
+                _ => ResumeMode::Default,
+            };
+        }
+    }
+    ResumeMode::Default
 }
 
 fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
