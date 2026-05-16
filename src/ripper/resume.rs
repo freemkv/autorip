@@ -425,10 +425,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             filename: filename.clone(),
             total_bytes,
             title_bytes_per_sec,
-            // Auto-resume bypasses sweep/retry entirely. Setting
-            // total_passes=0 makes mux render as "single phase" in
-            // the UI; pre-mux phases never ran in this process.
-            total_passes: 0,
+            // Auto-resume bypasses sweep/retry entirely — we open the
+            // existing ISO and run only the mux phase. Surface that to
+            // the UI as a single-phase mux (pass=1, total_passes=1)
+            // rather than 0/0 (which the dashboard renders as no phase
+            // label at all). `passLabelFor` in `web.rs` recognises
+            // total_passes=1 as direct-to-mux and labels it "muxing".
+            total_passes: 1,
             bytes_total_disc: disc.capacity_bytes,
             max_retries: 0,
             bytes_unreadable_at_mux: 0,

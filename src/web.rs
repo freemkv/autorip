@@ -229,6 +229,14 @@ function passLabelFor(s){
    /* Resolve the current pass into a human-readable label for the Ripping
       step. During multipass we show pass number + phase; otherwise "Ripping". */
    if(s.pass>0&&s.total_passes>0){
+     /* Single-phase mux (total_passes=1) is the auto-resume Remux path:
+        sweep/patch were skipped because the ISO already exists. Label
+        as "muxing" \u2014 it IS the mux phase, just without prior passes.
+        Same label rendering regardless of which orchestrator drove us
+        here; operators read phase, not code path. */
+     if(s.total_passes===1){
+       return 'pass 1/1 \u00b7 muxing';
+     }
      const phase=s.pass===1?'copying':(s.pass===s.total_passes?'muxing':'retrying');
      return 'pass '+s.pass+'/'+s.total_passes+' \u00b7 '+phase;
    }
