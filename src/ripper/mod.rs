@@ -727,21 +727,40 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
             || basename.starts_with(&sanitized)
             || sanitized.starts_with(&basename)
         {
+            // User-initiated resume bypasses any `.failed` or
+            // `.completed` markers — the user clicked Rip with
+            // resume=yes and that is the authoritative signal.
+            // `classify_resume` would refuse on those markers
+            // (designed for the auto-resume era); we go straight to
+            // the underlying check: ISO + mapfile present, mapfile
+            // parses, no bytes_pending in mapfile, lost_secs within
+            // the configured threshold.
             let snap = staging::snapshot_staging_disc(&path)?;
-            // Build a synthetic StagingResumeHint for classification.
-            let hint = staging::StagingResumeHint {
-                dir: snap.dir.clone(),
-                action: staging::ResumeAction::ResumePreserved {
-                    attempt: 0,
-                    has_iso: snap.has_iso,
-                    has_mapfile: snap.has_mapfile,
-                    has_mkv: snap.has_mkv,
-                },
-            };
-            let class = resume::classify_resume(&hint, cfg_read.abort_on_lost_secs);
-            if matches!(class, resume::ResumeClass::Remux { .. }) {
-                return Some(class);
+            if !snap.has_iso || !snap.has_mapfile {
+                continue;
             }
+            let (iso_path, mapfile_path) = resume::find_iso_and_mapfile(&path)?;
+            let map = match libfreemkv::disc::mapfile::Mapfile::load(&mapfile_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let stats = map.stats();
+            if stats.bytes_pending != 0 {
+                continue;
+            }
+            let lost_secs = stats.bytes_unreadable as f64 / 8_250_000.0;
+            if lost_secs > cfg_read.abort_on_lost_secs as f64 {
+                continue;
+            }
+            let dir_display_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Some(resume::ResumeClass::Remux {
+                iso_path,
+                mapfile_path,
+                display_name: dir_display_name,
+            });
         }
     }
     None
