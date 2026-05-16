@@ -161,7 +161,7 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
 
 /// Walk a staging dir and find the first `.iso` + matching
 /// `.iso.mapfile`. Returns None if either is missing.
-fn find_iso_and_mapfile(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(super) fn find_iso_and_mapfile(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut iso = None;
     let mut mapfile = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
