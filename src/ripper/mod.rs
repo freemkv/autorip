@@ -359,108 +359,21 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     // call `unregister_halt(device)` on exit.
                     register_halt(&device, libfreemkv::Halt::new());
 
+                    let _ = on_insert; // 0.23.0: insert is always scan-only
+                    let _ = resume_map_thread; // ditto — resume is now user-gated
                     if let Err(e) = spawn_rip_thread(&device, "rip", move || {
                         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            // 0.23.0: disc-insert always does scan-only.
+                            // No automatic rip, no automatic resume.
+                            // The user (via /api/rip[?resume=yes|no]) is
+                            // the sole trigger for any work that writes
+                            // to disk. This eliminates every variant of
+                            // "container restart auto-rips" pathology:
+                            // Watchtower deploys, hard-watchdog restarts,
+                            // host reboots — all leave staging untouched
+                            // until the user explicitly says go.
                             scan_disc(&cfg, &device_for_thread, &dev_path);
-                            let cancelled = device_halt(&device_for_thread)
-                                .map(|h| h.is_cancelled())
-                                .unwrap_or(false);
-                            if on_insert == "rip" && !cancelled {
-                                // If the staging-resume map has a
-                                // `Remux` entry for this disc, skip
-                                // the disc-side rip entirely and just
-                                // re-mux from the existing ISO. The map
-                                // was populated once at startup (see
-                                // drive_poll_loop top).
-                                //
-                                // Matching is not a single exact key
-                                // because the staging-dir basename is
-                                // produced from `display_name` at the
-                                // time of the original rip, and
-                                // `display_name` is `TMDB-title or
-                                // id_name` (see scan_disc) — i.e. it
-                                // shifts based on whether TMDB
-                                // resolved on a given run. The same
-                                // disc can therefore yield two
-                                // different dir names across runs
-                                // (e.g. "Civil_War" when TMDB hit vs
-                                // "Civil_War_-_Ultra_HD_Blu-ray" when
-                                // it missed). To survive that:
-                                //
-                                //   1. Try exact match on
-                                //      sanitize_path_compact(scanned
-                                //      display).
-                                //   2. Fall back to prefix-match in
-                                //      either direction. The shorter
-                                //      of the two names is always a
-                                //      prefix of the longer because
-                                //      TMDB only ever strips trailing
-                                //      "edition" suffixes (UHD, 4K,
-                                //      etc.) from the raw disc name —
-                                //      it never reorders or rewrites
-                                //      the title body.
-                                //   3. Among matches, require the
-                                //      candidate to be a Remux class
-                                //      (skip AlreadyCompleted /
-                                //      AlreadyFailed / NotEligible).
-                                let scanned_display = STATE
-                                    .lock()
-                                    .ok()
-                                    .and_then(|s| {
-                                        s.get(&device_for_thread).map(|rs| rs.disc_name.clone())
-                                    })
-                                    .unwrap_or_default();
-                                let sanitized =
-                                    crate::util::sanitize_path_compact(&scanned_display);
-                                let found = resume_map_thread.get(&sanitized).or_else(|| {
-                                    // Fallback: prefix-match in either
-                                    // direction. Pick the first Remux
-                                    // hit — on a single-drive rig
-                                    // there is only one inserted disc
-                                    // at a time and at most one
-                                    // matching staging dir.
-                                    resume_map_thread.iter().find_map(|(k, v)| {
-                                        if !matches!(v, resume::ResumeClass::Remux { .. }) {
-                                            return None;
-                                        }
-                                        let key_match = !sanitized.is_empty()
-                                            && (k.starts_with(&sanitized)
-                                                || sanitized.starts_with(k));
-                                        if key_match {
-                                            tracing::info!(
-                                                device = %device_for_thread,
-                                                scanned = %sanitized,
-                                                staging_key = %k,
-                                                "resume_map prefix-match (display_name shifted between rip and resume)"
-                                            );
-                                            Some(v)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                });
-                                if let Some(class) = found {
-                                    if matches!(class, resume::ResumeClass::Remux { .. }) {
-                                        resume::resume_remux(
-                                            &cfg,
-                                            &device_for_thread,
-                                            class.clone(),
-                                        );
-                                        // Drop the scanned session so a
-                                        // subsequent rip on the same
-                                        // device starts fresh.
-                                        drop_session(&device_for_thread);
-                                        unregister_halt(&device_for_thread);
-                                        return;
-                                    }
-                                }
-                                rip_disc(&cfg, &device_for_thread, &dev_path);
-                            } else {
-                                // scan-only or scan+stop: clear the
-                                // registered token so the next insert
-                                // starts fresh.
-                                unregister_halt(&device_for_thread);
-                            }
+                            unregister_halt(&device_for_thread);
                         }))
                         .is_err()
                         {
@@ -727,6 +640,144 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 }
 
 // ─── Rip ───────────────────────────────────────────────────────────────────
+
+/// Entry point for `/api/rip[?resume=yes|no]`. Scans the disc to
+/// identify it, then dispatches to `resume_remux` or `rip_disc`
+/// depending on the resume mode requested by the caller and the
+/// presence of resumable staging state.
+///
+/// This is the *only* path that starts disk-writing work as of
+/// 0.23.0. Disc insertion does scan-only; the user (via the HTTP API
+/// or UI) is the sole trigger for anything destructive.
+pub fn handle_rip_request(
+    cfg: &Arc<RwLock<Config>>,
+    device: &str,
+    device_path: &str,
+    mode: crate::web::ResumeMode,
+) {
+    scan_disc(cfg, device, device_path);
+    let cancelled = device_halt(device)
+        .map(|h| h.is_cancelled())
+        .unwrap_or(false);
+    if cancelled {
+        return;
+    }
+    match mode {
+        crate::web::ResumeMode::Require => {
+            match find_resumable_for_disc(cfg, device) {
+                Some(class) => {
+                    crate::log::device_log(device, "Resume requested: re-muxing existing ISO");
+                    resume::resume_remux(cfg, device, class);
+                    drop_session(device);
+                }
+                None => {
+                    crate::log::device_log(
+                        device,
+                        "Resume requested but no resumable staging state found for this disc",
+                    );
+                    update_state(
+                        device,
+                        RipState {
+                            device: device.to_string(),
+                            status: "error".to_string(),
+                            last_error: "Resume requested but no resumable staging state found for this disc".to_string(),
+                            ..Default::default()
+                        },
+                    );
+                    drop_session(device);
+                }
+            }
+        }
+        crate::web::ResumeMode::Wipe => {
+            wipe_staging_for_disc(cfg, device);
+            rip_disc(cfg, device, device_path);
+        }
+        crate::web::ResumeMode::Default => {
+            rip_disc(cfg, device, device_path);
+        }
+    }
+}
+
+/// Look at the staging dirs for a Remux-eligible entry whose
+/// dir basename matches (exact, prefix-either-way) the sanitized
+/// display_name of the currently-scanned disc. Returns the
+/// `ResumeClass::Remux` payload if found, else None.
+///
+/// Single-drive convention: rip1 has one drive, one inserted disc at
+/// a time. There is at most one staging dir matching the disc by
+/// title prefix. If somehow two match we pick the first; in a
+/// multi-drive future this needs disambiguation by stable disc
+/// fingerprint (UDF volume_id) instead of sanitized title.
+fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<resume::ResumeClass> {
+    let cfg_read = cfg.read().ok()?.clone();
+    let display_name = STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.get(device).map(|rs| rs.disc_name.clone()))
+        .unwrap_or_default();
+    if display_name.is_empty() {
+        return None;
+    }
+    let sanitized = crate::util::sanitize_path_compact(&display_name);
+    let entries = std::fs::read_dir(&cfg_read.staging_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let basename = path.file_name()?.to_string_lossy().into_owned();
+        if basename == sanitized
+            || basename.starts_with(&sanitized)
+            || sanitized.starts_with(&basename)
+        {
+            let snap = staging::snapshot_staging_disc(&path)?;
+            // Build a synthetic StagingResumeHint for classification.
+            let hint = staging::StagingResumeHint {
+                dir: snap.dir.clone(),
+                action: staging::ResumeAction::ResumePreserved {
+                    attempt: 0,
+                    has_iso: snap.has_iso,
+                    has_mapfile: snap.has_mapfile,
+                    has_mkv: snap.has_mkv,
+                },
+            };
+            let class = resume::classify_resume(&hint, cfg_read.abort_on_lost_secs);
+            if matches!(class, resume::ResumeClass::Remux { .. }) {
+                return Some(class);
+            }
+        }
+    }
+    None
+}
+
+/// Wipe the staging subdir for the currently-scanned disc. Used by
+/// `/api/rip?resume=no` to give the user an explicit clean slate
+/// before a fresh sweep.
+fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
+    let cfg_read = match cfg.read() {
+        Ok(c) => c.clone(),
+        Err(_) => return,
+    };
+    let display_name = STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.get(device).map(|rs| rs.disc_name.clone()))
+        .unwrap_or_default();
+    if display_name.is_empty() {
+        return;
+    }
+    let sanitized = crate::util::sanitize_path_compact(&display_name);
+    let path = std::path::Path::new(&cfg_read.staging_dir).join(&sanitized);
+    if path.exists() {
+        match std::fs::remove_dir_all(&path) {
+            Ok(_) => crate::log::device_log(
+                device,
+                &format!("Wiped staging dir for fresh rip: {}", path.display()),
+            ),
+            Err(e) => crate::log::device_log(
+                device,
+                &format!("Failed to wipe staging dir {}: {}", path.display(), e),
+            ),
+        }
+    }
+}
 
 /// Rip a disc. Reuses the existing drive session from scan_disc.
 /// If no session exists, opens fresh (for on_insert=rip).
