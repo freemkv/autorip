@@ -42,11 +42,3 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-
-# Local development override: build autorip against the sibling
-# libfreemkv repo so iteration loops pick up local changes immediately
-# without a crates.io round-trip. Must be removed (along with bumping
-# the `libfreemkv = "0.NN"` constraint) before `cargo publish`. CI
-# builds with this stripped via `--no-default-features`-style harness.
-[patch.crates-io]
-libfreemkv = { path = "../libfreemkv" }
