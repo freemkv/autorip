@@ -445,10 +445,20 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         }
     };
     let reader: Box<dyn libfreemkv::SectorSource> = Box::new(iso_reader_for_mux);
-    let mut input = libfreemkv::DiscStream::new(reader, title, keys, batch, format)
-        .with_halt(halt_token.clone());
-    // ISO-read demux glitches: same skip-on-error policy as multipass mux.
-    input.skip_errors = true;
+    // Resume path routes through the same `PipelinedPesStream`
+    // highway as multipass mux — same 3-stage threaded pipeline,
+    // same producer-thread BytesRead events for the UI. No skip-
+    // errors plumbing because the on-disk ISO is already clean (any
+    // sweep-pass loss got zero-filled in Pass 1).
+    let input: Box<dyn libfreemkv::pes::Stream> = Box::new(libfreemkv::build_iso_pipeline(
+        reader,
+        title,
+        keys,
+        batch,
+        format,
+        Some(halt_token.clone()),
+        None,
+    ));
 
     let latest_bytes_read = Arc::new(AtomicU64::new(0));
     let rip_last_lba = Arc::new(AtomicU64::new(0));

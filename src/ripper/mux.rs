@@ -569,7 +569,7 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
 /// cancellation inside libfreemkv even before the next frame yields.
 pub(super) fn run_mux(
     inputs: MuxInputs<'_>,
-    mut input: libfreemkv::DiscStream,
+    mut input: Box<dyn libfreemkv::pes::Stream>,
     atomics_in: MuxAtomics,
 ) -> MuxOutcome {
     // ── Headers-ready buffering ───────────────────────────────────
@@ -588,7 +588,7 @@ pub(super) fn run_mux(
                 bytes_done: 0,
                 elapsed_secs: 0.0,
                 speed_mbs: 0.0,
-                errors: input.errors as u32,
+                errors: input.errors() as u32,
                 lost_video_secs: 0.0,
                 output_opened: false,
                 finalize_error: None,
@@ -662,7 +662,7 @@ pub(super) fn run_mux(
                 bytes_done: 0,
                 elapsed_secs: 0.0,
                 speed_mbs: 0.0,
-                errors: input.errors as u32,
+                errors: input.errors() as u32,
                 lost_video_secs: 0.0,
                 output_opened: false,
                 finalize_error: None,
@@ -671,12 +671,13 @@ pub(super) fn run_mux(
     };
     let output = libfreemkv::pes::CountingStream::new(raw_output);
 
-    // Sync `input.skip_errors` with the orchestrator's choice. Done
-    // here (after headers, before main loop) for parity with the
-    // pre-split code.
-    if inputs.skip_errors {
-        input.skip_errors = true;
-    }
+    // `inputs.skip_errors` is wired at construction now (the
+    // orchestrator passes it directly into `DiscStream::new` /
+    // builds a `PipelinedPesStream` without it for the multipass
+    // ISO path). The post-headers re-sync that used to live here is
+    // no longer reachable from a `Box<dyn Stream>` and would be a
+    // no-op anyway since the value can't have changed.
+    let _ = inputs.skip_errors;
 
     // ── Watchdog thread ──────────────────────────────────────────
     //
@@ -934,7 +935,7 @@ pub(super) fn run_mux(
                 bytes_done: 0,
                 elapsed_secs: 0.0,
                 speed_mbs: 0.0,
-                errors: input.errors as u32,
+                errors: input.errors() as u32,
                 lost_video_secs: 0.0,
                 // The output IS open at this point — the pre-split
                 // behaviour didn't have this branch (no pipeline) so
@@ -1031,7 +1032,7 @@ pub(super) fn run_mux(
                     );
                     return;
                 }
-                input_errors_for_thread.store(local_input.errors as u32, Ordering::Relaxed);
+                input_errors_for_thread.store(local_input.errors() as u32, Ordering::Relaxed);
             }
 
             loop {
@@ -1041,7 +1042,8 @@ pub(super) fn run_mux(
                 }
                 match local_input.read() {
                     Ok(Some(frame)) => {
-                        input_errors_for_thread.store(local_input.errors as u32, Ordering::Relaxed);
+                        input_errors_for_thread
+                            .store(local_input.errors() as u32, Ordering::Relaxed);
                         // Producer per-frame log is the developer firehose
                         // (~hundreds of frames/sec on a UHD rip). Lives at
                         // `trace` so a normal /api/debug toggle (which raises

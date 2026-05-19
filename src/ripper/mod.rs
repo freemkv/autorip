@@ -2542,37 +2542,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // single-pass path keeps the inline reader because `DiscStream`'s
     // adaptive batch retry only fires inside `fill_extents` and the
     // prefetch wrapper would bypass it.
-    let mut input = if cfg_read.max_retries > 0 {
-        let decrypting = libfreemkv::DecryptingSectorSource::new(reader, keys.clone());
-        let prefetched = libfreemkv::PrefetchedSectorSource::new(
-            decrypting,
-            title.extents.clone(),
-            batch,
-            Some(halt_token.clone()),
-        );
-        libfreemkv::DiscStream::new_pipeline(
-            prefetched,
-            title,
-            keys,
-            batch,
-            format,
-            Some(halt_token.clone()),
-        )
-    } else {
-        libfreemkv::DiscStream::new(reader, title, keys, batch, format)
-            .with_halt(halt_token.clone())
-    };
-    if cfg_read.on_read_error == "skip" {
-        input.skip_errors = true;
-    }
+    // Stream-event callback — wired into both the multipass highway
+    // (BytesRead from the prefetch producer thread) and the drive
+    // single-pass inline path (BytesRead + BatchSizeChanged +
+    // SectorSkipped from DiscStream::fill_extents). Either path
+    // calls this same closure; the UI doesn't care which.
     let dev_for_stream_events = device.to_string();
     let wdf_stream = wd_last_frame.clone();
     let llba_stream = rip_last_lba.clone();
     let rbs_stream = rip_current_batch.clone();
     let lbr_stream = latest_bytes_read.clone();
-    input.on_event(move |event| {
-        // Same rationale as the drive callback — DiscStream events prove
-        // the rip is advancing even if no PES frame has been emitted yet.
+    let stream_event_fn = move |event: libfreemkv::event::Event| {
         wdf_stream.store(crate::util::epoch_secs(), Ordering::Relaxed);
         match event.kind {
             libfreemkv::event::EventKind::BytesRead { bytes, .. } => {
@@ -2598,7 +2578,38 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             }
             _ => {}
         }
-    });
+    };
+
+    let input: Box<dyn libfreemkv::pes::Stream> = if cfg_read.max_retries > 0 {
+        // Multipass ISO mux → PipelinedPesStream highway. The
+        // producer thread fires BytesRead events; BatchSizeChanged
+        // and SectorSkipped never fire on the highway (no adaptive
+        // retry — the ISO is zero-filled for any sweep-pass
+        // failures).
+        Box::new(libfreemkv::build_iso_pipeline(
+            reader,
+            title,
+            keys,
+            batch,
+            format,
+            Some(halt_token.clone()),
+            Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
+        ))
+    } else {
+        // Drive single-pass: stays on the inline DiscStream because
+        // its adaptive batch-retry on read failure lives inside
+        // `fill_extents`. The producer-thread highway doesn't (yet)
+        // replicate that retry policy, so for live-disc reads we
+        // keep the in-place fill loop. Same `on_event` closure as
+        // the highway path so the UI gets one event stream.
+        let mut s = libfreemkv::DiscStream::new(reader, title, keys, batch, format)
+            .with_halt(halt_token.clone());
+        if cfg_read.on_read_error == "skip" {
+            s.skip_errors = true;
+        }
+        s.on_event(stream_event_fn);
+        Box::new(s)
+    };
 
     // 0.18 round 2 #2: the headers-ready buffering, the spawning of
     // the consumer thread, the watchdog, and the per-frame

@@ -42,3 +42,9 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Local development override against the unreleased libfreemkv 0.25.1
+# tree. Removed again by release.sh before tagging so the published
+# Cargo.lock resolves libfreemkv from crates.io.
+[patch.crates-io]
+libfreemkv = { path = "../libfreemkv" }
