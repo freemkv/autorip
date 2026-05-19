@@ -197,6 +197,41 @@ pub fn delete_partial_output(staging_disc_dir: &Path, sanitized_name: &str) {
 
 /// The action half of the auto-resume flow.
 ///
+/// Reset the device's UI state from "ripping" → `terminal_status`
+/// after an early-return inside [`resume_remux`]. Preserves disc
+/// identity (so the dashboard tile keeps its title / format /
+/// duration) and zeroes everything else via `Default::default()`.
+///
+/// Called from every early-return site that happens AFTER the
+/// initial `status="ripping"` update at the top of `resume_remux`.
+/// Without this, the API state stays stuck at "ripping" forever and
+/// the "already ripping" gate in `web.rs::handle_rip` rejects all
+/// subsequent /api/rip requests. Mirrors `rip_disc`'s
+/// stopped → "idle" pattern.
+fn reset_status_after_ripping(
+    device: &str,
+    terminal_status: &str,
+    display_name: &str,
+    disc_format: &str,
+    duration: &str,
+    last_error: Option<String>,
+) {
+    let err = last_error.unwrap_or_default();
+    super::update_state(
+        device,
+        super::RipState {
+            device: device.to_string(),
+            status: terminal_status.to_string(),
+            disc_present: true,
+            disc_name: display_name.to_string(),
+            disc_format: disc_format.to_string(),
+            duration: duration.to_string(),
+            last_error: err,
+            ..Default::default()
+        },
+    );
+}
+
 /// Preconditions enforced by the caller:
 /// - `classification` is `ResumeClass::Remux { .. }`
 /// - the per-device `Halt` token has been (re-)registered by the
@@ -395,6 +430,16 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 device,
                 &format!("Auto-resume aborted: cannot re-open ISO for mux: {}", e),
             );
+            // Reset from "ripping" (set above) → "error" so the next
+            // /api/rip isn't blocked by the "already ripping" gate.
+            reset_status_after_ripping(
+                device,
+                "error",
+                &display_name,
+                &disc_format,
+                &duration,
+                Some(format!("ISO re-open failed: {}", e)),
+            );
             super::unregister_halt(device);
             return;
         }
@@ -411,17 +456,37 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let wd_last_frame = Arc::new(AtomicU64::new(crate::util::epoch_secs()));
     let mux_input_errors = Arc::new(AtomicU32::new(0));
 
+    // Pick up the TMDB metadata + codecs string that scan_disc
+    // populated in STATE before this path was entered. Without this,
+    // the mux's per-frame `update_state` would overwrite them with
+    // empty strings and the dashboard would lose the poster / title /
+    // year / codec badge for the entire mux phase.
+    let (tmdb_title, tmdb_year, tmdb_poster, tmdb_overview, state_codecs) = super::STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.get(device).cloned())
+        .map(|rs| {
+            (
+                rs.tmdb_title,
+                rs.tmdb_year,
+                rs.tmdb_poster,
+                rs.tmdb_overview,
+                rs.codecs,
+            )
+        })
+        .unwrap_or_default();
+
     let mux_outcome = super::mux::run_mux(
         super::mux::MuxInputs {
             device,
             display_name: display_name.clone(),
             disc_format: disc_format.clone(),
-            tmdb_title: String::new(),
-            tmdb_year: 0,
-            tmdb_poster: String::new(),
-            tmdb_overview: String::new(),
+            tmdb_title,
+            tmdb_year,
+            tmdb_poster,
+            tmdb_overview,
             duration: duration.clone(),
-            codecs: String::new(),
+            codecs: state_codecs,
             filename: filename.clone(),
             total_bytes,
             title_bytes_per_sec,
@@ -465,6 +530,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             device,
             "Auto-resume mux did not complete — preserving partial state for next restart",
         );
+        // Reset from "ripping" → "idle" so the next /api/rip isn't
+        // blocked by the "already ripping" gate. Halt-via-/api/stop is
+        // the common path here. Mirrors rip_disc's stopped → "idle".
+        reset_status_after_ripping(device, "idle", &display_name, &disc_format, &duration, None);
         return;
     }
 

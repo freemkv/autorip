@@ -13,6 +13,9 @@ mod webhook;
 use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 fn main() {
@@ -109,7 +112,7 @@ fn main() {
         }
     }
 
-    // Start mover thread
+    // Start mover thread.
     let _mover_handle = std::thread::spawn({
         let cfg = cfg.clone();
         move || mover::run(&cfg)

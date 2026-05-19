@@ -36,19 +36,22 @@ use super::state::{RipState, update_state};
 
 /// Hard watchdog escalation threshold. When the producer's
 /// "last frame / drive activity" timestamp hasn't moved in this many
-/// seconds, the mux consumer thread is presumed stuck inside an
-/// unkillable syscall (a hung NFS write, a wedged decryption thread,
-/// a kernel-side ioctl that never returns). At that point graceful
-/// teardown is impossible — the only escape is to exit the process and
-/// rely on Docker `restart: unless-stopped` to bring autorip back,
-/// after which `resume_or_quarantine_staging` decides whether to retry
-/// or quarantine the disc via `.failed`.
+/// seconds, the rip thread is presumed stuck inside an unkillable
+/// syscall (a hung NFS write, a wedged decryption thread, a
+/// kernel-side ioctl that never returns). At that point graceful
+/// teardown is impossible — the only escape is to exit the process
+/// and rely on Docker `restart: unless-stopped` to bring autorip
+/// back, after which `resume_or_quarantine_staging` decides whether
+/// to retry or quarantine the disc via `.failed`.
 ///
-/// 5 minutes was chosen as the smallest value comfortably above
-/// libfreemkv's per-read recovery timeout (60s) and above the soft
-/// "drive stalled" 30s warning. Anything under 60s would race with
-/// normal slow-recovery reads.
-pub const HARD_WATCHDOG_STALL_SECS: u64 = 300;
+/// 20 minutes is a generous margin over the soft "drive stalled" 30s
+/// warning and libfreemkv's per-read recovery timeout (60s). We
+/// raised this from the pre-0.24 default of 5 min after observing
+/// real muxes with legitimate 5-10 min NFS-server commit pauses get
+/// false-positive killed mid-rip. The cost of waiting up to 20 min
+/// before escalating a true wedge is far lower than the cost of
+/// repeatedly killing healthy-but-slow rips.
+pub const HARD_WATCHDOG_STALL_SECS: u64 = 1200;
 
 /// True if the device's registered `Halt` token has been cancelled
 /// (e.g. by the HTTP `/api/stop/{device}` handler in `web.rs`).
@@ -842,6 +845,24 @@ pub(super) fn run_mux(
                         }
                     };
                     super::state::update_state_with(&wd_device, |s| {
+                        // Don't clobber any terminal/intentional state set
+                        // by another path. The watchdog runs on a 15 s
+                        // wake tick and can fire AFTER:
+                        //   - `handle_stop` reset state to "idle"
+                        //     (60 s drain timed out, rip thread still
+                        //     wedged inside a syscall)
+                        //   - `rip_disc` / `resume_remux` completed and
+                        //     transitioned to "done" / "complete" /
+                        //     "failed" / "error"
+                        // In all those cases the operator-facing status
+                        // is authoritative; flipping it back to "ripping"
+                        // would be a UI lie. The hard-watchdog
+                        // escalation above (stall_secs >= 300) still
+                        // runs unconditionally to recover real wedges.
+                        match s.status.as_str() {
+                            "idle" | "done" | "complete" | "failed" | "error" => return,
+                            _ => {}
+                        }
                         s.device = wd_device.clone();
                         s.status = "ripping".to_string();
                         s.disc_present = true;
@@ -1078,6 +1099,27 @@ pub(super) fn run_mux(
             };
         }
     };
+
+    // DEADLOCK FIX (2026-05-18): drop the outer `frame_tx` immediately
+    // after spawning the producer. The producer thread holds its own
+    // clone (`frame_tx_for_closure`); the outer scope holding a
+    // never-used `frame_tx` was keeping `frame_rx` open even after the
+    // producer thread died / panicked / hit Ok(None), which meant the
+    // bridge `for frame in frame_rx` loop below blocked forever on
+    // recv (frame_rx never returns None until ALL Sender clones drop).
+    //
+    // Symptom: reproducible mux wedge at ~82% (48.5 GB) on both NFS
+    // and local SAS — gdb showed bridge thread parked in
+    // crossbeam::array::recv with no producer in the thread list (it
+    // had exited but its sender clone was still alive because the
+    // outer one kept the channel open). Hard watchdog escalated to
+    // exit(1), container restarted, retry hit the same wedge.
+    //
+    // With this drop, if the producer exits for any reason (EOF,
+    // read error, panic in HEVC parser, AACS key issue, etc.) the
+    // last sender clone drops and `frame_rx` returns None, exiting
+    // the bridge loop cleanly.
+    drop(frame_tx);
 
     // 0.20.8 validation-audit fix #2: track whether the consumer-bridge
     // loop drained the producer channel to natural EOF. The loop below

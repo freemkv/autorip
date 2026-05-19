@@ -2532,8 +2532,36 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // same signal that breaks sweep, patch, and the mux frame loop —
     // required for Stop to work during dense bad-sector regions
     // where the outer PES read() loop may never emit a frame.
-    let mut input = libfreemkv::DiscStream::new(reader, title, keys, batch, format)
-        .with_halt(halt_token.clone());
+    //
+    // Multipass ISO path: wrap the reader in a `PrefetchedSectorSource`
+    // so the read+decrypt work runs on a dedicated producer thread
+    // while the mux consumer (demux + codec parsers + writer) runs on
+    // the main thread. On the rip1 testbed this took the null:// /
+    // consumer ceiling from ~70 MB/s to ~124 MB/s and lets production
+    // mux push closer to the disk's combined r+w wall. The drive
+    // single-pass path keeps the inline reader because `DiscStream`'s
+    // adaptive batch retry only fires inside `fill_extents` and the
+    // prefetch wrapper would bypass it.
+    let mut input = if cfg_read.max_retries > 0 {
+        let decrypting = libfreemkv::DecryptingSectorSource::new(reader, keys.clone());
+        let prefetched = libfreemkv::PrefetchedSectorSource::new(
+            decrypting,
+            title.extents.clone(),
+            batch,
+            Some(halt_token.clone()),
+        );
+        libfreemkv::DiscStream::new_pipeline(
+            prefetched,
+            title,
+            keys,
+            batch,
+            format,
+            Some(halt_token.clone()),
+        )
+    } else {
+        libfreemkv::DiscStream::new(reader, title, keys, batch, format)
+            .with_halt(halt_token.clone())
+    };
     if cfg_read.on_read_error == "skip" {
         input.skip_errors = true;
     }
