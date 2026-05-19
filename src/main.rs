@@ -2,6 +2,7 @@ mod config;
 mod history;
 mod log;
 mod mover;
+mod muxer;
 mod observe;
 mod ripper;
 mod tmdb;
@@ -116,6 +117,17 @@ fn main() {
     let _mover_handle = std::thread::spawn({
         let cfg = cfg.clone();
         move || mover::run(&cfg)
+    });
+
+    // Start mux worker thread — pipelines mux behind the drive so a
+    // disc can be ripped on one device while a prior title muxes in
+    // the background. v0.25.3 scaffold; phase 3 wires the actual mux
+    // dispatch. Today the loop scans staging for `.ripped` markers and
+    // logs only — no behavioural change until the drive thread starts
+    // writing those markers.
+    let _muxer_handle = std::thread::spawn({
+        let cfg = cfg.clone();
+        move || muxer::run(&cfg)
     });
 
     // Start web server thread
