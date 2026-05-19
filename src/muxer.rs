@@ -106,7 +106,6 @@ pub fn delete_marker(staging_dir: &Path) -> std::io::Result<()> {
 /// [`crate::mover::MoveState`]. Read by the System page's
 /// `renderMuxes()` via SSE (`_mux` field on `/api/state`).
 #[derive(Debug, Clone, serde::Serialize, Default)]
-#[allow(dead_code)] // wired up in phase 3 (drive cut-over) + phase 4 (UI)
 pub struct MuxState {
     pub name: String,
     pub progress_pct: u8,
@@ -116,7 +115,6 @@ pub struct MuxState {
     pub eta: String,
 }
 
-#[allow(dead_code)] // wired up in phase 3 (drive cut-over) + phase 4 (UI)
 pub static MUX_STATE: once_cell::sync::Lazy<Mutex<Option<MuxState>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
@@ -236,7 +234,6 @@ fn check_and_mux(cfg: &Config) {
 
 /// Scan the staging dir for pending mux jobs. Returns display names
 /// for the System page's Mux Queue panel.
-#[allow(dead_code)] // wired in phase 4 (UI)
 pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
     let entries = match std::fs::read_dir(staging_dir) {
         Ok(e) => e,

@@ -128,6 +128,7 @@ tr:hover { background:var(--chip); }
 <!-- System page -->
 <div id="system" class="section">
   <div class="card" style="margin-top:16px"><h2>Data Files</h2><div id="files" class="files" style="margin-bottom:12px"></div><div style="display:flex;align-items:center;gap:10px"><button class="btn" onclick="updateKeydb()">Update KEYDB</button><span id="keydb-status" style="font-size:.8rem"></span></div></div>
+  <div class="card"><h2>Mux Queue</h2><div id="muxes"></div></div>
   <div class="card"><h2>Move Queue</h2><div id="moves"></div></div>
   <div><h2 style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;margin-bottom:8px">System Log</h2><div id="syslog" class="log" style="max-height:400px"></div></div>
 </div>
@@ -443,7 +444,7 @@ function handleState(data){
      drive list is empty (idle / state briefly cleared), so the
      no-devices early return below must not gate Move Queue updates. */
   window._stateData=data;
-  if(document.getElementById('system').classList.contains('active'))renderMoves();
+  if(document.getElementById('system').classList.contains('active')){renderMuxes();renderMoves();}
   const devs=Object.keys(data).filter(k=>!k.startsWith('_'));
   if(!devs.length){
     upd('dtabs','');
@@ -747,6 +748,49 @@ function updateKeydb(){
     else{st.textContent=data.error||'Update failed';st.style.color='var(--red)';}
   }).catch(e=>{st.textContent='Network error';st.style.color='var(--red)';});
 }
+/* ---- Mux queue with live progress (mirrors renderMoves shape) ---- */
+function renderMuxes(){
+  const el=document.getElementById('muxes');
+  if(!el)return;
+  const data=window._stateData||{};
+  const mx=data._mux;
+  let html='';
+  let hasContent=false;
+  if(mx&&mx.name){
+    hasContent=true;
+    const pct=mx.progress_pct||0;
+    const spdStr=mx.speed_mbs>=1?mx.speed_mbs.toFixed(1)+' MB/s':mx.speed_mbs>0?(mx.speed_mbs*1024).toFixed(0)+' KB/s':'';
+    const etaStr=mx.eta?mx.eta+' remaining':'';
+    const label=[pct+'%',spdStr,etaStr].filter(x=>x).join(' · ');
+    html+='<div style="padding:6px 0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);animation:p 1.5s infinite;flex-shrink:0"></span><span style="font-size:.85rem;font-weight:500">'+esc(mx.name)+'</span></div>';
+    html+='<div style="display:flex;align-items:center;gap:8px">';
+    if(pct>0)html+='<div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+pct+'%;transition:width 1s"></div></div>';
+    html+='<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div></div>';
+  }
+  if(window._muxQueue){
+    window._muxQueue.forEach(m=>{
+      if(mx&&mx.name&&m.replace(/ \(queued\)/,'').replace(/ /g,'_').includes(mx.name.replace(/ /g,'_')))return;
+      hasContent=true;
+      html+='<div style="padding:4px 0;font-size:.8rem"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--yellow);margin-right:8px;vertical-align:middle"></span>'+esc(m)+'</div>';
+    });
+  }
+  if(!hasContent)html='<div style="color:var(--text3);font-size:.8rem">No pending muxes</div>';
+  if(window._muxErrors&&window._muxErrors.length){
+    html+='<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--chip)">';
+    window._muxErrors.forEach(e=>{
+      html+='<div style="padding:6px 0;font-size:.8rem">'
+        +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">'
+        +'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);flex-shrink:0"></span>'
+        +'<span style="font-weight:500;color:var(--red)">'+esc(e.path||'')+'</span>'
+        +'</div>'
+        +'<div style="margin-left:16px;color:var(--text2)">'+esc(e.reason||'')+'</div>'
+        +(e.hint?'<div style="margin-left:16px;color:var(--text3);font-size:.75rem;margin-top:2px">'+esc(e.hint)+'</div>':'')
+        +'</div>';
+    });
+    html+='</div>';
+  }
+  upd('muxes',html);
+}
 /* ---- Move queue with live progress ---- */
 function renderMoves(){
   const el=document.getElementById('moves');
@@ -815,6 +859,10 @@ function loadSystem(){
     /* Move queue — store for renderMoves, then render */
     window._moveQueue=data.move_queue||[];
     window._moveErrors=data.move_errors||[];
+    /* Mux queue (v0.25.3) — same shape, separate panel above */
+    window._muxQueue=data.mux_queue||[];
+    window._muxErrors=data.mux_errors||[];
+    renderMuxes();
     renderMoves();
     /* System log */
     const logEl=document.getElementById('syslog');
@@ -1225,6 +1273,10 @@ fn get_state_json() -> String {
         .lock()
         .ok()
         .and_then(|ms| ms.clone());
+    let mux_state = crate::muxer::MUX_STATE
+        .lock()
+        .ok()
+        .and_then(|ms| ms.clone());
     let verify_state = crate::verify::VERIFY_STATE
         .lock()
         .ok()
@@ -1232,6 +1284,9 @@ fn get_state_json() -> String {
     let mut obj = serde_json::to_value(&*state).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(ms) = move_state {
         obj["_move"] = serde_json::to_value(&ms).unwrap_or_default();
+    }
+    if let Some(ms) = mux_state {
+        obj["_mux"] = serde_json::to_value(&ms).unwrap_or_default();
     }
     if let Some(vs) = verify_state {
         obj["_verify"] = serde_json::to_value(&vs).unwrap_or_default();
@@ -1341,6 +1396,16 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         .map(|m| m.values().cloned().collect())
         .unwrap_or_default();
 
+    // Mux queue (v0.25.3): staging dirs with a `.ripped` marker —
+    // sweep+patch done, awaiting the mux worker. Empty in v0.25.3
+    // until rip_disc starts writing the marker; the UI panel exists
+    // so the wiring is ready for the cut-over.
+    let mux_queue = crate::muxer::pending_queue(std::path::Path::new(&cfg.staging_dir));
+    let mux_errors: Vec<crate::muxer::MuxerError> = crate::muxer::MUX_ERRORS
+        .lock()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+
     // System log: last 50 lines
     let syslog_path = format!("{}/device_system.log", cfg.log_dir());
     let syslog = std::fs::read_to_string(&syslog_path)
@@ -1355,6 +1420,8 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         "files": files_json,
         "move_queue": move_queue,
         "move_errors": move_errors,
+        "mux_queue": mux_queue,
+        "mux_errors": mux_errors,
         "syslog": syslog,
     });
 
