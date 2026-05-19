@@ -106,6 +106,13 @@ jobs:
         run: |
           export CC=x86_64-linux-gnu-gcc
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-gnu-gcc
+          # Ubuntu's GCC defaults to -D_FORTIFY_SOURCE=2, which makes
+          # mimalloc-sys (a transitive C dep) emit calls to glibc-only
+          # __memcpy_chk / __memset_chk that are absent from musl. The
+          # final static-pie link against musl then fails with
+          # "undefined reference". Disable fortify for the C portion
+          # of the build; the Rust code is unaffected.
+          export CFLAGS="-U_FORTIFY_SOURCE"
           cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build (cross)
