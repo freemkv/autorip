@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-autorip"
-version = "0.25.1"
+version = "0.25.2"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -552,9 +552,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libfreemkv"
-version = "0.25.1"
+version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "097575e623768c7dc9309d3b3a1f965af01beebc62ac3d4bd384c37d252cddf0"
+checksum = "54c49669451b9a748529494f7391e8360e43ba9aee290cd51d604b5ac8168b85"
 dependencies = [
  "aes",
  "base64",
