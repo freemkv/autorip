@@ -580,6 +580,16 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         },
     );
     crate::log::device_log(device, "Auto-resume complete");
+
+    // Honor auto_eject after a successful resume the same way
+    // rip_disc's terminal branch does. Pre-0.25.2 the resume path
+    // silently skipped this, so a user with auto_eject=true would
+    // find a finished disc still in the drive whenever a rip was
+    // recovered after a container restart.
+    if cfg_read.auto_eject {
+        let device_path = format!("/dev/{}", device);
+        super::eject_drive(&device_path);
+    }
 }
 
 // Tests live in `tests/resume_remux.rs` (integration tests) — they

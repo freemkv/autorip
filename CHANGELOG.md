@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.25.2 (2026-05-19)
+
+### Fixed
+
+- **auto_eject honored on auto-resume** — the resume-mux path
+  (`ripper::resume::resume_remux`) previously skipped the eject
+  call entirely. After a successful resume, the disc would stay
+  in the drive even with `auto_eject=true`. Now mirrors
+  `rip_disc`'s terminal behaviour.
+- **Loud eject errors** — `eject_drive` no longer swallows
+  `Drive::open` / `Drive::eject` failures with `let _ =`. Both
+  paths now log to the device log + `tracing::warn!` so a failed
+  eject is visible instead of mysteriously silent.
+- **Move Queue UI froze on empty drive list** — `handleState` in
+  the dashboard JS used to early-return before updating
+  `_stateData` / `renderMoves` if the drive list was momentarily
+  empty (state poisoning, post-rip cleanup, etc). The Move Queue
+  panel would then sit stuck on whatever it last rendered even
+  though SSE was still pushing live progress. State + render are
+  now hoisted above the no-devices guard.
+- DTS-HD codec ID + PGS BlockDuration fixes inherited from
+  libfreemkv 0.25.2.
+
+## 0.25.1 (2026-05-19)
+
+### Changed
+
+- Multipass ISO mux and the post-stop resume path are wired through
+  the libfreemkv 0.25 mux highway (`libfreemkv::build_iso_pipeline`).
+  Three-stage threaded pipeline (read+decrypt → demux → codec parse)
+  for the entire file-backed ingest. Live-drive single-pass keeps
+  the inline `DiscStream::new` reader because its adaptive batch-
+  retry on bad sectors lives in `fill_extents`; that migration is
+  scheduled for v0.26.
+- `run_mux` now takes `Box<dyn libfreemkv::pes::Stream>` instead of a
+  concrete `DiscStream`. The orchestrator's `on_event` closure is
+  the same for both paths — for the highway it's wired through
+  `PrefetchedSectorSource`'s `event_fn` so `BytesRead` events still
+  drive the dashboard's progress UI.
+- `run_mux` no longer mutates `input.skip_errors` post-headers; the
+  setter happens at construction on the inline path and is a no-op
+  on the highway path.
+
+## 0.25.0 (2026-05-19)
+
+### CI / build
+
+- `release.yml` exports `CFLAGS=-U_FORTIFY_SOURCE` for the
+  `x86_64-unknown-linux-musl` build step. Ubuntu's `gcc` (called as
+  `x86_64-linux-gnu-gcc`) defaults to `-D_FORTIFY_SOURCE=2`, which
+  makes `mimalloc-sys 0.1.50` emit calls to glibc-only
+  `__memcpy_chk` / `__memset_chk` and break the final static-pie
+  link against musl. Disabling fortify for the C portion of the
+  build fixes it; the Rust code is unaffected.
+
+### Tracks libfreemkv 0.25.0
+
+See libfreemkv's CHANGELOG for the architectural details
+(`PipelinedPesStream` highway, deletion of `IsoSectorReader`,
+`FREEMKV_THREADS` env, etc.). autorip's multipass ISO ingest used
+the prior `DiscStream::new_pipeline` API in 0.25.0 and migrated to
+`build_iso_pipeline` in 0.25.1.
+
 ## 0.18.4 (2026-05-09)
 
 ### Build / CI hardening

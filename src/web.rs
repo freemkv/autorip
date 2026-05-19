@@ -438,6 +438,12 @@ function buildSteps(s){
 
 /* ---- Ripper page render ---- */
 function handleState(data){
+  /* Persist the latest payload + refresh the Move Queue first — the
+     mover keeps running (and `_move` keeps changing) even when the
+     drive list is empty (idle / state briefly cleared), so the
+     no-devices early return below must not gate Move Queue updates. */
+  window._stateData=data;
+  if(document.getElementById('system').classList.contains('active'))renderMoves();
   const devs=Object.keys(data).filter(k=>!k.startsWith('_'));
   if(!devs.length){
     upd('dtabs','');
@@ -473,9 +479,7 @@ function handleState(data){
     upd('dtabs','<div class="dtabs">'+tabHtml+'</div>');
   }else{upd('dtabs','')}
 
-  window._stateData=data;
   renderCurrent();
-  if(document.getElementById('system').classList.contains('active'))renderMoves();
 }
 
 function renderCurrent(){

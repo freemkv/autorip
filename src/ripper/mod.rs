@@ -2991,8 +2991,20 @@ pub fn eject_drive(device_path: &str) {
     drop_session(dev);
     unregister_halt(dev);
     crate::log::archive_device_log(dev);
-    if let Ok(mut session) = libfreemkv::Drive::open(std::path::Path::new(device_path)) {
-        let _ = session.eject();
+    // Pre-0.25.2 both branches here used `let _ =` and any failure was
+    // invisible: the user-facing symptom was "auto_eject is set but the
+    // disc stayed put, no log line, no idea why". Surface both.
+    match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
+        Ok(mut session) => {
+            if let Err(e) = session.eject() {
+                crate::log::device_log(dev, &format!("eject failed: {e}"));
+                tracing::warn!(device = %dev, error = %e, "eject command failed");
+            }
+        }
+        Err(e) => {
+            crate::log::device_log(dev, &format!("eject skipped — drive open failed: {e}"));
+            tracing::warn!(device = %dev, error = %e, "eject skipped — drive open failed");
+        }
     }
 }
 
