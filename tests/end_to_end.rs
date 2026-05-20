@@ -62,6 +62,7 @@ fn test_state_json_serialization_round_trip() {
         total_eta: "1:23:45".to_string(),
         damage_severity: "cosmetic".to_string(),
         failure_reason: None,
+        started_epoch_secs: 0,
     };
 
     // Serialize the same way get_state_json does: serde_json::to_value.

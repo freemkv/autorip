@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.25.7 (2026-05-20)
+
+### Fixed
+
+- **[critical] Mover destination-name collision with keep_iso=true.**
+  Pre-0.25.7 `build_destination` hardcoded `.mkv` for any movie file,
+  so when a rip left both the muxed `Title.mkv` and the kept
+  `Title.iso` in staging, both planned to the SAME `Title.mkv`
+  destination path. Successive mover ticks alternated overwriting
+  one with the other (ISO bytes wiping the MKV → post-cp EBML check
+  fails → next tick MKV overwrites again → next tick ISO wins, etc.).
+  Hit live on rip1 2026-05-20 on an Oppenheimer rip; the MKV was
+  destroyed by an ISO copy that landed under the `.mkv` name.
+  0.25.7 preserves the source extension so `Title.iso` and
+  `Title.mkv` land at distinct destination paths.
+- **[critical] BU40N firmware wedge on KEYDB-miss discs.** Inherited
+  via libfreemkv 0.25.7 — `do_handshake` no longer hammers the drive
+  with 16 cert attempts in a tight loop. See libfreemkv changelog.
+- **Skip redundant scan on /api/rip.** Pre-0.25.7 every rip click
+  re-ran the full Disc::scan + TMDB lookup even when scan_disc had
+  just run. Cleared the UI poster for 10-30 s and burned wallclock
+  for nothing. v0.25.7 checks `session_is_scanned(device)` first
+  and short-circuits if the disc was just identified.
+- **`auto_eject` honored on resume** — inherited from earlier;
+  consolidated into this release set.
+- **Mux Queue UI dedup.** The System tab card was showing the
+  currently-muxing title as both an active mux AND a queued entry
+  (because the `.ripped` marker stays on disk until success). Fixed
+  the dedup line to read `disc_name` from the live `_mux` state
+  (RipState shape) instead of the `name` field that the wire never
+  exposed.
+
+### Changed — operator UX
+
+- **System tab card order**: Mux Queue → Move Queue → Data Files →
+  System Log. Queues moved to the top where they're checked most
+  often.
+- **Live elapsed-time counter next to the Stop button.** Stamps
+  on scan/rip start, persists across the whole rip (scan → sweep
+  → patch → mux), clears when the drive returns to idle. Format
+  `0m 23s` → `5m 12s` → `1h 02m 34s`. tabular-nums + 80px reserved
+  width so the digit flips don't jitter neighbouring elements.
+- **Auto-rip-on-insert restored.** Setting `On Disc Insert = Rip`
+  now actually rips on insert — was silently a no-op since v0.23.0.
+  Combined with the v0.25.3 parallel-pipeline (drive frees as
+  soon as sweep+patch finishes), this enables the killer unattended
+  flow: insert disc, walk away, come back to find it ripped + the
+  next disc ready to slot in. Restart loops are now prevented by
+  the existing stop-cooldown, `.completed` marker, and
+  `.restart_count → .failed` paths instead of by globally killing
+  the auto-rip code path.
+
+### Changed — settings architecture (mild breaking)
+
+- **`settings.json` is now authoritative for every operator knob.**
+  Only 5 env vars are still read (`PORT`, `AUTORIP_DIR`,
+  `AUTORIP_LOG_LEVEL`, `RIP_USER`, `NFS_*`). All the rest
+  (`AUTO_EJECT`, `MAX_RETRIES`, `KEEP_ISO`, `MIN_LENGTH`,
+  `MAIN_FEATURE`, `ON_INSERT`, `ON_READ_ERROR`,
+  `ABORT_ON_LOST_SECS`, `OUTPUT_FORMAT`, `NETWORK_TARGET`,
+  `MOVIE_DIR`/`TV_DIR`/`STAGING_DIR`/`OUTPUT_DIR`, `TMDB_API_KEY`,
+  `KEYDB_*`, the new `FREEMKV_THREADS` / `LOG_RETENTION_DAYS`) are
+  set via the Settings page and persisted to `settings.json`. Old
+  env-var values are silently ignored — operators upgrading from
+  &lt;0.25.7 should move their values into the UI on first deploy.
+- New Settings page **Performance** group:
+  - **Decrypt Threads** — was `FREEMKV_THREADS` env. Applied
+    live via `libfreemkv::set_decrypt_threads` on settings POST;
+    no restart needed.
+  - **Log Retention (days)** — was `LOG_RETENTION_DAYS` env.
+    Re-read each daily prune tick.
+
+### Changed — image diet (~120 MB → ~25-30 MB target)
+
+The deployed image is now a curated `FROM scratch` build instead
+of `alpine:3.20 + 5 packages`. Multi-stage Dockerfile harvests
+`mount.nfs4` + its 11 dynamic deps + a single static busybox
+binary (~1 MB) with applet symlinks for operator triage via
+`docker exec`. autorip itself runs PID 1.
+
+- **Replaced**: `entrypoint.sh` → `autorip --bootstrap` Rust
+  subcommand. `curl` HEALTHCHECK → `autorip --healthcheck`.
+  `cp` subprocess in mover → `std::fs::copy` on a worker thread
+  (with the existing 3 s progress polling preserved).
+- **Dropped from image**: `bash`, `shadow` (no `useradd`), `cron`,
+  `curl`, `libssl3`.
+- **Kept**: `mount.nfs4` + libs (in-container NFS mount per
+  v0.25.4 still works), busybox-static (operator shell), the
+  autorip binary.
+- **BREAKING — compose entrypoint override removal.** If your
+  `docker-compose.yml` has
+  `entrypoint: ["/bin/bash", "-c", "exec /entrypoint.sh"]`,
+  REMOVE it. The Dockerfile ENTRYPOINT is now
+  `["/usr/local/bin/autorip", "--bootstrap"]` and there's no
+  `/bin/bash` or `/entrypoint.sh` to fall back to.
+
 ## 0.25.6 (2026-05-20)
 
 ### Changed — alpine base, image diet (~180 MB → ~30 MB)

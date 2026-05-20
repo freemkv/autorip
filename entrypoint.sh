@@ -1,4 +1,14 @@
-#!/bin/bash
+#!/bin/sh
+#
+# DEPRECATED in v0.25.7. The autorip image no longer ships bash, nor
+# does it COPY this file in. The Rust `autorip --bootstrap` subcommand
+# replaces it. Kept in the repo for operator reference only.
+#
+# Operators with `entrypoint: ["/bin/bash", "-c", "exec /entrypoint.sh"]`
+# overrides in their docker-compose.yml must remove the override (the
+# Dockerfile ENTRYPOINT is now `["/usr/local/bin/autorip", "--bootstrap"]`)
+# or rewrite it to invoke the binary directly.
+#
 set -e
 
 AUTORIP_DIR="${AUTORIP_DIR:-/config}"

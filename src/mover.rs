@@ -550,6 +550,19 @@ fn check_and_move(cfg: &Config) {
 }
 
 fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
+    // Source extension wins. Pre-0.25.7 this hardcoded ".mkv" for the
+    // movie branch, which collided when keep_iso=true left both the
+    // mux output and the source ISO in staging — both planned to the
+    // same `Title.mkv` destination path. Successive mover ticks then
+    // alternated overwriting one with the other, ultimately destroying
+    // the MKV on rip1 (Oppenheimer 2026-05-20). Preserving the source
+    // extension routes companions to distinct paths
+    // (`Title.mkv`, `Title.iso`) and lets the format-aware post-cp
+    // check correctly validate each.
+    let src_ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mkv");
     if let Some(result) = tmdb {
         let safe_title = crate::util::sanitize_path_display(&result.title);
         match result.media_type.as_str() {
@@ -560,8 +573,8 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
                     String::new()
                 };
                 let dir = format!("{}/{}{}", cfg.movie_dir, safe_title, year_str);
-                let mkv_name = format!("{}.mkv", safe_title);
-                format!("{}/{}", dir, mkv_name)
+                let name = format!("{safe_title}.{src_ext}");
+                format!("{dir}/{name}")
             }
             "tv" if !cfg.tv_dir.is_empty() => {
                 let dir = format!("{}/{}/Season 1", cfg.tv_dir, safe_title);
@@ -587,15 +600,16 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
 /// 2. **Atomic path**: try `rename(2)`. On the same filesystem this is
 ///    instant and unlinks src for free.
 ///
-/// 3. **Cross-fs / fallback**: shell out to `cp -f --` (force, no flag
-///    parsing of the path), then try to unlink src. If unlink fails
-///    (typical NFS squash-perm scenario where the staging dir is owned
-///    by an identity the container can't write into), return
-///    `MovedDirty` so the caller can surface the orphan to the UI.
+/// 3. **Cross-fs / fallback**: `std::fs::copy` on a worker thread
+///    (v0.25.7 — pre-0.25.7 this shelled out to `cp -f --`), then try
+///    to unlink src. If unlink fails (typical NFS squash-perm scenario
+///    where the staging dir is owned by an identity the container
+///    can't write into), return `MovedDirty` so the caller can
+///    surface the orphan to the UI.
 ///
-/// Child process prevents NFS/CIFS stalls from blocking the main
-/// autorip process. Calls `on_progress(pct, gb_done, gb_total,
-/// speed_mbs)` every few seconds while cp is running.
+/// Worker thread + polling loop here prevents NFS/CIFS stalls from
+/// blocking the main autorip thread. Calls `on_progress(pct, gb_done,
+/// gb_total, speed_mbs)` every 3 s while the copy is running.
 fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -> MoveOutcome {
     let src_meta = std::fs::metadata(src);
     let dest_meta = std::fs::metadata(dest);
@@ -618,59 +632,62 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
         return MoveOutcome::Moved;
     }
 
-    let src_str = src.to_string_lossy().to_string();
     let dest_str = dest.to_string_lossy().to_string();
     let src_size = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let total_gb = src_size as f64 / 1_073_741_824.0;
 
-    let mut child = match std::process::Command::new("cp")
-        .arg("-f")
-        .arg("--")
-        .arg(&src_str)
-        .arg(&dest_str)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            crate::log::syslog(&format!("Failed to spawn cp: {}", e));
-            return MoveOutcome::Failed;
-        }
-    };
+    // v0.25.7: replaced the `cp` subprocess with std::fs::copy on a
+    // worker thread, polled here for live progress. Drops the cp
+    // package dependency (the image-slim work doesn't ship a busybox
+    // cp by default) and gets us copy_file_range / sendfile fast-paths
+    // on filesystems that support them. Behaviour unchanged: progress
+    // ticks every 3 s, post-copy validation runs before unlink, src
+    // stays intact on any failure path.
+    let src_owned = src.to_path_buf();
+    let dest_owned = dest.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<u64>>();
+    let copy_handle = std::thread::spawn(move || {
+        let result = std::fs::copy(&src_owned, &dest_owned);
+        let _ = tx.send(result);
+    });
 
     let start = std::time::Instant::now();
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    on_progress(100, total_gb, total_gb, 0.0);
-                    // 0.20.8 validation-audit fix #3: even though cp
-                    // returned 0, double-check that dst byte-count
-                    // matches src. Silent NFS short-writes, out-of-space
-                    // conditions some cp implementations swallow, and
-                    // I/O glitches that surface as truncation all leave
-                    // the kernel cp happy but the destination short.
-                    // Catching it here — before we unlink src — keeps
-                    // the source bytes intact so the operator can retry
-                    // / investigate. Skipped on the rename fast-path
-                    // above (kernel atomic rename guarantees byte
-                    // equality on success).
-                    if let Err(e) = check_post_copy(src, Path::new(&dest_str)) {
-                        crate::log::syslog(&format!(
-                            "Post-cp validation failed for {}: {}",
-                            dest_str, e
-                        ));
-                        return MoveOutcome::SizeMismatch;
-                    }
-                    return match std::fs::remove_file(src) {
-                        Ok(_) => MoveOutcome::Moved,
-                        Err(_) => MoveOutcome::MovedDirty,
-                    };
-                } else {
-                    crate::log::syslog(&format!("cp failed with {}", status));
-                    return MoveOutcome::Failed;
+        match rx.try_recv() {
+            Ok(Ok(_bytes)) => {
+                let _ = copy_handle.join();
+                on_progress(100, total_gb, total_gb, 0.0);
+                // Post-copy validation. v0.25.3 made this format-aware
+                // (EBML head+tail for mkv, TS-sync for m2ts, fresh-FD
+                // stat for iso) so NFS attribute cache can't phantom-
+                // fail it. Runs BEFORE the unlink so src bytes stay
+                // intact on any mismatch — the operator can retry.
+                if let Err(e) = check_post_copy(src, Path::new(&dest_str)) {
+                    crate::log::syslog(&format!(
+                        "Post-cp validation failed for {}: {}",
+                        dest_str, e
+                    ));
+                    return MoveOutcome::SizeMismatch;
                 }
+                return match std::fs::remove_file(src) {
+                    Ok(_) => MoveOutcome::Moved,
+                    Err(_) => MoveOutcome::MovedDirty,
+                };
             }
-            Ok(None) => {
+            Ok(Err(e)) => {
+                let _ = copy_handle.join();
+                crate::log::syslog(&format!("fs::copy failed for {}: {}", dest_str, e));
+                return MoveOutcome::Failed;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Sender dropped without sending — worker panicked.
+                // Don't try to join (it already terminated); we'd
+                // need to propagate the panic, which we'd just log
+                // and return Failed anyway.
+                crate::log::syslog(&format!("fs::copy thread panicked for {}", dest_str));
+                return MoveOutcome::Failed;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
                 let dest_size = std::fs::metadata(&dest_str).map(|m| m.len()).unwrap_or(0);
                 let pct = if src_size > 0 {
                     (dest_size * 100 / src_size).min(100) as u8
@@ -687,10 +704,6 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 on_progress(pct, gb, total_gb, speed);
                 std::thread::sleep(std::time::Duration::from_secs(3));
             }
-            Err(e) => {
-                crate::log::syslog(&format!("Failed to wait on cp: {}", e));
-                return MoveOutcome::Failed;
-            }
         }
     }
 }
@@ -704,29 +717,10 @@ mod tests {
 
     fn cfg_with_dirs(movie_dir: &str, tv_dir: &str, output_dir: &str) -> Config {
         Config {
-            port: 8080,
-            staging_dir: "/staging".into(),
             output_dir: output_dir.into(),
             movie_dir: movie_dir.into(),
             tv_dir: tv_dir.into(),
-            min_length_secs: 600,
-            main_feature: true,
-            auto_eject: true,
-            on_insert: "rip".into(),
-            output_format: "mkv".into(),
-            network_target: String::new(),
-            on_read_error: "stop".into(),
-            max_retries: 1,
-            keep_iso: false,
-            abort_on_lost_secs: 0,
-            tmdb_api_key: String::new(),
-            keydb_path: None,
-            keydb_url: String::new(),
-            webhook_urls: Vec::new(),
-            autorip_dir: "/config".into(),
-            max_rip_duration_secs: 7200,
-            min_pass_budget_secs: 3600,
-            transport_recovery_delay_secs: 5,
+            ..Config::default()
         }
     }
 
@@ -822,6 +816,32 @@ mod tests {
         let dest = build_destination(&cfg, &tmdb, "disc.mkv");
         // movie_dir empty → fall-through to output_dir + filename.
         assert_eq!(dest, "/out/disc.mkv");
+    }
+
+    #[test]
+    fn build_destination_movie_preserves_iso_extension() {
+        // Bug fix: pre-0.25.7 a keep_iso=true rip left both .mkv and
+        // .iso in staging; build_destination hardcoded ".mkv" so both
+        // planned to the same path and the mover overwrote one with
+        // the other in alternating ticks. Source extension must win.
+        let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
+        let tmdb = Some(tmdb_movie("Oppenheimer", 2023));
+        let dest_iso = build_destination(&cfg, &tmdb, "Oppenheimer.iso");
+        let dest_mkv = build_destination(&cfg, &tmdb, "Oppenheimer.mkv");
+        assert_eq!(dest_iso, "/out/Movies/Oppenheimer (2023)/Oppenheimer.iso");
+        assert_eq!(dest_mkv, "/out/Movies/Oppenheimer (2023)/Oppenheimer.mkv");
+        assert_ne!(
+            dest_iso, dest_mkv,
+            "iso and mkv companions must not collide"
+        );
+    }
+
+    #[test]
+    fn build_destination_movie_preserves_m2ts_extension() {
+        let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
+        let tmdb = Some(tmdb_movie("Movie", 2024));
+        let dest = build_destination(&cfg, &tmdb, "00800.m2ts");
+        assert_eq!(dest, "/out/Movies/Movie (2024)/Movie.m2ts");
     }
 
     fn noop_progress(_: u8, _: f64, _: f64, _: f64) {}

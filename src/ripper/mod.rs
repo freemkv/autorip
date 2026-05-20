@@ -44,7 +44,9 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-use session::{DriveSession, drop_session, rediscover_drive, store_session, take_session};
+use session::{
+    DriveSession, drop_session, rediscover_drive, session_is_scanned, store_session, take_session,
+};
 use staging::staging_free_bytes;
 use state::{
     PassContext, PassProgressState, is_in_cooldown, push_pass_state, set_pass_progress,
@@ -359,20 +361,52 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     // call `unregister_halt(device)` on exit.
                     register_halt(&device, libfreemkv::Halt::new());
 
-                    let _ = on_insert; // 0.23.0: insert is always scan-only
-                    let _ = resume_map_thread; // ditto — resume is now user-gated
+                    // v0.25.7: restore the on_insert=rip auto-rip
+                    // behaviour. The v0.23.0 commit killed it as the
+                    // brute-force fix for "container restart auto-rips
+                    // pathology" (Watchtower deploys / watchdog
+                    // restarts / host reboots all kicking off a fresh
+                    // rip when a disc happened to still be in the
+                    // drive). The v0.25.3 parallel mux pipeline makes
+                    // unattended-rip the killer feature for this whole
+                    // project — insert disc, walk away, come back to
+                    // find it ripped + muxed + queued for the next
+                    // one — so we need the auto-rip back. The
+                    // "restart auto-rips" failure modes are now
+                    // handled by:
+                    //   - is_in_cooldown(device): 5-second STOP
+                    //     cooldown prevents flap-restart loops.
+                    //   - .completed marker check inside rip_disc:
+                    //     a disc that's already been ripped + got
+                    //     `.completed` doesn't get re-ripped on
+                    //     restart.
+                    //   - .restart_count counter promoting to
+                    //     `.failed` after RESTART_LIMIT to break the
+                    //     "container restarts mid-rip every N
+                    //     seconds" loop.
+                    // Operators who don't want auto-rip leave
+                    // on_insert at the default "scan", or set
+                    // "nothing" to skip even the scan.
+                    let do_auto_rip = on_insert == "rip";
+                    let _ = resume_map_thread; // resume is user-gated
+                    let cfg_for_thread = cfg.clone();
+                    let dev_path_for_thread = dev_path.clone();
                     if let Err(e) = spawn_rip_thread(&device, "rip", move || {
                         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            // 0.23.0: disc-insert always does scan-only.
-                            // No automatic rip, no automatic resume.
-                            // The user (via /api/rip[?resume=yes|no]) is
-                            // the sole trigger for any work that writes
-                            // to disk. This eliminates every variant of
-                            // "container restart auto-rips" pathology:
-                            // Watchtower deploys, hard-watchdog restarts,
-                            // host reboots — all leave staging untouched
-                            // until the user explicitly says go.
                             scan_disc(&cfg, &device_for_thread, &dev_path);
+                            if do_auto_rip {
+                                let cancelled = device_halt(&device_for_thread)
+                                    .map(|h| h.is_cancelled())
+                                    .unwrap_or(false);
+                                if !cancelled {
+                                    handle_rip_request(
+                                        &cfg_for_thread,
+                                        &device_for_thread,
+                                        &dev_path_for_thread,
+                                        crate::web::ResumeMode::Default,
+                                    );
+                                }
+                            }
                             unregister_halt(&device_for_thread);
                         }))
                         .is_err()
@@ -655,7 +689,22 @@ pub fn handle_rip_request(
     device_path: &str,
     mode: crate::web::ResumeMode,
 ) {
-    scan_disc(cfg, device, device_path);
+    // v0.25.7: skip the scan when the disc has already been scanned
+    // since insertion. Pre-0.25.7 this was unconditional, which meant
+    // every /api/rip click ran a second full scan + TMDB lookup —
+    // wiped the poster + title in the UI for ~10-30 s and burned the
+    // wallclock for no benefit since rip_disc would have reused the
+    // session anyway via take_session(). On disc eject + re-insert
+    // the poll loop calls drop_session, so a stale session can't
+    // survive a media change.
+    if !session_is_scanned(device) {
+        scan_disc(cfg, device, device_path);
+    } else {
+        crate::log::device_log(
+            device,
+            "Skipping redundant scan — disc already identified since insertion.",
+        );
+    }
     let cancelled = device_halt(device)
         .map(|h| h.is_cancelled())
         .unwrap_or(false);

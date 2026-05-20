@@ -122,29 +122,8 @@ fn handle_settings_post_drops_write_guard_before_save() {
     let tmp = tempdir().expect("tempdir");
     let autorip_dir = tmp.path().to_string_lossy().to_string();
     let cfg = Arc::new(RwLock::new(Config {
-        port: 8080,
-        staging_dir: "/staging".into(),
-        output_dir: "/output".into(),
-        movie_dir: String::new(),
-        tv_dir: String::new(),
-        min_length_secs: 600,
-        main_feature: true,
-        auto_eject: true,
-        on_insert: "scan".into(),
-        output_format: "mkv".into(),
-        network_target: String::new(),
-        on_read_error: "stop".into(),
-        max_retries: 1,
-        keep_iso: false,
-        abort_on_lost_secs: 0,
-        max_rip_duration_secs: 28800,
-        min_pass_budget_secs: 5400,
-        transport_recovery_delay_secs: 5,
-        tmdb_api_key: String::new(),
-        keydb_path: None,
-        keydb_url: String::new(),
-        webhook_urls: Vec::new(),
         autorip_dir: autorip_dir.clone(),
+        ..Config::default()
     }));
 
     // Same shape as handle_settings_post post-fix: mutate, snapshot,

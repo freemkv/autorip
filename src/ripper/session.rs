@@ -174,6 +174,25 @@ pub(super) fn store_session(device: &str, session: DriveSession) {
     }
 }
 
+/// True iff `device` has a stored `DriveSession` with `scanned == true`.
+/// Used by `handle_rip_request` to skip a redundant `scan_disc` call
+/// when the disc has just been scanned (e.g. ON_INSERT=scan ran on
+/// disc insertion, then the user clicked Rip). Without this check the
+/// scan ran twice — clearing the TMDB poster + title in the UI and
+/// burning 10-30 s redoing identify + lookup + full title scan.
+///
+/// Returns false if the lock can't be acquired, the device has no
+/// session, or the session exists but was created without `scanned=true`
+/// (currently impossible — every `store_session` call site passes true —
+/// but keeps the check honest if that invariant ever loosens).
+pub(super) fn session_is_scanned(device: &str) -> bool {
+    SESSIONS
+        .lock()
+        .ok()
+        .and_then(|s| s.get(device).map(|sess| sess.scanned))
+        .unwrap_or(false)
+}
+
 pub(super) fn drop_session(device: &str) {
     if let Ok(mut s) = SESSIONS.lock() {
         s.remove(device);

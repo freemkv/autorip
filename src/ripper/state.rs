@@ -126,6 +126,16 @@ pub struct RipState {
     /// that don't know the field don't see a stray `null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+
+    /// v0.25.7: epoch-seconds timestamp of when the current rip
+    /// transitioned into an active state (`scanning` or `ripping`).
+    /// 0 when no rip is in flight. The UI uses this to render a live
+    /// elapsed-time counter next to the Stop button — JS computes
+    /// `now - started_epoch_secs` so the display advances every tick
+    /// without server pressure. Preserved across `update_state` calls
+    /// for the same rip; cleared when status returns to `idle`.
+    #[serde(default)]
+    pub started_epoch_secs: u64,
 }
 
 impl Default for RipState {
@@ -172,6 +182,7 @@ impl Default for RipState {
             total_eta: String::new(),
             damage_severity: String::new(),
             failure_reason: None,
+            started_epoch_secs: 0,
         }
     }
 }
@@ -230,9 +241,35 @@ pub fn update_state(device: &str, mut state: RipState) {
     // 0.13.22: derive damage_severity from errors + total_lost_ms on
     // every push so the UI badge stays in sync with the latest counters.
     state.damage_severity = damage_severity_for(state.errors, state.total_lost_ms);
+
+    // v0.25.7: maintain `started_epoch_secs` automatically so callers
+    // don't have to remember to thread it through every RipState they
+    // build. Most call sites (rip_disc, scan_disc, watchdog) drop a
+    // fresh RipState into update_state with default zeros — without
+    // this preservation step the UI's live elapsed-time counter
+    // would reset on every state push.
     if let Ok(mut s) = STATE.lock() {
+        let prev_started = s.get(device).map(|p| p.started_epoch_secs).unwrap_or(0);
+        let now_active = is_active_status(&state.status);
+        let was_active = s.get(device).is_some_and(|p| is_active_status(&p.status));
+
+        if state.started_epoch_secs == 0 {
+            if now_active && was_active && prev_started > 0 {
+                // Continuing an in-flight rip — keep the original start
+                state.started_epoch_secs = prev_started;
+            } else if now_active {
+                // Transition into active — stamp now
+                state.started_epoch_secs = crate::util::epoch_secs();
+            }
+            // else: idle / done / error / failed → leave at 0 (clears
+            // the elapsed-counter in the UI)
+        }
         s.insert(device.to_string(), state);
     }
+}
+
+fn is_active_status(s: &str) -> bool {
+    matches!(s, "scanning" | "ripping")
 }
 
 /// Mutate a device's RipState via a closure. **Use this** instead of

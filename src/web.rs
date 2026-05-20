@@ -127,9 +127,9 @@ tr:hover { background:var(--chip); }
 
 <!-- System page -->
 <div id="system" class="section">
-  <div class="card" style="margin-top:16px"><h2>Data Files</h2><div id="files" class="files" style="margin-bottom:12px"></div><div style="display:flex;align-items:center;gap:10px"><button class="btn" onclick="updateKeydb()">Update KEYDB</button><span id="keydb-status" style="font-size:.8rem"></span></div></div>
-  <div class="card"><h2>Mux Queue</h2><div id="muxes"></div></div>
+  <div class="card" style="margin-top:16px"><h2>Mux Queue</h2><div id="muxes"></div></div>
   <div class="card"><h2>Move Queue</h2><div id="moves"></div></div>
+  <div class="card"><h2>Data Files</h2><div id="files" class="files" style="margin-bottom:12px"></div><div style="display:flex;align-items:center;gap:10px"><button class="btn" onclick="updateKeydb()">Update KEYDB</button><span id="keydb-status" style="font-size:.8rem"></span></div></div>
   <div><h2 style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;margin-bottom:8px">System Log</h2><div id="syslog" class="log" style="max-height:400px"></div></div>
 </div>
 
@@ -520,6 +520,13 @@ function renderCurrent(){
   let btns='';
   if(active){
     btns='<button class="btn btn-stop" onclick="if(confirm(\'Stop?\')){this.disabled=true;fetch(\'/api/stop/'+dev+'\',{method:\'POST\'})}">Stop</button>';
+    /* Elapsed-since-rip-started counter (v0.25.7). Ticks every 1s from
+       a single setInterval. font-variant-numeric:tabular-nums keeps
+       every digit the same pixel width so the second-flips don't
+       jitter; min-width reserves space for the widest expected value
+       ("1h 02m 34s" ≈ 70px) so growing past 10m or past 1h doesn't
+       shove anything else around. */
+    btns+='<span id="rip-elapsed-'+dev+'" data-started="'+(s.started_epoch_secs||0)+'" style="margin-left:10px;font-size:.78rem;color:var(--text2);align-self:center;font-variant-numeric:tabular-nums;min-width:80px;display:inline-block"></span>';
   }else if(scanned){
     btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="fetch(\'/api/rip/'+dev+'\',{method:\'POST\'})">Rip</button>';
     btns+='<button class="btn" onclick="fetch(\'/api/verify/'+dev+'\',{method:\'POST\'})">Verify</button>';
@@ -704,6 +711,21 @@ function connectSSE(){
 
 /* ---- History page ---- */
 function fmtElapsed(s){if(!s)return'';s=+s;const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h>0?h+'h '+m+'m':m+'m'}
+/* Includes seconds — for live-counter use; fmtElapsed is for static
+   minute-resolution rendering (history list). */
+function fmtElapsedSecs(s){if(!s||s<0)return'';s=+s;const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return h>0?h+'h '+String(m).padStart(2,'0')+'m '+String(sec).padStart(2,'0')+'s':m+'m '+String(sec).padStart(2,'0')+'s'}
+/* v0.25.7: tick the rip-elapsed counter every 1s. Reads each
+   rip-elapsed-* span's data-started attribute (set by renderCurrent
+   from the latest state push) so the value stays accurate even
+   after the state push briefly rewrites the DOM. */
+setInterval(()=>{
+  const now=Math.floor(Date.now()/1000);
+  document.querySelectorAll('[id^="rip-elapsed-"]').forEach(el=>{
+    const started=+el.dataset.started||0;
+    if(started>0){el.textContent=fmtElapsedSecs(now-started)}
+    else{el.textContent=''}
+  });
+},1000);
 function loadHistory(){
   fetch('/api/history').then(r=>r.json()).then(h=>{
     if(!h.length){document.getElementById('hi').innerHTML='<div style="color:var(--text2);font-size:.85rem;padding:20px">No rips yet</div>';return}
@@ -753,23 +775,31 @@ function renderMuxes(){
   const el=document.getElementById('muxes');
   if(!el)return;
   const data=window._stateData||{};
+  /* _mux on the wire is a RipState (the worker uses the synthetic
+     `_mux` device key in update_state), not the MuxState struct —
+     so we read disc_name / progress_pct / speed_mbs / eta. The
+     synthetic device's status is "ripping" while the mux is in
+     flight; treat absent or non-active as "no active mux". */
   const mx=data._mux;
+  const muxActive=mx&&mx.status==='ripping'&&mx.disc_name;
   let html='';
   let hasContent=false;
-  if(mx&&mx.name){
+  if(muxActive){
     hasContent=true;
     const pct=mx.progress_pct||0;
     const spdStr=mx.speed_mbs>=1?mx.speed_mbs.toFixed(1)+' MB/s':mx.speed_mbs>0?(mx.speed_mbs*1024).toFixed(0)+' KB/s':'';
     const etaStr=mx.eta?mx.eta+' remaining':'';
     const label=[pct+'%',spdStr,etaStr].filter(x=>x).join(' · ');
-    html+='<div style="padding:6px 0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);animation:p 1.5s infinite;flex-shrink:0"></span><span style="font-size:.85rem;font-weight:500">'+esc(mx.name)+'</span></div>';
+    html+='<div style="padding:6px 0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);animation:p 1.5s infinite;flex-shrink:0"></span><span style="font-size:.85rem;font-weight:500">'+esc(mx.disc_name)+'</span></div>';
     html+='<div style="display:flex;align-items:center;gap:8px">';
     if(pct>0)html+='<div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+pct+'%;transition:width 1s"></div></div>';
     html+='<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div></div>';
   }
   if(window._muxQueue){
     window._muxQueue.forEach(m=>{
-      if(mx&&mx.name&&m.replace(/ \(queued\)/,'').replace(/ /g,'_').includes(mx.name.replace(/ /g,'_')))return;
+      /* Skip the .ripped marker that corresponds to the title currently
+         muxing (worker leaves the marker in place until success). */
+      if(muxActive&&m.replace(/ \(queued\)/,'').replace(/ /g,'_').includes(mx.disc_name.replace(/ /g,'_')))return;
       hasContent=true;
       html+='<div style="padding:4px 0;font-size:.8rem"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--yellow);margin-right:8px;vertical-align:middle"></span>'+esc(m)+'</div>';
     });
@@ -924,6 +954,10 @@ function renderSettings(s){
     {title:'API Keys',fields:[
       {key:'tmdb_api_key',label:'TMDB API Key',type:'text',hint:'v3 API key from themoviedb.org'},
       {key:'keydb_url',label:'KEYDB Update URL',type:'text',hint:'HTTP URL to download KEYDB.cfg (zip, gz, or plain text)'},
+    ]},
+    {title:'Performance',fields:[
+      {key:'decrypt_threads',label:'Decrypt Threads',type:'number',hint:'How many threads AACS decryption uses. 0 = auto (all available cores, capped at 64). Drop to 4-8 if autorip is sharing the host with other heavy workloads.'},
+      {key:'log_retention_days',label:'Log Retention (days)',type:'number',hint:'Per-device .log files older than this are pruned by the in-process daily cleanup. Default 30.'},
     ]},
   ];
   let html='';
@@ -1638,8 +1672,22 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
                 .filter(|s| !s.is_empty())
                 .collect();
         }
+        // v0.25.7: decrypt_threads + log_retention_days. Were env-only
+        // pre-0.25.7; now operator-tunable from the Settings page.
+        if let Some(v) = patch.get("decrypt_threads").and_then(|v| v.as_u64()) {
+            c.decrypt_threads = v as usize;
+        }
+        if let Some(v) = patch.get("log_retention_days").and_then(|v| v.as_u64()) {
+            c.log_retention_days = v;
+        }
         c.clone()
     }; // <-- write guard dropped here; readers unblock immediately
+
+    // Apply the decrypt-thread setting LIVE without waiting for a
+    // container restart. set_decrypt_threads swaps libfreemkv's rayon
+    // pool; in-flight decrypt work uses the old pool, the next rip
+    // picks up the new size.
+    config::apply_decrypt_threads(snapshot.decrypt_threads);
 
     // Bounded-syscall pattern, hand-rolled because
     // `libfreemkv::io::bounded::bounded_syscall` is `pub(crate)` and

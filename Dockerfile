@@ -1,35 +1,57 @@
+# Local-dev Dockerfile. Multi-stage cargo build + harvest + FROM scratch.
+#
+# CI uses Dockerfile.ci which skips the cargo build by reusing the
+# musl-static binary the release `build` job already produced. This
+# file is for developers who want to `docker build` against the
+# current working tree without an upstream artifact.
+
 FROM rust:1.86-alpine AS builder
-
-# musl toolchain + headers for static linking. mimalloc-sys needs gcc;
-# the rust:alpine image already ships rustc + cargo but not gcc.
+# musl-dev + gcc + make + cmake for mimalloc-sys C build.
 RUN apk add --no-cache musl-dev gcc make cmake
-
 WORKDIR /build
 COPY . .
 # --locked: refuse to modify Cargo.lock during build. If the lock-pinned
-# libfreemkv version isn't yet on crates.io (race with the upstream
-# release CI), the build hard-fails with a visible error instead of
-# silently re-resolving to the previous published version. Hit at
-# 0.18.3: docker built against libfreemkv 0.18.2 because 0.18.3
-# hadn't published yet and cargo silently fell back. Now: hard
-# fail, retrigger after upstream lands.
+# libfreemkv version isn't yet on crates.io, hard-fail with a visible
+# error instead of silently re-resolving to the previous published
+# version (the v0.18.3 incident).
 RUN cargo build --locked --release
 
-FROM alpine:3.20
-RUN apk add --no-cache bash ca-certificates curl nfs-utils shadow
+# Harvest stage — pull mount.nfs4 + its deps + busybox-static + applet
+# symlinks from an alpine image so the FROM scratch final has a working
+# shell for operator triage and a working in-container NFS mount.
+# Maintenance: keep this list in sync with `Dockerfile.ci` — verify
+# via `ldd /sbin/mount.nfs4` after any alpine bump.
+FROM alpine:3.20 AS harvest
+RUN apk add --no-cache nfs-utils busybox-static \
+ && mkdir -p /out/sbin /out/lib /out/usr/lib /out/bin /out/etc \
+ && cp /sbin/mount.nfs4              /out/sbin/ \
+ && cp /sbin/mount.nfs               /out/sbin/ \
+ && cp /lib/ld-musl-x86_64.so.1      /out/lib/ \
+ && cp /lib/libmount.so.1            /out/lib/ \
+ && cp /lib/libblkid.so.1            /out/lib/ \
+ && cp /lib/libcom_err.so.2          /out/lib/ \
+ && cp /usr/lib/libtirpc.so.3        /out/usr/lib/ \
+ && cp /usr/lib/libkeyutils.so.1     /out/usr/lib/ \
+ && cp /usr/lib/libgssapi_krb5.so.2  /out/usr/lib/ \
+ && cp /usr/lib/libkrb5.so.3         /out/usr/lib/ \
+ && cp /usr/lib/libk5crypto.so.3     /out/usr/lib/ \
+ && cp /usr/lib/libkrb5support.so.0  /out/usr/lib/ \
+ && cp /usr/lib/libeconf.so.0        /out/usr/lib/ \
+ && cp /bin/busybox.static           /out/bin/busybox \
+ && for app in sh mount umount mountpoint ls cat env wget mkdir chown ln rm id ps grep less head tail; do \
+        ln -sf /bin/busybox /out/bin/$app; \
+    done \
+ && cp -r /etc/services              /out/etc/services 2>/dev/null || true \
+ && cp -r /etc/nsswitch.conf         /out/etc/nsswitch.conf 2>/dev/null || true
 
+FROM scratch
+COPY --from=harvest /out/ /
 COPY --from=builder /build/target/release/autorip /usr/local/bin/autorip
-COPY entrypoint.sh /entrypoint.sh
 COPY udev-trigger.sh /usr/local/bin/udev-trigger.sh
-RUN chmod +x /entrypoint.sh /usr/local/bin/udev-trigger.sh
 
 EXPOSE 8080
 
-# Healthcheck — fails when /api/state can't be reached (web thread dead,
-# port binding failure, process hung). Combined with the compose-side
-# `restart: unless-stopped`, Docker auto-recovers a wedged container
-# instead of leaving a dead-UI zombie running until somebody notices.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl --fail --silent --max-time 4 http://127.0.0.1:8080/api/state > /dev/null || exit 1
+    CMD ["/usr/local/bin/autorip", "--healthcheck"]
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/autorip", "--bootstrap"]

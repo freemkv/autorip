@@ -5,21 +5,21 @@ services:
     restart: unless-stopped
     privileged: true                    # required for optical SCSI access; also enables in-container NFS mount (see below)
     environment:
-      - AUTORIP_DIR=/config
-      - OUTPUT_DIR=/output
-      - MOVIE_DIR=/output/movies
-      - TV_DIR=/output/tv
-      - STAGING_DIR=/staging
-      - TMDB_API_KEY=your_tmdb_api_key
-      - MIN_LENGTH=600
-      - AUTO_EJECT=true
-      - ON_INSERT=rip
-      - MAX_RETRIES=1                   # 0..=10; retry passes after fast pass (multi-pass rip)
-      - KEEP_ISO=false                  # keep intermediate ISO after MKV mux (forensics)
+      # v0.25.7 cleanup: only bootstrap-only knobs live in env now.
+      # Everything else (output dirs, TMDB key, AUTO_EJECT, MAX_RETRIES,
+      # KEEP_ISO, MIN_LENGTH, ON_INSERT, abort_on_lost_secs, decrypt_threads,
+      # log_retention_days, …) is set via the Settings page in the web UI
+      # and persisted to /config/settings.json. Old env vars are silently
+      # ignored — operators upgrading from <0.25.7 should move their
+      # values into the UI on first deploy.
+      #
+      - AUTORIP_DIR=/config              # where settings.json + logs live
+      - PORT=8080                        # web bind port (can't change at runtime)
       # Tracing filter (env-filter syntax). Default `autorip=info,libfreemkv=warn`.
       # Crank to debug for deep-dives: `AUTORIP_LOG_LEVEL=autorip=debug`. The
       # JSON stream lands in /config/logs/autorip.jsonl, human-readable in
-      # /config/logs/autorip.log, both daily-rolled.
+      # /config/logs/autorip.log, both daily-rolled. Env-only because the
+      # tracing filter is built at startup, before the web server is up.
       - AUTORIP_LOG_LEVEL=autorip=info,libfreemkv=warn
       #
       # OPTIONAL: in-container NFS mount (v0.25.4+). Use this instead of
@@ -29,8 +29,8 @@ services:
       # self-heal automatically — no host-side `umount -fl` dance.
       #
       # If you set these, REMOVE the corresponding bind-mount line in
-      # `volumes:` below. The entrypoint creates the mountpoint and
-      # mounts it before exec'ing autorip.
+      # `volumes:` below. The bootstrap (`autorip --bootstrap`) creates
+      # the mountpoint and mounts it before the daemon starts.
       #
       # - NFS_HOST=unraid-1.internal.lan
       # - NFS_EXPORT=/mnt/user/media

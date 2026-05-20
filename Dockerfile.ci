@@ -10,24 +10,65 @@
 # Local developers building from source should keep using the regular
 # Dockerfile (multi-stage cargo build).
 #
-# v0.25.6: alpine base + minimal package set. Cut deployed image
-# from ~180 MB (debian:bookworm-slim + cron + libssl3 + ...) to
-# ~30 MB. autorip is musl-static so it runs on alpine with zero
-# dynamic-library deps; bash stays because compose entrypoint
-# overrides commonly invoke /bin/bash.
+# ── Image diet (v0.25.7) ───────────────────────────────────────────
+#
+# Started at 179 MB (debian:bookworm-slim + apt cruft) in v0.25.5.
+# v0.25.6 went to 120 MB on alpine:3.20. v0.25.7 finishes the job
+# with a curated FROM scratch image: just the autorip binary plus
+# the exact set of files needed to (a) operator-shell-exec for
+# triage, (b) mount NFSv4 inside the container.
+#
+# Replaced:
+#   - entrypoint.sh  → `autorip --bootstrap` (Rust)
+#   - curl HEALTHCHECK → `autorip --healthcheck` (Rust)
+#   - cp in mover.rs → std::fs::copy (Rust)
+#
+# Bundled from alpine harvest stage:
+#   - /sbin/mount.nfs4 + 11 dynamic deps (musl, libtirpc, libmount,
+#     libblkid, libcom_err, libkeyutils, libgssapi_krb5, libkrb5,
+#     libk5crypto, libkrb5support, libeconf). Verified via
+#     `ldd /sbin/mount.nfs4` on alpine 3.20.
+#   - /bin/busybox.static + applet symlinks (sh mount umount mountpoint
+#     ls cat env wget mkdir chown ln rm id). Operator shell for
+#     `docker exec` during triage; never invoked by the daemon.
+#
+# Maintenance note: when bumping the alpine harvest pin, re-run
+# `ldd /sbin/mount.nfs4` inside the new image and update the COPY
+# list below if the lib filenames have rev'd. Add a smoke test
+# (mount a real NFS export, run a sentinel rip) to the release
+# workflow to catch silent ABI breaks.
 
-FROM alpine:3.20
-RUN apk add --no-cache bash ca-certificates curl nfs-utils shadow
+FROM alpine:3.20 AS harvest
+RUN apk add --no-cache nfs-utils busybox-static \
+ && mkdir -p /out/sbin /out/lib /out/usr/lib /out/bin /out/etc \
+ && cp /sbin/mount.nfs4              /out/sbin/ \
+ && cp /sbin/mount.nfs               /out/sbin/ \
+ && cp /lib/ld-musl-x86_64.so.1      /out/lib/ \
+ && cp /lib/libmount.so.1            /out/lib/ \
+ && cp /lib/libblkid.so.1            /out/lib/ \
+ && cp /lib/libcom_err.so.2          /out/lib/ \
+ && cp /usr/lib/libtirpc.so.3        /out/usr/lib/ \
+ && cp /usr/lib/libkeyutils.so.1     /out/usr/lib/ \
+ && cp /usr/lib/libgssapi_krb5.so.2  /out/usr/lib/ \
+ && cp /usr/lib/libkrb5.so.3         /out/usr/lib/ \
+ && cp /usr/lib/libk5crypto.so.3     /out/usr/lib/ \
+ && cp /usr/lib/libkrb5support.so.0  /out/usr/lib/ \
+ && cp /usr/lib/libeconf.so.0        /out/usr/lib/ \
+ && cp /bin/busybox.static           /out/bin/busybox \
+ && for app in sh mount umount mountpoint ls cat env wget mkdir chown ln rm id ps grep less head tail; do \
+        ln -sf /bin/busybox /out/bin/$app; \
+    done \
+ && cp -r /etc/services              /out/etc/services 2>/dev/null || true \
+ && cp -r /etc/nsswitch.conf         /out/etc/nsswitch.conf 2>/dev/null || true
 
+FROM scratch
+COPY --from=harvest /out/ /
 COPY autorip /usr/local/bin/autorip
-RUN chmod +x /usr/local/bin/autorip
-COPY entrypoint.sh /entrypoint.sh
 COPY udev-trigger.sh /usr/local/bin/udev-trigger.sh
-RUN chmod +x /entrypoint.sh /usr/local/bin/udev-trigger.sh
 
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl --fail --silent --max-time 4 http://127.0.0.1:8080/api/state > /dev/null || exit 1
+    CMD ["/usr/local/bin/autorip", "--healthcheck"]
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/autorip", "--bootstrap"]
