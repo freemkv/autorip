@@ -1,4 +1,8 @@
-FROM rust:1.86-slim AS builder
+FROM rust:1.86-alpine AS builder
+
+# musl toolchain + headers for static linking. mimalloc-sys needs gcc;
+# the rust:alpine image already ships rustc + cargo but not gcc.
+RUN apk add --no-cache musl-dev gcc make cmake
 
 WORKDIR /build
 COPY . .
@@ -11,10 +15,8 @@ COPY . .
 # fail, retrigger after upstream lands.
 RUN cargo build --locked --release
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y \
-    libssl3 cron curl nfs-common \
-    && rm -rf /var/lib/apt/lists/*
+FROM alpine:3.20
+RUN apk add --no-cache bash ca-certificates curl nfs-utils shadow
 
 COPY --from=builder /build/target/release/autorip /usr/local/bin/autorip
 COPY entrypoint.sh /entrypoint.sh

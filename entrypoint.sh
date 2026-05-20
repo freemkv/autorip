@@ -57,15 +57,9 @@ cat > /etc/udev/rules.d/99-autorip.rules << 'UDEV'
 ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA}=="1", ENV{ID_CDROM_MEDIA_STATE}!="blank", RUN+="/usr/local/bin/udev-trigger.sh %k"
 UDEV
 
-# Log cleanup cron (4am daily). KEYDB updates happen inside the live autorip
-# process (main.rs spawns a daily updater thread) — never spawn a second
-# `autorip` binary from cron, it races the live process for /dev/sg* and the
-# web port and silently breaks the UI. See CHANGELOG 0.13.0 for the incident.
-mkdir -p /etc/cron.d
-echo "0 4 * * * root find $AUTORIP_DIR/logs -name '*.log' -mtime +${LOG_RETENTION_DAYS:-30} -delete" > /etc/cron.d/autorip
-
-# Start cron
-service cron start 2>/dev/null || true
+# Log cleanup moved into the autorip process itself in v0.25.6 (see
+# main.rs::prune_old_logs). cron + cron.d are no longer needed; the
+# image dropped the package as part of the v0.25.6 alpine slim-down.
 
 # Start autorip
 exec /usr/local/bin/autorip

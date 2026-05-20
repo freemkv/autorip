@@ -187,6 +187,38 @@ fn main() {
         }
     });
 
+    // Log prune thread — replaces the v0.25.5 cron-based daily cleanup
+    // (./entrypoint.sh used to drop a line in /etc/cron.d). Moving this
+    // in-process let us drop the cron package + the cron service from
+    // the image (alpine swap in v0.25.6), shrinking the deployed
+    // container by ~5 MB and eliminating a runtime dependency.
+    let _log_prune_handle = std::thread::spawn({
+        let cfg = cfg.clone();
+        move || {
+            tracing::info!("log prune thread starting (24h interval)");
+            let retention_days: u64 = std::env::var("LOG_RETENTION_DAYS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            'outer: loop {
+                // Wait first; on a fresh container the logs dir has only
+                // a few minutes of data and pruning is a no-op anyway.
+                for _ in 0..(24 * 3600) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if SHUTDOWN.load(Ordering::Relaxed) {
+                        break 'outer;
+                    }
+                }
+                let log_dir = cfg.read().ok().map(|c| c.log_dir()).unwrap_or_default();
+                if log_dir.is_empty() {
+                    continue;
+                }
+                prune_old_logs(&log_dir, retention_days);
+            }
+            tracing::info!("log prune thread stopping");
+        }
+    });
+
     // Main loop: poll drives (checks SHUTDOWN flag internally)
     ripper::drive_poll_loop(&cfg);
 
@@ -206,4 +238,36 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
         unsafe { libc::_exit(1) };
     }
     SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+/// Delete `.log` files under `log_dir` older than `retention_days`.
+/// Replaces the v0.25.5 cron-based cleanup so the deployed image
+/// doesn't need a cron daemon. Single-shot; the caller drives the
+/// daily cadence.
+fn prune_old_logs(log_dir: &str, retention_days: u64) {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(retention_days * 86_400));
+    let Some(cutoff) = cutoff else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    let mut pruned = 0u32;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("log") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if mtime < cutoff && std::fs::remove_file(&path).is_ok() {
+            pruned += 1;
+        }
+    }
+    if pruned > 0 {
+        log::syslog(&format!(
+            "log prune: removed {pruned} files older than {retention_days}d from {log_dir}"
+        ));
+    }
 }

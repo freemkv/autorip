@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.25.6 (2026-05-20)
+
+### Changed — alpine base, image diet (~180 MB → ~30 MB)
+
+The deployed image was 179 MB for a 9 MB Rust binary — most of
+that was the debian:bookworm-slim base, libssl3 (unused — the
+autorip binary is musl-static), and the cron package + service
+needed for the one daily log-cleanup line.
+
+- **Base swap** debian:bookworm-slim → alpine:3.20. autorip is
+  built `x86_64-unknown-linux-musl`, so it has zero dynamic-lib
+  deps and runs natively on alpine.
+- **Drop libssl3.** Not used by the musl-static binary; was just
+  apt dragging it along.
+- **Drop cron.** Replaced by an in-process `prune_old_logs`
+  thread in `main.rs` (mirrors the existing 24h KEYDB updater
+  pattern). `LOG_RETENTION_DAYS` env var keeps the same default
+  (30) and same semantics. Entrypoint no longer writes
+  `/etc/cron.d/autorip` or starts a cron service.
+- Packages kept: `bash` (compose entrypoint overrides commonly
+  invoke `/bin/bash`), `ca-certificates` (TLS for KEYDB
+  download), `curl` (HEALTHCHECK), `nfs-utils` (in-container
+  NFS mount per v0.25.4), `shadow` (`useradd` syntax compat
+  for the entrypoint's rip-user creation).
+- Both `Dockerfile` and `Dockerfile.ci` ported. Local-dev
+  Dockerfile uses `rust:1.86-alpine` for the build stage and
+  pulls in `musl-dev gcc make cmake` for mimalloc-sys.
+
 ## 0.25.5 (2026-05-20)
 
 ### Fixed
