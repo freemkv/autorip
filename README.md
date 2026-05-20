@@ -6,7 +6,7 @@
 Automatic disc ripper. Insert a disc, get an MKV.
 
 Uses [libfreemkv](https://github.com/freemkv/libfreemkv) directly -- no subprocess, no text parsing.
-Works with DVD, Blu-ray, and 4K UHD discs.
+Works with DVD, Blu-ray, and 4K UHD discs. Built-in keys cover DVDs and Blu-rays (AACS 1.0); a `keydb.cfg` is only needed for UHD (AACS 2.0 / 2.1).
 
 ## Quick Start
 
@@ -20,7 +20,9 @@ docker-compose up -d
 
 Open http://localhost:8080
 
-**First-time setup:** Go to Settings and enter your KEYDB Update URL to enable Blu-ray/UHD decryption. DVD ripping works out of the box. TMDB API key is optional (enables automatic title/poster lookup).
+**First-time setup:** DVDs and Blu-rays (AACS 1.0) work out of the box — no key setup needed. For UHD (AACS 2.0 / 2.1) discs, go to Settings and enter a KEYDB Update URL; autorip will fetch and refresh `keydb.cfg` automatically. TMDB API key is optional (enables automatic title/poster lookup).
+
+For operator-supplied keys (additional device keys, processing keys, or VUKs you have derived), drop a `local_keys.cfg` into the bind-mounted config directory at `config/keys/`. Same syntax as `keydb.cfg`; entries are loaded additively on top of the built-in keys and any main `keydb.cfg`.
 
 ### Build from source
 

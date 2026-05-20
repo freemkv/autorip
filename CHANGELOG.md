@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.25.9 (2026-05-20)
+
+### Changed
+
+- Inherits libfreemkv 0.25.9: DVDs and Blu-rays (AACS 1.0) now
+  decrypt out of the box, no keydb.cfg required. UHD discs still
+  need a keydb (auto-downloaded via KEYDB Update URL in Settings).
+- Operators can drop `local_keys.cfg` into the same keys directory
+  as `keydb.cfg` to layer additional derived keys on top. Same
+  syntax; merged additively.
+
 ## 0.25.8 (2026-05-20)
 
 ### Fixed
