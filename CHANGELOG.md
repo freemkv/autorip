@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.25.10 (2026-05-20)
+
+### Fixed
+
+- **[critical] Mover promoted intermediate ISO to library even with
+  `keep_iso=false`.** `check_and_move` collected ANY `.iso/.mkv/.m2ts`
+  from a `.done` staging dir; the `keep_iso` flag was only consulted
+  by the ripper's post-mux prune (which runs after `.done` is written,
+  losing the race against the mover's 10 s scan loop). Hit live on
+  rip1 2026-05-20: `Wicked.iso` (94 GB) landed at
+  `/mnt/unraid-1/media/movies/Wicked For Good/Wicked For Good.iso`
+  alongside the intended MKV. Fix: filter `.iso` out of the
+  planned-moves set when `keep_iso=false`; the existing
+  `remove_dir_all` staging-teardown sweeps the orphan ISO from
+  /staging once the MKV move succeeds.
+- **Mover telemetry froze on NFS attribute-cache stalls.** The
+  move_file polling loop called `std::fs::metadata(dest)` every 3 s
+  to update the `_move` field surfaced on the System page. Under
+  concurrent rip+mover I/O on rip1's /mnt/unraid-1 NFS share, this
+  call could block for many minutes on attribute-cache refresh,
+  freezing `progress_gb` at one bit-identical value (e.g.
+  `17.226043701171875`) while the dest file actually grew. Fix:
+  bound the stat with a 2 s deadline via a one-shot worker thread;
+  on timeout, extrapolate progress from the last-known size + speed
+  so the UI keeps showing forward motion. Fresh stats are still
+  preferred when they return promptly.
+
 ## 0.25.9 (2026-05-20)
 
 ### Changed

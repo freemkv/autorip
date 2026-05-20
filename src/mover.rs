@@ -146,6 +146,25 @@ fn fresh_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
     f.metadata()
 }
 
+/// Stat a path with a hard wall-clock deadline. Spawns a one-shot
+/// worker that calls `std::fs::metadata` and reports the file length
+/// via a channel; if the worker hasn't returned within `timeout` we
+/// give up and return `None` (the orphan thread will eventually
+/// complete and the result is dropped). Used by the move_file
+/// progress-polling loop to dodge unbounded NFS attribute-cache stalls
+/// that froze the System page telemetry pre-0.25.10. We deliberately
+/// don't join() the orphan: under the stall scenario join would itself
+/// block forever, which is the bug we're fixing.
+fn stat_size_with_timeout(path: &Path, timeout: std::time::Duration) -> Option<u64> {
+    let path_owned = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel::<Option<u64>>();
+    std::thread::spawn(move || {
+        let size = std::fs::metadata(&path_owned).ok().map(|m| m.len());
+        let _ = tx.send(size);
+    });
+    rx.recv_timeout(timeout).ok().flatten()
+}
+
 /// Verify a destination MKV is structurally complete by checking the
 /// EBML magic at the head and confirming the tail bytes form a clean
 /// EBML element. Doesn't validate the whole file — too expensive for
@@ -355,14 +374,31 @@ fn check_and_move(cfg: &Config) {
             None
         };
 
-        // Find ripped files
+        // Find ripped files. `keep_iso=false` means the operator does not
+        // want the intermediate ISO promoted to the output library — only
+        // the muxed MKV. Pre-0.25.10 this filter accepted any `.iso` in
+        // staging regardless, so the mover happily moved 90+ GB of ISO
+        // bytes to NFS the moment `.done` appeared (the ripper's own
+        // ISO-prune in `rip_disc` only runs after `.done` is written, so
+        // the mover's 10s scan loop typically wins the race). Hit live on
+        // rip1 2026-05-20 (Wicked.iso, 94 GB, copied to
+        // `/mnt/unraid-1/media/movies/Wicked For Good/`). Filter the ISO
+        // out at planning time; the staging-cleanup branch below deletes
+        // any leftover .iso from disk before tearing the dir down so we
+        // don't leak intermediate ISOs in /staging.
+        let move_iso = cfg.keep_iso;
         let ripped_files: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
             Ok(entries) => entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .filter(|p| {
                     p.extension()
-                        .map(|x| x == "mkv" || x == "m2ts" || x == "iso")
+                        .and_then(|x| x.to_str())
+                        .map(|ext| match ext {
+                            "mkv" | "m2ts" => true,
+                            "iso" => move_iso,
+                            _ => false,
+                        })
                         .unwrap_or(false)
                 })
                 .collect(),
@@ -370,6 +406,10 @@ fn check_and_move(cfg: &Config) {
         };
 
         if ripped_files.is_empty() {
+            // Nothing the mover should promote. Skip; the dir's lifetime
+            // is governed by the ripper (which writes the .done marker
+            // and is responsible for its own ISO-prune in the
+            // keep_iso=false multipass path).
             continue;
         }
 
@@ -652,6 +692,14 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
     });
 
     let start = std::time::Instant::now();
+    // 0.25.10: last-known-good telemetry state for the NFS-stat-stalls-
+    // forever case. When `stat_size_with_timeout` returns None we
+    // extrapolate from these values so the System page UI keeps showing
+    // forward motion instead of freezing at one number for tens of
+    // minutes. Updated only on a successful stat.
+    let mut last_known_size: u64 = 0;
+    let mut last_known_at: f64 = 0.0;
+    let mut last_known_speed_bps: f64 = 0.0;
     loop {
         match rx.try_recv() {
             Ok(Ok(_bytes)) => {
@@ -688,20 +736,54 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 return MoveOutcome::Failed;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                let dest_size = std::fs::metadata(&dest_str).map(|m| m.len()).unwrap_or(0);
+                // 0.25.10: replace the unbounded `std::fs::metadata(dest)`
+                // with a 2 s-capped lookup. On rip1's /mnt/unraid-1 NFS
+                // share under concurrent rip+mover I/O, `metadata()` can
+                // block on attribute-cache refresh for many minutes; the
+                // _move telemetry then freezes at the last value (e.g.
+                // `progress_gb=17.226043701171875` for 10+ min) while
+                // the dest actually grows. With a timeout the loop keeps
+                // ticking — when the stat returns we use the fresh size,
+                // when it doesn't we extrapolate from the last-known
+                // size + last-known speed so the System page UI keeps
+                // showing forward motion instead of a frozen number.
+                let elapsed = start.elapsed().as_secs_f64();
+                let measured_size =
+                    stat_size_with_timeout(Path::new(&dest_str), std::time::Duration::from_secs(2));
+                let now_dest_size = match measured_size {
+                    Some(sz) => {
+                        last_known_size = sz;
+                        last_known_at = elapsed;
+                        sz
+                    }
+                    None => {
+                        // Extrapolate. Use the smoothed speed from the
+                        // last successful stat as the growth-rate
+                        // estimate; clamp at src_size so we never report
+                        // > 100 %. If we've never had a successful stat
+                        // (first poll) `last_known_size` is 0 and speed
+                        // is 0 — pct stays at 0, which is honest.
+                        let stalled_for = (elapsed - last_known_at).max(0.0);
+                        let projected =
+                            last_known_size as f64 + (last_known_speed_bps * stalled_for);
+                        projected.min(src_size as f64).max(0.0) as u64
+                    }
+                };
                 let pct = if src_size > 0 {
-                    (dest_size * 100 / src_size).min(100) as u8
+                    (now_dest_size.saturating_mul(100) / src_size).min(100) as u8
                 } else {
                     0
                 };
-                let gb = dest_size as f64 / 1_073_741_824.0;
-                let elapsed = start.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    dest_size as f64 / (1024.0 * 1024.0) / elapsed
-                } else {
-                    0.0
-                };
-                on_progress(pct, gb, total_gb, speed);
+                let gb = now_dest_size as f64 / 1_073_741_824.0;
+                // Smoothed throughput, in bytes/sec, derived from the
+                // last successful stat. The reported `speed` field on
+                // the UI is in MB/s so we divide by (1024*1024) before
+                // surfacing.
+                if elapsed > 0.0 {
+                    last_known_speed_bps = now_dest_size as f64 / elapsed;
+                }
+                let speed_mbs = last_known_speed_bps / (1024.0 * 1024.0);
+                on_progress(pct, gb, total_gb, speed_mbs);
                 std::thread::sleep(std::time::Duration::from_secs(3));
             }
         }
@@ -1043,5 +1125,137 @@ mod tests {
         drop(m);
         clear_error(path);
         assert!(MOVE_ERRORS.lock().unwrap().get(path).is_none());
+    }
+
+    // 0.25.10 fixes regression tests.
+
+    fn marker_json(title: &str) -> String {
+        serde_json::json!({
+            "title": title,
+            "disc_name": title,
+            "format": "BD",
+            "year": 2024,
+            "media_type": "movie",
+            "poster_url": "",
+            "overview": "",
+            "date": "2026-05-20",
+        })
+        .to_string()
+    }
+
+    fn cfg_for_staging(staging: &std::path::Path, movie_dir: &str, keep_iso: bool) -> Config {
+        Config {
+            staging_dir: staging.to_string_lossy().to_string(),
+            output_dir: staging
+                .parent()
+                .unwrap()
+                .join("output")
+                .to_string_lossy()
+                .to_string(),
+            movie_dir: movie_dir.to_string(),
+            tv_dir: String::new(),
+            keep_iso,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn check_and_move_skips_iso_when_keep_iso_false() {
+        // Regression for 0.25.10: pre-fix, the mover blindly moved ANY
+        // .iso it found in a .done staging dir. Result: a 90+ GB
+        // intermediate ISO landed in the user's movie library
+        // (rip1 2026-05-20, Wicked.iso → /mnt/unraid-1/.../Wicked For
+        // Good.iso) even though keep_iso=false was set, because the
+        // mover's 10 s scan loop ran before the ripper's post-mux
+        // ISO-prune did. The fix: filter .iso out of the planned-moves
+        // set when keep_iso=false; the existing `remove_dir_all` cleanup
+        // at the end of check_and_move then sweeps the orphan ISO out
+        // of staging when the .mkv move succeeds.
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let movie_dir = tmp.path().join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
+
+        // One staging "disc dir" with .done + a valid .mkv + an .iso.
+        let disc_dir = staging.join("Wicked For Good");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Wicked For Good")).unwrap();
+        // Valid EBML head + tail-safe body so check_post_copy_mkv passes.
+        let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3];
+        mkv.extend_from_slice(&[0xAAu8; 1024]);
+        std::fs::write(disc_dir.join("Wicked For Good.mkv"), &mkv).unwrap();
+        std::fs::write(disc_dir.join("Wicked For Good.iso"), vec![0u8; 4096]).unwrap();
+
+        check_and_move(&cfg);
+
+        // MKV landed in the movie library.
+        let mkv_dest = movie_dir.join("Wicked For Good (2024)/Wicked For Good.mkv");
+        assert!(
+            mkv_dest.exists(),
+            "MKV should have been moved to {}",
+            mkv_dest.display()
+        );
+
+        // ISO must NOT have been promoted to the movie library.
+        let iso_dest = movie_dir.join("Wicked For Good (2024)/Wicked For Good.iso");
+        assert!(
+            !iso_dest.exists(),
+            "ISO must not be moved when keep_iso=false (found at {})",
+            iso_dest.display()
+        );
+
+        // Staging is torn down on the same tick because the MKV moved
+        // cleanly and the orphan ISO was swept by remove_dir_all.
+        assert!(
+            !disc_dir.exists(),
+            "staging disc dir should have been removed after successful MKV move"
+        );
+    }
+
+    #[test]
+    fn check_and_move_moves_iso_when_keep_iso_true() {
+        // Companion to the regression above: with keep_iso=true the
+        // operator explicitly wants the ISO promoted alongside the
+        // MKV. The 0.25.7 build_destination fix already routes them to
+        // distinct paths (Title.iso vs Title.mkv); this test just
+        // pins the filter behaviour on the cfg flag.
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let movie_dir = tmp.path().join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), true);
+
+        let disc_dir = staging.join("Keepme");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Keepme")).unwrap();
+        let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3];
+        mkv.extend_from_slice(&[0xAAu8; 1024]);
+        std::fs::write(disc_dir.join("Keepme.mkv"), &mkv).unwrap();
+        std::fs::write(disc_dir.join("Keepme.iso"), vec![0u8; 4096]).unwrap();
+
+        check_and_move(&cfg);
+
+        assert!(movie_dir.join("Keepme (2024)/Keepme.mkv").exists());
+        assert!(movie_dir.join("Keepme (2024)/Keepme.iso").exists());
+    }
+
+    #[test]
+    fn stat_size_with_timeout_returns_size_for_present_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.bin");
+        std::fs::write(&f, b"0123456789").unwrap();
+        let sz = stat_size_with_timeout(&f, std::time::Duration::from_secs(2));
+        assert_eq!(sz, Some(10));
+    }
+
+    #[test]
+    fn stat_size_with_timeout_returns_none_for_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("nope.bin");
+        let sz = stat_size_with_timeout(&f, std::time::Duration::from_secs(2));
+        assert_eq!(sz, None);
     }
 }
