@@ -258,9 +258,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.15.0"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "equivalent"
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-autorip"
-version = "0.25.9"
+version = "0.25.10"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -552,9 +552,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libfreemkv"
-version = "0.25.9"
+version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9eec75982966e46c4f20a797dcd66e28356414a860d9319a7432542e3c369c0"
+checksum = "610358af09a79f73f7cad6f9b89f8f37aaffcf6d1d3b4711412dc74bef59c508"
 dependencies = [
  "aes",
  "base64",
