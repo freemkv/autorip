@@ -586,10 +586,75 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // silently skipped this, so a user with auto_eject=true would
     // find a finished disc still in the drive whenever a rip was
     // recovered after a container restart.
-    if cfg_read.auto_eject {
+    if cfg_read.auto_eject && !device.starts_with('_') {
+        // Underscore-prefixed devices are synthetic — used by the
+        // v0.25.3 mux worker which gets here from a `.ripped`
+        // hand-off after the drive thread already ejected. Don't
+        // re-eject; the drive may even hold a different disc by now.
         let device_path = format!("/dev/{}", device);
         super::eject_drive(&device_path);
     }
+}
+
+/// Run a mux-from-staging pass as if it were an auto-resume, against
+/// a synthetic device key. Used by `crate::muxer` to dispatch the
+/// `.ripped` hand-off from the drive thread without itself
+/// re-implementing scan_image + run_mux + history bookkeeping. The
+/// device key is `"_mux"` — underscore-prefixed so the UI tile grid
+/// ignores it, but `update_state` / `device_log` / halt-token
+/// plumbing all still work through the existing per-device shape.
+///
+/// Returns true on a clean mux (`.completed` marker written, `.ripped`
+/// safe to delete). False on any failure path that left `.ripped` in
+/// place for next-tick retry.
+pub(crate) fn remux_from_ripped_marker(
+    cfg: &Arc<RwLock<Config>>,
+    staging_dir: &std::path::Path,
+    marker: &crate::muxer::RippedMarker,
+) -> bool {
+    let iso_path = std::path::PathBuf::from(&marker.iso_path);
+    let mapfile_path = std::path::PathBuf::from(&marker.mapfile_path);
+    let mux_device = "_mux";
+
+    // Pre-seed STATE so `run_mux`'s TMDB-from-STATE lookup finds the
+    // metadata we want on the history record. Codecs gets filled by
+    // the worker's scan_image below — for the initial seed we write
+    // an empty string and `run_mux` will overwrite via its frame loop.
+    super::update_state(
+        mux_device,
+        super::RipState {
+            device: mux_device.to_string(),
+            tmdb_title: marker.tmdb_title.clone(),
+            tmdb_year: marker.tmdb_year,
+            tmdb_poster: marker.tmdb_poster.clone(),
+            tmdb_overview: marker.tmdb_overview.clone(),
+            ..Default::default()
+        },
+    );
+
+    let classification = ResumeClass::Remux {
+        iso_path: iso_path.clone(),
+        mapfile_path: mapfile_path.clone(),
+        display_name: marker.display_name.clone(),
+    };
+    resume_remux(cfg, mux_device, classification);
+
+    // Success signal: `resume_remux` wrote `.completed` to staging.
+    // Anything else (halt, scan_image failure, mux loop break)
+    // leaves `.completed` absent.
+    let success = staging_dir.join(".completed").exists();
+    if success {
+        // Hand-off consumed. Drop the marker so this dir doesn't get
+        // re-queued on the next muxer tick.
+        let _ = crate::muxer::delete_marker(staging_dir);
+        // Clean up the synthetic STATE entry so the device tile grid
+        // (which already filters underscore keys, but still — be tidy)
+        // doesn't accumulate per-mux ghosts.
+        if let Ok(mut s) = super::STATE.lock() {
+            s.remove(mux_device);
+        }
+    }
+    success
 }
 
 // Tests live in `tests/resume_remux.rs` (integration tests) — they

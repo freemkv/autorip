@@ -9,7 +9,7 @@
 //! commit that will lift those loops out of `rip_disc`. See
 //! `(internal)/memory/0_18_redesign.md`.
 
-mod mux;
+pub(crate) mod mux;
 pub mod resume;
 mod session;
 pub mod staging;
@@ -2461,7 +2461,81 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             return;
         }
 
-        // Close drive — all physical I/O done.
+        // v0.25.3 parallel pipeline hand-off — sweep + patch are done,
+        // the ISO is on disk, the drive is no longer needed. Write
+        // the `.ripped` marker so the muxer worker can pick this
+        // staging dir up on its next tick, eject the disc if the
+        // operator asked for it, return the drive tile to idle, and
+        // exit `rip_disc`. The mux + post-mux bookkeeping that used
+        // to run below now runs inside `muxer::check_and_mux ->
+        // ripper::resume::remux_from_ripped_marker`.
+        let marker = crate::muxer::RippedMarker {
+            schema_version: crate::muxer::RIPPED_MARKER_SCHEMA,
+            iso_path: iso_path_str.clone(),
+            mapfile_path: mapfile_path_str.clone(),
+            display_name: display_name.clone(),
+            disc_format: disc_format.clone(),
+            mkv_filename: filename.clone(),
+            tmdb_title: tmdb_title.clone(),
+            tmdb_year,
+            tmdb_poster: tmdb_poster.clone(),
+            tmdb_overview: tmdb_overview.clone(),
+            max_retries: cfg_read.max_retries,
+            abort_on_lost_secs: cfg_read.abort_on_lost_secs as u32,
+            rip_elapsed_secs: 0.0, // mux worker re-derives elapsed from its own start
+            rip_errors: 0,
+            rip_lost_video_secs: main_lost_ms_for_history / 1000.0,
+            rip_last_sector: rip_last_lba.load(Ordering::Relaxed),
+            origin_device: device.to_string(),
+        };
+        let staging_path = std::path::Path::new(&staging);
+        if let Err(e) = crate::muxer::write_marker(staging_path, &marker) {
+            // Couldn't hand off — fall back to the inline mux below
+            // by NOT taking the early-return branch. Log the failure
+            // so the cause is on the device log.
+            crate::log::device_log(
+                device,
+                &format!(".ripped marker write failed ({e}); falling back to inline mux"),
+            );
+        } else {
+            crate::log::device_log(
+                device,
+                "Sweep + patch complete; handed off to mux worker via .ripped marker.",
+            );
+            update_state(
+                device,
+                RipState {
+                    device: device.to_string(),
+                    status: "idle".to_string(),
+                    disc_present: true,
+                    disc_name: display_name.clone(),
+                    disc_format: disc_format.clone(),
+                    tmdb_title: tmdb_title.clone(),
+                    tmdb_year,
+                    tmdb_poster: tmdb_poster.clone(),
+                    tmdb_overview: tmdb_overview.clone(),
+                    duration: duration.clone(),
+                    codecs: codecs.clone(),
+                    ..Default::default()
+                },
+            );
+            if cfg_read.auto_eject {
+                // eject_drive handles drain + drop_session + unregister_halt
+                // internally. Cancel the halt first so any in-flight work
+                // exits cleanly before the eject SCSI command issues.
+                if let Some(h) = device_halt(device) {
+                    h.cancel();
+                }
+                eject_drive(device_path);
+            } else {
+                drop(session);
+                unregister_halt(device);
+            }
+            return;
+        }
+
+        // Fallback inline-mux path (only reached if the marker write
+        // above failed). Closes drive, opens ISO, runs mux as before.
         crate::log::device_log(device, "Drive released; muxing ISO → MKV.");
         drop(session);
 
@@ -3012,7 +3086,7 @@ pub fn eject_drive(device_path: &str) {
 // Callers below now use `crate::util::sanitize_path_compact` and
 // `crate::util::format_duration_hm` directly.
 
-fn format_codecs(title: &libfreemkv::DiscTitle) -> String {
+pub(crate) fn format_codecs(title: &libfreemkv::DiscTitle) -> String {
     let mut parts = Vec::new();
     // Primary video
     for s in &title.streams {

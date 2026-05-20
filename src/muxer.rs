@@ -66,7 +66,6 @@ pub struct RippedMarker {
 pub const RIPPED_MARKER_NAME: &str = ".ripped";
 pub const RIPPED_MARKER_SCHEMA: u32 = 1;
 
-#[allow(dead_code)] // wired in phase 3
 pub fn write_marker(staging_dir: &Path, marker: &RippedMarker) -> std::io::Result<()> {
     let path = staging_dir.join(RIPPED_MARKER_NAME);
     let json = serde_json::to_string_pretty(marker)
@@ -74,7 +73,6 @@ pub fn write_marker(staging_dir: &Path, marker: &RippedMarker) -> std::io::Resul
     std::fs::write(path, json)
 }
 
-#[allow(dead_code)] // wired in phase 3
 pub fn read_marker(staging_dir: &Path) -> std::io::Result<RippedMarker> {
     let path = staging_dir.join(RIPPED_MARKER_NAME);
     let bytes = std::fs::read(path)?;
@@ -92,7 +90,6 @@ pub fn read_marker(staging_dir: &Path) -> std::io::Result<RippedMarker> {
     Ok(marker)
 }
 
-#[allow(dead_code)] // wired in phase 3
 pub fn delete_marker(staging_dir: &Path) -> std::io::Result<()> {
     let path = staging_dir.join(RIPPED_MARKER_NAME);
     match std::fs::remove_file(&path) {
@@ -132,7 +129,6 @@ pub struct MuxerError {
 pub static MUX_ERRORS: once_cell::sync::Lazy<Mutex<BTreeMap<String, MuxerError>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(BTreeMap::new()));
 
-#[allow(dead_code)] // wired up in the rip_disc cut-over (phase 3)
 pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
     let Ok(mut m) = MUX_ERRORS.lock() else {
         return;
@@ -151,7 +147,6 @@ pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
     }
 }
 
-#[allow(dead_code)] // wired up in the rip_disc cut-over (phase 3)
 pub(crate) fn clear_error(path: &str) {
     if let Ok(mut m) = MUX_ERRORS.lock() {
         m.remove(path);
@@ -169,16 +164,16 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
     use std::sync::atomic::Ordering;
     tracing::info!("mux loop starting");
     while !crate::SHUTDOWN.load(Ordering::Relaxed) {
-        let cfg_snapshot = match cfg.read() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "mux: config lock poisoned, retrying");
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                continue;
-            }
-        };
-        check_and_mux(&cfg_snapshot);
-        drop(cfg_snapshot);
+        // Health-check the lock once per tick; the dispatcher itself
+        // re-borrows since `remux_from_ripped_marker` needs the full
+        // `Arc<RwLock<Config>>` (run_mux re-reads config mid-mux for
+        // skip-errors etc).
+        if cfg.read().is_err() {
+            tracing::warn!("mux: config lock poisoned, retrying");
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            continue;
+        }
+        check_and_mux(cfg);
         // SHUTDOWN-responsive sleep — same pattern as the mover so
         // SIGTERM doesn't have to wait the full 10 s tick.
         for _ in 0..100 {
@@ -191,13 +186,18 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
     tracing::info!("mux loop stopping");
 }
 
-/// Find all staging dirs with a `.ripped` marker and queue each for
-/// mux processing. Phase 3 will run the mux inside this function; for
-/// now it's a discoverer — surfaces queue items to the System page
-/// without acting on them.
-fn check_and_mux(cfg: &Config) {
-    let staging_root = &cfg.staging_dir;
-    let entries = match std::fs::read_dir(staging_root) {
+/// Find all staging dirs with a `.ripped` marker and dispatch each
+/// through the resume-mux path. Serialized — only one mux runs at a
+/// time inside this worker thread (the next one waits on the loop
+/// tick). v0.25.3 ships with a single shared worker; concurrent
+/// muxes are explicitly out of scope (RAM/CPU thrash with no real
+/// win on a single-host setup).
+fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
+    let staging_root = match cfg_arc.read() {
+        Ok(c) => c.staging_dir.clone(),
+        Err(_) => return,
+    };
+    let entries = match std::fs::read_dir(&staging_root) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -209,17 +209,8 @@ fn check_and_mux(cfg: &Config) {
         if !dir.join(RIPPED_MARKER_NAME).exists() {
             continue;
         }
-        // Phase 2: validate the marker is well-formed and log it once
-        // per session. Phase 3 dispatches the actual mux from here.
-        match read_marker(&dir) {
-            Ok(m) => {
-                tracing::debug!(
-                    staging = %dir.display(),
-                    title = %m.display_name,
-                    format = %m.disc_format,
-                    "mux worker: pending .ripped marker (phase 3 dispatches)"
-                );
-            }
+        let marker = match read_marker(&dir) {
+            Ok(m) => m,
             Err(e) => {
                 let path_str = dir.to_string_lossy().to_string();
                 record_error(
@@ -227,7 +218,28 @@ fn check_and_mux(cfg: &Config) {
                     &format!("malformed .ripped marker: {e}"),
                     "delete the .ripped file (or the whole staging dir) and re-run the rip; the marker schema may be out of date",
                 );
+                continue;
             }
+        };
+        let title = marker.display_name.clone();
+        tracing::info!(
+            staging = %dir.display(),
+            title = %title,
+            "mux worker: dispatching .ripped marker"
+        );
+        crate::log::syslog(&format!("Muxing: {} (worker)", title));
+        let ok = crate::ripper::resume::remux_from_ripped_marker(cfg_arc, &dir, &marker);
+        if ok {
+            clear_error(&dir.to_string_lossy());
+            tracing::info!(staging = %dir.display(), title = %title, "mux worker: completed");
+            crate::log::syslog(&format!("Muxed: {}", title));
+        } else {
+            let path_str = dir.to_string_lossy().to_string();
+            record_error(
+                &path_str,
+                "mux worker dispatch did not complete (see _mux device log)",
+                "check `/api/state` _mux device or the device log for the underlying error; staging is preserved for retry",
+            );
         }
     }
 }

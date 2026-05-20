@@ -125,57 +125,57 @@ fn halt_requested(device: &str) -> bool {
 /// struct because the pre-split inline mux block referenced ~25
 /// captured locals; passing them as a struct keeps the `run_mux`
 /// signature readable and avoids a long positional argument list.
-pub(super) struct MuxInputs<'a> {
-    pub(super) device: &'a str,
-    pub(super) display_name: String,
-    pub(super) disc_format: String,
-    pub(super) tmdb_title: String,
-    pub(super) tmdb_year: u16,
-    pub(super) tmdb_poster: String,
-    pub(super) tmdb_overview: String,
-    pub(super) duration: String,
-    pub(super) codecs: String,
-    pub(super) filename: String,
+pub(crate) struct MuxInputs<'a> {
+    pub(crate) device: &'a str,
+    pub(crate) display_name: String,
+    pub(crate) disc_format: String,
+    pub(crate) tmdb_title: String,
+    pub(crate) tmdb_year: u16,
+    pub(crate) tmdb_poster: String,
+    pub(crate) tmdb_overview: String,
+    pub(crate) duration: String,
+    pub(crate) codecs: String,
+    pub(crate) filename: String,
     /// Total expected bytes for the mux phase (used for percent + ETA).
     /// Falls back to the input title's `size_bytes` if 0 is passed.
-    pub(super) total_bytes: u64,
+    pub(crate) total_bytes: u64,
     /// Per-title bitrate; used to convert skipped sectors → estimated
     /// lost video time for the UI.
-    pub(super) title_bytes_per_sec: f64,
+    pub(crate) title_bytes_per_sec: f64,
     /// `max_retries + 2` in multipass mode, 0 in direct mode. Threaded
     /// through every per-frame `update_state` so the dashboard's
     /// pass/total bars don't snap back to a "fresh rip" view.
-    pub(super) total_passes: u8,
+    pub(crate) total_passes: u8,
     /// Disc capacity in bytes — same value `state.rs` uses to compute
     /// the sweep + mux contributions to the total-progress denominator.
     /// Plumbed from `disc.capacity_bytes` at the orchestrator level.
-    pub(super) bytes_total_disc: u64,
+    pub(crate) bytes_total_disc: u64,
     /// User-configured max retry passes (`cfg_read.max_retries`). Used
     /// as the multiplier on `bytes_unreadable` for the retry-phase
     /// contribution to total work, mirroring `state.rs`.
-    pub(super) max_retries: u8,
+    pub(crate) max_retries: u8,
     /// `bytes_unreadable` at mux start — i.e. after every retry pass
     /// has finished. Drives the retry-phase contribution to the
     /// total-progress denominator. Zero on a clean disc (every bad
     /// sector recovered) — in that case the retry phase contributes
     /// nothing and total = sweep+mux only, so mux opens at ~50%.
-    pub(super) bytes_unreadable_at_mux: u64,
+    pub(crate) bytes_unreadable_at_mux: u64,
     /// Pre-resolved mux output URL (e.g. `mkv:///srv/.../foo.mkv`,
     /// `network://host:port`). Resolved by the orchestrator because URL
     /// construction depends on `cfg.network_target` + `output_format`.
-    pub(super) dest_url: String,
+    pub(crate) dest_url: String,
     /// Kernel-reported preferred batch size; surfaced in `RipState` so
     /// the UI keeps showing it through the mux phase.
-    pub(super) batch: u16,
+    pub(crate) batch: u16,
     /// `cfg.on_read_error == "skip"`. When set, `input.skip_errors`
     /// is true so demux failures during mux yield zero-filled frames
     /// instead of aborting.
-    pub(super) skip_errors: bool,
+    pub(crate) skip_errors: bool,
     /// Per-disc staging directory (e.g. `/staging/MyDisc/`). Used by
     /// the hard watchdog to bump `.restart_count` before
     /// `std::process::exit(1)` so the post-restart resume logic can
     /// promote the disc to `.failed` once `RESTART_LIMIT` is reached.
-    pub(super) staging_disc_dir: PathBuf,
+    pub(crate) staging_disc_dir: PathBuf,
 }
 
 /// Outcome of `run_mux`, used by the orchestrator to drive the
@@ -183,7 +183,7 @@ pub(super) struct MuxInputs<'a> {
 /// means the loop bailed early — either user halt, write error, or
 /// read error. The bytes/elapsed are filled even on early exit so
 /// the history record reflects partial progress.
-pub(super) struct MuxOutcome {
+pub(crate) struct MuxOutcome {
     /// True iff the read loop drained `frame_rx` to natural EOF
     /// (producer dropped its `frame_tx` after either EOF on the input
     /// stream or an unrecoverable read error logged via `device_log`)
@@ -206,19 +206,19 @@ pub(super) struct MuxOutcome {
     /// - `pipe.finish_with_halt` returning Err (consumer wedged or
     ///   `MuxSink::close` propagated a finalize error from
     ///   `output.finish()` — see `finalize_error`).
-    pub(super) completed: bool,
-    pub(super) bytes_done: u64,
-    pub(super) elapsed_secs: f64,
-    pub(super) speed_mbs: f64,
+    pub(crate) completed: bool,
+    pub(crate) bytes_done: u64,
+    pub(crate) elapsed_secs: f64,
+    pub(crate) speed_mbs: f64,
     /// Demux skip count from the input stream (`DiscStream::errors`).
     /// Multipass callers usually overwrite this with the mapfile's
     /// `bytes_unreadable / 2048` because demux skips during ISO mux
     /// are typically zero — the real bad-sector count lives in the
     /// mapfile sidecar.
-    pub(super) errors: u32,
+    pub(crate) errors: u32,
     /// Estimated lost video seconds derived from `errors`. Same
     /// override pattern as `errors` when a mapfile is available.
-    pub(super) lost_video_secs: f64,
+    pub(crate) lost_video_secs: f64,
     /// True iff the output stream was successfully opened (i.e. we got
     /// past header buffering and `libfreemkv::output(...)` returned
     /// Ok). The orchestrator gates history-record writing on this:
@@ -227,7 +227,7 @@ pub(super) struct MuxOutcome {
     /// (matching pre-split behaviour). Stops or write errors after
     /// the output is open leave a partial MKV in staging and a
     /// "stopped" history record describing it.
-    pub(super) output_opened: bool,
+    pub(crate) output_opened: bool,
     /// Set when `MuxSink::close()` failed to finalise the MKV (most
     /// commonly: the Cues seek-back at EBML close raised an I/O error,
     /// leaving an unseekable / structurally-invalid output). Carries
@@ -237,7 +237,7 @@ pub(super) struct MuxOutcome {
     /// Pre-0.20.8 the close error was swallowed (logged only) and
     /// `.done` / `.completed` got written for unseekable MKVs — the
     /// validation audit's #1 "Reasonable tier" item.
-    pub(super) finalize_error: Option<String>,
+    pub(crate) finalize_error: Option<String>,
 }
 
 /// Per-frame UI state that the consumer needs to fill in the
@@ -567,7 +567,7 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
 /// `with_halt(...)` upstream so `fill_extents` also bails on the same
 /// signal — so a Stop during a dense bad-sector region observes
 /// cancellation inside libfreemkv even before the next frame yields.
-pub(super) fn run_mux(
+pub(crate) fn run_mux(
     inputs: MuxInputs<'_>,
     mut input: Box<dyn libfreemkv::pes::Stream>,
     atomics_in: MuxAtomics,
@@ -1286,13 +1286,13 @@ pub(super) fn run_mux(
 /// session's drive earlier in `rip_disc`. `input.on_event` (also on
 /// the producer side) writes them too.
 #[derive(Clone)]
-pub(super) struct MuxAtomics {
-    pub(super) latest_bytes_read: Arc<AtomicU64>,
-    pub(super) rip_last_lba: Arc<AtomicU64>,
-    pub(super) rip_current_batch: Arc<AtomicU16>,
-    pub(super) wd_last_frame: Arc<AtomicU64>,
-    pub(super) wd_bytes: Arc<AtomicU64>,
-    pub(super) input_errors: Arc<AtomicU32>,
+pub(crate) struct MuxAtomics {
+    pub(crate) latest_bytes_read: Arc<AtomicU64>,
+    pub(crate) rip_last_lba: Arc<AtomicU64>,
+    pub(crate) rip_current_batch: Arc<AtomicU16>,
+    pub(crate) wd_last_frame: Arc<AtomicU64>,
+    pub(crate) wd_bytes: Arc<AtomicU64>,
+    pub(crate) input_errors: Arc<AtomicU32>,
 }
 
 #[cfg(test)]

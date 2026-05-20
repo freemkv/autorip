@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.25.3 (2026-05-19)
+
+### New — parallel mux pipeline
+
+Three serial workers, one of each stage, running in parallel. The
+drive returns to `idle` the moment sweep + patch complete; the mux
+runs in a dedicated worker thread; the mover keeps churning behind
+that. Net effect: rip disc 3 while muxing disc 2 while moving
+disc 1.
+
+- New `crate::muxer` module — background worker (`run(cfg)`)
+  mirroring `mover::run` shape: 10-second tick, single shared
+  worker (serialized), `MUX_STATE` global for live progress,
+  `MUX_ERRORS` map for stuck dirs.
+- `.ripped` hand-off marker — JSON written to the staging dir by
+  `ripper::rip_disc` when sweep + patch finish. Carries paths,
+  TMDB metadata, cfg-bound knobs, rip-side stats. Schema versioned
+  (currently 1).
+- `ripper::rip_disc` (multipass mode): after the patch loop +
+  abort-on-lost check passes, writes `.ripped`, ejects the drive
+  (if `auto_eject`), returns the device tile to `idle`, and exits
+  without running the inline mux. Single-pass mode (`max_retries=0`)
+  is unchanged — no ISO to hand off.
+- `ripper::resume::remux_from_ripped_marker` — calls
+  `resume_remux` with a synthetic `_mux` device key so the mux,
+  history record, `.done` / `.completed` markers, and stuck-dir
+  surfacing all reuse the existing battle-tested path. The
+  underscore-prefixed device is filtered out of the dashboard
+  tile grid.
+- System page: new **Mux Queue** card mirroring the Move Queue,
+  same render path (`_mux` field on SSE, `renderMuxes()` JS,
+  `mux_queue` + `mux_errors` on `/api/system`).
+
+### Fixed — post-cp validation (replaces size-stat)
+
+The v0.25.2 release-test rip hit a phantom `SizeMismatch` on a
+58 GiB Civil War MKV that had byte-for-byte landed on NFS — the cp
+closed, the autorip mover ran `std::fs::metadata` on the dest,
+NFS returned a stale cached attribute, and the size compared as
+short. Source was preserved (validation is gated correctly) but
+the staging dir got stuck behind a phantom `MOVE_ERRORS` entry.
+
+New `mover::check_post_copy` is format-aware:
+- **.mkv** → verifies EBML magic `1A 45 DF A3` at offset 0 + a
+  readable tail. Doesn't touch `stat()` at all; catches truncated
+  cp without depending on NFS attribute freshness.
+- **.m2ts** → samples TS sync byte `0x47` at 16 BD-TS packet
+  boundaries across head + tail.
+- **.iso** → fresh-FD stat (`std::fs::File::open` + `.metadata()`),
+  which round-trips a GETATTR to the NFS server and skips the
+  attribute cache.
+
 ## 0.25.2 (2026-05-19)
 
 ### Fixed
