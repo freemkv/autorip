@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.25.4 (2026-05-20)
+
+### New — opt-in in-container NFS mount
+
+Bind-mounting an NFS share from the host into the container makes
+the container fragile to host-side mount state: when Unraid spins
+the disk down or drops the idle TCP, the host's NFS file handle
+goes stale. Watchtower's next restart then can't bind-mount and
+the container is stranded in `Created` — fixed only by a manual
+`umount -fl + mount` on the host. Hit this twice in one session
+during the v0.25.2 → v0.25.3 rollout.
+
+v0.25.4 adds an opt-in path that mounts NFS *inside* the
+container. Each container start gets a fresh NFS session, so
+stale state self-heals on restart — Watchtower deploys stop
+needing a host-side intervention.
+
+Activate by setting in `docker-compose.yml`:
+```
+environment:
+  - NFS_HOST=unraid-1.internal.lan
+  - NFS_EXPORT=/mnt/user/media
+  - NFS_MOUNTPOINT=/output
+  - NFS_OPTS=vers=4.1,nconnect=4,nolock,actimeo=3,hard,_netdev
+```
+…and removing the matching `- /mnt/...:/output` line from
+`volumes:`. The entrypoint mounts the share before exec'ing
+autorip; if the mount fails the container still starts (with an
+empty `/output`) so a transient unraid blip doesn't trip the
+restart loop. `privileged: true` (which autorip already needs for
+SCSI access) covers the mount syscall capability — no extra
+`cap_add` needed.
+
+Image base picks up `nfs-common`; if `NFS_HOST` is unset the
+entrypoint is a no-op and the bind-mount pattern keeps working
+unchanged.
+
 ## 0.25.3 (2026-05-19)
 
 ### New — parallel mux pipeline
