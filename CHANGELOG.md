@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.25.5 (2026-05-20)
+
+### Fixed
+
+- **`nfs-common` missing from CI image.** v0.25.4 added the package
+  to the local-dev `Dockerfile` but not `Dockerfile.ci`, which is
+  what the GitHub Actions release pipeline uses. Result: the
+  v0.25.4 image had the in-container NFS mount code path but no
+  `mount.nfs` helper, so the entrypoint's NFS mount call failed
+  with "bad option; for several filesystems (e.g. nfs, cifs) you
+  might need a /sbin/mount.&lt;type&gt; helper program." 0.25.5 adds
+  `nfs-common` to `Dockerfile.ci` so the in-container mount path
+  actually works in deployed images.
+
 ## 0.25.4 (2026-05-20)
 
 ### New — opt-in in-container NFS mount
