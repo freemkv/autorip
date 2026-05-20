@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.25.8 (2026-05-20)
+
+### Fixed
+
+- **[critical] 0.25.7 image was DOA.** Dockerfile.ci's
+  `COPY autorip /usr/local/bin/autorip` didn't set the execute bit,
+  and the FROM scratch base has no chmod available. The artifact
+  uploaded by the `build` job lands 0644 in the build context
+  (actions/upload-artifact strips +x on Linux). 0.25.7 containers
+  failed to start with `permission denied` on `/usr/local/bin/autorip`
+  before any logging was initialized. 0.25.8 adds `--chmod=0755` to
+  the COPY in both Dockerfile and Dockerfile.ci.
+
 ## 0.25.7 (2026-05-20)
 
 ### Fixed

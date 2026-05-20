@@ -63,8 +63,14 @@ RUN apk add --no-cache nfs-utils busybox-static \
 
 FROM scratch
 COPY --from=harvest /out/ /
-COPY autorip /usr/local/bin/autorip
-COPY udev-trigger.sh /usr/local/bin/udev-trigger.sh
+# --chmod=0755 is mandatory for FROM scratch: the artifact uploaded
+# by the build job lands 0644 in the build context (actions/upload-
+# artifact strips the exec bit on Linux). Without --chmod the binary
+# is non-executable and the container fails to start with "permission
+# denied" before observe::init ever runs. v0.25.7 shipped without it
+# and was DOA on every deploy.
+COPY --chmod=0755 autorip /usr/local/bin/autorip
+COPY --chmod=0755 udev-trigger.sh /usr/local/bin/udev-trigger.sh
 
 EXPOSE 8080
 

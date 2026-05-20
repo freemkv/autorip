@@ -46,8 +46,11 @@ RUN apk add --no-cache nfs-utils busybox-static \
 
 FROM scratch
 COPY --from=harvest /out/ /
-COPY --from=builder /build/target/release/autorip /usr/local/bin/autorip
-COPY udev-trigger.sh /usr/local/bin/udev-trigger.sh
+# --chmod=0755 on the host-context COPY for udev-trigger.sh
+# (cargo-built binary already has +x from the builder stage but
+# pin perms explicitly to match Dockerfile.ci).
+COPY --from=builder --chmod=0755 /build/target/release/autorip /usr/local/bin/autorip
+COPY --chmod=0755 udev-trigger.sh /usr/local/bin/udev-trigger.sh
 
 EXPOSE 8080
 
