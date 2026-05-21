@@ -3254,19 +3254,19 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
         | ec::E_AACS_HOST_CERT_REJECTED => format!(
             "Host cert rejected (E{code})\n\
              Drive HRL rejected every cert in KEYDB. Needs firmware unrevoke or \
-             libredrive raw-read."
+             raw-read mode."
         ),
 
-        // Drive is not libredrive-capable AND keydb has no host certs
-        // available for cert auth. Distinct from cert-rejected because
-        // we never got far enough to attempt cert exchange.
-        ec::E_AACS_LIBREDRIVE_UNSUPPORTED => format!(
+        // Drive does not support raw-read mode AND keydb has no host
+        // certs available for cert auth. Distinct from cert-rejected
+        // because we never got far enough to attempt cert exchange.
+        ec::E_AACS_RAW_READ_UNSUPPORTED => format!(
             "No usable cert (E{code})\n\
-             Drive not raw-read capable AND no certs in KEYDB. Can't rip on this drive."
+             Drive does not support raw-read mode AND no certs in KEYDB. Can't rip on this drive."
         ),
 
         // VID retrieval failed. From cert path: VID read (7009) or VID
-        // MAC verification (7010) went sideways. From libredrive path:
+        // MAC verification (7010) went sideways. From raw-read path:
         // the alternate READ_DISC_STRUCTURE read failed (7017). Either
         // way the disc isn't in KEYDB (otherwise Path 1 would have hit
         // before we landed here).
@@ -3502,7 +3502,7 @@ mod tests {
         let s = aacs_failure_message(Some(&e));
         assert!(s.starts_with("Host cert rejected"), "msg: {s}");
         assert!(s.contains("E7003"), "msg: {s}");
-        assert!(s.contains("libredrive raw-read"), "msg: {s}");
+        assert!(s.contains("raw-read mode"), "msg: {s}");
         // No "Update KEYDB" — KEYDB has the cert; the HRL blocks it.
         assert!(!s.contains("Update KEYDB"), "msg: {s}");
         // Must not leak the debug-dump form the old catch-all emitted.
@@ -3595,18 +3595,18 @@ mod tests {
     }
 
     #[test]
-    fn aacs_failure_libredrive_unsupported_says_no_cert() {
-        // E7016 — drive isn't libredrive-capable AND no host certs.
-        let e = Error::AacsLibredriveUnsupported;
+    fn aacs_failure_raw_read_unsupported_says_no_cert() {
+        // E7016 — drive doesn't support raw-read mode AND no host certs.
+        let e = Error::AacsRawReadUnsupported;
         let s = aacs_failure_message(Some(&e));
         assert!(s.starts_with("No usable cert"), "msg: {s}");
         assert!(s.contains("E7016"), "msg: {s}");
-        assert!(s.contains("not raw-read capable"), "msg: {s}");
+        assert!(s.contains("does not support raw-read mode"), "msg: {s}");
     }
 
     #[test]
     fn aacs_failure_vid_unavailable_says_vid_missing() {
-        // E7017 — libredrive alternate VID read failed.
+        // E7017 — alternate VID read failed.
         let e = Error::AacsVidUnavailable;
         let s = aacs_failure_message(Some(&e));
         assert!(s.starts_with("No Volume ID"), "msg: {s}");
@@ -3643,7 +3643,7 @@ mod tests {
             Error::AacsNoKeys,
             Error::AacsCertRejected,
             Error::AacsHostCertRejected,
-            Error::AacsLibredriveUnsupported,
+            Error::AacsRawReadUnsupported,
             Error::AacsVidUnavailable,
             Error::AacsMkUnavailable,
             Error::AacsVukNotInKeydb,
