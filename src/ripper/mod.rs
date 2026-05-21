@@ -3191,37 +3191,116 @@ fn audio_secondary_suffix(secondary: bool) -> &'static str {
 /// Switches on the libfreemkv error surfaced via `Disc::aacs_error` so the
 /// UI tells the user *which* failure they're looking at instead of always
 /// printing the same generic "check KEYDB" line.
+///
+/// Dispatch is **code-based** (`e.code()`) using named libfreemkv constants.
+/// Codes outside the named set fall through to the 7xxx catch-all rather
+/// than breaking the build when libfreemkv adds a new variant.
 fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
-    match err {
-        Some(libfreemkv::Error::KeydbLoad { path }) if path == "<no keydb in search paths>" => {
-            "Disc is encrypted but no KEYDB.cfg found. Set the path in Settings \
-             or click \"Update KEYDB\" to download one."
-                .to_string()
+    use libfreemkv::error as ec;
+
+    // KeydbLoad is a structural pre-condition failure, not an AACS
+    // resolution failure — surface it with its own messaging before
+    // the numeric dispatch.
+    if let Some(libfreemkv::Error::KeydbLoad { path }) = err {
+        if path == "<no keydb in search paths>" {
+            return "Disc is encrypted but no KEYDB.cfg found. Set the path in Settings \
+                    or click \"Update KEYDB\" to download one."
+                .to_string();
         }
-        Some(libfreemkv::Error::KeydbLoad { path }) => {
-            format!(
-                "Disc is encrypted; KEYDB at {path} failed to load (E{}). \
-                 File may be corrupt — click \"Update KEYDB\" to re-download.",
-                libfreemkv::error::E_KEYDB_LOAD
-            )
-        }
-        Some(libfreemkv::Error::AacsNoKeys) => format!(
-            "Disc is encrypted; KEYDB loaded but this disc's key couldn't be \
-             resolved (E{}). The disc hash isn't in KEYDB and the MKB/PK/DK \
-             fallback paths all failed. Try \"Update KEYDB\".",
-            libfreemkv::error::E_AACS_NO_KEYS
+        return format!(
+            "Disc is encrypted; KEYDB at {path} failed to load (E{}). \
+             File may be corrupt — click \"Update KEYDB\" to re-download.",
+            ec::E_KEYDB_LOAD
+        );
+    }
+
+    let Some(e) = err else {
+        // Defensive fallback. scan_with always sets aacs_error when
+        // encrypted && aacs.is_none(); if we land here something is
+        // structurally off (e.g. callers building Disc by hand).
+        return "Disc is encrypted but no decryption keys found (check KEYDB)".to_string();
+    };
+
+    let code = e.code();
+    // Intentional overlap: specific 7xxx codes have dedicated arms above
+    // the `7000..=7999` catch-all. Match-order semantics give us the
+    // dispatch we want; clippy's match-overlapping-arm lint is a false
+    // positive in this layout.
+    #[allow(clippy::match_overlapping_arm)]
+    match code {
+        // E7000 — generic "everything tried, nothing worked" catch-all.
+        ec::E_AACS_NO_KEYS => format!(
+            "Missing: all (VID, MK, VUK). Disc is encrypted; KEYDB loaded but this \
+             disc's key couldn't be resolved (E{code}). The disc hash isn't in KEYDB \
+             and the MKB/PK/DK fallback paths all failed. Try \"Update KEYDB\"."
         ),
-        Some(e) => format!(
-            "Disc is encrypted; AACS resolution failed: E{} ({e:?}). Check \
-             /api/debug for details.",
-            e.code()
+
+        // Host cert rejected by the drive's HRL. Surfaces from
+        // `aacs/handshake.rs` as drive-side AGID/cert rejection (7003),
+        // host-side verify failure on the drive's cert (7005), drive
+        // rejected our processing key (7007), or the post-loop
+        // `AacsHostCertRejected` (7015) when every host cert in KEYDB
+        // was rejected. Same user remediation in every case: this
+        // drive's cert is on the AACS HRL.
+        ec::E_AACS_CERT_REJECTED
+        | ec::E_AACS_CERT_VERIFY
+        | ec::E_AACS_KEY_REJECTED
+        | ec::E_AACS_HOST_CERT_REJECTED => format!(
+            "Missing: host-cert-rejected. Drive rejected host cert (revoked by drive HRL, \
+             E{code}). Either the drive must be unrevoked (firmware) or libredrive \
+             raw-read mode must be available on this drive."
         ),
-        None => {
-            // Defensive fallback. scan_with always sets aacs_error when
-            // encrypted && aacs.is_none(); if we land here something is
-            // structurally off (e.g. callers building Disc by hand).
-            "Disc is encrypted but no decryption keys found (check KEYDB)".to_string()
+
+        // Drive is not libredrive-capable AND keydb has no host certs
+        // available for cert auth. Distinct from cert-rejected because
+        // we never got far enough to attempt cert exchange.
+        ec::E_AACS_LIBREDRIVE_UNSUPPORTED => format!(
+            "Missing: host-cert-rejected. Drive is not raw-read capable and no host \
+             certs were available for AACS auth (E{code}). This disc cannot be \
+             ripped on this drive."
+        ),
+
+        // VID retrieval failed. From cert path: VID read (7009) or VID
+        // MAC verification (7010) went sideways. From libredrive path:
+        // the alternate READ_DISC_STRUCTURE read failed (7017). Either
+        // way the disc isn't in KEYDB (otherwise Path 1 would have hit
+        // before we landed here).
+        ec::E_AACS_VID_READ | ec::E_AACS_VID_MAC | ec::E_AACS_VID_UNAVAILABLE => format!(
+            "Missing: VID. Drive ok at the SCSI layer, but Volume ID could not be \
+             retrieved (E{code}). Cannot compute keys for novel discs. The disc \
+             isn't in KEYDB either — try \"Update KEYDB\"."
+        ),
+
+        // MK derivation failed. VID succeeded but no DK in keydb walks
+        // this disc's MKB (7011) and no further fallback is available
+        // (7018).
+        ec::E_AACS_DATA_KEY | ec::E_AACS_MK_UNAVAILABLE => format!(
+            "Missing: MK. Drive ok, VID retrieved. No device key in KEYDB walks this \
+             disc's MKB (E{code}). Disc requires DK material that isn't in KEYDB. \
+             Try \"Update KEYDB\"."
+        ),
+
+        // Disc-hash lookup in keydb missed and no other path is
+        // available. Typically downstream of VID being unavailable so
+        // the derivation paths short-circuit.
+        ec::E_AACS_VUK_NOT_IN_KEYDB => {
+            format!("Missing: VUK. Disc hash isn't in KEYDB (E{code}). Try \"Update KEYDB\".")
         }
+
+        // Other 7xxx — known AACS category but unmapped. Use a
+        // generic-but-honest message rather than `({e:?})` debug-dump.
+        7000..=7999 => format!(
+            "Missing: unknown. Disc is encrypted; AACS resolution failed (E{code}). \
+             Try \"Update KEYDB\"; if that doesn't help, file an issue at \
+             github.com/freemkv/freemkv/issues with this code."
+        ),
+
+        // Non-AACS code on the aacs_error slot — structurally
+        // unexpected. Preserve the code; drop the `{e:?}` debug dump.
+        _ => format!(
+            "Disc is encrypted; key resolution failed with non-AACS error E{code}. \
+             Check /api/debug for details."
+        ),
     }
 }
 
@@ -3311,7 +3390,7 @@ mod tests {
     //! Tests for orchestrator-level helpers that live in this file.
     //! State-only helpers and their tests live in `state.rs`.
 
-    use super::format_pass_error;
+    use super::{aacs_failure_message, format_pass_error};
     use libfreemkv::{Error, ScsiSense};
 
     #[test]
@@ -3377,6 +3456,175 @@ mod tests {
         let s = format_pass_error("Pass 1", &e);
         assert!(s.contains("Pass 1"));
         assert!(s.contains("io test"));
+    }
+
+    // ── aacs_failure_message dispatch ────────────────────────────────
+    //
+    // Code-based dispatch must (1) lead each user-facing message with the
+    // missing-key tag, (2) include the numeric `E{code}` so support
+    // requests stay routable, and (3) never leak the `{e:?}` debug dump
+    // the pre-rewrite catch-all produced.
+
+    #[test]
+    fn aacs_failure_keydb_load_missing_path() {
+        let e = Error::KeydbLoad {
+            path: "<no keydb in search paths>".into(),
+        };
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.contains("no KEYDB.cfg found"), "msg: {s}");
+        assert!(s.contains("Update KEYDB"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_keydb_load_corrupt() {
+        let e = Error::KeydbLoad {
+            path: "/srv/autorip/config/keys/keydb.cfg".into(),
+        };
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.contains("/srv/autorip/config/keys/keydb.cfg"), "msg: {s}");
+        assert!(s.contains("E8005"), "msg: {s}");
+        assert!(s.contains("Update KEYDB"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_cert_rejected_says_host_cert() {
+        // E7003 — drive rejected our host cert (HRL).
+        let e = Error::AacsCertRejected;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: host-cert-rejected"), "msg: {s}");
+        assert!(s.contains("E7003"), "msg: {s}");
+        assert!(s.contains("libredrive raw-read"), "msg: {s}");
+        // Must not leak the debug-dump form the old catch-all emitted.
+        assert!(!s.contains("AacsCertRejected"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_cert_verify_collapses_to_host_cert() {
+        let e = Error::AacsCertVerify;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: host-cert-rejected"), "msg: {s}");
+        assert!(s.contains("E7005"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_key_rejected_says_host_cert() {
+        // E7007 — drive HRL blocked our processing key. Same
+        // remediation as cert rejection.
+        let e = Error::AacsKeyRejected;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: host-cert-rejected"), "msg: {s}");
+        assert!(s.contains("E7007"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_vid_read_says_vid_missing() {
+        let e = Error::AacsVidRead;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: VID"), "msg: {s}");
+        assert!(s.contains("E7009"), "msg: {s}");
+        assert!(s.contains("Volume ID"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_vid_mac_says_vid_missing() {
+        let e = Error::AacsVidMac;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: VID"), "msg: {s}");
+        assert!(s.contains("E7010"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_data_key_says_mk_missing() {
+        let e = Error::AacsDataKey;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: MK"), "msg: {s}");
+        assert!(s.contains("E7011"), "msg: {s}");
+        assert!(s.contains("MKB"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_no_keys_says_all_missing() {
+        let e = Error::AacsNoKeys;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: all"), "msg: {s}");
+        assert!(s.contains("E7000"), "msg: {s}");
+        assert!(s.contains("Update KEYDB"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_unknown_aacs_code_uses_generic_7xxx_arm() {
+        // Unmapped-but-AACS-range error falls through to the 7xxx
+        // catch-all. E_AACS_AGID_ALLOC (7002) is not in any named arm
+        // and exercises that path.
+        let e = Error::AacsAgidAlloc;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: unknown"), "msg: {s}");
+        assert!(s.contains("E7002"), "msg: {s}");
+        assert!(s.contains("github.com/freemkv/freemkv/issues"), "msg: {s}");
+        // No debug-dump leak.
+        assert!(!s.contains("AacsAgidAlloc"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_none_falls_back_defensively() {
+        let s = aacs_failure_message(None);
+        assert!(s.contains("no decryption keys"), "msg: {s}");
+    }
+
+    // ── new AACS variants landing with v0.25.11 ──────────────────────
+    //
+    // The five split variants (7015-7019) get dedicated arms; these
+    // tests pin the routing so future libfreemkv churn that renumbers
+    // or reorders the constants would surface here.
+
+    #[test]
+    fn aacs_failure_host_cert_rejected_says_host_cert() {
+        // E7015 — all host certs in keydb were rejected by the drive.
+        let e = Error::AacsHostCertRejected;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: host-cert-rejected"), "msg: {s}");
+        assert!(s.contains("E7015"), "msg: {s}");
+        assert!(!s.contains("AacsHostCertRejected"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_libredrive_unsupported_says_host_cert() {
+        // E7016 — drive isn't libredrive-capable AND no host certs.
+        let e = Error::AacsLibredriveUnsupported;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: host-cert-rejected"), "msg: {s}");
+        assert!(s.contains("E7016"), "msg: {s}");
+        assert!(s.contains("not raw-read capable"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_vid_unavailable_says_vid_missing() {
+        // E7017 — libredrive alternate VID read failed.
+        let e = Error::AacsVidUnavailable;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: VID"), "msg: {s}");
+        assert!(s.contains("E7017"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_mk_unavailable_says_mk_missing() {
+        // E7018 — VID ok, but no DK in keydb walks this MKB.
+        let e = Error::AacsMkUnavailable;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: MK"), "msg: {s}");
+        assert!(s.contains("E7018"), "msg: {s}");
+        assert!(s.contains("MKB"), "msg: {s}");
+    }
+
+    #[test]
+    fn aacs_failure_vuk_not_in_keydb_says_vuk_missing() {
+        // E7019 — disc hash isn't in keydb and no derivation path
+        // was available.
+        let e = Error::AacsVukNotInKeydb;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Missing: VUK"), "msg: {s}");
+        assert!(s.contains("E7019"), "msg: {s}");
+        assert!(s.contains("Update KEYDB"), "msg: {s}");
     }
 
     #[test]
