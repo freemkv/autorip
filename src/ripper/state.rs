@@ -136,6 +136,9 @@ pub struct RipState {
     /// for the same rip; cleared when status returns to `idle`.
     #[serde(default)]
     pub started_epoch_secs: u64,
+    /// Key readiness determined at scan time, for the dashboard tile:
+    /// "Ready to rip", "Missing keys — <reason>", or "" (unknown).
+    pub key_status: String,
 }
 
 impl Default for RipState {
@@ -183,6 +186,7 @@ impl Default for RipState {
             damage_severity: String::new(),
             failure_reason: None,
             started_epoch_secs: 0,
+            key_status: String::new(),
         }
     }
 }

@@ -67,6 +67,19 @@ fn resolve_keys_from_drive(
     crate::keysource::resolve_keys(&ks, &mut access, disc)
 }
 
+/// Human-readable key readiness for the dashboard tile, decided at scan time.
+/// Unencrypted, or keys present → "Ready to rip"; encrypted with no keys →
+/// "Missing keys — <reason>" (the concise AACS failure heading, source-free).
+fn key_readiness(disc: &libfreemkv::Disc) -> String {
+    if disc.encrypted && matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None) {
+        let msg = aacs_failure_message(disc.aacs_error.as_ref());
+        let head = msg.lines().next().unwrap_or("no keys");
+        format!("Missing keys — {head}")
+    } else {
+        "Ready to rip".to_string()
+    }
+}
+
 use session::{
     DriveSession, drop_session, rediscover_drive, session_is_scanned, store_session, take_session,
 };
@@ -608,6 +621,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Sample-based key source: resolve the Unit Key from the disc's files +
     // on-disc samples and re-scan with it (a no-op for a local source).
     let disc = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
+    let key_status = key_readiness(&disc);
 
     // Update format from full scan (UHD vs BD now known)
     let disc_name = disc
@@ -689,6 +703,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             codecs,
             last_error: last_error_str,
             failure_reason: failure_field,
+            key_status,
             ..Default::default()
         },
     );

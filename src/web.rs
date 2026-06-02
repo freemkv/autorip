@@ -511,7 +511,7 @@ function renderCurrent(){
     const yr=s.tmdb_year>0?s.tmdb_year:'';
     const dur=s.duration?' \u00b7 '+esc(s.duration):'';
     const codecs=s.codecs?'<div class="mo" style="color:var(--text3);font-size:.75rem;margin-top:6px">'+esc(s.codecs)+'</div>':'';
-    const ready=s.status==='idle'?'<div class="mo" style="color:var(--green)">Ready to rip</div>':'';
+    const ks=s.key_status||'';const rc=ks.indexOf('Missing')===0?'var(--yellow)':'var(--green)';const ready=s.status==='idle'?'<div class="mo" style="color:'+rc+'">'+esc(ks||'Ready to rip')+'</div>':'';
     card='<div class="np">'+img+'<div class="nfo"><div class="mt">'+esc(title)+'</div><div class="my">'+yr+dur+' '+b+'</div>'+o+codecs+ready+'</div></div>';
   }
   upd('np',card);
