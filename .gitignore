@@ -4,3 +4,6 @@
 *.swo
 .DS_Store
 infra/
+
+# session scratch — never track (may contain RE breadcrumbs)
+scratch/
