@@ -704,10 +704,9 @@ pub(crate) fn remux_from_ripped_marker(
     success
 }
 
-/// Sample-based key source on the resume/deferred-mux path: read the disc's key
-/// files + on-disc samples from the staged ISO, plus the Volume ID persisted in
-/// the mapfile, resolve a Unit Key, and re-scan the ISO with it so decryption
-/// keys populate. Returns the disc unchanged for a local source or on a miss.
+/// Resolve keys for a resumed disc via the configured source. A thin ISO/mapfile
+/// binding over [`crate::keysource::resolve_keys`]; returns the disc re-scanned
+/// with the key (sample-based source) or unchanged (local / no key).
 fn resolve_keys_from_iso(
     cfg: &Config,
     iso_path: &Path,
@@ -715,37 +714,9 @@ fn resolve_keys_from_iso(
     disc: libfreemkv::Disc,
     capacity: u32,
 ) -> libfreemkv::Disc {
-    use crate::keysource::{KeySource, SAMPLE_UNITS, read_sample_units};
-    let ks = KeySource::from_config(cfg);
-    if !ks.needs_samples() {
-        return disc;
-    }
-    let Some(title) = disc.titles.first().cloned() else {
-        return disc;
-    };
-    let Ok((inf, mkb)) = libfreemkv::Disc::read_aacs_inputs(iso_path) else {
-        return disc;
-    };
-    let vid = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path)
-        .ok()
-        .and_then(|m| m.vid());
-    let units = match libfreemkv::FileSectorSource::open(iso_path) {
-        Ok(mut r) => read_sample_units(&mut r, &title, SAMPLE_UNITS),
-        Err(_) => Vec::new(),
-    };
-    match ks.resolve(&inf, &mkb, vid, &units) {
-        Some(uk) => {
-            let opts = libfreemkv::ScanOptions {
-                unit_key: Some(uk),
-                ..Default::default()
-            };
-            match libfreemkv::FileSectorSource::open(iso_path) {
-                Ok(mut r) => libfreemkv::Disc::scan_image(&mut r, capacity, &opts).unwrap_or(disc),
-                Err(_) => disc,
-            }
-        }
-        None => disc,
-    }
+    let ks = crate::keysource::KeySource::from_config(cfg);
+    let mut access = crate::keysource::IsoAccess::new(iso_path, mapfile_path, capacity);
+    crate::keysource::resolve_keys(&ks, &mut access, disc)
 }
 
 // Tests live in `tests/resume_remux.rs` (integration tests) — they

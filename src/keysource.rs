@@ -11,7 +11,7 @@
 //! source for the Unit Key, then re-scan with it). The rip/resume code drives
 //! both shapes through this one type.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
@@ -161,6 +161,124 @@ pub fn read_sample_units(
             (o + UNIT_LEN <= buf.len()).then(|| buf[o..o + UNIT_LEN].to_vec())
         })
         .collect()
+}
+
+/// How a disc's key-resolution inputs are obtained, and how the disc is
+/// re-scanned once a Unit Key is known. Decouples [`resolve_keys`] from WHERE
+/// the disc lives — a live drive or a staged ISO — so the resolution logic is
+/// written once. See [`DriveAccess`] and [`IsoAccess`].
+pub trait DiscKeyAccess {
+    /// The disc's `Unit_Key_RO.inf` + `MKB` bytes.
+    fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)>;
+    /// The 16-byte AACS Volume ID, if available.
+    fn volume_id(&self) -> Option<[u8; 16]>;
+    /// Up to `n` encrypted aligned units sampled from the disc's content.
+    fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>>;
+    /// Re-scan the disc supplying `uk`, so its decryption keys populate.
+    fn rescan(&mut self, uk: [u8; 16]) -> Option<libfreemkv::Disc>;
+}
+
+/// Resolve a Unit Key for `disc` via `ks`, reading inputs + re-scanning through
+/// `access`. Returns the re-scanned disc (now carrying keys) on success, or
+/// `disc` unchanged for a source that resolves inline (local) or on a miss.
+///
+/// This is the single code path for both the live-drive and resume-from-ISO
+/// flows; the only difference between them is the `DiscKeyAccess` impl.
+pub fn resolve_keys<A: DiscKeyAccess>(
+    ks: &KeySource,
+    access: &mut A,
+    disc: libfreemkv::Disc,
+) -> libfreemkv::Disc {
+    if !ks.needs_samples() {
+        return disc;
+    }
+    let Some(title) = disc.titles.first().cloned() else {
+        return disc;
+    };
+    let Some((inf, mkb)) = access.key_files() else {
+        return disc;
+    };
+    let vid = access.volume_id();
+    let units = access.sample_units(&title, SAMPLE_UNITS);
+    match ks.resolve(&inf, &mkb, vid, &units) {
+        Some(uk) => access.rescan(uk).unwrap_or(disc),
+        None => disc,
+    }
+}
+
+/// [`DiscKeyAccess`] backed by a live optical drive. `vid` is the Volume ID
+/// from the structure scan (the drive read it during AACS auth).
+pub struct DriveAccess<'a> {
+    drive: &'a mut libfreemkv::Drive,
+    vid: Option<[u8; 16]>,
+}
+
+impl<'a> DriveAccess<'a> {
+    pub fn new(drive: &'a mut libfreemkv::Drive, vid: Option<[u8; 16]>) -> Self {
+        Self { drive, vid }
+    }
+}
+
+impl DiscKeyAccess for DriveAccess<'_> {
+    fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        libfreemkv::Disc::read_aacs_inputs_from_drive(self.drive).ok()
+    }
+    fn volume_id(&self) -> Option<[u8; 16]> {
+        self.vid
+    }
+    fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>> {
+        read_sample_units(self.drive, title, n)
+    }
+    fn rescan(&mut self, uk: [u8; 16]) -> Option<libfreemkv::Disc> {
+        let opts = libfreemkv::ScanOptions {
+            unit_key: Some(uk),
+            ..Default::default()
+        };
+        libfreemkv::Disc::scan(self.drive, &opts).ok()
+    }
+}
+
+/// [`DiscKeyAccess`] backed by a staged ISO + its mapfile (the resume path).
+/// The Volume ID is recovered from the mapfile (the ISO doesn't carry it).
+pub struct IsoAccess<'a> {
+    iso_path: &'a Path,
+    mapfile_path: &'a Path,
+    capacity: u32,
+}
+
+impl<'a> IsoAccess<'a> {
+    pub fn new(iso_path: &'a Path, mapfile_path: &'a Path, capacity: u32) -> Self {
+        Self {
+            iso_path,
+            mapfile_path,
+            capacity,
+        }
+    }
+}
+
+impl DiscKeyAccess for IsoAccess<'_> {
+    fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        libfreemkv::Disc::read_aacs_inputs(self.iso_path).ok()
+    }
+    fn volume_id(&self) -> Option<[u8; 16]> {
+        libfreemkv::disc::mapfile::Mapfile::load(self.mapfile_path)
+            .ok()
+            .and_then(|m| m.vid())
+    }
+    fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>> {
+        match libfreemkv::FileSectorSource::open(self.iso_path) {
+            Ok(mut r) => read_sample_units(&mut r, title, n),
+            Err(_) => Vec::new(),
+        }
+    }
+    fn rescan(&mut self, uk: [u8; 16]) -> Option<libfreemkv::Disc> {
+        let opts = libfreemkv::ScanOptions {
+            unit_key: Some(uk),
+            ..Default::default()
+        };
+        let mut r = libfreemkv::FileSectorSource::open(self.iso_path).ok()?;
+        libfreemkv::Disc::scan_image(&mut r, self.capacity, &opts).ok()
+    }
 }
 
 /// Parse a 32-char hex Unit Key into 16 bytes.

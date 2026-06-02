@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-use crate::keysource::{KeySource, read_sample_units};
+use crate::keysource::{DriveAccess, KeySource};
 
 /// [`libfreemkv::ScanOptions`] for the structure scan, per the configured key
 /// source (local carries the key database; sample-based sources scan keyless
@@ -52,41 +52,19 @@ pub(crate) fn scan_opts_for(cfg: &Config) -> libfreemkv::ScanOptions {
     KeySource::from_config(cfg).scan_options()
 }
 
-/// For sample-based key sources: after a structure scan, read the disc's key
-/// files + Volume ID + a few on-disc content samples off the drive, resolve a
-/// Unit Key, and re-scan with it so decryption keys populate. Returns the disc
-/// unchanged for non-sample sources (local) or when no key is available.
+/// Resolve keys for a freshly-scanned live disc via the configured source. A
+/// thin live-drive binding over [`crate::keysource::resolve_keys`]; returns the
+/// disc re-scanned with the key (sample-based source) or unchanged (local / no
+/// key).
 fn resolve_keys_from_drive(
     cfg: &Config,
-    device: &str,
     drive: &mut libfreemkv::Drive,
     disc: libfreemkv::Disc,
 ) -> libfreemkv::Disc {
     let ks = KeySource::from_config(cfg);
-    if !ks.needs_samples() {
-        return disc;
-    }
-    let Some(title) = disc.titles.first().cloned() else {
-        return disc;
-    };
     let vid = disc.aacs.as_ref().map(|a| a.volume_id);
-    let Ok((inf, mkb)) = libfreemkv::Disc::read_aacs_inputs_from_drive(drive) else {
-        return disc;
-    };
-    let units = read_sample_units(drive, &title, crate::keysource::SAMPLE_UNITS);
-    match ks.resolve(&inf, &mkb, vid, &units) {
-        Some(uk) => {
-            let opts = libfreemkv::ScanOptions {
-                unit_key: Some(uk),
-                ..Default::default()
-            };
-            libfreemkv::Disc::scan(drive, &opts).unwrap_or(disc)
-        }
-        None => {
-            crate::log::device_log(device, "No key available for this disc from the key source");
-            disc
-        }
-    }
+    let mut access = DriveAccess::new(drive, vid);
+    crate::keysource::resolve_keys(&ks, &mut access, disc)
 }
 
 use session::{
@@ -629,7 +607,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     };
     // Sample-based key source: resolve the Unit Key from the disc's files +
     // on-disc samples and re-scan with it (a no-op for a local source).
-    let disc = resolve_keys_from_drive(&cfg_read, device, &mut drive, disc);
+    let disc = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
 
     // Update format from full scan (UHD vs BD now known)
     let disc_name = disc
@@ -1010,7 +988,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     return;
                 }
             };
-            let disc = resolve_keys_from_drive(&cfg_read, device, &mut drive, disc);
+            let disc = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
 
             let disc_name = disc
                 .meta_title
