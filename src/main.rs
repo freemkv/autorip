@@ -116,8 +116,19 @@ fn main() {
     // Load config
     let cfg = config::load();
 
+    // The local KEYDB only matters for the `local` key source. In `online`
+    // mode keys come from the key service and a local keydb would only shadow
+    // it (libfreemkv default-search), so skip the download entirely.
+    let online_keys = cfg
+        .read()
+        .ok()
+        .map(|c| c.key_source == "online")
+        .unwrap_or(false);
+
     // Ensure KEYDB exists — download on first boot if URL is configured
-    if libfreemkv::keydb::default_path()
+    if online_keys {
+        log::syslog("Online key source — skipping local KEYDB download");
+    } else if libfreemkv::keydb::default_path()
         .ok()
         .map(|p| p.exists())
         .unwrap_or(false)
@@ -192,12 +203,14 @@ fn main() {
                         break 'outer;
                     }
                 }
-                let url = cfg2
+                // Online key source resolves out-of-band; no local keydb to keep
+                // fresh (and refreshing one would only shadow the service).
+                let (online, url) = cfg2
                     .read()
                     .ok()
-                    .map(|c| c.keydb_url.clone())
-                    .unwrap_or_default();
-                if url.is_empty() {
+                    .map(|c| (c.key_source == "online", c.keydb_url.clone()))
+                    .unwrap_or((false, String::new()));
+                if online || url.is_empty() {
                     continue;
                 }
                 tracing::info!(url = %url, "keydb: starting daily update");

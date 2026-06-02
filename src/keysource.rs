@@ -49,7 +49,14 @@ impl KeySource {
                 keydb_path: keydb_path.clone(),
                 ..Default::default()
             },
-            KeySource::Online(_) => libfreemkv::ScanOptions::default(),
+            // Online resolves keys out-of-band via the key service. Disable the
+            // local keydb entirely so a keydb that happens to sit in a default
+            // search path can't shadow the service (the radio means "server,
+            // not local keydb").
+            KeySource::Online(_) => libfreemkv::ScanOptions {
+                disable_keydb: true,
+                ..Default::default()
+            },
         }
     }
 
@@ -127,9 +134,54 @@ impl OnlineKeyService {
         if !self.secret.is_empty() {
             req = req.set("Authorization", &format!("Bearer {}", self.secret));
         }
-        let resp = req.send_json(body).ok()?;
-        let json: serde_json::Value = resp.into_json().ok()?;
-        parse_uk(json.get("UK")?.as_str()?)
+        tracing::info!(
+            phase = "keyservice_query",
+            url = %url,
+            inf = inf.len(),
+            mkb = mkb.len(),
+            has_vid = vid.is_some(),
+            units = units.len(),
+            "querying key service"
+        );
+        let resp = match req.send_json(body) {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) => {
+                tracing::warn!(
+                    phase = "keyservice_query",
+                    status = code,
+                    "key service returned no key"
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    phase = "keyservice_query",
+                    error = %e,
+                    "key service unreachable"
+                );
+                return None;
+            }
+        };
+        let json: serde_json::Value = match resp.into_json() {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(phase = "keyservice_query", error = %e, "key service reply unreadable");
+                return None;
+            }
+        };
+        match json.get("UK").and_then(|u| u.as_str()).and_then(parse_uk) {
+            Some(uk) => {
+                tracing::info!(phase = "keyservice_query", "key service returned a key");
+                Some(uk)
+            }
+            None => {
+                tracing::warn!(
+                    phase = "keyservice_query",
+                    "key service reply had no usable key"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -193,15 +245,35 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         return disc;
     }
     let Some(title) = disc.titles.first().cloned() else {
+        tracing::warn!(
+            phase = "keyservice_resolve",
+            "no titles — skipping key service"
+        );
         return disc;
     };
     let Some((inf, mkb)) = access.key_files() else {
+        tracing::warn!(
+            phase = "keyservice_resolve",
+            "could not read disc key files — skipping key service"
+        );
         return disc;
     };
     let vid = access.volume_id();
     let units = access.sample_units(&title, SAMPLE_UNITS);
+    tracing::info!(
+        phase = "keyservice_resolve",
+        has_vid = vid.is_some(),
+        units = units.len(),
+        "resolving key via key service"
+    );
     match ks.resolve(&inf, &mkb, vid, &units) {
-        Some(uk) => access.rescan(uk).unwrap_or(disc),
+        Some(uk) => {
+            tracing::info!(
+                phase = "keyservice_resolve",
+                "key resolved — re-scanning disc"
+            );
+            access.rescan(uk).unwrap_or(disc)
+        }
         None => disc,
     }
 }
