@@ -1621,6 +1621,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 skip_on_error: true,
                 progress: Some(&pass1_progress),
                 halt: Some(pass1_halt.clone()),
+                // Persist the disc's AACS Volume ID into the mapfile so it
+                // survives to deferred-mux / resume. None for unencrypted
+                // discs. Keyserver-send wiring is a later task.
+                vid: disc.aacs.as_ref().map(|a| a.volume_id),
             };
 
             match disc.sweep(&mut session.drive, iso_path, &sweep_opts) {

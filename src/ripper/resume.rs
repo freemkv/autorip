@@ -128,6 +128,14 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
         Ok(m) => m,
         Err(_) => return ResumeClass::NotEligible,
     };
+    // Surface the persisted AACS Volume ID (if Pass 1 recorded one) so the
+    // deferred-mux / keyserver path can resolve keys without re-reading the
+    // disc. Full keyserver consumption is a later task; here we just confirm
+    // the value round-tripped through the mapfile.
+    if let Some(vid) = map.vid() {
+        let hex: String = vid.iter().map(|b| format!("{b:02x}")).collect();
+        tracing::info!(vid = %hex, mapfile = %mapfile_path.display(), "resume: recovered AACS Volume ID from mapfile");
+    }
     let stats = map.stats();
     if stats.bytes_pending != 0 {
         // Pass 1 didn't fully settle the disc (some sectors still
