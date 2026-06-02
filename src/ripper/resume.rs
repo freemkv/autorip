@@ -312,7 +312,19 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     } else {
         None
     };
-    let scan_opts = super::scan_opts_for(&cfg_read, device, inf_mkb);
+    // Recover the AACS Volume ID Pass 1 persisted into the mapfile and forward
+    // it to the keyserver. The ISO carries no VID (it's a protected-area
+    // secret), so the mapfile is the only way the deferred-mux re-query can
+    // reach the server's MK/DK tiers — the self-healing path for a disc the
+    // first inf+mkb query missed.
+    let vid = if cfg_read.key_source == "online" {
+        libfreemkv::disc::mapfile::Mapfile::load(&_mapfile_path)
+            .ok()
+            .and_then(|m| m.vid())
+    } else {
+        None
+    };
+    let scan_opts = super::scan_opts_for(&cfg_read, device, inf_mkb, vid);
     use libfreemkv::SectorSource;
     let capacity = iso_reader.capacity_sectors();
     let disc = match libfreemkv::Disc::scan_image(&mut iso_reader, capacity, &scan_opts) {

@@ -52,12 +52,18 @@ use crate::config::Config;
 ///   (from the live drive, or from the ISO on the resume path) — keys are
 ///   needed during the scan, so this must be fetched up front.
 ///
+/// `vid` is the disc's AACS Volume ID when known — `None` on the live
+/// pre-scan path (no handshake yet), `Some` on the resume path (recovered
+/// from the mapfile). It is forwarded to the keyserver so the server can use
+/// its MK/DK tiers for discs a bare inf+mkb couldn't resolve.
+///
 /// Any online failure (no URL, server miss, network error) yields default
 /// options; the scan then surfaces the usual "no keys" error.
 pub(crate) fn scan_opts_for(
     cfg: &Config,
     device: &str,
     inf_mkb: Option<(Vec<u8>, Vec<u8>)>,
+    vid: Option<[u8; 16]>,
 ) -> libfreemkv::ScanOptions {
     if cfg.key_source != "online" {
         return libfreemkv::ScanOptions {
@@ -76,7 +82,7 @@ pub(crate) fn scan_opts_for(
         crate::log::device_log(device, "Online key source: disc key files unavailable");
         return libfreemkv::ScanOptions::default();
     };
-    match crate::keyserver::fetch_uk(&cfg.keyserver_url, &cfg.keyserver_secret, &inf, &mkb) {
+    match crate::keyserver::fetch_uk(&cfg.keyserver_url, &cfg.keyserver_secret, &inf, &mkb, vid) {
         Some(uk) => {
             crate::log::device_log(device, "Keyserver returned a unit key");
             libfreemkv::ScanOptions {
@@ -619,7 +625,9 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     } else {
         None
     };
-    let scan_opts = scan_opts_for(&cfg_read, device, inf_mkb);
+    // Live pre-scan: no authenticated handshake yet, so no VID to send.
+    // (Pass 1 captures the VID into the mapfile for the resume path.)
+    let scan_opts = scan_opts_for(&cfg_read, device, inf_mkb, None);
     let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
         Ok(d) => d,
         Err(e) => {
@@ -1002,7 +1010,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             } else {
                 None
             };
-            let scan_opts = scan_opts_for(&cfg_read, device, inf_mkb);
+            // Live pre-scan: no authenticated handshake yet, so no VID to send.
+            // (Pass 1 captures the VID into the mapfile for the resume path.)
+            let scan_opts = scan_opts_for(&cfg_read, device, inf_mkb, None);
             crate::log::device_log(device, "Scanning titles...");
             let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
                 Ok(d) => d,

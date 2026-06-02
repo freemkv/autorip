@@ -3,8 +3,16 @@
 //! Instead of a local `keydb.cfg`, autorip POSTs a disc's `Unit_Key_RO.inf`
 //! and `MKB` to a configurable keyserver and gets back the final Unit Key.
 //! The server's contract: `POST <url>/decode` with
-//! `{"inf_b64": "...", "mkb_b64": "..."}` → `{"UK":"<32-hex>"}` on success,
-//! or an empty 404 on any miss/error.
+//! `{"inf_b64": "...", "mkb_b64": "...", "vid_b64"?: "..."}` → `{"UK":"<32-hex>"}`
+//! on success, or an empty 404 on any miss/error.
+//!
+//! `vid_b64` (the 16-byte AACS Volume ID) is optional and only available once
+//! the disc has been read with an authenticated handshake — i.e. NOT on the
+//! live pre-scan path (online clients have no host cert), but on the resume
+//! path, where Pass 1 persisted the VID into the mapfile. Sending it lets the
+//! server reach its MK/DK tiers (derive VUK from a pooled media key + this
+//! disc's VID), which is the self-healing case: a first rip that missed gets
+//! captured to ISO with its VID, and the deferred re-query can now resolve.
 //!
 //! libfreemkv stays network-free; this is the only place autorip talks to the
 //! keyserver. The returned UK is fed back into libfreemkv via
@@ -17,17 +25,28 @@ use std::time::Duration;
 ///
 /// `base_url` is the configured keyserver (any compatible host). `secret`
 /// is the API secret (sent as `Authorization: Bearer <secret>`); empty = no
-/// auth header. Returns the 16-byte UK, or `None` on any failure (server
-/// miss/404, network error, malformed response) — the caller treats `None`
-/// as "no key available". autorip neither validates nor interprets the
-/// secret; the server owns that.
-pub fn fetch_uk(base_url: &str, secret: &str, inf: &[u8], mkb: &[u8]) -> Option<[u8; 16]> {
+/// auth header. `vid` is the disc's 16-byte AACS Volume ID when known
+/// (resume path, from the mapfile) — sent as `vid_b64` so the server can use
+/// its MK/DK tiers; omitted when `None` (live path). Returns the 16-byte UK,
+/// or `None` on any failure (server miss/404, network error, malformed
+/// response) — the caller treats `None` as "no key available". autorip neither
+/// validates nor interprets the secret; the server owns that.
+pub fn fetch_uk(
+    base_url: &str,
+    secret: &str,
+    inf: &[u8],
+    mkb: &[u8],
+    vid: Option<[u8; 16]>,
+) -> Option<[u8; 16]> {
     let url = format!("{}/decode", base_url.trim_end_matches('/'));
     let b64 = base64::engine::general_purpose::STANDARD;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "inf_b64": b64.encode(inf),
         "mkb_b64": b64.encode(mkb),
     });
+    if let Some(vid) = vid {
+        body["vid_b64"] = serde_json::Value::String(b64.encode(vid));
+    }
 
     let mut req = ureq::post(&url).timeout(Duration::from_secs(30));
     if !secret.is_empty() {
