@@ -311,12 +311,12 @@ mod tests {
     fn sample_marker() -> RippedMarker {
         RippedMarker {
             schema_version: RIPPED_MARKER_SCHEMA,
-            iso_path: "/staging/Civil_War/Civil_War.iso".into(),
-            mapfile_path: "/staging/Civil_War/Civil_War.iso.mapfile".into(),
-            display_name: "Civil War".into(),
+            iso_path: "/staging/Border_Town/Border_Town.iso".into(),
+            mapfile_path: "/staging/Border_Town/Border_Town.iso.mapfile".into(),
+            display_name: "Border Town".into(),
             disc_format: "uhd".into(),
-            mkv_filename: "Civil_War.mkv".into(),
-            tmdb_title: "Civil War".into(),
+            mkv_filename: "Border_Town.mkv".into(),
+            tmdb_title: "Border Town".into(),
             tmdb_year: 2024,
             tmdb_poster: "https://image.tmdb.org/poster.jpg".into(),
             tmdb_overview: "Synopsis".into(),
@@ -336,7 +336,7 @@ mod tests {
         let marker = sample_marker();
         write_marker(tmp.path(), &marker).unwrap();
         let back = read_marker(tmp.path()).unwrap();
-        assert_eq!(back.display_name, "Civil War");
+        assert_eq!(back.display_name, "Border Town");
         assert_eq!(back.tmdb_year, 2024);
         assert_eq!(back.schema_version, RIPPED_MARKER_SCHEMA);
     }
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn pending_queue_lists_markers() {
         let tmp = TempDir::new().unwrap();
-        let movie = tmp.path().join("Civil_War");
+        let movie = tmp.path().join("Border_Town");
         std::fs::create_dir_all(&movie).unwrap();
         write_marker(&movie, &sample_marker()).unwrap();
 
@@ -372,7 +372,7 @@ mod tests {
 
         let q = pending_queue(tmp.path());
         assert_eq!(q.len(), 1);
-        assert!(q[0].contains("Civil War"));
+        assert!(q[0].contains("Border Town"));
         assert!(q[0].contains("queued"));
     }
 }

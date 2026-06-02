@@ -7,5 +7,3 @@
 //! Once libfreemkv 0.18 ships its `Pipeline` + `SectorSource` /
 //! `SectorSink` traits, the multipass loop currently inside
 //! `rip_disc` migrates here.
-//!
-//! See `(internal)/memory/0_18_redesign.md` § "Module layout".

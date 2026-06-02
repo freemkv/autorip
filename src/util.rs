@@ -49,7 +49,7 @@ pub fn format_iso_datetime_filename() -> String {
 // Pre-0.13 these lived in `ripper::sanitize_filename`, `mover::sanitize_dir_name`,
 // `ripper::format_duration`, and `ripper::format_codecs`. The two sanitizers
 // drifted (one replaced spaces with `_`, the other kept them) and a single rip
-// could produce a `Dune_Part_Two` staging dir but a `Dune Part Two (2024)`
+// could produce a `Aurora_Drift` staging dir but a `Aurora Drift (2024)`
 // destination dir — same logic, two implementations. Consolidated here as
 // the single source of truth.
 
@@ -68,7 +68,7 @@ pub fn sanitize_path_compact(name: &str) -> String {
 }
 
 /// Sanitize a name for a user-visible directory (e.g. the final library
-/// destination `movies/Dune Part Two (2024)/`). Spaces preserved; apostrophes
+/// destination `movies/Aurora Drift (2024)/`). Spaces preserved; apostrophes
 /// kept (filesystems handle them, omitting them mangles "What's Up Doc").
 pub fn sanitize_path_display(name: &str) -> String {
     name.chars()
@@ -146,13 +146,19 @@ mod tests {
 
     #[test]
     fn sanitize_path_compact_collapses_spaces_to_underscore() {
-        assert_eq!(sanitize_path_compact("Dune Part Two"), "Dune_Part_Two");
-        assert_eq!(sanitize_path_compact("V for Vendetta"), "V_for_Vendetta");
+        assert_eq!(
+            sanitize_path_compact("Aurora Drift Two"),
+            "Aurora_Drift_Two"
+        );
+        assert_eq!(sanitize_path_compact("K for Kestrel"), "K_for_Kestrel");
     }
 
     #[test]
     fn sanitize_path_compact_strips_unsafe_chars() {
-        assert_eq!(sanitize_path_compact("Dune: Part Two"), "Dune_Part_Two");
+        assert_eq!(
+            sanitize_path_compact("Aurora: Drift Two"),
+            "Aurora_Drift_Two"
+        );
         assert_eq!(sanitize_path_compact("M*A*S*H"), "MASH");
         assert_eq!(sanitize_path_compact("Alien/Predator"), "AlienPredator");
     }
@@ -166,14 +172,17 @@ mod tests {
     fn sanitize_path_display_keeps_spaces_and_apostrophes() {
         assert_eq!(sanitize_path_display("What's Up Doc"), "What's Up Doc");
         assert_eq!(
-            sanitize_path_display("Rogue One - A Star Wars Story"),
-            "Rogue One - A Star Wars Story"
+            sanitize_path_display("Side Quest - A Long Journey"),
+            "Side Quest - A Long Journey"
         );
     }
 
     #[test]
     fn sanitize_path_display_strips_unsafe_chars() {
-        assert_eq!(sanitize_path_display("Dune: Part Two"), "Dune Part Two");
+        assert_eq!(
+            sanitize_path_display("Aurora: Drift Two"),
+            "Aurora Drift Two"
+        );
         assert_eq!(sanitize_path_display("M*A*S*H"), "MASH");
     }
 

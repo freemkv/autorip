@@ -18,8 +18,6 @@
 //! owns the output stream, the smoothed-speed estimator, and the
 //! per-frame `update_state` call (the morning's "fresh-rip snap-back"
 //! fix is preserved verbatim).
-//!
-//! See `(internal)/memory/0_18_redesign.md` § "Module layout".
 
 use crossbeam_channel::{SendTimeoutError as CbSendTimeoutError, bounded as cb_bounded};
 use std::path::PathBuf;
@@ -955,7 +953,7 @@ pub(crate) fn run_mux(
     // demuxer resolves codec_privates), then spawns the producer to parallelize
     // ISO reading with mux writing. This overlaps the latency-bound NFS write
     // path with the next ISO read, cutting total mux duration by ~30% on large
-    // UHD rips (Civil War: 2412s → ~1700s projected).
+    // UHD rips (one sample rip: 2412s → ~1700s projected).
     let (frame_tx, frame_rx) = cb_bounded::<PesFrame>(READ_PIPELINE_DEPTH);
 
     let _latest_bytes_read = atomics_in.latest_bytes_read.clone();
@@ -979,8 +977,7 @@ pub(crate) fn run_mux(
             // polling. The pre-0.21.7 version polled `try_send` on
             // 50 ms slices, which capped producer throughput at
             // ~20 frames/sec ≈ 1 MB/s whenever the consumer back-
-            // pressured — see (internal)/memory/
-            // feedback_send_with_halt_poll_throttle.md.
+            // pressured.
             //
             // The 250 ms halt-check cadence is just for stop-button
             // responsiveness; on the happy path the producer is woken

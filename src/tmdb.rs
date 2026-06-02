@@ -51,7 +51,7 @@ pub fn lookup(query: &str, api_key: &str) -> Option<TmdbResult> {
     })
 }
 
-/// Clean a disc label for TMDB search: "DUNE_PART_TWO" -> "Dune Part Two"
+/// Clean a disc label for TMDB search: "AURORA_DRIFT_TWO" -> "Aurora Drift Two"
 /// Strips common disc suffixes like "4K Ultra HD", "Blu-ray", "DVD", etc.
 pub fn clean_title(label: &str) -> String {
     let s = label.replace(['_', '-'], " ");
@@ -111,14 +111,17 @@ mod tests {
 
     #[test]
     fn clean_title_title_cases_snake_case() {
-        assert_eq!(clean_title("DUNE_PART_TWO"), "Dune Part Two");
-        assert_eq!(clean_title("V_FOR_VENDETTA"), "V For Vendetta");
+        assert_eq!(clean_title("AURORA_DRIFT_TWO"), "Aurora Drift Two");
+        assert_eq!(clean_title("K_FOR_KESTREL"), "K For Kestrel");
     }
 
     #[test]
     fn clean_title_strips_uhd_suffix() {
-        assert_eq!(clean_title("DUNE_PART_TWO_4K_UHD"), "Dune Part Two");
-        assert_eq!(clean_title("DUNE_PART_TWO_4K_ULTRA_HD"), "Dune Part Two");
+        assert_eq!(clean_title("AURORA_DRIFT_TWO_4K_UHD"), "Aurora Drift Two");
+        assert_eq!(
+            clean_title("AURORA_DRIFT_TWO_4K_ULTRA_HD"),
+            "Aurora Drift Two"
+        );
     }
 
     #[test]

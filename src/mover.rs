@@ -139,8 +139,8 @@ impl std::fmt::Display for MoveError {
 /// FD and fstats it. Hit this instead of `std::fs::metadata` whenever
 /// the value matters within an attribute-cache window (acregmin, NFS
 /// default 3 s) of a write by another process. Stat'ing the dest right
-/// after cp closes triggered phantom SizeMismatch errors on rip1's
-/// /mnt/unraid-1 NFS share before this helper landed.
+/// after cp closes triggered phantom SizeMismatch errors on an NFS
+/// share before this helper landed.
 fn fresh_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
     let f = std::fs::File::open(path)?;
     f.metadata()
@@ -290,10 +290,9 @@ fn check_post_copy_size(src: &Path, dst: &Path) -> Result<(), MoveError> {
 /// Replaces the v0.25.x `check_post_copy_sizes` helper, which used
 /// `std::fs::metadata` directly on the dest immediately after cp
 /// closed — that read could be served from the NFS attribute cache
-/// and produced phantom SizeMismatch failures on rip1's
-/// /mnt/unraid-1 share (the file was intact, the stat lied). The
-/// rip1 v0.25.2 release-test rip hit this on a 58 GiB Civil War mkv
-/// that had byte-for-byte landed.
+/// and produced phantom SizeMismatch failures on an NFS share (the
+/// file was intact, the stat lied). A v0.25.2 release-test rip hit
+/// this on a 58 GiB mkv that had byte-for-byte landed.
 pub(crate) fn check_post_copy(src: &Path, dst: &Path) -> Result<(), MoveError> {
     let ext = dst
         .extension()
@@ -380,9 +379,9 @@ fn check_and_move(cfg: &Config) {
         // staging regardless, so the mover happily moved 90+ GB of ISO
         // bytes to NFS the moment `.done` appeared (the ripper's own
         // ISO-prune in `rip_disc` only runs after `.done` is written, so
-        // the mover's 10s scan loop typically wins the race). Hit live on
-        // rip1 2026-05-20 (Wicked.iso, 94 GB, copied to
-        // `/mnt/unraid-1/media/movies/Wicked For Good/`). Filter the ISO
+        // the mover's 10s scan loop typically wins the race). Hit live
+        // (2026-05-20, a 94 GB ISO copied into the movies library).
+        // Filter the ISO
         // out at planning time; the staging-cleanup branch below deletes
         // any leftover .iso from disk before tearing the dir down so we
         // don't leak intermediate ISOs in /staging.
@@ -595,7 +594,7 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
     // mux output and the source ISO in staging — both planned to the
     // same `Title.mkv` destination path. Successive mover ticks then
     // alternated overwriting one with the other, ultimately destroying
-    // the MKV on rip1 (Oppenheimer 2026-05-20). Preserving the source
+    // the MKV (observed 2026-05-20). Preserving the source
     // extension routes companions to distinct paths
     // (`Title.mkv`, `Title.iso`) and lets the format-aware post-cp
     // check correctly validate each.
@@ -737,8 +736,8 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 // 0.25.10: replace the unbounded `std::fs::metadata(dest)`
-                // with a 2 s-capped lookup. On rip1's /mnt/unraid-1 NFS
-                // share under concurrent rip+mover I/O, `metadata()` can
+                // with a 2 s-capped lookup. On an NFS share under
+                // concurrent rip+mover I/O, `metadata()` can
                 // block on attribute-cache refresh for many minutes; the
                 // _move telemetry then freezes at the last value (e.g.
                 // `progress_gb=17.226043701171875` for 10+ min) while
@@ -819,8 +818,8 @@ mod tests {
     #[test]
     fn sanitize_dir_name_strips_unsafe_characters() {
         assert_eq!(
-            crate::util::sanitize_path_display("Dune: Part Two"),
-            "Dune Part Two"
+            crate::util::sanitize_path_display("Aurora: Drift Two"),
+            "Aurora Drift Two"
         );
         assert_eq!(crate::util::sanitize_path_display("M*A*S*H"), "MASH");
         assert_eq!(
@@ -836,8 +835,8 @@ mod tests {
     #[test]
     fn sanitize_dir_name_keeps_allowed_punctuation() {
         assert_eq!(
-            crate::util::sanitize_path_display("Rogue One - A Star Wars Story"),
-            "Rogue One - A Star Wars Story"
+            crate::util::sanitize_path_display("Side Quest - A Long Journey"),
+            "Side Quest - A Long Journey"
         );
         assert_eq!(
             crate::util::sanitize_path_display("Director_Cut.2019"),
@@ -856,9 +855,12 @@ mod tests {
     #[test]
     fn build_destination_movie_with_year() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
-        let tmdb = Some(tmdb_movie("Dune Part Two", 2024));
+        let tmdb = Some(tmdb_movie("Aurora Drift Two", 2024));
         let dest = build_destination(&cfg, &tmdb, "disc.mkv");
-        assert_eq!(dest, "/out/Movies/Dune Part Two (2024)/Dune Part Two.mkv");
+        assert_eq!(
+            dest,
+            "/out/Movies/Aurora Drift Two (2024)/Aurora Drift Two.mkv"
+        );
     }
 
     #[test]
@@ -907,11 +909,11 @@ mod tests {
         // planned to the same path and the mover overwrote one with
         // the other in alternating ticks. Source extension must win.
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
-        let tmdb = Some(tmdb_movie("Oppenheimer", 2023));
-        let dest_iso = build_destination(&cfg, &tmdb, "Oppenheimer.iso");
-        let dest_mkv = build_destination(&cfg, &tmdb, "Oppenheimer.mkv");
-        assert_eq!(dest_iso, "/out/Movies/Oppenheimer (2023)/Oppenheimer.iso");
-        assert_eq!(dest_mkv, "/out/Movies/Oppenheimer (2023)/Oppenheimer.mkv");
+        let tmdb = Some(tmdb_movie("Lumina", 2023));
+        let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso");
+        let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv");
+        assert_eq!(dest_iso, "/out/Movies/Lumina (2023)/Lumina.iso");
+        assert_eq!(dest_mkv, "/out/Movies/Lumina (2023)/Lumina.mkv");
         assert_ne!(
             dest_iso, dest_mkv,
             "iso and mkv companions must not collide"
@@ -1164,8 +1166,8 @@ mod tests {
         // Regression for 0.25.10: pre-fix, the mover blindly moved ANY
         // .iso it found in a .done staging dir. Result: a 90+ GB
         // intermediate ISO landed in the user's movie library
-        // (rip1 2026-05-20, Wicked.iso → /mnt/unraid-1/.../Wicked For
-        // Good.iso) even though keep_iso=false was set, because the
+        // (observed 2026-05-20, an ISO promoted into the movie
+        // library) even though keep_iso=false was set, because the
         // mover's 10 s scan loop ran before the ripper's post-mux
         // ISO-prune did. The fix: filter .iso out of the planned-moves
         // set when keep_iso=false; the existing `remove_dir_all` cleanup
@@ -1179,19 +1181,19 @@ mod tests {
         let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
 
         // One staging "disc dir" with .done + a valid .mkv + an .iso.
-        let disc_dir = staging.join("Wicked For Good");
+        let disc_dir = staging.join("Gleaming For Good");
         std::fs::create_dir_all(&disc_dir).unwrap();
-        std::fs::write(disc_dir.join(".done"), marker_json("Wicked For Good")).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Gleaming For Good")).unwrap();
         // Valid EBML head + tail-safe body so check_post_copy_mkv passes.
         let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3];
         mkv.extend_from_slice(&[0xAAu8; 1024]);
-        std::fs::write(disc_dir.join("Wicked For Good.mkv"), &mkv).unwrap();
-        std::fs::write(disc_dir.join("Wicked For Good.iso"), vec![0u8; 4096]).unwrap();
+        std::fs::write(disc_dir.join("Gleaming For Good.mkv"), &mkv).unwrap();
+        std::fs::write(disc_dir.join("Gleaming For Good.iso"), vec![0u8; 4096]).unwrap();
 
         check_and_move(&cfg);
 
         // MKV landed in the movie library.
-        let mkv_dest = movie_dir.join("Wicked For Good (2024)/Wicked For Good.mkv");
+        let mkv_dest = movie_dir.join("Gleaming For Good (2024)/Gleaming For Good.mkv");
         assert!(
             mkv_dest.exists(),
             "MKV should have been moved to {}",
@@ -1199,7 +1201,7 @@ mod tests {
         );
 
         // ISO must NOT have been promoted to the movie library.
-        let iso_dest = movie_dir.join("Wicked For Good (2024)/Wicked For Good.iso");
+        let iso_dest = movie_dir.join("Gleaming For Good (2024)/Gleaming For Good.iso");
         assert!(
             !iso_dest.exists(),
             "ISO must not be moved when keep_iso=false (found at {})",

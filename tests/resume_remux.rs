@@ -8,7 +8,7 @@
 //! Deliberate gap: `Disc::scan_image` and `run_mux` end-to-end need a
 //! real UDF ISO. Feeding synthetic bytes into `scan_image` reliably
 //! fails (per libfreemkv/project docs). The live test bed validates the
-//! full flow on Dune Part Two; the gap is documented in
+//! full flow on a real disc; the gap is documented in
 //! `src/ripper/resume.rs`.
 
 use std::path::{Path, PathBuf};

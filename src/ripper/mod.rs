@@ -6,8 +6,7 @@
 //! `staging`). The high-level orchestration — `drive_poll_loop`,
 //! `scan_disc`, `rip_disc`, `eject_drive` — stays here. Sweep + mux
 //! sub-modules exist as placeholders for the 0.18 trait-migration
-//! commit that will lift those loops out of `rip_disc`. See
-//! `(internal)/memory/0_18_redesign.md`.
+//! commit that will lift those loops out of `rip_disc`.
 
 pub(crate) mod mux;
 pub mod resume;
@@ -802,8 +801,8 @@ pub fn handle_rip_request(
 /// display_name of the currently-scanned disc. Returns the
 /// `ResumeClass::Remux` payload if found, else None.
 ///
-/// Single-drive convention: rip1 has one drive, one inserted disc at
-/// a time. There is at most one staging dir matching the disc by
+/// Single-drive convention: the host has one drive, one inserted disc
+/// at a time. There is at most one staging dir matching the disc by
 /// title prefix. If somehow two match we pick the first; in a
 /// multi-drive future this needs disambiguation by stable disc
 /// fingerprint (UDF volume_id) instead of sanitized title.
@@ -1262,9 +1261,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Local alias: pre-existing call sites refer to `halt` as the
     // legacy `Arc<AtomicBool>`. Keep the same name so the watcher
     // helpers (which still take `Arc<AtomicBool>`) compile unchanged
-    // — this is the deprecated bridge documented in
-    // (internal)/memory/0_18_round3_migration_audit.md and is
-    // dropped together with `Disc::copy()` in round 3.
+    // — this is a deprecated bridge, dropped together with
+    // `Disc::copy()` in round 3.
     let halt = drive_halt_arc;
 
     // Rip-level wallclock budget (Fix 3). Caps the ENTIRE rip — all passes
@@ -1297,8 +1295,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // it flips this flag and the watcher exits silently. Without this,
     // the thread sleeps blindly for `rip_budget_secs` and fires the
     // "budget exceeded" warning long after the rip already succeeded
-    // — empirically 2026-05-11 Top Gun Maverick: rip done at 13:27,
-    // false warning at 13:31. Now: poll every 5s, bail early when
+    // — empirically (2026-05-11): rip done at 13:27, false warning
+    // at 13:31. Now: poll every 5s, bail early when
     // rip_complete is set.
     let halt_rip_watcher = halt.clone();
     let device_rip_watcher = device.to_string();
@@ -2709,7 +2707,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Multipass ISO path: wrap the reader in a `PrefetchedSectorSource`
     // so the read+decrypt work runs on a dedicated producer thread
     // while the mux consumer (demux + codec parsers + writer) runs on
-    // the main thread. On the rip1 testbed this took the null:// /
+    // the main thread. On the testbed this took the null:// /
     // consumer ceiling from ~70 MB/s to ~124 MB/s and lets production
     // mux push closer to the disk's combined r+w wall. The drive
     // single-pass path keeps the inline reader because `DiscStream`'s
@@ -2788,8 +2786,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // the consumer thread, the watchdog, and the per-frame
     // `update_state` cadence all live in `mux::run_mux`. Round 1
     // shipped the mux module as a placeholder; this is the lift onto
-    // libfreemkv's `Pipeline` + `Sink` primitive. See
-    // `(internal)/memory/0_18_redesign.md` § "Module layout".
+    // libfreemkv's `Pipeline` + `Sink` primitive.
     //
     // The producer side of `run_mux` polls the per-device `Halt`
     // token (looked up via `device_halt(device)`) at the top of each
