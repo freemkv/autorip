@@ -38,6 +38,11 @@ body.dark {
   --pill-fg:#000;
 }
 * { margin:0; padding:0; box-sizing:border-box; }
+/* Always reserve the vertical scrollbar gutter. Without this, switching
+   between key sources (Local is taller than Online) makes the page scrollbar
+   appear/disappear, which changes the viewport width and shifts the centered
+   .c container sideways. overflow-y:scroll keeps the gutter present always. */
+html { overflow-y:scroll; scrollbar-gutter:stable; }
 body { font-family:-apple-system,system-ui,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; flex-direction:column; }
 .c { max-width:900px; margin:0 auto; padding:20px; width:100%; flex:1; display:flex; flex-direction:column; }
 @keyframes p { 0%,100%{opacity:1} 50%{opacity:.3} }
@@ -528,7 +533,16 @@ function renderCurrent(){
        shove anything else around. */
     btns+='<span id="rip-elapsed-'+dev+'" data-started="'+(s.started_epoch_secs||0)+'" style="margin-left:10px;font-size:.78rem;color:var(--text2);align-self:center;font-variant-numeric:tabular-nums;min-width:80px;display:inline-block"></span>';
   }else if(scanned){
-    btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="fetch(\'/api/rip/'+dev+'\',{method:\'POST\'})">Rip</button>';
+    /* Keys resolved at scan time. If they're missing (and the operator
+       hasn't opted into capture-without-keys), don't offer Rip at all —
+       it would just error. Offer "Scan again" so a freshly-loaded KEYDB
+       or a corrected key source can be re-checked without a page reload. */
+    const notReady=(s.key_status||'').indexOf('Missing')===0;
+    if(notReady){
+      btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan again</button>';
+    }else{
+      btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="fetch(\'/api/rip/'+dev+'\',{method:\'POST\'})">Rip</button>';
+    }
     btns+='<button class="btn" onclick="fetch(\'/api/verify/'+dev+'\',{method:\'POST\'})">Verify</button>';
   }else if(discIn){
     btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan</button>';
@@ -762,13 +776,17 @@ function loadHistory(){
   });
 }
 
-function updateKeydb(){
-  const st=document.getElementById('keydb-status');
-  st.textContent='Updating...';st.style.color='var(--text3)';
+function updateKeydb(stId){
+  /* stId lets the same handler back both the System-page Data Files
+     button (default 'keydb-status') and the Settings-page Local button
+     ('keydb-status-settings'). Tolerates a missing status element. */
+  const st=document.getElementById(stId||'keydb-status');
+  const set=(t,c)=>{if(st){st.textContent=t;st.style.color=c;}};
+  set('Updating…','var(--text3)');
   fetch('/api/update-keydb',{method:'POST'}).then(r=>r.json()).then(data=>{
-    if(data.ok){st.textContent='Updated: '+data.entries+' entries';st.style.color='var(--green)';loadSystem();}
-    else{st.textContent=data.error||'Update failed';st.style.color='var(--red)';}
-  }).catch(e=>{st.textContent='Network error';st.style.color='var(--red)';});
+    if(data.ok){set('Updated: '+data.entries+' entries','var(--green)');loadSystem();}
+    else{set(data.error||'Update failed','var(--red)');}
+  }).catch(e=>{set('Network error','var(--red)');});
 }
 /* ---- Mux queue with live progress (mirrors renderMoves shape) ---- */
 function renderMuxes(){
@@ -962,6 +980,7 @@ function renderSettings(s){
       {key:'key_source',label:'AACS Key Source',type:'radio',options:[{value:'local',label:'Local KEYDB'},{value:'online',label:'Online Keyserver'}],hint:'Where per-disc AACS keys come from. Local uses a KEYDB.cfg on disk; Online queries a keyserver.'},
       {key:'keydb_path',label:'KEYDB.cfg Location',type:'text',hint:'Path to KEYDB.cfg on disk (blank = default location).',indent:true,showIf:{key:'key_source',value:'local'}},
       {key:'keydb_url',label:'KEYDB Update URL',type:'text',hint:'HTTP URL to download KEYDB.cfg (zip, gz, or plain text).',indent:true,showIf:{key:'key_source',value:'local'}},
+      {type:'action',action:"updateKeydb('keydb-status-settings')",button:'Update KEYDB',status:'keydb-status-settings',hint:'Download the KEYDB.cfg from the URL above into the configured location.',indent:true,showIf:{key:'key_source',value:'local'}},
       {key:'keyserver_url',label:'Keyserver URL',type:'text',hint:'Base URL of the keyserver.',indent:true,showIf:{key:'key_source',value:'online'}},
       {key:'keyserver_secret',label:'Keyserver API Secret',type:'text',hint:'Bearer token for the keyserver, if it requires one.',indent:true,showIf:{key:'key_source',value:'online'}},
       {key:'capture_without_keys',label:'Capture Discs Without Keys',type:'bool',hint:'No usable keys → capture the disc to an ISO and mux later when keys become available. Off = skip the disc.'},
@@ -982,7 +1001,9 @@ function renderSettings(s){
       const hideHide=f.hideIf&&s[f.hideIf.key]===f.hideIf.value;
       const hide=(hideShow||hideHide)?'display:none;':'';
       const showAttr=f.showIf?' data-show-key="'+f.showIf.key+'" data-show-value="'+f.showIf.value+'"':(f.hideIf?' data-hide-key="'+f.hideIf.key+'" data-hide-value="'+f.hideIf.value+'"':'');
-      if(f.type==='radio'){
+      if(f.type==='action'){
+        html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><div style="display:flex;align-items:center;gap:10px"><button type="button" class="btn" onclick="'+f.action+'">'+f.button+'</button><span id="'+f.status+'" style="font-size:.8rem"></span></div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
+      }else if(f.type==='radio'){
         const opts=f.options.map(o=>'<label style="font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-right:16px"><input type="radio" name="'+f.key+'" data-key="'+f.key+'" value="'+o.value+'" style="width:14px;height:14px;margin:0;accent-color:var(--accent)" onchange="toggleConditional()" '+(v===o.value?'checked':'')+'>'+o.label+'</label>').join('');
         html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label>'+f.label+'</label><div style="margin-top:4px">'+opts+'</div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }else if(f.type==='bool'){

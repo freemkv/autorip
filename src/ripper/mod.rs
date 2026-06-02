@@ -69,9 +69,17 @@ fn resolve_keys_from_drive(
 
 /// Human-readable key readiness for the dashboard tile, decided at scan time.
 /// Unencrypted, or keys present → "Ready to rip"; encrypted with no keys →
-/// "Missing keys — <reason>" (the concise AACS failure heading, source-free).
-fn key_readiness(disc: &libfreemkv::Disc) -> String {
+/// "Missing keys — <reason>" (the concise AACS failure heading, source-free),
+/// unless the operator opted into capturing without keys, in which case the
+/// rip is allowed to proceed (encrypted ISO for later) → "Capture without keys".
+///
+/// The tile keys its action button off the "Missing keys" prefix: any other
+/// value (including "Capture without keys") leaves the green Rip button up.
+fn key_readiness(disc: &libfreemkv::Disc, capture_without_keys: bool) -> String {
     if disc.encrypted && matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None) {
+        if capture_without_keys {
+            return "Capture without keys — no decryption".to_string();
+        }
         let msg = aacs_failure_message(disc.aacs_error.as_ref());
         let head = msg.lines().next().unwrap_or("no keys");
         format!("Missing keys — {head}")
@@ -621,7 +629,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Sample-based key source: resolve the Unit Key from the disc's files +
     // on-disc samples and re-scan with it (a no-op for a local source).
     let disc = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
-    let key_status = key_readiness(&disc);
+    let key_status = key_readiness(&disc, cfg_read.capture_without_keys);
 
     // Update format from full scan (UHD vs BD now known)
     let disc_name = disc
