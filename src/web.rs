@@ -129,7 +129,7 @@ tr:hover { background:var(--chip); }
 <div id="system" class="section">
   <div class="card" style="margin-top:16px"><h2>Mux Queue</h2><div id="muxes"></div></div>
   <div class="card"><h2>Move Queue</h2><div id="moves"></div></div>
-  <div class="card"><h2>Data Files</h2><div id="files" class="files" style="margin-bottom:12px"></div><div style="display:flex;align-items:center;gap:10px"><button class="btn" onclick="updateKeydb()">Update KEYDB</button><span id="keydb-status" style="font-size:.8rem"></span></div></div>
+  <div class="card" id="datafiles-card"><h2>Data Files</h2><div id="files" class="files" style="margin-bottom:12px"></div><div style="display:flex;align-items:center;gap:10px"><button class="btn" onclick="updateKeydb()">Update KEYDB</button><span id="keydb-status" style="font-size:.8rem"></span></div></div>
   <div><h2 style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;margin-bottom:8px">System Log</h2><div id="syslog" class="log" style="max-height:400px"></div></div>
 </div>
 
@@ -911,6 +911,10 @@ function loadSettings(){
 }
 
 function renderSettings(s){
+  /* The KEYDB.cfg status + Update card is only relevant for the local key
+     source; hide it when an online source is selected. */
+  var dc=document.getElementById('datafiles-card');
+  if(dc)dc.style.display=(s.key_source==='online')?'none':'';
   /* v0.13.19: derive a virtual `rip_mode` from `max_retries` so the radio
      selector renders with the right value on load. The backend stays on
      `max_retries` (and `keep_iso`) — `saveSettings` translates rip_mode back
@@ -953,12 +957,14 @@ function renderSettings(s){
     ]},
     {title:'API Keys',fields:[
       {key:'tmdb_api_key',label:'TMDB API Key',type:'text',hint:'v3 API key from themoviedb.org'},
-      {key:'keydb_url',label:'KEYDB Update URL',type:'text',hint:'HTTP URL to download KEYDB.cfg (zip, gz, or plain text)'},
     ]},
     {title:'Key Source',fields:[
-      {key:'key_source',label:'AACS Key Source',type:'radio',options:[{value:'local',label:'Local KEYDB'},{value:'online',label:'Online Keyserver'}],hint:'Where per-disc AACS keys come from. Local uses keydb.cfg; Online queries a keyserver.'},
-      {key:'keyserver_url',label:'Keyserver URL',type:'text',hint:'Base URL of the keyserver (used when Key Source = Online).',indent:true},
-      {key:'keyserver_secret',label:'Keyserver API Secret',type:'text',hint:'Bearer token for the keyserver, if it requires one.',indent:true},
+      {key:'key_source',label:'AACS Key Source',type:'radio',options:[{value:'local',label:'Local KEYDB'},{value:'online',label:'Online Keyserver'}],hint:'Where per-disc AACS keys come from. Local uses a KEYDB.cfg on disk; Online queries a keyserver.'},
+      {key:'keydb_path',label:'KEYDB.cfg Location',type:'text',hint:'Path to KEYDB.cfg on disk (blank = default location).',indent:true,showIf:{key:'key_source',value:'local'}},
+      {key:'keydb_url',label:'KEYDB Update URL',type:'text',hint:'HTTP URL to download KEYDB.cfg (zip, gz, or plain text).',indent:true,showIf:{key:'key_source',value:'local'}},
+      {key:'keyserver_url',label:'Keyserver URL',type:'text',hint:'Base URL of the keyserver.',indent:true,showIf:{key:'key_source',value:'online'}},
+      {key:'keyserver_secret',label:'Keyserver API Secret',type:'text',hint:'Bearer token for the keyserver, if it requires one.',indent:true,showIf:{key:'key_source',value:'online'}},
+      {key:'capture_without_keys',label:'Capture Discs Without Keys',type:'bool',hint:'No usable keys → capture the disc to an ISO and mux later when keys become available. Off = skip the disc.'},
     ]},
     {title:'Performance',fields:[
       {key:'decrypt_threads',label:'Decrypt Threads',type:'number',hint:'How many threads AACS decryption uses. 0 = auto (all available cores, capped at 64). Drop to 4-8 if autorip is sharing the host with other heavy workloads.'},
@@ -1633,6 +1639,16 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         }
         if let Some(v) = patch.get("keyserver_secret").and_then(|v| v.as_str()) {
             c.keyserver_secret = v.to_string();
+        }
+        if let Some(v) = patch.get("keydb_path").and_then(|v| v.as_str()) {
+            c.keydb_path = if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            };
+        }
+        if let Some(v) = patch.get("capture_without_keys").and_then(|v| v.as_bool()) {
+            c.capture_without_keys = v;
         }
         if let Some(v) = patch.get("on_insert").and_then(|v| v.as_str()) {
             c.on_insert = v.to_string();

@@ -43,56 +43,48 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-/// Build [`libfreemkv::ScanOptions`] honoring the configured key source.
-///
-/// * `key_source = "local"` → use `keydb_path` (today's behavior).
-/// * `key_source = "online"` → POST the disc's key files to the keyserver and
-///   use the returned Unit Key directly. `inf_mkb` is the disc's
-///   `(Unit_Key_RO.inf, MKB)` bytes, extracted by the caller *before* the scan
-///   (from the live drive, or from the ISO on the resume path) — keys are
-///   needed during the scan, so this must be fetched up front.
-///
-/// `vid` is the disc's AACS Volume ID when known — `None` on the live
-/// pre-scan path (no handshake yet), `Some` on the resume path (recovered
-/// from the mapfile). It is forwarded to the keyserver so the server can use
-/// its MK/DK tiers for discs a bare inf+mkb couldn't resolve.
-///
-/// Any online failure (no URL, server miss, network error) yields default
-/// options; the scan then surfaces the usual "no keys" error.
-pub(crate) fn scan_opts_for(
+use crate::keysource::{KeySource, read_sample_units};
+
+/// [`libfreemkv::ScanOptions`] for the structure scan, per the configured key
+/// source (local carries the key database; sample-based sources scan keyless
+/// and resolve afterward via [`resolve_keys_from_drive`]).
+pub(crate) fn scan_opts_for(cfg: &Config) -> libfreemkv::ScanOptions {
+    KeySource::from_config(cfg).scan_options()
+}
+
+/// For sample-based key sources: after a structure scan, read the disc's key
+/// files + Volume ID + a few on-disc content samples off the drive, resolve a
+/// Unit Key, and re-scan with it so decryption keys populate. Returns the disc
+/// unchanged for non-sample sources (local) or when no key is available.
+fn resolve_keys_from_drive(
     cfg: &Config,
     device: &str,
-    inf_mkb: Option<(Vec<u8>, Vec<u8>)>,
-    vid: Option<[u8; 16]>,
-) -> libfreemkv::ScanOptions {
-    if cfg.key_source != "online" {
-        return libfreemkv::ScanOptions {
-            keydb_path: cfg.keydb_path.clone().map(Into::into),
-            ..Default::default()
-        };
+    drive: &mut libfreemkv::Drive,
+    disc: libfreemkv::Disc,
+) -> libfreemkv::Disc {
+    let ks = KeySource::from_config(cfg);
+    if !ks.needs_samples() {
+        return disc;
     }
-    if cfg.keyserver_url.is_empty() {
-        crate::log::device_log(
-            device,
-            "Online key source selected but no keyserver URL set",
-        );
-        return libfreemkv::ScanOptions::default();
-    }
-    let Some((inf, mkb)) = inf_mkb else {
-        crate::log::device_log(device, "Online key source: disc key files unavailable");
-        return libfreemkv::ScanOptions::default();
+    let Some(title) = disc.titles.first().cloned() else {
+        return disc;
     };
-    match crate::keyserver::fetch_uk(&cfg.keyserver_url, &cfg.keyserver_secret, &inf, &mkb, vid) {
+    let vid = disc.aacs.as_ref().map(|a| a.volume_id);
+    let Ok((inf, mkb)) = libfreemkv::Disc::read_aacs_inputs_from_drive(drive) else {
+        return disc;
+    };
+    let units = read_sample_units(drive, &title, crate::keysource::SAMPLE_UNITS);
+    match ks.resolve(&inf, &mkb, vid, &units) {
         Some(uk) => {
-            crate::log::device_log(device, "Keyserver returned a unit key");
-            libfreemkv::ScanOptions {
+            let opts = libfreemkv::ScanOptions {
                 unit_key: Some(uk),
                 ..Default::default()
-            }
+            };
+            libfreemkv::Disc::scan(drive, &opts).unwrap_or(disc)
         }
         None => {
-            crate::log::device_log(device, "Keyserver returned no key for this disc");
-            libfreemkv::ScanOptions::default()
+            crate::log::device_log(device, "No key available for this disc from the key source");
+            disc
         }
     }
 }
@@ -618,16 +610,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     // Full scan — titles, streams, AACS keys
     crate::log::device_log(device, "Scanning titles...");
-    // Online key source: fetch this disc's key files from the live drive and
-    // POST them to the keyserver before scanning (keys are needed during scan).
-    let inf_mkb = if cfg_read.key_source == "online" {
-        libfreemkv::Disc::read_aacs_inputs_from_drive(&mut drive).ok()
-    } else {
-        None
-    };
-    // Live pre-scan: no authenticated handshake yet, so no VID to send.
-    // (Pass 1 captures the VID into the mapfile for the resume path.)
-    let scan_opts = scan_opts_for(&cfg_read, device, inf_mkb, None);
+    let scan_opts = scan_opts_for(&cfg_read);
     let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
         Ok(d) => d,
         Err(e) => {
@@ -644,6 +627,9 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             return;
         }
     };
+    // Sample-based key source: resolve the Unit Key from the disc's files +
+    // on-disc samples and re-scan with it (a no-op for a local source).
+    let disc = resolve_keys_from_drive(&cfg_read, device, &mut drive, disc);
 
     // Update format from full scan (UHD vs BD now known)
     let disc_name = disc
@@ -1005,14 +991,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 tracing::warn!(device = %device, error = %e, "drive init failed (continuing)");
             }
 
-            let inf_mkb = if cfg_read.key_source == "online" {
-                libfreemkv::Disc::read_aacs_inputs_from_drive(&mut drive).ok()
-            } else {
-                None
-            };
-            // Live pre-scan: no authenticated handshake yet, so no VID to send.
-            // (Pass 1 captures the VID into the mapfile for the resume path.)
-            let scan_opts = scan_opts_for(&cfg_read, device, inf_mkb, None);
+            let scan_opts = scan_opts_for(&cfg_read);
             crate::log::device_log(device, "Scanning titles...");
             let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
                 Ok(d) => d,
@@ -1031,6 +1010,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     return;
                 }
             };
+            let disc = resolve_keys_from_drive(&cfg_read, device, &mut drive, disc);
 
             let disc_name = disc
                 .meta_title
@@ -1153,22 +1133,36 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let title = disc.titles[0].clone();
     let keys = disc.decrypt_keys();
 
-    // Keyless-capture: an encrypted disc with no usable keys can still be
-    // swept to a raw ISO (the sweep uses `decrypt: false`). Only the MUX
-    // truly needs keys. Previously this gate aborted the whole rip before
-    // the sweep (E7018), so the bitstream was never captured. Now we log
-    // the informative failure message as a *warning* and continue into the
-    // sweep; the mux is skipped later (ISO + mapfile preserved in staging
-    // for auto-resume to mux once keys arrive).
+    // No-keys decision. An encrypted disc with no usable keys can still be swept
+    // to a raw ISO (the sweep uses `decrypt: false`); only the MUX needs keys.
+    // The operator's `capture_without_keys` toggle decides what happens:
+    //   * enabled  → capture to ISO now, defer the mux until keys are available
+    //                (the mux is skipped below; staging is preserved for resume).
+    //   * disabled → don't rip; surface the explicit reason and stop here.
     let keys_missing = disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None);
     if keys_missing {
         let msg = aacs_failure_message(disc.aacs_error.as_ref());
-        crate::log::device_log(
-            device,
-            &format!(
-                "{msg}\nNo keys yet — capturing to ISO; mux deferred until keys are available."
-            ),
-        );
+        if cfg_read.capture_without_keys {
+            crate::log::device_log(
+                device,
+                &format!(
+                    "{msg}\nNo keys yet — capturing to ISO; mux deferred until keys are available."
+                ),
+            );
+        } else {
+            crate::log::device_log(
+                device,
+                &format!(
+                    "{msg}\nNo keys — not ripping. Enable \"capture without keys\" to save an ISO for later."
+                ),
+            );
+            update_state_with(device, |s| {
+                s.status = "error".to_string();
+                s.last_error = format!("No keys — not ripping. {msg}");
+            });
+            unregister_halt(device);
+            return;
+        }
     }
 
     // Probe for speed — only needed for rip, not scan
@@ -3310,15 +3304,10 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
     // KeydbLoad is a structural pre-condition failure, not an AACS
     // resolution failure — surface it with its own messaging before
     // the numeric dispatch.
-    if let Some(libfreemkv::Error::KeydbLoad { path }) = err {
-        if path == "<no keydb in search paths>" {
-            return "No KEYDB.cfg found\n\
-                    Set the path in Settings or click \"Update KEYDB\"."
-                .to_string();
-        }
+    if let Some(libfreemkv::Error::KeydbLoad { path: _ }) = err {
         return format!(
-            "KEYDB load failed (E{})\n\
-             KEYDB at {path} didn't parse. Click \"Update KEYDB\" to re-download.",
+            "No keys available (E{})\n\
+             Configure a key source in Settings.",
             ec::E_KEYDB_LOAD
         );
     }
@@ -3328,7 +3317,7 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
         // encrypted && aacs.is_none(); if we land here something is
         // structurally off (e.g. callers building Disc by hand).
         return "Encrypted disc, no keys found\n\
-                Check KEYDB."
+                Check the key source in Settings."
             .to_string();
     };
 
@@ -3342,7 +3331,7 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
         // E7000 — generic "everything tried, nothing worked" catch-all.
         ec::E_AACS_NO_KEYS => format!(
             "No keys (E{code})\n\
-             Disc not in KEYDB and no DK/PK path worked. Try \"Update KEYDB\"."
+             Disc not resolvable and no DK/PK path worked."
         ),
 
         // Host cert rejected by the drive's HRL. Surfaces from
@@ -3358,7 +3347,7 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
         | ec::E_AACS_KEY_REJECTED
         | ec::E_AACS_HOST_CERT_REJECTED => format!(
             "Host cert rejected (E{code})\n\
-             Drive HRL rejected every cert in KEYDB. Needs firmware unrevoke or \
+             Drive HRL rejected every available host cert. Needs firmware unrevoke or \
              raw-read mode."
         ),
 
@@ -3367,7 +3356,7 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
         // because we never got far enough to attempt cert exchange.
         ec::E_AACS_RAW_READ_UNSUPPORTED => format!(
             "No usable cert (E{code})\n\
-             Drive does not support raw-read mode AND no certs in KEYDB. Can't rip on this drive."
+             Drive does not support raw-read mode and no usable host cert. Can't rip on this drive."
         ),
 
         // VID retrieval failed. From cert path: VID read (7009) or VID
@@ -3378,7 +3367,7 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
         ec::E_AACS_VID_READ | ec::E_AACS_VID_MAC | ec::E_AACS_VID_UNAVAILABLE => format!(
             "No Volume ID (E{code})\n\
              Drive didn't return VID during AACS auth. Can't derive keys; disc not \
-             in KEYDB either."
+             resolvable."
         ),
 
         // MK derivation failed. VID succeeded but no DK in keydb walks
@@ -3386,15 +3375,15 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
         // (7018).
         ec::E_AACS_DATA_KEY | ec::E_AACS_MK_UNAVAILABLE => format!(
             "No usable DK (E{code})\n\
-             VID ok, but no DK in KEYDB walks this disc's MKB. Try \"Update KEYDB\"."
+             VID ok, but no DK walks this disc's MKB."
         ),
 
         // Disc-hash lookup in keydb missed and no other path is
         // available. Typically downstream of VID being unavailable so
         // the derivation paths short-circuit.
         ec::E_AACS_VUK_NOT_IN_KEYDB => format!(
-            "Disc not in KEYDB (E{code})\n\
-             Disc hash not in KEYDB. Try \"Update KEYDB\"."
+            "Disc not resolvable (E{code})\n\
+             Disc hash not found in available keys."
         ),
 
         // Other 7xxx — known AACS category but unmapped. Use a
@@ -3584,8 +3573,8 @@ mod tests {
             path: "<no keydb in search paths>".into(),
         };
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No KEYDB.cfg found"), "msg: {s}");
-        assert!(s.contains("Update KEYDB"), "msg: {s}");
+        assert!(s.starts_with("No keys available"), "msg: {s}");
+        assert!(!s.contains("KEYDB"), "msg must not name the source: {s}");
     }
 
     #[test]
@@ -3594,10 +3583,9 @@ mod tests {
             path: "/srv/autorip/config/keys/keydb.cfg".into(),
         };
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("KEYDB load failed"), "msg: {s}");
-        assert!(s.contains("/srv/autorip/config/keys/keydb.cfg"), "msg: {s}");
+        assert!(s.starts_with("No keys available"), "msg: {s}");
         assert!(s.contains("E8005"), "msg: {s}");
-        assert!(s.contains("Update KEYDB"), "msg: {s}");
+        assert!(!s.contains("KEYDB"), "msg must not name the source: {s}");
     }
 
     #[test]
@@ -3664,7 +3652,7 @@ mod tests {
         let s = aacs_failure_message(Some(&e));
         assert!(s.starts_with("No keys"), "msg: {s}");
         assert!(s.contains("E7000"), "msg: {s}");
-        assert!(s.contains("Update KEYDB"), "msg: {s}");
+        assert!(s.contains("DK/PK"), "msg: {s}");
     }
 
     #[test]
@@ -3734,9 +3722,9 @@ mod tests {
         // was available.
         let e = Error::AacsVukNotInKeydb;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("Disc not in KEYDB"), "msg: {s}");
+        assert!(s.starts_with("Disc not resolvable"), "msg: {s}");
         assert!(s.contains("E7019"), "msg: {s}");
-        assert!(s.contains("Update KEYDB"), "msg: {s}");
+        assert!(!s.contains("KEYDB"), "msg must not name the source: {s}");
     }
 
     #[test]

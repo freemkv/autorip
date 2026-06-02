@@ -472,7 +472,7 @@ pub(super) struct PassProgressState {
 ///   to full speed.
 ///
 /// Resulting schedule (1.5 s callback ⇒ ~40 samples in a 60 s window):
-/// ```
+/// ```text
 ///   t+ 30 s → 10 s window
 ///   t+ 60 s → 10 s window (start of growth phase)
 ///   t+210 s → 35 s window

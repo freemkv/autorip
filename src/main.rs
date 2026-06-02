@@ -1,6 +1,6 @@
 mod config;
 mod history;
-mod keyserver;
+mod keysource;
 mod log;
 mod mover;
 mod muxer;

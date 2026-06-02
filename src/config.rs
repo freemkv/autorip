@@ -49,6 +49,10 @@ pub struct Config {
     pub keep_iso: bool,
     /// Abort rip if main movie loss exceeds N seconds. 0 = never abort (continue anyway).
     pub abort_on_lost_secs: u64,
+    /// When a disc has no usable keys: if true, capture it to an ISO anyway and
+    /// defer the mux until keys are available; if false (default), abort the rip
+    /// with an explicit message. The operator's "proceed vs abort" decision.
+    pub capture_without_keys: bool,
     /// Maximum total time for entire rip across all passes (seconds). Prevents infinite hangs.
     pub max_rip_duration_secs: u64,
     /// Minimum per-pass wallclock budget (seconds), used when disc runtime is unknown.
@@ -58,15 +62,12 @@ pub struct Config {
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,
     pub keydb_url: String,
-    /// Key source mode: "local" (use keydb.cfg) or "online" (use a keyserver).
-    /// Mutually exclusive — one or the other.
+    /// Where AACS keys come from: "local" (a key database on disk) or "online"
+    /// (an external key service). Mutually exclusive.
     pub key_source: String,
-    /// Keyserver base URL for `key_source = "online"` (any compatible
-    /// keyserver). The disc's Unit_Key_RO.inf + MKB are POSTed to
-    /// `<url>/decode` and the returned Unit Key drives decryption.
+    /// Base URL of the external key service used when `key_source = "online"`.
     pub keyserver_url: String,
-    /// API secret for the keyserver, sent as `Authorization: Bearer <secret>`.
-    /// Lets the server attribute/rate-limit/bill/block per key. Empty = none.
+    /// Optional bearer token for the key service. Empty = none.
     pub keyserver_secret: String,
     pub webhook_urls: Vec<String>,
     pub autorip_dir: String,
@@ -107,6 +108,7 @@ impl Default for Config {
             max_retries: 1,
             keep_iso: false,
             abort_on_lost_secs: 0,
+            capture_without_keys: false,
             max_rip_duration_secs: 28_800, // 8h cap for UHD with heavy recovery
             min_pass_budget_secs: 5_400,   // 90 min per pass
             transport_recovery_delay_secs: 5,
@@ -248,6 +250,9 @@ fn load_saved(mut cfg: Config) -> Config {
     }
     if let Some(v) = saved.get("abort_on_lost_secs").and_then(|v| v.as_u64()) {
         cfg.abort_on_lost_secs = v;
+    }
+    if let Some(v) = saved.get("capture_without_keys").and_then(|v| v.as_bool()) {
+        cfg.capture_without_keys = v;
     }
     if let Some(v) = saved.get("max_rip_duration_secs").and_then(|v| v.as_u64()) {
         cfg.max_rip_duration_secs = v;

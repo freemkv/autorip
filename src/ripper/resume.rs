@@ -128,10 +128,8 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
         Ok(m) => m,
         Err(_) => return ResumeClass::NotEligible,
     };
-    // Surface the persisted AACS Volume ID (if Pass 1 recorded one) so the
-    // deferred-mux / keyserver path can resolve keys without re-reading the
-    // disc. Full keyserver consumption is a later task; here we just confirm
-    // the value round-tripped through the mapfile.
+    // Log the persisted AACS Volume ID (if Pass 1 recorded one) — the resume
+    // key resolution reads it back from the mapfile below.
     if let Some(vid) = map.vid() {
         let hex: String = vid.iter().map(|b| format!("{b:02x}")).collect();
         tracing::info!(vid = %hex, mapfile = %mapfile_path.display(), "resume: recovered AACS Volume ID from mapfile");
@@ -304,30 +302,19 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         }
     };
 
-    // 3. Disc::scan_image to recover Disc + titles.
-    // Online key source: extract this disc's key files from the ISO and POST
-    // them to the keyserver before scanning (the resume path muxes the ISO).
-    let inf_mkb = if cfg_read.key_source == "online" {
-        libfreemkv::Disc::read_aacs_inputs(&iso_path).ok()
+    // 3. Disc::scan_image to recover Disc + titles. A sample-based key source
+    //    scans structure-only first (the title extents are needed to read the
+    //    on-disc samples), then resolves a key and re-scans with it (see
+    //    `resolve_keys_from_iso`). A local source resolves keys here.
+    let online = cfg_read.key_source == "online";
+    let struct_opts = if online {
+        libfreemkv::ScanOptions::default()
     } else {
-        None
+        super::scan_opts_for(&cfg_read)
     };
-    // Recover the AACS Volume ID Pass 1 persisted into the mapfile and forward
-    // it to the keyserver. The ISO carries no VID (it's a protected-area
-    // secret), so the mapfile is the only way the deferred-mux re-query can
-    // reach the server's MK/DK tiers — the self-healing path for a disc the
-    // first inf+mkb query missed.
-    let vid = if cfg_read.key_source == "online" {
-        libfreemkv::disc::mapfile::Mapfile::load(&_mapfile_path)
-            .ok()
-            .and_then(|m| m.vid())
-    } else {
-        None
-    };
-    let scan_opts = super::scan_opts_for(&cfg_read, device, inf_mkb, vid);
     use libfreemkv::SectorSource;
     let capacity = iso_reader.capacity_sectors();
-    let disc = match libfreemkv::Disc::scan_image(&mut iso_reader, capacity, &scan_opts) {
+    let disc = match libfreemkv::Disc::scan_image(&mut iso_reader, capacity, &struct_opts) {
         Ok(d) => d,
         Err(e) => {
             crate::log::device_log(
@@ -352,6 +339,11 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         );
         return;
     }
+
+    // Sample-based key source: read the disc's files + Volume ID (from the
+    // mapfile) + on-disc samples (from the ISO), resolve a Unit Key, and re-scan
+    // with it so decryption keys populate. No-op for a local source.
+    let disc = resolve_keys_from_iso(&cfg_read, &iso_path, &_mapfile_path, disc, capacity);
 
     // Real-bitrate re-validation: now that we have the actual title,
     // recompute bytes-bad-in-title (vs the classifier's whole-disc
@@ -710,6 +702,50 @@ pub(crate) fn remux_from_ripped_marker(
         }
     }
     success
+}
+
+/// Sample-based key source on the resume/deferred-mux path: read the disc's key
+/// files + on-disc samples from the staged ISO, plus the Volume ID persisted in
+/// the mapfile, resolve a Unit Key, and re-scan the ISO with it so decryption
+/// keys populate. Returns the disc unchanged for a local source or on a miss.
+fn resolve_keys_from_iso(
+    cfg: &Config,
+    iso_path: &Path,
+    mapfile_path: &Path,
+    disc: libfreemkv::Disc,
+    capacity: u32,
+) -> libfreemkv::Disc {
+    use crate::keysource::{KeySource, SAMPLE_UNITS, read_sample_units};
+    let ks = KeySource::from_config(cfg);
+    if !ks.needs_samples() {
+        return disc;
+    }
+    let Some(title) = disc.titles.first().cloned() else {
+        return disc;
+    };
+    let Ok((inf, mkb)) = libfreemkv::Disc::read_aacs_inputs(iso_path) else {
+        return disc;
+    };
+    let vid = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path)
+        .ok()
+        .and_then(|m| m.vid());
+    let units = match libfreemkv::FileSectorSource::open(iso_path) {
+        Ok(mut r) => read_sample_units(&mut r, &title, SAMPLE_UNITS),
+        Err(_) => Vec::new(),
+    };
+    match ks.resolve(&inf, &mkb, vid, &units) {
+        Some(uk) => {
+            let opts = libfreemkv::ScanOptions {
+                unit_key: Some(uk),
+                ..Default::default()
+            };
+            match libfreemkv::FileSectorSource::open(iso_path) {
+                Ok(mut r) => libfreemkv::Disc::scan_image(&mut r, capacity, &opts).unwrap_or(disc),
+                Err(_) => disc,
+            }
+        }
+        None => disc,
+    }
 }
 
 // Tests live in `tests/resume_remux.rs` (integration tests) — they

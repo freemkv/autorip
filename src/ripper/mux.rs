@@ -64,9 +64,11 @@ pub const HARD_WATCHDOG_STALL_SECS: u64 = 1200;
 ///
 /// **Total work estimate** (matches `state.rs::total_work_estimated`):
 ///
+/// ```text
 ///     total_work = bytes_total_disc                 // sweep
 ///                + max_retries × bytes_unreadable    // retries
 ///                + bytes_total_disc                  // mux re-reads ISO
+/// ```
 ///
 /// On a clean disc with `bytes_unreadable=0`, the retry term vanishes
 /// and total_work = 2 × disc capacity — so mux opens at exactly 50%.
@@ -75,9 +77,11 @@ pub const HARD_WATCHDOG_STALL_SECS: u64 = 1200;
 ///
 /// **Total work done** by mux time:
 ///
+/// ```text
 ///     total_done = bytes_total_disc                 // sweep complete
 ///                + max_retries × bytes_unreadable    // retries complete
 ///                + (mux_pct / 100) × bytes_total_disc
+/// ```
 ///
 /// **Why `max_retries` and not actual-passes-run?** State.rs uses
 /// `max_retries × bytes_unreadable` (planned × current); we mirror it
