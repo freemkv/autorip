@@ -4,7 +4,7 @@
 
 ```bash
 # 1. Pre-commit (run locally)
-cd freemkv && (internal)/scripts/precommit.sh [libfreemkv|autorip]
+cd freemkv && ./precommit.sh [libfreemkv|autorip]
 
 # 2. Tag and push
 git tag -a v0.18.1 -m "v0.18.1"
@@ -25,10 +25,10 @@ Run lint + tests before pushing:
 
 ```bash
 # All crates
-(internal)/scripts/precommit.sh
+./precommit.sh
 
 # Single crate
-(internal)/scripts/precommit.sh autorip
+./precommit.sh autorip
 ```
 
 This runs:

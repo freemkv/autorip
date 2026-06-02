@@ -17,9 +17,9 @@
   `keep_iso=false`.** `check_and_move` collected ANY `.iso/.mkv/.m2ts`
   from a `.done` staging dir; the `keep_iso` flag was only consulted
   by the ripper's post-mux prune (which runs after `.done` is written,
-  losing the race against the mover's 10 s scan loop). Hit live on
-  rip1 2026-05-20: `Wicked.iso` (94 GB) landed at
-  `/mnt/unraid-1/media/movies/Wicked For Good/Wicked For Good.iso`
+  losing the race against the mover's 10 s scan loop). Hit live
+  2026-05-20: a 94 GB `.iso` landed at
+  `/media/movies/Sample Film/Sample Film.iso`
   alongside the intended MKV. Fix: filter `.iso` out of the
   planned-moves set when `keep_iso=false`; the existing
   `remove_dir_all` staging-teardown sweeps the orphan ISO from
@@ -27,7 +27,7 @@
 - **Mover telemetry froze on NFS attribute-cache stalls.** The
   move_file polling loop called `std::fs::metadata(dest)` every 3 s
   to update the `_move` field surfaced on the System page. Under
-  concurrent rip+mover I/O on rip1's /mnt/unraid-1 NFS share, this
+  concurrent rip+mover I/O on the NFS share, this
   call could block for many minutes on attribute-cache refresh,
   freezing `progress_gb` at one bit-identical value (e.g.
   `17.226043701171875`) while the dest file actually grew. Fix:
@@ -71,7 +71,7 @@
   destination path. Successive mover ticks alternated overwriting
   one with the other (ISO bytes wiping the MKV → post-cp EBML check
   fails → next tick MKV overwrites again → next tick ISO wins, etc.).
-  Hit live on rip1 2026-05-20 on an Oppenheimer rip; the MKV was
+  Hit live 2026-05-20 on a sample rip; the MKV was
   destroyed by an ISO copy that landed under the `.mkv` name.
   0.25.7 preserves the source extension so `Title.iso` and
   `Title.mkv` land at distinct destination paths.
@@ -271,7 +271,7 @@ disc 1.
 ### Fixed — post-cp validation (replaces size-stat)
 
 The v0.25.2 release-test rip hit a phantom `SizeMismatch` on a
-58 GiB Civil War MKV that had byte-for-byte landed on NFS — the cp
+58 GiB MKV that had byte-for-byte landed on NFS — the cp
 closed, the autorip mover ran `std::fs::metadata` on the dest,
 NFS returned a stale cached attribute, and the size compared as
 short. Source was preserved (validation is gated correctly) but
@@ -1123,7 +1123,7 @@ in-pipeline retry path can't recover from. On expiration:
 ### Fix: consume libfreemkv 0.13.12 PatchResult counters
 
 Pass 2..N's per-pass log line now includes `blocks attempted=N read_ok=N
-read_failed=N` so the v0.13.11 mystery (Dune 2: "100 minutes recovered 0
+read_failed=N` so the v0.13.11 mystery (a UHD disc: "100 minutes recovered 0
 bytes") becomes diagnosable from the live device log.
 
 ### Fix: stop drain comment drift
@@ -1148,7 +1148,7 @@ the field no longer exists upstream.
 
 Picks up libfreemkv's revert of the v0.13.10 SgIoTransport timeout
 path. v0.13.10's "fd-dead-after-one-timeout" caused Pass 1 to
-finish in 45 ms with 0 bytes good on Dune 2; v0.13.11 keeps the
+finish in 45 ms with 0 bytes good on a UHD disc; v0.13.11 keeps the
 transport alive across timeouts. Stall guard from v0.13.9 still
 caps the worst-case stall at 120 s.
 
@@ -1182,7 +1182,7 @@ deferred to v0.14.
   in `eject_drive`'s warning. No behavior change.
 - Picks up libfreemkv 0.13.9: `Disc::copy` stall guard + the
   `SgIoTransport` reopen-after-timeout fix that prevents the silent
-  Pass 1 hang observed on Dune 2 in the v0.13.8 live test.
+  Pass 1 hang observed on a UHD disc in the v0.13.8 live test.
 
 ## 0.13.8 (2026-04-25)
 
@@ -1207,7 +1207,7 @@ host (BU40N) where stop-drain worked but the post-stop UX surfaced as
   register_rip_thread` into one call. All three rip-related spawn
   sites (poll-loop, handle_scan, handle_rip) now use it. New
   `tests/spawn_registration.rs` pins the contract that v0.13.6 first
-  violated. See the post-mortem follow-up in (internal).
+  violated. See the internal post-mortem follow-up.
 
 ## 0.13.7 (2026-04-25)
 
@@ -1306,7 +1306,7 @@ on 0.13.6).
 
 ### Stop is a true reset; startup sweeps stale staging
 
-Two bugs surfaced during the 0.13.4 production test of Dune: Part Two and
+Two bugs surfaced during the 0.13.4 production test of a UHD disc and
 are fixed here.
 
 **Startup staging sweep.** Prior autorip processes killed mid-rip leave
@@ -1595,7 +1595,7 @@ Pass 1 of a multi-pass rip used to open `CopyOptions` with `resume: true`, so
 if a prior run's `*.iso` + `*.iso.mapfile` were still sitting in staging (from
 a Stop, error, eject-mid-rip, or container crash) the next rip inserted the
 same disc silently picked up from the prior mapfile's `bytes_good`. Observed
-on a cold rip of Dune: Part Two as "30 % · 24.0 / 78.8 GB" reported 10 s in.
+on a cold rip of a UHD disc as "30 % · 24.0 / 78.8 GB" reported 10 s in.
 
 - `ripper::rip_disc` now calls `Disc::copy` with `resume: false`. The library
   wipes the mapfile and recreates the ISO, so `bytes_good` starts at 0 and
@@ -1665,7 +1665,7 @@ Follow-up to 0.11.21 — every item from the original multi-pass design is now s
 
 When `max_retries > 0`, autorip now runs the full ddrescue-style multi-pass flow from libfreemkv 0.11.21:
 1. `Disc::copy` with `skip_on_error=true, skip_forward=true` → disc → ISO + ddrescue-format mapfile. 64 KB block reads, exponential skip-forward on failure, zero-fill bad ranges. A damaged disc completes pass 1 in minutes instead of hours.
-2. Up to `max_retries` calls to `Disc::patch` retry each bad range with full drive recovery enabled. Stops early if a pass recovers zero bytes (structure-protected sectors like Dune P2 never yield).
+2. Up to `max_retries` calls to `Disc::patch` retry each bad range with full drive recovery enabled. Stops early if a pass recovers zero bytes (structure-protected sectors never yield).
 3. Drive released. ISO muxed to MKV via existing `DiscStream + IsoSectorReader` pipeline.
 4. ISO pruned unless `keep_iso=true`.
 
