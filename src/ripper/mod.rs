@@ -1143,25 +1143,22 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let title = disc.titles[0].clone();
     let keys = disc.decrypt_keys();
 
-    if disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None) {
+    // Keyless-capture: an encrypted disc with no usable keys can still be
+    // swept to a raw ISO (the sweep uses `decrypt: false`). Only the MUX
+    // truly needs keys. Previously this gate aborted the whole rip before
+    // the sweep (E7018), so the bitstream was never captured. Now we log
+    // the informative failure message as a *warning* and continue into the
+    // sweep; the mux is skipped later (ISO + mapfile preserved in staging
+    // for auto-resume to mux once keys arrive).
+    let keys_missing = disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None);
+    if keys_missing {
         let msg = aacs_failure_message(disc.aacs_error.as_ref());
-        crate::log::device_log(device, &msg);
-        update_state(
+        crate::log::device_log(
             device,
-            RipState {
-                device: device.to_string(),
-                status: "error".to_string(),
-                last_error: msg,
-                disc_name: display_name,
-                disc_format,
-                tmdb_title,
-                tmdb_year,
-                tmdb_poster,
-                tmdb_overview,
-                ..Default::default()
-            },
+            &format!(
+                "{msg}\nNo keys yet — capturing to ISO; mux deferred until keys are available."
+            ),
         );
-        return;
     }
 
     // Probe for speed — only needed for rip, not scan
@@ -2693,6 +2690,53 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     } else {
         Box::new(session.drive) as Box<dyn libfreemkv::SectorSource>
     };
+
+    // Keyless-capture mux-skip: an encrypted disc with no usable keys was
+    // swept to a raw ISO above (sweep needs no keys). Muxing now with
+    // `DecryptKeys::None` would write a garbage/encrypted MKV, so SKIP the
+    // mux entirely and PRESERVE staging (ISO + mapfile) so the deferred
+    // mux can run once keys exist.
+    //
+    // Reachability:
+    //   - multipass (max_retries > 0): the primary route already returned
+    //     via the `.ripped` marker hand-off above; the muxer worker re-tries
+    //     and `resume_remux` applies the same no-keys deferral. We only land
+    //     here on the rare marker-write-failure fallback — keep the ISO.
+    //   - single-pass (max_retries == 0): live disc→MKV with no ISO
+    //     intermediate. There's nothing to defer to, but we must NOT write a
+    //     garbage MKV. Skip and surface the deferral reason.
+    if keys_missing {
+        let msg = aacs_failure_message(disc.aacs_error.as_ref());
+        if cfg_read.max_retries > 0 {
+            crate::log::device_log(
+                device,
+                &format!(
+                    "Ripped to ISO — no keys, mux deferred. ISO + mapfile preserved in staging \
+                     ({staging}); auto-resume will mux once keys are available. {msg}"
+                ),
+            );
+            update_state_with(device, |s| {
+                s.status = "idle".to_string();
+                s.last_error = format!("Ripped to ISO — no keys, mux deferred. {msg}");
+            });
+        } else {
+            crate::log::device_log(
+                device,
+                &format!(
+                    "Single-pass rip with no keys — cannot mux (no ISO captured). \
+                     Enable multi-pass mode to capture a deferred-mux ISO. {msg}"
+                ),
+            );
+            update_state_with(device, |s| {
+                s.status = "error".to_string();
+                s.last_error = format!(
+                    "No keys — cannot mux. {msg} (multi-pass mode captures an ISO for deferred mux.)"
+                );
+            });
+        }
+        unregister_halt(device);
+        return;
+    }
 
     // Debug log reader type for mux - confirms ISO vs drive source
     tracing::debug!(target: "mux", " mux using reader: {}", if cfg_read.max_retries > 0 { "ISO file (multipass)" } else { "physical drive" });

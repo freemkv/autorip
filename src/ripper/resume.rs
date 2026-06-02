@@ -379,6 +379,39 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let keys = disc.decrypt_keys();
     let batch = libfreemkv::disc::detect_max_batch_sectors("/dev/null");
 
+    // Keyless-capture deferral: the ISO was swept raw (no keys needed),
+    // but the MUX needs decryption keys. If this encrypted disc still has
+    // no usable keys, DO NOT mux — muxing with `DecryptKeys::None` would
+    // write a garbage/encrypted MKV. Return early (without writing the
+    // `.completed` marker) so `remux_from_ripped_marker` leaves the
+    // `.ripped` marker + ISO + mapfile in staging. The mux worker will
+    // re-attempt on its next tick, and once a KEYDB update / keydb refresh
+    // provides keys, the same ISO muxes cleanly. This is the deferred-mux
+    // half of the no-keys capture flow started in `rip_disc`.
+    if disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None) {
+        let msg = super::aacs_failure_message(disc.aacs_error.as_ref());
+        crate::log::device_log(
+            device,
+            &format!(
+                "{msg}\nRipped to ISO — no keys, mux deferred. \
+                 Staging preserved; will mux automatically once keys are available."
+            ),
+        );
+        // Status reset is a no-op for state (we never set "ripping" yet —
+        // that happens below at line ~411), but set a clear non-error
+        // terminal state that keeps the disc identity and surfaces the
+        // deferral reason without flagging a hard failure.
+        reset_status_after_ripping(
+            device,
+            "idle",
+            &display_name,
+            &disc_format,
+            &crate::util::format_duration_hm(title.duration_secs),
+            Some(format!("Ripped to ISO — no keys, mux deferred. {msg}")),
+        );
+        return;
+    }
+
     let output_format = cfg_read.output_format.clone();
     let ext = match output_format.as_str() {
         "m2ts" => "m2ts",
