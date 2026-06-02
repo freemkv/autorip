@@ -112,6 +112,21 @@ impl OnlineKeyService {
         if self.base_url.is_empty() {
             return None;
         }
+        // A real MKB is at most a few MB (a UHD MKB ~3.8 MB). Anything far
+        // larger means something is wrong (e.g. the padded MKB_RW region got
+        // read instead of the real MKB). Don't ship a giant body — surface a
+        // clear, reportable error and skip the query.
+        const MAX_MKB_BYTES: usize = 10 * 1024 * 1024;
+        if mkb.len() > MAX_MKB_BYTES {
+            tracing::warn!(
+                phase = "keyservice_query",
+                mkb_bytes = mkb.len(),
+                "MKB unexpectedly large ({} MB) — not querying the key service. \
+                 This is a bug; please file a report at github.com/freemkv/autorip/issues",
+                mkb.len() / 1024 / 1024
+            );
+            return None;
+        }
         let url = format!("{}/decode", self.base_url.trim_end_matches('/'));
         let b64 = base64::engine::general_purpose::STANDARD;
         let mut body = serde_json::json!({
