@@ -343,7 +343,8 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // Sample-based key source: read the disc's files + Volume ID (from the
     // mapfile) + on-disc samples (from the ISO), resolve a Unit Key, and re-scan
     // with it so decryption keys populate. No-op for a local source.
-    let disc = resolve_keys_from_iso(&cfg_read, &iso_path, &_mapfile_path, disc, capacity);
+    let (disc, _key_outcome) =
+        resolve_keys_from_iso(&cfg_read, &iso_path, &_mapfile_path, disc, capacity);
 
     // Real-bitrate re-validation: now that we have the actual title,
     // recompute bytes-bad-in-title (vs the classifier's whole-disc
@@ -713,7 +714,7 @@ fn resolve_keys_from_iso(
     mapfile_path: &Path,
     disc: libfreemkv::Disc,
     capacity: u32,
-) -> libfreemkv::Disc {
+) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
     let ks = crate::keysource::KeySource::from_config(cfg);
     let mut access = crate::keysource::IsoAccess::new(iso_path, mapfile_path, capacity);
     crate::keysource::resolve_keys(&ks, &mut access, disc)

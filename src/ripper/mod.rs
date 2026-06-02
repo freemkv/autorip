@@ -60,7 +60,7 @@ fn resolve_keys_from_drive(
     cfg: &Config,
     drive: &mut libfreemkv::Drive,
     disc: libfreemkv::Disc,
-) -> libfreemkv::Disc {
+) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
     let ks = KeySource::from_config(cfg);
     let vid = disc.aacs.as_ref().map(|a| a.volume_id);
     let mut access = DriveAccess::new(drive, vid);
@@ -69,23 +69,43 @@ fn resolve_keys_from_drive(
 
 /// Human-readable key readiness for the dashboard tile, decided at scan time.
 /// Unencrypted, or keys present → "Ready to rip"; encrypted with no keys →
-/// "Missing keys — <reason>" (the concise AACS failure heading, source-free),
-/// unless the operator opted into capturing without keys, in which case the
-/// rip is allowed to proceed (encrypted ISO for later) → "Capture without keys".
+/// "Missing keys — <reason>", where the reason reflects WHAT happened when we
+/// tried to resolve (key service unreachable / no key / disc-data anomaly /
+/// couldn't read the disc's key files), or — for a local source — the concise
+/// libfreemkv AACS failure heading. Capture-without-keys overrides to a
+/// proceed-anyway state.
 ///
 /// The tile keys its action button off the "Missing keys" prefix: any other
 /// value (including "Capture without keys") leaves the green Rip button up.
-fn key_readiness(disc: &libfreemkv::Disc, capture_without_keys: bool) -> String {
-    if disc.encrypted && matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None) {
-        if capture_without_keys {
-            return "Capture without keys — no decryption".to_string();
-        }
-        let msg = aacs_failure_message(disc.aacs_error.as_ref());
-        let head = msg.lines().next().unwrap_or("no keys");
-        format!("Missing keys — {head}")
-    } else {
-        "Ready to rip".to_string()
+fn key_readiness(
+    disc: &libfreemkv::Disc,
+    outcome: crate::keysource::KeyOutcome,
+    capture_without_keys: bool,
+) -> String {
+    use crate::keysource::KeyOutcome;
+    let no_keys =
+        disc.encrypted && matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None);
+    if !no_keys {
+        return "Ready to rip".to_string();
     }
+    if capture_without_keys {
+        return "Capture without keys — no decryption".to_string();
+    }
+    let reason = match outcome {
+        KeyOutcome::Unreachable => {
+            "key service unreachable (check Keyserver URL / network)".to_string()
+        }
+        KeyOutcome::NoKey => "no key available for this disc".to_string(),
+        KeyOutcome::InputAnomaly => "disc data anomaly — please file a bug report".to_string(),
+        KeyOutcome::MissingInputs => "could not read this disc's key files".to_string(),
+        // Local source, or a resolve that still left the disc keyless: defer to
+        // the libfreemkv AACS failure heading (the authority for the local path).
+        KeyOutcome::Inline | KeyOutcome::Resolved => {
+            let msg = aacs_failure_message(disc.aacs_error.as_ref());
+            msg.lines().next().unwrap_or("no keys").to_string()
+        }
+    };
+    format!("Missing keys — {reason}")
 }
 
 use session::{
@@ -627,9 +647,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     };
     // Sample-based key source: resolve the Unit Key from the disc's files +
-    // on-disc samples and re-scan with it (a no-op for a local source).
-    let disc = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
-    let key_status = key_readiness(&disc, cfg_read.capture_without_keys);
+    // on-disc samples and re-scan with it (a no-op for a local source). The
+    // outcome carries WHY a resolve failed, for the readiness message.
+    let (disc, key_outcome) = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
+    let key_status = key_readiness(&disc, key_outcome, cfg_read.capture_without_keys);
 
     // Update format from full scan (UHD vs BD now known)
     let disc_name = disc
@@ -1011,7 +1032,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                     return;
                 }
             };
-            let disc = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
+            let (disc, _key_outcome) = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
 
             let disc_name = disc
                 .meta_title

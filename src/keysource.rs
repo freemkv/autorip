@@ -18,6 +18,33 @@ use crate::config::Config;
 /// How many 6144-byte aligned units a sample-based source is given.
 pub const SAMPLE_UNITS: usize = 4;
 
+/// What happened when resolving keys for a disc — carried back so the UI can
+/// tell the user *why*, instead of a generic "missing keys".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOutcome {
+    /// Resolved a Unit Key and re-scanned — the disc now carries keys.
+    Resolved,
+    /// Local key source: keys resolve inline during the scan; the libfreemkv
+    /// scan result (and its `aacs_error`) is the authority, nothing to add here.
+    Inline,
+    /// Couldn't read the disc's key files, or the disc reported no titles.
+    MissingInputs,
+    /// Key service was reached but has no key for this disc.
+    NoKey,
+    /// Key service could not be reached (network / TLS / DNS / bad URL).
+    Unreachable,
+    /// The disc's key data was anomalous (e.g. an oversized MKB) — not queried.
+    InputAnomaly,
+}
+
+/// Result of a single fetch from a key source.
+enum FetchResult {
+    Key([u8; 16]),
+    NoKey,
+    Unreachable,
+    InputAnomaly,
+}
+
 /// A configured AACS key source.
 pub enum KeySource {
     /// Resolve against a local key database (libfreemkv does it during scan).
@@ -67,17 +94,17 @@ impl KeySource {
     }
 
     /// Resolve a Unit Key for a disc from its key files + on-disc content
-    /// samples. Returns `None` if unavailable. A local source resolves inline at
-    /// scan time, so it returns `None` here.
-    pub fn resolve(
+    /// samples. A local source resolves inline at scan time, so it reports
+    /// `NoKey` here (it never reaches this path — `needs_samples` is false).
+    fn resolve(
         &self,
         inf: &[u8],
         mkb: &[u8],
         vid: Option<[u8; 16]>,
         units: &[Vec<u8>],
-    ) -> Option<[u8; 16]> {
+    ) -> FetchResult {
         match self {
-            KeySource::Local { .. } => None,
+            KeySource::Local { .. } => FetchResult::NoKey,
             KeySource::Online(svc) => svc.fetch(inf, mkb, vid, units),
         }
     }
@@ -105,12 +132,12 @@ impl OnlineKeyService {
         mkb: &[u8],
         vid: Option<[u8; 16]>,
         units: &[Vec<u8>],
-    ) -> Option<[u8; 16]> {
+    ) -> FetchResult {
         use base64::Engine;
         use std::time::Duration;
 
         if self.base_url.is_empty() {
-            return None;
+            return FetchResult::Unreachable;
         }
         // A real MKB is at most a few MB (a UHD MKB ~3.8 MB). Anything far
         // larger means something is wrong (e.g. the padded MKB_RW region got
@@ -125,7 +152,7 @@ impl OnlineKeyService {
                  This is a bug; please file a report at github.com/freemkv/autorip/issues",
                 mkb.len() / 1024 / 1024
             );
-            return None;
+            return FetchResult::InputAnomaly;
         }
         let url = format!("{}/decode", self.base_url.trim_end_matches('/'));
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -166,7 +193,7 @@ impl OnlineKeyService {
                     status = code,
                     "key service returned no key"
                 );
-                return None;
+                return FetchResult::NoKey;
             }
             Err(e) => {
                 tracing::warn!(
@@ -174,27 +201,27 @@ impl OnlineKeyService {
                     error = %e,
                     "key service unreachable"
                 );
-                return None;
+                return FetchResult::Unreachable;
             }
         };
         let json: serde_json::Value = match resp.into_json() {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(phase = "keyservice_query", error = %e, "key service reply unreadable");
-                return None;
+                return FetchResult::NoKey;
             }
         };
         match json.get("UK").and_then(|u| u.as_str()).and_then(parse_uk) {
             Some(uk) => {
                 tracing::info!(phase = "keyservice_query", "key service returned a key");
-                Some(uk)
+                FetchResult::Key(uk)
             }
             None => {
                 tracing::warn!(
                     phase = "keyservice_query",
                     "key service reply had no usable key"
                 );
-                None
+                FetchResult::NoKey
             }
         }
     }
@@ -255,23 +282,23 @@ pub fn resolve_keys<A: DiscKeyAccess>(
     ks: &KeySource,
     access: &mut A,
     disc: libfreemkv::Disc,
-) -> libfreemkv::Disc {
+) -> (libfreemkv::Disc, KeyOutcome) {
     if !ks.needs_samples() {
-        return disc;
+        return (disc, KeyOutcome::Inline);
     }
     let Some(title) = disc.titles.first().cloned() else {
         tracing::warn!(
             phase = "keyservice_resolve",
             "no titles — skipping key service"
         );
-        return disc;
+        return (disc, KeyOutcome::MissingInputs);
     };
     let Some((inf, mkb)) = access.key_files() else {
         tracing::warn!(
             phase = "keyservice_resolve",
             "could not read disc key files — skipping key service"
         );
-        return disc;
+        return (disc, KeyOutcome::MissingInputs);
     };
     let vid = access.volume_id();
     let units = access.sample_units(&title, SAMPLE_UNITS);
@@ -282,14 +309,21 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         "resolving key via key service"
     );
     match ks.resolve(&inf, &mkb, vid, &units) {
-        Some(uk) => {
+        FetchResult::Key(uk) => {
             tracing::info!(
                 phase = "keyservice_resolve",
                 "key resolved — re-scanning disc"
             );
-            access.rescan(uk).unwrap_or(disc)
+            match access.rescan(uk) {
+                Some(d) => (d, KeyOutcome::Resolved),
+                // Got a key but the re-scan didn't surface usable keys — treat
+                // as no usable key rather than claiming success.
+                None => (disc, KeyOutcome::NoKey),
+            }
         }
-        None => disc,
+        FetchResult::NoKey => (disc, KeyOutcome::NoKey),
+        FetchResult::Unreachable => (disc, KeyOutcome::Unreachable),
+        FetchResult::InputAnomaly => (disc, KeyOutcome::InputAnomaly),
     }
 }
 
