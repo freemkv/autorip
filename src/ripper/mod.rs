@@ -44,6 +44,54 @@ use std::time::Duration;
 
 use crate::config::Config;
 
+/// Build [`libfreemkv::ScanOptions`] honoring the configured key source.
+///
+/// * `key_source = "local"` → use `keydb_path` (today's behavior).
+/// * `key_source = "online"` → POST the disc's key files to the keyserver and
+///   use the returned Unit Key directly. `inf_mkb` is the disc's
+///   `(Unit_Key_RO.inf, MKB)` bytes, extracted by the caller *before* the scan
+///   (from the live drive, or from the ISO on the resume path) — keys are
+///   needed during the scan, so this must be fetched up front.
+///
+/// Any online failure (no URL, server miss, network error) yields default
+/// options; the scan then surfaces the usual "no keys" error.
+pub(crate) fn scan_opts_for(
+    cfg: &Config,
+    device: &str,
+    inf_mkb: Option<(Vec<u8>, Vec<u8>)>,
+) -> libfreemkv::ScanOptions {
+    if cfg.key_source != "online" {
+        return libfreemkv::ScanOptions {
+            keydb_path: cfg.keydb_path.clone().map(Into::into),
+            ..Default::default()
+        };
+    }
+    if cfg.keyserver_url.is_empty() {
+        crate::log::device_log(
+            device,
+            "Online key source selected but no keyserver URL set",
+        );
+        return libfreemkv::ScanOptions::default();
+    }
+    let Some((inf, mkb)) = inf_mkb else {
+        crate::log::device_log(device, "Online key source: disc key files unavailable");
+        return libfreemkv::ScanOptions::default();
+    };
+    match crate::keyserver::fetch_uk(&cfg.keyserver_url, &cfg.keyserver_secret, &inf, &mkb) {
+        Some(uk) => {
+            crate::log::device_log(device, "Keyserver returned a unit key");
+            libfreemkv::ScanOptions {
+                unit_key: Some(uk),
+                ..Default::default()
+            }
+        }
+        None => {
+            crate::log::device_log(device, "Keyserver returned no key for this disc");
+            libfreemkv::ScanOptions::default()
+        }
+    }
+}
+
 use session::{
     DriveSession, drop_session, rediscover_drive, session_is_scanned, store_session, take_session,
 };
@@ -565,12 +613,14 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     // Full scan — titles, streams, AACS keys
     crate::log::device_log(device, "Scanning titles...");
-    let scan_opts = match &cfg_read.keydb_path {
-        Some(p) => libfreemkv::ScanOptions {
-            keydb_path: Some(p.into()),
-        },
-        None => libfreemkv::ScanOptions::default(),
+    // Online key source: fetch this disc's key files from the live drive and
+    // POST them to the keyserver before scanning (keys are needed during scan).
+    let inf_mkb = if cfg_read.key_source == "online" {
+        libfreemkv::Disc::read_aacs_inputs_from_drive(&mut drive).ok()
+    } else {
+        None
     };
+    let scan_opts = scan_opts_for(&cfg_read, device, inf_mkb);
     let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
         Ok(d) => d,
         Err(e) => {
@@ -948,12 +998,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 tracing::warn!(device = %device, error = %e, "drive init failed (continuing)");
             }
 
-            let scan_opts = match &cfg_read.keydb_path {
-                Some(p) => libfreemkv::ScanOptions {
-                    keydb_path: Some(p.into()),
-                },
-                None => libfreemkv::ScanOptions::default(),
+            let inf_mkb = if cfg_read.key_source == "online" {
+                libfreemkv::Disc::read_aacs_inputs_from_drive(&mut drive).ok()
+            } else {
+                None
             };
+            let scan_opts = scan_opts_for(&cfg_read, device, inf_mkb);
             crate::log::device_log(device, "Scanning titles...");
             let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
                 Ok(d) => d,

@@ -58,6 +58,16 @@ pub struct Config {
     pub tmdb_api_key: String,
     pub keydb_path: Option<String>,
     pub keydb_url: String,
+    /// Key source mode: "local" (use keydb.cfg) or "online" (use a keyserver).
+    /// Mutually exclusive — one or the other.
+    pub key_source: String,
+    /// Keyserver base URL for `key_source = "online"` (any compatible
+    /// keyserver). The disc's Unit_Key_RO.inf + MKB are POSTed to
+    /// `<url>/decode` and the returned Unit Key drives decryption.
+    pub keyserver_url: String,
+    /// API secret for the keyserver, sent as `Authorization: Bearer <secret>`.
+    /// Lets the server attribute/rate-limit/bill/block per key. Empty = none.
+    pub keyserver_secret: String,
     pub webhook_urls: Vec<String>,
     pub autorip_dir: String,
 
@@ -103,6 +113,9 @@ impl Default for Config {
             tmdb_api_key: String::new(),
             keydb_path: None,
             keydb_url: String::new(),
+            key_source: "local".into(),
+            keyserver_url: String::new(),
+            keyserver_secret: String::new(),
             webhook_urls: Vec::new(),
             autorip_dir: "/config".into(),
             decrypt_threads: 0, // 0 = auto-detect cores
@@ -196,6 +209,15 @@ fn load_saved(mut cfg: Config) -> Config {
     }
     if let Some(v) = saved.get("keydb_path").and_then(|v| v.as_str()) {
         cfg.keydb_path = Some(v.to_string());
+    }
+    if let Some(v) = saved.get("key_source").and_then(|v| v.as_str()) {
+        cfg.key_source = v.to_string();
+    }
+    if let Some(v) = saved.get("keyserver_url").and_then(|v| v.as_str()) {
+        cfg.keyserver_url = v.to_string();
+    }
+    if let Some(v) = saved.get("keyserver_secret").and_then(|v| v.as_str()) {
+        cfg.keyserver_secret = v.to_string();
     }
     if let Some(v) = saved.get("min_length_secs").and_then(|v| v.as_u64()) {
         cfg.min_length_secs = v;

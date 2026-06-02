@@ -20,6 +20,7 @@ pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 pub mod config;
 pub mod history;
+pub mod keyserver;
 pub mod log;
 pub mod mover;
 pub mod muxer;

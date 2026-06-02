@@ -116,6 +116,7 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
     let scan_opts = match keydb_path {
         Some(p) => libfreemkv::ScanOptions {
             keydb_path: Some(p.into()),
+            ..Default::default()
         },
         None => libfreemkv::ScanOptions::default(),
     };

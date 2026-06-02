@@ -955,6 +955,11 @@ function renderSettings(s){
       {key:'tmdb_api_key',label:'TMDB API Key',type:'text',hint:'v3 API key from themoviedb.org'},
       {key:'keydb_url',label:'KEYDB Update URL',type:'text',hint:'HTTP URL to download KEYDB.cfg (zip, gz, or plain text)'},
     ]},
+    {title:'Key Source',fields:[
+      {key:'key_source',label:'AACS Key Source',type:'radio',options:[{value:'local',label:'Local KEYDB'},{value:'online',label:'Online Keyserver'}],hint:'Where per-disc AACS keys come from. Local uses keydb.cfg; Online queries a keyserver.'},
+      {key:'keyserver_url',label:'Keyserver URL',type:'text',hint:'Base URL of the keyserver (used when Key Source = Online).',indent:true},
+      {key:'keyserver_secret',label:'Keyserver API Secret',type:'text',hint:'Bearer token for the keyserver, if it requires one.',indent:true},
+    ]},
     {title:'Performance',fields:[
       {key:'decrypt_threads',label:'Decrypt Threads',type:'number',hint:'How many threads AACS decryption uses. 0 = auto (all available cores, capped at 64). Drop to 4-8 if autorip is sharing the host with other heavy workloads.'},
       {key:'log_retention_days',label:'Log Retention (days)',type:'number',hint:'Per-device .log files older than this are pruned by the in-process daily cleanup. Default 30.'},
@@ -1619,6 +1624,15 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         }
         if let Some(v) = patch.get("keydb_url").and_then(|v| v.as_str()) {
             c.keydb_url = v.to_string();
+        }
+        if let Some(v) = patch.get("key_source").and_then(|v| v.as_str()) {
+            c.key_source = v.to_string();
+        }
+        if let Some(v) = patch.get("keyserver_url").and_then(|v| v.as_str()) {
+            c.keyserver_url = v.to_string();
+        }
+        if let Some(v) = patch.get("keyserver_secret").and_then(|v| v.as_str()) {
+            c.keyserver_secret = v.to_string();
         }
         if let Some(v) = patch.get("on_insert").and_then(|v| v.as_str()) {
             c.on_insert = v.to_string();

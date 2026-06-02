@@ -297,12 +297,14 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     };
 
     // 3. Disc::scan_image to recover Disc + titles.
-    let scan_opts = match &cfg_read.keydb_path {
-        Some(p) => libfreemkv::ScanOptions {
-            keydb_path: Some(p.into()),
-        },
-        None => libfreemkv::ScanOptions::default(),
+    // Online key source: extract this disc's key files from the ISO and POST
+    // them to the keyserver before scanning (the resume path muxes the ISO).
+    let inf_mkb = if cfg_read.key_source == "online" {
+        libfreemkv::Disc::read_aacs_inputs(&iso_path).ok()
+    } else {
+        None
     };
+    let scan_opts = super::scan_opts_for(&cfg_read, device, inf_mkb);
     use libfreemkv::SectorSource;
     let capacity = iso_reader.capacity_sectors();
     let disc = match libfreemkv::Disc::scan_image(&mut iso_reader, capacity, &scan_opts) {
