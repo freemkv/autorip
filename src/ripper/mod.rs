@@ -573,6 +573,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     if let Err(e) = drive.init() {
         tracing::warn!(device = %device, error = %e, "drive init failed (continuing — scan may degrade)");
     }
+    // Engage the drive's disc-type read mode before any read. Idempotent.
+    if let Err(e) = drive.probe_disc() {
+        tracing::warn!(device = %device, error = %e, "drive probe_disc failed (continuing)");
+    }
 
     // Fast identify — disc name only, no playlists
     crate::log::device_log(device, "Identifying disc...");
@@ -1011,6 +1015,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             crate::log::device_log(device, "Initializing...");
             if let Err(e) = drive.init() {
                 tracing::warn!(device = %device, error = %e, "drive init failed (continuing)");
+            }
+            // Engage the drive's disc-type read mode before any read. Idempotent.
+            if let Err(e) = drive.probe_disc() {
+                tracing::warn!(device = %device, error = %e, "drive probe_disc failed (continuing)");
             }
 
             let scan_opts = scan_opts_for(&cfg_read);
