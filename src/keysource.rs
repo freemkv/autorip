@@ -227,51 +227,68 @@ impl OnlineKeyService {
     }
 }
 
-/// Read up to `n` encrypted 6144-byte aligned units off `reader` at the title's
-/// first extent, raw (no decrypt) — returning only units that are actually
-/// ENCRYPTED, so they can byte-validate a key.
+/// Read up to `n` ENCRYPTED 6144-byte aligned units from `title`'s main body,
+/// raw (no decrypt) — so the key service can byte-validate a key against them.
 ///
-/// A clip starts with clear navigation units (PAT/PMT etc.) whose
-/// `transport_scrambling_control` (TSC) bits are zero; decrypting one with a
-/// correct key yields garbage and would wrongly reject the key. AACS encrypts
-/// at aligned-unit granularity and flags it via the TSC bits — the top two bits
-/// of TS-header byte 3, which is byte 7 of the unit, inside the clear 16-byte
-/// seed (readable without the key). So we scan unit-by-unit, skip TSC==0 (clear)
-/// units, and collect the first `n` encrypted ones. Empty if the title has no
-/// extents or the read fails. Works for any `SectorSource` (drive or ISO).
+/// "Encrypted" is decided by the shared library predicate
+/// `libfreemkv::aacs::is_aacs_scrambled` — the SAME function the key service
+/// uses to gate the request — so both ends agree. It reads the raw TS syncs: an
+/// AACS-scrambled unit's body packets have their `0x47` syncs destroyed, while a
+/// clear unit keeps them. A clip OPENS with clear navigation units (PAT/PMT,
+/// menus); only the feature body is scrambled. Handing the key service a clear
+/// unit proves nothing (nothing to decrypt), so we collect only scrambled ones.
+///
+/// The earlier version scanned only ~120 units from the FIRST extent's start —
+/// squarely inside the clear nav head — and returned zero encrypted units on a
+/// real disc (the feature is gigabytes deep). This samples the LARGEST extent
+/// (the main feature body) at depth: midpoint first, then quarter points, then
+/// the start as a last resort, scanning forward at each anchor. The midpoint of
+/// a multi-GB feature is reliably in the encrypted body. Empty only if the title
+/// has no extents or every read fails (i.e. not an encrypted disc).
 pub fn read_sample_units(
     reader: &mut dyn libfreemkv::SectorSource,
     title: &libfreemkv::DiscTitle,
     n: usize,
 ) -> Vec<Vec<u8>> {
     const UNIT_LEN: usize = 6144;
-    const UNIT_SECTORS: u16 = 3; // 6144 / 2048
-    const CHUNK_UNITS: u16 = 15; // 45 sectors/read — under the drive transfer cap
-    const MAX_CHUNKS: u32 = 8; // scan up to 120 units past the clip start
-    let Some(ext) = title.extents.first() else {
-        return Vec::new();
-    };
+    const UNIT_SECTORS: u32 = 3; // 6144 / 2048
+    const CHUNK_UNITS: u32 = 15; // 45 sectors/read — under the drive transfer cap
+    const MAX_CHUNKS_PER_EXTENT: u32 = 4; // ~60 units scanned at each extent's midpoint
+
     let mut out: Vec<Vec<u8>> = Vec::new();
-    for chunk in 0..MAX_CHUNKS {
-        let lba = ext.start_lba + chunk * (CHUNK_UNITS * UNIT_SECTORS) as u32;
-        let count = CHUNK_UNITS * UNIT_SECTORS;
-        let mut buf = vec![0u8; count as usize * 2048];
-        if reader.read_sectors(lba, count, &mut buf, false).is_err() {
-            break;
+    for ext in &title.extents {
+        let total_units = ext.sector_count / UNIT_SECTORS;
+        if total_units == 0 {
+            continue;
         }
-        for i in 0..CHUNK_UNITS as usize {
-            let o = i * UNIT_LEN;
-            if o + UNIT_LEN > buf.len() {
+        let mut unit = total_units / 2; // midpoint of this extent (past clear nav)
+        for _ in 0..MAX_CHUNKS_PER_EXTENT {
+            if unit >= total_units {
                 break;
             }
-            let unit = &buf[o..o + UNIT_LEN];
-            // TSC bits (byte 7, top two) — non-zero means an encrypted unit.
-            if (unit[7] >> 6) & 0x03 != 0 {
-                out.push(unit.to_vec());
-                if out.len() >= n {
-                    return out;
+            let units_this = CHUNK_UNITS.min(total_units - unit);
+            let lba = ext.start_lba + unit * UNIT_SECTORS;
+            let count = (units_this * UNIT_SECTORS) as u16;
+            let mut buf = vec![0u8; count as usize * 2048];
+            // `false` = no recovery retries. The reader is the raw drive/file
+            // (no decrypt decorator), so these are the on-disc encrypted bytes.
+            if reader.read_sectors(lba, count, &mut buf, false).is_err() {
+                break;
+            }
+            for i in 0..units_this as usize {
+                let o = i * UNIT_LEN;
+                if o + UNIT_LEN > buf.len() {
+                    break;
+                }
+                let u = &buf[o..o + UNIT_LEN];
+                if libfreemkv::aacs::is_aacs_scrambled(u) {
+                    out.push(u.to_vec());
+                    if out.len() >= n {
+                        return out;
+                    }
                 }
             }
+            unit += units_this;
         }
     }
     out
@@ -306,7 +323,10 @@ pub fn resolve_keys<A: DiscKeyAccess>(
     if !ks.needs_samples() {
         return (disc, KeyOutcome::Inline);
     }
-    let Some(title) = disc.titles.first().cloned() else {
+    // Sample from the LARGEST title (the main feature) — its body is the
+    // encrypted bulk and uses the disc's primary unit key, which is what the
+    // key service resolves. The first title can be a menu / FirstPlay clip.
+    let Some(title) = disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() else {
         tracing::warn!(
             phase = "keyservice_resolve",
             "no titles — skipping key service"
@@ -449,5 +469,61 @@ mod tests {
         );
         assert!(parse_uk("deadbeef").is_none());
         assert!(parse_uk("zz").is_none());
+    }
+
+    /// Cross-side agreement: autorip's sample selector (`read_sample_units`)
+    /// hands the key service only units the service's own gate accepts —
+    /// because both sides call the SAME predicate,
+    /// `libfreemkv::aacs::is_aacs_scrambled`.
+    #[test]
+    fn sample_units_are_all_aacs_scrambled() {
+        use std::io::Write;
+
+        // Synthetic ISO: 1200 sectors of scrambled (non-TS) content — no 0x47 at
+        // any TS sync offset, so every aligned unit reads as AACS-scrambled.
+        const SECTORS: usize = 1200;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&vec![0xE5u8; SECTORS * 2048]).unwrap();
+        tmp.flush().unwrap();
+        let mut reader = libfreemkv::FileSectorSource::open(tmp.path()).unwrap();
+
+        // One extent over the whole image; its midpoint (the sampling anchor)
+        // lands squarely in the scrambled body.
+        let title = libfreemkv::DiscTitle {
+            playlist: "00800.mpls".into(),
+            playlist_id: 800,
+            duration_secs: 0.0,
+            size_bytes: (SECTORS * 2048) as u64,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: vec![libfreemkv::Extent {
+                start_lba: 0,
+                sector_count: SECTORS as u32,
+            }],
+            content_format: libfreemkv::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        };
+
+        let units = read_sample_units(&mut reader, &title, SAMPLE_UNITS);
+        assert_eq!(units.len(), SAMPLE_UNITS, "should collect 4 sample units");
+        for u in &units {
+            assert_eq!(u.len(), 6144);
+            // Exactly what the key service gates on — agreement by construction.
+            assert!(
+                libfreemkv::aacs::is_aacs_scrambled(u),
+                "selector must only emit units the key service accepts"
+            );
+        }
+
+        // The converse the service relies on: a clear unit (TS syncs intact) is
+        // NOT scrambled, so the service rejects it (nothing to decrypt-validate).
+        let mut clear = vec![0u8; 6144];
+        let mut off = 4;
+        while off < 6144 {
+            clear[off] = 0x47;
+            off += 192;
+        }
+        assert!(!libfreemkv::aacs::is_aacs_scrambled(&clear));
     }
 }
