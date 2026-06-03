@@ -653,6 +653,17 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Sample-based key source: resolve the Unit Key from the disc's files +
     // on-disc samples and re-scan with it (a no-op for a local source). The
     // outcome carries WHY a resolve failed, for the readiness message.
+    //
+    // The online path POSTs the MKB + samples to the keyserver, which over a
+    // slow remote link can take a minute or two — tell the user we're waiting on
+    // it so the pause isn't mistaken for a hang. (Online sources are exactly the
+    // ones that `needs_samples()`.)
+    if KeySource::from_config(&cfg_read).needs_samples() {
+        crate::log::device_log(device, "Communicating with online keyserver...");
+        update_state_with(device, |s| {
+            s.key_status = "Communicating with online keyserver…".to_string();
+        });
+    }
     let (disc, key_outcome) = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
     let key_status = key_readiness(&disc, key_outcome, cfg_read.capture_without_keys);
 

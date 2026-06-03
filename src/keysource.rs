@@ -172,7 +172,13 @@ impl OnlineKeyService {
             );
         }
 
-        let mut req = ureq::post(&url).timeout(Duration::from_secs(30));
+        // Generous overall deadline: the request body carries the MKB (a UHD MKB
+        // is ~3.8 MB, ~5 MB base64-encoded) plus sample units, and the keyserver
+        // is often remote on a slow link where that upload alone can take 1-2
+        // minutes. A truly-down server still fails fast (connection refused
+        // returns immediately), so this only extends the slow-but-alive case.
+        const KEYSERVICE_TIMEOUT_SECS: u64 = 180;
+        let mut req = ureq::post(&url).timeout(Duration::from_secs(KEYSERVICE_TIMEOUT_SECS));
         if !self.secret.is_empty() {
             req = req.set("Authorization", &format!("Bearer {}", self.secret));
         }
