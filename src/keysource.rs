@@ -228,9 +228,17 @@ impl OnlineKeyService {
 }
 
 /// Read up to `n` encrypted 6144-byte aligned units off `reader` at the title's
-/// first extent, raw (no decrypt). These are the on-disc content samples a
-/// sample-based source needs. Empty if the title has no extents or the read
-/// fails. Works for any `SectorSource` (live drive or a staged ISO).
+/// first extent, raw (no decrypt) — returning only units that are actually
+/// ENCRYPTED, so they can byte-validate a key.
+///
+/// A clip starts with clear navigation units (PAT/PMT etc.) whose
+/// `transport_scrambling_control` (TSC) bits are zero; decrypting one with a
+/// correct key yields garbage and would wrongly reject the key. AACS encrypts
+/// at aligned-unit granularity and flags it via the TSC bits — the top two bits
+/// of TS-header byte 3, which is byte 7 of the unit, inside the clear 16-byte
+/// seed (readable without the key). So we scan unit-by-unit, skip TSC==0 (clear)
+/// units, and collect the first `n` encrypted ones. Empty if the title has no
+/// extents or the read fails. Works for any `SectorSource` (drive or ISO).
 pub fn read_sample_units(
     reader: &mut dyn libfreemkv::SectorSource,
     title: &libfreemkv::DiscTitle,
@@ -238,23 +246,35 @@ pub fn read_sample_units(
 ) -> Vec<Vec<u8>> {
     const UNIT_LEN: usize = 6144;
     const UNIT_SECTORS: u16 = 3; // 6144 / 2048
+    const CHUNK_UNITS: u16 = 15; // 45 sectors/read — under the drive transfer cap
+    const MAX_CHUNKS: u32 = 8; // scan up to 120 units past the clip start
     let Some(ext) = title.extents.first() else {
         return Vec::new();
     };
-    let count = (n as u16).saturating_mul(UNIT_SECTORS);
-    let mut buf = vec![0u8; count as usize * 2048];
-    if reader
-        .read_sectors(ext.start_lba, count, &mut buf, false)
-        .is_err()
-    {
-        return Vec::new();
-    }
-    (0..n)
-        .filter_map(|i| {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for chunk in 0..MAX_CHUNKS {
+        let lba = ext.start_lba + chunk * (CHUNK_UNITS * UNIT_SECTORS) as u32;
+        let count = CHUNK_UNITS * UNIT_SECTORS;
+        let mut buf = vec![0u8; count as usize * 2048];
+        if reader.read_sectors(lba, count, &mut buf, false).is_err() {
+            break;
+        }
+        for i in 0..CHUNK_UNITS as usize {
             let o = i * UNIT_LEN;
-            (o + UNIT_LEN <= buf.len()).then(|| buf[o..o + UNIT_LEN].to_vec())
-        })
-        .collect()
+            if o + UNIT_LEN > buf.len() {
+                break;
+            }
+            let unit = &buf[o..o + UNIT_LEN];
+            // TSC bits (byte 7, top two) — non-zero means an encrypted unit.
+            if (unit[7] >> 6) & 0x03 != 0 {
+                out.push(unit.to_vec());
+                if out.len() >= n {
+                    return out;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// How a disc's key-resolution inputs are obtained, and how the disc is
