@@ -44,8 +44,10 @@ pub struct Config {
     /// (direct disc→MKV, no ISO intermediate). 1..=10 = multi-pass (disc→ISO,
     /// retry bad ranges N times, then mux to MKV).
     pub max_retries: u8,
-    /// Keep the intermediate ISO after mux completes. Defaults to false — the
-    /// ISO is pruned once the MKV is successfully finalized.
+    /// Promote the intermediate ISO into the output library alongside the muxed
+    /// title (MKV/M2TS) after mux completes. Defaults to false — the ISO is
+    /// pruned once the title is finalized. The disc mapfile is staging-only and
+    /// never promoted.
     pub keep_iso: bool,
     /// Abort rip if main movie loss exceeds N seconds. 0 = never abort (continue anyway).
     pub abort_on_lost_secs: u64,

@@ -146,23 +146,42 @@ fn fresh_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
     f.metadata()
 }
 
-/// Stat a path with a hard wall-clock deadline. Spawns a one-shot
-/// worker that calls `std::fs::metadata` and reports the file length
-/// via a channel; if the worker hasn't returned within `timeout` we
-/// give up and return `None` (the orphan thread will eventually
-/// complete and the result is dropped). Used by the move_file
-/// progress-polling loop to dodge unbounded NFS attribute-cache stalls
-/// that froze the System page telemetry pre-0.25.10. We deliberately
-/// don't join() the orphan: under the stall scenario join would itself
-/// block forever, which is the bug we're fixing.
-fn stat_size_with_timeout(path: &Path, timeout: std::time::Duration) -> Option<u64> {
-    let path_owned = path.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel::<Option<u64>>();
-    std::thread::spawn(move || {
-        let size = std::fs::metadata(&path_owned).ok().map(|m| m.len());
-        let _ = tx.send(size);
-    });
-    rx.recv_timeout(timeout).ok().flatten()
+/// Copy `src` → `dest` in 4 MiB chunks, publishing the running
+/// bytes-written count into `written` as we go.
+///
+/// This is what lets the mover show real progress: the move loop reads
+/// `written` (bytes WE have pushed) instead of `stat()`-ing the
+/// destination. On an NFS share under concurrent rip+mover I/O a dest
+/// stat blocks for minutes or reads a stale `0`, which used to freeze the
+/// System page move telemetry at 0 % for the entire copy (pre-0.26.x bug
+/// this replaces). Counting our own writes can't stall and can't go stale.
+///
+/// `std::fs::copy`'s kernel fast paths (`copy_file_range`/`sendfile`) don't
+/// apply across filesystems, and staging→library is the only path that
+/// reaches here — same-filesystem moves take the `rename(2)` fast path — so
+/// a plain buffered loop loses no acceleration in practice.
+fn copy_counting(
+    src: &Path,
+    dest: &Path,
+    written: &std::sync::atomic::AtomicU64,
+) -> std::io::Result<u64> {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+    let mut reader = std::fs::File::open(src)?;
+    let mut writer = std::fs::File::create(dest)?;
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        total += n as u64;
+        written.store(total, Ordering::Relaxed);
+    }
+    writer.flush()?;
+    Ok(total)
 }
 
 /// Verify a destination MKV is structurally complete by checking the
@@ -684,21 +703,20 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
     // stays intact on any failure path.
     let src_owned = src.to_path_buf();
     let dest_owned = dest.to_path_buf();
+    // Copy on a worker thread, counting bytes as we write them. Progress is
+    // derived from THIS counter (see `copy_counting`), not from stat()-ing the
+    // NFS destination — that stat was the pre-0.26.x bug that pinned the move
+    // bar at 0 % for the whole copy. Reads come from local staging (fast); only
+    // the writes touch NFS, and they stay on this worker thread so a write
+    // stall can never block the poll loop below.
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let written_w = std::sync::Arc::clone(&written);
     let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<u64>>();
     let copy_handle = std::thread::spawn(move || {
-        let result = std::fs::copy(&src_owned, &dest_owned);
-        let _ = tx.send(result);
+        let _ = tx.send(copy_counting(&src_owned, &dest_owned, &written_w));
     });
 
     let start = std::time::Instant::now();
-    // 0.25.10: last-known-good telemetry state for the NFS-stat-stalls-
-    // forever case. When `stat_size_with_timeout` returns None we
-    // extrapolate from these values so the System page UI keeps showing
-    // forward motion instead of freezing at one number for tens of
-    // minutes. Updated only on a successful stat.
-    let mut last_known_size: u64 = 0;
-    let mut last_known_at: f64 = 0.0;
-    let mut last_known_speed_bps: f64 = 0.0;
     loop {
         match rx.try_recv() {
             Ok(Ok(_bytes)) => {
@@ -728,62 +746,28 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 // Sender dropped without sending — worker panicked.
-                // Don't try to join (it already terminated); we'd
-                // need to propagate the panic, which we'd just log
-                // and return Failed anyway.
                 crate::log::syslog(&format!("fs::copy thread panicked for {}", dest_str));
                 return MoveOutcome::Failed;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                // 0.25.10: replace the unbounded `std::fs::metadata(dest)`
-                // with a 2 s-capped lookup. On an NFS share under
-                // concurrent rip+mover I/O, `metadata()` can
-                // block on attribute-cache refresh for many minutes; the
-                // _move telemetry then freezes at the last value (e.g.
-                // `progress_gb=17.226043701171875` for 10+ min) while
-                // the dest actually grows. With a timeout the loop keeps
-                // ticking — when the stat returns we use the fresh size,
-                // when it doesn't we extrapolate from the last-known
-                // size + last-known speed so the System page UI keeps
-                // showing forward motion instead of a frozen number.
+                // Progress straight from the bytes we've written — no NFS stat,
+                // so it can't stall and can't read stale. `speed` is the simple
+                // average so far (bytes/elapsed), surfaced in MB/s.
+                let done = written.load(std::sync::atomic::Ordering::Relaxed);
                 let elapsed = start.elapsed().as_secs_f64();
-                let measured_size =
-                    stat_size_with_timeout(Path::new(&dest_str), std::time::Duration::from_secs(2));
-                let now_dest_size = match measured_size {
-                    Some(sz) => {
-                        last_known_size = sz;
-                        last_known_at = elapsed;
-                        sz
-                    }
-                    None => {
-                        // Extrapolate. Use the smoothed speed from the
-                        // last successful stat as the growth-rate
-                        // estimate; clamp at src_size so we never report
-                        // > 100 %. If we've never had a successful stat
-                        // (first poll) `last_known_size` is 0 and speed
-                        // is 0 — pct stays at 0, which is honest.
-                        let stalled_for = (elapsed - last_known_at).max(0.0);
-                        let projected =
-                            last_known_size as f64 + (last_known_speed_bps * stalled_for);
-                        projected.min(src_size as f64).max(0.0) as u64
-                    }
-                };
                 let pct = if src_size > 0 {
-                    (now_dest_size.saturating_mul(100) / src_size).min(100) as u8
+                    (done.saturating_mul(100) / src_size).min(100) as u8
                 } else {
                     0
                 };
-                let gb = now_dest_size as f64 / 1_073_741_824.0;
-                // Smoothed throughput, in bytes/sec, derived from the
-                // last successful stat. The reported `speed` field on
-                // the UI is in MB/s so we divide by (1024*1024) before
-                // surfacing.
-                if elapsed > 0.0 {
-                    last_known_speed_bps = now_dest_size as f64 / elapsed;
-                }
-                let speed_mbs = last_known_speed_bps / (1024.0 * 1024.0);
+                let gb = done as f64 / 1_073_741_824.0;
+                let speed_mbs = if elapsed > 0.0 {
+                    (done as f64 / elapsed) / (1024.0 * 1024.0)
+                } else {
+                    0.0
+                };
                 on_progress(pct, gb, total_gb, speed_mbs);
-                std::thread::sleep(std::time::Duration::from_secs(3));
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
     }
@@ -1245,19 +1229,36 @@ mod tests {
     }
 
     #[test]
-    fn stat_size_with_timeout_returns_size_for_present_file() {
+    fn copy_counting_copies_bytes_and_publishes_total() {
+        use std::sync::atomic::{AtomicU64, Ordering};
         let tmp = tempfile::tempdir().unwrap();
-        let f = tmp.path().join("a.bin");
-        std::fs::write(&f, b"0123456789").unwrap();
-        let sz = stat_size_with_timeout(&f, std::time::Duration::from_secs(2));
-        assert_eq!(sz, Some(10));
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("dst.bin");
+        // Larger than the 4 MiB chunk so the counter ticks more than once.
+        let data = vec![0xABu8; 5 * 1024 * 1024 + 17];
+        std::fs::write(&src, &data).unwrap();
+        let written = AtomicU64::new(0);
+        let n = copy_counting(&src, &dst, &written).unwrap();
+        assert_eq!(n, data.len() as u64, "returns total bytes copied");
+        assert_eq!(
+            written.load(Ordering::Relaxed),
+            data.len() as u64,
+            "final published count equals the source size"
+        );
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            data,
+            "dest is a faithful copy"
+        );
     }
 
     #[test]
-    fn stat_size_with_timeout_returns_none_for_missing_file() {
+    fn copy_counting_errors_on_missing_source() {
+        use std::sync::atomic::AtomicU64;
         let tmp = tempfile::tempdir().unwrap();
-        let f = tmp.path().join("nope.bin");
-        let sz = stat_size_with_timeout(&f, std::time::Duration::from_secs(2));
-        assert_eq!(sz, None);
+        let src = tmp.path().join("nope.bin");
+        let dst = tmp.path().join("dst.bin");
+        let written = AtomicU64::new(0);
+        assert!(copy_counting(&src, &dst, &written).is_err());
     }
 }

@@ -134,7 +134,7 @@ tr:hover { background:var(--chip); }
 <div id="system" class="section">
   <div class="card" style="margin-top:16px"><h2>Mux Queue</h2><div id="muxes"></div></div>
   <div class="card"><h2>Move Queue</h2><div id="moves"></div></div>
-  <div class="card" id="datafiles-card"><h2>Data Files</h2><div id="files" class="files" style="margin-bottom:12px"></div><div style="display:flex;align-items:center;gap:10px"><button class="btn" onclick="updateKeydb()">Update KEYDB</button><span id="keydb-status" style="font-size:.8rem"></span></div></div>
+  <div class="card" id="datafiles-card"><h2>Data Files</h2><div id="files" class="files"></div></div>
   <div><h2 style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;margin-bottom:8px">System Log</h2><div id="syslog" class="log" style="max-height:400px"></div></div>
 </div>
 
@@ -964,7 +964,7 @@ function renderSettings(s){
          in multi-pass — sweep always skips by design, retries always retry, and the
          post-retry abort decision is governed by abort_on_lost_secs (time-based). */
       {key:'max_retries',label:'Retry Passes',type:'number',hint:'How many retry passes to run on bad sectors. Each pass uses smaller blocks (60→30→15→7→1 sectors) and alternates direction. Default 5 covers most recoverable damage.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
-      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Preserve the disc ISO + mapfile after MKV mux. Off by default to reclaim disk.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
+      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Promote the disc ISO into the library alongside the muxed title. Off by default to reclaim disk (the mapfile is never promoted).',indent:true,showIf:{key:'rip_mode',value:'multi'}},
       {key:'abort_on_lost_secs',label:'Max Acceptable Main Movie Loss',type:'number',hint:'Seconds of missing data I will tolerate in the main feature after all retries finish. 0 = perfect rip required (abort if any loss). Applies to multi-pass only.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
     ]},
     {title:'Output',fields:[

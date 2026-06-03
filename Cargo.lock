@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-autorip"
-version = "0.26.8"
+version = "0.26.9"
 dependencies = [
  "base64",
  "crossbeam-channel",
