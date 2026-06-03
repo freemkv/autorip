@@ -134,7 +134,6 @@ tr:hover { background:var(--chip); }
 <div id="system" class="section">
   <div class="card" style="margin-top:16px"><h2>Mux Queue</h2><div id="muxes"></div></div>
   <div class="card"><h2>Move Queue</h2><div id="moves"></div></div>
-  <div class="card" id="datafiles-card"><h2>Data Files</h2><div id="files" class="files"></div></div>
   <div><h2 style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;margin-bottom:8px">System Log</h2><div id="syslog" class="log" style="max-height:400px"></div></div>
 </div>
 
@@ -889,22 +888,7 @@ function renderMoves(){
 /* ---- System page ---- */
 function loadSystem(){
   fetch('/api/system').then(r=>r.json()).then(data=>{
-    /* Data files */
-    const filesEl=document.getElementById('files');
-    if(data.files&&data.files.length){
-      let fhtml='';
-      data.files.forEach(f=>{
-        if(f.present){
-          fhtml+='<div style="display:flex;align-items:center;gap:8px;padding:4px 0"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0"></span><div><div>'+esc(f.name)+'</div><div style="font-size:.75rem;color:var(--text3)">'+esc(f.size||'')+' \u00b7 '+esc(f.updated||'')+'</div></div></div>';
-        }else{
-          fhtml+='<div style="display:flex;align-items:center;gap:8px;padding:4px 0"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text3);flex-shrink:0"></span><div><div>KEYDB.cfg <span style="color:var(--text3);font-size:.8rem">— not found</span></div><div style="font-size:.75rem;color:var(--text3)">Optional — needed for encrypted Blu-ray/UHD discs. Set URL in Settings then click Update.</div></div></div>';
-        }
-      });
-      filesEl.innerHTML=fhtml;
-    }else{
-      filesEl.innerHTML='<div style="color:var(--text3);font-size:.8rem">No data files found</div>';
-    }
-    /* Move queue — store for renderMoves, then render */
+    /* Move queue - store for renderMoves, then render */
     window._moveQueue=data.move_queue||[];
     window._moveErrors=data.move_errors||[];
     /* Mux queue (v0.25.3) — same shape, separate panel above */
@@ -929,10 +913,6 @@ function loadSettings(){
 }
 
 function renderSettings(s){
-  /* The KEYDB.cfg status + Update card is only relevant for the local key
-     source; hide it when an online source is selected. */
-  var dc=document.getElementById('datafiles-card');
-  if(dc)dc.style.display=(s.key_source==='online')?'none':'';
   /* v0.13.19: derive a virtual `rip_mode` from `max_retries` so the radio
      selector renders with the right value on load. The backend stays on
      `max_retries` (and `keep_iso`) — `saveSettings` translates rip_mode back
@@ -964,7 +944,7 @@ function renderSettings(s){
          in multi-pass — sweep always skips by design, retries always retry, and the
          post-retry abort decision is governed by abort_on_lost_secs (time-based). */
       {key:'max_retries',label:'Retry Passes',type:'number',hint:'How many retry passes to run on bad sectors. Each pass uses smaller blocks (60→30→15→7→1 sectors) and alternates direction. Default 5 covers most recoverable damage.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
-      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Promote the disc ISO into the library alongside the muxed title. Off by default to reclaim disk (the mapfile is never promoted).',indent:true,showIf:{key:'rip_mode',value:'multi'}},
+      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Promote the disc ISO into the library alongside the muxed title. Off by default to reclaim disk.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
       {key:'abort_on_lost_secs',label:'Max Acceptable Main Movie Loss',type:'number',hint:'Seconds of missing data I will tolerate in the main feature after all retries finish. 0 = perfect rip required (abort if any loss). Applies to multi-pass only.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
     ]},
     {title:'Output',fields:[
@@ -1390,57 +1370,6 @@ fn handle_history_file(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, f
 fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     let cfg = cfg.read().unwrap();
 
-    // KEYDB status — check config path, then default path
-    let keydb_paths: Vec<std::path::PathBuf> = [
-        cfg.keydb_path.as_ref().map(std::path::PathBuf::from),
-        Some(std::path::PathBuf::from(format!(
-            "{}/freemkv/KEYDB.cfg",
-            cfg.autorip_dir
-        ))),
-        libfreemkv::keydb::default_path().ok(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
-    let mut files_json = Vec::new();
-    let mut found = false;
-    for path in &keydb_paths {
-        if let Ok(m) = std::fs::metadata(path) {
-            let size = m.len();
-            let size_str = if size > 1024 * 1024 {
-                format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
-            } else if size > 1024 {
-                format!("{:.1} KB", size as f64 / 1024.0)
-            } else {
-                format!("{} B", size)
-            };
-            let modified = m
-                .modified()
-                .ok()
-                .and_then(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| format_epoch_datetime(d.as_secs()))
-                })
-                .unwrap_or_default();
-            files_json.push(serde_json::json!({
-                "name": format!("KEYDB.cfg ({})", path.display()),
-                "present": true,
-                "size": size_str,
-                "updated": modified,
-            }));
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        files_json.push(serde_json::json!({
-            "name": "KEYDB.cfg",
-            "present": false,
-        }));
-    }
-
     // Move queue: scan staging for .done markers (pending moves)
     let move_queue: Vec<String> = std::fs::read_dir(&cfg.staging_dir)
         .ok()
@@ -1483,7 +1412,6 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         .join("\n");
 
     let body = serde_json::json!({
-        "files": files_json,
         "move_queue": move_queue,
         "move_errors": move_errors,
         "mux_queue": mux_queue,
@@ -2146,24 +2074,6 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&result).to_string()
-}
-
-fn format_epoch_datetime(secs: u64) -> String {
-    let days = (secs / 86400) as i64;
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    let time_of_day = secs % 86400;
-    let hh = time_of_day / 3600;
-    let mm = (time_of_day % 3600) / 60;
-    format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, hh, mm)
 }
 
 /// Toggle debug logging on/off at runtime. POST body can be empty or contain {"enabled":true/false}.
