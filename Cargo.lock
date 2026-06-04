@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-autorip"
-version = "0.27.2"
+version = "0.27.3"
 dependencies = [
  "base64",
  "crossbeam-channel",
@@ -553,9 +553,9 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libfreemkv"
-version = "0.27.0"
+version = "0.27.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a56b36ac9cafadbea969dadd55c73053aab18c743ce6ecc3f51d0e9ceeed1aba"
+checksum = "1c7f0416658deece95f225054a3a51f77ca87d4ef1131e4f636b78d7a9b72d5e"
 dependencies = [
  "aes",
  "base64",
@@ -1545,9 +1545,9 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "yoke"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abe8c5fda708d9ca3df187cae8bfb9ceda00dd96231bed36e445a1a48e66f9ca"
+checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
 dependencies = [
  "stable_deref_trait",
  "yoke-derive",
