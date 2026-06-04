@@ -961,7 +961,7 @@ function renderSettings(s){
       {key:'keydb_path',label:'KEYDB.cfg Location',type:'text',hint:'Path to KEYDB.cfg on disk (blank = default location).',indent:true,showIf:{key:'key_source',value:'local'}},
       {key:'keydb_url',label:'KEYDB Update URL',type:'text',hint:'HTTP URL to download KEYDB.cfg (zip, gz, or plain text).',indent:true,showIf:{key:'key_source',value:'local'}},
       {type:'action',action:"updateKeydb('keydb-status-settings')",button:'Update KEYDB',status:'keydb-status-settings',hint:'Download the KEYDB.cfg from the URL above into the configured location.',indent:true,showIf:{key:'key_source',value:'local'}},
-      {key:'keyserver_url',label:'Keyserver URL',type:'text',hint:'Base URL of the keyserver.',indent:true,showIf:{key:'key_source',value:'online'}},
+      {key:'keyserver_url',label:'Keyserver URL',type:'text',hint:'Full keyserver endpoint URL — the decode request is POSTed here verbatim, so include the path (e.g. https://host/decode).',indent:true,showIf:{key:'key_source',value:'online'}},
       {key:'keyserver_secret',label:'Keyserver API Secret',type:'text',hint:'Bearer token for the keyserver, if it requires one.',indent:true,showIf:{key:'key_source',value:'online'}},
       {key:'capture_without_keys',label:'Capture Discs Without Keys',type:'bool',hint:'No usable keys → capture the disc to an ISO and mux later when keys become available. Off = skip the disc.'},
     ]},
