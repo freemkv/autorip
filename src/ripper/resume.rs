@@ -715,6 +715,26 @@ fn resolve_keys_from_iso(
     disc: libfreemkv::Disc,
     capacity: u32,
 ) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
+    // Mapfile UK fast-path: if the sweep persisted unit keys (the disc was keyed
+    // at scan), inject them and skip the key service entirely — NO second call.
+    // Keys XOR VID, so a UK here means we have the final answer.
+    if let Ok(map) = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path) {
+        let uk = map.unit_keys();
+        if !uk.is_empty() {
+            let mut disc = disc;
+            disc.inject_unit_keys(uk.to_vec());
+            tracing::info!(
+                phase = "keyservice_resolve",
+                keys = uk.len(),
+                "keys recovered from mapfile — skipping key service"
+            );
+            return (disc, crate::keysource::KeyOutcome::Resolved);
+        }
+    }
+    // No persisted UK → VID-only (the key service retries — correct, the disc was
+    // never keyed) or a local source. `resolve_keys` reads the VID from the
+    // mapfile via IsoAccess; a genuinely-unkeyed disc returns NoKey and the
+    // caller stops.
     let ks = crate::keysource::KeySource::from_config(cfg);
     let mut access = crate::keysource::IsoAccess::new(iso_path, mapfile_path, capacity);
     crate::keysource::resolve_keys(&ks, &mut access, disc)

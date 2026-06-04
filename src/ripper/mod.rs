@@ -1666,10 +1666,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 skip_on_error: true,
                 progress: Some(&pass1_progress),
                 halt: Some(pass1_halt.clone()),
-                // Persist the disc's AACS Volume ID into the mapfile so it
-                // survives to deferred-mux / resume. None for unencrypted
-                // discs. Keyserver-send wiring is a later task.
+                // Persist the disc's decryption state into the mapfile so it
+                // survives to deferred-mux / resume. KEYS XOR VID: if the disc
+                // resolved a key, persist the unit keys (the final answer — the
+                // mux decrypts directly, no second key-service call); otherwise
+                // persist the VID (the retry marker). libfreemkv writes whichever
+                // applies (set_unit_keys clears vid when keys are present).
                 vid: disc.aacs.as_ref().map(|a| a.volume_id),
+                unit_keys: disc
+                    .aacs
+                    .as_ref()
+                    .map(|a| a.unit_keys.clone())
+                    .unwrap_or_default(),
             };
 
             match disc.sweep(&mut session.drive, iso_path, &sweep_opts) {
