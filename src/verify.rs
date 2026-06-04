@@ -113,11 +113,11 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
     }
 
     crate::log::device_log(device, "Verify: scanning...");
+    // Keyless scan; supply host credentials from the keydb for the live-drive
+    // handshake (LibreDrive/OEM ignores them). Verify checks readability, not
+    // decryption, so no key resolution is needed here.
     let scan_opts = match keydb_path {
-        Some(p) => libfreemkv::ScanOptions {
-            keydb_path: Some(p.into()),
-            ..Default::default()
-        },
+        Some(p) => crate::keysource::drive_scan_opts_for_keydb(std::path::Path::new(p)),
         None => libfreemkv::ScanOptions::default(),
     };
     let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {

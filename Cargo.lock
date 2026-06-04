@@ -343,7 +343,6 @@ dependencies = [
  "base64",
  "libfreemkv",
  "serde_json",
- "tracing",
  "ureq",
 ]
 

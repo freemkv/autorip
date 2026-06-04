@@ -45,11 +45,12 @@ use crate::config::Config;
 
 use crate::keysource::DriveAccess;
 
-/// [`libfreemkv::ScanOptions`] for the structure scan: always keyless. The
+/// [`libfreemkv::ScanOptions`] for the live-drive structure scan: lookup-free,
+/// plus the AACS host credentials for the handshake (from the keydb). The
 /// library captures structure + AACS inputs; autorip resolves keys afterward
 /// from the configured sources via [`resolve_keys_from_drive`].
-pub(crate) fn scan_opts_for(_cfg: &Config) -> libfreemkv::ScanOptions {
-    crate::keysource::keyless_scan_opts()
+pub(crate) fn scan_opts_for(cfg: &Config) -> libfreemkv::ScanOptions {
+    crate::keysource::drive_scan_opts(cfg)
 }
 
 /// Resolve keys for a freshly-scanned live disc via the configured sources. A

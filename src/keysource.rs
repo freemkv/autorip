@@ -41,11 +41,37 @@ pub enum KeyOutcome {
 /// but resolves no keys; autorip resolves them afterward through the sources.
 /// `disable_keydb` also stops any keydb sitting in a default search path from
 /// resolving inline behind autorip's back.
-pub fn keyless_scan_opts() -> libfreemkv::ScanOptions {
-    libfreemkv::ScanOptions {
-        disable_keydb: true,
-        ..Default::default()
-    }
+/// The configured keydb path, or the standard default location.
+fn keydb_path(cfg: &Config) -> PathBuf {
+    cfg.keydb_path
+        .clone()
+        .map(Into::into)
+        .or_else(|| libfreemkv::keydb::default_path().ok())
+        .unwrap_or_else(|| PathBuf::from("keydb.cfg"))
+}
+
+/// ScanOptions for a **live-drive** structure scan. Lookup-free (the library
+/// resolves no keys), plus the AACS host credentials for the authenticated
+/// handshake — sourced from the keydb, *independent of `key_source`* (a locked
+/// drive needs the cert even in online mode; an unlocked / LibreDrive drive
+/// takes the OEM Volume-ID path and ignores them).
+pub fn drive_scan_opts(cfg: &Config) -> libfreemkv::ScanOptions {
+    drive_scan_opts_for_keydb(&keydb_path(cfg))
+}
+
+/// Live-drive [`ScanOptions`](libfreemkv::ScanOptions) with host credentials
+/// sourced from a specific keydb path — the handshake's only keydb dependency
+/// (an unlocked / LibreDrive drive ignores them).
+pub fn drive_scan_opts_for_keydb(keydb: &Path) -> libfreemkv::ScanOptions {
+    let host_certs = KeydbSource::new(keydb).host_certs();
+    let credentials =
+        (!host_certs.is_empty()).then_some(libfreemkv::DriveCredentials { host_certs });
+    libfreemkv::ScanOptions { credentials }
+}
+
+/// ScanOptions for an **ISO** structure scan — no handshake, no credentials.
+pub fn iso_scan_opts() -> libfreemkv::ScanOptions {
+    libfreemkv::ScanOptions::default()
 }
 
 /// Build the ordered key-source list from config.
@@ -64,15 +90,7 @@ pub fn build_sources(cfg: &Config, mapfile: Option<&Path>) -> Vec<Box<dyn KeySou
             cfg.keyserver_url.clone(),
             cfg.keyserver_secret.clone(),
         ))),
-        _ => {
-            let path: PathBuf = cfg
-                .keydb_path
-                .clone()
-                .map(Into::into)
-                .or_else(|| libfreemkv::keydb::default_path().ok())
-                .unwrap_or_else(|| PathBuf::from("keydb.cfg"));
-            sources.push(Box::new(KeydbSource::new(path)));
-        }
+        _ => sources.push(Box::new(KeydbSource::new(keydb_path(cfg)))),
     }
     sources
 }

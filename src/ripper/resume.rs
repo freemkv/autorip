@@ -306,12 +306,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     //    scans structure-only first (the title extents are needed to read the
     //    on-disc samples), then resolves a key and re-scans with it (see
     //    `resolve_keys_from_iso`). A local source resolves keys here.
-    let online = cfg_read.key_source == "online";
-    let struct_opts = if online {
-        libfreemkv::ScanOptions::default()
-    } else {
-        super::scan_opts_for(&cfg_read)
-    };
+    // ISO scan: keyless, no handshake (so no drive credentials). Keys are
+    // resolved afterward in `resolve_keys_from_iso` via the source list.
+    let struct_opts = crate::keysource::iso_scan_opts();
     use libfreemkv::SectorSource;
     let capacity = iso_reader.capacity_sectors();
     let disc = match libfreemkv::Disc::scan_image(&mut iso_reader, capacity, &struct_opts) {
