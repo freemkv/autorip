@@ -321,6 +321,7 @@ version = "0.27.4"
 dependencies = [
  "base64",
  "crossbeam-channel",
+ "freemkv-keysources",
  "libc",
  "libfreemkv",
  "mimalloc",
@@ -332,6 +333,17 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "ureq",
+]
+
+[[package]]
+name = "freemkv-keysources"
+version = "0.27.5"
+dependencies = [
+ "base64",
+ "libfreemkv",
+ "serde_json",
+ "tracing",
  "ureq",
 ]
 
@@ -553,9 +565,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libfreemkv"
-version = "0.27.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb58c49ea182f42a1f450dd10521a2d51f35997fe8fe373d1492c65f0badf484"
+version = "0.27.5"
 dependencies = [
  "aes",
  "base64",

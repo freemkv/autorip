@@ -43,28 +43,28 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-use crate::keysource::{DriveAccess, KeySource};
+use crate::keysource::DriveAccess;
 
-/// [`libfreemkv::ScanOptions`] for the structure scan, per the configured key
-/// source (local carries the key database; sample-based sources scan keyless
-/// and resolve afterward via [`resolve_keys_from_drive`]).
-pub(crate) fn scan_opts_for(cfg: &Config) -> libfreemkv::ScanOptions {
-    KeySource::from_config(cfg).scan_options()
+/// [`libfreemkv::ScanOptions`] for the structure scan: always keyless. The
+/// library captures structure + AACS inputs; autorip resolves keys afterward
+/// from the configured sources via [`resolve_keys_from_drive`].
+pub(crate) fn scan_opts_for(_cfg: &Config) -> libfreemkv::ScanOptions {
+    crate::keysource::keyless_scan_opts()
 }
 
-/// Resolve keys for a freshly-scanned live disc via the configured source. A
+/// Resolve keys for a freshly-scanned live disc via the configured sources. A
 /// thin live-drive binding over [`crate::keysource::resolve_keys`]; returns the
-/// disc re-scanned with the key (sample-based source) or unchanged (local / no
-/// key).
+/// disc with keys applied (`Resolved`) or unchanged on a miss. No mapfile yet
+/// on a fresh rip, so the source list is just the configured source.
 fn resolve_keys_from_drive(
     cfg: &Config,
     drive: &mut libfreemkv::Drive,
     disc: libfreemkv::Disc,
 ) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
-    let ks = KeySource::from_config(cfg);
+    let sources = crate::keysource::build_sources(cfg, None);
     let vid = disc.aacs.as_ref().map(|a| a.volume_id);
     let mut access = DriveAccess::new(drive, vid);
-    crate::keysource::resolve_keys(&ks, &mut access, disc)
+    crate::keysource::resolve_keys(&sources, &mut access, disc)
 }
 
 /// Human-readable key readiness for the dashboard tile, decided at scan time.
@@ -93,14 +93,13 @@ fn key_readiness(
     }
     let reason = match outcome {
         KeyOutcome::Unreachable => {
-            "key service unreachable (check Keyserver URL / network)".to_string()
+            "key source unavailable (check Keyserver URL / network, or the keydb file)".to_string()
         }
         KeyOutcome::NoKey => "no key available for this disc".to_string(),
-        KeyOutcome::InputAnomaly => "disc data anomaly — please file a bug report".to_string(),
         KeyOutcome::MissingInputs => "could not read this disc's key files".to_string(),
-        // Local source, or a resolve that still left the disc keyless: defer to
-        // the libfreemkv AACS failure heading (the authority for the local path).
-        KeyOutcome::Inline | KeyOutcome::Resolved => {
+        // A resolve that still left the disc keyless: defer to the libfreemkv
+        // AACS failure heading.
+        KeyOutcome::Resolved => {
             let msg = aacs_failure_message(disc.aacs_error.as_ref());
             msg.lines().next().unwrap_or("no keys").to_string()
         }
@@ -658,7 +657,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // slow remote link can take a minute or two — tell the user we're waiting on
     // it so the pause isn't mistaken for a hang. (Online sources are exactly the
     // ones that `needs_samples()`.)
-    if KeySource::from_config(&cfg_read).needs_samples() {
+    if crate::keysource::uses_online(&cfg_read) {
         crate::log::device_log(device, "Communicating with online keyserver...");
         update_state_with(device, |s| {
             s.key_status = "Communicating with online keyserver…".to_string();

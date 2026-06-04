@@ -343,8 +343,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // Sample-based key source: read the disc's files + Volume ID (from the
     // mapfile) + on-disc samples (from the ISO), resolve a Unit Key, and re-scan
     // with it so decryption keys populate. No-op for a local source.
-    let (disc, _key_outcome) =
-        resolve_keys_from_iso(&cfg_read, &iso_path, &_mapfile_path, disc, capacity);
+    let (disc, _key_outcome) = resolve_keys_from_iso(&cfg_read, &iso_path, &_mapfile_path, disc);
 
     // Real-bitrate re-validation: now that we have the actual title,
     // recompute bytes-bad-in-title (vs the classifier's whole-disc
@@ -713,37 +712,17 @@ fn resolve_keys_from_iso(
     iso_path: &Path,
     mapfile_path: &Path,
     disc: libfreemkv::Disc,
-    capacity: u32,
 ) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
-    // Mapfile UK fast-path: the mapfile is the cached "already-resolved" key
-    // source. If the sweep persisted unit keys (the disc was keyed at scan),
-    // hand them to libfreemkv and skip the key service entirely — NO second
-    // call. Keys XOR VID, so a UK here is the final answer. We pass the UK via
-    // the lookup-free `Disc::decrypt_with(Key::Unit(..))` entry point so
-    // libfreemkv never references a keydb on this path (it builds the AACS
-    // decrypt state straight from the supplied key, even when the structure
-    // scan found no keydb — the E8005 deferred-mux bug).
-    if let Ok(map) = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path) {
-        let uk = map.unit_keys();
-        if !uk.is_empty() {
-            let mut disc = disc;
-            let n = uk.len();
-            let _ = disc.decrypt_with(libfreemkv::Key::Unit(uk.to_vec()));
-            tracing::info!(
-                phase = "keyservice_resolve",
-                keys = n,
-                "keys recovered from mapfile — skipping key service"
-            );
-            return (disc, crate::keysource::KeyOutcome::Resolved);
-        }
-    }
-    // No persisted UK → VID-only (the key service retries — correct, the disc was
-    // never keyed) or a local source. `resolve_keys` reads the VID from the
-    // mapfile via IsoAccess; a genuinely-unkeyed disc returns NoKey and the
-    // caller stops.
-    let ks = crate::keysource::KeySource::from_config(cfg);
-    let mut access = crate::keysource::IsoAccess::new(iso_path, mapfile_path, capacity);
-    crate::keysource::resolve_keys(&ks, &mut access, disc)
+    // The mapfile cache is the resume fast-path: when the sweep persisted unit
+    // keys (the disc was keyed at scan), `MapfileSource` — first in the source
+    // list — hands them straight to `Disc::decrypt_with(Key::Unit(..))`, no
+    // keydb parse and no key-service call. Keys XOR VID, so a UK there is the
+    // final answer. If the mapfile holds no keys (disc never keyed), resolution
+    // falls through to the configured source (which reads the VID from the
+    // mapfile via `IsoAccess`); a genuinely-unkeyed disc returns NoKey.
+    let sources = crate::keysource::build_sources(cfg, Some(mapfile_path));
+    let mut access = crate::keysource::IsoAccess::new(iso_path, mapfile_path);
+    crate::keysource::resolve_keys(&sources, &mut access, disc)
 }
 
 // Tests live in `tests/resume_remux.rs` (integration tests) — they

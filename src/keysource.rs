@@ -1,256 +1,185 @@
 //! Where AACS keys come from.
 //!
-//! Pluggable by design. Today there are two sources — `local` (an on-disk key
-//! database that libfreemkv resolves against during the scan) and `online` (a
-//! remote key service) — and more can be added as `KeySource` variants without
-//! touching the rip loop.
+//! libfreemkv does no key lookup — it is handed a [`libfreemkv::Key`] and
+//! derives down the AACS chain to decrypt. autorip resolves that key from one
+//! or more *published key sources* (`freemkv_keysources`): the mapfile cache
+//! (the resume fast-path) is tried first, then the configured source — a local
+//! keydb (`local`) or a remote key service (`online`).
 //!
-//! A source either resolves keys *inline during the scan* (local: it just hands
-//! libfreemkv a `keydb` path) or *from the disc after a structure scan*
-//! (sample-based sources: scan keyless, take a few on-disc samples, ask the
-//! source for the Unit Key, then re-scan with it). The rip/resume code drives
-//! both shapes through this one type.
+//! The flow is the same for a live drive and a staged ISO: scan the disc
+//! KEYLESS (structure + AACS inputs, no resolution), build [`DiscInputs`] from
+//! its key files (+ content samples when a source needs them), then try each
+//! source's candidate keys via [`libfreemkv::Disc::decrypt_with`] — the first
+//! that derives unit keys wins. The only drive-vs-ISO difference is the
+//! [`DiscKeyAccess`] impl.
 
 use std::path::{Path, PathBuf};
 
+use freemkv_keysources::{DiscInputs, KeySource, KeydbSource, MapfileSource, OnlineSource};
+
 use crate::config::Config;
 
-/// How many 6144-byte aligned units a sample-based source is given.
+/// How many 6144-byte aligned encrypted units a sample-needing source is given.
 pub const SAMPLE_UNITS: usize = 4;
 
 /// What happened when resolving keys for a disc — carried back so the UI can
 /// tell the user *why*, instead of a generic "missing keys".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOutcome {
-    /// Resolved a Unit Key and re-scanned — the disc now carries keys.
+    /// A source's key derived unit keys — the disc now carries keys.
     Resolved,
-    /// Local key source: keys resolve inline during the scan; the libfreemkv
-    /// scan result (and its `aacs_error`) is the authority, nothing to add here.
-    Inline,
     /// Couldn't read the disc's key files, or the disc reported no titles.
     MissingInputs,
-    /// Key service was reached but has no key for this disc.
+    /// No configured source produced a key that decrypts this disc.
     NoKey,
-    /// Key service could not be reached (network / TLS / DNS / bad URL).
+    /// A source itself failed (e.g. key service unreachable / unreadable keydb).
     Unreachable,
-    /// The disc's key data was anomalous (e.g. an oversized MKB) — not queried.
-    InputAnomaly,
 }
 
-/// Result of a single fetch from a key source.
-enum FetchResult {
-    Key([u8; 16]),
-    NoKey,
-    Unreachable,
-    InputAnomaly,
-}
-
-/// A configured AACS key source.
-pub enum KeySource {
-    /// Resolve against a local key database (libfreemkv does it during scan).
-    Local { keydb_path: Option<PathBuf> },
-    /// Resolve via a remote key service from the disc's files + samples.
-    Online(OnlineKeyService),
-}
-
-impl KeySource {
-    /// Select the source from configuration.
-    pub fn from_config(cfg: &Config) -> Self {
-        match cfg.key_source.as_str() {
-            "online" => KeySource::Online(OnlineKeyService::new(
-                cfg.keyserver_url.clone(),
-                cfg.keyserver_secret.clone(),
-            )),
-            _ => KeySource::Local {
-                keydb_path: cfg.keydb_path.clone().map(Into::into),
-            },
-        }
-    }
-
-    /// `ScanOptions` for the structure scan. A local source carries the key
-    /// database so keys resolve inline; a sample-based source scans keyless and
-    /// resolves afterward via [`resolve`](Self::resolve).
-    pub fn scan_options(&self) -> libfreemkv::ScanOptions {
-        match self {
-            KeySource::Local { keydb_path } => libfreemkv::ScanOptions {
-                keydb_path: keydb_path.clone(),
-                ..Default::default()
-            },
-            // Online resolves keys out-of-band via the key service. Disable the
-            // local keydb entirely so a keydb that happens to sit in a default
-            // search path can't shadow the service (the radio means "server,
-            // not local keydb").
-            KeySource::Online(_) => libfreemkv::ScanOptions {
-                disable_keydb: true,
-                ..Default::default()
-            },
-        }
-    }
-
-    /// Whether this source resolves a Unit Key from on-disc samples taken AFTER
-    /// a structure scan, rather than inline during the scan.
-    pub fn needs_samples(&self) -> bool {
-        matches!(self, KeySource::Online(_))
-    }
-
-    /// Resolve a Unit Key for a disc from its key files + on-disc content
-    /// samples. A local source resolves inline at scan time, so it reports
-    /// `NoKey` here (it never reaches this path — `needs_samples` is false).
-    fn resolve(
-        &self,
-        inf: &[u8],
-        mkb: &[u8],
-        vid: Option<[u8; 16]>,
-        units: &[Vec<u8>],
-    ) -> FetchResult {
-        match self {
-            KeySource::Local { .. } => FetchResult::NoKey,
-            KeySource::Online(svc) => svc.fetch(inf, mkb, vid, units),
-        }
+/// [`libfreemkv::ScanOptions`] for the structure scan: always KEYLESS. The
+/// library captures disc structure + AACS inputs (Unit_Key_RO.inf, MKB, VID)
+/// but resolves no keys; autorip resolves them afterward through the sources.
+/// `disable_keydb` also stops any keydb sitting in a default search path from
+/// resolving inline behind autorip's back.
+pub fn keyless_scan_opts() -> libfreemkv::ScanOptions {
+    libfreemkv::ScanOptions {
+        disable_keydb: true,
+        ..Default::default()
     }
 }
 
-/// Client for a remote key service. autorip treats it as an opaque third party:
-/// it sends the disc's files and a few on-disc samples and receives a Unit Key
-/// or nothing. It makes no assumptions about how the service produces the key.
-pub struct OnlineKeyService {
-    base_url: String,
-    secret: String,
+/// Build the ordered key-source list from config.
+///
+/// The mapfile cache (when a rip mapfile exists) is tried first — it holds
+/// already-resolved unit keys, so a resume needs no keydb parse and no network.
+/// Then the configured source: `online` → the remote key service, anything
+/// else → the local keydb (explicit path, else the standard location).
+pub fn build_sources(cfg: &Config, mapfile: Option<&Path>) -> Vec<Box<dyn KeySource>> {
+    let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
+    if let Some(mf) = mapfile {
+        sources.push(Box::new(MapfileSource::new(mf)));
+    }
+    match cfg.key_source.as_str() {
+        "online" => sources.push(Box::new(OnlineSource::new(
+            cfg.keyserver_url.clone(),
+            cfg.keyserver_secret.clone(),
+        ))),
+        _ => {
+            let path: PathBuf = cfg
+                .keydb_path
+                .clone()
+                .map(Into::into)
+                .or_else(|| libfreemkv::keydb::default_path().ok())
+                .unwrap_or_else(|| PathBuf::from("keydb.cfg"));
+            sources.push(Box::new(KeydbSource::new(path)));
+        }
+    }
+    sources
 }
 
-impl OnlineKeyService {
-    fn new(base_url: String, secret: String) -> Self {
-        Self { base_url, secret }
-    }
+/// Whether the configured (non-mapfile) source talks to a remote key service —
+/// used by the UI to announce a potentially slow keyserver round-trip.
+pub fn uses_online(cfg: &Config) -> bool {
+    cfg.key_source == "online"
+}
 
-    /// `POST <base_url>/decode` with a JSON body of base64 fields
-    /// (`inf_b64`, `mkb_b64`, `vid_b64`, `units_b64`); on a `{"UK":"<32-hex>"}`
-    /// reply, return the 16-byte key. Any other outcome is `None`.
-    fn fetch(
-        &self,
-        inf: &[u8],
-        mkb: &[u8],
-        vid: Option<[u8; 16]>,
-        units: &[Vec<u8>],
-    ) -> FetchResult {
-        use base64::Engine;
-        use std::time::Duration;
+/// How a disc's key-resolution inputs are obtained. Decouples [`resolve_keys`]
+/// from WHERE the disc lives — a live drive or a staged ISO — so the resolution
+/// logic is written once. See [`DriveAccess`] and [`IsoAccess`].
+pub trait DiscKeyAccess {
+    /// The disc's `Unit_Key_RO.inf` + `MKB` bytes.
+    fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)>;
+    /// The 16-byte AACS Volume ID, if available.
+    fn volume_id(&self) -> Option<[u8; 16]>;
+    /// Up to `n` encrypted aligned units sampled from the disc's content.
+    fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>>;
+}
 
-        if self.base_url.is_empty() {
-            return FetchResult::Unreachable;
-        }
-        // A real MKB is at most a few MB (a UHD MKB ~3.8 MB). Anything far
-        // larger means something is wrong (e.g. the padded MKB_RW region got
-        // read instead of the real MKB). Don't ship a giant body — surface a
-        // clear, reportable error and skip the query.
-        const MAX_MKB_BYTES: usize = 10 * 1024 * 1024;
-        if mkb.len() > MAX_MKB_BYTES {
-            tracing::warn!(
-                phase = "keyservice_query",
-                mkb_bytes = mkb.len(),
-                "MKB unexpectedly large ({} MB) — not querying the key service. \
-                 This is a bug; please file a report at github.com/freemkv/autorip/issues",
-                mkb.len() / 1024 / 1024
-            );
-            return FetchResult::InputAnomaly;
-        }
-        let url = format!("{}/decode", self.base_url.trim_end_matches('/'));
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let mut body = serde_json::json!({
-            "inf_b64": b64.encode(inf),
-            "mkb_b64": b64.encode(mkb),
-        });
-        if let Some(vid) = vid {
-            body["vid_b64"] = serde_json::Value::String(b64.encode(vid));
-        }
-        if !units.is_empty() {
-            body["units_b64"] = serde_json::Value::Array(
-                units
-                    .iter()
-                    .map(|u| serde_json::Value::String(b64.encode(u)))
-                    .collect(),
-            );
-        }
+/// Resolve keys for `disc` via the ordered `sources`, reading inputs through
+/// `access`. Returns the disc with keys applied (`Resolved`) or unchanged.
+///
+/// The disc must have been scanned KEYLESS (see [`keyless_scan_opts`]). Each
+/// source offers candidate keys; the first whose [`libfreemkv::Disc::decrypt_with`]
+/// derives unit keys wins. A wrong candidate (e.g. a device-key set that does
+/// not apply to this disc's MKB) is rejected by `decrypt_with` and the next
+/// candidate / source is tried. `decrypt_with` only mutates the disc on success,
+/// so a rejected candidate leaves it untouched.
+pub fn resolve_keys<A: DiscKeyAccess>(
+    sources: &[Box<dyn KeySource>],
+    access: &mut A,
+    mut disc: libfreemkv::Disc,
+) -> (libfreemkv::Disc, KeyOutcome) {
+    let Some((inf, mkb)) = access.key_files() else {
+        tracing::warn!(phase = "key_resolve", "could not read disc key files");
+        return (disc, KeyOutcome::MissingInputs);
+    };
+    let vid = access.volume_id().unwrap_or([0u8; 16]);
 
-        // Generous overall deadline: the request body carries the MKB (a UHD MKB
-        // is ~3.8 MB, ~5 MB base64-encoded) plus sample units, and the keyserver
-        // is often remote on a slow link where that upload alone can take 1-2
-        // minutes. A truly-down server still fails fast (connection refused
-        // returns immediately), so this only extends the slow-but-alive case.
-        const KEYSERVICE_TIMEOUT_SECS: u64 = 180;
-        let mut req = ureq::post(&url).timeout(Duration::from_secs(KEYSERVICE_TIMEOUT_SECS));
-        if !self.secret.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", self.secret));
-        }
-        tracing::info!(
-            phase = "keyservice_query",
-            url = %url,
-            inf = inf.len(),
-            mkb = mkb.len(),
-            has_vid = vid.is_some(),
-            units = units.len(),
-            "querying key service"
-        );
-        let resp = match req.send_json(body) {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, _)) => {
-                tracing::warn!(
-                    phase = "keyservice_query",
-                    status = code,
-                    "key service returned no key"
-                );
-                return FetchResult::NoKey;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    phase = "keyservice_query",
-                    error = %e,
-                    "key service unreachable"
-                );
-                return FetchResult::Unreachable;
-            }
-        };
-        let json: serde_json::Value = match resp.into_json() {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!(phase = "keyservice_query", error = %e, "key service reply unreadable");
-                return FetchResult::NoKey;
-            }
-        };
-        match json.get("UK").and_then(|u| u.as_str()).and_then(parse_uk) {
-            Some(uk) => {
-                tracing::info!(phase = "keyservice_query", "key service returned a key");
-                FetchResult::Key(uk)
-            }
+    // Read content samples only if some source validates against ciphertext
+    // (an online key service); a keydb / mapfile keys on identity alone.
+    let need_samples = sources.iter().any(|s| s.needs_samples());
+    let samples = if need_samples {
+        match disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() {
+            Some(title) => access.sample_units(&title, SAMPLE_UNITS),
             None => {
                 tracing::warn!(
-                    phase = "keyservice_query",
-                    "key service reply had no usable key"
+                    phase = "key_resolve",
+                    "no titles — cannot sample for key service"
                 );
-                FetchResult::NoKey
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let inputs = DiscInputs {
+        disc_hash: libfreemkv::aacs::disc_hash_hex(&libfreemkv::aacs::disc_hash(&inf)),
+        volume_id: vid,
+        mkb,
+        unit_key_ro: inf,
+        samples,
+    };
+
+    let mut had_source_error = false;
+    for src in sources {
+        let cands = match src.resolve(&inputs) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(phase = "key_resolve", error = %e, "key source failed");
+                had_source_error = true;
+                continue;
+            }
+        };
+        for key in cands {
+            if disc.decrypt_with(key).is_ok() {
+                tracing::info!(phase = "key_resolve", "key resolved — disc now keyed");
+                return (disc, KeyOutcome::Resolved);
             }
         }
     }
+
+    // No candidate decrypted. A hard source error (e.g. an unreadable keydb)
+    // is reported distinctly from a clean "no key for this disc".
+    let outcome = if had_source_error {
+        KeyOutcome::Unreachable
+    } else {
+        KeyOutcome::NoKey
+    };
+    (disc, outcome)
 }
 
 /// Read up to `n` ENCRYPTED 6144-byte aligned units from `title`'s main body,
-/// raw (no decrypt) — so the key service can byte-validate a key against them.
+/// raw (no decrypt) — so a key service can byte-validate a key against them.
 ///
-/// "Encrypted" is decided by the shared library predicate
-/// `libfreemkv::aacs::is_aacs_scrambled` — the SAME function the key service
-/// uses to gate the request — so both ends agree. It reads the raw TS syncs: an
-/// AACS-scrambled unit's body packets have their `0x47` syncs destroyed, while a
-/// clear unit keeps them. A clip OPENS with clear navigation units (PAT/PMT,
-/// menus); only the feature body is scrambled. Handing the key service a clear
-/// unit proves nothing (nothing to decrypt), so we collect only scrambled ones.
-///
-/// The earlier version scanned only ~120 units from the FIRST extent's start —
-/// squarely inside the clear nav head — and returned zero encrypted units on a
-/// real disc (the feature is gigabytes deep). This samples the LARGEST extent
-/// (the main feature body) at depth: midpoint first, then quarter points, then
-/// the start as a last resort, scanning forward at each anchor. The midpoint of
-/// a multi-GB feature is reliably in the encrypted body. Empty only if the title
-/// has no extents or every read fails (i.e. not an encrypted disc).
+/// "Encrypted" is decided by `libfreemkv::aacs::is_aacs_scrambled` — the SAME
+/// function the key service uses to gate the request — so both ends agree. It
+/// reads the raw TS syncs: an AACS-scrambled unit's body packets have their
+/// `0x47` syncs destroyed, while a clear unit keeps them. A clip OPENS with
+/// clear navigation units (PAT/PMT, menus); only the feature body is scrambled.
+/// Handing a clear unit proves nothing (nothing to decrypt), so we collect only
+/// scrambled ones — sampling the LARGEST extent (the feature body) at depth:
+/// midpoint first, scanning forward.
 pub fn read_sample_units(
     reader: &mut dyn libfreemkv::SectorSource,
     title: &libfreemkv::DiscTitle,
@@ -300,79 +229,6 @@ pub fn read_sample_units(
     out
 }
 
-/// How a disc's key-resolution inputs are obtained, and how the disc is
-/// re-scanned once a Unit Key is known. Decouples [`resolve_keys`] from WHERE
-/// the disc lives — a live drive or a staged ISO — so the resolution logic is
-/// written once. See [`DriveAccess`] and [`IsoAccess`].
-pub trait DiscKeyAccess {
-    /// The disc's `Unit_Key_RO.inf` + `MKB` bytes.
-    fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)>;
-    /// The 16-byte AACS Volume ID, if available.
-    fn volume_id(&self) -> Option<[u8; 16]>;
-    /// Up to `n` encrypted aligned units sampled from the disc's content.
-    fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>>;
-    /// Re-scan the disc supplying `uk`, so its decryption keys populate.
-    fn rescan(&mut self, uk: [u8; 16]) -> Option<libfreemkv::Disc>;
-}
-
-/// Resolve a Unit Key for `disc` via `ks`, reading inputs + re-scanning through
-/// `access`. Returns the re-scanned disc (now carrying keys) on success, or
-/// `disc` unchanged for a source that resolves inline (local) or on a miss.
-///
-/// This is the single code path for both the live-drive and resume-from-ISO
-/// flows; the only difference between them is the `DiscKeyAccess` impl.
-pub fn resolve_keys<A: DiscKeyAccess>(
-    ks: &KeySource,
-    access: &mut A,
-    disc: libfreemkv::Disc,
-) -> (libfreemkv::Disc, KeyOutcome) {
-    if !ks.needs_samples() {
-        return (disc, KeyOutcome::Inline);
-    }
-    // Sample from the LARGEST title (the main feature) — its body is the
-    // encrypted bulk and uses the disc's primary unit key, which is what the
-    // key service resolves. The first title can be a menu / FirstPlay clip.
-    let Some(title) = disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() else {
-        tracing::warn!(
-            phase = "keyservice_resolve",
-            "no titles — skipping key service"
-        );
-        return (disc, KeyOutcome::MissingInputs);
-    };
-    let Some((inf, mkb)) = access.key_files() else {
-        tracing::warn!(
-            phase = "keyservice_resolve",
-            "could not read disc key files — skipping key service"
-        );
-        return (disc, KeyOutcome::MissingInputs);
-    };
-    let vid = access.volume_id();
-    let units = access.sample_units(&title, SAMPLE_UNITS);
-    tracing::info!(
-        phase = "keyservice_resolve",
-        has_vid = vid.is_some(),
-        units = units.len(),
-        "resolving key via key service"
-    );
-    match ks.resolve(&inf, &mkb, vid, &units) {
-        FetchResult::Key(uk) => {
-            tracing::info!(
-                phase = "keyservice_resolve",
-                "key resolved — re-scanning disc"
-            );
-            match access.rescan(uk) {
-                Some(d) => (d, KeyOutcome::Resolved),
-                // Got a key but the re-scan didn't surface usable keys — treat
-                // as no usable key rather than claiming success.
-                None => (disc, KeyOutcome::NoKey),
-            }
-        }
-        FetchResult::NoKey => (disc, KeyOutcome::NoKey),
-        FetchResult::Unreachable => (disc, KeyOutcome::Unreachable),
-        FetchResult::InputAnomaly => (disc, KeyOutcome::InputAnomaly),
-    }
-}
-
 /// [`DiscKeyAccess`] backed by a live optical drive. `vid` is the Volume ID
 /// from the structure scan (the drive read it during AACS auth).
 pub struct DriveAccess<'a> {
@@ -396,13 +252,6 @@ impl DiscKeyAccess for DriveAccess<'_> {
     fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>> {
         read_sample_units(self.drive, title, n)
     }
-    fn rescan(&mut self, uk: [u8; 16]) -> Option<libfreemkv::Disc> {
-        let opts = libfreemkv::ScanOptions {
-            unit_key: Some(uk),
-            ..Default::default()
-        };
-        libfreemkv::Disc::scan(self.drive, &opts).ok()
-    }
 }
 
 /// [`DiscKeyAccess`] backed by a staged ISO + its mapfile (the resume path).
@@ -410,15 +259,13 @@ impl DiscKeyAccess for DriveAccess<'_> {
 pub struct IsoAccess<'a> {
     iso_path: &'a Path,
     mapfile_path: &'a Path,
-    capacity: u32,
 }
 
 impl<'a> IsoAccess<'a> {
-    pub fn new(iso_path: &'a Path, mapfile_path: &'a Path, capacity: u32) -> Self {
+    pub fn new(iso_path: &'a Path, mapfile_path: &'a Path) -> Self {
         Self {
             iso_path,
             mapfile_path,
-            capacity,
         }
     }
 }
@@ -438,44 +285,11 @@ impl DiscKeyAccess for IsoAccess<'_> {
             Err(_) => Vec::new(),
         }
     }
-    fn rescan(&mut self, uk: [u8; 16]) -> Option<libfreemkv::Disc> {
-        let opts = libfreemkv::ScanOptions {
-            unit_key: Some(uk),
-            ..Default::default()
-        };
-        let mut r = libfreemkv::FileSectorSource::open(self.iso_path).ok()?;
-        libfreemkv::Disc::scan_image(&mut r, self.capacity, &opts).ok()
-    }
-}
-
-/// Parse a 32-char hex Unit Key into 16 bytes.
-fn parse_uk(hex: &str) -> Option<[u8; 16]> {
-    if hex.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_uk_roundtrip() {
-        assert_eq!(
-            parse_uk("1deb13ba851d8fbc01e169dca7d2f258").unwrap(),
-            [
-                0x1d, 0xeb, 0x13, 0xba, 0x85, 0x1d, 0x8f, 0xbc, 0x01, 0xe1, 0x69, 0xdc, 0xa7, 0xd2,
-                0xf2, 0x58
-            ]
-        );
-        assert!(parse_uk("deadbeef").is_none());
-        assert!(parse_uk("zz").is_none());
-    }
 
     /// Cross-side agreement: autorip's sample selector (`read_sample_units`)
     /// hands the key service only units the service's own gate accepts —
@@ -493,8 +307,6 @@ mod tests {
         tmp.flush().unwrap();
         let mut reader = libfreemkv::FileSectorSource::open(tmp.path()).unwrap();
 
-        // One extent over the whole image; its midpoint (the sampling anchor)
-        // lands squarely in the scrambled body.
         let title = libfreemkv::DiscTitle {
             playlist: "00800.mpls".into(),
             playlist_id: 800,
@@ -515,15 +327,13 @@ mod tests {
         assert_eq!(units.len(), SAMPLE_UNITS, "should collect 4 sample units");
         for u in &units {
             assert_eq!(u.len(), 6144);
-            // Exactly what the key service gates on — agreement by construction.
             assert!(
                 libfreemkv::aacs::is_aacs_scrambled(u),
                 "selector must only emit units the key service accepts"
             );
         }
 
-        // The converse the service relies on: a clear unit (TS syncs intact) is
-        // NOT scrambled, so the service rejects it (nothing to decrypt-validate).
+        // The converse: a clear unit (TS syncs intact) is NOT scrambled.
         let mut clear = vec![0u8; 6144];
         let mut off = 4;
         while off < 6144 {
