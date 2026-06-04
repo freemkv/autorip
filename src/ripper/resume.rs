@@ -715,17 +715,23 @@ fn resolve_keys_from_iso(
     disc: libfreemkv::Disc,
     capacity: u32,
 ) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
-    // Mapfile UK fast-path: if the sweep persisted unit keys (the disc was keyed
-    // at scan), inject them and skip the key service entirely — NO second call.
-    // Keys XOR VID, so a UK here means we have the final answer.
+    // Mapfile UK fast-path: the mapfile is the cached "already-resolved" key
+    // source. If the sweep persisted unit keys (the disc was keyed at scan),
+    // hand them to libfreemkv and skip the key service entirely — NO second
+    // call. Keys XOR VID, so a UK here is the final answer. We pass the UK via
+    // the lookup-free `Disc::decrypt_with(Key::Unit(..))` entry point so
+    // libfreemkv never references a keydb on this path (it builds the AACS
+    // decrypt state straight from the supplied key, even when the structure
+    // scan found no keydb — the E8005 deferred-mux bug).
     if let Ok(map) = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path) {
         let uk = map.unit_keys();
         if !uk.is_empty() {
             let mut disc = disc;
-            disc.inject_unit_keys(uk.to_vec());
+            let n = uk.len();
+            let _ = disc.decrypt_with(libfreemkv::Key::Unit(uk.to_vec()));
             tracing::info!(
                 phase = "keyservice_resolve",
-                keys = uk.len(),
+                keys = n,
                 "keys recovered from mapfile — skipping key service"
             );
             return (disc, crate::keysource::KeyOutcome::Resolved);
