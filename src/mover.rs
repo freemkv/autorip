@@ -631,7 +631,11 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
                     String::new()
                 };
                 let dir = format!("{}/{}{}", cfg.movie_dir, safe_title, year_str);
-                let name = format!("{safe_title}.{src_ext}");
+                // Filename carries the year too, matching the folder and the
+                // Plex/Jellyfin `Title (Year)/Title (Year).ext` convention
+                // (pre-fix the file was bare `Title.ext` — folder had the year
+                // but the file did not).
+                let name = format!("{safe_title}{year_str}.{src_ext}");
                 format!("{dir}/{name}")
             }
             "tv" if !cfg.tv_dir.is_empty() => {
@@ -843,7 +847,7 @@ mod tests {
         let dest = build_destination(&cfg, &tmdb, "disc.mkv");
         assert_eq!(
             dest,
-            "/out/Movies/Aurora Drift Two (2024)/Aurora Drift Two.mkv"
+            "/out/Movies/Aurora Drift Two (2024)/Aurora Drift Two (2024).mkv"
         );
     }
 
@@ -896,8 +900,8 @@ mod tests {
         let tmdb = Some(tmdb_movie("Lumina", 2023));
         let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso");
         let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv");
-        assert_eq!(dest_iso, "/out/Movies/Lumina (2023)/Lumina.iso");
-        assert_eq!(dest_mkv, "/out/Movies/Lumina (2023)/Lumina.mkv");
+        assert_eq!(dest_iso, "/out/Movies/Lumina (2023)/Lumina (2023).iso");
+        assert_eq!(dest_mkv, "/out/Movies/Lumina (2023)/Lumina (2023).mkv");
         assert_ne!(
             dest_iso, dest_mkv,
             "iso and mkv companions must not collide"
@@ -909,7 +913,7 @@ mod tests {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Movie", 2024));
         let dest = build_destination(&cfg, &tmdb, "00800.m2ts");
-        assert_eq!(dest, "/out/Movies/Movie (2024)/Movie.m2ts");
+        assert_eq!(dest, "/out/Movies/Movie (2024)/Movie (2024).m2ts");
     }
 
     fn noop_progress(_: u8, _: f64, _: f64, _: f64) {}
@@ -1177,7 +1181,7 @@ mod tests {
         check_and_move(&cfg);
 
         // MKV landed in the movie library.
-        let mkv_dest = movie_dir.join("Gleaming For Good (2024)/Gleaming For Good.mkv");
+        let mkv_dest = movie_dir.join("Gleaming For Good (2024)/Gleaming For Good (2024).mkv");
         assert!(
             mkv_dest.exists(),
             "MKV should have been moved to {}",
@@ -1185,7 +1189,7 @@ mod tests {
         );
 
         // ISO must NOT have been promoted to the movie library.
-        let iso_dest = movie_dir.join("Gleaming For Good (2024)/Gleaming For Good.iso");
+        let iso_dest = movie_dir.join("Gleaming For Good (2024)/Gleaming For Good (2024).iso");
         assert!(
             !iso_dest.exists(),
             "ISO must not be moved when keep_iso=false (found at {})",
@@ -1224,8 +1228,8 @@ mod tests {
 
         check_and_move(&cfg);
 
-        assert!(movie_dir.join("Keepme (2024)/Keepme.mkv").exists());
-        assert!(movie_dir.join("Keepme (2024)/Keepme.iso").exists());
+        assert!(movie_dir.join("Keepme (2024)/Keepme (2024).mkv").exists());
+        assert!(movie_dir.join("Keepme (2024)/Keepme (2024).iso").exists());
     }
 
     #[test]

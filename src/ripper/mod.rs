@@ -798,21 +798,23 @@ pub fn handle_rip_request(
     }
     match mode {
         crate::web::ResumeMode::Require => {
-            if let Some(class) = find_resumable_for_disc(cfg, device) {
-                // Sweep already complete — just re-mux the staged ISO, no
-                // disc reads.
-                crate::log::device_log(device, "Resume requested: re-muxing existing ISO");
-                resume::resume_remux(cfg, device, class);
-                drop_session(device);
-            } else if resumable_for_device(cfg, device) == Some(Resumable::Sweep) {
-                // Partial sweep — continue Pass 1 from the mapfile, reading
-                // only the missing (NonTrimmed / non-tried) ranges instead of
-                // re-reading the whole disc.
+            if resumable_for_device(cfg, device) == Some(Resumable::Sweep) {
+                // Prefer continuing the sweep whenever there is ANY not-good
+                // data left to recover (pending OR previously-Unreadable):
+                // continue Pass N from the mapfile, re-reading only the
+                // not-good ranges instead of the whole disc. `passes = N` is
+                // the recovery budget; nothing is ever abandoned as "dead".
                 crate::log::device_log(
                     device,
                     "Resume requested: continuing partial sweep from mapfile",
                 );
                 rip_disc(cfg, device, device_path, true);
+            } else if let Some(class) = find_resumable_for_disc(cfg, device) {
+                // Mapfile is 100% recovered — just re-mux the staged ISO, no
+                // disc reads.
+                crate::log::device_log(device, "Resume requested: re-muxing existing ISO");
+                resume::resume_remux(cfg, device, class);
+                drop_session(device);
             } else {
                 crate::log::device_log(
                     device,
@@ -974,7 +976,13 @@ fn resumable_for_disc(cfg: &Config, display_name: &str) -> Option<Resumable> {
             Ok(m) => m,
             Err(_) => continue,
         };
-        return Some(if map.stats().bytes_pending == 0 {
+        let st = map.stats();
+        // Any not-good data is retryable: pending (NonTried/NonTrimmed/
+        // NonScraped) OR a previously-stamped Unreadable. Continue the sweep so
+        // the remaining passes get another shot — there is NO terminal "won't
+        // retry" state; the patch re-attempts Unreadable ranges every pass.
+        // Only a mapfile that is 100% Finished resumes straight to remux.
+        return Some(if st.bytes_pending == 0 && st.bytes_unreadable == 0 {
             Resumable::Remux
         } else {
             Resumable::Sweep
@@ -1441,17 +1449,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 return;
             }
         }
-        // Genuine budget exceeded.
-        tracing::warn!(
-            device = %device_rip_watcher,
-            rip_budget_secs,
-            "Rip budget exceeded — firing halt flag"
-        );
-        halt_rip_watcher.store(true, std::sync::atomic::Ordering::Relaxed);
-        crate::log::device_log(
-            &device_rip_watcher,
-            &format!("exceeded {}-second rip budget", rip_budget_secs),
-        );
+        // Arbitrary whole-rip time cap REMOVED (2026-06-04). A rip stops on
+        // failure or pass exhaustion, never on a wall-clock: `passes = N` is the
+        // budget for recovering not-good data, and libfreemkv's own
+        // progress/stall watchdogs catch a genuinely stuck pass. The watcher
+        // no longer fires a halt when the (legacy) budget elapses — it just
+        // exits. The loop above still bails cleanly on rip_complete / halt.
     });
     // Drop guard that signals rip_complete on scope exit (rip
     // function returns). The watcher polls this and exits cleanly.
@@ -1480,16 +1483,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // cap_fired (and pass_halt) when wall-clock exceeds max_secs; writes
     // a per-pass `last_error` for UI surfacing.
     fn spawn_pass_watcher(
-        pass_label: String,
-        device: String,
+        _pass_label: String,
+        _device: String,
         pass_halt: Arc<AtomicBool>,
         user_halt: Arc<AtomicBool>,
-        cap_fired: Arc<AtomicBool>,
-        max_secs: u64,
+        _cap_fired: Arc<AtomicBool>,
+        _max_secs: u64,
     ) -> WallclockGuard {
         let active = Arc::new(AtomicBool::new(true));
         let active_for_watcher = active.clone();
-        let pass_start = std::time::Instant::now();
         std::thread::spawn(move || {
             while active_for_watcher.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1503,28 +1505,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 if pass_halt.load(Ordering::Relaxed) {
                     return;
                 }
-                if pass_start.elapsed().as_secs() > max_secs {
-                    let hrs = max_secs / 3600;
-                    let mins = (max_secs % 3600) / 60;
-                    let budget_str = if mins > 0 {
-                        format!("{}h {:02}m", hrs, mins)
-                    } else {
-                        format!("{}h", hrs)
-                    };
-                    crate::log::device_log(
-                        &device,
-                        &format!(
-                            "{} exceeded {} budget; halting pass",
-                            pass_label, budget_str
-                        ),
-                    );
-                    cap_fired.store(true, Ordering::Relaxed);
-                    pass_halt.store(true, Ordering::Relaxed);
-                    update_state_with(&device, |s| {
-                        s.last_error = format!("{} exceeded {} budget", pass_label, budget_str);
-                    });
-                    return;
-                }
+                // Per-pass wall-clock cap REMOVED (2026-06-04): a pass is
+                // bounded by its own work + libfreemkv's failure/stall
+                // watchdogs, never an arbitrary clock. This watcher now only
+                // forwards a user stop (above) into the pass halt flag.
             }
         });
         WallclockGuard(active)
