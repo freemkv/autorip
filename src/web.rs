@@ -46,6 +46,7 @@ html { overflow-y:scroll; scrollbar-gutter:stable; }
 body { font-family:-apple-system,system-ui,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; flex-direction:column; }
 .c { max-width:900px; margin:0 auto; padding:20px; width:100%; flex:1; display:flex; flex-direction:column; }
 @keyframes p { 0%,100%{opacity:1} 50%{opacity:.3} }
+@keyframes ph { 0%,100%{opacity:1} 50%{opacity:.45} }
 .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:16px; }
 .card h2 { font-size:.7rem; color:var(--text3); margin-bottom:10px; text-transform:uppercase; font-weight:600; letter-spacing:1px; }
 .log { background:var(--log-bg); border:1px solid var(--log-border); border-radius:8px; padding:12px; font-family:'SF Mono','Fira Code',monospace; font-size:.75rem; max-height:280px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; line-height:1.6; color:var(--log-text); }
@@ -207,19 +208,52 @@ let _activeTab=null;
 let _badRangesOpen=false;
 
 function renderBar(s,p){
-  /* Per-pass progress bar with bad-range overlay. Green fill = pass_progress_pct,
-     red ticks for each bad range at its LBA position. Ticks use min-width 0.3%
-     so single-sector bad regions are still visible on a 72GB UHD. */
-  let html='<div style="flex:1;background:var(--chip);border-radius:3px;height:6px;overflow:hidden;position:relative">';
-  html+='<div style="background:var(--green);height:100%;width:'+p+'%;transition:width 1s"></div>';
+  /* Two modes, one renderer:
+     - Pass 1 (sequential sweep, s.pass<=1): a genuine left-to-right progress
+       fill. x-axis = work done. Green grows to pass_progress_pct. Bad-range
+       ticks still overlay at their real LBA position so the operator sees
+       damage accumulating during the sweep.
+     - Pass 2-N (retry/patch, s.pass>1): a POSITIONAL disc map ("the disc,
+       coloured by status"). x-axis = DISC POSITION (0..bytes_total_disc), NOT
+       work done. The whole bar is the disc: GREEN everywhere it's good, RED
+       segments at each still-bad range's real offset. As patches recover
+       sectors, bad_ranges shrink and the red heals to green IN PLACE. A blue
+       PLAYHEAD marks the current read position (last_sector) and pulses so it
+       reads as "actively working here". */
   const total=s&&s.bytes_total_disc||0;
   const ranges=s&&s.bad_ranges||[];
+  const positional=!!(s&&s.pass>1);
+  let html='<div style="flex:1;background:var(--chip);border-radius:3px;height:6px;overflow:hidden;position:relative">';
+  if(positional){
+    /* Positional map: the entire bar is green (the whole disc, good), then
+       red bad ranges are punched in at their real offsets. If total is
+       unknown (0) we can't place anything positionally — fall back to a
+       neutral green fill so we never divide by zero. */
+    html+='<div style="position:absolute;left:0;top:0;width:100%;height:100%;background:var(--green)"></div>';
+  }else{
+    /* Sequential sweep: green grows with pass_progress_pct. */
+    html+='<div style="background:var(--green);height:100%;width:'+p+'%;transition:width 1s"></div>';
+  }
+  /* Red bad-range overlay (both modes). Drawn at each range's real LBA
+     position. min-width 0.5% keeps single-sector ranges visible on a 72GB
+     UHD; clamp left+width so a range near the tail never overflows the bar. */
   if(total>0&&ranges.length){
     ranges.forEach(r=>{
-      const offPct=(r.lba*2048)/total*100;
-      const wPct=Math.max((r.count*2048)/total*100,0.3);
-      html+='<div style="position:absolute;left:'+offPct+'%;top:0;width:'+wPct+'%;height:100%;background:var(--red);opacity:0.9"></div>';
+      let offPct=(r.lba*2048)/total*100;
+      if(offPct<0)offPct=0; if(offPct>100)offPct=100;
+      let wPct=Math.max((r.count*2048)/total*100,0.5);
+      if(offPct+wPct>100)wPct=100-offPct;
+      html+='<div style="position:absolute;left:'+offPct+'%;top:0;width:'+wPct+'%;height:100%;background:var(--red);opacity:0.9;transition:left 1s,width 1s"></div>';
     });
+  }
+  /* Playhead: current read position = last_sector / total-sectors. Only during
+     an active rip with a known position and a known total. Thin (2px), full
+     height, accent/blue, pulsing — answers "where are we trying right now". It
+     hops around the bad ranges as the patch works. */
+  if(total>0&&s&&s.status==='ripping'&&s.last_sector>0){
+    let phPct=(s.last_sector*2048)/total*100;
+    if(phPct<0)phPct=0; if(phPct>100)phPct=100;
+    html+='<div style="position:absolute;left:'+phPct+'%;top:0;width:2px;height:100%;margin-left:-1px;background:var(--blue);box-shadow:0 0 3px var(--blue);animation:ph 1.2s infinite;transition:left 1s"></div>';
   }
   html+='</div>';
   return html;
