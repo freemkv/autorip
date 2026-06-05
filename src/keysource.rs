@@ -15,7 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-use freemkv_keysources::{DiscInputs, KeySource, KeydbSource, MapfileSource, OnlineSource};
+use freemkv_keysources::{
+    DiscInputs, KeySource, KeydbSource, MapfileSource, MultiSource, OnlineSource,
+    read_sample_units, resolve_and_apply,
+};
 
 use crate::config::Config;
 
@@ -123,7 +126,7 @@ pub trait DiscKeyAccess {
 /// candidate / source is tried. `decrypt_with` only mutates the disc on success,
 /// so a rejected candidate leaves it untouched.
 pub fn resolve_keys<A: DiscKeyAccess>(
-    sources: &[Box<dyn KeySource>],
+    sources: Vec<Box<dyn KeySource>>,
     access: &mut A,
     mut disc: libfreemkv::Disc,
 ) -> (libfreemkv::Disc, KeyOutcome) {
@@ -134,7 +137,8 @@ pub fn resolve_keys<A: DiscKeyAccess>(
     let vid = access.volume_id().unwrap_or([0u8; 16]);
 
     // Read content samples only if some source validates against ciphertext
-    // (an online key service); a keydb / mapfile keys on identity alone.
+    // (an online key service); a keydb / mapfile keys on disc identity alone and
+    // the keydb's UK-first ordering already hands the terminal key out first.
     let need_samples = sources.iter().any(|s| s.needs_samples());
     let samples = if need_samples {
         match disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() {
@@ -159,92 +163,23 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         samples,
     };
 
-    let mut had_source_error = false;
-    for src in sources {
-        let cands = match src.resolve(&inputs) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(phase = "key_resolve", error = %e, "key source failed");
-                had_source_error = true;
-                continue;
-            }
-        };
-        for key in cands {
-            if disc.decrypt_with(key).is_ok() {
-                tracing::info!(phase = "key_resolve", "key resolved — disc now keyed");
-                return (disc, KeyOutcome::Resolved);
-            }
-        }
+    // One ordered driver, one shared loop: hand each source's candidates (one at
+    // a time) to `Disc::decrypt_with` — which validates and only keeps a key that
+    // decrypts — and stop at the first that takes.
+    let mut sources = MultiSource::new(sources);
+    if resolve_and_apply(&mut sources, &inputs, &mut disc) {
+        tracing::info!(phase = "key_resolve", "key resolved — disc now keyed");
+        return (disc, KeyOutcome::Resolved);
     }
 
-    // No candidate decrypted. A hard source error (e.g. an unreadable keydb)
-    // is reported distinctly from a clean "no key for this disc".
-    let outcome = if had_source_error {
+    // Every source exhausted with no key. A source that FAILED (an unreachable
+    // key service) is reported distinctly from a clean "no key for this disc".
+    let outcome = if sources.errored() {
         KeyOutcome::Unreachable
     } else {
         KeyOutcome::NoKey
     };
     (disc, outcome)
-}
-
-/// Read up to `n` ENCRYPTED 6144-byte aligned units from `title`'s main body,
-/// raw (no decrypt) — so a key service can byte-validate a key against them.
-///
-/// "Encrypted" is decided by `libfreemkv::aacs::is_aacs_scrambled` — the SAME
-/// function the key service uses to gate the request — so both ends agree. It
-/// reads the raw TS syncs: an AACS-scrambled unit's body packets have their
-/// `0x47` syncs destroyed, while a clear unit keeps them. A clip OPENS with
-/// clear navigation units (PAT/PMT, menus); only the feature body is scrambled.
-/// Handing a clear unit proves nothing (nothing to decrypt), so we collect only
-/// scrambled ones — sampling the LARGEST extent (the feature body) at depth:
-/// midpoint first, scanning forward.
-pub fn read_sample_units(
-    reader: &mut dyn libfreemkv::SectorSource,
-    title: &libfreemkv::DiscTitle,
-    n: usize,
-) -> Vec<Vec<u8>> {
-    const UNIT_LEN: usize = 6144;
-    const UNIT_SECTORS: u32 = 3; // 6144 / 2048
-    const CHUNK_UNITS: u32 = 15; // 45 sectors/read — under the drive transfer cap
-    const MAX_CHUNKS_PER_EXTENT: u32 = 4; // ~60 units scanned at each extent's midpoint
-
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    for ext in &title.extents {
-        let total_units = ext.sector_count / UNIT_SECTORS;
-        if total_units == 0 {
-            continue;
-        }
-        let mut unit = total_units / 2; // midpoint of this extent (past clear nav)
-        for _ in 0..MAX_CHUNKS_PER_EXTENT {
-            if unit >= total_units {
-                break;
-            }
-            let units_this = CHUNK_UNITS.min(total_units - unit);
-            let lba = ext.start_lba + unit * UNIT_SECTORS;
-            let count = (units_this * UNIT_SECTORS) as u16;
-            let mut buf = vec![0u8; count as usize * 2048];
-            // `false` = no recovery retries. The reader is the raw drive/file
-            // (no decrypt decorator), so these are the on-disc encrypted bytes.
-            if reader.read_sectors(lba, count, &mut buf, false).is_err() {
-                break;
-            }
-            for i in 0..units_this as usize {
-                let o = i * UNIT_LEN;
-                if o + UNIT_LEN > buf.len() {
-                    break;
-                }
-                let u = &buf[o..o + UNIT_LEN];
-                if libfreemkv::aacs::is_aacs_scrambled(u) {
-                    out.push(u.to_vec());
-                    if out.len() >= n {
-                        return out;
-                    }
-                }
-            }
-            unit += units_this;
-        }
-    }
-    out
 }
 
 /// [`DiscKeyAccess`] backed by a live optical drive. `vid` is the Volume ID

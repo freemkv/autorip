@@ -719,7 +719,7 @@ fn resolve_keys_from_iso(
     // mapfile via `IsoAccess`); a genuinely-unkeyed disc returns NoKey.
     let sources = crate::keysource::build_sources(cfg, Some(mapfile_path));
     let mut access = crate::keysource::IsoAccess::new(iso_path, mapfile_path);
-    crate::keysource::resolve_keys(&sources, &mut access, disc)
+    crate::keysource::resolve_keys(sources, &mut access, disc)
 }
 
 // Tests live in `tests/resume_remux.rs` (integration tests) — they

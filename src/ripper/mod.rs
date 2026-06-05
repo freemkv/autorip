@@ -65,7 +65,7 @@ fn resolve_keys_from_drive(
     let sources = crate::keysource::build_sources(cfg, None);
     let vid = disc.aacs.as_ref().map(|a| a.volume_id);
     let mut access = DriveAccess::new(drive, vid);
-    crate::keysource::resolve_keys(&sources, &mut access, disc)
+    crate::keysource::resolve_keys(sources, &mut access, disc)
 }
 
 /// Human-readable key readiness for the dashboard tile, decided at scan time.
