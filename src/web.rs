@@ -201,6 +201,10 @@ function ml(v,m){if(!v)return'';for(const[k,l]of m)if(v.includes(k))return l;ret
 const ACTIVE_STATES=['ripping','scanning','detecting','verifying'];
 let _lastStatus={};
 let _activeTab=null;
+/* Persisted across the ~1s data re-renders so the bad-range details stays
+   open if the user opened it (upd() swaps innerHTML, which would otherwise
+   collapse the native <details> every tick). Updated via its ontoggle. */
+let _badRangesOpen=false;
 
 function renderBar(s,p){
   /* Per-pass progress bar with bad-range overlay. Green fill = pass_progress_pct,
@@ -415,7 +419,7 @@ function renderBadRanges(s){
     rows+='<tr><td style="font-family:monospace;font-size:.75rem">'+r.lba.toLocaleString()+'</td><td style="font-size:.75rem">'+r.count+'</td><td style="font-size:.75rem">'+fmtMs(r.duration_ms)+'</td><td style="font-size:.75rem;color:var(--text3)">'+loc+'</td></tr>';
   });
   if(truncated>0)rows+='<tr><td colspan="4" style="font-size:.75rem;color:var(--text3);padding-top:6px">\u2026 +'+truncated+' smaller</td></tr>';
-  return '<div class="card"><details><summary style="cursor:pointer;font-size:.85rem"><strong>'+summary+'</strong></summary><table style="width:100%;margin-top:8px;border-collapse:collapse"><thead><tr style="color:var(--text3);font-size:.7rem;text-align:left;text-transform:uppercase"><th>LBA</th><th>Sectors</th><th>Duration</th><th>Location</th></tr></thead><tbody>'+rows+'</tbody></table></details></div>';
+  return '<div class="card"><details'+(_badRangesOpen?' open':'')+' ontoggle="_badRangesOpen=this.open"><summary style="cursor:pointer;font-size:.85rem"><strong>'+summary+'</strong></summary><table style="width:100%;margin-top:8px;border-collapse:collapse"><thead><tr style="color:var(--text3);font-size:.7rem;text-align:left;text-transform:uppercase"><th>LBA</th><th>Sectors</th><th>Duration</th><th>Location</th></tr></thead><tbody>'+rows+'</tbody></table></details></div>';
 }
 
 /* ---- Build steps from state ---- */
@@ -575,47 +579,11 @@ function renderCurrent(){
   let errHtml='';
   if(s.errors>0&&s.last_error){
     errHtml='<div style="background:var(--red);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u26a0 '+esc(s.last_error)+'</div>';
-  }else if(s.errors>0){
-    const errMb=(s.errors*2048/1048576).toFixed(1);
-    /* Prefer server-computed lost_video_secs (uses actual title bitrate).
-       Fall back to the old BD-sustained constant only if missing. */
-    const lostSecs=(typeof s.lost_video_secs==='number'&&s.lost_video_secs>=0)?s.lost_video_secs:(s.errors*2048/8250000);
-   const lostStr=lostSecs<1?(lostSecs*1000).toFixed(0)+' ms':lostSecs.toFixed(2)+' s';
-    /* Display model (2026-05-11 design call): bytes are Good or Maybe
-       UNTIL all retry passes complete. The "lost forever" (Cosmetic)
-       label only applies AFTER the end-of-recovery promotion fires —
-       which the autorip orchestrator does post-final-pass. So:
-        - DURING a rip (status=ripping/scanning AND pass < total_passes):
-          combine total_lost_ms + total_maybe_ms into one "at risk"
-          number — even if mapfile has some Unreadable bytes from
-          legacy code, we keep hope until passes are exhausted.
-        - AFTER all retries: total_maybe_ms should be 0 post-promotion;
-          show total_lost_ms as "lost" only.
-       Both fields are in milliseconds. */
-    const fmtTime=(ms)=>{
-      const sec=ms/1000;
-      return sec<1?Math.round(ms)+' ms':sec.toFixed(2)+' s';
-    };
-    const lostMs=(typeof s.total_lost_ms==='number')?s.total_lost_ms:0;
-    const maybeMs=(typeof s.total_maybe_ms==='number')?s.total_maybe_ms:0;
-    const totalPasses=(typeof s.total_passes==='number')?s.total_passes:0;
-    const curPass=(typeof s.pass==='number')?s.pass:0;
-    const inRetryPhase=(s.status==='ripping'||s.status==='scanning')
-                      &&(totalPasses===0||curPass<totalPasses);
-    let detailStr='';
-    if(lostMs>0||maybeMs>0){
-      if(inRetryPhase){
-        const atRisk=lostMs+maybeMs;
-        if(atRisk>0)detailStr=' — '+fmtTime(atRisk)+' at risk';
-      }else{
-        const parts=[];
-        if(lostMs>0)parts.push(fmtTime(lostMs)+' lost');
-        if(maybeMs>0)parts.push(fmtTime(maybeMs)+' at risk');
-        if(parts.length>0)detailStr=' — '+parts.join(', ');
-      }
-    }
-    errHtml+='<div style="background:var(--yellow);color:#000;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">'+s.errors+' sector'+(s.errors>1?'s':'')+' skipped ('+errMb+' MB)'+detailStr+'</div>';
   }
+  /* The old "N sectors skipped (X MB) — Y at risk" yellow box was removed
+     (2026-06-05): it duplicated the Good/Maybe/No-chance pills (which already
+     show the byte + time breakdown) and the bad-range bar (which shows where
+     the damage is). The red banner above still surfaces a real last_error. */
   /* Adaptive batch recovery state \u2014 only during an active rip.
      current_batch < preferred_batch means the library shrunk the read size
      after a failure and is working through a marginal zone. Show a blue
