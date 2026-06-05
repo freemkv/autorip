@@ -30,7 +30,7 @@ pub use session::{
     spawn_rip_thread, take_rip_thread, unregister_halt,
 };
 #[allow(unused_imports)]
-pub use state::{BadRange, RipState, STATE, is_busy, set_stop_cooldown, update_state};
+pub use state::{BadRange, Resumable, RipState, STATE, is_busy, set_stop_cooldown, update_state};
 
 // Internal-use imports for the orchestrator code that lives in this
 // file. Sub-module-private helpers (`pub(super)`) are reachable from
@@ -725,6 +725,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         None => ("idle".to_string(), String::new(), None),
     };
 
+    // Does this disc have resumable partial staging? Drives the dashboard's
+    // Resume-vs-Rip choice. Computed before `display_name` moves into the state.
+    let resumable = resumable_for_disc(&cfg_read, &display_name);
+
     update_state(
         device,
         RipState {
@@ -748,6 +752,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             last_error: last_error_str,
             failure_reason: failure_field,
             key_status,
+            resumable,
             ..Default::default()
         },
     );
@@ -793,36 +798,46 @@ pub fn handle_rip_request(
     }
     match mode {
         crate::web::ResumeMode::Require => {
-            match find_resumable_for_disc(cfg, device) {
-                Some(class) => {
-                    crate::log::device_log(device, "Resume requested: re-muxing existing ISO");
-                    resume::resume_remux(cfg, device, class);
-                    drop_session(device);
-                }
-                None => {
-                    crate::log::device_log(
-                        device,
-                        "Resume requested but no resumable staging state found for this disc",
-                    );
-                    update_state(
-                        device,
-                        RipState {
-                            device: device.to_string(),
-                            status: "error".to_string(),
-                            last_error: "Resume requested but no resumable staging state found for this disc".to_string(),
-                            ..Default::default()
-                        },
-                    );
-                    drop_session(device);
-                }
+            if let Some(class) = find_resumable_for_disc(cfg, device) {
+                // Sweep already complete — just re-mux the staged ISO, no
+                // disc reads.
+                crate::log::device_log(device, "Resume requested: re-muxing existing ISO");
+                resume::resume_remux(cfg, device, class);
+                drop_session(device);
+            } else if resumable_for_device(cfg, device) == Some(Resumable::Sweep) {
+                // Partial sweep — continue Pass 1 from the mapfile, reading
+                // only the missing (NonTrimmed / non-tried) ranges instead of
+                // re-reading the whole disc.
+                crate::log::device_log(
+                    device,
+                    "Resume requested: continuing partial sweep from mapfile",
+                );
+                rip_disc(cfg, device, device_path, true);
+            } else {
+                crate::log::device_log(
+                    device,
+                    "Resume requested but no resumable staging state found for this disc",
+                );
+                update_state(
+                    device,
+                    RipState {
+                        device: device.to_string(),
+                        status: "error".to_string(),
+                        last_error:
+                            "Resume requested but no resumable staging state found for this disc"
+                                .to_string(),
+                        ..Default::default()
+                    },
+                );
+                drop_session(device);
             }
         }
         crate::web::ResumeMode::Wipe => {
             wipe_staging_for_disc(cfg, device);
-            rip_disc(cfg, device, device_path);
+            rip_disc(cfg, device, device_path, false);
         }
         crate::web::ResumeMode::Default => {
-            rip_disc(cfg, device, device_path);
+            rip_disc(cfg, device, device_path, false);
         }
     }
 }
@@ -927,9 +942,67 @@ fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
     }
 }
 
+/// Detect whether `display_name`'s disc has resumable staging state and of
+/// what kind. Mirrors `find_resumable_for_disc`'s directory matching but
+/// classifies by `bytes_pending` rather than only accepting complete ISOs:
+/// `bytes_pending == 0` → [`Resumable::Remux`], `> 0` → [`Resumable::Sweep`].
+/// Pure (no STATE, no side effects); used by both the scan-time detector and
+/// the `?resume=yes` action.
+fn resumable_for_disc(cfg: &Config, display_name: &str) -> Option<Resumable> {
+    if display_name.is_empty() {
+        return None;
+    }
+    let sanitized = crate::util::sanitize_path_compact(display_name);
+    let entries = std::fs::read_dir(&cfg.staging_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let basename = match path.file_name() {
+            Some(n) => n.to_string_lossy().into_owned(),
+            None => continue,
+        };
+        if !(basename == sanitized
+            || basename.starts_with(&sanitized)
+            || sanitized.starts_with(&basename))
+        {
+            continue;
+        }
+        let (_iso_path, mapfile_path) = match resume::find_iso_and_mapfile(&path) {
+            Some(p) => p,
+            None => continue,
+        };
+        let map = match libfreemkv::disc::mapfile::Mapfile::load(&mapfile_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        return Some(if map.stats().bytes_pending == 0 {
+            Resumable::Remux
+        } else {
+            Resumable::Sweep
+        });
+    }
+    None
+}
+
+/// STATE-reading wrapper of [`resumable_for_disc`] used by the `?resume=yes`
+/// action (the disc has been scanned, so its name is in STATE).
+fn resumable_for_device(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<Resumable> {
+    let cfg_read = cfg.read().ok()?.clone();
+    let display_name = STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.get(device).map(|rs| rs.disc_name.clone()))?;
+    resumable_for_disc(&cfg_read, &display_name)
+}
+
 /// Rip a disc. Reuses the existing drive session from scan_disc.
 /// If no session exists, opens fresh (for on_insert=rip).
-pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
+///
+/// `resume_sweep` continues an existing partial sweep: when true, Pass 1's
+/// first attempt runs with libfreemkv `SweepOptions.resume = true`, so the
+/// existing ISO + mapfile are kept and only the missing (NonTrimmed /
+/// non-tried) ranges are read. When false, Pass 1 starts fresh (the mapfile
+/// is recreated and the ISO truncated) — the classic full sweep.
+pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resume_sweep: bool) {
     // The poll-loop spawn site already registered a fresh `Halt` for
     // this device (so an HTTP stop during scan has something to flip).
     // Replace it with a Halt backed by the drive's halt-flag once the
@@ -1659,9 +1732,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             // mapfile state continues where the bridge crash left it
             // (matches the pre-existing implicit resume behaviour: the
             // first attempt is fresh and each retry resumes from mapfile).
+            //
+            // `resume_sweep` (user clicked Resume on a partial) makes even the
+            // FIRST attempt resume from the existing mapfile + ISO, so the
+            // ~40 GB already swept isn't re-read off the disc.
             let sweep_opts = libfreemkv::SweepOptions {
                 decrypt: false,
-                resume: attempt > 1,
+                resume: resume_sweep || attempt > 1,
                 batch_sectors: None,
                 skip_on_error: true,
                 progress: Some(&pass1_progress),

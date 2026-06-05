@@ -19,6 +19,21 @@ pub struct BadRange {
     pub time_offset_secs: Option<f64>,
 }
 
+/// Whether — and how — a disc's partial staging state can be resumed. Set on
+/// [`RipState::resumable`] at scan time and rendered by the dashboard as a
+/// Resume button. Serializes to a lowercase tag (`"remux"` / `"sweep"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Resumable {
+    /// Sweep finished (no bytes pending) but the final MKV is missing — Resume
+    /// just re-muxes the staged ISO (no disc reads).
+    Remux,
+    /// Partial sweep: the mapfile still has pending (NonTrimmed / non-tried)
+    /// bytes. Resume continues Pass 1 from the mapfile, reading only the
+    /// missing ranges.
+    Sweep,
+}
+
 /// State broadcast for web UI.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RipState {
@@ -139,6 +154,13 @@ pub struct RipState {
     /// Key readiness determined at scan time, for the dashboard tile:
     /// "Ready to rip", "Missing keys — <reason>", or "" (unknown).
     pub key_status: String,
+
+    /// Resume affordance computed at scan time. `None` when there's no
+    /// resumable staging for this disc (Rip only); `Some(_)` makes the
+    /// dashboard show a Resume button alongside Rip. Omitted from the JSON
+    /// when `None` so older dashboards don't see a stray field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumable: Option<Resumable>,
 }
 
 impl Default for RipState {
@@ -187,6 +209,7 @@ impl Default for RipState {
             failure_reason: None,
             started_epoch_secs: 0,
             key_status: String::new(),
+            resumable: None,
         }
     }
 }

@@ -539,8 +539,16 @@ function renderCurrent(){
     const notReady=(s.key_status||'').indexOf('Missing')===0;
     if(notReady){
       btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan again</button>';
+    }else if(s.resumable){
+      /* A resumable partial exists for this disc. Resume (accent) continues
+         where the last rip left off — for "sweep" it reads only the missing
+         ranges off the disc, for "remux" it just re-muxes the staged ISO.
+         Rip (green) means START OVER: it wipes the partial first, so confirm. */
+      const rl=s.resumable==='remux'?'Resume (re-mux)':'Resume';
+      btns='<button class="btn" style="background:var(--accent);color:#fff;border-color:var(--accent)" onclick="fetch(\'/api/rip/'+dev+'?resume=yes\',{method:\'POST\'})">'+rl+'</button>';
+      btns+='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="if(confirm(\'Start over from scratch? This discards the resumable partial for this disc.\')){fetch(\'/api/rip/'+dev+'?resume=no\',{method:\'POST\'})}">Rip</button>';
     }else{
-      btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="fetch(\'/api/rip/'+dev+'\',{method:\'POST\'})">Rip</button>';
+      btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="fetch(\'/api/rip/'+dev+'?resume=no\',{method:\'POST\'})">Rip</button>';
     }
     btns+='<button class="btn" onclick="fetch(\'/api/verify/'+dev+'\',{method:\'POST\'})">Verify</button>';
   }else if(discIn){
