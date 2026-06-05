@@ -44,13 +44,3 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-
-# ─── DEV-ONLY LOCAL PATCH — DO NOT COMMIT/PUSH ───────────────────────────────
-# autorip's CI builds dependencies from crates.io. libfreemkv 0.27.5 and
-# freemkv-keysources are not published yet, so this points them at the local
-# working copies for development + testing of the 0.27.5 keydb-decoupling.
-# Before release: publish in order (libfreemkv → freemkv-keysources → … →
-# autorip) and DELETE this section. Pushing it would break CI.
-[patch.crates-io]
-libfreemkv = { path = "../libfreemkv" }
-freemkv-keysources = { path = "../freemkv-keysources" }
