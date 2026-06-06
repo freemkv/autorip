@@ -81,6 +81,12 @@ enum MoveOutcome {
     /// move + source unlink. Caller leaves the staging dir alone — the
     /// dst is the broken copy, src is the source of truth.
     SizeMismatch,
+    /// Destination already exists as a DIFFERENT file (present, non-empty, and a
+    /// different size than src). A wrong title match can resolve two distinct
+    /// discs to the same `Title (Year)/Title (Year).ext` path; overwriting would
+    /// destroy a good prior rip. We refuse the move, leave the new file in
+    /// staging, and surface a collision error for the operator to resolve.
+    Collision,
 }
 
 /// 0.20.8 validation-audit fix #3 (revised v0.25.3): errors from the
@@ -488,9 +494,29 @@ fn check_and_move(cfg: &Config) {
                     });
                 }
             };
+            // Overwrite guard (0.30.1): never clobber an existing destination
+            // that is a DIFFERENT file. A wrong TMDB match can route two discs
+            // to the same name; overwriting would destroy a good prior rip.
+            // Same-size dest is the idempotent re-move case, handled inside
+            // move_file (Skipped) — only a present, non-empty, DIFFERENT-size
+            // dest is treated as a collision. The new file stays in staging.
+            if let (Ok(s), Ok(d)) = (std::fs::metadata(src), std::fs::metadata(Path::new(dest))) {
+                if s.is_file() && d.is_file() && d.len() > 0 && s.len() != d.len() {
+                    crate::log::syslog(&format!(
+                        "Move blocked (destination exists, different size): {} ({} B) vs existing {} ({} B)",
+                        src.display(),
+                        s.len(),
+                        dest,
+                        d.len()
+                    ));
+                    outcomes.push(MoveOutcome::Collision);
+                    continue;
+                }
+            }
             let outcome = move_file(src, Path::new(dest), &on_progress);
             outcomes.push(outcome);
             match outcome {
+                MoveOutcome::Collision => {}
                 MoveOutcome::Skipped => {
                     // Quiet — already moved on a prior tick; no log noise.
                 }
@@ -531,6 +557,7 @@ fn check_and_move(cfg: &Config) {
             }
         }
 
+        let any_collision = outcomes.iter().any(|o| matches!(o, MoveOutcome::Collision));
         let any_failed = outcomes.iter().any(|o| matches!(o, MoveOutcome::Failed));
         let any_size_mismatch = outcomes
             .iter()
@@ -550,6 +577,15 @@ fn check_and_move(cfg: &Config) {
         // (one Failed, one SizeMismatch) still surfaces the more
         // diagnostic message — both lead to "leave dir alone, retry
         // next tick", so ordering only affects the surfaced reason.
+        if any_collision {
+            record_error(
+                &dir_str,
+                "destination already exists as a different file — not overwriting",
+                "likely a wrong title match (two discs resolving to the same name). Verify/rename the existing library file, or correct the title, then re-run; the new rip is preserved in staging.",
+            );
+            continue;
+        }
+
         if any_size_mismatch {
             record_error(
                 &dir_str,

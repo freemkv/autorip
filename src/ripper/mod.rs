@@ -3034,8 +3034,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // In multipass mode the `input.errors` counter above counts ISO→MKV demux
     // skips (usually zero — ISO reads don't fail). The real bad-sector count
     // lives in the mapfile sidecar. Prefer that when present.
-    let mut final_num_bad_ranges: u32 = 0;
-    let mut final_largest_gap_ms: f64 = 0.0;
     if cfg_read.max_retries > 0 {
         let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
         let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
@@ -3054,19 +3052,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             } else {
                 0.0
             };
-            use libfreemkv::disc::mapfile::SectorStatus;
-            let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
-            final_num_bad_ranges = bad_ranges.len() as u32;
-            final_largest_gap_ms = bad_ranges
-                .iter()
-                .map(|(_, size)| {
-                    if title_bytes_per_sec > 0.0 {
-                        *size as f64 / title_bytes_per_sec * 1000.0
-                    } else {
-                        0.0
-                    }
-                })
-                .fold(0.0f64, f64::max);
         }
     }
 
@@ -3090,22 +3075,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         crate::log::device_log(device, &format!("Mux failed: {reason}"));
     }
 
-    // Write a history record for every rip attempt — completed OR stopped.
-    // Stopped rips used to leave no persistent trace except the device log,
-    // which gets clobbered on the next scan. Include errors/lost/last_sector
-    // so damaged-disc attempts are auditable.
-    //
-    // 0.20.8 status labels:
-    //   - `completed=true`                                → "complete"
-    //   - `finalize_error.is_some()` (broken MKV)         → "failed"
-    //   - else (halt / timeout / write error / wedge)     → "stopped"
-    let status_label = if completed {
-        "complete"
-    } else if finalize_error.is_some() {
-        "failed"
-    } else {
-        "stopped"
-    };
+    // Write the staging markers (.done / .completed / .failed) the mover and the
+    // resume-on-startup detector depend on. (The per-rip history record/log that
+    // used to be written here was removed in 0.30.1 — the History tab was
+    // unmaintained and didn't work; see web.rs.)
     {
         let marker = serde_json::json!({
             "title": display_name,
@@ -3157,25 +3130,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             );
             staging::clear_restart_count(staging_disc_path);
         }
-
-        let mut entry = marker.clone();
-        entry["status"] = serde_json::json!(status_label);
-        entry["staging_dir"] = serde_json::json!(staging);
-        entry["size_gb"] =
-            serde_json::json!((bytes_done as f64 / 1_073_741_824.0 * 10.0).round() / 10.0);
-        entry["speed_mbs"] = serde_json::json!((speed * 10.0).round() / 10.0);
-        entry["elapsed_secs"] = serde_json::json!(elapsed.round() as u64);
-        entry["duration"] = serde_json::json!(duration);
-        entry["codecs"] = serde_json::json!(codecs);
-        entry["device"] = serde_json::json!(device);
-        entry["errors"] = serde_json::json!(final_errors);
-        entry["lost_video_secs"] = serde_json::json!((final_lost_secs * 1000.0).round() / 1000.0);
-        entry["last_sector"] = serde_json::json!(final_last_sector);
-        entry["num_bad_ranges"] = serde_json::json!(final_num_bad_ranges);
-        entry["largest_gap_ms"] = serde_json::json!(final_largest_gap_ms.round());
-        let log_lines = crate::log::get_device_log(device, 2000);
-        entry["log"] = serde_json::json!(log_lines.join("\n"));
-        crate::history::record(&cfg_read.history_dir(), &entry);
     }
 
     if !completed {

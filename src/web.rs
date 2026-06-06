@@ -1,5 +1,4 @@
 use crate::config::{self, Config};
-use crate::history;
 use crate::ripper;
 use once_cell::sync::Lazy;
 use std::io::{Read as _, Write as _};
@@ -108,7 +107,6 @@ tr:hover { background:var(--chip); }
 <div class="headerbar">
   <span style="font-size:1.1rem;color:var(--text3);font-weight:400;letter-spacing:3px;text-transform:uppercase">AUTORIP</span>
   <button class="nav active" data-tab="ripper">Ripper</button>
-  <button class="nav" data-tab="history">History</button>
   <button class="nav" data-tab="system">System</button>
   <button class="nav" data-tab="settings">Settings</button>
   <button class="btn" style="margin-left:auto" onclick="toggleTheme()" id="thm"></button>
@@ -124,11 +122,6 @@ tr:hover { background:var(--chip); }
   <div id="bad-ranges"></div>
   <details style="margin-top:16px"><summary style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;cursor:pointer;user-select:none">Log</summary>
   <div id="log" class="log" style="flex:1;max-height:none;margin-top:8px"></div></details>
-</div>
-
-<!-- History page -->
-<div id="history" class="section">
-  <div id="hi" style="margin-top:16px"></div>
 </div>
 
 <!-- System page -->
@@ -175,7 +168,6 @@ document.querySelectorAll('.nav[data-tab]').forEach(btn=>{
     document.getElementById(tab).classList.add('active');
     document.querySelectorAll('.nav[data-tab]').forEach(b=>b.classList.remove('active'));
     this.classList.add('active');
-    if(tab==='history')loadHistory();
     if(tab==='system')loadSystem();
     if(tab==='settings')loadSettings();
   });
@@ -732,10 +724,7 @@ function connectSSE(){
   _es.onerror=function(){_es.close();_es=null;setTimeout(connectSSE,2000)};
 }
 
-/* ---- History page ---- */
-function fmtElapsed(s){if(!s)return'';s=+s;const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h>0?h+'h '+m+'m':m+'m'}
-/* Includes seconds — for live-counter use; fmtElapsed is for static
-   minute-resolution rendering (history list). */
+/* Live rip-elapsed counter (seconds resolution). */
 function fmtElapsedSecs(s){if(!s||s<0)return'';s=+s;const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return h>0?h+'h '+String(m).padStart(2,'0')+'m '+String(sec).padStart(2,'0')+'s':m+'m '+String(sec).padStart(2,'0')+'s'}
 /* v0.25.7: tick the rip-elapsed counter every 1s. Reads each
    rip-elapsed-* span's data-started attribute (set by renderCurrent
@@ -749,41 +738,6 @@ setInterval(()=>{
     else{el.textContent=''}
   });
 },1000);
-function loadHistory(){
-  fetch('/api/history').then(r=>r.json()).then(h=>{
-    if(!h.length){document.getElementById('hi').innerHTML='<div style="color:var(--text2);font-size:.85rem;padding:20px">No rips yet</div>';return}
-    let html='';
-    h.forEach((i,idx)=>{
-      const title=i.title||i.disc_name||'Unknown';
-      const fmt=(i.format||'').toLowerCase();
-      const badge=fmt&&fmt!=='unknown'?'<span class="b '+fmt+'">'+fmt.toUpperCase()+'</span>':'';
-      const dt=(i.date||'').split('T')[0];
-      const poster=i.poster_url?'<img src="'+esc(i.poster_url)+'" style="width:48px;height:72px;border-radius:6px;object-fit:cover;flex-shrink:0" alt="">':'<div style="width:48px;height:72px;border-radius:6px;background:var(--chip);flex-shrink:0"></div>';
-      const elapsed=fmtElapsed(i.elapsed_secs);
-      const size=i.size_gb?(+i.size_gb).toFixed(1)+' GB':'';
-      const speed=i.speed_mbs?(+i.speed_mbs).toFixed(0)+' MB/s':'';
-      const stats=[size,elapsed,speed].filter(x=>x).join(' \u00b7 ');
-      const codecs=i.codecs||'';
-      const dur=i.duration||'';
-      const hasLog=!!i.log;
-
-      html+='<div style="display:flex;gap:14px;padding:14px 0;border-bottom:1px solid var(--border);align-items:flex-start">';
-      html+=poster;
-      html+='<div style="flex:1;min-width:0">';
-      html+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><strong style="font-size:.9rem">'+esc(title)+'</strong>'+badge+'</div>';
-      html+='<div style="font-size:.75rem;color:var(--text3);margin-top:3px">'+esc(dt);
-      if(dur)html+=' \u00b7 '+esc(dur);
-      html+='</div>';
-      if(stats)html+='<div style="font-size:.75rem;color:var(--text2);margin-top:2px">'+esc(stats)+'</div>';
-      if(codecs)html+='<div style="font-size:.7rem;color:var(--text3);margin-top:2px">'+esc(codecs)+'</div>';
-      if(hasLog)html+='<details style="margin-top:6px"><summary style="font-size:.7rem;color:var(--text3);cursor:pointer;user-select:none">Log</summary><div class="log" style="margin-top:4px;max-height:none;font-size:.7rem">'+esc(i.log)+'</div></details>';
-      html+='</div></div>';
-    });
-    document.getElementById('hi').innerHTML=html;
-  }).catch(()=>{
-    document.getElementById('hi').innerHTML='<div style="color:var(--text2);font-size:.85rem;padding:20px">Could not load history</div>';
-  });
-}
 
 function updateKeydb(stId){
   /* stId lets the same handler back both the System-page Data Files
@@ -1169,14 +1123,6 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             200,
             &format!("{{\"version\":\"{}\"}}", env!("CARGO_PKG_VERSION")),
         );
-    } else if is_get && url == "/api/history" {
-        let history_dir = cfg.read().map(|c| c.history_dir()).unwrap_or_default();
-        let items = history::load_recent(&history_dir, 50);
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        json_response(request, 200, &json);
-    } else if is_get && url.starts_with("/api/history/") {
-        let fname = url.trim_start_matches("/api/history/");
-        handle_history_file(request, cfg, fname);
     } else if is_get && url == "/api/settings" {
         let c = match cfg.read() {
             Ok(c) => c,
@@ -1348,33 +1294,6 @@ fn get_state_json() -> String {
         obj["_verify"] = serde_json::to_value(&vs).unwrap_or_default();
     }
     obj.to_string()
-}
-
-fn handle_history_file(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, fname: &str) {
-    let fname = percent_decode(fname);
-    // Only allow safe filenames
-    if !fname.ends_with(".json") || fname.contains("..") || fname.contains('/') {
-        json_response(request, 400, r#"{"error":"invalid filename"}"#);
-        return;
-    }
-    let history_dir = cfg.read().map(|c| c.history_dir()).unwrap_or_default();
-    let path = format!("{}/{}", history_dir, fname);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let header =
-                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-            let disp = format!("attachment; filename=\"{}\"", fname);
-            let disp_header =
-                Header::from_bytes(&b"Content-Disposition"[..], disp.as_bytes()).unwrap();
-            let response = Response::from_string(content)
-                .with_header(header)
-                .with_header(disp_header);
-            let _ = request.respond(response);
-        }
-        Err(_) => {
-            json_response(request, 404, r#"{"error":"not found"}"#);
-        }
-    }
 }
 
 fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {

@@ -19,7 +19,6 @@ use std::sync::atomic::AtomicBool;
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 pub mod config;
-pub mod history;
 pub mod keysource;
 pub mod log;
 pub mod mover;

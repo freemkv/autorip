@@ -1,5 +1,4 @@
 mod config;
-mod history;
 mod keysource;
 mod log;
 mod mover;
@@ -382,7 +381,7 @@ fn run_bootstrap() {
     let rip_user = std::env::var("RIP_USER").unwrap_or_else(|_| "autorip".to_string());
 
     // Working directories
-    for sub in ["logs", "freemkv", "history"] {
+    for sub in ["logs", "freemkv"] {
         let p = format!("{autorip_dir}/{sub}");
         if let Err(e) = std::fs::create_dir_all(&p) {
             eprintln!("bootstrap: mkdir {p}: {e}");

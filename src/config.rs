@@ -132,9 +132,6 @@ impl Config {
     pub fn staging_device_dir(&self, device: &str) -> String {
         format!("{}/{}", self.staging_dir, device)
     }
-    pub fn history_dir(&self) -> String {
-        format!("{}/history", self.autorip_dir)
-    }
     pub fn log_dir(&self) -> String {
         format!("{}/logs", self.autorip_dir)
     }
