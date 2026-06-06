@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.29.0 (2026-06-06)
+
+### Fixed
+
+- **Output folder now includes the release year again.** TMDB lookup picked the
+  first multi-search hit, which could be a person/collection or a dateless
+  entry — yielding `year=0` and a year-less folder (e.g. Dune Part Two). It now
+  skips person/collection/dateless results and prefers the best dated movie/tv
+  match by popularity.
+
+### Changed
+
+- Key resolution flows through the shared, content-validated `MultiSource`
+  loop (one candidate key tried at a time, UK-first), via libfreemkv 0.29 +
+  freemkv-keysources 0.29 — so the muxed audio/video is the same fix that
+  corrects B-frame presentation timecodes across the toolchain.
+- Pass 2-N progress is shown as a positional disc-map with a read playhead.
+
 ## 0.26.1 (2026-05-22)
 
 ### Changed
