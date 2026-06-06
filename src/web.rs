@@ -57,8 +57,8 @@ body { font-family:-apple-system,system-ui,"Segoe UI",Roboto,sans-serif; backgro
 .nav { text-decoration:none; font-size:.85rem; color:var(--text3); padding:4px 0; border-bottom:2px solid transparent; cursor:pointer; background:none; border-top:none; border-left:none; border-right:none; }
 .nav:hover { color:var(--text); } .nav.active { color:var(--text); border-bottom-color:var(--accent); font-weight:500; }
 /* Now Playing card */
-.np { display:flex; gap:20px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; margin-bottom:16px; min-height:180px; }
-.poster { width:120px; min-height:170px; border-radius:8px; background:var(--poster-bg); flex-shrink:0; object-fit:cover; box-shadow:0 2px 8px rgba(0,0,0,.1); }
+.np { display:flex; align-items:flex-start; gap:20px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; margin-bottom:16px; min-height:180px; }
+.poster { width:120px; height:180px; border-radius:8px; background:var(--poster-bg); flex-shrink:0; align-self:flex-start; object-fit:cover; box-shadow:0 2px 8px rgba(0,0,0,.1); }
 .ph { width:120px; min-height:170px; border-radius:8px; background:var(--poster-bg); flex-shrink:0; display:flex; align-items:center; justify-content:center; }
 .ph svg { width:40px; height:40px; opacity:.4; }
 .nfo { flex:1; display:flex; flex-direction:column; justify-content:center; }
@@ -550,9 +550,11 @@ function renderCurrent(){
     /* Before ripping (idle), let the operator correct the matched title:
        search TMDB and pick — the choice overrides the auto-match for this rip. */
     const editable=s.status==='idle';
-    const editBtn=editable?' <button class="btn" style="padding:1px 7px;font-size:.7rem;vertical-align:middle" onclick="titleEdit(\''+dev+'\')">✎ change</button>':'';
+    /* ✎ change sits in a fixed row ABOVE the title (not appended to it, where it
+       shifted with title length). */
+    const editRow=editable?'<div style="margin-bottom:6px"><button class="btn" style="padding:1px 7px;font-size:.7rem" onclick="titleEdit(\''+dev+'\')">✎ change</button></div>':'';
     const editBox=editable?'<div id="tedit-'+dev+'" style="display:none;margin-top:8px"></div>':'';
-    card='<div class="np">'+img+'<div class="nfo"><div class="mt">'+esc(title)+editBtn+'</div><div class="my">'+yr+dur+' '+b+'</div>'+o+codecs+ready+editBox+'</div></div>';
+    card='<div class="np">'+img+'<div class="nfo">'+editRow+'<div class="mt">'+esc(title)+'</div><div class="my">'+yr+dur+' '+b+'</div>'+o+codecs+ready+editBox+'</div></div>';
   }
   upd('np',card);
 
