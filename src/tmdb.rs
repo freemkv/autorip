@@ -20,7 +20,25 @@ pub fn lookup(query: &str, api_key: &str) -> Option<TmdbResult> {
 
     let resp: serde_json::Value = ureq::get(&url).call().ok()?.into_json().ok()?;
     let results = resp["results"].as_array()?;
-    pick_best(results)
+    pick_best(query, results)
+}
+
+/// Normalize a title for comparison: lowercase, every run of non-alphanumerics
+/// collapses to one space, trimmed. So "Top Gun: Maverick" and the disc label
+/// "Top Gun Maverick" both become "top gun maverick".
+fn norm(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut sep = true; // leading: suppress a leading space
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            sep = false;
+        } else if !sep {
+            out.push(' ');
+            sep = true;
+        }
+    }
+    out.trim_end().to_string()
 }
 
 /// Choose the best entry from a TMDB `search/multi` response.
@@ -34,27 +52,40 @@ pub fn lookup(query: &str, api_key: &str) -> Option<TmdbResult> {
 ///
 /// We keep only movie/TV entries, prefer ones that actually carry a
 /// release year, and break ties on TMDB popularity.
-fn pick_best(results: &[serde_json::Value]) -> Option<TmdbResult> {
-    let mut best: Option<(TmdbResult, f64)> = None;
+fn pick_best(query: &str, results: &[serde_json::Value]) -> Option<TmdbResult> {
+    let want = norm(query);
+    // (result, popularity, exact). `exact` = the candidate's title matches the
+    // disc label exactly (normalized) AND it has a year. An exact dated match
+    // beats popularity — without this, a generic disc label like "Civil War"
+    // matches the most POPULAR "Civil War" (Captain America: Civil War, 2016)
+    // instead of the actual disc (the 2024 film whose title IS exactly "Civil
+    // War"). Same class as "Top Gun Maverick" vs the more popular "Top Gun".
+    let mut best: Option<(TmdbResult, f64, bool)> = None;
     for v in results {
         let Some((cand, popularity)) = parse_result(v) else {
             continue;
         };
+        let exact = cand.year > 0 && !want.is_empty() && norm(&cand.title) == want;
         let better = match &best {
             None => true,
-            Some((cur, cur_pop)) => match (cand.year > 0, cur.year > 0) {
-                // A dated result always beats an undated one; among
-                // results of equal dated-ness, higher popularity wins.
+            Some((cur, cur_pop, cur_exact)) => match (exact, *cur_exact) {
+                // An exact dated-title match wins over any non-exact result.
                 (true, false) => true,
                 (false, true) => false,
-                _ => popularity > *cur_pop,
+                // Otherwise: a dated result beats an undated one; among results
+                // of equal dated-ness (and equal exactness), popularity wins.
+                _ => match (cand.year > 0, cur.year > 0) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    _ => popularity > *cur_pop,
+                },
             },
         };
         if better {
-            best = Some((cand, popularity));
+            best = Some((cand, popularity, exact));
         }
     }
-    best.map(|(r, _)| r)
+    best.map(|(r, _, _)| r)
 }
 
 /// Parse one `search/multi` result into a `TmdbResult` + its popularity.
@@ -221,7 +252,7 @@ mod tests {
             {"media_type": "movie", "title": "Dune: Part Two",
              "release_date": "2024-02-27", "popularity": 120.0}
         ]);
-        let r = pick_best(results.as_array().unwrap()).expect("must pick the film");
+        let r = pick_best("", results.as_array().unwrap()).expect("must pick the film");
         assert_eq!(r.title, "Dune: Part Two");
         assert_eq!(r.year, 2024);
     }
@@ -236,7 +267,7 @@ mod tests {
             {"media_type": "movie", "title": "Dune: Part Two",
              "release_date": "2024-02-27", "popularity": 10.0}
         ]);
-        let r = pick_best(results.as_array().unwrap()).unwrap();
+        let r = pick_best("", results.as_array().unwrap()).unwrap();
         assert_eq!(r.year, 2024);
     }
 
@@ -246,7 +277,7 @@ mod tests {
             {"media_type": "movie", "title": "Low", "release_date": "2010-01-01", "popularity": 5.0},
             {"media_type": "movie", "title": "High", "release_date": "2011-01-01", "popularity": 99.0}
         ]);
-        let r = pick_best(results.as_array().unwrap()).unwrap();
+        let r = pick_best("", results.as_array().unwrap()).unwrap();
         assert_eq!(r.title, "High");
     }
 
@@ -256,7 +287,7 @@ mod tests {
             {"media_type": "person", "name": "Denis Villeneuve", "popularity": 80.0},
             {"media_type": "movie", "title": "Arrival", "release_date": "2016-11-11", "popularity": 40.0}
         ]);
-        let r = pick_best(results.as_array().unwrap()).unwrap();
+        let r = pick_best("", results.as_array().unwrap()).unwrap();
         assert_eq!(r.title, "Arrival");
     }
 
@@ -266,7 +297,7 @@ mod tests {
             {"media_type": "person", "name": "Someone", "popularity": 80.0},
             {"media_type": "collection", "name": "Some Collection", "popularity": 50.0}
         ]);
-        assert!(pick_best(results.as_array().unwrap()).is_none());
+        assert!(pick_best("", results.as_array().unwrap()).is_none());
     }
 
     #[test]
@@ -274,9 +305,40 @@ mod tests {
         let results = serde_json::json!([
             {"media_type": "tv", "name": "Severance", "first_air_date": "2022-02-18", "popularity": 60.0}
         ]);
-        let r = pick_best(results.as_array().unwrap()).unwrap();
+        let r = pick_best("", results.as_array().unwrap()).unwrap();
         assert_eq!(r.title, "Severance");
         assert_eq!(r.year, 2022);
         assert_eq!(r.media_type, "tv");
+    }
+
+    #[test]
+    fn pick_best_exact_title_beats_more_popular() {
+        // The "Civil War" disc (volume label exactly "Civil War" = the 2024 A24
+        // film) must NOT be matched to the far more popular "Captain America:
+        // Civil War" (2016). An exact normalized-title match wins over popularity.
+        let results = serde_json::json!([
+            {"media_type": "movie", "title": "Captain America: Civil War",
+             "release_date": "2016-04-27", "popularity": 200.0},
+            {"media_type": "movie", "title": "Civil War",
+             "release_date": "2024-04-10", "popularity": 30.0}
+        ]);
+        let r = pick_best("Civil War", results.as_array().unwrap()).unwrap();
+        assert_eq!(r.title, "Civil War");
+        assert_eq!(r.year, 2024);
+    }
+
+    #[test]
+    fn pick_best_exact_match_ignores_punctuation_and_case() {
+        // Disc label "TOP GUN MAVERICK" (cleaned) must match "Top Gun: Maverick"
+        // exactly (punctuation/case-insensitive), beating a more popular near-name.
+        let results = serde_json::json!([
+            {"media_type": "movie", "title": "Top Gun",
+             "release_date": "1986-05-16", "popularity": 90.0},
+            {"media_type": "movie", "title": "Top Gun: Maverick",
+             "release_date": "2022-05-24", "popularity": 50.0}
+        ]);
+        let r = pick_best("Top Gun Maverick", results.as_array().unwrap()).unwrap();
+        assert_eq!(r.title, "Top Gun: Maverick");
+        assert_eq!(r.year, 2022);
     }
 }
