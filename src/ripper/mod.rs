@@ -30,7 +30,10 @@ pub use session::{
     spawn_rip_thread, take_rip_thread, unregister_halt,
 };
 #[allow(unused_imports)]
-pub use state::{BadRange, Resumable, RipState, STATE, is_busy, set_stop_cooldown, update_state};
+pub use state::{
+    BadRange, Resumable, RipState, STATE, is_busy, set_stop_cooldown, set_title_override,
+    take_title_override, update_state, update_state_with,
+};
 
 // Internal-use imports for the orchestrator code that lives in this
 // file. Sub-module-private helpers (`pub(super)`) are reachable from
@@ -112,10 +115,7 @@ use session::{
     DriveSession, drop_session, rediscover_drive, session_is_scanned, store_session, take_session,
 };
 use staging::staging_free_bytes;
-use state::{
-    PassContext, PassProgressState, is_in_cooldown, push_pass_state, set_pass_progress,
-    update_state_with,
-};
+use state::{PassContext, PassProgressState, is_in_cooldown, push_pass_state, set_pass_progress};
 
 // ─── Poll loop ─────────────────────────────────────────────────────────────
 
@@ -1201,7 +1201,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         disc.titles.first().map(|t| t.size_bytes).unwrap_or(0)
     };
 
-    let tmdb = &session.tmdb;
+    // An operator title override (set from the Ripper card's "✎ change" picker
+    // before clicking Rip) takes precedence over the scan's auto-match — the rip
+    // then files under the operator's pick. Taken once; falls back to the scan
+    // result. A picked title is trusted (treated as confident → no review hold).
+    let title_override = take_title_override(device);
+    let overridden = title_override.is_some();
+    let tmdb_owned: Option<crate::tmdb::TmdbResult> =
+        title_override.or_else(|| session.tmdb.clone());
+    let tmdb = &tmdb_owned;
     let tmdb_title = tmdb.as_ref().map(|t| t.title.clone()).unwrap_or_default();
     let tmdb_year = tmdb.as_ref().map(|t| t.year).unwrap_or(0);
     let tmdb_poster = tmdb
@@ -1228,11 +1236,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Confident = an exact title match WITH a year. Carried to the finalize block
     // to decide auto-file (.done) vs hold-for-review (.review). disc_name is the
     // disc's volume label; display_name is the resolved (TMDB) title.
-    let title_confident = crate::tmdb::is_confident_match(
-        &crate::tmdb::clean_title(&disc_name),
-        &display_name,
-        tmdb_year,
-    );
+    let title_confident = overridden
+        || crate::tmdb::is_confident_match(
+            &crate::tmdb::clean_title(&disc_name),
+            &display_name,
+            tmdb_year,
+        );
 
     crate::log::device_log(
         device,

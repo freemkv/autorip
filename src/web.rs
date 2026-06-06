@@ -547,7 +547,12 @@ function renderCurrent(){
     const dur=s.duration?' \u00b7 '+esc(s.duration):'';
     const codecs=s.codecs?'<div class="mo" style="color:var(--text3);font-size:.75rem;margin-top:6px">'+esc(s.codecs)+'</div>':'';
     const ks=s.key_status||'';const rc=ks.indexOf('Missing')===0?'var(--yellow)':'var(--green)';const ready=s.status==='idle'?'<div class="mo" style="color:'+rc+'">'+esc(ks||'Ready to rip')+'</div>':'';
-    card='<div class="np">'+img+'<div class="nfo"><div class="mt">'+esc(title)+'</div><div class="my">'+yr+dur+' '+b+'</div>'+o+codecs+ready+'</div></div>';
+    /* Before ripping (idle), let the operator correct the matched title:
+       search TMDB and pick — the choice overrides the auto-match for this rip. */
+    const editable=s.status==='idle';
+    const editBtn=editable?' <button class="btn" style="padding:1px 7px;font-size:.7rem;vertical-align:middle" onclick="titleEdit(\''+dev+'\')">✎ change</button>':'';
+    const editBox=editable?'<div id="tedit-'+dev+'" style="display:none;margin-top:8px"></div>':'';
+    card='<div class="np">'+img+'<div class="nfo"><div class="mt">'+esc(title)+editBtn+'</div><div class="my">'+yr+dur+' '+b+'</div>'+o+codecs+ready+editBox+'</div></div>';
   }
   upd('np',card);
 
@@ -740,38 +745,46 @@ setInterval(()=>{
   });
 },1000);
 
-/* ---- Needs review (rips held for a confident title) ---- */
-function reviewResolve(dir,action,extra){
-  const body=Object.assign({dir:dir,action:action},extra||{});
+/* ---- Candidate caches (avoid inlining titles/dirs — apostrophes break attrs;
+       we key off integer indices instead). ---- */
+let _REV=[];        /* held-rip items, by index */
+let _RC={};         /* review TMDB candidates, by item index */
+let _TC={};         /* ripper-card TMDB candidates, by device */
+
+/* ---- Needs review (System page): rips held for a confident title ---- */
+function reviewResolve(idx,action,extra){
+  const it=_REV[idx]; if(!it)return;
+  const body=Object.assign({dir:it.dir,action:action},extra||{});
   fetch('/api/review/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(r=>r.json()).then(()=>loadReview()).catch(()=>{});
 }
-function reviewSearch(dir,idx){
+function reviewSearch(idx){
   const q=(document.getElementById('rvq-'+idx)||{}).value; if(!q||!q.trim())return;
   const box=document.getElementById('rvc-'+idx); if(box)box.textContent='searching…';
   fetch('/api/tmdb/search?q='+encodeURIComponent(q.trim())).then(r=>r.json()).then(cs=>{
-    if(!box)return;
+    if(!box)return; _RC[idx]=cs;
     if(!cs.length){box.textContent='no matches';return}
-    box.innerHTML=cs.map(c=>'<button class="btn" style="margin:2px" onclick=\'reviewResolve('+JSON.stringify(dir)+',"retitle",{title:'+JSON.stringify(c.title)+',year:'+(c.year||0)+'})\'>'+esc(c.title)+(c.year?' ('+c.year+')':'')+'</button>').join('');
+    box.innerHTML=cs.map((c,j)=>'<button class="btn" style="margin:2px" onclick="reviewPick('+idx+','+j+')">'+esc(c.title)+(c.year?' ('+c.year+')':'')+'</button>').join('');
   }).catch(()=>{if(box)box.textContent='search failed'});
 }
+function reviewPick(idx,j){const c=(_RC[idx]||[])[j]; if(c)reviewResolve(idx,'retitle',{title:c.title,year:c.year||0});}
 function loadReview(){
   fetch('/api/review').then(r=>r.json()).then(items=>{
     const el=document.getElementById('review'); if(!el)return;
-    if(!items||!items.length){el.innerHTML='';return}
+    _REV=items||[];
+    if(!_REV.length){el.innerHTML='';return}
     let h='<div class="card" style="border-left:3px solid var(--accent);margin-bottom:16px">';
-    h+='<div style="font-weight:600;margin-bottom:8px">⏸ Needs review — '+items.length+' rip(s) held for a confident title</div>';
-    items.forEach((it,idx)=>{
+    h+='<div style="font-weight:600;margin-bottom:8px">⏸ Needs review — '+_REV.length+' rip(s) held for a confident title</div>';
+    _REV.forEach((it,idx)=>{
       const t=esc(it.title||it.dir)+(it.year?' ('+it.year+')':'');
-      const dj=JSON.stringify(it.dir);
       h+='<div style="padding:8px 0;border-top:1px solid var(--border)">';
       h+='<div><strong>'+t+'</strong> <span style="color:var(--text3);font-size:.8rem">'+esc(it.reason||'')+'</span></div>';
       h+='<div style="color:var(--text3);font-size:.75rem">'+esc(it.file||'')+'</div>';
       h+='<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">';
       h+='<input id="rvq-'+idx+'" placeholder="correct title…" value="'+esc(it.title||'')+'" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px">';
-      h+='<button class="btn" onclick="reviewSearch('+dj+','+idx+')">Search TMDB</button>';
-      h+='<button class="btn" onclick=\'reviewResolve('+dj+',"proceed")\'>Proceed as-is</button>';
-      h+='<button class="btn" onclick=\'if(confirm("Discard this rip?"))reviewResolve('+dj+',"cancel")\'>Cancel</button>';
+      h+='<button class="btn" onclick="reviewSearch('+idx+')">Search TMDB</button>';
+      h+='<button class="btn" onclick="reviewResolve('+idx+',\'proceed\')">Proceed as-is</button>';
+      h+='<button class="btn" onclick="if(confirm(\'Discard this rip?\'))reviewResolve('+idx+',\'cancel\')">Cancel</button>';
       h+='</div><div id="rvc-'+idx+'" style="margin-top:6px"></div></div>';
     });
     h+='</div>';
@@ -780,6 +793,29 @@ function loadReview(){
 }
 loadReview();
 setInterval(loadReview,5000);
+
+/* ---- Ripper-card title editor: correct the match BEFORE ripping ---- */
+function titleEdit(dev){
+  const el=document.getElementById('tedit-'+dev); if(!el)return;
+  if(el.style.display!=='none'){el.style.display='none';return}
+  el.style.display='block';
+  el.innerHTML='<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><input id="tq-'+dev+'" placeholder="search a different title…" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px"><button class="btn" onclick="titleSearch(\''+dev+'\')">Search TMDB</button></div><div id="tr-'+dev+'" style="margin-top:6px"></div>';
+  const i=document.getElementById('tq-'+dev); if(i)i.focus();
+}
+function titleSearch(dev){
+  const i=document.getElementById('tq-'+dev); const q=i?i.value.trim():''; if(!q)return;
+  const box=document.getElementById('tr-'+dev); if(box)box.textContent='searching…';
+  fetch('/api/tmdb/search?q='+encodeURIComponent(q)).then(r=>r.json()).then(cs=>{
+    if(!box)return; _TC[dev]=cs;
+    if(!cs.length){box.textContent='no matches';return}
+    box.innerHTML=cs.map((c,j)=>'<button class="btn" style="margin:2px" onclick="titlePick(\''+dev+'\','+j+')">'+esc(c.title)+(c.year?' ('+c.year+')':'')+'</button>').join('');
+  }).catch(()=>{if(box)box.textContent='search failed'});
+}
+function titlePick(dev,j){
+  const c=(_TC[dev]||[])[j]; if(!c)return;
+  fetch('/api/title/'+dev,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)})
+    .then(r=>r.json()).then(()=>{const el=document.getElementById('tedit-'+dev);if(el)el.style.display='none';}).catch(()=>{});
+}
 
 function updateKeydb(stId){
   /* stId lets the same handler back both the System-page Data Files
@@ -1253,9 +1289,63 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         handle_review_resolve(request, cfg);
     } else if is_get && url.starts_with("/api/tmdb/search") {
         handle_tmdb_search(request, cfg, &url);
+    } else if is_post && url.starts_with("/api/title/") {
+        let device = percent_decode(url.trim_start_matches("/api/title/"));
+        if !is_valid_device_name(&device) {
+            return json_response(request, 400, r#"{"error":"invalid device name"}"#);
+        }
+        handle_title_override(request, &device);
     } else {
         json_response(request, 404, r#"{"error":"not found"}"#);
     }
+}
+
+/// `POST /api/title/<device>` — operator's TMDB pick for the active disc (from the
+/// Ripper card). Body: `{"title":"…","year":2024,"poster_url":"…","overview":"…"}`.
+/// Stored as a one-shot override `rip_disc` consumes; also reflected on the live
+/// card immediately.
+fn handle_title_override(mut request: tiny_http::Request, device: &str) {
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        return json_response(request, 400, r#"{"ok":false,"error":"bad body"}"#);
+    }
+    let v: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return json_response(request, 400, r#"{"ok":false,"error":"invalid json"}"#),
+    };
+    let title = v["title"].as_str().unwrap_or("").trim().to_string();
+    if title.is_empty() {
+        return json_response(request, 400, r#"{"ok":false,"error":"title required"}"#);
+    }
+    let year = v["year"]
+        .as_u64()
+        .and_then(|y| u16::try_from(y).ok())
+        .unwrap_or(0);
+    let poster = v["poster_url"].as_str().unwrap_or("").to_string();
+    let overview = v["overview"].as_str().unwrap_or("").to_string();
+    let media_type = v["media_type"].as_str().unwrap_or("movie").to_string();
+    ripper::set_title_override(
+        device,
+        crate::tmdb::TmdbResult {
+            title: title.clone(),
+            year,
+            poster_url: poster.clone(),
+            overview: overview.clone(),
+            media_type,
+        },
+    );
+    // Reflect on the live card right away.
+    ripper::update_state_with(device, |s| {
+        s.tmdb_title = title.clone();
+        s.tmdb_year = year;
+        if !poster.is_empty() {
+            s.tmdb_poster = poster.clone();
+        }
+        if !overview.is_empty() {
+            s.tmdb_overview = overview.clone();
+        }
+    });
+    json_response(request, 200, r#"{"ok":true}"#);
 }
 
 /// `POST /api/review/resolve` — resolve a held rip. Body:
