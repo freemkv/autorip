@@ -114,6 +114,7 @@ tr:hover { background:var(--chip); }
 
 <!-- Ripper page -->
 <div id="ripper" class="section active">
+  <div id="review"></div>
   <div id="dtabs"></div>
   <div id="np"></div>
   <div id="actions"></div>
@@ -739,6 +740,47 @@ setInterval(()=>{
   });
 },1000);
 
+/* ---- Needs review (rips held for a confident title) ---- */
+function reviewResolve(dir,action,extra){
+  const body=Object.assign({dir:dir,action:action},extra||{});
+  fetch('/api/review/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(()=>loadReview()).catch(()=>{});
+}
+function reviewSearch(dir,idx){
+  const q=(document.getElementById('rvq-'+idx)||{}).value; if(!q||!q.trim())return;
+  const box=document.getElementById('rvc-'+idx); if(box)box.textContent='searching…';
+  fetch('/api/tmdb/search?q='+encodeURIComponent(q.trim())).then(r=>r.json()).then(cs=>{
+    if(!box)return;
+    if(!cs.length){box.textContent='no matches';return}
+    box.innerHTML=cs.map(c=>'<button class="btn" style="margin:2px" onclick=\'reviewResolve('+JSON.stringify(dir)+',"retitle",{title:'+JSON.stringify(c.title)+',year:'+(c.year||0)+'})\'>'+esc(c.title)+(c.year?' ('+c.year+')':'')+'</button>').join('');
+  }).catch(()=>{if(box)box.textContent='search failed'});
+}
+function loadReview(){
+  fetch('/api/review').then(r=>r.json()).then(items=>{
+    const el=document.getElementById('review'); if(!el)return;
+    if(!items||!items.length){el.innerHTML='';return}
+    let h='<div class="card" style="border-left:3px solid var(--accent);margin-bottom:16px">';
+    h+='<div style="font-weight:600;margin-bottom:8px">⏸ Needs review — '+items.length+' rip(s) held for a confident title</div>';
+    items.forEach((it,idx)=>{
+      const t=esc(it.title||it.dir)+(it.year?' ('+it.year+')':'');
+      const dj=JSON.stringify(it.dir);
+      h+='<div style="padding:8px 0;border-top:1px solid var(--border)">';
+      h+='<div><strong>'+t+'</strong> <span style="color:var(--text3);font-size:.8rem">'+esc(it.reason||'')+'</span></div>';
+      h+='<div style="color:var(--text3);font-size:.75rem">'+esc(it.file||'')+'</div>';
+      h+='<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">';
+      h+='<input id="rvq-'+idx+'" placeholder="correct title…" value="'+esc(it.title||'')+'" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px">';
+      h+='<button class="btn" onclick="reviewSearch('+dj+','+idx+')">Search TMDB</button>';
+      h+='<button class="btn" onclick=\'reviewResolve('+dj+',"proceed")\'>Proceed as-is</button>';
+      h+='<button class="btn" onclick=\'if(confirm("Discard this rip?"))reviewResolve('+dj+',"cancel")\'>Cancel</button>';
+      h+='</div><div id="rvc-'+idx+'" style="margin-top:6px"></div></div>';
+    });
+    h+='</div>';
+    el.innerHTML=h;
+  }).catch(()=>{});
+}
+loadReview();
+setInterval(loadReview,5000);
+
 function updateKeydb(stId){
   /* stId lets the same handler back both the System-page Data Files
      button (default 'keydb-status') and the Settings-page Local button
@@ -1196,9 +1238,84 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             crate::verify::run_verify(&device, &dev_path, keydb);
             json_response(request, 200, r#"{"ok":true}"#);
         }
+    } else if is_get && url == "/api/review" {
+        let staging = cfg
+            .read()
+            .map(|c| c.staging_dir.clone())
+            .unwrap_or_default();
+        let items = crate::review::list_held(&staging);
+        json_response(
+            request,
+            200,
+            &serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string()),
+        );
+    } else if is_post && url == "/api/review/resolve" {
+        handle_review_resolve(request, cfg);
+    } else if is_get && url.starts_with("/api/tmdb/search") {
+        handle_tmdb_search(request, cfg, &url);
     } else {
         json_response(request, 404, r#"{"error":"not found"}"#);
     }
+}
+
+/// `POST /api/review/resolve` — resolve a held rip. Body:
+/// `{"dir":"<staging subdir>","action":"proceed|retitle|cancel","title":"…","year":2024}`.
+fn handle_review_resolve(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        return json_response(request, 400, r#"{"ok":false,"error":"bad body"}"#);
+    }
+    let v: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return json_response(request, 400, r#"{"ok":false,"error":"invalid json"}"#),
+    };
+    let dir = v["dir"].as_str().unwrap_or("").to_string();
+    let staging = cfg
+        .read()
+        .map(|c| c.staging_dir.clone())
+        .unwrap_or_default();
+    let action = match v["action"].as_str().unwrap_or("") {
+        "proceed" => crate::review::Resolve::Proceed,
+        "cancel" => crate::review::Resolve::Cancel,
+        "retitle" => {
+            let title = v["title"].as_str().unwrap_or("").trim().to_string();
+            if title.is_empty() {
+                return json_response(request, 400, r#"{"ok":false,"error":"title required"}"#);
+            }
+            let year = v["year"]
+                .as_u64()
+                .and_then(|y| u16::try_from(y).ok())
+                .unwrap_or(0);
+            crate::review::Resolve::Retitle { title, year }
+        }
+        _ => return json_response(request, 400, r#"{"ok":false,"error":"bad action"}"#),
+    };
+    match crate::review::resolve(&staging, &dir, action) {
+        Ok(()) => json_response(request, 200, r#"{"ok":true}"#),
+        Err(e) => json_response(
+            request,
+            400,
+            &format!(r#"{{"ok":false,"error":"{}"}}"#, e.replace('"', "'")),
+        ),
+    }
+}
+
+/// `GET /api/tmdb/search?q=<query>` — candidate matches for the review picker.
+fn handle_tmdb_search(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, url: &str) {
+    let q = url
+        .split_once("?q=")
+        .map(|(_, q)| percent_decode(q.split('&').next().unwrap_or("")))
+        .unwrap_or_default();
+    let key = cfg
+        .read()
+        .map(|c| c.tmdb_api_key.clone())
+        .unwrap_or_default();
+    let results = crate::tmdb::search(&q, &key, 8);
+    json_response(
+        request,
+        200,
+        &serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string()),
+    );
 }
 
 // ---------- Helpers ----------

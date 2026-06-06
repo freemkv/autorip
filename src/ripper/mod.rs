@@ -1225,6 +1225,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     } else {
         tmdb_title.clone()
     };
+    // Confident = an exact title match WITH a year. Carried to the finalize block
+    // to decide auto-file (.done) vs hold-for-review (.review). disc_name is the
+    // disc's volume label; display_name is the resolved (TMDB) title.
+    let title_confident = crate::tmdb::is_confident_match(
+        &crate::tmdb::clean_title(&disc_name),
+        &display_name,
+        tmdb_year,
+    );
 
     crate::log::device_log(
         device,
@@ -3091,12 +3099,28 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             "date": crate::util::format_date(),
         });
         if completed {
-            // Only mark staging as ready-to-move when the rip actually finished.
-            let marker_path = format!("{}/.done", staging);
+            // Confident match (exact title + year) → hand straight to the mover
+            // (.done). Otherwise HOLD for operator review (.review): the rip is
+            // complete and staged, but we will NOT auto-file it into the library
+            // under a guessed name. The Needs-review UI resolves it (pick the
+            // right title → promotes to .done, or proceed as-is). "Better to
+            // pause; worst case the operator clicks proceed." A would-overwrite
+            // collision is still caught later by the mover's own guard.
+            let marker_name = if title_confident { ".done" } else { ".review" };
+            let marker_path = format!("{}/{}", staging, marker_name);
             let _ = std::fs::write(
                 &marker_path,
                 serde_json::to_string_pretty(&marker).unwrap_or_default(),
             );
+            if !title_confident {
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "Held for review: uncertain title match for \"{}\" — confirm/correct in the UI",
+                        display_name
+                    ),
+                );
+            }
             // 0.20.7: also write `.completed` (and clear `.restart_count`)
             // so the resume-on-startup detector knows this disc finished
             // cleanly even if the mover hasn't run yet. `.done` and

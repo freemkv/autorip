@@ -4,6 +4,7 @@ mod log;
 mod mover;
 mod muxer;
 mod observe;
+mod review;
 mod ripper;
 mod tmdb;
 mod util;

@@ -24,6 +24,7 @@ pub mod log;
 pub mod mover;
 pub mod muxer;
 pub mod observe;
+pub mod review;
 pub mod ripper;
 pub mod tmdb;
 pub mod util;

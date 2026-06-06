@@ -41,6 +41,53 @@ fn norm(s: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// Is the resolved `title`/`year` a CONFIDENT match for the disc label `query`?
+/// An exact normalized-title match that also carries a year. Rips whose match is
+/// NOT confident (or that would overwrite an existing file) are held for operator
+/// review rather than auto-filed into the library under a guessed name.
+pub fn is_confident_match(query: &str, title: &str, year: u16) -> bool {
+    year > 0 && norm(title) == norm(query)
+}
+
+/// Return up to `limit` candidate matches for `query`, best first (exact dated
+/// title → dated → popularity). Powers the "needs review" correction picker.
+pub fn search(query: &str, api_key: &str, limit: usize) -> Vec<TmdbResult> {
+    if api_key.is_empty() || query.trim().is_empty() {
+        return Vec::new();
+    }
+    let url = format!(
+        "https://api.themoviedb.org/3/search/multi?api_key={}&query={}&page=1",
+        api_key,
+        urlencoded(query)
+    );
+    let resp = match ureq::get(&url).call() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let json: serde_json::Value = match resp.into_json() {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+    let Some(results) = json["results"].as_array() else {
+        return Vec::new();
+    };
+    let want = norm(query);
+    let mut parsed: Vec<(TmdbResult, f64, bool)> = results
+        .iter()
+        .filter_map(parse_result)
+        .map(|(r, pop)| {
+            let exact = r.year > 0 && norm(&r.title) == want;
+            (r, pop, exact)
+        })
+        .collect();
+    parsed.sort_by(|a, b| {
+        b.2.cmp(&a.2) // exact first
+            .then((b.0.year > 0).cmp(&(a.0.year > 0))) // then dated
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)) // then popularity
+    });
+    parsed.into_iter().take(limit).map(|(r, _, _)| r).collect()
+}
+
 /// Choose the best entry from a TMDB `search/multi` response.
 ///
 /// `search/multi` mixes movies, TV, people, and collections, and does
