@@ -161,6 +161,16 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         mkb,
         unit_key_ro: inf,
         samples,
+        // The disc's own title (UDF/ISO volume id, else BDMV name) so the key
+        // service can catalog hash→title from our ripped discs.
+        volume_label: {
+            let v = disc.volume_id.trim();
+            if v.is_empty() {
+                disc.meta_title.clone()
+            } else {
+                Some(v.to_string())
+            }
+        },
     };
 
     // One ordered driver, one shared loop: hand each source's candidates (one at
