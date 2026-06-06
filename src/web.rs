@@ -114,7 +114,6 @@ tr:hover { background:var(--chip); }
 
 <!-- Ripper page -->
 <div id="ripper" class="section active">
-  <div id="review"></div>
   <div id="dtabs"></div>
   <div id="np"></div>
   <div id="actions"></div>
@@ -127,6 +126,7 @@ tr:hover { background:var(--chip); }
 
 <!-- System page -->
 <div id="system" class="section">
+  <div id="review"></div>
   <div class="card" style="margin-top:16px"><h2>Mux Queue</h2><div id="muxes"></div></div>
   <div class="card"><h2>Move Queue</h2><div id="moves"></div></div>
   <div><h2 style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;margin-bottom:8px">System Log</h2><div id="syslog" class="log" style="max-height:400px"></div></div>
