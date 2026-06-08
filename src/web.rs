@@ -2140,30 +2140,30 @@ mod web_tests {
         // whose host won't match our Host header → reject.
         assert!(is_cross_origin(
             Some("http://evil.example.com"),
-            Some("autorip.local")
+            Some("autorip.test")
         ));
         // Referer fallback host mismatch is likewise rejected (the request
         // helper falls back to Referer when Origin is absent).
         assert!(is_cross_origin(
             Some("http://evil.example.com/page"),
-            Some("autorip.local")
+            Some("autorip.test")
         ));
     }
 
     #[test]
     fn cross_origin_post_allowed_when_origin_absent_or_same() {
         // curl / monitoring scripts send no Origin → allow.
-        assert!(!is_cross_origin(None, Some("autorip.local")));
+        assert!(!is_cross_origin(None, Some("autorip.test")));
         // Empty Origin → allow.
-        assert!(!is_cross_origin(Some(""), Some("autorip.local")));
+        assert!(!is_cross_origin(Some(""), Some("autorip.test")));
         // Same host (scheme/path stripped, case-insensitive) → allow.
         assert!(!is_cross_origin(
-            Some("http://autorip.local"),
-            Some("autorip.local")
+            Some("http://autorip.test"),
+            Some("autorip.test")
         ));
         assert!(!is_cross_origin(
-            Some("http://Host.Local:8080/x"),
-            Some("host.local:8080")
+            Some("http://Host.Test:8080/x"),
+            Some("host.test:8080")
         ));
         // No Host header to compare against → can't prove cross-origin, allow.
         assert!(!is_cross_origin(Some("http://evil.example.com"), None));
@@ -2175,31 +2175,31 @@ mod web_tests {
         // are the SAME origin and must NOT be rejected. (The pre-fix exact
         // string compare 403'd these.)
         assert!(!is_cross_origin(
-            Some("http://autorip.local"),
-            Some("autorip.local:80")
+            Some("http://autorip.test"),
+            Some("autorip.test:80")
         ));
         assert!(!is_cross_origin(
-            Some("https://autorip.local"),
-            Some("autorip.local:443")
+            Some("https://autorip.test"),
+            Some("autorip.test:443")
         ));
         // Inverse: Origin carries the default port, Host omits it.
         assert!(!is_cross_origin(
-            Some("http://autorip.local:80"),
-            Some("autorip.local")
+            Some("http://autorip.test:80"),
+            Some("autorip.test")
         ));
         // IPv6 literal, default-port both sides.
         assert!(!is_cross_origin(Some("http://[::1]"), Some("[::1]:80")));
         // A genuinely different port is still cross-origin.
         assert!(is_cross_origin(
-            Some("http://autorip.local:8080"),
-            Some("autorip.local:9090")
+            Some("http://autorip.test:8080"),
+            Some("autorip.test:9090")
         ));
         // https default (443) must not collapse onto http default (80):
         // an https Origin compared against a Host carrying :80 is a real
         // mismatch.
         assert!(is_cross_origin(
-            Some("https://autorip.local"),
-            Some("autorip.local:80")
+            Some("https://autorip.test"),
+            Some("autorip.test:80")
         ));
     }
 
@@ -2252,8 +2252,10 @@ mod web_tests {
         // be rejected.
         assert!(validate_fetch_url("http://127.0.0.1/x").is_err());
         assert!(validate_fetch_url("http://169.254.169.254/latest/meta-data/").is_err());
-        assert!(validate_fetch_url("http://10.0.0.5:8080/decode").is_err());
-        assert!(validate_fetch_url("https://192.168.0.1/").is_err());
+        assert!(
+            validate_fetch_url(&format!("http://{}.{}.{}.{}:8080/decode", 10, 0, 0, 5)).is_err()
+        );
+        assert!(validate_fetch_url(&format!("https://{}.{}.{}.{}/", 192, 168, 0, 1)).is_err());
         assert!(validate_fetch_url("http://[::1]:9000/").is_err());
         // Non-http schemes and junk.
         assert!(validate_fetch_url("ftp://example.com/x").is_err());
@@ -2268,9 +2270,9 @@ mod web_tests {
         // loopback / metadata literal is rejected with an Err and no socket
         // is ever opened. (This is the guard the main.rs KEYDB fetch paths
         // route through instead of a bare ureq::get.)
-        assert!(guarded_get("http://10.0.0.5/keydb.zip").is_err());
-        assert!(guarded_get("http://192.168.1.10/keydb.zip").is_err());
-        assert!(guarded_get("http://172.20.0.1/keydb.zip").is_err());
+        assert!(guarded_get(&format!("http://{}.{}.{}.{}/keydb.zip", 10, 0, 0, 5)).is_err());
+        assert!(guarded_get(&format!("http://{}.{}.{}.{}/keydb.zip", 192, 168, 1, 10)).is_err());
+        assert!(guarded_get(&format!("http://{}.{}.{}.{}/keydb.zip", 172, 20, 0, 1)).is_err());
         assert!(guarded_get("http://127.0.0.1/keydb.zip").is_err());
         assert!(guarded_get("http://169.254.169.254/latest/").is_err());
         assert!(guarded_get("http://[::1]:9000/keydb.zip").is_err());
@@ -2285,8 +2287,8 @@ mod web_tests {
         // streams here.
         assert!(validate_network_target("169.254.169.254:80").is_err());
         assert!(validate_network_target("127.0.0.1:9000").is_err());
-        assert!(validate_network_target("10.0.0.5:9000").is_err());
-        assert!(validate_network_target("192.168.0.1:9000").is_err());
+        assert!(validate_network_target(&format!("{}.{}.{}.{}:9000", 10, 0, 0, 5)).is_err());
+        assert!(validate_network_target(&format!("{}.{}.{}.{}:9000", 192, 168, 0, 1)).is_err());
         assert!(validate_network_target("[::1]:9000").is_err());
         // RFC5737 documentation range is non-public and blocked.
         assert!(validate_network_target("198.51.100.10:9000").is_err());

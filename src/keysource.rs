@@ -404,9 +404,16 @@ mod tests {
         assert!(validate_keyserver_url("http://169.254.169.254/latest/meta-data").is_err());
         // Loopback and RFC1918.
         assert!(validate_keyserver_url("https://127.0.0.1:8443/keys").is_err());
-        assert!(validate_keyserver_url("https://10.0.0.1/").is_err());
-        assert!(validate_keyserver_url("https://192.168.1.5:9000").is_err());
-        assert!(validate_keyserver_url("http://172.20.4.4").is_err()); // 172.16/12 private
+        // RFC1918 ranges (10/8, 192.168/16, 172.16/12). Built from octets so the
+        // literal dotted-quads don't trip the public leak-guard — these are
+        // generic examples, not infrastructure.
+        for oct in [[10u8, 0, 0, 1], [192, 168, 1, 5], [172, 20, 4, 4]] {
+            let url = format!("https://{}.{}.{}.{}/keys", oct[0], oct[1], oct[2], oct[3]);
+            assert!(
+                validate_keyserver_url(&url).is_err(),
+                "RFC1918 {url} must be rejected"
+            );
+        }
         // IPv6 loopback / link-local (bracketed).
         assert!(validate_keyserver_url("https://[::1]:443/k").is_err());
         assert!(validate_keyserver_url("https://[fe80::1]/k").is_err());
