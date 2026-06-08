@@ -7,7 +7,7 @@
 //!
 //! Deliberate gap: `Disc::scan_image` and `run_mux` end-to-end need a
 //! real UDF ISO. Feeding synthetic bytes into `scan_image` reliably
-//! fails (per libfreemkv/project docs). The live test bed validates the
+//! fails (per the libfreemkv library rules). The live test bed validates the
 //! full flow on a real disc; the gap is documented in
 //! `src/ripper/resume.rs`.
 

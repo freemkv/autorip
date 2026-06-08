@@ -4,8 +4,10 @@
 //!
 //! - **`{AUTORIP_DIR}/logs/autorip.log`** — daily-rolling, human-readable.
 //!   The file an operator tails when something is going on.
-//! - **`{AUTORIP_DIR}/logs/autorip.jsonl`** — daily-rolling, JSON Lines.
-//!   The file a tool greps when something already went wrong.
+//! - **`{AUTORIP_DIR}/logs/autorip.jsonl`** — non-rolling (stable path),
+//!   JSON Lines. The file a tool greps when something already went wrong.
+//!   Not rolled so the `/api/debug` tailer can rely on a fixed filename
+//!   (see the appender setup in `init`).
 //! - **stderr** — compact, captured by Docker as the container log.
 //!
 //! Filter level via `AUTORIP_LOG_LEVEL` (env-filter syntax). Default
@@ -58,13 +60,22 @@ static GUARDS: once_cell::sync::OnceCell<Vec<WorkerGuard>> = once_cell::sync::On
 static RELOAD_HANDLE: once_cell::sync::OnceCell<reload::Handle<EnvFilter, Registry>> =
     once_cell::sync::OnceCell::new();
 
-/// Initialize the tracing stack. Idempotent — second + subsequent calls
-/// are no-ops, so it's safe to call from `main` even if a thread spawned
-/// before init touches the global subscriber.
+/// Initialize the tracing stack. Returns nothing.
 ///
-/// Returns Ok if the subscriber installed cleanly. On failure (couldn't
-/// create log dir, couldn't open files), still installs a stderr-only
-/// fallback so events at least surface in `docker logs`.
+/// Contract: call exactly once, early in `main`, before any threads are
+/// spawned. The leading `GUARDS.get().is_some()` check makes a *sequential*
+/// second call a no-op, but it is not a synchronization barrier — two
+/// concurrent callers could both pass the check, and the loser's
+/// `tracing_subscriber::...init()` would then panic (global subscriber
+/// already installed). Single-call-from-main is the contract, not a
+/// thread-safe guard.
+///
+/// No `Result`: log-dir creation is best-effort (`create_dir_all` errors are
+/// ignored — the appenders below will simply fail to write into a missing
+/// dir), the file appenders are lazy (no file is opened at init time, so
+/// there is no open-time error to surface), and the stderr layer is always
+/// in the stack — events surface in `docker logs` regardless of whether the
+/// file sinks can be written.
 pub fn init() {
     if GUARDS.get().is_some() {
         return;

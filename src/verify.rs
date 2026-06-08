@@ -52,11 +52,38 @@ pub fn request_stop() {
 }
 
 pub fn is_running() -> bool {
-    VERIFY_STATE
-        .lock()
-        .ok()
-        .and_then(|vs| vs.as_ref().map(|v| v.status == "running"))
-        .unwrap_or(false)
+    // Recover a poisoned lock: a panic in the progress callback (which
+    // holds this lock) must not permanently wedge the verify state
+    // machine. `.ok()` would silently treat a poisoned mutex as "not
+    // running" and could mask a stuck state; into_inner reflects truth.
+    let vs = VERIFY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    vs.as_ref().map(|v| v.status == "running").unwrap_or(false)
+}
+
+/// Atomically claim the verify slot: while holding the lock, if a verify is
+/// already "running" bail (return false); otherwise install a "running"
+/// placeholder state and return true. This closes a TOCTOU where the previous
+/// design only set "running" *inside* the spawned thread after a slow disc
+/// scan — two triggers arriving during that window both passed the busy check
+/// and both spawned a verify against the same drive. Only the lock winner spawns.
+fn try_claim_running(disc_name: &str) -> bool {
+    // Recover a poisoned lock rather than returning false: a panic in the
+    // progress callback poisons VERIFY_STATE permanently, and a bare
+    // `let Ok else { return false }` would then wedge the slot so NO
+    // future verify could ever claim it. Consistent with `is_running` /
+    // `set_state`, which also `unwrap_or_else(into_inner)`.
+    let mut vs = VERIFY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(state) = vs.as_ref() {
+        if state.status == "running" {
+            return false;
+        }
+    }
+    *vs = Some(VerifyState {
+        status: "running".into(),
+        disc_name: disc_name.into(),
+        ..empty()
+    });
+    true
 }
 
 pub fn run_verify(device: &str, device_path: &str, keydb_path: Option<String>) {
@@ -71,9 +98,25 @@ pub fn run_verify(device: &str, device_path: &str, keydb_path: Option<String>) {
         return;
     }
 
+    // Clear any STOP_FLAG left over from a PRIOR verify BEFORE claiming the
+    // slot. The reset must happen before the claim, not after the spawn: once
+    // `try_claim_running` flips status to "running" the slot is visible to
+    // `/api/stop` (→ `request_stop` sets STOP_FLAG). If the worker reset the
+    // flag as its first act instead, a Stop issued in the window between the
+    // claim and the worker's reset would be silently cleared and lost. The
+    // worker only ever READS the flag, so resetting here means every stop
+    // after the claim is honored.
+    STOP_FLAG.store(false, Ordering::Relaxed);
+
+    // Claim the slot synchronously BEFORE spawning so a second trigger that
+    // races in (e.g. during the slow drive scan) cannot also start a verify.
+    if !try_claim_running("Starting…") {
+        crate::log::device_log(device, "Verify: already running");
+        return;
+    }
+
     let device = device.to_string();
     let device_path = device_path.to_string();
-    STOP_FLAG.store(false, Ordering::Relaxed);
 
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -141,6 +184,10 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
         return;
     }
 
+    // Deliberate: verify the first title. Verify is a readability check over
+    // the disc's primary title, not the rip's main-feature selection; titles[0]
+    // is the library's primary listing. (If this should track the rip's
+    // main-feature selection, switch to longest-by-duration here.)
     let title = &disc.titles[0];
     let disc_name = disc
         .meta_title
@@ -148,6 +195,17 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
         .unwrap_or(&disc.volume_id)
         .to_string();
     let total_sectors: u64 = title.extents.iter().map(|e| e.sector_count as u64).sum();
+    if total_sectors == 0 {
+        // Guard divide-by-zero: every percentage below divides by
+        // total_sectors, yielding inf/NaN that serializes to JSON `null`.
+        crate::log::device_log(device, "Verify: title has no readable sectors");
+        set_state(VerifyState {
+            status: "error".into(),
+            disc_name: "No readable sectors".into(),
+            ..empty()
+        });
+        return;
+    }
     let total_bytes = total_sectors * 2048;
     let bytes_per_sec = if title.duration_secs > 0.0 {
         total_bytes as f64 / title.duration_secs
@@ -156,7 +214,9 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
     };
     let batch = libfreemkv::disc::detect_max_batch_sectors(device_path);
 
-    let _ = drive.probe_disc();
+    if let Err(e) = drive.probe_disc() {
+        tracing::warn!(device = %device, error = %e, "verify: probe_disc failed");
+    }
 
     crate::log::device_log(
         device,
@@ -195,7 +255,13 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
                 0.0
             };
 
-            if let Ok(mut vs) = crate::verify::VERIFY_STATE.lock() {
+            // Recover a poisoned lock rather than skipping the update: if
+            // a prior callback panicked the mutex is poisoned forever, and
+            // `if let Ok` would silently stop all progress updates.
+            {
+                let mut vs = crate::verify::VERIFY_STATE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(ref mut state) = *vs {
                     state.progress_pct = pct;
                     state.sectors_done = p.work_done;
@@ -216,13 +282,18 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
     let mut bad_ranges = Vec::new();
 
     for range in &result.ranges {
-        let offset_pct = range.byte_offset as f64 / (total_sectors as f64 * 2048.0) * 100.0;
-        let width_pct = (range.count as f64 / total_sectors as f64 * 100.0).max(0.3);
+        // Clamp so a pathological range can't render past the bar (>100%) or
+        // invisibly thin (<0.3%).
+        let offset_pct =
+            (range.byte_offset as f64 / (total_sectors as f64 * 2048.0) * 100.0).clamp(0.0, 100.0);
+        let width_pct = (range.count as f64 / total_sectors as f64 * 100.0).clamp(0.3, 100.0);
+        // Exhaustive match (no `_`) so a new SectorStatus variant forces a
+        // deliberate decision here instead of being silently dropped.
         let status_str = match range.status {
             libfreemkv::verify::SectorStatus::Slow => "slow",
             libfreemkv::verify::SectorStatus::Recovered => "recovered",
             libfreemkv::verify::SectorStatus::Bad => "bad",
-            _ => continue,
+            libfreemkv::verify::SectorStatus::Good => continue,
         };
         sector_map.push(SectorMapEntry {
             offset_pct,
@@ -238,9 +309,15 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
             title_clone.size_bytes,
         )
         .map(|(ch, secs)| {
-            let h = secs as u32 / 3600;
-            let m = (secs as u32 % 3600) / 60;
-            let s = secs as u32 % 60;
+            // Guard a non-finite/negative duration: `secs as u32` saturates
+            // (NaN -> 0, huge -> u32::MAX), rendering a misleading timestamp.
+            if !secs.is_finite() || secs < 0.0 {
+                return format!("Chapter {}", ch);
+            }
+            let t = secs as u64;
+            let h = t / 3600;
+            let m = (t % 3600) / 60;
+            let s = t % 60;
             if h > 0 {
                 format!("Chapter {}, {}:{:02}:{:02}", ch, h, m, s)
             } else {
@@ -283,7 +360,7 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
         status: status.into(),
         disc_name,
         progress_pct: if was_stopped {
-            result.total_sectors as f64 * 100.0 / total_sectors.max(1) as f64
+            (result.total_sectors as f64 * 100.0 / total_sectors.max(1) as f64).clamp(0.0, 100.0)
         } else {
             100.0
         },
@@ -303,9 +380,14 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
 }
 
 fn set_state(state: VerifyState) {
-    if let Ok(mut vs) = VERIFY_STATE.lock() {
-        *vs = Some(state);
-    }
+    // Recover from poison: this is the path that writes the terminal
+    // "error"/"done"/"stopped" state. If a panic in the progress
+    // callback poisoned the lock, `if let Ok` would drop the error
+    // state on the floor, leaving status stuck at "running" forever and
+    // blocking every future verify (is_running stays true). into_inner
+    // guarantees the terminal state always lands.
+    let mut vs = VERIFY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    *vs = Some(state);
 }
 
 fn empty() -> VerifyState {
@@ -325,5 +407,94 @@ fn empty() -> VerifyState {
         sector_map: Vec::new(),
         bad_ranges: Vec::new(),
         elapsed_secs: 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Both tests below mutate the process-global `VERIFY_STATE` and one of
+    /// them deliberately poisons it, so they cannot run concurrently (the
+    /// default multi-threaded test runner would otherwise interleave them).
+    /// Serialize them on this guard. Recover from poison so a panicking test
+    /// can't wedge the guard for the other.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// Reset `VERIFY_STATE` to a clean slot, tolerating a poisoned lock (the
+    /// poison test leaves it poisoned for any test that runs afterwards).
+    fn reset_state() {
+        let mut vs = VERIFY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        *vs = None;
+    }
+
+    /// The TOCTOU fix: claiming the slot is atomic. The first caller wins and
+    /// installs a "running" state; a second caller arriving before the first
+    /// finishes is rejected, so it can never also spawn a verify against the
+    /// same drive. (Uses the global VERIFY_STATE, so this test owns it.)
+    #[test]
+    fn try_claim_running_is_exclusive() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // Reset to a clean slot.
+        reset_state();
+
+        // First claim wins.
+        assert!(try_claim_running("Disc A"));
+        assert!(is_running());
+
+        // Second claim, while still "running", loses — no double-start.
+        assert!(!try_claim_running("Disc B"));
+
+        // After the slot is released (terminal state), a new claim wins again.
+        set_state(VerifyState {
+            status: "done".into(),
+            ..empty()
+        });
+        assert!(!is_running());
+        assert!(try_claim_running("Disc C"));
+
+        // Cleanup so we don't leave a stray "running" state for other tests.
+        reset_state();
+    }
+
+    /// Simulate the exact failure mode the poison-recovery fix targets:
+    /// a panic while holding VERIFY_STATE poisons the mutex. set_state
+    /// must still land the terminal "error" state (not silently no-op),
+    /// and is_running must reflect it — otherwise a single callback panic
+    /// would wedge the verify state machine at "running" forever and
+    /// block every subsequent verify.
+    #[test]
+    fn set_state_recovers_from_poisoned_lock() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // Start from a clean, un-poisoned slot regardless of prior tests.
+        reset_state();
+        // Seed a "running" state.
+        set_state(VerifyState {
+            status: "running".into(),
+            ..empty()
+        });
+        assert!(is_running());
+
+        // Poison the mutex by panicking while the guard is held.
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = VERIFY_STATE.lock().unwrap();
+            panic!("poison the verify state lock");
+        });
+        assert!(
+            VERIFY_STATE.lock().is_err(),
+            "lock should be poisoned for this test"
+        );
+
+        // The terminal state must still land despite the poison.
+        set_state(VerifyState {
+            status: "error".into(),
+            disc_name: "boom".into(),
+            ..empty()
+        });
+        assert!(!is_running(), "is_running must observe the recovered state");
+        let vs = VERIFY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(vs.as_ref().unwrap().status, "error");
+        assert_eq!(vs.as_ref().unwrap().disc_name, "boom");
     }
 }

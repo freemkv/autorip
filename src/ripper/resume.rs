@@ -28,6 +28,24 @@ use crate::config::Config;
 
 use super::staging::{self, ResumeAction, StagingResumeHint};
 
+/// Fallback title bitrate (bytes/sec) used to convert bad-byte counts
+/// into estimated lost title-seconds when the real per-title bitrate is
+/// unknown (≈ 8.25 Mbps). Shared by `classify_resume`'s pre-flight
+/// estimate and `resume_remux`'s post-`scan_image` re-validation so the
+/// two cannot silently diverge. The authoritative title-scoped re-check
+/// in `resume_remux` (real per-title bitrate + `bytes_bad_in_title`) is
+/// what ultimately gates the mux. Single source of truth so the value
+/// can't drift across call sites.
+pub(super) const FALLBACK_BITRATE_BYTES_PER_SEC: f64 = 8_250_000.0;
+
+/// Sentinel device path passed to `detect_max_batch_sectors` from the
+/// resume-remux path. There is no live drive here — we mux from a staged
+/// ISO — so we deliberately probe a non-optical, non-existent node. The
+/// probe finds no SCSI peripheral type for it and falls back to the
+/// library's default optical batch size, which is the correct read batch
+/// for a file-backed ISO source.
+const DEFAULT_BATCH_PROBE_PATH: &str = "/dev/null";
+
 /// Classification of a `ResumePreserved` staging hint. Anything that
 /// isn't `ResumePreserved` is mapped here too so the orchestrator can
 /// fan out a single `match`.
@@ -115,8 +133,9 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
     // staging-snapshot booleans tell us they exist but not their
     // exact names; the orchestrator names them `<sanitized>.iso` and
     // `<sanitized>.iso.mapfile` but we don't want to depend on the
-    // sanitization matching exactly post-restart (it does today but
-    // project docs's hard rule #5 says guard against drift).
+    // sanitization matching exactly post-restart (it does today, but
+    // guard against staging-filename sanitization drift across
+    // restarts rather than reconstructing the expected names).
     let (iso_path, mapfile_path) = match find_iso_and_mapfile(&hint.dir) {
         Some(p) => p,
         None => return ResumeClass::NotEligible,
@@ -126,7 +145,17 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
     // ambiguous — fall back to a full re-rip.
     let map = match libfreemkv::disc::mapfile::Mapfile::load(&mapfile_path) {
         Ok(m) => m,
-        Err(_) => return ResumeClass::NotEligible,
+        Err(e) => {
+            // Don't swallow this: a corrupt/unreadable mapfile silently
+            // demotes resume to a full re-rip, which looks like the
+            // resume logic "just didn't fire". Make it observable.
+            tracing::warn!(
+                mapfile = %mapfile_path.display(),
+                error = %e,
+                "resume: mapfile load failed; classifying as not-eligible (full re-rip)"
+            );
+            return ResumeClass::NotEligible;
+        }
     };
     // Log the persisted AACS Volume ID (if Pass 1 recorded one) — the resume
     // key resolution reads it back from the mapfile below.
@@ -147,16 +176,23 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
     // pre-flight estimate; the actor re-validates with the real
     // title bitrate after `Disc::scan_image`.
     let bad_bytes = stats.bytes_unreadable;
-    let lost_secs = bad_bytes as f64 / 8_250_000.0;
+    let lost_secs = bad_bytes as f64 / FALLBACK_BITRATE_BYTES_PER_SEC;
     if lost_secs > abort_on_lost_secs as f64 {
         return ResumeClass::NotEligible;
     }
 
-    let display_name = hint
-        .dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // file_name() returns None only for a path ending in `..`. Defaulting to
+    // "" here would make the output filename ".mkv"/".m2ts" and point
+    // delete_partial_output at "<staging>/.mkv" at the staging root — a
+    // destructive write outside the disc subdir. hint.dir is always a child
+    // of staging_dir today so this never fires, but bail loudly if it ever does.
+    let display_name = match hint.dir.file_name() {
+        Some(n) => n.to_string_lossy().into_owned(),
+        None => {
+            tracing::warn!(dir = %hint.dir.display(), "resume: staging dir has no file_name component; not eligible");
+            return ResumeClass::NotEligible;
+        }
+    };
 
     ResumeClass::Remux {
         iso_path,
@@ -165,21 +201,54 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
     }
 }
 
-/// Walk a staging dir and find the first `.iso` + matching
-/// `.iso.mapfile`. Returns None if either is missing.
+/// Walk a staging dir and find the unique `.iso` plus its matching
+/// mapfile (`<iso>.mapfile`, i.e. `foo.iso.mapfile` for `foo.iso`).
+/// Returns None if there is no ISO, more than one ISO (ambiguous), or
+/// no mapfile keyed to that exact ISO name.
+///
+/// `read_dir` order is unspecified, so we cannot rely on last-wins
+/// pairing: a stale/extra `.iso` or an unrelated `.mapfile` left in the
+/// dir would otherwise pair `foo.iso` with `bar.mapfile`, corrupting the
+/// loss accounting and reading the wrong Volume ID. We therefore pin the
+/// mapfile to the chosen ISO's name and bail on any ISO ambiguity.
 pub(super) fn find_iso_and_mapfile(dir: &Path) -> Option<(PathBuf, PathBuf)> {
-    let mut iso = None;
-    let mut mapfile = None;
+    let mut isos: Vec<PathBuf> = Vec::new();
+    let mut mapfiles: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let p = entry.path();
-        let name = p.file_name()?.to_string_lossy().into_owned();
-        if name.ends_with(".iso.mapfile") || name.ends_with(".mapfile") {
-            mapfile = Some(p);
+        let name = match p.file_name() {
+            Some(n) => n.to_string_lossy().into_owned(),
+            None => continue,
+        };
+        if name.ends_with(".mapfile") {
+            mapfiles.push(p);
         } else if name.ends_with(".iso") {
-            iso = Some(p);
+            isos.push(p);
         }
     }
-    Some((iso?, mapfile?))
+    // Exactly one ISO, or we can't say which staging artefact is the
+    // real one — refuse to guess.
+    if isos.len() != 1 {
+        if isos.len() > 1 {
+            tracing::warn!(
+                dir = %dir.display(),
+                count = isos.len(),
+                "resume: multiple .iso files in staging dir — ambiguous, not resuming"
+            );
+        }
+        return None;
+    }
+    let iso = isos.into_iter().next()?;
+    let iso_name = iso.file_name()?.to_string_lossy().into_owned();
+    // Canonical mapfile is `<iso-name>.mapfile` (the orchestrator names
+    // it `<sanitized>.iso.mapfile`). Match exactly on that.
+    let want = format!("{}.mapfile", iso_name);
+    let mapfile = mapfiles.into_iter().find(|m| {
+        m.file_name()
+            .map(|n| n.to_string_lossy() == want.as_str())
+            .unwrap_or(false)
+    })?;
+    Some((iso, mapfile))
 }
 
 /// Delete the partial MKV (or `.m2ts`) at `<dir>/<sanitized>.<ext>`.
@@ -201,19 +270,19 @@ pub fn delete_partial_output(staging_disc_dir: &Path, sanitized_name: &str) {
     }
 }
 
-/// The action half of the auto-resume flow.
+/// Reset the device to a terminal idle/error UI state at any early-return
+/// site inside [`resume_remux`], whether or not `status="ripping"` was
+/// ever set. Preserves disc identity (so the dashboard tile keeps its
+/// title / format / duration) and zeroes everything else via
+/// `Default::default()`.
 ///
-/// Reset the device's UI state from "ripping" → `terminal_status`
-/// after an early-return inside [`resume_remux`]. Preserves disc
-/// identity (so the dashboard tile keeps its title / format /
-/// duration) and zeroes everything else via `Default::default()`.
-///
-/// Called from every early-return site that happens AFTER the
-/// initial `status="ripping"` update at the top of `resume_remux`.
-/// Without this, the API state stays stuck at "ripping" forever and
-/// the "already ripping" gate in `web.rs::handle_rip` rejects all
-/// subsequent /api/rip requests. Mirrors `rip_disc`'s
-/// stopped → "idle" pattern.
+/// Several callers (the config-poison, scan, and key-resolution early
+/// returns) run BEFORE the `status="ripping"` update, but the reset is
+/// still correct there — it just writes the terminal state directly.
+/// When it runs after "ripping" was set, it un-sticks the API state so
+/// the "already ripping" gate in `web.rs::handle_rip` doesn't reject all
+/// subsequent /api/rip requests. Mirrors `rip_disc`'s stopped → "idle"
+/// pattern.
 fn reset_status_after_ripping(
     device: &str,
     terminal_status: &str,
@@ -238,10 +307,18 @@ fn reset_status_after_ripping(
     );
 }
 
-/// Preconditions enforced by the caller:
-/// - `classification` is `ResumeClass::Remux { .. }`
-/// - the per-device `Halt` token has been (re-)registered by the
-///   spawn site (mirrors how `rip_disc` is entered)
+/// Callers and what they actually provide:
+/// - `handle_rip_request` (real device) passes a `ResumeClass::Remux`
+///   from `find_resumable_for_disc` and the spawn site has already
+///   registered the per-device `Halt` token (same as `rip_disc`).
+/// - `remux_from_ripped_marker` (the `_mux` worker path) passes a
+///   freshly-built `ResumeClass::Remux` but does NOT register a `Halt`
+///   token for the `_mux` pseudo-device.
+///
+/// So neither precondition is relied upon here: a non-`Remux`
+/// classification is handled by the early-return below (logged as a
+/// caller bug rather than assumed away), and the halt-token lookups in
+/// the mux loop tolerate an absent token (the `_mux` path).
 ///
 /// On success: writes `.completed` + clears `.restart_count`. On any
 /// failure (scan_image, mux open, mux loop): preserves the partial
@@ -250,7 +327,7 @@ fn reset_status_after_ripping(
 pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: ResumeClass) {
     let ResumeClass::Remux {
         iso_path,
-        mapfile_path: _mapfile_path,
+        mapfile_path,
         display_name,
     } = classification
     else {
@@ -265,7 +342,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
 
     let cfg_read = match cfg.read() {
         Ok(c) => c.clone(),
-        Err(_) => return,
+        Err(_) => {
+            // status="ripping" is not set yet here so there is no stuck
+            // gate, but leave a trace so the silently-vanished resume is
+            // diagnosable instead of disappearing with zero explanation.
+            crate::log::device_log(device, "Auto-resume aborted: config lock poisoned");
+            return;
+        }
     };
 
     let staging_dir = iso_path
@@ -318,6 +401,20 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 device,
                 &format!("Auto-resume aborted: scan_image failed: {}", e),
             );
+            // The live-device dispatch (`handle_rip_request` → `scan_disc`)
+            // already moved this device to status="scanning". Bailing here
+            // without resetting wedges the "already ripping" gate in
+            // `web.rs::handle_rip` so no further /api/rip is accepted. Reset
+            // to idle so the operator can retry. (For the `_mux` worker
+            // device this is a harmless no-op — nothing gates on it.)
+            super::update_state(
+                device,
+                super::RipState {
+                    device: device.to_string(),
+                    status: "idle".to_string(),
+                    ..Default::default()
+                },
+            );
             return;
         }
     };
@@ -334,28 +431,96 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             device,
             "Auto-resume aborted: scan_image produced no usable title",
         );
+        // Same wedge as the scan_image failure above: reset scanning → idle
+        // so the "already ripping" gate doesn't reject every later /api/rip.
+        super::update_state(
+            device,
+            super::RipState {
+                device: device.to_string(),
+                status: "idle".to_string(),
+                ..Default::default()
+            },
+        );
         return;
     }
 
     // Sample-based key source: read the disc's files + Volume ID (from the
     // mapfile) + on-disc samples (from the ISO), resolve a Unit Key, and re-scan
     // with it so decryption keys populate. No-op for a local source.
-    let (disc, _key_outcome) = resolve_keys_from_iso(&cfg_read, &iso_path, &_mapfile_path, disc);
+    let (disc, _key_outcome) = resolve_keys_from_iso(&cfg_read, &iso_path, &mapfile_path, disc);
 
     // Real-bitrate re-validation: now that we have the actual title,
     // recompute bytes-bad-in-title (vs the classifier's whole-disc
     // estimate) and re-check against abort_on_lost_secs.
-    let title = disc.titles[0].clone();
+    //
+    // Re-check `.first()` on the post-key `disc` binding rather than
+    // indexing `[0]`: `resolve_keys_from_iso` rebinds `disc` (line
+    // above), and although today it preserves titles, a future change
+    // that re-scans could leave it empty — index-into-empty would panic
+    // the rip thread. The earlier `title_ok` guard ran on the *pre-key*
+    // binding, so it doesn't cover this one.
+    let title = match disc.titles.first() {
+        Some(t) => t.clone(),
+        None => {
+            crate::log::device_log(device, "Auto-resume aborted: no title after key resolution");
+            reset_status_after_ripping(
+                device,
+                "idle",
+                &display_name,
+                "",
+                "",
+                Some("no title after key resolution".to_string()),
+            );
+            return;
+        }
+    };
     let title_bytes_per_sec: f64 = {
         let b = title.size_bytes as f64;
         let d = title.duration_secs;
         if b > 0.0 && d > 0.0 {
             b / d
         } else {
-            8_250_000.0
+            FALLBACK_BITRATE_BYTES_PER_SEC
         }
     };
-    if let Ok(map) = libfreemkv::disc::mapfile::Mapfile::load(&_mapfile_path) {
+    // Compute disc_format + duration up front so the abort/early-return
+    // paths below can surface them in the UI state (they were previously
+    // only available after the mux-build block).
+    let disc_format = match disc.format {
+        libfreemkv::DiscFormat::Uhd => "uhd",
+        libfreemkv::DiscFormat::BluRay => "bluray",
+        libfreemkv::DiscFormat::Dvd => "dvd",
+        libfreemkv::DiscFormat::Unknown => "unknown",
+    }
+    .to_string();
+    let duration = crate::util::format_duration_hm(title.duration_secs);
+    let map = match libfreemkv::disc::mapfile::Mapfile::load(&mapfile_path) {
+        Ok(m) => m,
+        Err(e) => {
+            // The classifier already loaded this mapfile cleanly; a
+            // failure here is a TOCTOU (file removed/corrupted/IO error
+            // between classify and act). We must NOT skip the per-title
+            // loss guard and mux blind — abort the resume and let the
+            // next pass re-classify against fresh state.
+            crate::log::device_log(
+                device,
+                &format!(
+                    "Auto-resume aborted: mapfile reload failed for loss re-validation: {}",
+                    e
+                ),
+            );
+            reset_status_after_ripping(
+                device,
+                "idle",
+                &display_name,
+                &disc_format,
+                &duration,
+                Some(format!("mapfile reload failed: {}", e)),
+            );
+            return;
+        }
+    };
+    {
         use libfreemkv::disc::mapfile::SectorStatus;
         let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
         let bad_in_title = libfreemkv::disc::bytes_bad_in_title(&title, &bad_ranges);
@@ -372,21 +537,26 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                     lost_secs, cfg_read.abort_on_lost_secs
                 ),
             );
+            reset_status_after_ripping(
+                device,
+                "idle",
+                &display_name,
+                &disc_format,
+                &duration,
+                Some(format!(
+                    "title loss {:.2}s exceeds threshold {}s",
+                    lost_secs, cfg_read.abort_on_lost_secs
+                )),
+            );
             return;
         }
     }
 
     // 4. Build MuxInputs + run mux exactly as rip_disc does.
-    let disc_format = match disc.format {
-        libfreemkv::DiscFormat::Uhd => "uhd",
-        libfreemkv::DiscFormat::BluRay => "bluray",
-        libfreemkv::DiscFormat::Dvd => "dvd",
-        libfreemkv::DiscFormat::Unknown => "unknown",
-    }
-    .to_string();
+    // (`disc_format` + `duration` were computed up front, above.)
     let format = disc.content_format;
     let keys = disc.decrypt_keys();
-    let batch = libfreemkv::disc::detect_max_batch_sectors("/dev/null");
+    let batch = libfreemkv::disc::detect_max_batch_sectors(DEFAULT_BATCH_PROBE_PATH);
 
     // Keyless-capture deferral: the ISO was swept raw (no keys needed),
     // but the MUX needs decryption keys. If this encrypted disc still has
@@ -406,8 +576,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                  Staging preserved; will mux automatically once keys are available."
             ),
         );
-        // Status reset is a no-op for state (we never set "ripping" yet —
-        // that happens below at line ~411), but set a clear non-error
+        // We have not set status="ripping" yet (that happens via the
+        // update_state call further below). reset_status_after_ripping
+        // actively writes status="idle" here — a clear non-error
         // terminal state that keeps the disc identity and surfaces the
         // deferral reason without flagging a hard failure.
         reset_status_after_ripping(
@@ -415,7 +586,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             "idle",
             &display_name,
             &disc_format,
-            &crate::util::format_duration_hm(title.duration_secs),
+            &duration,
             Some(format!("Ripped to ISO — no keys, mux deferred. {msg}")),
         );
         return;
@@ -435,7 +606,6 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         format!("{}://{}", ext, output_path)
     };
 
-    let duration = crate::util::format_duration_hm(title.duration_secs);
     let total_bytes = if disc.capacity_bytes > 0 {
         disc.capacity_bytes
     } else {
@@ -447,7 +617,18 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     super::register_halt(device, libfreemkv::Halt::new());
     let halt_token = match super::device_halt(device) {
         Some(h) => h,
-        None => libfreemkv::Halt::new(),
+        None => {
+            // `register_halt` no-ops when the HALTS mutex is poisoned, so
+            // device_halt then returns None. The fallback token below was
+            // never inserted into HALTS, so /api/stop's lookup can't find
+            // it and this resume mux would be uncancellable. Surface it so
+            // the degraded stop guarantee is at least visible in the log.
+            crate::log::device_log(
+                device,
+                "Warning: halt registry unavailable (poisoned); this resume mux will not be stoppable via /api/stop",
+            );
+            libfreemkv::Halt::new()
+        }
     };
 
     super::update_state(
@@ -494,7 +675,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // same producer-thread BytesRead events for the UI. No skip-
     // errors plumbing because the on-disk ISO is already clean (any
     // sweep-pass loss got zero-filled in Pass 1).
-    let input: Box<dyn libfreemkv::pes::Stream> = Box::new(libfreemkv::build_iso_pipeline(
+    let input: Box<dyn libfreemkv::pes::Stream> = match libfreemkv::build_iso_pipeline(
         reader,
         title,
         keys,
@@ -502,7 +683,28 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         format,
         Some(halt_token.clone()),
         None,
-    ));
+    ) {
+        Ok(s) => Box::new(s),
+        Err(e) => {
+            tracing::error!(target: "mux", device=%device, "build_iso_pipeline failed: {e}");
+            crate::log::device_log(
+                device,
+                &format!("Auto-resume aborted: mux pipeline build failed: {}", e),
+            );
+            // Reset from "ripping" (set above) → "error" so the next
+            // /api/rip isn't blocked by the "already ripping" gate.
+            reset_status_after_ripping(
+                device,
+                "error",
+                &display_name,
+                &disc_format,
+                &duration,
+                Some(format!("Mux pipeline build failed: {}", e)),
+            );
+            super::unregister_halt(device);
+            return;
+        }
+    };
 
     let latest_bytes_read = Arc::new(AtomicU64::new(0));
     let rip_last_lba = Arc::new(AtomicU64::new(0));
@@ -529,6 +731,31 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             )
         })
         .unwrap_or_default();
+
+    // Title-confidence gate — mirror rip_disc's completion path
+    // (mod.rs: `if title_confident { ".done" } else { ".review" }`).
+    // Auto-resume previously wrote `.done` unconditionally, auto-filing a
+    // resumed rip into the library under a possibly-guessed title and
+    // bypassing the operator-review hold the fresh-rip path enforces.
+    // Compute confidence the same way: an exact normalized-title match
+    // that carries a year, comparing the resolved TMDB title against the
+    // disc's own label. No operator-override concept exists on the resume
+    // path, so confidence is purely the match check.
+    let disc_label = disc
+        .meta_title
+        .as_deref()
+        .unwrap_or(&disc.volume_id)
+        .to_string();
+    let title_for_match = if tmdb_title.is_empty() {
+        display_name.clone()
+    } else {
+        tmdb_title.clone()
+    };
+    let title_confident = crate::tmdb::is_confident_match(
+        &crate::tmdb::clean_title(&disc_label),
+        &title_for_match,
+        tmdb_year,
+    );
 
     let mux_outcome = super::mux::run_mux(
         super::mux::MuxInputs {
@@ -563,7 +790,6 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             bytes_unreadable_at_mux: 0,
             dest_url,
             batch,
-            skip_errors: true,
             staging_disc_dir: staging_dir.clone(),
         },
         input,
@@ -591,23 +817,63 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         return;
     }
 
-    // 5. Success — write .completed marker, drop .done hand-off
-    // marker for the mover, clear .restart_count. Same shape as the
-    // rip_disc completion path so the mover treats this output
-    // identically.
+    // 5. Success — write .completed marker, drop the hand-off marker for
+    // the mover, clear .restart_count. Same shape as the rip_disc
+    // completion path so the mover treats this output identically.
+    //
+    // Honor the SAME title-confidence gate the fresh-rip path uses: a
+    // confident match (.done) hands straight to the mover; a low-confidence
+    // match (.review) HOLDS the rip for operator review instead of
+    // auto-filing it under a guessed name. Unconditionally writing .done
+    // here bypassed that hold for every resumed rip.
+    let marker_name = if title_confident { ".done" } else { ".review" };
     let done_marker = serde_json::json!({
         "title": display_name,
         "format": disc_format,
+        "year": tmdb_year,
         "date": crate::util::format_date(),
         "resumed": true,
     });
-    let done_path = staging_dir.join(".done");
-    let _ = std::fs::write(
+    let done_path = staging_dir.join(marker_name);
+    if let Err(e) = std::fs::write(
         &done_path,
         serde_json::to_string_pretty(&done_marker).unwrap_or_default(),
-    );
+    ) {
+        // The hand-off marker is what the mover / review UI keys on. If it
+        // fails to write (NFS / perms), do NOT write .completed or clear
+        // .restart_count — leaving the partial state intact means the
+        // next restart's resume_or_quarantine_staging re-attempts the
+        // hand-off rather than stranding a finished MKV in staging with
+        // no surfaced error and a "completed" accounting that the mover
+        // never sees.
+        crate::log::device_log(
+            device,
+            &format!(
+                "Auto-resume: {} marker write failed ({}): {}. \
+                 Preserving staging for next-restart retry.",
+                marker_name,
+                done_path.display(),
+                e
+            ),
+        );
+        reset_status_after_ripping(
+            device,
+            "error",
+            &display_name,
+            &disc_format,
+            &duration,
+            Some(format!("{} marker write failed: {}", marker_name, e)),
+        );
+        return;
+    }
     staging::write_completed_marker(&staging_dir);
     staging::clear_restart_count(&staging_dir);
+    if !title_confident {
+        crate::log::device_log(
+            device,
+            "Auto-resume: title match not confident — held for operator review (.review)",
+        );
+    }
 
     super::update_state(
         device,
@@ -689,8 +955,17 @@ pub(crate) fn remux_from_ripped_marker(
     let success = staging_dir.join(".completed").exists();
     if success {
         // Hand-off consumed. Drop the marker so this dir doesn't get
-        // re-queued on the next muxer tick.
-        let _ = crate::muxer::delete_marker(staging_dir);
+        // re-queued on the next muxer tick. If the delete fails, surface
+        // it: the `.completed` guard in `check_and_mux` now prevents an
+        // infinite re-mux loop even when `.ripped` lingers, but a stuck
+        // marker is still worth a warning so the operator can clear it.
+        if let Err(e) = crate::muxer::delete_marker(staging_dir) {
+            tracing::warn!(
+                staging = %staging_dir.display(),
+                error = %e,
+                "failed to delete .ripped marker after successful mux; .completed guard prevents re-mux"
+            );
+        }
         // Clean up the synthetic STATE entry so the device tile grid
         // (which already filters underscore keys, but still — be tidy)
         // doesn't accumulate per-mux ghosts.
@@ -727,5 +1002,68 @@ fn resolve_keys_from_iso(
 // `classify_resume` + `delete_partial_output` directly. The deeper
 // integration paths (`Disc::scan_image` + `run_mux` against a real
 // UDF ISO) are covered by the live test bed only — feeding synthetic
-// bytes into `scan_image` reliably fails (project docs hard rule re:
-// live-drive testing), so unit tests cap at the boundary helpers.
+// bytes into `scan_image` reliably fails, so unit tests cap at the
+// boundary helpers rather than exercising the disc-read path.
+//
+// `find_iso_and_mapfile` is `pub(super)` (not reachable from the
+// integration test crate), so its deterministic-pairing contract is
+// unit-tested in-module here.
+
+#[cfg(test)]
+mod find_iso_tests {
+    use super::find_iso_and_mapfile;
+    use std::fs;
+
+    fn tmpdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        // Repo-local scratch, never /tmp — anchor to the crate's own
+        // target/ dir so artifacts are cleaned by `cargo clean` (mirrors
+        // the staging.rs test helper).
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!(
+                "autorip-find-iso-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+            ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn pairs_iso_with_matching_mapfile() {
+        let d = tmpdir();
+        fs::write(d.join("Movie.iso"), b"x").unwrap();
+        fs::write(d.join("Movie.iso.mapfile"), b"x").unwrap();
+        let (iso, map) = find_iso_and_mapfile(&d).expect("should pair");
+        assert!(iso.ends_with("Movie.iso"));
+        assert!(map.ends_with("Movie.iso.mapfile"));
+    }
+
+    #[test]
+    fn rejects_when_mapfile_does_not_match_iso() {
+        let d = tmpdir();
+        fs::write(d.join("Movie.iso"), b"x").unwrap();
+        // Mapfile keyed to a *different* ISO name — must not be paired.
+        fs::write(d.join("Other.iso.mapfile"), b"x").unwrap();
+        assert!(find_iso_and_mapfile(&d).is_none());
+    }
+
+    #[test]
+    fn rejects_multiple_isos_as_ambiguous() {
+        let d = tmpdir();
+        fs::write(d.join("A.iso"), b"x").unwrap();
+        fs::write(d.join("A.iso.mapfile"), b"x").unwrap();
+        fs::write(d.join("B.iso"), b"x").unwrap();
+        assert!(find_iso_and_mapfile(&d).is_none());
+    }
+
+    #[test]
+    fn rejects_missing_mapfile() {
+        let d = tmpdir();
+        fs::write(d.join("Movie.iso"), b"x").unwrap();
+        assert!(find_iso_and_mapfile(&d).is_none());
+    }
+}

@@ -1,12 +1,11 @@
 //! Tests for the 0.20.8 hang-path fixes that touch autorip-side code.
 //!
 //! Covers:
-//!   - Finding 24 (hard watchdog must not touch NFS before exit): the
-//!     hand-rolled bounded-syscall pattern around
-//!     `increment_restart_count` returns within its 5 s deadline even
-//!     when the underlying call would never complete; on the happy
-//!     path the counter does increment.
-//!   - Finding 22 (cfg.write() must drop guard before Config::save):
+//!   - hard watchdog must not touch NFS before exit: the hand-rolled
+//!     bounded-syscall pattern around `increment_restart_count` returns
+//!     within its 5 s deadline even when the underlying call would never
+//!     complete; on the happy path the counter does increment.
+//!   - cfg.write() must drop guard before Config::save:
 //!     `handle_settings_post` releases the write lock before invoking
 //!     the on-disk save, and the on-disk file matches the snapshot.
 //!
@@ -104,7 +103,7 @@ fn watchdog_counter_bump_times_out_when_op_hangs() {
 
 #[test]
 fn handle_settings_post_drops_write_guard_before_save() {
-    // Finding 22: after `handle_settings_post` returns, the
+    // After `handle_settings_post` returns, the
     // `RwLock<Config>` must be in a state where a fresh writer can
     // acquire it without contention — i.e. the handler's write guard
     // is dropped before the on-disk save. The pre-fix code held the
@@ -144,7 +143,7 @@ fn handle_settings_post_drops_write_guard_before_save() {
 
     // Persist the snapshot. Note: with this Config's `autorip_dir`
     // pointing at the tempdir, save writes settings.json there.
-    freemkv_autorip::config::save(&snapshot);
+    freemkv_autorip::config::save(&snapshot).expect("save to tempdir should succeed");
 
     let settings_path = std::path::Path::new(&autorip_dir).join("settings.json");
     assert!(settings_path.exists(), "settings.json should exist");

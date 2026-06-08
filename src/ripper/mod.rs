@@ -1,19 +1,19 @@
 //! Rip orchestrator — drive poll loop + scan/rip/eject entry points.
 //!
-//! 0.18 prep: this module was a single 4350-line `ripper.rs`. The
+//! This module was originally a single 4350-line `ripper.rs`. The
 //! state types, thread/halt bookkeeping, and staging-dir helpers have
 //! been lifted into sibling sub-modules (`state`, `session`,
 //! `staging`). The high-level orchestration — `drive_poll_loop`,
-//! `scan_disc`, `rip_disc`, `eject_drive` — stays here. Sweep + mux
-//! sub-modules exist as placeholders for the 0.18 trait-migration
-//! commit that will lift those loops out of `rip_disc`.
+//! `scan_disc`, `rip_disc`, `eject_drive` — stays here. The `mux`
+//! sub-module holds the active parallel mux "highway" (consumer/
+//! producer split + watchdog); the multipass sweep loop still lives
+//! inline in `rip_disc`. (`sweep` remains an empty placeholder.)
 
 pub(crate) mod mux;
 pub mod resume;
 mod session;
 pub mod staging;
 pub mod state;
-mod sweep;
 
 // Re-export every symbol the rest of the crate (and integration tests)
 // addresses as `crate::ripper::*`. Names that aren't reached for
@@ -163,8 +163,11 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     // auto-resume re-mux path or falls through to `rip_disc` as
     // before. Map is `BTreeMap` for deterministic logging order;
     // size is bounded by the number of staging subdirs (small).
-    let mut resume_map: std::collections::BTreeMap<String, resume::ResumeClass> =
-        std::collections::BTreeMap::new();
+    // Startup staging scan. This runs `resume_or_quarantine_staging`
+    // for its side-effect (quarantine of terminally-failed dirs) and
+    // logging. We no longer build a `resume_map` from it: resume is
+    // user-gated and recomputed on demand via `find_resumable_for_disc`,
+    // so the prior per-disc classification BTreeMap was dead work.
     if let Ok(c) = cfg.read() {
         let hints = staging::resume_or_quarantine_staging(&c.staging_dir);
         tracing::info!(
@@ -173,29 +176,17 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
             "staging resume scan complete"
         );
         for hint in &hints {
-            tracing::info!(
-                dir = %hint.dir.display(),
-                action = ?hint.action,
-                "staging resume hint"
-            );
-            let key = hint
-                .dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if key.is_empty() {
-                continue;
-            }
+            // Classify for the log only (resume itself is recomputed on
+            // demand via find_resumable_for_disc); no map is retained.
             let class = resume::classify_resume(hint, c.abort_on_lost_secs);
             tracing::info!(
                 dir = %hint.dir.display(),
+                action = ?hint.action,
                 classification = ?class,
-                "resume classification"
+                "staging resume hint"
             );
-            resume_map.insert(key, class);
         }
     }
-    let resume_map = Arc::new(resume_map);
 
     let initial_drives = libfreemkv::list_drives();
     let mut drive_paths: Vec<String> = initial_drives.iter().map(|d| d.path.clone()).collect();
@@ -415,7 +406,6 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     let cfg = cfg.clone();
                     let dev_path = path.clone();
                     let device_for_thread = device.clone();
-                    let resume_map_thread = resume_map.clone();
 
                     // Allocate the rip's single `Halt` token at the spawn
                     // site so the HTTP /api/stop/{device} handler can find
@@ -452,7 +442,6 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     // on_insert at the default "scan", or set
                     // "nothing" to skip even the scan.
                     let do_auto_rip = on_insert == "rip";
-                    let _ = resume_map_thread; // resume is user-gated
                     let cfg_for_thread = cfg.clone();
                     let dev_path_for_thread = dev_path.clone();
                     if let Err(e) = spawn_rip_thread(&device, "rip", move || {
@@ -869,10 +858,13 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
     for entry in entries.flatten() {
         let path = entry.path();
         let basename = path.file_name()?.to_string_lossy().into_owned();
-        if basename == sanitized
-            || basename.starts_with(&sanitized)
-            || sanitized.starts_with(&basename)
-        {
+        // Match the disc's own staging dir. We accept an exact match, or
+        // a dir whose name *starts with* our sanitized name (covers a
+        // suffixed dir like "Dune (2021) [UHD]"). We deliberately do NOT
+        // accept the reverse (`sanitized.starts_with(&basename)`): that
+        // let a SHORTER stale dir like "Du" latch onto disc "Dune" — i.e.
+        // resume onto a different title's partial data.
+        if basename == sanitized || basename.starts_with(&sanitized) {
             // User-initiated resume bypasses any `.failed` or
             // `.completed` markers — the user clicked Rip with
             // resume=yes and that is the authoritative signal.
@@ -894,7 +886,14 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
             if stats.bytes_pending != 0 {
                 continue;
             }
-            let lost_secs = stats.bytes_unreadable as f64 / 8_250_000.0;
+            // Pre-filter loss estimate: whole-disc bad bytes over the
+            // generic-BD fallback bitrate (we have no DiscTitle here, same
+            // constraint as `classify_resume`). `>` matches both
+            // `classify_resume` and the authoritative title-scoped
+            // re-check in `resume_remux`, which runs after `scan_image`
+            // and is what ultimately gates the mux. Shared constant so
+            // the bitrate can't drift from the other call sites.
+            let lost_secs = stats.bytes_unreadable as f64 / resume::FALLBACK_BITRATE_BYTES_PER_SEC;
             if lost_secs > cfg_read.abort_on_lost_secs as f64 {
                 continue;
             }
@@ -910,6 +909,26 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
         }
     }
     None
+}
+
+/// True if `seg` is safe to use as a single staging-directory path
+/// segment. Rejects values that could escape the staging root or
+/// resolve to it: empty, all-dots (`.`, `..`, `...`), anything
+/// containing a path separator, and absolute paths. `display_name`
+/// derives from untrusted disc bytes / TMDB JSON, and the sanitizer
+/// (`util::sanitize_path_compact`) keeps `.` and does not reject these,
+/// so a disc label of `..` would otherwise make
+/// `join("..")` + `remove_dir_all` delete the PARENT of staging.
+fn is_safe_staging_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && !seg.chars().all(|c| c == '.')
+        && !seg.contains('/')
+        && !seg.contains('\\')
+        && std::path::Path::new(seg).components().count() == 1
+        && matches!(
+            std::path::Path::new(seg).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
 }
 
 /// Wipe the staging subdir for the currently-scanned disc. Used by
@@ -929,7 +948,32 @@ fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
         return;
     }
     let sanitized = crate::util::sanitize_path_compact(&display_name);
-    let path = std::path::Path::new(&cfg_read.staging_dir).join(&sanitized);
+    // Defence-in-depth: never let an untrusted disc label sanitize to a
+    // segment that escapes (or resolves to) the staging root. Without
+    // this a label of `..` makes `join("..")` point at staging's parent
+    // and `remove_dir_all` would delete it.
+    if !is_safe_staging_segment(&sanitized) {
+        crate::log::device_log(
+            device,
+            &format!("Refusing to wipe staging: unsafe sanitized dir name {sanitized:?}"),
+        );
+        return;
+    }
+    let staging_root = std::path::Path::new(&cfg_read.staging_dir);
+    let path = staging_root.join(&sanitized);
+    // Belt-and-braces: confirm the join stays strictly inside the
+    // staging root before removing anything.
+    if path.parent() != Some(staging_root) {
+        crate::log::device_log(
+            device,
+            &format!(
+                "Refusing to wipe staging: {} is not a direct child of {}",
+                path.display(),
+                staging_root.display()
+            ),
+        );
+        return;
+    }
     if path.exists() {
         match std::fs::remove_dir_all(&path) {
             Ok(_) => crate::log::device_log(
@@ -962,10 +1006,11 @@ fn resumable_for_disc(cfg: &Config, display_name: &str) -> Option<Resumable> {
             Some(n) => n.to_string_lossy().into_owned(),
             None => continue,
         };
-        if !(basename == sanitized
-            || basename.starts_with(&sanitized)
-            || sanitized.starts_with(&basename))
-        {
+        // Exact match or a dir suffixed past our sanitized name only.
+        // Not the reverse (`sanitized.starts_with(&basename)`), which
+        // would let a shorter stale dir ("Du") match disc "Dune" and
+        // resume onto the wrong title's partial data.
+        if !(basename == sanitized || basename.starts_with(&sanitized)) {
             continue;
         }
         let (_iso_path, mapfile_path) = match resume::find_iso_and_mapfile(&path) {
@@ -1002,6 +1047,20 @@ fn resumable_for_device(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<Resum
     resumable_for_disc(&cfg_read, &display_name)
 }
 
+/// RAII guard that unregisters a device's halt-map entry on drop. Created
+/// immediately after `register_halt` in `rip_disc` so every exit path —
+/// early-return error branches, the normal tail, and panics — cleans up the
+/// entry. See the v0.13.6 halt-map-leak class.
+struct HaltGuard {
+    device: String,
+}
+
+impl Drop for HaltGuard {
+    fn drop(&mut self) {
+        unregister_halt(&self.device);
+    }
+}
+
 /// Rip a disc. Reuses the existing drive session from scan_disc.
 /// If no session exists, opens fresh (for on_insert=rip).
 ///
@@ -1019,6 +1078,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // from a prior rip on the same device must NOT survive into this
     // rip's checks.
     register_halt(device, libfreemkv::Halt::new());
+
+    // RAII cleanup for the halt-map entry. Every exit path from `rip_disc`
+    // (including the many early returns on scan/open/keys/staging errors)
+    // must drop this device's `Halt` so a subsequent rip starts with a
+    // fresh token; leaking it on an error path was the v0.13.6 class of
+    // bug. Holding the guard for the function's whole body guarantees the
+    // `unregister_halt` runs on return, panic, and `?`-style early exits
+    // alike. `unregister_halt` is idempotent (a `HashMap::remove`), so it
+    // composes safely with the eject path that also unregisters.
+    let _halt_guard = HaltGuard {
+        device: device.to_string(),
+    };
 
     // Archive the previous rip's per-device log so the live log only
     // shows events from the current attempt. Mirrors what scan_disc
@@ -1332,13 +1403,33 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     };
 
     let staging = cfg_read.staging_device_dir(&crate::util::sanitize_path_compact(&display_name));
-    let _ = std::fs::create_dir_all(&staging);
+    if let Err(e) = std::fs::create_dir_all(&staging) {
+        // Bail loudly instead of pressing on: a missing staging dir
+        // makes the free-space preflight skip its check and the sweep
+        // later dies with a confusing ENOENT/EACCES far from the cause.
+        crate::log::device_log(device, &format!("Cannot create staging dir {staging}: {e}"));
+        update_state_with(device, |s| {
+            s.status = "error".to_string();
+            if s.last_error.is_empty() {
+                s.last_error = format!("cannot create staging dir: {e}");
+            }
+        });
+        unregister_halt(device);
+        return;
+    }
     let filename = format!(
         "{}.{}",
         crate::util::sanitize_path_compact(&display_name),
         ext
     );
     let output_path = format!("{}/{}", staging, filename);
+    // Intermediate-ISO + mapfile-sidecar paths for multipass mode, derived
+    // once here from `staging` + `display_name`. Only the `max_retries > 0`
+    // branch writes/reads these; single-pass rips never produce an ISO. They
+    // were previously rebuilt at ~5 sites scattered through this function.
+    let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
+    let iso_path_str = format!("{staging}/{iso_filename}");
+    let mapfile_path_str = format!("{iso_path_str}.mapfile");
     let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
         format!("network://{}", cfg_read.network_target)
     } else {
@@ -1374,7 +1465,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         if b > 0.0 && d > 0.0 {
             b / d
         } else {
-            8_250_000.0
+            resume::FALLBACK_BITRATE_BYTES_PER_SEC
         }
     };
 
@@ -1397,7 +1488,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // here in autorip that holds a `halt.clone()`.
     let drive_halt_arc = session.drive.halt_flag();
     let halt_token = libfreemkv::Halt::from_arc(drive_halt_arc.clone());
+    // Carry a Stop that landed on the OLD (placeholder) token in the
+    // window between the dispatch-site cancellation check and this swap
+    // into the new token. Without this, the first stop click would
+    // cancel a token nobody reads again and silently no-op (the user
+    // would have to click again).
+    let prior_cancelled = device_halt(device)
+        .map(|h| h.is_cancelled())
+        .unwrap_or(false);
     register_halt(device, halt_token.clone());
+    if prior_cancelled {
+        halt_token.cancel();
+    }
     // Local alias: pre-existing call sites refer to `halt` as the
     // legacy `Arc<AtomicBool>`. Keep the same name so the watcher
     // helpers (which still take `Arc<AtomicBool>`) compile unchanged
@@ -1405,13 +1507,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // `Disc::copy()` in round 3.
     let halt = drive_halt_arc;
 
-    // Rip-level wallclock budget (Fix 3). Caps the ENTIRE rip — all passes
-    // combined — at max(disc_runtime, 1h). Implemented as a background thread
-    // that sleeps for the budget then fires halt if the rip hasn't finished.
-    // Per-pass caps (spawn_pass_watcher) still apply as a finer-grained
-    // safety net; this is the backstop so a rip can't run forever even if
-    // individual passes keep resetting their timers. Configurable via
-    // MAX_RIP_DURATION_SECS env var or settings.json.
+    // Rip-level wallclock watcher. Historically capped the ENTIRE rip at
+    // max(disc_runtime, 1h); the cap itself was removed 2026-06-04 (the
+    // watcher now just exits silently when the budget elapses — see the
+    // body below). Kept as a no-op poll loop that bails cleanly on
+    // rip_complete / halt. Configurable via MAX_RIP_DURATION_SECS.
     // Snapshot every cfg field the rip needs upfront, then drop the read
     // lock immediately. Pre-fix this binding shadowed the outer `cfg`
     // RwLock<Config> with the read guard for the entire `rip_disc` body,
@@ -1422,13 +1522,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // too — so `/api/settings`, `/api/history`, `/api/system` all stop
     // responding until the rip ends. `/api/state` survived because it
     // uses a separate lock.
-    let (rip_budget_secs, min_pass_budget_secs, transport_recovery_delay_secs) = {
-        let c = cfg.read().unwrap();
-        (
-            c.max_rip_duration_secs,
-            c.min_pass_budget_secs,
-            c.transport_recovery_delay_secs,
-        )
+    let (rip_budget_secs, transport_recovery_delay_secs) = {
+        // Recover the guard if the RwLock is poisoned (a settings writer
+        // panicked mid-write) rather than unwrapping and killing the rip
+        // thread — the snapshotted config values are still valid to read.
+        // Every other cfg read in this file degrades gracefully; this was
+        // the lone `.unwrap()`.
+        let c = cfg.read().unwrap_or_else(|e| e.into_inner());
+        (c.max_rip_duration_secs, c.transport_recovery_delay_secs)
     };
     // Rip-level wallclock watcher. Cancellable via `rip_complete` —
     // when the main rip thread finishes (success or graceful eject),
@@ -1483,29 +1584,25 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     }
     let _rip_complete_guard = RipCompleteGuard(rip_complete);
 
-    // Per-pass wallclock budget. Each pass (Pass 1 sweep + every retry) gets
-    // its own `max(disc_runtime, min_budget)` budget. Configurable via
-    // MIN_PASS_BUDGET_SECS env var or settings.json. If ANY pass exceeds
-    // its budget the rip ends with status=error (see cap_fired_any tracking below).
-    let chosen_runtime_secs: u64 = title.duration_secs.max(0.0) as u64;
-    let max_pass_secs = chosen_runtime_secs.max(min_pass_budget_secs);
+    // Per-pass user-stop forwarding. The per-pass wall-clock cap was
+    // removed 2026-06-04: a pass is bounded by its own work +
+    // libfreemkv's failure/stall watchdogs, never an arbitrary clock, so
+    // MIN_PASS_BUDGET_SECS no longer gates anything here.
     struct WallclockGuard(Arc<AtomicBool>);
     impl Drop for WallclockGuard {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Relaxed);
         }
     }
-    // Fires per-pass watcher. Returns a guard that, on drop, stops the
-    // watcher thread. While alive: forwards user_halt → pass_halt; fires
-    // cap_fired (and pass_halt) when wall-clock exceeds max_secs; writes
-    // a per-pass `last_error` for UI surfacing.
+    // Per-pass user-stop forwarder. Returns a guard that, on drop, stops
+    // the watcher thread. While alive it only forwards a user stop
+    // (`user_halt`) into the per-pass `pass_halt` flag. The per-pass
+    // wall-clock cap was REMOVED (2026-06-04): a pass is bounded by its
+    // own work + libfreemkv's failure/stall watchdogs, never an arbitrary
+    // clock — so this is no longer a "watcher", just a halt bridge.
     fn spawn_pass_watcher(
-        _pass_label: String,
-        _device: String,
         pass_halt: Arc<AtomicBool>,
         user_halt: Arc<AtomicBool>,
-        _cap_fired: Arc<AtomicBool>,
-        _max_secs: u64,
     ) -> WallclockGuard {
         let active = Arc::new(AtomicBool::new(true));
         let active_for_watcher = active.clone();
@@ -1522,18 +1619,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 if pass_halt.load(Ordering::Relaxed) {
                     return;
                 }
-                // Per-pass wall-clock cap REMOVED (2026-06-04): a pass is
-                // bounded by its own work + libfreemkv's failure/stall
-                // watchdogs, never an arbitrary clock. This watcher now only
-                // forwards a user stop (above) into the pass halt flag.
             }
         });
         WallclockGuard(active)
     }
-    // True if ANY pass cap-fired during this rip. v0.13.15: when true, mux
-    // is skipped and status=error; ISO is retained in staging for manual
-    // salvage. False = all passes completed naturally → mux normally.
-    let cap_fired_any = Arc::new(AtomicBool::new(false));
     // The user-stop halt — the existing flag. Pass-specific halts forward
     // from this via spawn_pass_watcher. Renamed locally for clarity.
     let user_halt = halt.clone();
@@ -1586,8 +1675,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let mut bytes_unreadable_at_mux: u64 = 0;
 
     let reader: Box<dyn libfreemkv::SectorSource> = if cfg_read.max_retries > 0 {
-        let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
-        let iso_path_str = format!("{}/{}", staging, iso_filename);
         let iso_path = std::path::Path::new(&iso_path_str);
         let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
 
@@ -1600,12 +1687,23 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // Without this, a UHD rip on a too-small disk runs ~30 minutes
         // before ENOSPC at the boundary; user loses the time and the
         // staging dir is left half-full of partial ISO (cleanup on
-        // ENOSPC failure isn't perfect — see audit finding #13).
+        // ENOSPC failure isn't perfect).
         // Escape hatch: AUTORIP_SKIP_DISKCHECK=1 bypasses the pre-flight
         // check. Used to deliberately rip onto a smaller volume than 2×
         // disc capacity for diagnostics (speed isolation, partial ISO
         // tests). The rip will run and predictably ENOSPC mid-stream;
         // the operator accepts that. Don't use in production.
+        if bytes_total_disc == 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
+            // read_capacity() returned 0/unknown, so we can't compute the
+            // 2×-capacity requirement. Don't silently skip the preflight —
+            // tell the operator why the space check didn't run, so an
+            // eventual mid-stream ENOSPC isn't a surprise.
+            crate::log::device_log(
+                device,
+                "disk-space preflight skipped: drive reported unknown capacity (read_capacity=0); \
+                 a too-small staging volume will ENOSPC mid-rip",
+            );
+        }
         if bytes_total_disc > 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
             let required = bytes_total_disc.saturating_mul(2);
             if let Some(avail) = staging_free_bytes(&staging) {
@@ -1645,30 +1743,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             max_retries: cfg_read.max_retries,
         };
         let title_for_progress = title.clone();
-        let mapfile_path_str = format!("{iso_path_str}.mapfile");
         let bps_progress = title_bytes_per_sec;
 
         // Pass 1: disc → ISO (fast sweep, skip-forward on failure).
         let pass_label = format!("Pass 1/{total_passes}: disc → ISO");
         crate::log::device_log(device, &pass_label);
         set_pass_progress(
-            device,
-            &display_name,
-            &disc_format,
-            &tmdb_title,
-            tmdb_year,
-            &tmdb_poster,
-            &tmdb_overview,
-            &duration,
-            &codecs,
-            &filename,
+            &pass_ctx,
             1,
             total_passes,
             0, // bytes_good
             0, // bytes_maybe
             0, // bytes_lost
-            bytes_total_disc,
-            batch,
         );
 
         // Progress callback — runs every read block (~64 KB). Throttle the
@@ -1706,14 +1792,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // aborts, but the mapfile captures all progress. We retry with
         // resume=true after re-opening the drive on its new device path.
         let pass1_halt = Arc::new(AtomicBool::new(false));
-        let _pass1_guard = spawn_pass_watcher(
-            "Pass 1".to_string(),
-            device.to_string(),
-            pass1_halt.clone(),
-            user_halt.clone(),
-            cap_fired_any.clone(),
-            max_pass_secs,
-        );
+        let _pass1_guard = spawn_pass_watcher(pass1_halt.clone(), user_halt.clone());
 
         const MAX_PASS1_ATTEMPTS: u32 = 10;
         let mut attempt = 0;
@@ -1829,68 +1908,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                             );
 
                             // Retry Drive::open with exponential backoff (firmware may not be ready yet).
-                            let mut drive = None;
-                            for retry in 0..3 {
-                                match libfreemkv::Drive::open(std::path::Path::new(&p)) {
-                                    Ok(d) => {
-                                        drive = Some(d);
-                                        break;
-                                    }
-                                    Err(e) if retry < 2 => {
-                                        let backoff_secs =
-                                            transport_recovery_delay_secs * (1u64 << retry);
-                                        crate::log::device_log(
-                                            device,
-                                            &format!(
-                                                "Pass 1 attempt {attempt}: Drive::open({}) failed, retrying in {}s: error={} sense_key={:?} ASC={:?}",
-                                                p,
-                                                backoff_secs,
-                                                e.code(),
-                                                e.scsi_sense().map(|s| s.sense_key),
-                                                e.scsi_sense().map(|s| s.asc)
-                                            ),
-                                        );
-                                        std::thread::sleep(std::time::Duration::from_secs(
-                                            backoff_secs,
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        crate::log::device_log(
-                                            device,
-                                            &format!(
-                                                "Pass 1 attempt {attempt}: Drive::open({}) failed strategy=transport_failure_recovery error={} sense_key={:?} ASC={:?} — recovery path exhausted",
-                                                p,
-                                                e.code(),
-                                                e.scsi_sense().map(|s| s.sense_key),
-                                                e.scsi_sense().map(|s| s.asc)
-                                            ),
-                                        );
-
-                                        let failure_category = if e.code() == 4000 {
-                                            "SCSI_ERROR"
-                                        } else if e.code() >= 1000 && e.code() < 2000 {
-                                            "DEVICE_ERROR"
-                                        } else {
-                                            &format!("ERROR_CODE_{}", e.code())
-                                        };
-
-                                        crate::log::device_log(
-                                            device,
-                                            &format!(
-                                                "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::open category={} error_code={}",
-                                                failure_category,
-                                                e.code()
-                                            ),
-                                        );
-
-                                        break 'pass1;
-                                    }
-                                }
-                            }
-
-                            let mut drive = match drive {
+                            let mut drive = match open_drive_with_backoff(
+                                device,
+                                attempt,
+                                p,
+                                transport_recovery_delay_secs,
+                            ) {
                                 Some(d) => d,
-                                None => continue 'pass1,
+                                None => break 'pass1,
                             };
 
                             if let Err(e) = drive.wait_ready() {
@@ -1933,37 +1958,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                                     ),
                                 );
 
-                                // Special handling for ILLEGAL REQUEST (0x20/0x00) which indicates wedged firmware
-                                let is_wedged_firmware = e.code() == 4000
-                                    && e.scsi_sense().map(|s| s.asc == 0x20).unwrap_or(false);
-
-                                if is_wedged_firmware {
-                                    crate::log::device_log(
-                                        device,
-                                        "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::init with ILLEGAL_REQUEST (ASC=0x20) — drive firmware wedged",
-                                    );
-
-                                    // Log user action required
-                                    crate::log::device_log(
-                                        device,
-                                        "USER_ACTION_REQUIRED: Eject disc and physically power-cycle USB optical drive to clear firmware state before retrying",
-                                    );
-                                } else {
-                                    let failure_category = if e.code() == 4000 {
-                                        "SCSI_ERROR"
-                                    } else {
-                                        &format!("ERROR_CODE_{}", e.code())
-                                    };
-
-                                    crate::log::device_log(
-                                        device,
-                                        &format!(
-                                            "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::init category={} error_code={}",
-                                            failure_category,
-                                            e.code()
-                                        ),
-                                    );
-                                }
+                                log_init_recovery_failure(device, &e);
 
                                 break 'pass1;
                             }
@@ -1990,36 +1985,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                                 ),
                             );
 
-                            let mut drive = match libfreemkv::Drive::open(std::path::Path::new(&p))
-                            {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    crate::log::device_log(
-                                        device,
-                                        &format!(
-                                            "Pass 1 attempt {attempt}: Drive::open({}) failed strategy=transport_failure_recovery error={} — recovery path exhausted",
-                                            p,
-                                            e.code()
-                                        ),
-                                    );
-
-                                    let failure_category = if e.code() == 4000 {
-                                        "SCSI_ERROR"
-                                    } else {
-                                        &format!("ERROR_CODE_{}", e.code())
-                                    };
-
-                                    crate::log::device_log(
-                                        device,
-                                        &format!(
-                                            "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::open category={} error_code={}",
-                                            failure_category,
-                                            e.code()
-                                        ),
-                                    );
-
-                                    break 'pass1;
-                                }
+                            // Retry Drive::open with exponential backoff (firmware
+                            // may not be ready yet) — same as the new-path arm, since
+                            // a same-sg re-enumeration leaves firmware just as cold.
+                            let mut drive = match open_drive_with_backoff(
+                                device,
+                                attempt,
+                                p,
+                                transport_recovery_delay_secs,
+                            ) {
+                                Some(d) => d,
+                                None => break 'pass1,
                             };
 
                             if let Err(e) = drive.wait_ready() {
@@ -2054,26 +2030,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                                 crate::log::device_log(
                                     device,
                                     &format!(
-                                        "Pass 1 attempt {attempt}: Drive::init({}) failed strategy=transport_failure_recovery error={} — recovery path exhausted",
+                                        "Pass 1 attempt {attempt}: Drive::init({}) failed strategy=transport_failure_recovery error={} sense_key={:?} ASC={:?} — recovery path exhausted",
                                         p,
-                                        e.code()
+                                        e.code(),
+                                        e.scsi_sense().map(|s| s.sense_key),
+                                        e.scsi_sense().map(|s| s.asc)
                                     ),
                                 );
 
-                                let failure_category = if e.code() == 4000 {
-                                    "SCSI_ERROR"
-                                } else {
-                                    &format!("ERROR_CODE_{}", e.code())
-                                };
-
-                                crate::log::device_log(
-                                    device,
-                                    &format!(
-                                        "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::init category={} error_code={}",
-                                        failure_category,
-                                        e.code()
-                                    ),
-                                );
+                                // Same wedged-firmware diagnostic as the
+                                // new-path arm: an ILLEGAL REQUEST after a
+                                // same-sg re-enumeration also means the
+                                // firmware needs a power-cycle.
+                                log_init_recovery_failure(device, &e);
 
                                 break 'pass1;
                             }
@@ -2158,7 +2127,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     device,
                     &format!(
                         "Pass 1: recovery failed at attempt {}/{}, strategy={}",
-                        attempt + 1,
+                        // `attempt` is already 1-based (incremented at the top
+                        // of the loop), so print it directly — `attempt + 1`
+                        // overcounted, yielding e.g. "12/10" at exhaustion.
+                        attempt.min(MAX_PASS1_ATTEMPTS),
                         MAX_PASS1_ATTEMPTS,
                         failure_reason
                     ),
@@ -2198,7 +2170,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
                     crate::log::device_log(
                         device,
-                        "NEXT_STEPS: 1) Check /api/logs/sg4 for STRATEGY_FAILURE entries. 2) Identify which phase failed (Drive::open/wait_ready/init). 3) If firmware wedged, power-cycle drive. 4) Reprogram autorip and retry rip.",
+                        &format!(
+                            "NEXT_STEPS: 1) Check /api/logs/{device} for STRATEGY_FAILURE entries. 2) Identify which phase failed (Drive::open/wait_ready/init). 3) If firmware wedged, power-cycle the drive and retry.",
+                        ),
                     );
                 } else {
                     crate::log::device_log(
@@ -2244,16 +2218,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         );
         let mut pass_2_settled = false;
         for retry_n in 1..=max_retries {
-            // If user hit stop OR a prior pass cap-fired, bail.
-            if user_halt.load(Ordering::Relaxed) || cap_fired_any.load(Ordering::Relaxed) {
+            // If user hit stop, bail.
+            if user_halt.load(Ordering::Relaxed) {
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "PASS {} STOPPED: user halt={}/cap_fired={} before retry pass",
-                        retry_n + 1,
-                        user_halt.load(Ordering::Relaxed),
-                        cap_fired_any.load(Ordering::Relaxed)
-                    ),
+                    &format!("PASS {} STOPPED: user halt before retry pass", retry_n + 1),
                 );
                 break;
             }
@@ -2325,11 +2294,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
             let pass = retry_n + 1;
 
-            // Settle the drive between Pass 1 and Pass 2 only. Per
-            // RIP_DESIGN.md §15 Fix F: the BU40N (and other Initio-bridge
-            // drives) wedge after grinding on bad sectors. Giving the drive
-            // 30 s of idle BEFORE we hammer it again with retry reads lets
-            // its internal state recover. Cheap insurance.
+            // Settle the drive between Pass 1 and Pass 2 only. The BU40N
+            // (and other Initio-bridge drives) wedge after grinding on bad
+            // sectors. Giving the drive 30 s of idle BEFORE we hammer it
+            // again with retry reads lets its internal state recover.
+            // Cheap insurance.
             if !pass_2_settled {
                 crate::log::device_log(device, "Settling drive for 30 s before retry pass");
                 std::thread::sleep(std::time::Duration::from_secs(30));
@@ -2349,23 +2318,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             );
 
             set_pass_progress(
-                device,
-                &display_name,
-                &disc_format,
-                &tmdb_title,
-                tmdb_year,
-                &tmdb_poster,
-                &tmdb_overview,
-                &duration,
-                &codecs,
-                &filename,
+                &pass_ctx,
                 pass,
                 total_passes,
                 bytes_good,
                 bytes_pending,    // MAYBE bucket — Pass 2-N may still recover
                 bytes_unreadable, // LOST bucket — terminal
-                bytes_total_disc,
-                batch,
             );
 
             // Per-pass progress + watcher.
@@ -2391,14 +2349,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 true
             };
             let pass_halt = Arc::new(AtomicBool::new(false));
-            let _pass_guard = spawn_pass_watcher(
-                format!("Pass {pass}"),
-                device.to_string(),
-                pass_halt.clone(),
-                user_halt.clone(),
-                cap_fired_any.clone(),
-                max_pass_secs,
-            );
+            let _pass_guard = spawn_pass_watcher(pass_halt.clone(), user_halt.clone());
 
             // 0.18 round 3: Pass 2..N calls Disc::patch directly. The old
             // disc.copy(opts.multipass=true) dispatched to patch_internal
@@ -2515,9 +2466,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             );
             // Drop this pass's watcher before next iteration.
             drop(_pass_guard);
-            // Stop early if user-halt or pass cap-fire happened during the
-            // patch (the watcher set pass_halt + cap_fired_any).
-            if user_halt.load(Ordering::Relaxed) || cap_fired_any.load(Ordering::Relaxed) {
+            // Stop early if the user hit stop during the patch (the
+            // watcher forwards user_halt into pass_halt).
+            if user_halt.load(Ordering::Relaxed) {
                 break;
             }
             // If THIS pass made no progress, no future pass with the same
@@ -2562,8 +2513,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // sweep behavior (sweep never marks Unreadable either, but
         // single-pass mode skips abort_on_lost_secs entirely).
         if cfg_read.max_retries > 0 {
-            let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
-            let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
             let mapfile_path = std::path::Path::new(&mapfile_path_str);
             if let Ok(mut map) = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path) {
                 use libfreemkv::disc::mapfile::SectorStatus;
@@ -2598,23 +2547,34 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // If loss exceeds configured threshold, abort instead of muxing damaged content.
         let mut main_lost_ms_for_history = 0.0f64;
         if cfg_read.max_retries > 0 && bytes_unreadable > 0 {
-            let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
-            let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
             if let Ok(map) =
                 libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str))
             {
                 use libfreemkv::disc::mapfile::SectorStatus;
                 let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
                 if !bad_ranges.is_empty() && title_bytes_per_sec > 0.0 {
-                    main_lost_ms_for_history = bad_ranges
-                        .iter()
-                        .map(|(_, size)| *size as f64 / title_bytes_per_sec * 1000.0)
-                        .fold(0.0f64, f64::max);
+                    // TOTAL unreadable time scoped to the muxed title (not
+                    // the single largest gap, not whole-disc), exactly as
+                    // the per-pass loop-exit gate does (see `mux_scope_bad`
+                    // above). The old `.fold(.., f64::max)` over whole-disc
+                    // ranges both under-counted scattered gaps and falsely
+                    // aborted on out-of-title (menu/trailer) loss: for a
+                    // real MKV mux only in-title unreadable bytes count, so
+                    // a scratched menu/trailer outside the title extents
+                    // must NOT trigger the abort. For raw ISO output there
+                    // is no title to scope to, so the whole disc is the
+                    // unit of loss.
+                    main_lost_ms_for_history = abort_lost_ms(
+                        cfg_read.output_format == "iso",
+                        &title_for_progress,
+                        &bad_ranges,
+                        title_bytes_per_sec,
+                    );
                 }
             }
 
             let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
-            if main_lost_ms_for_history >= abort_threshold_ms {
+            if should_abort_for_loss(main_lost_ms_for_history, abort_threshold_ms) {
                 crate::log::device_log(
                     device,
                     &format!(
@@ -2635,7 +2595,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
                 crate::log::device_log(
                     device,
-                    "RECOVERY_GUIDANCE: To allow this rip to complete with data loss, increase abort_on_lost_secs in settings or set to 0 for perfect-rip-only mode.",
+                    "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. To let a rip complete despite some loss, RAISE abort_on_lost_secs to the number of seconds of main-movie loss you can tolerate (e.g. 5 or 30).",
                 );
                 update_state_with(device, |s| {
                     s.status = "error".to_string();
@@ -2665,30 +2625,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             }
         }
 
-        // Mux gating per RIP_DESIGN.md §15 Fix B.
-        // Skip mux + return cleanly if user pressed stop.
+        // Mux gating: skip mux + return cleanly if user pressed stop.
         if user_halt.load(Ordering::Relaxed) {
             crate::log::device_log(device, "Rip cancelled — skipping mux.");
             unregister_halt(device);
             return;
         }
-        // Skip mux + status=error if any pass cap-fired (per-pass wallclock
-        // budget exceeded). The ISO is retained in staging for manual
-        // salvage; this is a hard failure signal, not a partial success.
-        if cap_fired_any.load(Ordering::Relaxed) {
-            crate::log::device_log(
-                device,
-                "Pass cap-fired — rip failed; ISO retained in staging, no mux.",
-            );
-            update_state_with(device, |s| {
-                s.status = "error".to_string();
-                if s.last_error.is_empty() {
-                    s.last_error = "rip failed — pass exceeded wallclock budget".to_string();
-                }
-            });
-            unregister_halt(device);
-            return;
-        }
+        // (The per-pass wall-clock cap and its mux-skip branch were
+        // removed 2026-06-04 along with `cap_fired_any` — a pass is now
+        // bounded only by its own work + libfreemkv's stall watchdogs, so
+        // there is no cap-fire failure signal to gate the mux on.)
 
         // v0.25.3 parallel pipeline hand-off — sweep + patch are done,
         // the ISO is on disk, the drive is no longer needed. Write
@@ -2936,7 +2882,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // and SectorSkipped never fire on the highway (no adaptive
         // retry — the ISO is zero-filled for any sweep-pass
         // failures).
-        Box::new(libfreemkv::build_iso_pipeline(
+        match libfreemkv::build_iso_pipeline(
             reader,
             title,
             keys,
@@ -2944,7 +2890,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             format,
             Some(halt_token.clone()),
             Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
-        ))
+        ) {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                tracing::error!(target: "mux", device=%device, "build_iso_pipeline failed: {e}");
+                crate::log::device_log(device, &format!("Mux pipeline build failed: {e}"));
+                update_state_with(device, |s| {
+                    s.status = "error".to_string();
+                    s.last_error = format!("Mux pipeline build failed: {e}");
+                });
+                unregister_halt(device);
+                return;
+            }
+        }
     } else {
         // Drive single-pass: stays on the inline DiscStream because
         // its adaptive batch-retry on read failure lives inside
@@ -2996,15 +2954,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             bytes_unreadable_at_mux,
             dest_url: dest_url.clone(),
             batch,
-            // In multi-pass mode (max_retries > 0) the on_read_error setting is
-            // hidden from the UI: sweep always skips by design, retries always
-            // retry, and the post-retry abort decision is `abort_on_lost_secs`
-            // (time-based). The only place on_read_error could touch behaviour
-            // is here at mux — file-read / demux glitches on the local ISO.
-            // Force skip in multi-pass so the user's stale single-pass setting
-            // doesn't trip a spurious abort on a near-finished rip; the
-            // accepted-loss intent is already encoded in abort_on_lost_secs.
-            skip_errors: cfg_read.max_retries > 0 || cfg_read.on_read_error == "skip",
             // Hand the mux watchdog the per-disc staging dir so its
             // hard-escalation path (5-minute stall → exit + Docker
             // restart) can bump `.restart_count` before exiting.
@@ -3052,8 +3001,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // skips (usually zero — ISO reads don't fail). The real bad-sector count
     // lives in the mapfile sidecar. Prefer that when present.
     if cfg_read.max_retries > 0 {
-        let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
-        let mapfile_path_str = format!("{staging}/{iso_filename}.mapfile");
         if let Ok(map) =
             libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str))
         {
@@ -3117,10 +3064,28 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // collision is still caught later by the mover's own guard.
             let marker_name = if title_confident { ".done" } else { ".review" };
             let marker_path = format!("{}/{}", staging, marker_name);
-            let _ = std::fs::write(
+            if let Err(e) = std::fs::write(
                 &marker_path,
                 serde_json::to_string_pretty(&marker).unwrap_or_default(),
-            );
+            ) {
+                // The mux finished and the MKV is in staging, but the
+                // mover keys off this marker — without it the file sits
+                // in staging forever with no signal. Surface it so the
+                // operator can see the rip is staged-but-unqueued rather
+                // than silently lost.
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "{marker_name} marker write failed ({e}); MKV is staged but the mover cannot pick it up"
+                    ),
+                );
+                update_state_with(device, |s| {
+                    if s.last_error.is_empty() {
+                        s.last_error =
+                            format!("MKV staged but {marker_name} marker write failed: {e}");
+                    }
+                });
+            }
             if !title_confident {
                 crate::log::device_log(
                     device,
@@ -3264,15 +3229,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Prune intermediate ISO + mapfile unless keep_iso is set. Only runs in
     // multipass mode (max_retries > 0) — direct mode never produced an ISO.
     if cfg_read.max_retries > 0 && !cfg_read.keep_iso {
-        let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
-        let iso_path_str = format!("{}/{}", staging, iso_filename);
-        let mapfile_path = format!("{iso_path_str}.mapfile");
         match std::fs::remove_file(&iso_path_str) {
             Ok(_) => crate::log::device_log(device, "Pruned intermediate ISO"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => crate::log::device_log(device, &format!("ISO prune warning: {e}")),
         }
-        let _ = std::fs::remove_file(&mapfile_path);
+        // Mirror the ISO arm: a lingering mapfile in staging could be
+        // misread as a partial rip by the resume classifier on next startup,
+        // so surface any unexpected removal error instead of swallowing it.
+        match std::fs::remove_file(&mapfile_path_str) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => crate::log::device_log(device, &format!("mapfile prune warning: {e}")),
+        }
     }
 
     crate::log::device_log(device, "Rip complete");
@@ -3366,7 +3335,6 @@ pub(crate) fn format_codecs(title: &libfreemkv::DiscTitle) -> String {
 /// English purpose label for autorip rendering. None for Normal streams.
 /// libfreemkv keeps strings out of the library; autorip is English-only so we
 /// inline the words here rather than going through i18n.
-#[allow(dead_code)]
 fn audio_purpose_tag(p: libfreemkv::LabelPurpose) -> Option<&'static str> {
     match p {
         libfreemkv::LabelPurpose::Commentary => Some("Commentary"),
@@ -3377,10 +3345,42 @@ fn audio_purpose_tag(p: libfreemkv::LabelPurpose) -> Option<&'static str> {
     }
 }
 
-/// English secondary suffix for autorip rendering. Empty when not secondary.
-#[allow(dead_code)]
-fn audio_secondary_suffix(secondary: bool) -> &'static str {
-    if secondary { " (Secondary)" } else { "" }
+/// Milliseconds of loss that the post-retry abort check should weigh.
+///
+/// For a raw ISO rip the whole disc is the deliverable, so every
+/// unreadable byte counts. For an MKV/m2ts mux only the bytes that fall
+/// inside the muxed title's extents matter — a scratched menu / trailer
+/// that lives OUTSIDE the title must not count, otherwise an
+/// `abort_on_lost_secs=0` ("perfect rip") setting would abort a
+/// fully-recovered main movie just because some out-of-title sector was
+/// lost (the Top Gun false-positive). Mirrors the per-pass loop-exit
+/// gate's `mux_scope_bad` scoping.
+fn abort_lost_ms(
+    output_is_iso: bool,
+    title: &libfreemkv::DiscTitle,
+    bad_ranges: &[(u64, u64)],
+    title_bytes_per_sec: f64,
+) -> f64 {
+    if title_bytes_per_sec <= 0.0 {
+        return 0.0;
+    }
+    let lost_bytes = if output_is_iso {
+        bad_ranges.iter().map(|(_, sz)| *sz).sum::<u64>()
+    } else {
+        libfreemkv::disc::bytes_bad_in_title(title, bad_ranges)
+    };
+    lost_bytes as f64 / title_bytes_per_sec * 1000.0
+}
+
+/// Whether the post-retry abort check should fire.
+///
+/// Strictly `>`, NOT `>=`: `abort_on_lost_secs=0` (threshold 0 ms) means
+/// "require a perfect in-title rip" — abort on ANY positive in-title
+/// loss, but proceed to mux when in-title loss is exactly zero. With
+/// `>=` a zero-loss title (`lost_ms == 0.0 >= 0.0`) would wrongly abort
+/// whenever any out-of-title sector was unreadable.
+fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
+    lost_ms > abort_threshold_ms
 }
 
 /// User-facing message for the "encrypted disc, no keys resolved" failure.
@@ -3524,9 +3524,14 @@ fn format_pass_error(pass_label: &str, e: &libfreemkv::Error) -> String {
     };
 
     let Some(sense) = sense else {
-        // Non-SCSI error (transport / IO / other) — append the raw
-        // error string; less common path, fewer user complaints.
-        return format!("{}{} failed: {}", pass_label, location, e);
+        // Non-SCSI error (transport / IO / other) — surface the inner
+        // io::Error detail. The libfreemkv Error Display is code-only
+        // (language-neutral) as of 0.31; its `source` carries the message.
+        let detail = match e {
+            libfreemkv::Error::IoError { source } => source.to_string(),
+            other => other.to_string(),
+        };
+        return format!("{}{} failed: {}", pass_label, location, detail);
     };
 
     // SCSI sense-key reference (SPC-4 §4.5):
@@ -3580,13 +3585,240 @@ fn format_pass_error(pass_label: &str, e: &libfreemkv::Error) -> String {
     format!("{}{} failed: {} — {}", pass_label, location, cause, action)
 }
 
+/// Open a drive during transport-failure recovery, retrying with
+/// exponential backoff because firmware may not be ready for several
+/// seconds after a USB-bridge crash re-enumerates the device (whether on
+/// a new sg path or the original one). Shared by both recovery arms so
+/// same-path recovery gets the same 3-attempt backoff as new-path.
+///
+/// Returns `Some(drive)` on success, or `None` once recovery is exhausted
+/// (the caller should `break 'pass1` — all per-attempt and STRATEGY_FAILURE
+/// logging is emitted here).
+fn open_drive_with_backoff(
+    device: &str,
+    attempt: u32,
+    path: &str,
+    transport_recovery_delay_secs: u64,
+) -> Option<libfreemkv::Drive> {
+    for retry in 0..3 {
+        match libfreemkv::Drive::open(std::path::Path::new(path)) {
+            Ok(d) => return Some(d),
+            Err(e) if retry < 2 => {
+                let backoff_secs = transport_recovery_delay_secs * (1u64 << retry);
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "Pass 1 attempt {attempt}: Drive::open({}) failed, retrying in {}s: error={} sense_key={:?} ASC={:?}",
+                        path,
+                        backoff_secs,
+                        e.code(),
+                        e.scsi_sense().map(|s| s.sense_key),
+                        e.scsi_sense().map(|s| s.asc)
+                    ),
+                );
+                std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+            }
+            Err(e) => {
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "Pass 1 attempt {attempt}: Drive::open({}) failed strategy=transport_failure_recovery error={} sense_key={:?} ASC={:?} — recovery path exhausted",
+                        path,
+                        e.code(),
+                        e.scsi_sense().map(|s| s.sense_key),
+                        e.scsi_sense().map(|s| s.asc)
+                    ),
+                );
+
+                let failure_category = if e.code() == 4000 {
+                    "SCSI_ERROR"
+                } else if e.code() >= 1000 && e.code() < 2000 {
+                    "DEVICE_ERROR"
+                } else {
+                    &format!("ERROR_CODE_{}", e.code())
+                };
+
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::open category={} error_code={}",
+                        failure_category,
+                        e.code()
+                    ),
+                );
+
+                return None;
+            }
+        }
+    }
+
+    // Unreachable: the loop either returns Some on success or None on the
+    // final Err arm. Treat any fall-through as exhausted.
+    None
+}
+
+/// Emit the post-`Drive::init` failure diagnostic for a transport-recovery
+/// re-open. Shared by both the new-path and same-path recovery arms so they
+/// log consistently: an ILLEGAL REQUEST (ASC=0x20) after init means the
+/// drive firmware is wedged and needs a physical power-cycle, so we surface
+/// the USER_ACTION_REQUIRED line; anything else is a plain STRATEGY_FAILURE.
+fn log_init_recovery_failure(device: &str, e: &libfreemkv::Error) {
+    let is_wedged_firmware =
+        e.code() == 4000 && e.scsi_sense().map(|s| s.asc == 0x20).unwrap_or(false);
+
+    if is_wedged_firmware {
+        crate::log::device_log(
+            device,
+            "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::init with ILLEGAL_REQUEST (ASC=0x20) — drive firmware wedged",
+        );
+        crate::log::device_log(
+            device,
+            "USER_ACTION_REQUIRED: Eject disc and physically power-cycle USB optical drive to clear firmware state before retrying",
+        );
+    } else {
+        let failure_category = if e.code() == 4000 {
+            "SCSI_ERROR".to_string()
+        } else {
+            format!("ERROR_CODE_{}", e.code())
+        };
+
+        crate::log::device_log(
+            device,
+            &format!(
+                "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::init category={} error_code={}",
+                failure_category,
+                e.code()
+            ),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Tests for orchestrator-level helpers that live in this file.
     //! State-only helpers and their tests live in `state.rs`.
 
-    use super::{aacs_failure_message, format_pass_error};
+    use super::{
+        HaltGuard, aacs_failure_message, format_pass_error, is_safe_staging_segment, register_halt,
+    };
+    use crate::ripper::session::device_halt;
     use libfreemkv::{Error, ScsiSense};
+
+    /// The `HaltGuard` created at the top of `rip_disc` must unregister the
+    /// device's halt-map entry on EVERY exit path — including the early-return
+    /// error branches that leaked it in the v0.13.6 class of bug. Dropping the
+    /// guard (what happens on any return/panic) must remove the entry so a
+    /// subsequent rip starts with a fresh, uncancelled token rather than
+    /// inheriting the prior attempt's state.
+    #[test]
+    fn halt_guard_unregisters_on_drop() {
+        let device = "sg_haltguard_drop_test";
+        // Clean any residue from a prior run so the assertion is meaningful.
+        super::unregister_halt(device);
+        register_halt(device, libfreemkv::Halt::new());
+        assert!(
+            device_halt(device).is_some(),
+            "halt entry should be registered before the guard drops"
+        );
+        {
+            let _guard = HaltGuard {
+                device: device.to_string(),
+            };
+            // Simulate an early-return error path: leaving this scope drops
+            // the guard, which must run `unregister_halt`.
+        }
+        assert!(
+            device_halt(device).is_none(),
+            "HaltGuard::drop must unregister the halt-map entry on every exit path"
+        );
+    }
+
+    /// The staging-segment guard must reject anything that could escape
+    /// or resolve to the staging root, so a hostile disc label can never
+    /// drive `remove_dir_all` outside staging.
+    #[test]
+    fn staging_segment_guard_rejects_traversal() {
+        // Dangerous: traversal, current-dir, all-dots, empty, separators,
+        // absolute.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "...",
+            "/",
+            "..\\",
+            "a/b",
+            "a\\b",
+            "/etc",
+            "../sibling",
+            "./foo",
+        ] {
+            assert!(
+                !is_safe_staging_segment(bad),
+                "{bad:?} must be rejected as a staging segment"
+            );
+        }
+        // Safe: ordinary sanitized title names (dots inside a name are
+        // fine as long as the whole segment isn't only dots).
+        for ok in [
+            "Dune (2021)",
+            "Blade.Runner (1982)",
+            "untitled",
+            "A.Movie.With.Dots",
+            "disc",
+        ] {
+            assert!(
+                is_safe_staging_segment(ok),
+                "{ok:?} must be accepted as a staging segment"
+            );
+        }
+    }
+
+    /// Build a minimal `DiscTitle` whose single extent spans `[start_lba,
+    /// start_lba + sector_count)`. Only `extents` matters for
+    /// `bytes_bad_in_title` / the abort-loss scoping.
+    fn test_title(start_lba: u32, sector_count: u32) -> libfreemkv::DiscTitle {
+        libfreemkv::DiscTitle {
+            playlist: "00800.mpls".to_string(),
+            playlist_id: 800,
+            duration_secs: 7200.0,
+            size_bytes: (sector_count as u64) * 2048,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: vec![libfreemkv::disc::Extent {
+                start_lba,
+                sector_count,
+            }],
+            content_format: libfreemkv::disc::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        }
+    }
+
+    /// The scoped loss is the TOTAL of all in-title gaps, not the single
+    /// largest one (the old `fold(.., f64::max)` bug). Many scattered
+    /// small gaps must accumulate against the threshold.
+    #[test]
+    fn abort_loss_sums_scattered_in_title_gaps() {
+        // Title covers bytes [0, 100_000_000) (sectors 0..~48829).
+        let title = test_title(0, 48_829);
+        let bps = 1_000_000.0; // 1 byte == 1 us
+
+        // 50 scattered 1 MB gaps inside the title = 50 MB total.
+        // At 1 MB/s that is 50 s == 50_000 ms.
+        let bad: Vec<(u64, u64)> = (0..50).map(|i| (i * 1_500_000u64, 1_000_000u64)).collect();
+        let lost = super::abort_lost_ms(false, &title, &bad, bps);
+        // Old fold-max would have reported ~1000 ms (one gap); sum is 50x.
+        assert!(
+            (lost - 50_000.0).abs() < 1.0,
+            "expected ~50_000 ms total, got {lost}"
+        );
+
+        // ISO output is whole-disc: same bad ranges sum regardless of
+        // title scoping.
+        let lost_iso = super::abort_lost_ms(true, &title, &bad, bps);
+        assert!((lost_iso - 50_000.0).abs() < 1.0, "iso whole-disc sum");
+    }
 
     #[test]
     fn format_pass_error_hardware_wedge() {
@@ -3855,5 +4087,93 @@ mod tests {
         assert_eq!(super::device_key("/dev/disk2"), "disk2");
         assert_eq!(super::device_key("\\\\.\\CdRom0"), "CdRom0");
         assert_eq!(super::device_key("sg4"), "sg4"); // already a bare name
+    }
+
+    // ── abort-on-loss scoping (Top Gun false-positive regression) ────
+
+    /// A title spanning LBA 1000..2000 (sectors), i.e. byte range
+    /// 1000*2048 .. 2000*2048. `bytes_bad_in_title` intersects bad
+    /// ranges (byte offsets) with this window.
+    fn title_lba(start_lba: u32, sector_count: u32, bps: f64) -> libfreemkv::DiscTitle {
+        let mut t = libfreemkv::DiscTitle::empty();
+        t.extents.push(libfreemkv::disc::Extent {
+            start_lba,
+            sector_count,
+        });
+        // size/duration are only used by the caller to derive bps; here
+        // we pass bps directly to the helpers, so leave them at zero.
+        let _ = bps;
+        t
+    }
+
+    #[test]
+    fn abort_lost_ms_ignores_out_of_title_loss_for_mkv() {
+        // Title occupies sectors 1000..2000. The only unreadable range
+        // is at byte offset 0 (a scratched menu / pre-title region) and
+        // does NOT overlap the title extents — so for an MKV mux the
+        // in-title loss must be zero.
+        let bps = 8_250_000.0;
+        let title = title_lba(1000, 1000, bps);
+        // 50 sectors bad starting at byte 0 (well before the title).
+        let bad = vec![(0u64, 50 * 2048)];
+        let lost = super::abort_lost_ms(false, &title, &bad, bps);
+        assert_eq!(lost, 0.0, "out-of-title loss must not count for MKV mux");
+    }
+
+    #[test]
+    fn abort_lost_ms_counts_whole_disc_for_iso() {
+        // Same out-of-title bad range, but ISO output → whole disc is
+        // the deliverable, so it DOES count.
+        let bps = 8_250_000.0;
+        let title = title_lba(1000, 1000, bps);
+        let bad = vec![(0u64, 50 * 2048)];
+        let lost = super::abort_lost_ms(true, &title, &bad, bps);
+        assert!(lost > 0.0, "ISO output counts whole-disc loss");
+    }
+
+    #[test]
+    fn abort_lost_ms_counts_in_title_loss_for_mkv() {
+        // A bad range that overlaps the title extents counts.
+        let bps = 8_250_000.0;
+        let title = title_lba(1000, 1000, bps);
+        // 10 bad sectors starting at sector 1500 (inside the title).
+        let bad = vec![(1500u64 * 2048, 10 * 2048)];
+        let lost = super::abort_lost_ms(false, &title, &bad, bps);
+        assert!(lost > 0.0, "in-title loss must count for MKV mux");
+    }
+
+    #[test]
+    fn perfect_in_title_rip_does_not_abort_at_threshold_zero() {
+        // THE regression: out-of-title unreadable + 0 in-title loss +
+        // abort_on_lost_secs=0 (threshold 0 ms) → NO abort, proceed to
+        // mux. Previously `>=` aborted because 0.0 >= 0.0.
+        let bps = 8_250_000.0;
+        let title = title_lba(1000, 1000, bps);
+        let bad = vec![(0u64, 50 * 2048)]; // out-of-title only
+        let in_title_lost_ms = super::abort_lost_ms(false, &title, &bad, bps);
+        assert_eq!(in_title_lost_ms, 0.0);
+        let abort_threshold_ms = 0.0; // abort_on_lost_secs = 0
+        assert!(
+            !super::should_abort_for_loss(in_title_lost_ms, abort_threshold_ms),
+            "a fully-recovered title must NOT abort on out-of-title loss at threshold 0"
+        );
+    }
+
+    #[test]
+    fn any_in_title_loss_aborts_at_threshold_zero() {
+        // abort_on_lost_secs=0 still means "perfect in-title required":
+        // ANY positive in-title loss aborts.
+        let abort_threshold_ms = 0.0;
+        assert!(super::should_abort_for_loss(0.001, abort_threshold_ms));
+        assert!(super::should_abort_for_loss(5_000.0, abort_threshold_ms));
+    }
+
+    #[test]
+    fn loss_within_threshold_does_not_abort() {
+        // abort_on_lost_secs=30 (30_000 ms): 20s lost is tolerated, 31s
+        // aborts.
+        let threshold = 30_000.0;
+        assert!(!super::should_abort_for_loss(20_000.0, threshold));
+        assert!(super::should_abort_for_loss(31_000.0, threshold));
     }
 }

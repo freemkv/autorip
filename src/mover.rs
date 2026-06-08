@@ -21,8 +21,10 @@ pub static MOVE_STATE: once_cell::sync::Lazy<Mutex<Option<MoveState>>> =
 
 /// Per-staging-dir error surfaced to the System page so the user can act
 /// on it (e.g. orphaned source files that the container can't unlink due
-/// to NFS squash perms). Keyed by staging dir path; updates are
-/// idempotent — same `reason` for the same path is a no-op (no log spam).
+/// to NFS squash perms). Keyed by staging dir path. The stored entry is
+/// always refreshed, but the syslog line is only emitted when the
+/// `reason` changes — so repeating the same error on every loop tick
+/// updates the UI without spamming the log.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MoverError {
     pub path: String,
@@ -81,6 +83,14 @@ enum MoveOutcome {
     /// move + source unlink. Caller leaves the staging dir alone — the
     /// dst is the broken copy, src is the source of truth.
     SizeMismatch,
+    /// Post-copy validation failed for a NON-size reason: a structural
+    /// check (missing EBML head, short/garbled tail, insufficient TS sync)
+    /// or an unreadable destination. Kept distinct from `SizeMismatch` so
+    /// the operator gets an accurate hint — an ENOSPC/short-write hint is
+    /// wrong for a structurally-invalid-but-correctly-sized copy. Like
+    /// `SizeMismatch`, the caller leaves the staging dir alone (src is the
+    /// source of truth) and retries next tick.
+    PostCopyInvalid,
     /// Destination already exists as a DIFFERENT file (present, non-empty, and a
     /// different size than src). A wrong title match can resolve two distinct
     /// discs to the same `Title (Year)/Title (Year).ext` path; overwriting would
@@ -106,9 +116,9 @@ pub(crate) enum MoveError {
     /// `1A 45 DF A3`. Either the cp truncated at the head, or the
     /// destination wasn't really an MKV to begin with.
     MkvBadHead,
-    /// MKV-specific: the destination didn't end on a clean EBML
-    /// element. Either the file is truncated mid-cluster or the tail
-    /// bytes aren't readable.
+    /// MKV-specific: the destination is too short, or its tail bytes
+    /// couldn't be read back. This is a truncation/readability gate, not
+    /// a structural EBML parse — see `check_post_copy_mkv`.
     MkvBadTail,
     /// TS / m2ts: not enough sync bytes (0x47) at TS-packet boundaries
     /// in the file head or tail to consider the file structurally
@@ -131,7 +141,7 @@ impl std::fmt::Display for MoveError {
             MoveError::MkvBadHead => {
                 write!(f, "destination MKV missing EBML header (1A 45 DF A3)")
             }
-            MoveError::MkvBadTail => write!(f, "destination MKV tail not a clean EBML element"),
+            MoveError::MkvBadTail => write!(f, "destination MKV tail too short or unreadable"),
             MoveError::M2tsBadSync => write!(
                 f,
                 "destination m2ts has insufficient TS sync (0x47) at packet boundaries"
@@ -150,6 +160,42 @@ impl std::fmt::Display for MoveError {
 fn fresh_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
     let f = std::fs::File::open(path)?;
     f.metadata()
+}
+
+/// Cheap content-identity probe for two files KNOWN to be the same length.
+/// Reads a fixed-size head and tail window from each and compares them.
+/// Used by the collision guard to tell an idempotent re-move (the
+/// dest IS this rip's output, copied on a prior tick whose unlink failed)
+/// apart from a genuine collision (a wrong title match routed two
+/// DIFFERENT discs to the same path, and their muxes happen to be the same
+/// byte length). Returns `true` only when both windows match on both files.
+///
+/// Fixed-size reads keep this O(1) — we never read the whole multi-GB file.
+/// A false "same" would require two different discs to be byte-identical in
+/// both their first and last 64 KiB AND identical in length; that is not a
+/// realistic mux collision. On any read error we conservatively return
+/// `false` (treat as NOT confirmed identical → real collision), so a probe
+/// failure can never green-light clobbering a different file.
+fn same_head_and_tail(a: &Path, b: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    const WINDOW: u64 = 64 * 1024;
+
+    fn windows(path: &Path, window: u64) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        let mut f = std::fs::File::open(path)?;
+        let size = f.metadata()?.len();
+        let n = window.min(size) as usize;
+        let mut head = vec![0u8; n];
+        f.read_exact(&mut head)?;
+        let mut tail = vec![0u8; n];
+        f.seek(SeekFrom::End(-(n as i64)))?;
+        f.read_exact(&mut tail)?;
+        Ok((head, tail))
+    }
+
+    match (windows(a, WINDOW), windows(b, WINDOW)) {
+        (Ok(wa), Ok(wb)) => wa == wb,
+        _ => false,
+    }
 }
 
 /// Copy `src` → `dest` in 4 MiB chunks, publishing the running
@@ -190,11 +236,14 @@ fn copy_counting(
     Ok(total)
 }
 
-/// Verify a destination MKV is structurally complete by checking the
-/// EBML magic at the head and confirming the tail bytes form a clean
-/// EBML element. Doesn't validate the whole file — too expensive for
-/// every move tick — but catches the cases the size-stat check used to
-/// catch (truncated cp) without relying on NFS attribute freshness.
+/// Verify a destination MKV by confirming the EBML head magic
+/// (`1A 45 DF A3`) and that the tail bytes are present and readable.
+/// This is a truncation/readability gate, NOT a structural EBML parse:
+/// it does not verify the tail forms a valid EBML element (a
+/// structurally-wrong-but-readable tail passes). Full parsing would drag
+/// in the EBML reader and is overkill per move tick — the mux already
+/// validated the stream when it wrote the file; here we only need to
+/// confirm cp didn't truncate, without relying on NFS attribute freshness.
 fn check_post_copy_mkv(dst: &Path) -> Result<(), MoveError> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -256,7 +305,14 @@ fn check_post_copy_m2ts(dst: &Path) -> Result<(), MoveError> {
         .metadata()
         .map_err(|e| MoveError::Unreadable(e.to_string()))?
         .len();
-    if size < PKT * SAMPLE_PACKETS {
+    // Require room for two DISTINCT, non-overlapping sample windows. With
+    // a single window (`PKT * SAMPLE_PACKETS`) a file of 8..16 packets
+    // would have its head window (0..1536) overlap the tail window
+    // (End(-1536)), so the same 8 intact head sync bytes get counted
+    // twice and reach THRESHOLD=6 from a single intact head — a tail-
+    // truncated cp would pass. Demanding 2x the sample size keeps head
+    // and tail strictly disjoint.
+    if size < PKT * SAMPLE_PACKETS * 2 {
         return Err(MoveError::M2tsBadSync);
     }
 
@@ -299,8 +355,18 @@ fn check_post_copy_m2ts(dst: &Path) -> Result<(), MoveError> {
 /// bypasses the NFS attribute cache. Used for ISO files (no
 /// lightweight structural check available without parsing UDF).
 fn check_post_copy_size(src: &Path, dst: &Path) -> Result<(), MoveError> {
-    let src_size = fresh_metadata(src).map(|m| m.len()).unwrap_or(0);
-    let dst_size = fresh_metadata(dst).map(|m| m.len()).unwrap_or(0);
+    // Do NOT default to 0 on a stat failure. The old `unwrap_or(0)`
+    // turned a failed dst stat into "size 0" — and if the src stat also
+    // failed, 0 == 0 validated a *missing* destination, after which
+    // `move_file` would `remove_file(src)` and destroy the only copy of
+    // the bytes. A post-copy destination must always be readable; a stat
+    // error there is itself a validation failure, not a size.
+    let dst_size = fresh_metadata(dst)
+        .map_err(|e| MoveError::Unreadable(format!("dst stat failed: {e}")))?
+        .len();
+    let src_size = fresh_metadata(src)
+        .map_err(|e| MoveError::Unreadable(format!("src stat failed: {e}")))?
+        .len();
     if src_size != dst_size {
         return Err(MoveError::SizeDoesNotMatch { src_size, dst_size });
     }
@@ -323,9 +389,23 @@ pub(crate) fn check_post_copy(src: &Path, dst: &Path) -> Result<(), MoveError> {
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
+    // The structural checks (EBML head/tail, TS sync) only inspect a
+    // fixed-size head/tail window — a cp truncated to anything above
+    // that window (>= a few KiB) still passes them. That is a DATA-LOSS
+    // hazard: a passing validation lets `move_file` unlink the source,
+    // so a short destination becomes the only (broken) copy. Pair every
+    // structural check with the same fresh-FD src-vs-dst size compare the
+    // ISO path already does — the size cross-check is what actually
+    // guarantees the destination isn't truncated.
     match ext.as_deref() {
-        Some("mkv") => check_post_copy_mkv(dst),
-        Some("m2ts") => check_post_copy_m2ts(dst),
+        Some("mkv") => {
+            check_post_copy_mkv(dst)?;
+            check_post_copy_size(src, dst)
+        }
+        Some("m2ts") => {
+            check_post_copy_m2ts(dst)?;
+            check_post_copy_size(src, dst)
+        }
         _ => check_post_copy_size(src, dst),
     }
 }
@@ -361,10 +441,34 @@ fn check_and_move(cfg: &Config) {
     let staging_root = &cfg.staging_dir;
     let entries = match std::fs::read_dir(staging_root) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            // Don't swallow this: a dropped NFS mount or a deleted staging
+            // root surfaces here, and a silent return makes the mover look
+            // healthy while moving nothing. Make it observable.
+            tracing::warn!(
+                staging = %staging_root,
+                error = %e,
+                "mover: failed to read staging directory; skipping this pass"
+            );
+            return;
+        }
     };
 
-    for entry in entries.filter_map(|e| e.ok()) {
+    for entry in entries {
+        // Don't silently drop a per-entry error (e.g. NFS ESTALE on a
+        // specific dentry): on a loaded share a completed rip would be
+        // missed for the whole tick with no trace. Log and skip.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    staging = %staging_root,
+                    error = %e,
+                    "mover: per-entry error listing staging root; skipping entry"
+                );
+                continue;
+            }
+        };
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
@@ -378,18 +482,30 @@ fn check_and_move(cfg: &Config) {
         // Read marker for TMDB metadata
         let marker: serde_json::Value = match std::fs::read_to_string(&marker_path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-            Err(_) => continue,
+            Err(e) => {
+                // A .done read failure (NFS ESTALE, permission denied)
+                // leaves the dir in staging looking healthy from the
+                // mover's view until the handle recovers; surface it.
+                tracing::warn!(
+                    marker = %marker_path.display(),
+                    error = %e,
+                    "mover: failed to read .done marker; skipping staging dir"
+                );
+                continue;
+            }
         };
 
         let disc_name = marker["disc_name"].as_str().unwrap_or("").to_string();
         let display_name = marker["title"].as_str().unwrap_or(&disc_name).to_string();
-        let _disc_format = marker["format"].as_str().unwrap_or("").to_string();
 
         // Build TMDB result from marker
         let tmdb_result = if !marker["title"].is_null() {
             Some(tmdb::TmdbResult {
                 title: marker["title"].as_str().unwrap_or("").to_string(),
-                year: marker["year"].as_u64().unwrap_or(0) as u16,
+                // Clamp before the cast: a year above 65535 would wrap to a
+                // small number (e.g. 70000 -> 4464) and mislabel the folder.
+                // 9999 is well past any real release year.
+                year: marker["year"].as_u64().unwrap_or(0).min(9999) as u16,
                 poster_url: marker["poster_url"].as_str().unwrap_or("").to_string(),
                 overview: marker["overview"].as_str().unwrap_or("").to_string(),
                 media_type: marker["media_type"].as_str().unwrap_or("movie").to_string(),
@@ -405,11 +521,10 @@ fn check_and_move(cfg: &Config) {
         // bytes to NFS the moment `.done` appeared (the ripper's own
         // ISO-prune in `rip_disc` only runs after `.done` is written, so
         // the mover's 10s scan loop typically wins the race). Hit live
-        // (2026-05-20, a 94 GB ISO copied into the movies library).
-        // Filter the ISO
-        // out at planning time; the staging-cleanup branch below deletes
-        // any leftover .iso from disk before tearing the dir down so we
-        // don't leak intermediate ISOs in /staging.
+        // (2026-05-20, a 94 GB ISO copied into the movies library). So we
+        // filter the ISO out at planning time; the staging-cleanup branch
+        // below deletes any leftover .iso from disk before tearing the
+        // dir down so we don't leak intermediate ISOs in /staging.
         let move_iso = cfg.keep_iso;
         let ripped_files: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
             Ok(entries) => entries
@@ -494,23 +609,87 @@ fn check_and_move(cfg: &Config) {
                     });
                 }
             };
-            // Overwrite guard (0.30.1): never clobber an existing destination
-            // that is a DIFFERENT file. A wrong TMDB match can route two discs
-            // to the same name; overwriting would destroy a good prior rip.
-            // Same-size dest is the idempotent re-move case, handled inside
-            // move_file (Skipped) — only a present, non-empty, DIFFERENT-size
-            // dest is treated as a collision. The new file stays in staging.
-            if let (Ok(s), Ok(d)) = (std::fs::metadata(src), std::fs::metadata(Path::new(dest))) {
-                if s.is_file() && d.is_file() && d.len() > 0 && s.len() != d.len() {
+            // Overwrite guard: never clobber an existing destination that is
+            // a DIFFERENT file. A wrong TMDB match can route two discs to the
+            // same `Title (Year)/Title (Year).ext` name; overwriting would
+            // destroy a good prior rip.
+            //
+            // A DIFFERENT-size dest is unambiguously a collision. A SAME-size
+            // dest is the tricky case: it is normally the idempotent re-move
+            // (this rip's output was copied on a prior tick whose unlink
+            // failed — move_file returns Skipped/Moved and staging cleans up).
+            // But two DIFFERENT discs can mux to the same byte length, in
+            // which case a same-size dest is a real collision and the
+            // size-only guard would wave it through to a Skipped, then
+            // remove_dir_all would delete the NEW rip while the library keeps
+            // the OLD wrong file. So when sizes are equal we content-probe
+            // (head+tail) to confirm the dest really is this rip's output
+            // before allowing the idempotent path. We must NOT just require
+            // `d.len() > 0` here — that would flag every legitimate same-size
+            // re-move as a permanent Collision and staging would never clean
+            // up (regressing MovedDirty idempotency).
+            //
+            // Use fresh_metadata (fresh-FD stat) on BOTH sides, consistent
+            // with the rest of mover.rs: a cache-served stat here can
+            // mis-size the dest on NFS — either flagging a spurious
+            // Collision (blocking a legitimate move) or missing a real
+            // different-size dest, which move_file's same-size guard then
+            // also misses, letting copy_counting truncate a good library
+            // file. (Note: a regular file always reports is_file via the
+            // fresh-FD stat; fresh_metadata returns Err for a non-file.)
+            // Stat the destination first. A NotFound error means there is no
+            // dest and the move is safe; ANY other stat error is transient
+            // (NFS ESTALE/EIO, a dropped mount) and we must NOT fall through
+            // to the destructive move_file — a transient stat error could
+            // otherwise let a real collision slip past this guard and have
+            // copy_counting truncate a good library file. Defer this entry to
+            // a later tick instead.
+            let dest_meta = match fresh_metadata(Path::new(dest)) {
+                Ok(d) => Some(d),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
                     crate::log::syslog(&format!(
-                        "Move blocked (destination exists, different size): {} ({} B) vs existing {} ({} B)",
-                        src.display(),
-                        s.len(),
-                        dest,
-                        d.len()
+                        "Move deferred (could not stat destination {}): {} — will retry next tick",
+                        dest, e
                     ));
-                    outcomes.push(MoveOutcome::Collision);
+                    outcomes.push(MoveOutcome::Failed);
                     continue;
+                }
+            };
+            if let Some(d) = dest_meta {
+                // Dest exists. We need a fresh stat of the source too; a
+                // transient src-stat error here is likewise conservative —
+                // defer rather than risk clobbering an existing dest.
+                let s = match fresh_metadata(src) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        crate::log::syslog(&format!(
+                            "Move deferred (destination {} exists but could not stat source {:?}): {} — will retry next tick",
+                            dest, src, e
+                        ));
+                        outcomes.push(MoveOutcome::Failed);
+                        continue;
+                    }
+                };
+                if s.is_file() && d.is_file() && d.len() > 0 {
+                    let collision = if s.len() != d.len() {
+                        true
+                    } else {
+                        // Equal sizes: only a confirmed content match is the
+                        // idempotent re-move. Anything else is a collision.
+                        !same_head_and_tail(src, Path::new(dest))
+                    };
+                    if collision {
+                        crate::log::syslog(&format!(
+                            "Move blocked (destination exists, different file): {} ({} B) vs existing {} ({} B)",
+                            src.display(),
+                            s.len(),
+                            dest,
+                            d.len()
+                        ));
+                        outcomes.push(MoveOutcome::Collision);
+                        continue;
+                    }
                 }
             }
             let outcome = move_file(src, Path::new(dest), &on_progress);
@@ -554,6 +733,12 @@ fn check_and_move(cfg: &Config) {
                         src, dest
                     ));
                 }
+                MoveOutcome::PostCopyInvalid => {
+                    crate::log::syslog(&format!(
+                        "Move blocked (post-cp validation failed — structural/unreadable): {:?} -> {}",
+                        src, dest
+                    ));
+                }
             }
         }
 
@@ -562,6 +747,9 @@ fn check_and_move(cfg: &Config) {
         let any_size_mismatch = outcomes
             .iter()
             .any(|o| matches!(o, MoveOutcome::SizeMismatch));
+        let any_post_copy_invalid = outcomes
+            .iter()
+            .any(|o| matches!(o, MoveOutcome::PostCopyInvalid));
         let any_dirty = outcomes
             .iter()
             .any(|o| matches!(o, MoveOutcome::MovedDirty));
@@ -591,6 +779,15 @@ fn check_and_move(cfg: &Config) {
                 &dir_str,
                 "post-cp validation failed: destination size does not match source",
                 "check the destination filesystem for ENOSPC / short writes; remove the partial dst file and the mover will retry",
+            );
+            continue;
+        }
+
+        if any_post_copy_invalid {
+            record_error(
+                &dir_str,
+                "post-cp validation failed: destination is structurally invalid or unreadable",
+                "the copy is the correct size but failed a format/readability check (truncated header/tail, bad TS sync, or unreadable dst); remove the dst file and the mover will retry — see device_system.log for the specific check",
             );
             continue;
         }
@@ -676,14 +873,32 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
             }
             "tv" if !cfg.tv_dir.is_empty() => {
                 let dir = format!("{}/{}/Season 1", cfg.tv_dir, safe_title);
-                format!("{}/{}", dir, filename)
+                // Sanitize the leaf too — the movie branch already derives
+                // its leaf from a sanitized title, but this branch used the
+                // RAW source filename, so a filename carrying a path
+                // separator or traversal sequence could escape tv_dir.
+                // sanitize_path_display drops '/' and '\' (keeps '.' and '_'
+                // so the extension and episode tags survive).
+                let safe_filename = crate::util::sanitize_path_display(filename);
+                format!("{}/{}", dir, safe_filename)
             }
             _ => {
-                format!("{}/{}", cfg.output_dir, filename)
+                // Sanitize the leaf for consistency with the movie/tv
+                // branches (they sanitize; this fallback used the raw leaf,
+                // so e.g. "..mkv" would reach output_dir verbatim).
+                format!(
+                    "{}/{}",
+                    cfg.output_dir,
+                    crate::util::sanitize_path_display(filename)
+                )
             }
         }
     } else {
-        format!("{}/{}", cfg.output_dir, filename)
+        format!(
+            "{}/{}",
+            cfg.output_dir,
+            crate::util::sanitize_path_display(filename)
+        )
     }
 }
 
@@ -707,16 +922,36 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
 ///
 /// Worker thread + polling loop here prevents NFS/CIFS stalls from
 /// blocking the main autorip thread. Calls `on_progress(pct, gb_done,
-/// gb_total, speed_mbs)` every 3 s while the copy is running.
+/// gb_total, speed_mbs)` every 1 s while the copy is running.
 fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -> MoveOutcome {
-    let src_meta = std::fs::metadata(src);
-    let dest_meta = std::fs::metadata(dest);
+    // Fresh-FD stat on both sides (consistent with the rest of mover.rs):
+    // a cache-served stat on NFS can mis-size either side, spuriously
+    // tripping the matching-content Skipped pre-flight or the src-missing
+    // Moved pre-flight below.
+    let src_meta = fresh_metadata(src);
+    let dest_meta = fresh_metadata(dest);
 
     // Pre-flight: dest already has matching content. Stops the infinite
     // re-copy loop when src can't be unlinked.
+    //
+    // Defensive content probe: the move-loop caller already gates this with
+    // `same_head_and_tail` before calling us, but equal LENGTH alone does
+    // not prove equal CONTENT — a wrong title match can route two distinct
+    // discs to the same path with byte-identical mux lengths. If `move_file`
+    // is ever called WITHOUT the caller guard (a future refactor, a new
+    // call site), trusting size-only here would silently keep the wrong file
+    // as "already moved". Re-confirm head+tail so the skip can never clobber
+    // a different file; a mismatch surfaces as a Collision instead.
     if let (Ok(s), Ok(d)) = (&src_meta, &dest_meta) {
         if s.is_file() && d.is_file() && s.len() == d.len() && s.len() > 0 {
-            return MoveOutcome::Skipped;
+            if same_head_and_tail(src, dest) {
+                return MoveOutcome::Skipped;
+            }
+            crate::log::syslog(&format!(
+                "Move blocked (destination same size but different content): {:?} vs {:?}",
+                src, dest
+            ));
+            return MoveOutcome::Collision;
         }
     }
     // Pre-flight: src missing but dest present — earlier rename succeeded.
@@ -734,13 +969,16 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
     let src_size = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let total_gb = src_size as f64 / 1_073_741_824.0;
 
-    // v0.25.7: replaced the `cp` subprocess with std::fs::copy on a
-    // worker thread, polled here for live progress. Drops the cp
-    // package dependency (the image-slim work doesn't ship a busybox
-    // cp by default) and gets us copy_file_range / sendfile fast-paths
-    // on filesystems that support them. Behaviour unchanged: progress
-    // ticks every 3 s, post-copy validation runs before unlink, src
-    // stays intact on any failure path.
+    // v0.25.7: replaced the `cp` subprocess with an in-process copy on a
+    // worker thread, polled here for live progress. Drops the cp package
+    // dependency (the image-slim work doesn't ship a busybox cp by
+    // default). The copy itself is `copy_counting`, a plain buffered
+    // read/write loop — not `std::fs::copy` — so we can count bytes as we
+    // write them for progress; the kernel fast paths
+    // (copy_file_range/sendfile) wouldn't apply here anyway since this
+    // branch only runs for cross-filesystem moves (see `copy_counting`).
+    // Behaviour unchanged: progress ticks every 1 s, post-copy validation
+    // runs before unlink, src stays intact on any failure path.
     let src_owned = src.to_path_buf();
     let dest_owned = dest.to_path_buf();
     // Copy on a worker thread, counting bytes as we write them. Progress is
@@ -772,7 +1010,18 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                         "Post-cp validation failed for {}: {}",
                         dest_str, e
                     ));
-                    return MoveOutcome::SizeMismatch;
+                    // Map the failure KIND to the outcome so the operator
+                    // gets an accurate hint. Only a true length disagreement
+                    // is SizeMismatch (ENOSPC / short-write hint); structural
+                    // and readability failures get the generic PostCopyInvalid
+                    // path instead of a misleading size hint.
+                    return match e {
+                        MoveError::SizeDoesNotMatch { .. } => MoveOutcome::SizeMismatch,
+                        MoveError::MkvBadHead
+                        | MoveError::MkvBadTail
+                        | MoveError::M2tsBadSync
+                        | MoveError::Unreadable(_) => MoveOutcome::PostCopyInvalid,
+                    };
                 }
                 return match std::fs::remove_file(src) {
                     Ok(_) => MoveOutcome::Moved,
@@ -790,6 +1039,16 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 return MoveOutcome::Failed;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Honor SIGTERM mid-copy: the run() loop's SHUTDOWN-aware
+                // sleep only gates BETWEEN ticks, so without this a multi-GB
+                // cross-fs copy would run to completion ignoring the signal,
+                // and docker stop's 10 s grace would SIGKILL mid-write. Join
+                // the worker (bounded to its current chunk write) and bail.
+                if crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = copy_handle.join();
+                    crate::log::syslog(&format!("Move aborted (shutdown) mid-copy: {}", dest_str));
+                    return MoveOutcome::Failed;
+                }
                 // Progress straight from the bytes we've written — no NFS stat,
                 // so it can't stall and can't read stale. `speed` is the simple
                 // average so far (bytes/elapsed), surfaced in MB/s.
@@ -1060,13 +1319,12 @@ mod tests {
         let src = tmp.path().join("src.iso");
         let dst = tmp.path().join("never_created.iso");
         std::fs::write(&src, b"some bytes").unwrap();
-        // fresh_metadata returns Err for a missing file → src/dst
-        // become 0/0 and the check passes. That's a known weakness of
-        // the size-only path; non-mkv/m2ts movables (only .iso today)
-        // already exist before this check runs. The MKV/m2ts paths
-        // (the only outputs the rip pipeline produces) are covered by
-        // dedicated structural tests below and don't have this gap.
-        let _ = check_post_copy(&src, &dst);
+        // A missing destination must surface as an error — never as a
+        // silent pass. Previously fresh_metadata's Err defaulted to 0
+        // for both sides (0 == 0) and validated the missing dst, which
+        // would let move_file unlink the source ISO and lose the bytes.
+        let err = check_post_copy(&src, &dst).unwrap_err();
+        assert!(matches!(err, MoveError::Unreadable(_)), "got {:?}", err);
     }
 
     #[test]
@@ -1075,8 +1333,10 @@ mod tests {
         let dst = tmp.path().join("good.mkv");
         // Body is at least 5 bytes so the tail check has bytes to read.
         write_minimal_mkv(&dst, &vec![0xAA; 256]);
+        // src must match dst size: check_post_copy now pairs the
+        // structural check with a src-vs-dst size cross-check.
         let src = tmp.path().join("src.mkv");
-        std::fs::write(&src, b"any").unwrap();
+        write_minimal_mkv(&src, &vec![0xAA; 256]);
         assert!(check_post_copy(&src, &dst).is_ok());
     }
 
@@ -1109,8 +1369,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dst = tmp.path().join("good.m2ts");
         write_minimal_m2ts(&dst, 32); // > 16 packets, plenty for head+tail
+        // src must match dst size for the size cross-check.
         let src = tmp.path().join("src.m2ts");
-        std::fs::write(&src, b"any").unwrap();
+        write_minimal_m2ts(&src, 32);
         assert!(check_post_copy(&src, &dst).is_ok());
     }
 
@@ -1300,5 +1561,222 @@ mod tests {
         let dst = tmp.path().join("dst.bin");
         let written = AtomicU64::new(0);
         assert!(copy_counting(&src, &dst, &written).is_err());
+    }
+
+    // ---- post-copy integrity + collision hardening tests ----
+
+    /// Repo-local, gitignored scratch dir (never /tmp). Each call makes a
+    /// unique subdir so parallel test threads don't collide.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!("{}-{}-{}", tag, std::process::id(), n));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn check_post_copy_mkv_rejects_truncated_above_head_window() {
+        // Load-bearing: a structurally-valid head/tail must NOT pass
+        // when the destination is shorter than the source. Pre-fix the
+        // mkv arm did head+tail only, so a copy truncated to anything
+        // above the 5-byte tail window passed and move_file then unlinked
+        // the only complete copy.
+        let dir = scratch_dir("mkv-trunc");
+        let src = dir.join("src.mkv");
+        let dst = dir.join("dst.mkv");
+        // Full source: valid EBML + 1 MiB body.
+        write_minimal_mkv(&src, &vec![0xAA; 1024 * 1024]);
+        // Truncated dest: valid EBML head and a readable tail, but far
+        // shorter than src. Structural check alone would pass.
+        write_minimal_mkv(&dst, &vec![0xAA; 4096]);
+        let err = check_post_copy(&src, &dst).unwrap_err();
+        assert!(
+            matches!(err, MoveError::SizeDoesNotMatch { .. }),
+            "truncated mkv must be rejected by the size cross-check, got {:?}",
+            err
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_post_copy_m2ts_rejects_truncated_above_head_window() {
+        // Load-bearing: same as mkv but for the TS-sync path. A copy
+        // truncated to fewer packets than src — but still enough intact
+        // head+tail sync bytes to clear THRESHOLD — must be rejected by
+        // the size cross-check.
+        let dir = scratch_dir("m2ts-trunc");
+        let src = dir.join("src.m2ts");
+        let dst = dir.join("dst.m2ts");
+        write_minimal_m2ts(&src, 4096); // full source
+        write_minimal_m2ts(&dst, 64); // truncated, but structurally fine
+        let err = check_post_copy(&src, &dst).unwrap_err();
+        assert!(
+            matches!(err, MoveError::SizeDoesNotMatch { .. }),
+            "truncated m2ts must be rejected by the size cross-check, got {:?}",
+            err
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_post_copy_m2ts_rejects_overlapping_window_truncation() {
+        // Secondary case: an 8..16-packet m2ts is too small for two disjoint
+        // sample windows; pre-fix the head and tail windows overlapped and
+        // a single intact head was counted twice to clear THRESHOLD. The
+        // size floor (2x sample) now rejects such a file outright.
+        let dir = scratch_dir("m2ts-overlap");
+        let dst = dir.join("dst.m2ts");
+        write_minimal_m2ts(&dst, 10); // 1920 bytes — between 1536 and 3072
+        let src = dir.join("src.m2ts");
+        std::fs::write(&src, b"any").unwrap();
+        let err = check_post_copy(&src, &dst).unwrap_err();
+        assert!(
+            matches!(err, MoveError::M2tsBadSync),
+            "8..16-packet m2ts must be rejected (overlapping sample windows), got {:?}",
+            err
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_and_move_collision_same_size_different_content_preserves_staging() {
+        // Two DIFFERENT discs route to the same Title (Year) path and
+        // their muxes happen to be the SAME byte length. The size-only
+        // guard waved this through to Skipped, then remove_dir_all deleted
+        // the NEW rip's staging while the library kept the OLD wrong file.
+        // The content-aware guard must catch it: Collision, staging
+        // preserved, library file untouched.
+        let dir = scratch_dir("collision");
+        let staging = dir.join("staging");
+        let movie_dir = dir.join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
+
+        // Pre-existing (OLD, wrong) library file at the destination path.
+        let dest_dir = movie_dir.join("Clash (2024)");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest_file = dest_dir.join("Clash (2024).mkv");
+        let mut old = vec![0x1A, 0x45, 0xDF, 0xA3];
+        old.extend_from_slice(&[0x11u8; 4096]);
+        std::fs::write(&dest_file, &old).unwrap();
+
+        // NEW rip in staging — SAME byte length, DIFFERENT content.
+        let disc_dir = staging.join("Clash");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Clash")).unwrap();
+        let mut new = vec![0x1A, 0x45, 0xDF, 0xA3];
+        new.extend_from_slice(&[0x22u8; 4096]); // differs in body
+        assert_eq!(new.len(), old.len(), "test setup: sizes must match");
+        let staged_mkv = disc_dir.join("Clash.mkv");
+        std::fs::write(&staged_mkv, &new).unwrap();
+
+        check_and_move(&cfg);
+
+        // Library file must be untouched (still the OLD content).
+        assert_eq!(
+            std::fs::read(&dest_file).unwrap(),
+            old,
+            "existing library file must NOT be overwritten or removed"
+        );
+        // The NEW rip must still be in staging — NOT deleted.
+        assert!(
+            staged_mkv.exists(),
+            "new rip must be preserved in staging on a collision"
+        );
+        assert!(disc_dir.exists(), "staging dir must not be torn down");
+        // A collision error must be surfaced for the operator.
+        let key = disc_dir.to_string_lossy().to_string();
+        {
+            let m = MOVE_ERRORS.lock().unwrap();
+            assert!(
+                m.contains_key(&key),
+                "collision must be recorded for the staging dir"
+            );
+        }
+        clear_error(&key);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_and_move_idempotent_same_size_same_content_cleans_up() {
+        // Regression guard: the content-aware collision check must NOT
+        // break the legitimate idempotent re-move. A prior tick copied the
+        // file to the library (same content, same size); on a later tick
+        // the dest already exists identically. This must be treated as the
+        // idempotent path (Skipped/Moved), NOT a collision, and staging
+        // must clean up.
+        let dir = scratch_dir("idempotent");
+        let staging = dir.join("staging");
+        let movie_dir = dir.join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
+
+        let mut content = vec![0x1A, 0x45, 0xDF, 0xA3];
+        content.extend_from_slice(&[0x33u8; 4096]);
+
+        // Dest already present with identical bytes (prior successful copy).
+        let dest_dir = movie_dir.join("Echo (2024)");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("Echo (2024).mkv"), &content).unwrap();
+
+        // Staging still holds the same file (its unlink failed last tick).
+        let disc_dir = staging.join("Echo");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Echo")).unwrap();
+        std::fs::write(disc_dir.join("Echo.mkv"), &content).unwrap();
+
+        check_and_move(&cfg);
+
+        // Staging is torn down — the re-move was recognized as idempotent.
+        assert!(
+            !disc_dir.exists(),
+            "idempotent same-content re-move must clean up staging"
+        );
+        // No collision error recorded.
+        let key = disc_dir.to_string_lossy().to_string();
+        {
+            let m = MOVE_ERRORS.lock().unwrap();
+            assert!(
+                !m.contains_key(&key),
+                "idempotent re-move must not surface a collision error"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_head_and_tail_distinguishes_identical_from_different() {
+        let dir = scratch_dir("headtail");
+        let a = dir.join("a.bin");
+        let b = dir.join("b.bin");
+        let c = dir.join("c.bin");
+        let base = vec![0x5Au8; 200 * 1024]; // larger than the 64 KiB window
+        std::fs::write(&a, &base).unwrap();
+        std::fs::write(&b, &base).unwrap();
+        // c: same length, differs only in the middle (outside both windows)
+        // — head+tail probe treats it as identical (acceptable: a real mux
+        // collision differing only in the interior of a multi-GB file is
+        // not realistic, and the cost of a full compare every tick is not).
+        let mut mid = base.clone();
+        let m = mid.len() / 2;
+        mid[m] ^= 0xFF;
+        std::fs::write(&c, &mid).unwrap();
+        assert!(same_head_and_tail(&a, &b), "identical files match");
+        assert!(same_head_and_tail(&a, &c), "interior-only diff matches");
+
+        // d: differs at the head → not identical.
+        let d = dir.join("d.bin");
+        let mut headdiff = base.clone();
+        headdiff[0] ^= 0xFF;
+        std::fs::write(&d, &headdiff).unwrap();
+        assert!(!same_head_and_tail(&a, &d), "head diff must not match");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

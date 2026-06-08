@@ -2,6 +2,8 @@ use crate::config::{self, Config};
 use crate::ripper;
 use once_cell::sync::Lazy;
 use std::io::{Read as _, Write as _};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
@@ -9,8 +11,15 @@ use tiny_http::{Header, Method, Response, Server, StatusCode};
 pub static DEBUG_ENABLED: Lazy<Arc<RwLock<bool>>> = Lazy::new(|| Arc::new(RwLock::new(false)));
 
 /// Check if debug logging is enabled.
+///
+/// Poison-tolerant: this runs on the mux hot path, so a panic elsewhere
+/// while the write guard is held must not turn every later call into a
+/// panic (which would kill the mux thread). Recover the inner value
+/// instead of unwrapping.
 pub fn debug_enabled() -> bool {
-    *DEBUG_ENABLED.read().unwrap()
+    *DEBUG_ENABLED
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Embedded single-page HTML dashboard — full parity with Python autorip web UI.
@@ -158,7 +167,7 @@ function toggleTheme(){document.body.classList.toggle('dark');localStorage.setIt
 })();
 
 /* ---- Util ---- */
-function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function esc(s){if(s==null)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function upd(id,html){const el=document.getElementById(id);if(el&&el._last!==html){el.innerHTML=html;el._last=html}}
 
 /* ---- Navigation ---- */
@@ -339,18 +348,10 @@ function renderSteps(steps,progress,eta,speed,s){
       const bg=s.bytes_good||0, bm=s.bytes_maybe||0, bl=s.bytes_lost||0;
       const haveAny = bg>0 || bm>0 || bl>0;
       if(haveAny){
-        const bytesPerMs = (s.bytes_total_disc>0 && s.duration)
-          ? null   // server-computed *_ms is authoritative; we won't recompute
-          : null;
-        void bytesPerMs;
         const fmtBytes = (b)=> b>=1073741824 ? (b/1073741824).toFixed(2)+' GB'
                             : b>=1048576    ? (b/1048576).toFixed(1)+' MB'
                             : b>=1024       ? (b/1024).toFixed(1)+' KB'
                             : b+' B';
-        const goodMs  = (s.bytes_total_disc>0 && s.duration)
-          ? null  // good time isn't computed server-side; show bytes only
-          : null;
-        void goodMs;
         const maybeMs = (s.total_maybe_ms!=null && s.total_maybe_ms>=0) ? s.total_maybe_ms : 0;
         const lostMs  = (s.total_lost_ms!=null  && s.total_lost_ms >=0) ? s.total_lost_ms  : 0;
         /* Fixed-width per pill type: each pill's content can grow as
@@ -406,7 +407,7 @@ function renderSteps(steps,progress,eta,speed,s){
            visible width wobble as the rip moves through phases. */
         return '<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:.8rem"><span style="color:'+colors[st.status]+';font-size:.7rem;width:14px;text-align:center;flex-shrink:0;animation:p 1.5s infinite">'+icons[st.status]+'</span><span style="color:var(--text);flex:1;min-width:0">Rip'+header+detail+'</span></div>';
       }
-    }else if(detail){detail=' \u2014 '+detail}
+    }else if(detail){detail=' \u2014 '+esc(detail)}
     const anim=st.status==='active'?';animation:p 1.5s infinite':'';
     return '<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:.8rem"><span style="color:'+colors[st.status]+';font-size:.7rem;width:14px;text-align:center'+anim+'">'+icons[st.status]+'</span><span style="color:'+(st.status==='pending'?'var(--text3)':'var(--text)')+'">'+st.name+detail+'</span></div>';
   }).join('');
@@ -541,7 +542,7 @@ function renderCurrent(){
   }else{
     const img=s.tmdb_poster?'<img class="poster" src="'+esc(s.tmdb_poster)+'" alt="">':'<div class="ph">'+D+'</div>';
     const fmt=s.disc_format;
-    const b=fmt&&fmt!=='unknown'?'<span class="b '+fmt+'">'+fmt+'</span>':'';
+    const b=fmt&&fmt!=='unknown'?'<span class="b '+esc(fmt)+'">'+esc(fmt)+'</span>':'';
     const o=s.tmdb_overview?'<div class="mo">'+esc(s.tmdb_overview)+'</div>':'';
     const yr=s.tmdb_year>0?s.tmdb_year:'';
     const dur=s.duration?' \u00b7 '+esc(s.duration):'';
@@ -976,7 +977,7 @@ function renderSettings(s){
       // act on, so they hide. Network output is a streamed mux, so
       // the title filters still apply.
       {key:'output_format',label:'Output Format',type:'radio',options:[{value:'mkv',label:'MKV'},{value:'m2ts',label:'M2TS'},{value:'iso',label:'ISO (disc image)'},{value:'network',label:'Network'}],hint:'Format for ripped files. ISO copies the whole disc; the other formats mux selected titles.'},
-      {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. 192.168.1.100:9000)',indent:true,placeholder:'192.168.1.100:9000',showIf:{key:'output_format',value:'network'}},
+      {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. nas.example.com:9000)',indent:true,placeholder:'nas.example.com:9000',showIf:{key:'output_format',value:'network'}},
       {key:'main_feature',label:'Main Feature Only',type:'bool',hint:'',indent:true,hideIf:{key:'output_format',value:'iso'}},
       {key:'min_length_secs',label:'Minimum Title Length (seconds)',type:'number',hint:'Shorter titles are skipped (600 = 10 min)',indent:true,hideIf:{key:'output_format',value:'iso'}},
     ]},
@@ -1180,18 +1181,169 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
         if crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
+        // Bound concurrent handler threads so a connection flood can't
+        // fork the container to death (unauthenticated LAN DoS). Over the
+        // cap we answer 503 on this thread and move on without spawning.
+        let guard = match ConnGuard::try_acquire(&INFLIGHT_HANDLERS, MAX_INFLIGHT_HANDLERS) {
+            Some(g) => g,
+            None => {
+                tracing::warn!(
+                    max = MAX_INFLIGHT_HANDLERS,
+                    "request rejected: in-flight handler cap reached"
+                );
+                json_response(request, 503, r#"{"ok":false,"error":"server busy"}"#);
+                continue;
+            }
+        };
         let cfg = Arc::clone(cfg);
-        std::thread::spawn(move || {
-            handle_request(request, &cfg);
-        });
+        if let Err(e) = std::thread::Builder::new()
+            .name("autorip-http".into())
+            .spawn(move || {
+                // Hold the admission token for the handler's lifetime;
+                // dropped here on return/unwind, freeing the slot.
+                let _guard = guard;
+                handle_request(request, &cfg);
+            })
+        {
+            tracing::error!(error = %e, "failed to spawn request handler thread");
+            // guard drops here, freeing the reserved slot.
+        }
     }
     tracing::info!("web server stopping");
+}
+
+/// Extract a header value by case-insensitive field name.
+fn header_value<'a>(request: &'a tiny_http::Request, name: &str) -> Option<&'a str> {
+    // `HeaderField::equiv` requires a `&'static str`; compare the field
+    // name ourselves so we can take a borrowed `name`. HTTP header field
+    // names are case-insensitive.
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str())
+}
+
+/// Pull the host[:port] authority out of a URL or a bare Host header value.
+fn authority_of(s: &str) -> Option<String> {
+    // Strip scheme (origin headers look like `http://host:port`); Host
+    // headers are already bare. Then strip any path/query tail.
+    let after_scheme = s.split("://").last().unwrap_or(s);
+    let host = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme)
+        .trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Default TCP port implied by a URL scheme (used to normalize an authority
+/// that omits its port). Only the two web schemes matter here.
+fn default_port_for_scheme(s: &str) -> u16 {
+    if s.starts_with("https://") {
+        443
+    } else {
+        // http:// and bare Host values (no scheme) both default to 80,
+        // which is the right comparison baseline for a same-origin POST.
+        80
+    }
+}
+
+/// Normalize an authority (`host` or `host:port`) to a canonical
+/// `host:port`, filling in `default_port` when the port is omitted. This
+/// lets `http://host` (Origin, port implied) compare equal to `host:80`
+/// (Host header) so a legitimate same-origin request on the scheme's
+/// default port isn't falsely rejected as cross-origin.
+fn normalize_authority(authority: &str, default_port: u16) -> Option<String> {
+    let a = authority_of(authority)?;
+    // Bracketed IPv6 literal: [::1] or [::1]:8080.
+    if let Some(rest) = a.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse::<u16>().ok()?,
+            None if after.is_empty() => default_port,
+            None => return None,
+        };
+        return Some(format!("[{host}]:{port}"));
+    }
+    match a.rsplit_once(':') {
+        // Trailing ':NNN' is a port only if numeric; otherwise treat the
+        // whole thing as a host (defensive — keeps a stray colon from
+        // silently dropping the port).
+        Some((host, p)) => match p.parse::<u16>() {
+            Ok(port) => Some(format!("{host}:{port}")),
+            Err(_) => Some(format!("{a}:{default_port}")),
+        },
+        None => Some(format!("{a}:{default_port}")),
+    }
+}
+
+/// Lightweight cross-origin defense for state-changing POST routes.
+///
+/// This service is intentionally unauthenticated on the LAN and is driven
+/// both by a browser dashboard and by operator `curl`/monitoring scripts
+/// (which send no Origin header). So the policy is deliberately permissive:
+/// if an `Origin` (or, failing that, `Referer`) header is PRESENT and its
+/// host does NOT match the request's Host header, reject with 403. If no
+/// such header is present we ALLOW the request, so curl and monitoring
+/// keep working. This is defense-in-depth against a browser on the same
+/// LAN being used to forge state-changing requests (CSRF); it is not an
+/// authentication mechanism.
+///
+/// Returns `true` if the request should be rejected (caller sends 403).
+fn is_cross_origin_post(request: &tiny_http::Request) -> bool {
+    let origin = header_value(request, "Origin").or_else(|| header_value(request, "Referer"));
+    let host = header_value(request, "Host");
+    is_cross_origin(origin, host)
+}
+
+/// Pure cross-origin decision over the raw `Origin`/`Referer` and `Host`
+/// header values. Returns `true` when the request should be rejected.
+/// Absent/empty Origin → allow (curl/monitoring). Unparseable Origin or
+/// absent Host → can't prove cross-origin, so allow.
+fn is_cross_origin(origin: Option<&str>, host: Option<&str>) -> bool {
+    let origin = match origin {
+        None => return false,
+        Some(o) if o.trim().is_empty() => return false,
+        Some(o) => o,
+    };
+    // The Origin/Referer carries the scheme, which fixes the default port for
+    // BOTH sides: a same-origin request's Host equals the Origin's host:port,
+    // so the Host header (which never carries a scheme) is normalized against
+    // the same scheme's default. Without this, `http://host` (Origin, port
+    // implied) wouldn't match `host:80` (Host header) and a legitimate
+    // same-origin POST on the default port would be falsely 403'd.
+    let default_port = default_port_for_scheme(origin.trim());
+    let origin_norm = match normalize_authority(origin, default_port) {
+        Some(h) => h,
+        None => return false,
+    };
+    let host_norm = match host.and_then(|h| normalize_authority(h, default_port)) {
+        Some(h) => h,
+        None => return false,
+    };
+    origin_norm != host_norm
 }
 
 fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     let url = request.url().to_string();
     let is_get = *request.method() == Method::Get;
     let is_post = *request.method() == Method::Post;
+
+    // Defense-in-depth CSRF check: reject a state-changing POST whose
+    // Origin/Referer host disagrees with our Host header. Absent header is
+    // allowed so curl/monitoring scripts keep working (see helper doc).
+    if is_post && is_cross_origin_post(&request) {
+        return json_response(
+            request,
+            403,
+            r#"{"ok":false,"error":"cross-origin request rejected"}"#,
+        );
+    }
 
     if is_get && (url == "/" || url == "/index.html") {
         serve_html(request);
@@ -1206,9 +1358,15 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     } else if is_get && url == "/api/settings" {
         let c = match cfg.read() {
             Ok(c) => c,
-            Err(_) => return json_response(request, 500, "{}"),
+            Err(_) => {
+                return json_response(
+                    request,
+                    500,
+                    r#"{"ok":false,"error":"config lock poisoned"}"#,
+                );
+            }
         };
-        let json = serde_json::to_string(&*c).unwrap_or_else(|_| "{}".to_string());
+        let json = settings_json_redacted(&c);
         json_response(request, 200, &json);
     } else if is_post && url == "/api/settings" {
         handle_settings_post(request, cfg);
@@ -1302,15 +1460,27 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     }
 }
 
+/// Defensive validation for an operator-supplied poster URL. The value is
+/// later interpolated into an `<img src>` attribute on the dashboard; require
+/// an http(s) scheme and reject control characters or quotes so it can't break
+/// out of the attribute context even if the front-end escaping regresses.
+fn is_valid_poster_url(url: &str) -> bool {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+    !url.chars()
+        .any(|c| c.is_control() || c == '"' || c == '\'' || c == '<' || c == '>')
+}
+
 /// `POST /api/title/<device>` — operator's TMDB pick for the active disc (from the
 /// Ripper card). Body: `{"title":"…","year":2024,"poster_url":"…","overview":"…"}`.
 /// Stored as a one-shot override `rip_disc` consumes; also reflected on the live
 /// card immediately.
-fn handle_title_override(mut request: tiny_http::Request, device: &str) {
-    let mut body = String::new();
-    if request.as_reader().read_to_string(&mut body).is_err() {
-        return json_response(request, 400, r#"{"ok":false,"error":"bad body"}"#);
-    }
+fn handle_title_override(request: tiny_http::Request, device: &str) {
+    let (request, body) = match read_json_body(request) {
+        Ok(rb) => rb,
+        Err(()) => return,
+    };
     let v: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(_) => return json_response(request, 400, r#"{"ok":false,"error":"invalid json"}"#),
@@ -1323,7 +1493,11 @@ fn handle_title_override(mut request: tiny_http::Request, device: &str) {
         .as_u64()
         .and_then(|y| u16::try_from(y).ok())
         .unwrap_or(0);
-    let poster = v["poster_url"].as_str().unwrap_or("").to_string();
+    let poster_raw = v["poster_url"].as_str().unwrap_or("");
+    if !poster_raw.is_empty() && !is_valid_poster_url(poster_raw) {
+        return json_response(request, 400, r#"{"ok":false,"error":"invalid poster_url"}"#);
+    }
+    let poster = poster_raw.to_string();
     let overview = v["overview"].as_str().unwrap_or("").to_string();
     let media_type = v["media_type"].as_str().unwrap_or("movie").to_string();
     ripper::set_title_override(
@@ -1352,11 +1526,11 @@ fn handle_title_override(mut request: tiny_http::Request, device: &str) {
 
 /// `POST /api/review/resolve` — resolve a held rip. Body:
 /// `{"dir":"<staging subdir>","action":"proceed|retitle|cancel","title":"…","year":2024}`.
-fn handle_review_resolve(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
-    let mut body = String::new();
-    if request.as_reader().read_to_string(&mut body).is_err() {
-        return json_response(request, 400, r#"{"ok":false,"error":"bad body"}"#);
-    }
+fn handle_review_resolve(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
+    let (request, body) = match read_json_body(request) {
+        Ok(rb) => rb,
+        Err(()) => return,
+    };
     let v: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(_) => return json_response(request, 400, r#"{"ok":false,"error":"invalid json"}"#),
@@ -1384,20 +1558,23 @@ fn handle_review_resolve(mut request: tiny_http::Request, cfg: &Arc<RwLock<Confi
     };
     match crate::review::resolve(&staging, &dir, action) {
         Ok(()) => json_response(request, 200, r#"{"ok":true}"#),
-        Err(e) => json_response(
-            request,
-            400,
-            &format!(r#"{{"ok":false,"error":"{}"}}"#, e.replace('"', "'")),
-        ),
+        Err(e) => {
+            // Build the error payload with serde so backslashes, newlines,
+            // and control chars in a filesystem error string are escaped
+            // properly — manual quote-replacement produced malformed JSON
+            // the browser silently failed to parse.
+            let body = serde_json::json!({ "ok": false, "error": e }).to_string();
+            json_response(request, 400, &body)
+        }
     }
 }
 
 /// `GET /api/tmdb/search?q=<query>` — candidate matches for the review picker.
 fn handle_tmdb_search(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, url: &str) {
-    let q = url
-        .split_once("?q=")
-        .map(|(_, q)| percent_decode(q.split('&').next().unwrap_or("")))
-        .unwrap_or_default();
+    // Parse via parse_query so `q` is found regardless of parameter order
+    // (split_once("?q=") only matched q as the first query parameter, so
+    // e.g. /api/tmdb/search?version=2&q=movie yielded an empty query).
+    let q = parse_query(url).get("q").cloned().unwrap_or_default();
     let key = cfg
         .read()
         .map(|c| c.tmdb_api_key.clone())
@@ -1428,6 +1605,102 @@ fn json_response(request: tiny_http::Request, status: u16, body: &str) {
     let _ = request.respond(response);
 }
 
+/// Sentinel returned in place of a stored secret on GET /api/settings.
+/// On POST, a field carrying exactly this value is treated as "unchanged"
+/// so the UI can round-trip the redacted form without clobbering the real
+/// secret.
+const SECRET_SENTINEL: &str = "********";
+
+/// Serialize Config for GET /api/settings with credential fields redacted.
+/// No route is authenticated and the server binds 0.0.0.0, so returning
+/// `keyserver_secret` / `tmdb_api_key` in cleartext would hand any
+/// LAN/host client the operator's bearer token and API key.
+fn settings_json_redacted(c: &Config) -> String {
+    let mut v = serde_json::to_value(c).unwrap_or_else(|_| serde_json::json!({}));
+    for field in ["keyserver_secret", "tmdb_api_key"] {
+        if let Some(s) = v.get(field).and_then(|x| x.as_str()) {
+            if !s.is_empty() {
+                v[field] = serde_json::json!(SECRET_SENTINEL);
+            }
+        }
+    }
+    // webhook_urls embed bearer tokens (Discord/Slack/Jellyfin webhook
+    // secrets live in the path/query). Redact each non-empty entry to the
+    // sentinel, same round-trip as the scalar secrets above: POST treats a
+    // sentinel entry as "unchanged" and keeps the stored value.
+    if let Some(arr) = v.get_mut("webhook_urls").and_then(|x| x.as_array_mut()) {
+        for entry in arr.iter_mut() {
+            if entry.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+                *entry = serde_json::json!(SECRET_SENTINEL);
+            }
+        }
+    }
+    v.to_string()
+}
+
+/// Cap on a request body we read fully into memory. Every POST handler
+/// deals in small JSON documents (a settings patch, a title override, a
+/// review action, a debug toggle); 1 MiB is orders of magnitude above
+/// the largest legitimate body. Without this cap a LAN client could
+/// stream a multi-GB body and OOM the container, killing any in-flight
+/// rip/mux — a trivial unauthenticated DoS.
+const MAX_REQUEST_BODY: u64 = 1024 * 1024;
+
+/// Outcome of [`read_body_capped`].
+enum BodyRead {
+    /// Body read successfully, within the cap.
+    Ok(String),
+    /// The reader errored before EOF (truncated/disconnected client).
+    Err,
+    /// The body exceeded `MAX_REQUEST_BODY` before EOF.
+    TooLarge,
+}
+
+/// Read a request body fully into a `String`, but never more than
+/// `MAX_REQUEST_BODY + 1` bytes. We read one byte past the cap so an
+/// exactly-at-limit body is accepted while an oversized one is detected
+/// (the reader yields the extra byte only if more data exists). The
+/// client-supplied Content-Length is never trusted — the `take` adapter
+/// bounds the actual bytes pulled off the socket.
+fn read_body_capped(request: &mut tiny_http::Request) -> BodyRead {
+    let mut body = String::new();
+    match request
+        .as_reader()
+        .take(MAX_REQUEST_BODY + 1)
+        .read_to_string(&mut body)
+    {
+        Ok(_) => {
+            if body.len() as u64 > MAX_REQUEST_BODY {
+                BodyRead::TooLarge
+            } else {
+                BodyRead::Ok(body)
+            }
+        }
+        Err(_) => BodyRead::Err,
+    }
+}
+
+/// Read a JSON POST body with the shared size cap, replying with the
+/// appropriate error status (400 bad body / 413 too large) on failure.
+/// Returns `None` once a response has already been sent.
+fn read_json_body(mut request: tiny_http::Request) -> Result<(tiny_http::Request, String), ()> {
+    match read_body_capped(&mut request) {
+        BodyRead::Ok(body) => Ok((request, body)),
+        BodyRead::Err => {
+            json_response(request, 400, r#"{"ok":false,"error":"bad body"}"#);
+            Err(())
+        }
+        BodyRead::TooLarge => {
+            json_response(
+                request,
+                413,
+                r#"{"ok":false,"error":"request body too large"}"#,
+            );
+            Err(())
+        }
+    }
+}
+
 /// Validate that a device name is `sg\d+`. Rejects anything containing slashes
 /// or other characters that would let a malformed URL (e.g. a typo like
 /// `/api/rip/sg4/stop`) hit the rip handler with `device = "sg4/stop"`, which
@@ -1439,6 +1712,274 @@ fn is_valid_device_name(s: &str) -> bool {
         return false;
     }
     bytes[2..].iter().all(|b| b.is_ascii_digit())
+}
+
+// ── SSRF guard ─────────────────────────────────────────────────────────
+//
+// Any operator-supplied URL that autorip later fetches/POSTs to from
+// inside the container (keydb_url, keyserver_url, webhook_urls) is an
+// SSRF vector: an unauthenticated LAN client who can reach the settings
+// API could point it at 169.254.169.254 (cloud metadata), RFC1918
+// hosts, or loopback and either exfiltrate disc-key material or probe
+// internal services. We block those address classes at *store* time
+// (reject the save with a 400) and again at *fetch* time as
+// defence-in-depth, and we pin the connection to the IP we validated so
+// a DNS-rebinding attacker can't swap a public answer for an internal
+// one between the check and the connect (TOCTOU).
+
+/// True when `ip` is in a class autorip must never connect to: loopback,
+/// any RFC1918 / link-local / ULA private range, multicast, unspecified,
+/// the cloud-metadata anycast 169.254.169.254, and other non-global
+/// space. Conservative — anything not clearly a routable public address
+/// is blocked.
+fn is_blocked_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local() // 169.254.0.0/16, incl. metadata 169.254.169.254
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                // Carrier-grade NAT 100.64.0.0/10 (not flagged by std helpers).
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
+                // 0.0.0.0/8 "this network".
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // Unique-local fc00::/7.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local fe80::/10.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped (::ffff:a.b.c.d) — unwrap and re-check.
+                || v6.to_ipv4_mapped().map(|m| is_blocked_ip(&IpAddr::V4(m))) == Some(true)
+        }
+    }
+}
+
+/// Validate an operator-supplied fetch/POST URL against the SSRF guard.
+///
+/// Requires an `http`/`https` scheme, resolves the host **once**, and
+/// rejects the URL if it has no addresses or any resolved address is in
+/// a blocked class. On success returns the resolved+validated socket
+/// addresses so the caller can pin the connection to them (avoiding a
+/// re-resolve race). `Err(msg)` carries an operator-facing reason.
+pub(crate) fn validate_fetch_url(url: &str) -> Result<Vec<SocketAddr>, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("URL is empty".to_string());
+    }
+    // Minimal scheme + authority parse — no URL crate dep, mirroring the
+    // hand-rolled parsers already in this module.
+    let rest = if let Some(r) = url.strip_prefix("https://") {
+        (r, 443u16)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (r, 80u16)
+    } else {
+        return Err("URL must start with http:// or https://".to_string());
+    };
+    let (authority, default_port) = rest;
+    // Strip path/query/fragment — keep only the authority (host[:port]).
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
+    // Strip userinfo if present (user:pass@host).
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if authority.is_empty() {
+        return Err("URL has no host".to_string());
+    }
+    // Split host:port, handling bracketed IPv6 literals [::1]:8080.
+    let (host, port): (String, u16) = if let Some(stripped) = authority.strip_prefix('[') {
+        match stripped.split_once(']') {
+            Some((h, after)) => {
+                let p = after
+                    .strip_prefix(':')
+                    .map(|s| s.parse::<u16>().map_err(|_| "invalid port".to_string()))
+                    .transpose()?
+                    .unwrap_or(default_port);
+                (h.to_string(), p)
+            }
+            None => return Err("malformed IPv6 host".to_string()),
+        }
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        // Only treat the trailing ':' as a port separator if the right
+        // side is numeric (avoids mis-splitting a bare IPv6 literal,
+        // though those should be bracketed).
+        match p.parse::<u16>() {
+            Ok(p) => (h.to_string(), p),
+            Err(_) => (authority.to_string(), default_port),
+        }
+    } else {
+        (authority.to_string(), default_port)
+    };
+    if host.is_empty() {
+        return Err("URL has no host".to_string());
+    }
+
+    // Resolve once. ToSocketAddrs over (host, port) performs DNS.
+    let addrs: Vec<SocketAddr> = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("could not resolve host: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("host did not resolve to any address".to_string());
+    }
+    for a in &addrs {
+        if is_blocked_ip(&a.ip()) {
+            return Err(format!(
+                "refusing to connect to non-public address {} (SSRF guard)",
+                a.ip()
+            ));
+        }
+    }
+    Ok(addrs)
+}
+
+/// Validate an operator-supplied network output target against the SSRF
+/// guard. Unlike [`validate_fetch_url`] the target is a bare `host:port`
+/// (no scheme) — at rip time libfreemkv streams decrypted disc content to
+/// it, so the same non-public-address rule applies. Resolves the host once
+/// and rejects if it has no addresses or any resolved address is blocked.
+pub(crate) fn validate_network_target(target: &str) -> Result<(), String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("network target is empty".to_string());
+    }
+    // Split host:port, handling bracketed IPv6 literals [::1]:9000.
+    let (host, port): (String, u16) = if let Some(stripped) = target.strip_prefix('[') {
+        match stripped.split_once(']') {
+            Some((h, after)) => {
+                let p = after
+                    .strip_prefix(':')
+                    .ok_or_else(|| "network target needs a port (host:port)".to_string())?
+                    .parse::<u16>()
+                    .map_err(|_| "invalid port".to_string())?;
+                (h.to_string(), p)
+            }
+            None => return Err("malformed IPv6 host".to_string()),
+        }
+    } else {
+        let (h, p) = target
+            .rsplit_once(':')
+            .ok_or_else(|| "network target needs a port (host:port)".to_string())?;
+        let p = p.parse::<u16>().map_err(|_| "invalid port".to_string())?;
+        (h.to_string(), p)
+    };
+    if host.is_empty() {
+        return Err("network target has no host".to_string());
+    }
+
+    let addrs: Vec<SocketAddr> = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("could not resolve host: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("host did not resolve to any address".to_string());
+    }
+    for a in &addrs {
+        if is_blocked_ip(&a.ip()) {
+            return Err(format!(
+                "refusing to stream to non-public address {} (SSRF guard)",
+                a.ip()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build a ureq agent that (a) follows zero redirects — so a permitted
+/// public URL can't 30x-redirect into an internal address — and (b)
+/// pins DNS resolution to `pinned`, the exact addresses
+/// `validate_fetch_url` already vetted. Pinning closes the DNS-rebinding
+/// TOCTOU: ureq connects to the validated IPs instead of re-resolving
+/// the hostname (which an attacker could flip to 169.254.169.254 /
+/// RFC1918 in the window between validation and fetch).
+pub(crate) fn guarded_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
+    // ureq 2.x sets NO default connect/read timeout. Without one a peer
+    // that accepts the connection but never responds would block the
+    // caller's thread (and hold its socket) forever — for webhooks a
+    // fresh thread spawns on every move/rip-complete, so a dead receiver
+    // would leak threads and sockets without bound. Bound both alongside
+    // the SSRF pinning (resolver) and redirect block.
+    ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout_read(std::time::Duration::from_secs(30))
+        .resolver(move |_netloc: &str| Ok(pinned.clone()))
+        .build()
+}
+
+/// SSRF-guarded HTTP GET. Runs [`validate_fetch_url`] (scheme + resolved-IP
+/// allow-list) and then issues the request through [`guarded_agent`] so the
+/// connection is pinned to the validated addresses and redirects are blocked.
+///
+/// This is the single entry point any code path that fetches an
+/// operator-supplied URL from inside the container should use — the KEYDB
+/// download on startup and the daily-refresh thread (main.rs) both route
+/// through here instead of calling `ureq::get` directly, which would bypass
+/// the guard entirely. Returns the response on success or an
+/// operator-facing reason string on rejection / transport failure.
+///
+/// `pub` (not `pub(crate)`): the binary's `main.rs` declares its own `mod
+/// web`, but the library facade in `lib.rs` re-exports this module too. In
+/// the lib build nothing inside the crate calls this helper — only the bin
+/// and the test module do — so `pub(crate)` would trip `dead_code`. Exposing
+/// it as the crate's public SSRF-guarded fetch entry point is also the honest
+/// description of its role.
+pub fn guarded_get(url: &str) -> Result<ureq::Response, String> {
+    let pinned = validate_fetch_url(url)?;
+    guarded_agent(pinned)
+        .get(url)
+        .call()
+        .map_err(|e| format!("fetch failed: {e}"))
+}
+
+// ── Connection caps ────────────────────────────────────────────────────
+//
+// run() spawns one OS thread per accepted connection, and /events
+// (handle_sse) loops forever holding its thread until the client
+// disconnects. With no cap an unauthenticated LAN client can open N
+// sockets and pin N threads/stacks, exhausting the container and
+// starving in-flight rips. We bound both: total in-flight handler
+// threads and, more tightly, concurrent SSE streams. Over the cap we
+// return 503 and let the thread end immediately.
+
+/// Max concurrent request-handler threads. Generous — normal use is a
+/// handful of browser tabs polling — but finite so a flood can't fork
+/// the box to death.
+const MAX_INFLIGHT_HANDLERS: usize = 64;
+/// Max concurrent SSE (`/events`) streams. Each pins a thread for its
+/// whole lifetime, so this is the tighter bound.
+const MAX_SSE_CLIENTS: usize = 8;
+
+static INFLIGHT_HANDLERS: AtomicUsize = AtomicUsize::new(0);
+static SSE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII admission token for a counted connection slot. Decrements its
+/// counter on drop, so the slot is freed no matter how the handler exits
+/// (return, panic-unwind). `try_acquire` returns None when the cap is
+/// already reached.
+struct ConnGuard(&'static AtomicUsize);
+
+impl ConnGuard {
+    fn try_acquire(counter: &'static AtomicUsize, max: usize) -> Option<ConnGuard> {
+        // fetch_update gives us a CAS loop that only increments while
+        // under the cap, so the count can never exceed `max`.
+        let ok = counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                if n < max { Some(n + 1) } else { None }
+            })
+            .is_ok();
+        if ok { Some(ConnGuard(counter)) } else { None }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -1466,6 +2007,346 @@ mod web_tests {
         assert!(!is_valid_device_name("sda"));
         assert!(!is_valid_device_name("sg0a"));
     }
+
+    #[test]
+    fn poster_url_validation() {
+        assert!(is_valid_poster_url(
+            "https://image.tmdb.org/t/p/w500/abc.jpg"
+        ));
+        assert!(is_valid_poster_url("http://example.com/poster.png"));
+        // Wrong scheme.
+        assert!(!is_valid_poster_url("javascript:alert(1)"));
+        assert!(!is_valid_poster_url("ftp://example.com/x.jpg"));
+        assert!(!is_valid_poster_url("//example.com/x.jpg"));
+        // Attribute-breakout / control chars.
+        assert!(!is_valid_poster_url("https://example.com/\"><script>"));
+        assert!(!is_valid_poster_url("https://example.com/x'onerror=1"));
+        assert!(!is_valid_poster_url("https://example.com/a\nb"));
+    }
+
+    /// The dashboard's `esc()` must HTML-escape all five sensitive characters
+    /// (`&`, `<`, `>`, `"`, `'`) because its output is interpolated into both
+    /// double-quoted attributes and `innerHTML`. A `textContent`/`innerHTML`
+    /// round-trip (the prior implementation) leaves `"` and `'` unescaped.
+    /// We mirror the shipped regex chain here and assert the full set, and
+    /// also assert the JS source carries the quote escapes so a regression in
+    /// the template is caught.
+    #[test]
+    fn dashboard_esc_escapes_all_five() {
+        fn esc(s: &str) -> String {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&#39;")
+        }
+        assert_eq!(esc("\"x<>&'"), "&quot;x&lt;&gt;&amp;&#39;");
+        // The shipped JS must escape quotes and apostrophes, not just <>&.
+        assert!(DASHBOARD_HTML.contains(r#"replace(/"/g,'&quot;')"#));
+        assert!(DASHBOARD_HTML.contains(r"replace(/'/g,'&#39;')"));
+    }
+
+    #[test]
+    fn settings_get_redacts_secrets() {
+        let c = Config {
+            tmdb_api_key: "real-tmdb-key".into(),
+            keyserver_secret: "real-bearer-token".into(),
+            ..Config::default()
+        };
+        let json: serde_json::Value = serde_json::from_str(&settings_json_redacted(&c)).unwrap();
+        assert_eq!(json["tmdb_api_key"], SECRET_SENTINEL);
+        assert_eq!(json["keyserver_secret"], SECRET_SENTINEL);
+        // An empty secret stays empty (no sentinel) so the UI shows a blank field.
+        let json2: serde_json::Value =
+            serde_json::from_str(&settings_json_redacted(&Config::default())).unwrap();
+        assert_eq!(json2["tmdb_api_key"], "");
+    }
+
+    #[test]
+    fn settings_get_redacts_webhook_urls() {
+        // Webhook URLs embed bearer tokens (Discord/Slack/Jellyfin), so a
+        // GET must hand back the sentinel, not the cleartext token URL.
+        let c = Config {
+            webhook_urls: vec![
+                "https://discord.com/api/webhooks/123/secrettoken".into(),
+                "".into(),
+                "https://hooks.slack.com/services/AAA/BBB/cccsecret".into(),
+            ],
+            ..Config::default()
+        };
+        let json: serde_json::Value = serde_json::from_str(&settings_json_redacted(&c)).unwrap();
+        let arr = json["webhook_urls"].as_array().unwrap();
+        assert_eq!(arr[0], SECRET_SENTINEL);
+        // Empty entry stays empty (no sentinel) so the UI shows a blank row.
+        assert_eq!(arr[1], "");
+        assert_eq!(arr[2], SECRET_SENTINEL);
+    }
+
+    #[test]
+    fn webhook_post_sentinel_preserves_stored_url() {
+        // Mirror the inline POST resolution: a sentinel entry resolves
+        // positionally against the stored URL; a real entry replaces; an
+        // empty entry is dropped. A GET→POST round-trip of the redacted
+        // form must NOT wipe the token-bearing stored URL.
+        let existing: Vec<String> = vec![
+            "https://discord.com/api/webhooks/1/aaa".into(),
+            "https://hooks.slack.com/services/x/y/zzz".into(),
+        ];
+        let patch: Vec<String> = vec![
+            SECRET_SENTINEL.into(),                // unchanged → keep stored[0]
+            "https://example.com/new-hook".into(), // changed → replace
+        ];
+        let resolved: Vec<String> = patch
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                if s == SECRET_SENTINEL {
+                    existing.get(i).cloned()
+                } else {
+                    Some(s.clone())
+                }
+            })
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0], "https://discord.com/api/webhooks/1/aaa");
+        assert_eq!(resolved[1], "https://example.com/new-hook");
+    }
+
+    #[test]
+    fn port_range_validation_rejects_out_of_range() {
+        // handle_settings_post validates the parsed port against this range
+        // BEFORE taking the Config write guard, so a bad value (e.g. 70000,
+        // which would truncate to 4464 as u16) can't leave a partial
+        // in-memory mutation behind. Pin the predicate the pre-guard check
+        // uses.
+        let ok = |v: u64| (1..=65535).contains(&v);
+        assert!(!ok(0), "0 is not a valid bind port");
+        assert!(
+            !ok(70000),
+            "70000 must be rejected (would truncate to 4464)"
+        );
+        assert!(!ok(65536), "65536 overflows u16");
+        assert!(ok(1));
+        assert!(ok(8080));
+        assert!(ok(65535));
+    }
+
+    // ── Cross-origin (CSRF defense-in-depth) ───────────────────────────
+
+    #[test]
+    fn cross_origin_post_rejected_when_origin_host_differs() {
+        // A browser on the LAN forging a POST carries an Origin header
+        // whose host won't match our Host header → reject.
+        assert!(is_cross_origin(
+            Some("http://evil.example.com"),
+            Some("autorip.local")
+        ));
+        // Referer fallback host mismatch is likewise rejected (the request
+        // helper falls back to Referer when Origin is absent).
+        assert!(is_cross_origin(
+            Some("http://evil.example.com/page"),
+            Some("autorip.local")
+        ));
+    }
+
+    #[test]
+    fn cross_origin_post_allowed_when_origin_absent_or_same() {
+        // curl / monitoring scripts send no Origin → allow.
+        assert!(!is_cross_origin(None, Some("autorip.local")));
+        // Empty Origin → allow.
+        assert!(!is_cross_origin(Some(""), Some("autorip.local")));
+        // Same host (scheme/path stripped, case-insensitive) → allow.
+        assert!(!is_cross_origin(
+            Some("http://autorip.local"),
+            Some("autorip.local")
+        ));
+        assert!(!is_cross_origin(
+            Some("http://Host.Local:8080/x"),
+            Some("host.local:8080")
+        ));
+        // No Host header to compare against → can't prove cross-origin, allow.
+        assert!(!is_cross_origin(Some("http://evil.example.com"), None));
+    }
+
+    #[test]
+    fn cross_origin_default_port_normalization() {
+        // Origin omits the default port; Host carries it explicitly. These
+        // are the SAME origin and must NOT be rejected. (The pre-fix exact
+        // string compare 403'd these.)
+        assert!(!is_cross_origin(
+            Some("http://autorip.local"),
+            Some("autorip.local:80")
+        ));
+        assert!(!is_cross_origin(
+            Some("https://autorip.local"),
+            Some("autorip.local:443")
+        ));
+        // Inverse: Origin carries the default port, Host omits it.
+        assert!(!is_cross_origin(
+            Some("http://autorip.local:80"),
+            Some("autorip.local")
+        ));
+        // IPv6 literal, default-port both sides.
+        assert!(!is_cross_origin(Some("http://[::1]"), Some("[::1]:80")));
+        // A genuinely different port is still cross-origin.
+        assert!(is_cross_origin(
+            Some("http://autorip.local:8080"),
+            Some("autorip.local:9090")
+        ));
+        // https default (443) must not collapse onto http default (80):
+        // an https Origin compared against a Host carrying :80 is a real
+        // mismatch.
+        assert!(is_cross_origin(
+            Some("https://autorip.local"),
+            Some("autorip.local:80")
+        ));
+    }
+
+    // ── SSRF guard ─────────────────────────────────────────────────────
+
+    #[test]
+    fn blocks_loopback_private_and_metadata_ips() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // Loopback.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        // RFC1918 private ranges.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        // Cloud metadata anycast (link-local).
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        // Carrier-grade NAT 100.64.0.0/10 and "this network" 0.0.0.0/8.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+        // IPv6 loopback, ULA, link-local.
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfd00, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        // IPv4-mapped loopback ::ffff:127.0.0.1 must also be blocked.
+        assert!(is_blocked_ip(&IpAddr::V6(
+            Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped()
+        )));
+    }
+
+    #[test]
+    fn allows_public_ips() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        // Public IPv6 (Cloudflare DNS).
+        assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111
+        ))));
+    }
+
+    #[test]
+    fn validate_fetch_url_rejects_internal_and_bad_scheme() {
+        // Numeric internal/metadata literals resolve without DNS and must
+        // be rejected.
+        assert!(validate_fetch_url("http://127.0.0.1/x").is_err());
+        assert!(validate_fetch_url("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(validate_fetch_url("http://10.0.0.5:8080/decode").is_err());
+        assert!(validate_fetch_url("https://192.168.0.1/").is_err());
+        assert!(validate_fetch_url("http://[::1]:9000/").is_err());
+        // Non-http schemes and junk.
+        assert!(validate_fetch_url("ftp://example.com/x").is_err());
+        assert!(validate_fetch_url("file:///etc/passwd").is_err());
+        assert!(validate_fetch_url("not a url").is_err());
+        assert!(validate_fetch_url("").is_err());
+    }
+
+    #[test]
+    fn guarded_get_rejects_rfc1918_before_connecting() {
+        // guarded_get must run the SSRF guard FIRST, so an RFC1918 /
+        // loopback / metadata literal is rejected with an Err and no socket
+        // is ever opened. (This is the guard the main.rs KEYDB fetch paths
+        // route through instead of a bare ureq::get.)
+        assert!(guarded_get("http://10.0.0.5/keydb.zip").is_err());
+        assert!(guarded_get("http://192.168.1.10/keydb.zip").is_err());
+        assert!(guarded_get("http://172.16.0.1/keydb.zip").is_err());
+        assert!(guarded_get("http://127.0.0.1/keydb.zip").is_err());
+        assert!(guarded_get("http://169.254.169.254/latest/").is_err());
+        assert!(guarded_get("http://[::1]:9000/keydb.zip").is_err());
+        // Wrong scheme is rejected too (no connect attempt).
+        assert!(guarded_get("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_network_target_rejects_internal_hosts() {
+        // Bare host:port (no scheme). Internal/metadata literals resolve
+        // without DNS and must be rejected — at rip time decrypted content
+        // streams here.
+        assert!(validate_network_target("169.254.169.254:80").is_err());
+        assert!(validate_network_target("127.0.0.1:9000").is_err());
+        assert!(validate_network_target("10.0.0.5:9000").is_err());
+        assert!(validate_network_target("192.168.0.1:9000").is_err());
+        assert!(validate_network_target("[::1]:9000").is_err());
+        // RFC5737 documentation range is non-public and blocked.
+        assert!(validate_network_target("198.51.100.10:9000").is_err());
+        // Malformed / missing port.
+        assert!(validate_network_target("nas.example.com").is_err());
+        assert!(validate_network_target("169.254.169.254").is_err());
+        assert!(validate_network_target("").is_err());
+    }
+
+    #[test]
+    fn validate_network_target_accepts_public_literal() {
+        // A public numeric host:port (no DNS needed) should validate.
+        assert!(validate_network_target("8.8.8.8:9000").is_ok());
+        assert!(validate_network_target("1.1.1.1:443").is_ok());
+    }
+
+    #[test]
+    fn validate_fetch_url_accepts_public_literal() {
+        // A public numeric host (no DNS needed) should validate and yield
+        // the pinned address with the default port for the scheme.
+        let addrs = validate_fetch_url("https://8.8.8.8/keydb.zip").expect("public IP allowed");
+        assert!(addrs.iter().any(|a| a.port() == 443));
+        let addrs = validate_fetch_url("http://1.1.1.1:8080/decode").expect("public IP allowed");
+        assert!(addrs.iter().any(|a| a.port() == 8080));
+    }
+
+    // ── Connection cap ─────────────────────────────────────────────────
+
+    #[test]
+    fn conn_guard_enforces_cap_and_releases_on_drop() {
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let g1 = ConnGuard::try_acquire(&C, 2);
+        let g2 = ConnGuard::try_acquire(&C, 2);
+        assert!(g1.is_some());
+        assert!(g2.is_some());
+        assert_eq!(C.load(Ordering::SeqCst), 2);
+        // Third over the cap is rejected.
+        assert!(ConnGuard::try_acquire(&C, 2).is_none());
+        // Dropping one frees a slot so the next acquire succeeds.
+        drop(g1);
+        assert_eq!(C.load(Ordering::SeqCst), 1);
+        let g3 = ConnGuard::try_acquire(&C, 2);
+        assert!(g3.is_some());
+        drop(g2);
+        drop(g3);
+        assert_eq!(C.load(Ordering::SeqCst), 0);
+    }
+
+    // ── percent_decode trailing %XX ────────────────────────────────────
+
+    #[test]
+    fn percent_decode_handles_trailing_encoded_byte() {
+        // A value ending in a percent-encoded byte must decode (the old
+        // off-by-one dropped it through as literal text).
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("end%20"), "end ");
+        // A bare trailing '%' or incomplete '%X' stays literal (no panic).
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("50%2"), "50%2");
+    }
 }
 
 fn text_response(request: tiny_http::Request, body: &str) {
@@ -1484,10 +2365,10 @@ fn get_state_json() -> String {
         .lock()
         .ok()
         .and_then(|ms| ms.clone());
-    let mux_state = crate::muxer::MUX_STATE
-        .lock()
-        .ok()
-        .and_then(|ms| ms.clone());
+    // Mux progress rides on the synthetic `_mux` device key in STATE (a
+    // RipState seeded by the mux worker — see the dashboard JS at the
+    // `_mux` field), serialized below as part of `state`. There is no
+    // separate live MuxState struct.
     let verify_state = crate::verify::VERIFY_STATE
         .lock()
         .ok()
@@ -1496,9 +2377,6 @@ fn get_state_json() -> String {
     if let Some(ms) = move_state {
         obj["_move"] = serde_json::to_value(&ms).unwrap_or_default();
     }
-    if let Some(ms) = mux_state {
-        obj["_mux"] = serde_json::to_value(&ms).unwrap_or_default();
-    }
     if let Some(vs) = verify_state {
         obj["_verify"] = serde_json::to_value(&vs).unwrap_or_default();
     }
@@ -1506,7 +2384,19 @@ fn get_state_json() -> String {
 }
 
 fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
-    let cfg = cfg.read().unwrap();
+    // Degrade gracefully on a poisoned lock, matching every other handler
+    // (e.g. GET /api/settings) rather than panicking this handler thread
+    // and silently breaking the System tab.
+    let cfg = match cfg.read() {
+        Ok(c) => c,
+        Err(_) => {
+            return json_response(
+                request,
+                500,
+                r#"{"ok":false,"error":"config lock poisoned"}"#,
+            );
+        }
+    };
 
     // Move queue: scan staging for .done markers (pending moves)
     let move_queue: Vec<String> = std::fs::read_dir(&cfg.staging_dir)
@@ -1539,9 +2429,11 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         .map(|m| m.values().cloned().collect())
         .unwrap_or_default();
 
-    // System log: last 50 lines
+    // System log: last 50 lines. Tail from the end with a bounded read
+    // rather than slurping the whole file — device_system.log is never
+    // rotated and the System page polls this endpoint every few seconds.
     let syslog_path = format!("{}/device_system.log", cfg.log_dir());
-    let syslog = std::fs::read_to_string(&syslog_path)
+    let syslog = tail_file(&syslog_path, SYSLOG_TAIL_BYTES)
         .unwrap_or_default()
         .lines()
         .rev()
@@ -1561,13 +2453,55 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 }
 
 fn handle_device_log(request: tiny_http::Request, _cfg: &Arc<RwLock<Config>>, device: &str) {
-    // Validate device name
-    if !device.chars().all(|c| c.is_ascii_alphanumeric()) {
+    // Single source of truth for device-name validation. The /api/logs
+    // dispatch site already gates on is_valid_device_name (strict sg\d+),
+    // so this is normally unreachable with a bad name — but re-checking
+    // with the *same* strict predicate (rather than the looser
+    // ascii-alphanumeric test that previously lived here, which an empty
+    // string passes vacuously and which accepts sda/sr0) closes any
+    // latent bypass if the handler is ever called directly.
+    if !is_valid_device_name(device) {
         text_response(request, "invalid device");
         return;
     }
     let lines = crate::log::get_device_log(device, 2000);
     text_response(request, &lines.join("\n"));
+}
+
+/// Upper bound on how many trailing bytes of a log file we read into
+/// memory when tailing. The JSONL event log uses `rolling::never`
+/// (observe.rs) so it grows unbounded for the container's life; the
+/// System/Debug tabs poll it every few seconds. 8 MiB comfortably holds
+/// the 5000-line `n` cap of typical events while keeping per-request
+/// allocation bounded regardless of total file size.
+const DEBUG_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Same idea for the system log: 50 lines, generously bounded.
+const SYSLOG_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Read up to the last `max_bytes` of a file as a UTF-8 string, seeking
+/// from the end rather than slurping the whole file. If the file is
+/// larger than `max_bytes`, the first (partial) line of the returned
+/// region may be truncated mid-record — acceptable for a tail view and
+/// the truncated head line is dropped by callers that split on `\n`.
+fn tail_file(path: &str, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let read_from = len.saturating_sub(max_bytes);
+    let truncated = read_from > 0;
+    f.seek(SeekFrom::Start(read_from))?;
+    let mut buf = Vec::with_capacity(len.saturating_sub(read_from).min(max_bytes) as usize);
+    f.take(max_bytes).read_to_end(&mut buf)?;
+    let mut s = String::from_utf8_lossy(&buf).into_owned();
+    // When we seeked into the middle of the file, the first line is a
+    // partial record — drop it so callers never parse a half line.
+    if truncated {
+        if let Some(nl) = s.find('\n') {
+            s.drain(..=nl);
+        }
+    }
+    Ok(s)
 }
 
 /// `GET /api/debug?n=N&level=L&device=D&q=substr` — last N JSONL events.
@@ -1596,12 +2530,12 @@ fn handle_debug_log(request: tiny_http::Request, url: &str) {
     let q = params.get("q").cloned();
 
     let path = crate::observe::json_log_path();
-    let content = match std::fs::read_to_string(&path) {
+    let content = match tail_file(&path, DEBUG_TAIL_BYTES) {
         Ok(s) => s,
         Err(e) => {
-            // Daily-rolled file may not exist on a fresh boot before the
-            // first event flushes. Return empty rather than 404 — UI can
-            // poll without alerting.
+            // The non-rolling jsonl file may not exist on a fresh boot
+            // before the first event flushes. Return empty rather than 404
+            // — UI can poll without alerting.
             tracing::debug!(path = %path, error = %e, "debug: jsonl missing");
             return text_response(request, "");
         }
@@ -1647,10 +2581,12 @@ fn handle_debug_log(request: tiny_http::Request, url: &str) {
     text_response(request, &out.join("\n"));
 }
 
-/// Parse `?key=value&key2=v2` from a URL into a HashMap. Naive (no
-/// percent-decoding except `+` → space, no array-style keys) — sufficient
-/// for our handful of debug filters and easier to audit than pulling a URL
-/// parser dep.
+/// Parse `?key=value&key2=v2` from a URL into a HashMap. Naive:
+/// percent-decodes each key and value via `percent_decode`, but does NOT
+/// translate `+` to space (so this is not full
+/// application/x-www-form-urlencoded decoding) and has no array-style
+/// keys — sufficient for our handful of debug filters and easier to
+/// audit than pulling a URL parser dep.
 fn parse_query(url: &str) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let q = match url.split_once('?') {
@@ -1673,12 +2609,11 @@ fn parse_query(url: &str) -> std::collections::HashMap<String, String> {
 /// file and only rename on success.
 const SETTINGS_SAVE_DEADLINE_SECS: u64 = 15;
 
-fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
-    let mut body = String::new();
-    if request.as_reader().read_to_string(&mut body).is_err() {
-        json_response(request, 400, r#"{"ok":false,"error":"bad body"}"#);
-        return;
-    }
+fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
+    let (request, body) = match read_json_body(request) {
+        Ok(rb) => rb,
+        Err(()) => return,
+    };
     let patch: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(_) => {
@@ -1687,8 +2622,113 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
         }
     };
 
-    // 0.20.8 fix (Finding 22): mutate the Config inside the write guard,
-    // then snapshot+drop the guard BEFORE calling `config::save`. The
+    // Validate every outbound URL/target BEFORE taking the write guard.
+    // `validate_fetch_url` / `validate_network_target` do synchronous DNS
+    // (`to_socket_addrs`); running them under `cfg.write()` would block
+    // every concurrent `cfg.read()` handler for the resolution duration —
+    // the 0.20.8 lock-stall, here driven by a slow-resolving host in an
+    // unauthenticated POST. Resolution happens here with no lock held; on
+    // rejection we return before mutating anything. The write guard below
+    // covers only in-memory mutation.
+    if let Some(v) = patch.get("keydb_url").and_then(|v| v.as_str()) {
+        // SSRF guard at store time (handle_update_keydb re-validates +
+        // pins at fetch time). Empty clears the configured URL.
+        if !v.trim().is_empty() {
+            if let Err(e) = validate_fetch_url(v) {
+                return json_response(
+                    request,
+                    400,
+                    &serde_json::json!({
+                        "ok": false,
+                        "error": format!("keydb_url rejected: {e}")
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    }
+    if let Some(v) = patch.get("keyserver_url").and_then(|v| v.as_str()) {
+        // SSRF guard: keysource.rs OnlineSource POSTs this URL verbatim at
+        // rip time, so an unauthenticated LAN client must not be able to
+        // aim it at metadata/internal hosts. Empty is allowed (disables the
+        // online source). Reject on failure.
+        if !v.trim().is_empty() {
+            if let Err(e) = validate_fetch_url(v) {
+                return json_response(
+                    request,
+                    400,
+                    &serde_json::json!({
+                        "ok": false,
+                        "error": format!("keyserver_url rejected: {e}")
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    }
+    if let Some(v) = patch.get("network_target").and_then(|v| v.as_str()) {
+        // SSRF guard: at rip time libfreemkv streams decrypted disc content
+        // to this bare `host:port`. Without a check an unauthenticated POST
+        // could beacon plaintext to an internal/metadata host. Empty clears
+        // the target (no check needed). Reject any host that is or resolves
+        // to a non-public address.
+        if !v.trim().is_empty() {
+            if let Err(e) = validate_network_target(v) {
+                return json_response(
+                    request,
+                    400,
+                    &serde_json::json!({
+                        "ok": false,
+                        "error": format!("network_target rejected: {e}")
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    }
+    if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {
+        // SSRF guard: webhook.rs fire() POSTs each of these to deliver
+        // rip/move events. Validate every one at store time so a LAN client
+        // can't make autorip beacon to internal/metadata hosts. A sentinel
+        // entry is a redacted "unchanged" placeholder (resolved to the
+        // stored URL under the write guard), so skip it here — the stored
+        // value was already validated when it was first saved.
+        for u in arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty() && *s != SECRET_SENTINEL)
+        {
+            if let Err(e) = validate_fetch_url(u) {
+                return json_response(
+                    request,
+                    400,
+                    &serde_json::json!({
+                        "ok": false,
+                        "error": format!("webhook URL rejected: {e}")
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    }
+    if let Some(v) = patch.get("port").and_then(|v| v.as_u64()) {
+        // Reject out-of-range BEFORE taking the write guard. Validating
+        // inside the guard meant a bad port returned 400 only after other
+        // fields had already been mutated in the live in-memory Config,
+        // leaving a partial update behind. The server is the trust
+        // boundary; a raw POST can carry any value (e.g. 70000 would
+        // otherwise truncate to 4464 as u16).
+        if !(1..=65535).contains(&v) {
+            return json_response(
+                request,
+                400,
+                r#"{"ok":false,"error":"port must be 1..=65535"}"#,
+            );
+        }
+    }
+
+    // Mutate the Config inside the write guard, then snapshot+drop the
+    // guard BEFORE calling `config::save`. The
     // previous code held the write guard across `fs::write` +
     // `fs::rename` on `/config/settings.json` — on NFS those calls can
     // hang indefinitely, blocking every concurrent reader of the lock
@@ -1698,7 +2738,13 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
     let snapshot: Config = {
         let mut c = match cfg.write() {
             Ok(c) => c,
-            Err(_) => return json_response(request, 500, "{}"),
+            Err(_) => {
+                return json_response(
+                    request,
+                    500,
+                    r#"{"ok":false,"error":"config lock poisoned"}"#,
+                );
+            }
         };
         if let Some(v) = patch.get("output_dir").and_then(|v| v.as_str()) {
             c.output_dir = v.to_string();
@@ -1713,19 +2759,27 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
             c.tv_dir = v.to_string();
         }
         if let Some(v) = patch.get("tmdb_api_key").and_then(|v| v.as_str()) {
-            c.tmdb_api_key = v.to_string();
+            // Ignore the redaction sentinel so a round-trip of the GET
+            // response doesn't wipe the stored key.
+            if v != SECRET_SENTINEL {
+                c.tmdb_api_key = v.to_string();
+            }
         }
         if let Some(v) = patch.get("keydb_url").and_then(|v| v.as_str()) {
+            // Validated above the write guard (SSRF).
             c.keydb_url = v.to_string();
         }
         if let Some(v) = patch.get("key_source").and_then(|v| v.as_str()) {
             c.key_source = v.to_string();
         }
         if let Some(v) = patch.get("keyserver_url").and_then(|v| v.as_str()) {
+            // Validated above the write guard (SSRF).
             c.keyserver_url = v.to_string();
         }
         if let Some(v) = patch.get("keyserver_secret").and_then(|v| v.as_str()) {
-            c.keyserver_secret = v.to_string();
+            if v != SECRET_SENTINEL {
+                c.keyserver_secret = v.to_string();
+            }
         }
         if let Some(v) = patch.get("keydb_path").and_then(|v| v.as_str()) {
             c.keydb_path = if v.is_empty() {
@@ -1757,12 +2811,15 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
             c.output_format = v.to_string();
         }
         if let Some(v) = patch.get("network_target").and_then(|v| v.as_str()) {
+            // Validated above the write guard (SSRF); empty clears it.
             c.network_target = v.to_string();
         }
         if let Some(v) = patch.get("min_length_secs").and_then(|v| v.as_u64()) {
             c.min_length_secs = v;
         }
         if let Some(v) = patch.get("port").and_then(|v| v.as_u64()) {
+            // Range-validated above the write guard (1..=65535) so a bad
+            // value can't leave a partial in-memory mutation behind.
             c.port = v as u16;
         }
         if let Some(v) = patch.get("max_retries").and_then(|v| v.as_u64()) {
@@ -1775,24 +2832,46 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
             c.abort_on_lost_secs = v;
         }
         if let Some(rip_mode) = patch.get("rip_mode").and_then(|v| v.as_str()) {
-            c.max_retries = if rip_mode == "single" {
-                0
-            } else {
-                c.max_retries
-            };
-            c.keep_iso = rip_mode == "multi";
+            // "single" = direct disc->MKV, no retries. "multi" = retry
+            // passes + ISO intermediate, which is meaningless with zero
+            // retries — clamp to at least 1 so a raw POST can't persist an
+            // invalid multi/0 config. Do NOT re-derive keep_iso from the
+            // mode here: keep_iso is handled explicitly above, and silently
+            // clobbering it overrode the operator's explicit choice.
+            if rip_mode == "single" {
+                c.max_retries = 0;
+            } else if c.max_retries == 0 {
+                c.max_retries = 1;
+            }
         }
         if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {
+            // Validated above the write guard (SSRF). A sentinel entry is a
+            // redacted "unchanged" placeholder: resolve it positionally
+            // against the currently-stored URL so a GET→POST round-trip of
+            // the redacted form doesn't wipe the real (token-bearing) URL.
+            // Same mechanism as the scalar secrets above.
+            let existing = c.webhook_urls.clone();
             c.webhook_urls = arr
                 .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .filter(|s| !s.is_empty())
+                .enumerate()
+                .filter_map(|(i, v)| {
+                    let s = v.as_str()?;
+                    if s == SECRET_SENTINEL {
+                        existing.get(i).cloned()
+                    } else {
+                        Some(s.to_string())
+                    }
+                })
+                .filter(|s| !s.trim().is_empty())
                 .collect();
         }
         // v0.25.7: decrypt_threads + log_retention_days. Were env-only
         // pre-0.25.7; now operator-tunable from the Settings page.
         if let Some(v) = patch.get("decrypt_threads").and_then(|v| v.as_u64()) {
-            c.decrypt_threads = v as usize;
+            // Match config::load's .min(256) clamp so the live/on-disk
+            // value can't diverge from what a restart would load (and
+            // libfreemkv caps the effective pool at 64 regardless).
+            c.decrypt_threads = (v as usize).min(256);
         }
         if let Some(v) = patch.get("log_retention_days").and_then(|v| v.as_u64()) {
             c.log_retention_days = v;
@@ -1816,15 +2895,44 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
     // it atomically; if either step wedges the prior settings.json is
     // left intact (the timeout aborts before rename completes
     // observably).
-    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
-    let _ = std::thread::Builder::new()
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<()>>(0);
+    // Capture the spawn Result. A discarded Err here would mean the worker
+    // never ran, the channel never receives, and the `recv_timeout` below
+    // would block the full deadline and report a misleading "timed out"
+    // 503 — when the real failure was that we couldn't fork a thread at
+    // all. Surface that as a distinct 500 immediately.
+    if let Err(e) = std::thread::Builder::new()
         .name("autorip-settings-save".into())
         .spawn(move || {
-            config::save(&snapshot);
-            let _ = tx.send(());
-        });
+            let result = config::save(&snapshot);
+            let _ = tx.send(result);
+        })
+    {
+        tracing::error!(
+            target: "web",
+            error = %e,
+            "failed to spawn settings-save thread; on-disk settings.json unchanged"
+        );
+        return json_response(
+            request,
+            500,
+            r#"{"ok":false,"error":"settings save failed: could not spawn save thread"}"#,
+        );
+    }
     match rx.recv_timeout(std::time::Duration::from_secs(SETTINGS_SAVE_DEADLINE_SECS)) {
-        Ok(()) => json_response(request, 200, r#"{"ok":true}"#),
+        Ok(Ok(())) => json_response(request, 200, r#"{"ok":true}"#),
+        Ok(Err(e)) => {
+            tracing::error!(
+                target: "web",
+                error = %e,
+                "settings save failed; on-disk settings.json unchanged"
+            );
+            json_response(
+                request,
+                500,
+                r#"{"ok":false,"error":"settings save failed"}"#,
+            )
+        }
         Err(_) => {
             tracing::error!(
                 target: "web",
@@ -1841,11 +2949,32 @@ fn handle_settings_post(mut request: tiny_http::Request, cfg: &Arc<RwLock<Config
 }
 
 fn handle_sse(request: tiny_http::Request) {
+    // /events holds its thread for the whole client session (1s poll
+    // loop). Cap concurrent streams so N clients can't pin N threads and
+    // DoS the box; over the cap return 503 and let the thread end.
+    let _sse_guard = match ConnGuard::try_acquire(&SSE_CLIENTS, MAX_SSE_CLIENTS) {
+        Some(g) => g,
+        None => {
+            tracing::warn!(
+                max = MAX_SSE_CLIENTS,
+                "SSE connection rejected: concurrent /events cap reached"
+            );
+            return json_response(
+                request,
+                503,
+                r#"{"ok":false,"error":"too many SSE clients"}"#,
+            );
+        }
+    };
+    // Same-origin only, matching every other route — no
+    // Access-Control-Allow-Origin. The service is unauthenticated, so a
+    // wildcard ACAO would let any page the operator visits cross-origin
+    // subscribe and read the full RipState (disc names, staging paths,
+    // progress, bad ranges, last_error, key_status).
     let headers = vec![
         Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..]).unwrap(),
         Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..]).unwrap(),
         Header::from_bytes(&b"Connection"[..], &b"keep-alive"[..]).unwrap(),
-        Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap(),
     ];
 
     let mut response = Response::empty(200);
@@ -1904,6 +3033,17 @@ fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
         ripper::scan_disc(&cfg, &dev, &dev_path);
     }) {
         tracing::error!(device = %dev_for_register, error = %e, "failed to spawn scan thread");
+        // Roll the device state back to idle so a failed spawn doesn't
+        // wedge the busy-check at "scanning" forever (409 on every
+        // future scan/rip until restart).
+        ripper::update_state(
+            &dev_for_register,
+            ripper::RipState {
+                device: dev_for_register.clone(),
+                status: "idle".to_string(),
+                ..Default::default()
+            },
+        );
         json_response(
             request,
             500,
@@ -1996,6 +3136,17 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
     }) {
         tracing::error!(device = %dev_for_register, error = %e, "failed to spawn rip thread");
         ripper::unregister_halt(&dev_for_register);
+        // Roll the device state back to idle so a failed spawn doesn't
+        // wedge the busy-check at "scanning" forever (409 on every
+        // future scan/rip until restart).
+        ripper::update_state(
+            &dev_for_register,
+            ripper::RipState {
+                device: dev_for_register.clone(),
+                status: "idle".to_string(),
+                ..Default::default()
+            },
+        );
         json_response(
             request,
             500,
@@ -2054,8 +3205,26 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         return;
     }
 
+    // SSRF guard at fetch time (defence-in-depth on top of the store-time
+    // check in handle_settings_post): resolve+validate once, then pin the
+    // connection to those IPs so DNS rebinding can't redirect the fetch to
+    // an internal/metadata host between validation and connect.
+    let pinned = match validate_fetch_url(&keydb_url) {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            let msg = serde_json::json!({
+                "ok": false,
+                "error": format!("KEYDB URL rejected: {e}")
+            })
+            .to_string();
+            json_response(request, 400, &msg);
+            return;
+        }
+    };
+    let agent = guarded_agent(pinned);
+
     // Download via ureq (supports HTTPS) then save via libfreemkv
-    let body = match ureq::get(&keydb_url).call() {
+    let body = match agent.get(&keydb_url).call() {
         Ok(resp) => {
             let mut buf = Vec::new();
             if resp
@@ -2112,6 +3281,28 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 }
 
 fn handle_eject(request: tiny_http::Request, device: &str) {
+    // Gate on rip status. The BU40N is a slot-loading drive: a software
+    // eject is physically irreversible (the operator must reload the disc
+    // by hand), so ejecting mid-rip abandons the in-flight rip and is a
+    // direct violation of the project's hard rule against ejecting without
+    // consent. The UI hides the eject button while active, but POST
+    // /api/eject/<dev> is unauthenticated and reachable from any LAN
+    // client — so the server must enforce the gate, not just the JS.
+    let busy = ripper::STATE
+        .lock()
+        .map(|s| {
+            s.get(device)
+                .map(|r| r.status == "scanning" || r.status == "ripping")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if busy {
+        return json_response(
+            request,
+            409,
+            r#"{"ok":false,"error":"drive busy; stop the rip before ejecting"}"#,
+        );
+    }
     let device_path = format!("/dev/{}", device);
     crate::ripper::eject_drive(&device_path);
     ripper::STATE
@@ -2200,7 +3391,11 @@ fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        // Need two hex digits AFTER the '%': indices i+1 and i+2 must be
+        // in range, i.e. i + 3 <= len. The previous `i + 2 < len` guard
+        // was off by one and dropped a trailing `%XX` (e.g. a value
+        // ending in a percent-encoded byte) through to literal output.
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
             if let Ok(byte) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16)
             {
                 result.push(byte);
@@ -2215,12 +3410,11 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Toggle debug logging on/off at runtime. POST body can be empty or contain {"enabled":true/false}.
-fn handle_debug_toggle(mut request: tiny_http::Request) {
-    let mut body = String::new();
-    if request.as_reader().read_to_string(&mut body).is_err() {
-        json_response(request, 400, r#"{"ok":false,"error":"bad body"}"#);
-        return;
-    }
+fn handle_debug_toggle(request: tiny_http::Request) {
+    let (request, body) = match read_json_body(request) {
+        Ok(rb) => rb,
+        Err(()) => return,
+    };
 
     // Parse JSON body for explicit enable/disable, or default to toggle
     let enabled = match serde_json::from_str::<serde_json::Value>(&body) {
@@ -2228,7 +3422,9 @@ fn handle_debug_toggle(mut request: tiny_http::Request) {
         Err(_) => true, // Default: turn on if no valid JSON
     };
 
-    *DEBUG_ENABLED.write().expect("debug lock poisoned") = enabled;
+    *DEBUG_ENABLED
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
 
     // Swap the EnvFilter so libfreemkv's `tracing::debug!` events
     // (target: "mux" writeback seeks, WAIT_AFTER latency, fill_extents

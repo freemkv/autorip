@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.31.0 (2026-06-08)
+
+Hardening release across the web/API surface, the rip loop, the mover, and the
+muxer.
+
+### Fixed
+
+- Web/API: dashboard now HTML-escapes attribute and `innerHTML` values
+  (stored-XSS fix); `webhook_urls` are redacted in `GET /api/settings`;
+  outbound targets (KEYDB, keyserver, webhooks, network output) are validated
+  against private / loopback / link-local addresses; settings are validated
+  before the in-memory config is mutated; and a cross-origin POST guard rejects
+  requests whose `Origin` host differs (absent `Origin` still allowed for CLI
+  use).
+- Rip / move / mux: a failed worker-thread spawn no longer wedges a device in
+  "scanning"; the mover cross-checks source vs. destination size before
+  unlinking the source; a mid-stream producer read error or send-deadline abort
+  no longer marks a truncated MKV complete; the mux header buffer is bounded.
+- Robustness: poisoned-mutex recovery across state and session bookkeeping,
+  graceful shutdown joins the mover/muxer, and a bounded NFS mount on startup.
+
+### Changed
+
+- Release profile now builds with thin LTO and a single codegen unit.
+
 ## 0.29.0 (2026-06-06)
 
 ### Fixed
@@ -236,7 +261,7 @@ needing a host-side intervention.
 Activate by setting in `docker-compose.yml`:
 ```
 environment:
-  - NFS_HOST=unraid-1.internal.lan
+  - NFS_HOST=nas.example.com
   - NFS_EXPORT=/mnt/user/media
   - NFS_MOUNTPOINT=/output
   - NFS_OPTS=vers=4.1,nconnect=4,nolock,actimeo=3,hard,_netdev

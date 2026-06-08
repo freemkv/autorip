@@ -2,8 +2,6 @@
 //!
 //! Mirrors the shape of [`crate::mover`]:
 //! - A 10-second tick loop polling the staging dir for hand-off markers.
-//! - A single global "live state" mutex (`MUX_STATE`) read by the
-//!   System page over SSE.
 //! - A `BTreeMap<String, MuxerError>` for stuck-dir surfacing.
 //!
 //! Hand-off contract (v0.25.3):
@@ -28,7 +26,7 @@
 
 use crate::config::Config;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Hand-off marker written by `ripper::rip_disc` after sweep + patch
@@ -99,22 +97,6 @@ pub fn delete_marker(staging_dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Mux progress — separate from device/rip state and from
-/// [`crate::mover::MoveState`]. Read by the System page's
-/// `renderMuxes()` via SSE (`_mux` field on `/api/state`).
-#[derive(Debug, Clone, serde::Serialize, Default)]
-pub struct MuxState {
-    pub name: String,
-    pub progress_pct: u8,
-    pub progress_gb: f64,
-    pub total_gb: f64,
-    pub speed_mbs: f64,
-    pub eta: String,
-}
-
-pub static MUX_STATE: once_cell::sync::Lazy<Mutex<Option<MuxState>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(None));
-
 /// Per-staging-dir error surfaced to the System page so the user can
 /// act on it (e.g. `MuxFinalize` after an NFS hiccup that left the MKV
 /// unseekable). Keyed by staging dir path; same `reason` for the same
@@ -130,18 +112,26 @@ pub static MUX_ERRORS: once_cell::sync::Lazy<Mutex<BTreeMap<String, MuxerError>>
     once_cell::sync::Lazy::new(|| Mutex::new(BTreeMap::new()));
 
 pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
-    let Ok(mut m) = MUX_ERRORS.lock() else {
-        return;
+    // Mutate the map and capture whether this is a new reason under the
+    // lock, then DROP the guard before the syslog write. syslog does
+    // blocking log-file I/O (NFS-backed staging on the testbed); holding
+    // MUX_ERRORS across it would block every other record_error/clear_error
+    // and the System-page reader for the duration of that write.
+    let same_reason = {
+        let Ok(mut m) = MUX_ERRORS.lock() else {
+            return;
+        };
+        let same_reason = m.get(path).map(|e| e.reason == reason).unwrap_or(false);
+        m.insert(
+            path.to_string(),
+            MuxerError {
+                path: path.to_string(),
+                reason: reason.to_string(),
+                hint: hint.to_string(),
+            },
+        );
+        same_reason
     };
-    let same_reason = m.get(path).map(|e| e.reason == reason).unwrap_or(false);
-    m.insert(
-        path.to_string(),
-        MuxerError {
-            path: path.to_string(),
-            reason: reason.to_string(),
-            hint: hint.to_string(),
-        },
-    );
     if !same_reason {
         crate::log::syslog(&format!("Mux blocked: {} — {}", path, reason));
     }
@@ -155,24 +145,24 @@ pub(crate) fn clear_error(path: &str) {
 
 /// Worker entry point — spawn from `main` alongside the mover thread.
 ///
-/// Currently a heartbeat loop: scans the staging dir for `.ripped`
-/// markers on each tick. Phase 3 wires the actual mux invocation; for
-/// now this is a placeholder that keeps the worker thread alive and
-/// the staging scan plumbed so the System page can list pending mux
-/// jobs as soon as the drive thread starts writing markers.
+/// A 10-second tick loop: each tick scans the staging dir for `.ripped`
+/// hand-off markers (`check_and_mux`) and dispatches every one it finds
+/// through the resume-mux path (`remux_from_ripped_marker`). On success
+/// the dir gets a `.done`/`.completed` marker (handed to the mover) and
+/// the `.ripped` marker is deleted; on failure the `.ripped` marker is
+/// left in place for next-tick retry and a `MuxerError` is surfaced to
+/// the System page. SHUTDOWN-responsive so SIGTERM doesn't wait a full
+/// tick.
 pub fn run(cfg: &Arc<RwLock<Config>>) {
     use std::sync::atomic::Ordering;
     tracing::info!("mux loop starting");
     while !crate::SHUTDOWN.load(Ordering::Relaxed) {
-        // Health-check the lock once per tick; the dispatcher itself
-        // re-borrows since `remux_from_ripped_marker` needs the full
-        // `Arc<RwLock<Config>>` (run_mux re-reads config mid-mux for
-        // skip-errors etc).
-        if cfg.read().is_err() {
-            tracing::warn!("mux: config lock poisoned, retrying");
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            continue;
-        }
+        // A poisoned RwLock never un-poisons, so a bare `is_err()` check
+        // here would turn a one-time poison into a permanent warn+sleep
+        // spin: the worker would never mux again, never exit, and
+        // /api/state would still report healthy. This path only reads
+        // Config, so recover from poison (handled inside check_and_mux's
+        // `unwrap_or_else(into_inner)`) instead of spinning.
         check_and_mux(cfg);
         // SHUTDOWN-responsive sleep — same pattern as the mover so
         // SIGTERM doesn't have to wait the full 10 s tick.
@@ -193,14 +183,32 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
 /// muxes are explicitly out of scope (RAM/CPU thrash with no real
 /// win on a single-host setup).
 fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
-    let staging_root = match cfg_arc.read() {
-        Ok(c) => c.staging_dir.clone(),
-        Err(_) => return,
-    };
+    // Recover from a poisoned config lock rather than returning (which,
+    // combined with the per-tick loop, would silently wedge the worker
+    // forever). This borrow only reads the staging path.
+    let staging_root = cfg_arc
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .staging_dir
+        .clone();
     let entries = match std::fs::read_dir(&staging_root) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            // A dropped NFS mount or a deleted staging dir would otherwise
+            // silently freeze every future tick. Surface it so the operator
+            // sees a paused mux queue instead of a frozen one.
+            tracing::warn!("mux: cannot read staging dir {staging_root:?}: {e}");
+            record_error(
+                &staging_root,
+                &format!("cannot read staging dir: {e}"),
+                "check the staging mount (NFS) is up and the dir exists; mux is paused until it is readable",
+            );
+            return;
+        }
     };
+    // The staging dir is readable again — clear any prior "cannot read"
+    // error so the System page doesn't show a stale alarm.
+    clear_error(&staging_root);
     for entry in entries.filter_map(|e| e.ok()) {
         let dir = entry.path();
         if !dir.is_dir() {
@@ -209,8 +217,28 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         if !dir.join(RIPPED_MARKER_NAME).exists() {
             continue;
         }
+        // Never re-mux an already-completed dir. `remux_from_ripped_marker`
+        // deletes `.ripped` on success, but if that delete fails (a
+        // persistent NFS / permission error on the marker file) the
+        // `.ripped` file survives and, without this guard, the next tick
+        // would re-dispatch the same dir — deleting the just-written MKV
+        // via `delete_partial_output`, re-scanning, re-muxing, and
+        // re-writing `.done` every tick forever. `.completed` is written
+        // on success and is the authoritative "this dir is finished"
+        // signal, so it breaks the loop regardless of why the marker
+        // delete failed.
+        if dir.join(crate::ripper::staging::COMPLETED_MARKER).exists() {
+            continue;
+        }
         let marker = match read_marker(&dir) {
             Ok(m) => m,
+            // TOCTOU: the `.exists()` check above and this read race a
+            // concurrent cleanup / fast subsequent tick. If the marker
+            // vanished in between, that's not a malformed-marker error —
+            // skip silently rather than recording a spurious "No such
+            // file or directory" MuxerError that sticks in the System
+            // page until dismissed.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 let path_str = dir.to_string_lossy().to_string();
                 record_error(
@@ -260,6 +288,13 @@ pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
         if !dir.join(RIPPED_MARKER_NAME).exists() {
             continue;
         }
+        // A successful mux can leave `.ripped` alongside `.completed`
+        // when delete_marker fails post-mux (NFS, see resume.rs). The
+        // `.completed` marker is the authoritative "done" signal — skip
+        // the dir so a finished title doesn't report "(queued)" forever.
+        if dir.join(crate::ripper::staging::COMPLETED_MARKER).exists() {
+            continue;
+        }
         if let Ok(m) = read_marker(&dir) {
             out.push(format!("{} (queued)", m.display_name));
         } else {
@@ -273,14 +308,6 @@ pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
         }
     }
     out
-}
-
-/// Used by `pending_queue` callers that already have a marker handle
-/// — keeps the type inference loose so phase 3 can swap to a richer
-/// "queue entry" struct without breaking call sites.
-#[allow(dead_code)]
-pub(crate) fn staging_dir_for_marker(marker_path: &Path) -> Option<PathBuf> {
-    marker_path.parent().map(|p| p.to_path_buf())
 }
 
 #[cfg(test)]
@@ -299,13 +326,6 @@ mod tests {
         clear_error("/x/staging/Foo");
         let m = MUX_ERRORS.lock().unwrap();
         assert!(!m.contains_key("/x/staging/Foo"));
-    }
-
-    #[test]
-    fn mux_state_default_is_empty() {
-        let s = MuxState::default();
-        assert!(s.name.is_empty());
-        assert_eq!(s.progress_pct, 0);
     }
 
     fn sample_marker() -> RippedMarker {
@@ -374,5 +394,24 @@ mod tests {
         assert_eq!(q.len(), 1);
         assert!(q[0].contains("Border Town"));
         assert!(q[0].contains("queued"));
+    }
+
+    #[test]
+    fn pending_queue_skips_completed_dir() {
+        // A successful mux can leave `.ripped` alongside `.completed`
+        // when delete_marker fails post-mux (NFS). `.completed` is the
+        // authoritative "done" signal — such a dir must not show up as
+        // "(queued)" forever.
+        let tmp = TempDir::new().unwrap();
+        let movie = tmp.path().join("Border_Town");
+        std::fs::create_dir_all(&movie).unwrap();
+        write_marker(&movie, &sample_marker()).unwrap();
+        crate::ripper::staging::write_completed_marker(&movie);
+
+        let q = pending_queue(tmp.path());
+        assert!(
+            q.is_empty(),
+            "a dir with .completed present must be skipped, got {q:?}"
+        );
     }
 }

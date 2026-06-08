@@ -13,6 +13,7 @@
 //! that derives unit keys wins. The only drive-vs-ISO difference is the
 //! [`DiscKeyAccess`] impl.
 
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use freemkv_keysources::{
@@ -21,6 +22,111 @@ use freemkv_keysources::{
 };
 
 use crate::config::Config;
+
+/// Is this resolved address one a key-service request must never reach?
+/// Blocks loopback, link-local (incl. the 169.254.169.254 cloud metadata
+/// endpoint), private RFC1918 / ULA, unspecified, and other non-global
+/// ranges. Defense-in-depth at the request use-site: the web store-side
+/// guard rejects most of these at save time, but `keyserver_url` is POSTed
+/// verbatim at rip time, so we re-check here too.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local() // 169.254.0.0/16 — cloud metadata lives here
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.octets()[0] == 0 // 0.0.0.0/8
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64) // 100.64/10 CGNAT
+                || v4.octets()[0] >= 240 // 240.0.0.0/4 reserved
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || v6.to_ipv4_mapped().map(IpAddr::V4).is_some_and(is_blocked_ip)
+        }
+    }
+}
+
+/// Validate a key-service base URL before it is handed to `OnlineSource`.
+/// Requires http(s), extracts the host, and rejects any host that is a
+/// literal blocked IP or that resolves to one (SSRF / cloud-metadata
+/// exfiltration guard). Returns the input on success so call sites can
+/// gate construction.
+fn validate_keyserver_url(raw: &str) -> Result<(), String> {
+    let url = raw.trim();
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| format!("keyserver URL must be http(s): {url}"))?;
+
+    // host[:port] is everything before the first '/', '?' or '#'.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@') // drop any userinfo
+        .next()
+        .unwrap_or("");
+    if authority.is_empty() {
+        return Err(format!("keyserver URL has no host: {url}"));
+    }
+
+    // Split host / port, handling bracketed IPv6 literals ([::1]:443).
+    let (host, port): (String, u16) = if let Some(end) = authority.strip_prefix('[') {
+        let (h, tail) = end
+            .split_once(']')
+            .ok_or_else(|| format!("malformed IPv6 host: {authority}"))?;
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443);
+        (h.to_string(), port)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        // Only treat the trailing segment as a port if it parses; otherwise
+        // it's part of a bare IPv6 (which would have been bracketed) — fall
+        // back to treating the whole thing as the host.
+        match p.parse::<u16>() {
+            Ok(port) => (h.to_string(), port),
+            Err(_) => (authority.to_string(), 443),
+        }
+    } else {
+        (authority.to_string(), 443)
+    };
+
+    // Literal IP? classify directly — no DNS, no rebind window.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if is_blocked_ip(ip) {
+            Err(format!(
+                "keyserver host {host} is a blocked/internal address"
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    // Hostname — resolve and reject if ANY resolved address is blocked.
+    let addrs = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("keyserver host {host} did not resolve: {e}"))?;
+    let mut saw_any = false;
+    for sa in addrs {
+        saw_any = true;
+        if is_blocked_ip(sa.ip()) {
+            return Err(format!(
+                "keyserver host {host} resolves to a blocked/internal address ({})",
+                sa.ip()
+            ));
+        }
+    }
+    if !saw_any {
+        return Err(format!("keyserver host {host} resolved to no addresses"));
+    }
+    Ok(())
+}
 
 /// How many 6144-byte aligned encrypted units a sample-needing source is given.
 pub const SAMPLE_UNITS: usize = 4;
@@ -39,11 +145,6 @@ pub enum KeyOutcome {
     Unreachable,
 }
 
-/// [`libfreemkv::ScanOptions`] for the structure scan: always KEYLESS. The
-/// library captures disc structure + AACS inputs (Unit_Key_RO.inf, MKB, VID)
-/// but resolves no keys; autorip resolves them afterward through the sources.
-/// `disable_keydb` also stops any keydb sitting in a default search path from
-/// resolving inline behind autorip's back.
 /// The configured keydb path, or the standard default location.
 fn keydb_path(cfg: &Config) -> PathBuf {
     cfg.keydb_path
@@ -89,11 +190,36 @@ pub fn build_sources(cfg: &Config, mapfile: Option<&Path>) -> Vec<Box<dyn KeySou
         sources.push(Box::new(MapfileSource::new(mf)));
     }
     match cfg.key_source.as_str() {
-        "online" => sources.push(Box::new(OnlineSource::new(
-            cfg.keyserver_url.clone(),
-            cfg.keyserver_secret.clone(),
-        ))),
-        _ => sources.push(Box::new(KeydbSource::new(keydb_path(cfg)))),
+        "online" => match validate_keyserver_url(&cfg.keyserver_url) {
+            Ok(()) => sources.push(Box::new(OnlineSource::new(
+                cfg.keyserver_url.clone(),
+                cfg.keyserver_secret.clone(),
+            ))),
+            // SSRF defense-in-depth: refuse to POST disc-key material to an
+            // internal / metadata address. Drop the online source entirely
+            // (the mapfile cache, if present, still applies) rather than
+            // hand `OnlineSource` a URL we won't trust. The web store-side
+            // guard normally rejects these at save time; this covers a
+            // value that slipped past it or predates that guard.
+            Err(e) => {
+                tracing::error!(
+                    phase = "key_resolve",
+                    url = %cfg.keyserver_url,
+                    "keyserver URL rejected (SSRF guard): {e} — online key source disabled for this rip"
+                );
+            }
+        },
+        "local" => sources.push(Box::new(KeydbSource::new(keydb_path(cfg)))),
+        other => {
+            // key_source is user-edited config; a typo ("onlnie") would
+            // silently resolve keydb-only when the operator meant online.
+            // Fall back to the local keydb but make the fallback visible.
+            tracing::warn!(
+                key_source = %other,
+                "unrecognised key_source; falling back to local keydb"
+            );
+            sources.push(Box::new(KeydbSource::new(keydb_path(cfg))));
+        }
     }
     sources
 }
@@ -119,7 +245,8 @@ pub trait DiscKeyAccess {
 /// Resolve keys for `disc` via the ordered `sources`, reading inputs through
 /// `access`. Returns the disc with keys applied (`Resolved`) or unchanged.
 ///
-/// The disc must have been scanned KEYLESS (see [`keyless_scan_opts`]). Each
+/// The disc must have been scanned KEYLESS (see [`drive_scan_opts`] /
+/// [`iso_scan_opts`]). Each
 /// source offers candidate keys; the first whose [`libfreemkv::Disc::decrypt_with`]
 /// derives unit keys wins. A wrong candidate (e.g. a device-key set that does
 /// not apply to this disc's MKB) is rejected by `decrypt_with` and the next
@@ -134,7 +261,13 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         tracing::warn!(phase = "key_resolve", "could not read disc key files");
         return (disc, KeyOutcome::MissingInputs);
     };
-    let vid = access.volume_id().unwrap_or([0u8; 16]);
+    let vid = access.volume_id().unwrap_or_else(|| {
+        tracing::warn!(
+            phase = "key_resolve",
+            "no Volume ID available; using all-zero VID — key derivation may fail"
+        );
+        [0u8; 16]
+    });
 
     // Read content samples only if some source validates against ciphertext
     // (an online key service); a keydb / mapfile keys on disc identity alone and
@@ -245,7 +378,18 @@ impl DiscKeyAccess for IsoAccess<'_> {
     fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>> {
         match libfreemkv::FileSectorSource::open(self.iso_path) {
             Ok(mut r) => read_sample_units(&mut r, title, n),
-            Err(_) => Vec::new(),
+            Err(err) => {
+                // Without samples an online key request fires with no
+                // units_b64 and can fail later as NoKey with no visible cause;
+                // surface the real reason here.
+                tracing::warn!(
+                    phase = "key_resolve",
+                    path = %self.iso_path.display(),
+                    %err,
+                    "could not open ISO to sample units"
+                );
+                Vec::new()
+            }
         }
     }
 }
@@ -253,6 +397,49 @@ impl DiscKeyAccess for IsoAccess<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssrf_guard_blocks_metadata_and_internal_hosts() {
+        // Cloud metadata endpoint — the canonical SSRF target.
+        assert!(validate_keyserver_url("http://169.254.169.254/latest/meta-data").is_err());
+        // Loopback and RFC1918.
+        assert!(validate_keyserver_url("https://127.0.0.1:8443/keys").is_err());
+        assert!(validate_keyserver_url("https://10.0.0.1/").is_err());
+        assert!(validate_keyserver_url("https://192.168.1.5:9000").is_err());
+        assert!(validate_keyserver_url("http://172.20.4.4").is_err()); // 172.16/12 private
+        // IPv6 loopback / link-local (bracketed).
+        assert!(validate_keyserver_url("https://[::1]:443/k").is_err());
+        assert!(validate_keyserver_url("https://[fe80::1]/k").is_err());
+        // IPv4-mapped IPv6 loopback.
+        assert!(validate_keyserver_url("https://[::ffff:127.0.0.1]/k").is_err());
+        // Non-http scheme rejected.
+        assert!(validate_keyserver_url("ftp://example.com/keys").is_err());
+        // No host.
+        assert!(validate_keyserver_url("https:///keys").is_err());
+    }
+
+    #[test]
+    fn ssrf_guard_allows_public_literal_ip() {
+        // A public literal IP must pass (no DNS needed, deterministic).
+        assert!(validate_keyserver_url("https://8.8.8.8/keys").is_ok());
+        assert!(validate_keyserver_url("https://1.1.1.1:443").is_ok());
+    }
+
+    #[test]
+    fn ssrf_classifier_ranges() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        assert!(is_blocked_ip(Ipv4Addr::new(169, 254, 169, 254).into()));
+        assert!(is_blocked_ip(Ipv4Addr::new(10, 0, 0, 1).into()));
+        assert!(is_blocked_ip(Ipv4Addr::new(127, 0, 0, 1).into()));
+        assert!(is_blocked_ip(Ipv4Addr::new(100, 64, 0, 1).into())); // CGNAT
+        assert!(is_blocked_ip(Ipv4Addr::new(0, 0, 0, 0).into()));
+        assert!(!is_blocked_ip(Ipv4Addr::new(8, 8, 8, 8).into()));
+        assert!(!is_blocked_ip(Ipv4Addr::new(1, 1, 1, 1).into()));
+        assert!(is_blocked_ip(Ipv6Addr::LOCALHOST.into()));
+        assert!(!is_blocked_ip(
+            "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap().into()
+        ));
+    }
 
     /// Cross-side agreement: autorip's sample selector (`read_sample_units`)
     /// hands the key service only units the service's own gate accepts —

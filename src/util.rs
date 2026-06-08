@@ -53,25 +53,63 @@ pub fn format_iso_datetime_filename() -> String {
 // destination dir — same logic, two implementations. Consolidated here as
 // the single source of truth.
 
+/// Fallback path segment when sanitization yields nothing usable.
+/// Deliberately constant + filesystem-trivial so the downstream callers
+/// (staging dir, ISO basename, library destination) always receive a
+/// real, non-traversing segment.
+const SAFE_FALLBACK: &str = "untitled";
+
+/// Make a filtered/trimmed string safe to use as a *single* path segment.
+///
+/// Input is attacker-controllable (disc UDF volume label from physical
+/// media; TMDB title from external HTTP), so the result must never be a
+/// segment that the OS interprets specially:
+///   - empty (`""`) — `Path::join("")` resolves to the parent itself, so a
+///     `remove_dir_all` on the joined path would wipe the staging/library
+///     root and every in-progress rip under it.
+///   - `"."` / `".."` / any all-dots run (`"..."`) — directory traversal:
+///     `join("..")` escapes one level up.
+///   - leading dots — hidden files and broken resume prefix-matching.
+///
+/// Leading dots are stripped; if what remains is empty or consists solely
+/// of dots, a deterministic safe fallback is substituted. Keeping this in
+/// the sanitizers covers every call site rather than each caller patching it.
+fn ensure_safe_segment(s: String) -> String {
+    // Strip leading dots (hidden-file / "." / ".." defense).
+    let stripped = s.trim_start_matches('.');
+    // Reject empty or all-dots results (e.g. "", ".", "..", "...").
+    if stripped.is_empty() || stripped.chars().all(|c| c == '.') {
+        return SAFE_FALLBACK.to_string();
+    }
+    stripped.to_string()
+}
+
 /// Sanitize a name for use as a filesystem path segment with **no spaces**.
 /// Used for staging directories and file basenames where snake_case is
 /// preferred (so logs and shell commands don't need quoting).
 ///
 /// Keeps `[A-Za-z0-9 \-_.]`, drops everything else, then collapses spaces
-/// to underscores.
+/// to underscores. The result can never be empty, `.`, `..`, or all-dots —
+/// those collapse to a safe fallback (see [`ensure_safe_segment`]).
 pub fn sanitize_path_compact(name: &str) -> String {
-    name.chars()
+    let filtered = name
+        .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '-' || *c == '_' || *c == '.')
         .collect::<String>()
         .trim()
-        .replace(' ', "_")
+        .replace(' ', "_");
+    ensure_safe_segment(filtered)
 }
 
 /// Sanitize a name for a user-visible directory (e.g. the final library
 /// destination `movies/Aurora Drift (2024)/`). Spaces preserved; apostrophes
 /// kept (filesystems handle them, omitting them mangles "What's Up Doc").
+///
+/// Same path-segment safety guarantee as [`sanitize_path_compact`]: the
+/// result is never empty, `.`, `..`, or all-dots (see [`ensure_safe_segment`]).
 pub fn sanitize_path_display(name: &str) -> String {
-    name.chars()
+    let filtered = name
+        .chars()
         .filter(|c| {
             c.is_ascii_alphanumeric()
                 || *c == ' '
@@ -82,7 +120,8 @@ pub fn sanitize_path_display(name: &str) -> String {
         })
         .collect::<String>()
         .trim()
-        .to_string()
+        .to_string();
+    ensure_safe_segment(filtered)
 }
 
 /// Format a number of seconds as `Xh YYm`. Used by the rip card and the
@@ -189,6 +228,54 @@ mod tests {
     #[test]
     fn sanitize_path_display_trims_whitespace() {
         assert_eq!(sanitize_path_display("  spaced title  "), "spaced title");
+    }
+
+    // ─── Hostile path-segment inputs (untrusted disc label / TMDB title) ──
+    //
+    // A disc volume label or external TMDB title must never sanitize to a
+    // segment the OS treats specially: "" (join resolves to the parent),
+    // "." / ".." (traversal), or a leading-dot hidden name. Verified these
+    // outputs are NEVER produced — they collapse to the safe fallback.
+
+    #[test]
+    fn sanitize_compact_never_emits_empty() {
+        // All-non-ASCII (CJK / Arabic) filters down to nothing.
+        assert_eq!(sanitize_path_compact("日本語のタイトル"), "untitled");
+        assert_eq!(sanitize_path_compact("العنوان"), "untitled");
+        assert_eq!(sanitize_path_compact(""), "untitled");
+        assert_eq!(sanitize_path_compact("   "), "untitled");
+        // Only-punctuation that the filter drops entirely.
+        assert_eq!(sanitize_path_compact("***"), "untitled");
+    }
+
+    #[test]
+    fn sanitize_compact_never_emits_dot_segments() {
+        assert_eq!(sanitize_path_compact("."), "untitled");
+        assert_eq!(sanitize_path_compact(".."), "untitled");
+        assert_eq!(sanitize_path_compact("..."), "untitled");
+        // Surrounding whitespace must not reintroduce a traversal segment.
+        assert_eq!(sanitize_path_compact("  ..  "), "untitled");
+    }
+
+    #[test]
+    fn sanitize_compact_strips_leading_dots() {
+        // Leading dot would make a hidden file / break resume matching.
+        assert_eq!(sanitize_path_compact(".hidden"), "hidden");
+        assert_eq!(sanitize_path_compact("..weird"), "weird");
+        // A legitimate internal/trailing dot is preserved.
+        assert_eq!(sanitize_path_compact("Movie.2024"), "Movie.2024");
+    }
+
+    #[test]
+    fn sanitize_display_never_emits_empty_or_dot_segments() {
+        assert_eq!(sanitize_path_display("日本語のタイトル"), "untitled");
+        assert_eq!(sanitize_path_display(""), "untitled");
+        assert_eq!(sanitize_path_display("."), "untitled");
+        assert_eq!(sanitize_path_display(".."), "untitled");
+        assert_eq!(sanitize_path_display("..."), "untitled");
+        assert_eq!(sanitize_path_display("  ..  "), "untitled");
+        // Leading dots stripped, real content preserved.
+        assert_eq!(sanitize_path_display(".A Movie"), "A Movie");
     }
 
     #[test]

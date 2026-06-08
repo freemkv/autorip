@@ -32,7 +32,7 @@ services:
       # `volumes:` below. The bootstrap (`autorip --bootstrap`) creates
       # the mountpoint and mounts it before the daemon starts.
       #
-      # - NFS_HOST=unraid-1.internal.lan
+      # - NFS_HOST=nas.example.com
       # - NFS_EXPORT=/mnt/user/media
       # - NFS_MOUNTPOINT=/output
       # - NFS_OPTS=vers=4.1,nconnect=4,nolock,actimeo=3,hard,_netdev

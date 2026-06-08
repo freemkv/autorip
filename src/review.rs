@@ -32,16 +32,26 @@ fn read_marker(dir: &Path) -> serde_json::Value {
 }
 
 fn media_file(dir: &Path) -> Option<String> {
-    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
-        let p = e.path();
-        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
-        matches!(ext, "mkv" | "m2ts").then(|| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string()
+    // read_dir order is platform-dependent, so when a dir holds more than
+    // one media file pick deterministically (lexicographically smallest)
+    // rather than returning an arbitrary one. Display-only.
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+            matches!(ext, "mkv" | "m2ts")
+                .then(|| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                })
+                .flatten()
         })
-    })
+        .collect();
+    names.sort();
+    names.into_iter().next()
 }
 
 /// List every held rip under `staging_root` (a `.review` marker, no `.done`).
@@ -57,7 +67,14 @@ pub fn list_held(staging_root: &str) -> Vec<HeldRip> {
         }
         let m = read_marker(&dir);
         let title = m["title"].as_str().unwrap_or("").to_string();
-        let year = m["year"].as_u64().unwrap_or(0) as u16;
+        // Range-validate rather than a truncating `as u16`: a corrupt /
+        // hand-edited marker with year > 65535 would otherwise WRAP (e.g.
+        // 70000 → 4464) and mislabel the held rip. Out-of-range → 0
+        // ("no confident year"), the same as a missing field.
+        let year = m["year"]
+            .as_u64()
+            .and_then(|y| u16::try_from(y).ok())
+            .unwrap_or(0);
         out.push(HeldRip {
             dir: dir
                 .file_name()
@@ -82,7 +99,7 @@ pub fn list_held(staging_root: &str) -> Vec<HeldRip> {
 /// against traversal). Actions:
 /// * `Proceed`            — promote `.review` → `.done` as-named.
 /// * `Retitle{title,year}`— rewrite the marker's title/year, then `.done`.
-/// * `Cancel`             — drop `.review`, mark `.failed` so it isn't retried.
+/// * `Cancel`             — mark `.failed` (so it isn't retried), then drop `.review`.
 pub enum Resolve {
     Proceed,
     Retitle { title: String, year: u16 },
@@ -90,8 +107,17 @@ pub enum Resolve {
 }
 
 pub fn resolve(staging_root: &str, dir: &str, action: Resolve) -> Result<(), String> {
-    // Path-traversal guard: a held-rip handle is a single dir name.
-    if dir.is_empty() || dir.contains('/') || dir.contains("..") {
+    // Path-traversal guard: a held-rip handle is a single staging subdir
+    // name. Inspect path components rather than substring-matching `..` —
+    // a substring check wrongly rejects legitimate titles like
+    // `Blade..Runner (1982)` while a component check still rejects `..`,
+    // absolute paths, a bare `.`, and any nested path.
+    if dir.is_empty()
+        || Path::new(dir).components().count() != 1
+        || Path::new(dir)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
         return Err("invalid dir".into());
     }
     let d: PathBuf = Path::new(staging_root).join(dir);
@@ -104,23 +130,46 @@ pub fn resolve(staging_root: &str, dir: &str, action: Resolve) -> Result<(), Str
             std::fs::rename(&review, d.join(".done")).map_err(|e| e.to_string())?;
         }
         Resolve::Retitle { title, year } => {
+            // Reject a blank title at the library boundary: `resolve` is a
+            // pub fn and an empty/whitespace title would write a `.done` the
+            // mover promotes with no name. The web caller already guards
+            // this, but a future/non-web caller must not be able to.
+            if title.trim().is_empty() {
+                return Err("title required".into());
+            }
             let mut m = read_marker(&d);
             if !m.is_object() {
                 m = serde_json::json!({});
             }
             m["title"] = serde_json::json!(title);
             m["year"] = serde_json::json!(year);
-            m["media_type"] = serde_json::json!("movie");
-            std::fs::write(
-                d.join(".done"),
-                serde_json::to_string_pretty(&m).unwrap_or_default(),
-            )
-            .map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_file(&review);
+            // Only default media_type to "movie" when absent — a non-movie
+            // marker (e.g. a TV title) must survive a retitle. An
+            // unconditional set here would silently rewrite every retitled
+            // title as a movie.
+            if m.get("media_type").and_then(|v| v.as_str()).is_none() {
+                m["media_type"] = serde_json::json!("movie");
+            }
+            // Propagate a serialization failure instead of writing an empty
+            // `.done` that the mover would promote with a blank title.
+            let serialized = serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?;
+            // Write `.done` before removing `.review` (crash-atomic: a
+            // lingering `.review` is harmless since `list_held` excludes
+            // dirs that have `.done`), and propagate the removal error so a
+            // failed cleanup is visible instead of silently leaving both.
+            std::fs::write(d.join(".done"), serialized).map_err(|e| e.to_string())?;
+            std::fs::remove_file(&review).map_err(|e| e.to_string())?;
         }
         Resolve::Cancel => {
-            let _ = std::fs::remove_file(&review);
-            let _ = std::fs::write(d.join(".failed"), "cancelled by operator\n");
+            // Write `.failed` BEFORE removing `.review`, and propagate any
+            // IO error. The previous order (remove then write, both errors
+            // discarded) could leave the dir with no `.review`/`.done`/
+            // `.failed` marker at all — invisible to the mover, the UI, and
+            // the re-rip guard — while still reporting success to the
+            // operator.
+            std::fs::write(d.join(".failed"), "cancelled by operator\n")
+                .map_err(|e| e.to_string())?;
+            std::fs::remove_file(&review).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -174,6 +223,141 @@ mod tests {
 
         // traversal guard
         assert!(resolve(tmp.to_str().unwrap(), "../etc", Resolve::Proceed).is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn traversal_guard_rejects_escapes_accepts_dotted_titles() {
+        // Component-based guard: reject anything that isn't a single
+        // normal path component...
+        for bad in ["..", ".", "../etc", "a/b", "/abs", "", "./x"] {
+            assert!(
+                resolve("/nonexistent-staging-root", bad, Resolve::Proceed).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+        // ...but a legitimate title containing `..` is NOT a traversal and
+        // must pass the guard (it fails later only because the dir/marker
+        // doesn't exist — "not a held rip", not "invalid dir").
+        let err = resolve(
+            "/nonexistent-staging-root",
+            "Blade..Runner (1982)",
+            Resolve::Proceed,
+        )
+        .unwrap_err();
+        assert_eq!(err, "not a held rip", "dotted title must clear the guard");
+    }
+
+    #[test]
+    fn cancel_propagates_write_error_and_preserves_review() {
+        // If `.failed` can't be written, Cancel must return Err and leave
+        // `.review` intact (so the rip is still visibly held), rather than
+        // reporting success after dropping the only marker.
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-cancel-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let held = tmp.join("Held");
+        std::fs::create_dir_all(&held).unwrap();
+        touch(&held.join(".review"), r#"{"title":"Held","year":0}"#);
+
+        // Make `.failed` un-writable by pre-creating it as a directory, so
+        // std::fs::write fails (can't truncate/open a dir as a file).
+        std::fs::create_dir(held.join(".failed")).unwrap();
+
+        let res = resolve(tmp.to_str().unwrap(), "Held", Resolve::Cancel);
+        assert!(res.is_err(), "cancel must surface the write failure");
+        // `.review` must survive so the rip stays held, not orphaned.
+        assert!(held.join(".review").exists(), ".review must be preserved");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cancel_success_writes_failed_and_drops_review() {
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-cancelok-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let held = tmp.join("Held");
+        std::fs::create_dir_all(&held).unwrap();
+        touch(&held.join(".review"), r#"{"title":"Held","year":0}"#);
+
+        resolve(tmp.to_str().unwrap(), "Held", Resolve::Cancel).unwrap();
+        assert!(held.join(".failed").exists());
+        assert!(!held.join(".review").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn media_file_is_deterministic_across_multiple() {
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-media-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        touch(&tmp.join("zeta.mkv"), "x");
+        touch(&tmp.join("alpha.mkv"), "x");
+        touch(&tmp.join("notes.txt"), "x");
+        assert_eq!(media_file(&tmp).as_deref(), Some("alpha.mkv"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn retitle_preserves_non_movie_media_type() {
+        let tmp =
+            std::env::temp_dir().join(format!("autorip-review-mediatype-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let held = tmp.join("Some Show");
+        std::fs::create_dir_all(&held).unwrap();
+        // Marker already carries a non-movie media_type (e.g. a TV title).
+        touch(
+            &held.join(".review"),
+            r#"{"title":"Some Show","year":0,"media_type":"tv"}"#,
+        );
+        touch(&held.join("Some Show.mkv"), "x");
+
+        resolve(
+            tmp.to_str().unwrap(),
+            "Some Show",
+            Resolve::Retitle {
+                title: "Severance".into(),
+                year: 2022,
+            },
+        )
+        .unwrap();
+
+        let m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(held.join(".done")).unwrap()).unwrap();
+        assert_eq!(m["title"], "Severance");
+        assert_eq!(m["year"], 2022);
+        // The retitle must not clobber the existing non-movie marker.
+        assert_eq!(m["media_type"], "tv");
+
+        // And when media_type is absent, retitle defaults it to "movie".
+        let held2 = tmp.join("Some Movie");
+        std::fs::create_dir_all(&held2).unwrap();
+        touch(&held2.join(".review"), r#"{"title":"Some Movie","year":0}"#);
+        resolve(
+            tmp.to_str().unwrap(),
+            "Some Movie",
+            Resolve::Retitle {
+                title: "Civil War".into(),
+                year: 2024,
+            },
+        )
+        .unwrap();
+        let m2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(held2.join(".done")).unwrap()).unwrap();
+        assert_eq!(m2["media_type"], "movie");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

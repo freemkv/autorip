@@ -7,3 +7,7 @@ infra/
 
 # session scratch — never track (may contain RE breadcrumbs)
 scratch/
+
+# internal agent context — never publish (leak-guard blocks both)
+CLAUDE.md
+.claude/

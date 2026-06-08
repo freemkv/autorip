@@ -7,18 +7,98 @@ pub struct TmdbResult {
     pub media_type: String, // "movie" or "tv"
 }
 
+/// Shared agent for all TMDB calls. ureq 2.x sets NO connect/read timeout by
+/// default, so a hung api.themoviedb.org connection would wedge the rip thread
+/// (lookup runs on it) or a web handler (search) indefinitely. Bound both.
+static AGENT: once_cell::sync::Lazy<ureq::Agent> = once_cell::sync::Lazy::new(|| {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout_read(std::time::Duration::from_secs(10))
+        .build()
+});
+
+/// Build the `search/multi` URL. Both `api_key` and `query` are
+/// percent-encoded: an api_key with a stray space/`&`/`#`/`=` (config
+/// copy-paste error) would otherwise yield a malformed URL or a silently-wrong
+/// key, and the query is untrusted disc-label content.
+fn search_multi_url(query: &str, api_key: &str) -> String {
+    format!(
+        "https://api.themoviedb.org/3/search/multi?api_key={}&query={}&page=1",
+        urlencoded(api_key),
+        urlencoded(query)
+    )
+}
+
+/// Run a TMDB `search/multi` request and return the parsed JSON, or `None`.
+///
+/// Uses the shared timeout-bounded [`AGENT`] (so a hung connection can't wedge
+/// the rip thread / web handler) and the percent-encoded [`search_multi_url`].
+///
+/// Unlike a bare `.call().ok()?`, this distinguishes the failure modes so a
+/// misconfigured API key (HTTP 401) or rate-limit (429) is visible in the
+/// log instead of silently collapsing to "no results" — which would route
+/// every disc to the needs-review queue with no actionable cause. A 401 is
+/// throttled (once per minute) so a stuck-bad-key loop can't spam syslog.
+fn fetch_multi(query: &str, api_key: &str) -> Option<serde_json::Value> {
+    let url = search_multi_url(query, api_key);
+    match AGENT.get(&url).call() {
+        Ok(resp) => match resp.into_json::<serde_json::Value>() {
+            Ok(json) => Some(json),
+            Err(e) => {
+                tracing::warn!(query = %query, error = %e, "tmdb: response was not valid JSON");
+                None
+            }
+        },
+        Err(ureq::Error::Status(401, _)) => {
+            warn_bad_key_throttled();
+            None
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            tracing::warn!(query = %query, status = code, "tmdb: HTTP error status");
+            None
+        }
+        Err(e) => {
+            // Transport error (DNS / connect / timeout).
+            tracing::warn!(query = %query, error = %e, "tmdb: request failed (network/transport)");
+            None
+        }
+    }
+}
+
+/// One-per-minute warning that the configured TMDB API key was rejected.
+fn warn_bad_key_throttled() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARN_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 60
+        && LAST_WARN_SECS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            "tmdb: API key rejected (HTTP 401) — check the TMDB_API_KEY in Settings; \
+             titles will fall through to the needs-review queue until it is fixed"
+        );
+        crate::log::syslog("TMDB API key rejected (HTTP 401) — check TMDB_API_KEY in Settings");
+    }
+}
+
 pub fn lookup(query: &str, api_key: &str) -> Option<TmdbResult> {
     if api_key.is_empty() {
         return None;
     }
-
-    let url = format!(
-        "https://api.themoviedb.org/3/search/multi?api_key={}&query={}&page=1",
-        api_key,
-        urlencoded(query)
-    );
-
-    let resp: serde_json::Value = ureq::get(&url).call().ok()?.into_json().ok()?;
+    // Mirror `search`'s guard: a separator-only volume label that
+    // clean_title reduces to "" would otherwise fire a query=&... request
+    // that TMDB answers with HTTP 422 and a spurious per-insert warning.
+    if query.trim().is_empty() {
+        return None;
+    }
+    let resp = fetch_multi(query, api_key)?;
     let results = resp["results"].as_array()?;
     pick_best(query, results)
 }
@@ -30,8 +110,10 @@ fn norm(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut sep = true; // leading: suppress a leading space
     for c in s.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
+        // Unicode-aware: keep accented letters/digits (so "Amélie" and
+        // "Pokémon" can match exactly) instead of stripping all non-ASCII.
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
             sep = false;
         } else if !sep {
             out.push(' ');
@@ -55,18 +137,8 @@ pub fn search(query: &str, api_key: &str, limit: usize) -> Vec<TmdbResult> {
     if api_key.is_empty() || query.trim().is_empty() {
         return Vec::new();
     }
-    let url = format!(
-        "https://api.themoviedb.org/3/search/multi?api_key={}&query={}&page=1",
-        api_key,
-        urlencoded(query)
-    );
-    let resp = match ureq::get(&url).call() {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    let json: serde_json::Value = match resp.into_json() {
-        Ok(j) => j,
-        Err(_) => return Vec::new(),
+    let Some(json) = fetch_multi(query, api_key) else {
+        return Vec::new();
     };
     let Some(results) = json["results"].as_array() else {
         return Vec::new();
@@ -139,7 +211,9 @@ fn pick_best(query: &str, results: &[serde_json::Value]) -> Option<TmdbResult> {
 /// Returns `None` for non-movie/TV entries (people, collections) and for
 /// entries missing a usable title.
 fn parse_result(v: &serde_json::Value) -> Option<(TmdbResult, f64)> {
-    let media_type = v["media_type"].as_str().unwrap_or("movie");
+    // Default to "" (not "movie") so an entry that is missing media_type is
+    // rejected by the guard below rather than silently admitted as a movie.
+    let media_type = v["media_type"].as_str().unwrap_or("");
     if media_type != "movie" && media_type != "tv" {
         return None;
     }
@@ -159,9 +233,13 @@ fn parse_result(v: &serde_json::Value) -> Option<(TmdbResult, f64)> {
         .and_then(|d| d.as_str())
         .unwrap_or("");
     let year: u16 = date.get(..4).and_then(|y| y.parse().ok()).unwrap_or(0);
+    // TMDB poster_path is always a host-absolute path ("/abc.jpg"). Guard
+    // the leading slash so a slashless or unexpected value can't produce a
+    // malformed/host-relative image URL — keeps the empty-path behavior.
     let poster = v["poster_path"]
         .as_str()
-        .map(|p| format!("https://image.tmdb.org/t/p/w300{}", p))
+        .filter(|p| p.starts_with('/'))
+        .map(|p| format!("https://image.tmdb.org/t/p/w300{p}"))
         .unwrap_or_default();
     let overview = v["overview"].as_str().unwrap_or("").to_string();
     Some((
@@ -195,17 +273,42 @@ pub fn clean_title(label: &str) -> String {
         "disc 4",
         "disk 1",
         "disk 2",
+        "disk 3",
+        "disk 4",
     ];
+    // Search AND slice the SAME (lowercased) string. `to_lowercase()` can
+    // change byte length (e.g. 'İ' U+0130 -> 2 bytes, 'ẞ' -> 'ß'), so an
+    // offset found in `lower` is NOT a valid byte index into `s` and slicing
+    // `s` at it can panic mid-codepoint. Title-casing below re-lowercases the
+    // tail anyway, so working from `lower` yields identical output.
+    //
+    // Strip only suffixes anchored at the END of the (current) string —
+    // never an embedded match, which would truncate a real title mid-string
+    // (the "dvd" in "DOCUMENTARY_ABOUT_DVD_COLLECTIONS", the "bluray" in
+    // "HOLIDAY_BLURAY_SPECIAL"). Repeat so a chained tail like "4K UHD BLURAY"
+    // peels off group by group.
     let lower = s.to_lowercase();
-    let mut end = s.len();
-    for suffix in &suffixes {
-        if let Some(pos) = lower.find(suffix) {
-            if pos < end {
-                end = pos;
+    let mut clipped = lower.as_str();
+    loop {
+        let trimmed = clipped.trim_end();
+        let mut next: Option<&str> = None;
+        for suffix in &suffixes {
+            if let Some(pos) = trimmed.rfind(suffix) {
+                if pos + suffix.len() == trimmed.len() {
+                    next = Some(&trimmed[..pos]);
+                    break;
+                }
+            }
+        }
+        match next {
+            Some(rest) => clipped = rest,
+            None => {
+                clipped = trimmed;
+                break;
             }
         }
     }
-    let trimmed = s[..end].trim();
+    let trimmed = clipped.trim();
 
     trimmed
         .split_whitespace()
@@ -266,9 +369,9 @@ mod tests {
     }
 
     #[test]
-    fn clean_title_picks_earliest_suffix_match() {
-        // Multiple suffix candidates — must cut at the earliest one so we
-        // don't leave suffix fragments in the cleaned title.
+    fn clean_title_peels_chained_trailing_suffixes() {
+        // A chained tail of format suffixes ("4K UHD BLURAY") must peel off
+        // group by group from the END, leaving no suffix fragments behind.
         let out = clean_title("MOVIE_4K_UHD_BLURAY");
         assert!(!out.to_lowercase().contains("uhd"));
         assert!(!out.to_lowercase().contains("bluray"));
@@ -281,11 +384,72 @@ mod tests {
     }
 
     #[test]
+    fn clean_title_multibyte_lowercase_does_not_panic() {
+        // 'İ' (U+0130) and 'ẞ' (U+1E9E) change byte length under to_lowercase,
+        // so an offset found in the lowercased string is not a valid index into
+        // the original — slicing the original there panicked ("not a char
+        // boundary"). Searching+slicing the same lowercased string fixes it.
+        // The disc volume label is disc-controlled, so this must never panic.
+        let _ = clean_title("İẞẞdvd");
+        let _ = clean_title("İstanbul DVD");
+        let _ = clean_title("Straße ẞ Blu-ray");
+        // A pure-multibyte label with a trailing suffix still produces output
+        // without panicking.
+        assert!(!clean_title("İẞẞ 4K UHD").is_empty());
+    }
+
+    #[test]
+    fn clean_title_keeps_embedded_format_words() {
+        // A format word that is NOT at the end must not truncate the title.
+        assert_eq!(
+            clean_title("DOCUMENTARY_ABOUT_DVD_COLLECTIONS"),
+            "Documentary About Dvd Collections"
+        );
+        assert_eq!(
+            clean_title("HOLIDAY_BLURAY_SPECIAL"),
+            "Holiday Bluray Special"
+        );
+    }
+
+    #[test]
+    fn clean_title_strips_only_trailing_suffix() {
+        // Trailing suffix is still stripped.
+        assert_eq!(clean_title("THE_MATRIX_DVD"), "The Matrix");
+        // Chained trailing groups peel off one after another.
+        assert_eq!(clean_title("THE_MATRIX_4K_UHD_BLURAY"), "The Matrix");
+    }
+
+    #[test]
     fn urlencoded_keeps_allowed_chars() {
         assert_eq!(urlencoded("hello"), "hello");
         assert_eq!(urlencoded("hello world"), "hello+world");
         assert_eq!(urlencoded("name=value"), "name%3Dvalue");
         assert_eq!(urlencoded("a-b_c.d"), "a-b_c.d");
+    }
+
+    #[test]
+    fn search_url_encodes_both_key_and_query() {
+        // Untrusted disc-label query content cannot break out of the query
+        // param or inject extra URL params (SSRF/param-injection guard), and a
+        // malformed api_key is encoded rather than corrupting the URL.
+        let url = search_multi_url("a&b=c #x", "key with space&evil=1");
+        assert!(url.starts_with("https://api.themoviedb.org/3/search/multi?"));
+        assert!(!url.contains(' '));
+        // Raw '&'/'#'/'=' from inputs must be percent-encoded, never literal
+        // separators that would add params or a fragment.
+        assert!(url.contains("api_key=key+with+space%26evil%3D1"));
+        assert!(url.contains("query=a%26b%3Dc+%23x"));
+        // Exactly the two intended params plus page.
+        assert_eq!(url.matches('&').count(), 2); // &query= and &page=
+        assert!(!url.contains('#'));
+    }
+
+    #[test]
+    fn norm_keeps_accented_letters() {
+        // Accented titles must be able to match exactly (was stripped to ASCII).
+        assert_eq!(norm("Amélie"), "amélie");
+        assert_eq!(norm("Pokémon"), "pokémon");
+        assert_eq!(norm("Amélie"), norm("amélie"));
     }
 
     // --- pick_best: robust result selection from search/multi ---

@@ -218,11 +218,17 @@ impl Default for RipState {
 /// fields. Wraps libfreemkv's `classify_damage` so the UI gets a stable
 /// lowercase string ("clean" / "cosmetic" / "moderate" / "serious").
 pub(super) fn damage_severity_for(errors: u32, total_lost_ms: f64) -> String {
-    let s = libfreemkv::classify_damage(errors as u64, total_lost_ms);
-    serde_json::to_value(s)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
+    use libfreemkv::DamageSeverity;
+    // Direct match instead of round-tripping through serde_json::to_value
+    // on every (throttled) progress callback. Strings match libfreemkv's
+    // `#[serde(rename_all = "lowercase")]` repr so the UI is unchanged.
+    match libfreemkv::classify_damage(errors as u64, total_lost_ms) {
+        DamageSeverity::Clean => "clean",
+        DamageSeverity::Cosmetic => "cosmetic",
+        DamageSeverity::Moderate => "moderate",
+        DamageSeverity::Serious => "serious",
+    }
+    .to_string()
 }
 
 // Global state for web UI.
@@ -239,17 +245,16 @@ pub static TITLE_OVERRIDES: once_cell::sync::Lazy<
 
 /// Record an operator title override for `device` (from the Ripper card picker).
 pub fn set_title_override(device: &str, r: crate::tmdb::TmdbResult) {
-    if let Ok(mut m) = TITLE_OVERRIDES.lock() {
-        m.insert(device.to_string(), r);
-    }
+    // Recover-and-proceed on poison (same convention as is_busy/update_state):
+    // silently dropping the override would lose the operator's title pick.
+    let mut m = TITLE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+    m.insert(device.to_string(), r);
 }
 
 /// Take (and clear) the operator title override for `device`, if any.
 pub fn take_title_override(device: &str) -> Option<crate::tmdb::TmdbResult> {
-    TITLE_OVERRIDES
-        .lock()
-        .ok()
-        .and_then(|mut m| m.remove(device))
+    let mut m = TITLE_OVERRIDES.lock().unwrap_or_else(|e| e.into_inner());
+    m.remove(device)
 }
 
 /// Stop cooldowns: device -> epoch seconds when cooldown expires.
@@ -261,29 +266,31 @@ const STOP_COOLDOWN_SECS: u64 = 5;
 
 pub fn set_stop_cooldown(device: &str) {
     let now = crate::util::epoch_secs();
-    if let Ok(mut cd) = STOP_COOLDOWNS.lock() {
-        cd.insert(device.to_string(), now + STOP_COOLDOWN_SECS);
-    }
+    // Recover-and-proceed on poison (same convention as is_busy/update_state).
+    let mut cd = STOP_COOLDOWNS.lock().unwrap_or_else(|e| e.into_inner());
+    cd.insert(device.to_string(), now + STOP_COOLDOWN_SECS);
 }
 
 pub(super) fn is_in_cooldown(device: &str) -> bool {
     let now = crate::util::epoch_secs();
-    if let Ok(cd) = STOP_COOLDOWNS.lock() {
-        if let Some(&expires) = cd.get(device) {
-            return now < expires;
-        }
+    let cd = STOP_COOLDOWNS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&expires) = cd.get(device) {
+        return now < expires;
     }
     false
 }
 
 pub fn is_busy(device: &str) -> bool {
-    STATE
-        .lock()
-        .map(|s| {
-            s.get(device)
-                .map(|r| r.status == "scanning" || r.status == "ripping")
-                .unwrap_or(false)
-        })
+    // Recover the poisoned guard instead of treating poison as "not
+    // busy". This is the double-rip guard: if a panic while holding
+    // STATE poisoned the mutex, swallowing the error would make every
+    // later is_busy() return false, opening the guards in ripper/mod.rs
+    // (rip/scan dispatch) and letting a second rip launch concurrently
+    // on the same drive. Matches the poison-recovery convention in
+    // log.rs (`.lock().unwrap_or_else(|e| e.into_inner())`).
+    let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    s.get(device)
+        .map(|r| r.status == "scanning" || r.status == "ripping")
         .unwrap_or(false)
 }
 
@@ -298,24 +305,26 @@ pub fn update_state(device: &str, mut state: RipState) {
     // fresh RipState into update_state with default zeros — without
     // this preservation step the UI's live elapsed-time counter
     // would reset on every state push.
-    if let Ok(mut s) = STATE.lock() {
-        let prev_started = s.get(device).map(|p| p.started_epoch_secs).unwrap_or(0);
-        let now_active = is_active_status(&state.status);
-        let was_active = s.get(device).is_some_and(|p| is_active_status(&p.status));
+    // Recover from a poisoned STATE mutex rather than silently dropping
+    // the write — a dropped write freezes the dashboard on stale state
+    // for the rest of the process. Matches `is_busy` / log.rs convention.
+    let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let prev_started = s.get(device).map(|p| p.started_epoch_secs).unwrap_or(0);
+    let now_active = is_active_status(&state.status);
+    let was_active = s.get(device).is_some_and(|p| is_active_status(&p.status));
 
-        if state.started_epoch_secs == 0 {
-            if now_active && was_active && prev_started > 0 {
-                // Continuing an in-flight rip — keep the original start
-                state.started_epoch_secs = prev_started;
-            } else if now_active {
-                // Transition into active — stamp now
-                state.started_epoch_secs = crate::util::epoch_secs();
-            }
-            // else: idle / done / error / failed → leave at 0 (clears
-            // the elapsed-counter in the UI)
+    if state.started_epoch_secs == 0 {
+        if now_active && was_active && prev_started > 0 {
+            // Continuing an in-flight rip — keep the original start
+            state.started_epoch_secs = prev_started;
+        } else if now_active {
+            // Transition into active — stamp now
+            state.started_epoch_secs = crate::util::epoch_secs();
         }
-        s.insert(device.to_string(), state);
+        // else: idle / done / error / failed → leave at 0 (clears
+        // the elapsed-counter in the UI)
     }
+    s.insert(device.to_string(), state);
 }
 
 fn is_active_status(s: &str) -> bool {
@@ -332,13 +341,20 @@ fn is_active_status(s: &str) -> bool {
 /// Creates a default-initialized RipState if the device isn't in the map
 /// yet so the first call after boot doesn't silently no-op.
 pub fn update_state_with<F: FnOnce(&mut RipState)>(device: &str, f: F) {
-    if let Ok(mut s) = STATE.lock() {
-        let entry = s.entry(device.to_string()).or_insert_with(|| RipState {
-            device: device.to_string(),
-            ..Default::default()
-        });
-        f(entry);
-    }
+    // Recover from a poisoned STATE mutex rather than silently dropping
+    // the mutation — see `update_state` / `is_busy` / log.rs.
+    let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = s.entry(device.to_string()).or_insert_with(|| RipState {
+        device: device.to_string(),
+        ..Default::default()
+    });
+    f(entry);
+    // Re-derive damage_severity after the mutation, matching `update_state`.
+    // A closure that bumps `errors` / `total_lost_ms` (the patch-pass and
+    // watchdog callbacks do) would otherwise leave a stale severity badge in
+    // the UI, since this path skipped the re-derivation `update_state` does
+    // on every push.
+    entry.damage_severity = damage_severity_for(entry.errors, entry.total_lost_ms);
 }
 
 /// Shared context for the progress callbacks of a multi-pass rip. Built once
@@ -503,6 +519,16 @@ pub(super) struct PassProgressState {
     /// Last `work_total` reported by libfreemkv's `Progress` trait — total
     /// bytes this pass will process. Drives `pass_progress_pct` denominator.
     pub(super) last_work_total: u64,
+    /// `bytes_unreadable` snapshotted on this pass's first
+    /// `push_pass_state` callback, frozen for the rest of the pass. The
+    /// total-progress denominator (`max_retries × bytes_lost`) uses this
+    /// frozen value instead of the live mapfile figure: during Pass 1
+    /// `bytes_unreadable` grows from 0 as new bad sectors are discovered,
+    /// so a live read inflated the denominator mid-pass and made
+    /// `total_pct` visibly stall or regress. Re-snapshotted each pass (a
+    /// fresh `PassProgressState` is built per pass), so the estimate
+    /// still tightens pass-to-pass.
+    pub(super) frozen_bytes_lost: Option<u64>,
 }
 
 /// Display-speed sliding-window size, adapted to elapsed pass time:
@@ -566,6 +592,7 @@ impl PassProgressState {
             last_log: now,
             last_work_done: 0,
             last_work_total: 0,
+            frozen_bytes_lost: None,
         }
     }
 
@@ -679,11 +706,12 @@ pub(super) fn push_pass_state(
         build_bad_ranges(&map, title, bps);
     // Main-title-only lost time: intersect Unreadable ranges with the
     // main feature's extents, then convert to ms using the same bps.
-    let main_title_bad = map.ranges_with(&[
-        libfreemkv::disc::mapfile::SectorStatus::NonTrimmed,
-        libfreemkv::disc::mapfile::SectorStatus::Unreadable,
-        libfreemkv::disc::mapfile::SectorStatus::NonScraped,
-    ]);
+    // Unreadable-only, to match this field's doc and `total_lost_ms` /
+    // `build_bad_ranges`. (Pre-fix this also folded in the MAYBE buckets
+    // NonTrimmed/NonScraped — still-retry-eligible bytes — so during a
+    // patch pass the "(Xs in main movie)" pill counted bytes that hadn't
+    // been given up on yet, and could exceed `total_lost_ms`.)
+    let main_title_bad = map.ranges_with(&[libfreemkv::disc::mapfile::SectorStatus::Unreadable]);
     let main_title_bad_bytes = libfreemkv::disc::bytes_bad_in_title(title, &main_title_bad);
     let main_lost_ms = if bps > 0.0 {
         main_title_bad_bytes as f64 * 1000.0 / bps
@@ -705,6 +733,16 @@ pub(super) fn push_pass_state(
     // retry-eligible bytes show up in the yellow pill.
     let bytes_lost = stats.bytes_unreadable;
     let bytes_maybe = stats.bytes_retryable;
+    // Freeze `bytes_unreadable` on this pass's first callback for use as
+    // the total-progress retry-work term. Re-reading it live each
+    // callback let the Pass-1 denominator grow as bad sectors were
+    // discovered, making total_pct stall/regress mid-pass. The red-pill
+    // `bytes_lost` above stays live (terminal-bad truth); only the
+    // total-progress estimate uses this frozen figure.
+    let retry_denom_bytes = {
+        let mut s = state.borrow_mut();
+        *s.frozen_bytes_lost.get_or_insert(bytes_lost)
+    };
     // `errors` is the user-visible skipped-sector count: terminal-bad
     // sectors only (`bytes_lost`). Pending bytes are not "errors" — they
     // may still recover.
@@ -748,17 +786,19 @@ pub(super) fn push_pass_state(
     };
     let total_work_estimated = ctx
         .bytes_total_disc
-        .saturating_add(cfg_max_retries.saturating_mul(bytes_lost))
+        .saturating_add(cfg_max_retries.saturating_mul(retry_denom_bytes))
         .saturating_add(mux_estimate_bytes);
     // Cumulative work done across all passes:
     //   pass 1: total_done = last_pos
     //   pass>=2 (retry): total_done = capacity + (pass-2) × bytes_lost + last_pos
+    // Numerator uses the same frozen `retry_denom_bytes` as the
+    // denominator so prior-pass retry work and total work stay consistent.
     let total_done: u64 = if pass <= 1 {
         last_pos
     } else {
         let prior_retry_count = pass.saturating_sub(2) as u64;
         ctx.bytes_total_disc
-            .saturating_add(prior_retry_count.saturating_mul(bytes_lost))
+            .saturating_add(prior_retry_count.saturating_mul(retry_denom_bytes))
             .saturating_add(last_pos)
     };
     let total_pct = if total_work_estimated > 0 {
@@ -826,6 +866,12 @@ pub(super) fn push_pass_state(
             disc_format: ctx.disc_format.clone(),
             progress_pct: pct,
             progress_gb: last_pos as f64 / 1_073_741_824.0,
+            // Populate the documented last_sector (LBA) during sweep too,
+            // not just mux. `last_pos` is the swept byte offset; / 2048
+            // is the equivalent LBA the UI playhead expects. Previously
+            // left at Default (0), so the playhead never moved during the
+            // sweep phase despite the field being documented.
+            last_sector: last_pos / 2048,
             speed_mbs,
             eta,
             errors,
@@ -898,58 +944,48 @@ pub(super) fn push_pass_state(
 }
 
 /// Build a RipState snapshot for a multi-pass rip in a specific pass, with
-/// everything the UI needs to render pass progress. Status is always "ripping"
-/// during the passes; pass=total_passes indicates the mux phase.
-#[allow(clippy::too_many_arguments)]
+/// everything the UI needs to render pass progress. The immutable per-rip
+/// fields (disc / TMDB / batch / capacity) come from `ctx`; the rest are the
+/// per-pass dynamic values. Status is always "ripping" during the passes;
+/// pass=total_passes indicates the mux phase.
 pub(super) fn set_pass_progress(
-    device: &str,
-    display_name: &str,
-    disc_format: &str,
-    tmdb_title: &str,
-    tmdb_year: u16,
-    tmdb_poster: &str,
-    tmdb_overview: &str,
-    duration: &str,
-    codecs: &str,
-    filename: &str,
+    ctx: &PassContext,
     pass: u8,
     total_passes: u8,
     bytes_good: u64,
     bytes_maybe: u64,
     bytes_lost: u64,
-    bytes_total_disc: u64,
-    batch: u16,
 ) {
-    let pct = if bytes_total_disc > 0 {
-        (bytes_good * 100 / bytes_total_disc).min(100) as u8
+    let pct = if ctx.bytes_total_disc > 0 {
+        (bytes_good * 100 / ctx.bytes_total_disc).min(100) as u8
     } else {
         0
     };
     update_state(
-        device,
+        &ctx.device,
         RipState {
-            device: device.to_string(),
+            device: ctx.device.clone(),
             status: "ripping".to_string(),
             disc_present: true,
-            disc_name: display_name.to_string(),
-            disc_format: disc_format.to_string(),
+            disc_name: ctx.display_name.clone(),
+            disc_format: ctx.disc_format.clone(),
             progress_pct: pct,
             progress_gb: bytes_good as f64 / 1_073_741_824.0,
-            output_file: filename.to_string(),
-            tmdb_title: tmdb_title.to_string(),
-            tmdb_year,
-            tmdb_poster: tmdb_poster.to_string(),
-            tmdb_overview: tmdb_overview.to_string(),
-            duration: duration.to_string(),
-            codecs: codecs.to_string(),
+            output_file: ctx.filename.clone(),
+            tmdb_title: ctx.tmdb_title.clone(),
+            tmdb_year: ctx.tmdb_year,
+            tmdb_poster: ctx.tmdb_poster.clone(),
+            tmdb_overview: ctx.tmdb_overview.clone(),
+            duration: ctx.duration.clone(),
+            codecs: ctx.codecs.clone(),
             pass,
             total_passes,
             bytes_good,
             bytes_maybe,
             bytes_lost,
-            bytes_total_disc,
-            preferred_batch: batch,
-            current_batch: batch,
+            bytes_total_disc: ctx.bytes_total_disc,
+            preferred_batch: ctx.batch,
+            current_batch: ctx.batch,
             ..Default::default()
         },
     );
@@ -969,19 +1005,15 @@ mod tests {
     use super::*;
     use libfreemkv::disc::mapfile::{Mapfile, SectorStatus};
 
-    fn tmp_map(tag: &str, total: u64) -> (std::path::PathBuf, Mapfile) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "autorip-ripper-test-{}-{}-{}.mapfile",
-            std::process::id(),
-            tag,
-            n
-        ));
-        let _ = std::fs::remove_file(&path);
+    /// Create a throwaway mapfile inside a fresh `TempDir`. The returned
+    /// `TempDir` guard must be held for the test's lifetime; its Drop
+    /// removes the directory (and the mapfile) so temp_dir() doesn't
+    /// accumulate `autorip-ripper-test-*.mapfile` artifacts across runs.
+    fn tmp_map(tag: &str, total: u64) -> (tempfile::TempDir, Mapfile) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{tag}.mapfile"));
         let map = Mapfile::create(&path, total, "test").unwrap();
-        (path, map)
+        (dir, map)
     }
 
     fn minimal_title() -> libfreemkv::DiscTitle {
@@ -1368,8 +1400,9 @@ mod tests {
     }
 
     #[test]
-    fn pass_progress_zero_dt_returns_previous() {
-        // Two calls at the same instant must not divide by zero.
+    fn pass_progress_zero_dt_leaves_speed_unchanged() {
+        // Two calls at the same instant must not divide by zero, and a
+        // zero-dt sample must leave the smoothed speed untouched.
         let mut s = PassProgressState::new();
         let t0 = std::time::Instant::now();
         let _ = s.observe(t0, 0);
@@ -1410,5 +1443,38 @@ mod tests {
         assert_eq!(snap.preferred_batch, 60, "preferred_batch wiped");
         assert_eq!(snap.progress_pct, 42, "new field not applied");
         assert_eq!(snap.status, "ripping", "new field not applied");
+    }
+
+    #[test]
+    fn spawn_failure_reset_to_idle_clears_busy() {
+        // HIGH: handle_scan/handle_rip set status="scanning" BEFORE spawning
+        // the worker. If the spawn fails the handlers now roll the device
+        // back to idle. Pin the contract the rollback relies on: an idle
+        // push clears is_busy so the next scan/rip isn't rejected with 409.
+        let dev = format!("test-spawnfail-{}", std::process::id());
+        // Pre-state set by the handler before spawn.
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "scanning".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(is_busy(&dev), "scanning device must read as busy");
+        // The exact rollback the handlers perform on spawn failure.
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "idle".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !is_busy(&dev),
+            "after spawn-failure reset the device must no longer be busy \
+             (else every future scan/rip 409s until restart)"
+        );
     }
 }

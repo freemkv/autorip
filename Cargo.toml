@@ -1,11 +1,12 @@
 [package]
 name = "freemkv-autorip"
-version = "0.30.6"
+version = "0.31.0"
 edition = "2024"
 rust-version = "1.86"
 license = "AGPL-3.0-only"
 description = "Automatic disc ripper — insert a disc, get an MKV"
 repository = "https://github.com/freemkv/autorip"
+exclude = ["CLAUDE.md"]
 keywords = ["bluray", "uhd", "ripper", "automation", "disc"]
 categories = ["hardware-support", "multimedia"]
 
@@ -14,8 +15,8 @@ name = "autorip"
 path = "src/main.rs"
 
 [dependencies]
-libfreemkv = "0.30"
-freemkv-keysources = "0.30"
+libfreemkv = "0.31"
+freemkv-keysources = "0.31"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -44,3 +45,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

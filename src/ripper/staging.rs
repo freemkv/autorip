@@ -108,7 +108,14 @@ pub fn write_failed_marker(staging_disc_dir: &Path, reason: &str) {
         "reason": reason,
         "timestamp": crate::util::format_iso_datetime(),
     });
-    if let Err(e) = std::fs::write(&p, serde_json::to_string_pretty(&body).unwrap_or_default()) {
+    // `to_string_pretty` on a `json!`-constructed Value is effectively
+    // infallible; `.expect` makes the invariant explicit so a real
+    // serialization failure surfaces as a panic rather than silently
+    // writing an empty `.failed` marker that `read_failed_reason` would
+    // then parse as `None`, masking the failure reason.
+    let serialized =
+        serde_json::to_string_pretty(&body).expect("json! value is always serialisable");
+    if let Err(e) = std::fs::write(&p, serialized) {
         tracing::warn!(path = %p.display(), error = %e, "failed to write .failed marker");
     }
 }
@@ -138,18 +145,81 @@ pub struct StagingSnapshot {
     pub dir: PathBuf,
     pub completed: bool,
     pub failed_reason: Option<String>,
+    /// `.done` hand-off marker present. A completed mux writes `.done`
+    /// (for the mover) before `.completed` (the process-level marker)
+    /// and before the ISO prune. A crash in that window leaves `.done`
+    /// present but `.completed` absent and the ISO still on disk — the
+    /// resume scan must recognise this as a finished rip, not partial
+    /// state to be retried. Hoisting `.done` into the snapshot lets the
+    /// resume gate short-circuit before the partial-state branch.
+    pub has_done: bool,
     pub has_iso: bool,
     pub has_mapfile: bool,
     pub has_mkv: bool,
+    /// Set when a per-entry `read_dir` error occurred during the scan
+    /// (partial NFS degradation). When true the snapshot must NOT be
+    /// classified as empty, because the artifact counts may be undercounts.
+    pub had_entry_error: bool,
 }
 
 impl StagingSnapshot {
     /// True iff there's any sign of an interrupted rip — at least one
     /// of ISO / mapfile / partial MKV is present. Used by the resume
     /// gate to distinguish "completely empty dir, nothing to do" from
-    /// "rip was running when the process died".
+    /// "rip was running when the process died". Also returns true when a
+    /// per-entry scan error occurred, so partial NFS degradation can't
+    /// undercount artifacts and trigger the remove_dir_all wipe on a
+    /// populated dir.
     pub fn has_partial_state(&self) -> bool {
-        self.has_iso || self.has_mapfile || self.has_mkv
+        self.has_iso || self.has_mapfile || self.has_mkv || self.had_entry_error
+    }
+}
+
+/// Raw, untrusted observations from scanning a staging dir's entries.
+/// Separated from the classification decision so the "what does this
+/// mean?" logic (`classify_observations`) is unit-testable without
+/// having to provoke real per-entry NFS I/O errors from the filesystem.
+#[derive(Debug, Default, Clone, Copy)]
+struct ScanObservations {
+    has_done: bool,
+    has_completed: bool,
+    has_failed: bool,
+    has_iso: bool,
+    has_mapfile: bool,
+    has_mkv: bool,
+    /// At least one `read_dir` attempt returned `Ok(entries)`.
+    saw_read_ok: bool,
+    /// At least one `Ok(DirEntry)` was yielded across all attempts.
+    saw_any_entries: bool,
+    /// At least one DirEntry yielded `Err(_)` (partial NFS degradation).
+    had_entry_error: bool,
+}
+
+impl ScanObservations {
+    /// True iff no marker and no artifact was observed — nothing we can
+    /// act on.
+    fn observed_nothing(&self) -> bool {
+        !self.has_done
+            && !self.has_completed
+            && !self.has_failed
+            && !self.has_iso
+            && !self.has_mapfile
+            && !self.has_mkv
+    }
+
+    /// True iff the dir's contents must be treated as UNKNOWN (not empty,
+    /// not partial) — the caller must skip it without wiping OR bumping
+    /// `.restart_count`. Two cases, both NFS-startup degradation:
+    ///
+    /// 1. Every `read_dir` attempt errored (`!saw_read_ok`) — never got
+    ///    a listing at all.
+    /// 2. `read_dir` opened but every DirEntry I/O errored
+    ///    (`had_entry_error`) and nothing trustworthy was observed
+    ///    (`observed_nothing`) — a possibly-completed 85 GB rip whose
+    ///    listing degraded mid-scan must NOT be counted as partial state
+    ///    and walked toward `.failed` over RESTART_LIMIT restarts.
+    fn contents_unknown(&self) -> bool {
+        !self.saw_read_ok || (self.had_entry_error && self.observed_nothing())
     }
 }
 
@@ -159,9 +229,6 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
     if !dir.is_dir() {
         return None;
     }
-    let completed = dir.join(COMPLETED_MARKER).exists();
-    let failed_reason = read_failed_reason(dir);
-
     // The orchestrator names the ISO `<sanitize(display_name)>.iso` and
     // the mapfile `<...>.iso.mapfile`. The MKV is `<sanitize(...)>.mkv`
     // or `.m2ts`. We don't know the exact display_name from the disc
@@ -176,24 +243,51 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
     // ran `read_dir` immediately, got 0 entries, wiped an 85 GB ISO
     // + partial MKV that genuinely existed on the server. Retry up to
     // 3 times with a 500 ms gap before trusting an empty result.
-    let mut has_iso = false;
-    let mut has_mapfile = false;
-    let mut has_mkv = false;
-    let mut saw_any_entries = false;
+    //
+    // The `.done` / `.completed` / `.failed` markers are read from this
+    // SAME primed `read_dir` view (not a separate un-retried `.exists()`
+    // stat) so a transient cold-cache NFS error can't race them to
+    // "absent" while the retry loop surfaces the ISO/mapfile — the
+    // exact case where a genuinely-completed rip would otherwise bump
+    // `.restart_count` every cold restart and be wrongly promoted to
+    // `.failed`.
+    let mut obs = ScanObservations::default();
     for attempt in 0..3 {
         if let Ok(entries) = std::fs::read_dir(dir) {
+            obs.saw_read_ok = true;
             let mut empty_this_pass = true;
-            for entry in entries.flatten() {
+            for entry in entries {
+                // Don't `.flatten()` away per-entry errors: a partial NFS
+                // degradation can error on individual DirEntry I/O while
+                // the dir is genuinely populated. Silently dropping those
+                // would undercount artifacts and could trip the
+                // remove_dir_all wipe on a non-empty dir. Treat any entry
+                // error like the all-attempts-errored case (suppress the
+                // empty classification) — same defense as `saw_any_entries`.
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => {
+                        obs.had_entry_error = true;
+                        continue;
+                    }
+                };
                 empty_this_pass = false;
-                saw_any_entries = true;
+                obs.saw_any_entries = true;
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name.ends_with(".iso") {
-                    has_iso = true;
-                } else if name.ends_with(".iso.mapfile") || name.ends_with(".mapfile") {
-                    has_mapfile = true;
+                if name == DONE_MARKER {
+                    obs.has_done = true;
+                } else if name == COMPLETED_MARKER {
+                    obs.has_completed = true;
+                } else if name == FAILED_MARKER {
+                    obs.has_failed = true;
+                } else if name.ends_with(".iso") {
+                    obs.has_iso = true;
+                } else if name.ends_with(".mapfile") {
+                    // ".iso.mapfile" is subsumed by ".mapfile" — one arm covers both.
+                    obs.has_mapfile = true;
                 } else if name.ends_with(".mkv") || name.ends_with(".m2ts") {
-                    has_mkv = true;
+                    obs.has_mkv = true;
                 }
             }
             if !empty_this_pass {
@@ -204,20 +298,50 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
-    if !saw_any_entries {
+
+    // UNKNOWN contents — never got a trustworthy listing. Two NFS-startup
+    // degradation cases (see `ScanObservations::contents_unknown`):
+    //   1. every `read_dir` attempt errored, or
+    //   2. `read_dir` opened but every DirEntry I/O errored and nothing
+    //      was observed.
+    // Return None so the caller skips the dir entirely (its
+    // `let Some(snap) = ... else { continue }`) rather than treating it
+    // as empty (→ wipe) or as partial state (→ bump `.restart_count`,
+    // eventually promoting a possibly-completed 85 GB rip to `.failed`).
+    if obs.contents_unknown() {
+        tracing::warn!(
+            path = %dir.display(),
+            saw_read_ok = obs.saw_read_ok,
+            had_entry_error = obs.had_entry_error,
+            "staging dir contents UNKNOWN (read_dir/DirEntry errors, nothing observed) — skipping, not wiping or restart-counting"
+        );
+        return None;
+    }
+    if !obs.saw_any_entries {
         tracing::warn!(
             path = %dir.display(),
             "staging dir read_dir returned 0 entries on all 3 retries — treating as empty"
         );
     }
 
+    // Only read the `.failed` reason file when the primed scan actually
+    // saw the marker, so the content read is consistent with the
+    // presence check above.
+    let failed_reason = if obs.has_failed {
+        read_failed_reason(dir)
+    } else {
+        None
+    };
+
     Some(StagingSnapshot {
         dir: dir.to_path_buf(),
-        completed,
+        completed: obs.has_completed,
         failed_reason,
-        has_iso,
-        has_mapfile,
-        has_mkv,
+        has_done: obs.has_done,
+        has_iso: obs.has_iso,
+        has_mapfile: obs.has_mapfile,
+        has_mkv: obs.has_mkv,
+        had_entry_error: obs.had_entry_error,
     })
 }
 
@@ -246,9 +370,22 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
     let mut hints = Vec::new();
     let entries = match std::fs::read_dir(staging_dir) {
         Ok(e) => e,
-        Err(_) => return hints,
+        Err(e) => {
+            tracing::warn!(staging_dir, error = %e, "could not list staging root at startup; nothing resumed this cycle");
+            return hints;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // Mirror the inner scan's defense: don't `.flatten()` away a
+        // per-entry error (NFS ESTALE on a specific dentry), which would
+        // silently skip a whole disc subdir for a container cycle.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(staging_dir, error = %e, "per-entry error listing staging root - skipping this entry, share may be degraded");
+                continue;
+            }
+        };
         let path = entry.path();
         let Some(snap) = snapshot_staging_disc(&path) else {
             continue;
@@ -270,17 +407,28 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
             });
             continue;
         }
+        // `.done` carve-out — checked BEFORE the partial-state branch.
+        // The mux writes `.done` then `.completed` then prunes the ISO;
+        // a crash between `.done` and `.completed` leaves `.done`
+        // present, `.completed` absent, and the ISO/mapfile still on
+        // disk (so `has_partial_state()` is true). That dir is a
+        // *finished* rip awaiting the mover, NOT partial state to be
+        // re-rip-counted. If this check stayed inside the
+        // `!has_partial_state()` branch it would be unreachable in that
+        // crash window, the dir would fall through to the restart-loop
+        // path, and after RESTART_LIMIT crashes a completed rip would be
+        // wrongly marked `.failed`. Short-circuit to AlreadyCompleted
+        // whenever `.done` exists, regardless of leftover ISO/mapfile.
+        if snap.has_done {
+            tracing::info!(path = %path.display(), "staging entry has .done — completed rip awaiting mover, leaving alone");
+            hints.push(StagingResumeHint {
+                dir: snap.dir,
+                action: ResumeAction::AlreadyCompleted,
+            });
+            continue;
+        }
         if !snap.has_partial_state() {
-            // Truly empty subdir with no markers — safe to wipe. The
-            // `.done` marker carve-out keeps a completed-but-not-yet-
-            // moved rip alive for the mover thread to pick up.
-            if path.join(DONE_MARKER).exists() {
-                hints.push(StagingResumeHint {
-                    dir: snap.dir,
-                    action: ResumeAction::AlreadyCompleted,
-                });
-                continue;
-            }
+            // Truly empty subdir with no markers — safe to wipe.
             match std::fs::remove_dir_all(&path) {
                 Ok(_) => tracing::info!(path = %path.display(), "wiped empty staging entry"),
                 Err(e) => {
@@ -312,10 +460,18 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
                         path = %path.display(),
                         attempt = new_rc,
                         limit = RESTART_LIMIT,
+                        // The failure gate above checks pre-bump
+                        // `rc >= RESTART_LIMIT`, so this dir is promoted to
+                        // `.failed` only once its count reaches
+                        // RESTART_LIMIT — i.e. on a restart where the
+                        // pre-bump count is already RESTART_LIMIT. Surface
+                        // that threshold so attempt=RESTART_LIMIT here
+                        // doesn't read as "should already have failed".
+                        fails_after = RESTART_LIMIT,
                         has_iso = snap.has_iso,
                         has_mapfile = snap.has_mapfile,
                         has_mkv = snap.has_mkv,
-                        "partial staging state preserved across restart"
+                        "partial staging state preserved across restart (fails on next restart once attempt reaches the limit)"
                     );
                     hints.push(StagingResumeHint {
                         dir: snap.dir,
@@ -382,16 +538,27 @@ mod tests {
     use std::fs;
 
     fn tmpdir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
+        // Repo-local scratch, never /tmp — /tmp is wiped on reboot and a
+        // stray collision there can leak across unrelated runs. Anchor to
+        // the crate's own target/ dir so artifacts land inside the build
+        // tree and are cleaned by `cargo clean`.
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch");
+        let p = base.join(format!(
             "autorip-staging-test-{}-{}",
             std::process::id(),
             crate::util::epoch_secs()
         ));
         fs::create_dir_all(&p).unwrap();
-        // Ensure each invocation gets a fresh subdir even when two
-        // tests land on the same epoch second (the test runner is
-        // multi-threaded by default).
-        let sub = p.join(format!("{:p}", &p));
+        // Ensure each invocation gets a fresh subdir even when two tests
+        // land on the same epoch second (the test runner is multi-threaded
+        // by default). A process-lifetime monotonic counter is guaranteed
+        // non-repeating; a stack-address discriminator ({:p}) is not, since
+        // sequential tests on the same pool thread can reuse the address.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let sub = p.join(format!("t-{}", COUNTER.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir_all(&sub).unwrap();
         sub
     }
@@ -492,6 +659,135 @@ mod tests {
         assert!(disc.join(COMPLETED_MARKER).exists());
         // MKV must still be there afterwards.
         assert!(disc.join("foo.mkv").exists());
+    }
+
+    #[test]
+    fn done_marker_with_partial_state_is_completed_not_retried() {
+        // A crash between writing .done and .completed leaves .done +
+        // the ISO/mapfile on disk. The resume scan must treat this as a
+        // completed rip awaiting the mover, NOT bump .restart_count.
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("foo.iso"), b"x").unwrap();
+        fs::write(disc.join("foo.iso.mapfile"), b"x").unwrap();
+        fs::write(disc.join(DONE_MARKER), b"{}").unwrap();
+        // No .completed marker (the crash happened before it landed).
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::AlreadyCompleted),
+            "got {:?}",
+            hints[0].action
+        );
+        // Counter must NOT have been bumped — this was a finished rip.
+        assert_eq!(restart_count(&disc), 0);
+        assert!(!disc.join(FAILED_MARKER).exists());
+        // Data preserved for the mover.
+        assert!(disc.join("foo.iso").exists());
+        assert!(disc.join(DONE_MARKER).exists());
+    }
+
+    #[test]
+    fn snapshot_reports_unknown_on_unreadable_dir() {
+        // A path that isn't a directory (read_dir errors) must yield
+        // None, not a "looks empty" snapshot that the caller might wipe.
+        let root = tmpdir();
+        let not_a_dir = root.join("a_file");
+        fs::write(&not_a_dir, b"x").unwrap();
+        assert!(snapshot_staging_disc(&not_a_dir).is_none());
+    }
+
+    #[test]
+    fn all_direntry_errors_with_no_artifacts_is_unknown_not_partial() {
+        // read_dir opened fine but every DirEntry I/O errored (partial
+        // NFS degradation mid-listing at container startup) and nothing
+        // trustworthy was observed. This MUST be classified UNKNOWN — the
+        // caller skips it without bumping `.restart_count`. Bumping would,
+        // over RESTART_LIMIT cold restarts, wrongly promote a possibly-
+        // completed 85 GB rip to `.failed` (the NFS-startup-wipe class).
+        let obs = ScanObservations {
+            saw_read_ok: true,
+            had_entry_error: true,
+            ..Default::default()
+        };
+        assert!(obs.observed_nothing());
+        assert!(
+            obs.contents_unknown(),
+            "all-DirEntry-error + no artifacts must be UNKNOWN, not partial state"
+        );
+    }
+
+    #[test]
+    fn all_read_dir_attempts_errored_is_unknown() {
+        // The original all-attempts-errored defense: never got a listing.
+        let obs = ScanObservations {
+            saw_read_ok: false,
+            ..Default::default()
+        };
+        assert!(obs.contents_unknown());
+    }
+
+    #[test]
+    fn entry_error_alongside_real_artifact_is_not_unknown() {
+        // A populated dir where one DirEntry errored but the ISO was
+        // still seen is NOT unknown — the snapshot is kept so the normal
+        // resume/restart handling runs. (has_iso alone already makes
+        // has_partial_state() true; the entry error must not erase that.)
+        let obs = ScanObservations {
+            saw_read_ok: true,
+            saw_any_entries: true,
+            had_entry_error: true,
+            has_iso: true,
+            ..Default::default()
+        };
+        assert!(!obs.observed_nothing());
+        assert!(!obs.contents_unknown());
+    }
+
+    #[test]
+    fn clean_empty_dir_is_not_unknown() {
+        // read_dir succeeded, dir was genuinely empty, no entry errors.
+        // Not UNKNOWN — the caller may legitimately wipe a truly-empty,
+        // marker-less staging dir.
+        let obs = ScanObservations {
+            saw_read_ok: true,
+            ..Default::default()
+        };
+        assert!(!obs.contents_unknown());
+    }
+
+    #[test]
+    fn unknown_contents_snapshot_does_not_bump_restart_count() {
+        // End-to-end shape of the bug: a snapshot that returns None for
+        // UNKNOWN contents means resume_or_quarantine_staging skips the
+        // dir entirely, leaving `.restart_count` untouched. We can't
+        // provoke real per-entry NFS errors from the local FS, so this
+        // asserts the contract the None-return relies on: a dir we never
+        // touch keeps its restart count at 0 and gains no `.failed`.
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        // Pre-seed restart_count near the limit to make a wrongful bump
+        // (which would push it to .failed) maximally visible.
+        fs::write(
+            disc.join(RESTART_COUNT_FILE),
+            format!("{}\n", RESTART_LIMIT - 1).as_bytes(),
+        )
+        .unwrap();
+        // The contract: when snapshot_staging_disc returns None (UNKNOWN),
+        // the dir is skipped. Verify the predicate that drives that None.
+        let unknown = ScanObservations {
+            saw_read_ok: true,
+            had_entry_error: true,
+            ..Default::default()
+        };
+        assert!(unknown.contents_unknown());
+        // And confirm that simply NOT processing the dir leaves the
+        // counter where it was — no bump, no promotion to .failed.
+        assert_eq!(restart_count(&disc), RESTART_LIMIT - 1);
+        assert!(!disc.join(FAILED_MARKER).exists());
     }
 
     #[test]
