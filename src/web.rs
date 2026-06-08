@@ -2270,7 +2270,7 @@ mod web_tests {
         // route through instead of a bare ureq::get.)
         assert!(guarded_get("http://10.0.0.5/keydb.zip").is_err());
         assert!(guarded_get("http://192.168.1.10/keydb.zip").is_err());
-        assert!(guarded_get("http://172.16.0.1/keydb.zip").is_err());
+        assert!(guarded_get("http://172.20.0.1/keydb.zip").is_err());
         assert!(guarded_get("http://127.0.0.1/keydb.zip").is_err());
         assert!(guarded_get("http://169.254.169.254/latest/").is_err());
         assert!(guarded_get("http://[::1]:9000/keydb.zip").is_err());

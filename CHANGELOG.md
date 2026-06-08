@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.31.1 (2026-06-08)
+
+- Builds against libfreemkv 0.31.1, which fixes the UDF Long-AD extent read.
+  This repairs reading a disc's AACS key-input files (`/AACS/*.inf`) on discs
+  whose metadata uses Long allocation descriptors (UHD/large Blu-ray): the
+  online key request is now built and sent instead of being silently skipped
+  when those files failed to read.
+- Hardened an SSRF guard test fixture.
+
 ## 0.31.0 (2026-06-08)
 
 Hardening release across the web/API surface, the rip loop, the mover, and the
