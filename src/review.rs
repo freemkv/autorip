@@ -208,7 +208,7 @@ mod tests {
             tmp.to_str().unwrap(),
             "Some Movie",
             Resolve::Retitle {
-                title: "Civil War".into(),
+                title: "Sample Movie".into(),
                 year: 2024,
             },
         )
@@ -217,7 +217,7 @@ mod tests {
         assert!(!held.join(".review").exists());
         let m: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(held.join(".done")).unwrap()).unwrap();
-        assert_eq!(m["title"], "Civil War");
+        assert_eq!(m["title"], "Sample Movie");
         assert_eq!(m["year"], 2024);
         assert!(list_held(tmp.to_str().unwrap()).is_empty());
 
@@ -350,7 +350,7 @@ mod tests {
             tmp.to_str().unwrap(),
             "Some Movie",
             Resolve::Retitle {
-                title: "Civil War".into(),
+                title: "Sample Movie".into(),
                 year: 2024,
             },
         )
