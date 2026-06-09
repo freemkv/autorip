@@ -290,7 +290,13 @@ pub fn clean_title(label: &str) -> String {
     let lower = s.to_lowercase();
     let mut clipped = lower.as_str();
     loop {
-        let trimmed = clipped.trim_end();
+        // Trim trailing whitespace AND non-alphanumeric junk (trademark glyphs
+        // ™/®, punctuation, stray separators) before testing the END-anchor.
+        // Retail UHD/BD volume labels routinely carry such trailing characters
+        // after the format words ("Ultra HD™", "Blu-ray."), and trimming only
+        // whitespace left the suffix un-anchored so it was never stripped — the
+        // polluted title ("Fight Club Ultra Hd™") then matched nothing on TMDB.
+        let trimmed = clipped.trim_end_matches(|c: char| !c.is_alphanumeric());
         let mut next: Option<&str> = None;
         for suffix in &suffixes {
             if let Some(pos) = trimmed.rfind(suffix) {
@@ -417,6 +423,23 @@ mod tests {
         assert_eq!(clean_title("THE_MATRIX_DVD"), "The Matrix");
         // Chained trailing groups peel off one after another.
         assert_eq!(clean_title("THE_MATRIX_4K_UHD_BLURAY"), "The Matrix");
+    }
+
+    #[test]
+    fn clean_title_strips_suffix_followed_by_trademark_or_punctuation() {
+        // Regression: retail volume labels carry a trademark glyph or trailing
+        // punctuation AFTER the format word. Trimming only whitespace before the
+        // END-anchor test left "ultra hd" un-anchored, so it was never stripped
+        // and TMDB matched nothing. The cleaned title must drop both the suffix
+        // and the trailing junk.
+        assert_eq!(clean_title("Fight Club - Ultra HD™"), "Fight Club");
+        assert_eq!(clean_title("Dune 4K Ultra HD®"), "Dune");
+        assert_eq!(clean_title("The Matrix Blu-ray."), "The Matrix");
+        // Embedded format word still protected even with trailing junk.
+        assert_eq!(
+            clean_title("DOCUMENTARY_ABOUT_DVD_COLLECTIONS™"),
+            "Documentary About Dvd Collections"
+        );
     }
 
     #[test]
