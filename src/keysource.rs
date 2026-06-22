@@ -471,11 +471,11 @@ mod tests {
             "::127.0.0.1 (IPv4-compatible) must be blocked"
         );
 
-        // IPv4-compatible ::10.0.0.1 (RFC1918 via deprecated form).
+        // IPv4-compatible mapping of an RFC1918 address (deprecated ::a.b.c.d form).
         let ipv4_compat_private = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 0x0001);
         assert!(
             is_blocked_ip(ipv4_compat_private.into()),
-            "::10.0.0.1 (IPv4-compatible) must be blocked"
+            "IPv4-compatible RFC1918 address must be blocked"
         );
 
         // IPv4 multicast 224.0.0.1.

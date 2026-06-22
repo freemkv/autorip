@@ -2253,8 +2253,8 @@ mod web_tests {
         );
         // Host with port.
         assert_eq!(
-            mask_webhook_url("http://jellyfin.lan:8096/webhook/abc"),
-            "http://jellyfin.lan:8096/********"
+            mask_webhook_url("http://jellyfin.example:8096/webhook/abc"),
+            "http://jellyfin.example:8096/********"
         );
         // Bare origin, no path → still origin/sentinel.
         assert_eq!(

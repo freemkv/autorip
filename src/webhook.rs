@@ -160,9 +160,9 @@ mod tests {
 
     #[test]
     fn webhook_url_origin_host_with_port() {
-        let url = "http://jellyfin.lan:8096/webhook/abc/SECRET";
+        let url = "http://jellyfin.example:8096/webhook/abc/SECRET";
         let origin = webhook_url_origin(url);
-        assert_eq!(origin, "http://jellyfin.lan:8096");
+        assert_eq!(origin, "http://jellyfin.example:8096");
         assert!(!origin.contains("SECRET"));
     }
 
