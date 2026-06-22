@@ -107,8 +107,12 @@ jobs:
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
-          cargo install cross --version 0.2.5
+          # Download the prebuilt cross binary (matches the freemkv workflow).
+          # `cargo install cross` fails here because the rust-toolchain action
+          # pins a target-only toolchain and building cross from source is both
+          # slow and flaky on the runner.
+          curl -sL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz | tar xz
+          sudo mv cross /usr/local/bin/
 
       # 0.18.13: dropped the redundant `cargo check --locked` step.
       # `cargo build --release` below does typechecking already; the
