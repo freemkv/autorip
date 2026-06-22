@@ -171,14 +171,26 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
         return ResumeClass::NotEligible;
     }
 
-    // Bad-bytes → estimated title-seconds. Use the same 8.25 Mbps
-    // fallback `rip_disc` uses when bitrate is unknown. This is a
-    // pre-flight estimate; the actor re-validates with the real
-    // title bitrate after `Disc::scan_image`.
-    let bad_bytes = stats.bytes_unreadable;
-    let lost_secs = bad_bytes as f64 / FALLBACK_BITRATE_BYTES_PER_SEC;
-    if lost_secs > abort_on_lost_secs as f64 {
-        return ResumeClass::NotEligible;
+    // Bad-bytes pre-filter. Two cases:
+    //
+    // abort_on_lost_secs == 0 ("perfect rip required"): using whole-disc
+    // bad bytes as the gate is too strict. A disc whose unreadable sectors
+    // are entirely OUTSIDE the main title is still a valid mux candidate —
+    // the authoritative per-title re-validation in `resume_remux` (which
+    // runs after `Disc::scan_image` and calls `bytes_bad_in_title`) will
+    // correctly allow it. Blocking here on whole-disc damage means that
+    // disc never reaches the title-scoped check. ALLOW and defer.
+    //
+    // abort_on_lost_secs > 0: apply the coarse whole-disc estimate as a
+    // cheap early-reject (avoids `scan_image` for heavily damaged discs).
+    // This is still a pre-flight estimate; the actor re-validates with the
+    // real per-title bitrate after `Disc::scan_image`.
+    if abort_on_lost_secs > 0 {
+        let bad_bytes = stats.bytes_unreadable;
+        let lost_secs = bad_bytes as f64 / FALLBACK_BITRATE_BYTES_PER_SEC;
+        if lost_secs > abort_on_lost_secs as f64 {
+            return ResumeClass::NotEligible;
+        }
     }
 
     // file_name() returns None only for a path ending in `..`. Defaulting to
@@ -669,6 +681,41 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             return;
         }
     };
+    // Compute sweep damage snapshot before `title` is moved into
+    // `build_iso_pipeline`. Re-derives all damage fields from the
+    // already-loaded mapfile so /api/state shows correct damage during
+    // a resumed mux. The mapfile holds the same Unreadable ranges that
+    // push_pass_state would have read at sweep end — re-reading them
+    // here is equivalent. `errors` mirrors push_pass_state's formula:
+    // bytes_unreadable / 2048. `main_lost_ms` uses `bytes_bad_in_title`
+    // scoped to the longest title.
+    let sweep_damage_for_resume = {
+        use libfreemkv::disc::mapfile::SectorStatus;
+        let (bad_ranges, num_bad_ranges, bad_ranges_truncated, total_lost_ms, largest_gap_ms) =
+            super::state::build_bad_ranges(&map, &title, title_bytes_per_sec);
+        let main_title_bad = map.ranges_with(&[SectorStatus::Unreadable]);
+        let main_title_bad_bytes = libfreemkv::disc::bytes_bad_in_title(&title, &main_title_bad);
+        let main_lost_ms = if title_bytes_per_sec > 0.0 {
+            main_title_bad_bytes as f64 * 1000.0 / title_bytes_per_sec
+        } else {
+            0.0
+        };
+        let errors = (map.stats().bytes_unreadable / 2048) as u32;
+        super::mux::SweepDamageSnapshot {
+            errors,
+            total_lost_ms,
+            main_lost_ms,
+            bad_ranges,
+            num_bad_ranges,
+            bad_ranges_truncated,
+            largest_gap_ms,
+        }
+    };
+
+    // Clone before move into MuxInputs so the done-state update below
+    // can carry sweep damage into the terminal RipState.
+    let done_sweep_damage = sweep_damage_for_resume.clone();
+
     let reader: Box<dyn libfreemkv::SectorSource> = Box::new(iso_reader_for_mux);
     // Resume path routes through the same `PipelinedPesStream`
     // highway as multipass mux — same 3-stage threaded pipeline,
@@ -786,11 +833,18 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             // + retries + mux); we match.
             total_passes: cfg_read.max_retries.saturating_add(2).max(2),
             bytes_total_disc: disc.capacity_bytes,
-            max_retries: 0,
-            bytes_unreadable_at_mux: 0,
+            // Pass the real max_retries and bytes_unreadable so that
+            // total_pct_byte_weight accounts for the already-completed sweep.
+            // Previously max_retries=0 caused the helper to return mux_pct
+            // directly (0→100%) — erasing the sweep's ~50% credit — so the
+            // progress bar started at 0% on every resumed rip even though all
+            // the sweep work was already done.
+            max_retries: cfg_read.max_retries,
+            bytes_unreadable_at_mux: map.stats().bytes_unreadable,
             dest_url,
             batch,
             staging_disc_dir: staging_dir.clone(),
+            sweep_damage: sweep_damage_for_resume,
         },
         input,
         super::mux::MuxAtomics {
@@ -826,6 +880,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // match (.review) HOLDS the rip for operator review instead of
     // auto-filing it under a guessed name. Unconditionally writing .done
     // here bypassed that hold for every resumed rip.
+    // Durability gate: fsync the finished MKV/M2TS before any success
+    // marker so a crash can't leave a "done" marker over a page-cache-only
+    // (on-disk-truncated) file. Skip network:// output (no local file).
+    if output_format != "network" || cfg_read.network_target.is_empty() {
+        staging::fsync_output_file(std::path::Path::new(&output_path));
+    }
     let marker_name = if title_confident { ".done" } else { ".review" };
     let done_marker = serde_json::json!({
         "title": display_name,
@@ -835,9 +895,15 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         "resumed": true,
     });
     let done_path = staging_dir.join(marker_name);
-    if let Err(e) = std::fs::write(
+    // Durable, atomic marker write (tmp + fsync + rename + staging-dir fsync).
+    // The dir-fsync is the crash barrier: it guarantees this hand-off marker
+    // is observed on disk before the later `.completed` write, so a crash can
+    // never strand `.completed` (terminal) without a durable `.done`.
+    if let Err(e) = staging::write_handoff_marker(
         &done_path,
-        serde_json::to_string_pretty(&done_marker).unwrap_or_default(),
+        serde_json::to_string_pretty(&done_marker)
+            .unwrap_or_default()
+            .as_bytes(),
     ) {
         // The hand-off marker is what the mover / review UI keys on. If it
         // fails to write (NFS / perms), do NOT write .completed or clear
@@ -886,6 +952,15 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             progress_pct: 100,
             output_file: staging_str,
             duration,
+            // Carry sweep damage so the done card reflects real damage
+            // instead of showing a clean result for a damaged rip.
+            errors: done_sweep_damage.errors,
+            total_lost_ms: done_sweep_damage.total_lost_ms,
+            main_lost_ms: done_sweep_damage.main_lost_ms,
+            bad_ranges: done_sweep_damage.bad_ranges.clone(),
+            num_bad_ranges: done_sweep_damage.num_bad_ranges,
+            bad_ranges_truncated: done_sweep_damage.bad_ranges_truncated,
+            largest_gap_ms: done_sweep_damage.largest_gap_ms,
             ..Default::default()
         },
     );
@@ -1065,5 +1140,101 @@ mod find_iso_tests {
         let d = tmpdir();
         fs::write(d.join("Movie.iso"), b"x").unwrap();
         assert!(find_iso_and_mapfile(&d).is_none());
+    }
+}
+
+#[cfg(test)]
+mod sweep_damage_marker_tests {
+    /// Regression: resume_remux previously passed SweepDamageSnapshot::default()
+    /// (all zeros) so a resumed mux showed zero damage even when the original
+    /// sweep had bad sectors.
+    ///
+    /// Fix: RippedMarker gained sweep_* fields (serde-defaulted for back-compat)
+    /// populated at hand-off time. This test verifies round-trip: a marker with
+    /// non-zero sweep_* fields serializes and deserializes correctly, and the
+    /// resulting values are what remux_from_ripped_marker would carry into
+    /// SweepDamageSnapshot.
+    #[test]
+    fn ripped_marker_sweep_fields_round_trip() {
+        let marker = crate::muxer::RippedMarker {
+            schema_version: crate::muxer::RIPPED_MARKER_SCHEMA,
+            iso_path: "/staging/Foo/Foo.iso".into(),
+            mapfile_path: "/staging/Foo/Foo.iso.mapfile".into(),
+            display_name: "Foo".into(),
+            disc_format: "uhd".into(),
+            mkv_filename: "Foo.mkv".into(),
+            tmdb_title: "Foo".into(),
+            tmdb_year: 2024,
+            tmdb_poster: String::new(),
+            tmdb_overview: String::new(),
+            max_retries: 3,
+            abort_on_lost_secs: 0,
+            rip_elapsed_secs: 0.0,
+            rip_errors: 0,
+            rip_lost_video_secs: 1.23,
+            rip_last_sector: 0,
+            origin_device: "sg0".into(),
+            sweep_errors: 77,
+            sweep_total_lost_ms: 2500.0,
+            sweep_main_lost_ms: 1200.0,
+            sweep_num_bad_ranges: 5,
+            sweep_largest_gap_ms: 900.0,
+        };
+
+        // Serialize then deserialize (mirrors write_marker / read_marker).
+        let json = serde_json::to_string(&marker).expect("serialize");
+        let back: crate::muxer::RippedMarker = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.sweep_errors, 77);
+        assert!((back.sweep_total_lost_ms - 2500.0).abs() < 0.001);
+        assert!((back.sweep_main_lost_ms - 1200.0).abs() < 0.001);
+        assert_eq!(back.sweep_num_bad_ranges, 5);
+        assert!((back.sweep_largest_gap_ms - 900.0).abs() < 0.001);
+    }
+
+    /// Backward-compat: a marker JSON without sweep_* fields (pre-v0.25.12)
+    /// must deserialize successfully with sweep_* defaulting to zero.
+    #[test]
+    fn ripped_marker_missing_sweep_fields_default_to_zero() {
+        // JSON without any sweep_* keys — simulates an old marker on disk.
+        let json = r#"{
+            "schema_version": 1,
+            "iso_path": "/staging/Bar/Bar.iso",
+            "mapfile_path": "/staging/Bar/Bar.iso.mapfile",
+            "display_name": "Bar",
+            "disc_format": "bluray",
+            "mkv_filename": "Bar.mkv",
+            "tmdb_title": "Bar",
+            "tmdb_year": 2020,
+            "tmdb_poster": "",
+            "tmdb_overview": "",
+            "max_retries": 5,
+            "abort_on_lost_secs": 30,
+            "rip_elapsed_secs": 0.0,
+            "rip_errors": 0,
+            "rip_lost_video_secs": 0.0,
+            "rip_last_sector": 0,
+            "origin_device": "sg0"
+        }"#;
+        let marker: crate::muxer::RippedMarker =
+            serde_json::from_str(json).expect("old marker must deserialize");
+        // schema_version check is done by read_marker, not serde; skip it here.
+        assert_eq!(marker.sweep_errors, 0, "missing field must default to 0");
+        assert_eq!(
+            marker.sweep_total_lost_ms, 0.0,
+            "missing field must default to 0.0"
+        );
+        assert_eq!(
+            marker.sweep_main_lost_ms, 0.0,
+            "missing field must default to 0.0"
+        );
+        assert_eq!(
+            marker.sweep_num_bad_ranges, 0,
+            "missing field must default to 0"
+        );
+        assert_eq!(
+            marker.sweep_largest_gap_ms, 0.0,
+            "missing field must default to 0.0"
+        );
     }
 }

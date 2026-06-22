@@ -38,16 +38,20 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                || v4.is_multicast()
                 || v4.octets()[0] == 0 // 0.0.0.0/8
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64) // 100.64/10 CGNAT
-                || v4.octets()[0] >= 240 // 240.0.0.0/4 reserved
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40) // 100.64/10 CGNAT
+                || v4.octets()[0] >= 240 // 240.0.0.0/4 Class-E reserved
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                 || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-                || v6.to_ipv4_mapped().map(IpAddr::V4).is_some_and(is_blocked_ip)
+                // to_ipv4() catches both ::ffff:a.b.c.d (mapped) AND ::a.b.c.d
+                // (compatible); to_ipv4_mapped() misses the deprecated :: form.
+                || v6.to_ipv4().map(|v4| is_blocked_ip(IpAddr::V4(v4))).unwrap_or(false)
         }
     }
 }
@@ -170,7 +174,10 @@ pub fn drive_scan_opts_for_keydb(keydb: &Path) -> libfreemkv::ScanOptions {
     let host_certs = KeydbSource::new(keydb).host_certs();
     let credentials =
         (!host_certs.is_empty()).then_some(libfreemkv::DriveCredentials { host_certs });
-    libfreemkv::ScanOptions { credentials }
+    libfreemkv::ScanOptions {
+        credentials,
+        ..Default::default()
+    }
 }
 
 /// ScanOptions for an **ISO** structure scan — no handshake, no credentials.
@@ -204,7 +211,7 @@ pub fn build_sources(cfg: &Config, mapfile: Option<&Path>) -> Vec<Box<dyn KeySou
             Err(e) => {
                 tracing::error!(
                     phase = "key_resolve",
-                    url = %cfg.keyserver_url,
+                    url_origin = %crate::webhook::webhook_url_origin(&cfg.keyserver_url),
                     "keyserver URL rejected (SSRF guard): {e} — online key source disabled for this rip"
                 );
             }
@@ -443,6 +450,63 @@ mod tests {
         assert!(!is_blocked_ip(Ipv4Addr::new(8, 8, 8, 8).into()));
         assert!(!is_blocked_ip(Ipv4Addr::new(1, 1, 1, 1).into()));
         assert!(is_blocked_ip(Ipv6Addr::LOCALHOST.into()));
+        assert!(!is_blocked_ip(
+            "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap().into()
+        ));
+    }
+
+    /// Regression: to_ipv4_mapped() missed the deprecated IPv4-compatible form
+    /// (::a.b.c.d) and both v4+v6 multicast and Class-E were absent.
+    /// These must all be blocked — divergence from web.rs's is_blocked_ip is
+    /// a SSRF middle-layer gap.
+    #[test]
+    fn ssrf_classifier_ipv4_compat_multicast_class_e() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        // IPv4-compatible ::127.0.0.1 (deprecated form, segments 0:0:0:0:0:0:7f00:1).
+        // to_ipv4_mapped() returns None for this; to_ipv4() returns Some(127.0.0.1).
+        let ipv4_compat_loopback = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001);
+        assert!(
+            is_blocked_ip(ipv4_compat_loopback.into()),
+            "::127.0.0.1 (IPv4-compatible) must be blocked"
+        );
+
+        // IPv4-compatible ::10.0.0.1 (RFC1918 via deprecated form).
+        let ipv4_compat_private = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 0x0001);
+        assert!(
+            is_blocked_ip(ipv4_compat_private.into()),
+            "::10.0.0.1 (IPv4-compatible) must be blocked"
+        );
+
+        // IPv4 multicast 224.0.0.1.
+        assert!(
+            is_blocked_ip(Ipv4Addr::new(224, 0, 0, 1).into()),
+            "IPv4 multicast must be blocked"
+        );
+        // IPv4 multicast 239.255.255.255 (upper boundary).
+        assert!(
+            is_blocked_ip(Ipv4Addr::new(239, 255, 255, 255).into()),
+            "IPv4 multicast upper boundary must be blocked"
+        );
+
+        // IPv6 multicast ff02::1.
+        assert!(
+            is_blocked_ip(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1).into()),
+            "IPv6 multicast must be blocked"
+        );
+
+        // Class-E 240.0.0.0/4 (reserved, not public).
+        assert!(
+            is_blocked_ip(Ipv4Addr::new(240, 0, 0, 1).into()),
+            "Class-E 240.0.0.1 must be blocked"
+        );
+        assert!(
+            is_blocked_ip(Ipv4Addr::new(255, 255, 255, 254).into()),
+            "Class-E 255.255.255.254 must be blocked"
+        );
+
+        // Sanity: public addresses must still be allowed.
+        assert!(!is_blocked_ip(Ipv4Addr::new(8, 8, 8, 8).into()));
         assert!(!is_blocked_ip(
             "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap().into()
         ));

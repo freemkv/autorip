@@ -357,6 +357,34 @@ pub fn update_state_with<F: FnOnce(&mut RipState)>(device: &str, f: F) {
     entry.damage_severity = damage_severity_for(entry.errors, entry.total_lost_ms);
 }
 
+/// Atomically claim a device for active work. If it is already
+/// `scanning`/`ripping`, returns `false` (the caller should reject with 409);
+/// otherwise marks it `scanning` and returns `true`.
+///
+/// Folding the busy-check and the status-set into ONE `STATE` lock closes a
+/// TOCTOU: the web handlers previously did a separate `is_busy`-style check and
+/// then a separate `update_state`, so two concurrent POSTs could both observe
+/// `idle` and both launch a rip on the same device (orphaned halt token +
+/// concurrent writes to one staging dir). Poison-recovers like the rest of this
+/// module. The caller may follow with a full `update_state` to populate the
+/// remaining fields — the claim has already made the device read as busy.
+pub fn try_claim_active(device: &str) -> bool {
+    let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if s.get(device)
+        .map(|r| r.status == "scanning" || r.status == "ripping")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let entry = s.entry(device.to_string()).or_insert_with(|| RipState {
+        device: device.to_string(),
+        ..Default::default()
+    });
+    entry.status = "scanning".to_string();
+    entry.disc_present = true;
+    true
+}
+
 /// Shared context for the progress callbacks of a multi-pass rip. Built once
 /// before pass 1, cheaply Arc-cloned per pass so each closure captures the
 /// same immutable values without reallocating every callback.
@@ -419,7 +447,7 @@ fn range_chapter(lba: u32, title: &libfreemkv::DiscTitle) -> (Option<u32>, Optio
 
 /// Build the UI's bad-range list from the mapfile. Caps at 50 entries by size
 /// (largest first); returns the truncation count so the UI can say "+X more".
-pub(super) fn build_bad_ranges(
+pub(crate) fn build_bad_ranges(
     map: &libfreemkv::disc::mapfile::Mapfile,
     title: &libfreemkv::DiscTitle,
     bps: f64,
@@ -961,34 +989,37 @@ pub(super) fn set_pass_progress(
     } else {
         0
     };
-    update_state(
-        &ctx.device,
-        RipState {
-            device: ctx.device.clone(),
-            status: "ripping".to_string(),
-            disc_present: true,
-            disc_name: ctx.display_name.clone(),
-            disc_format: ctx.disc_format.clone(),
-            progress_pct: pct,
-            progress_gb: bytes_good as f64 / 1_073_741_824.0,
-            output_file: ctx.filename.clone(),
-            tmdb_title: ctx.tmdb_title.clone(),
-            tmdb_year: ctx.tmdb_year,
-            tmdb_poster: ctx.tmdb_poster.clone(),
-            tmdb_overview: ctx.tmdb_overview.clone(),
-            duration: ctx.duration.clone(),
-            codecs: ctx.codecs.clone(),
-            pass,
-            total_passes,
-            bytes_good,
-            bytes_maybe,
-            bytes_lost,
-            bytes_total_disc: ctx.bytes_total_disc,
-            preferred_batch: ctx.batch,
-            current_batch: ctx.batch,
-            ..Default::default()
-        },
-    );
+    // Use update_state_with instead of a full RipState replacement so that
+    // the pass-independent fields (pass_progress_pct, total_progress_*,
+    // errors, total_lost_ms, bad_ranges, etc.) are preserved across the
+    // pass boundary. A full RipState with ..Default::default() would zero
+    // those fields, causing the UI progress bars to visibly drop to 0 at
+    // the start of each new pass. Only the fields that reflect the new
+    // pass's initial state are updated here; push_pass_state callbacks
+    // will update progress / ETA once the pass is running.
+    update_state_with(&ctx.device, |s| {
+        s.status = "ripping".to_string();
+        s.disc_present = true;
+        s.disc_name = ctx.display_name.clone();
+        s.disc_format = ctx.disc_format.clone();
+        s.progress_pct = pct;
+        s.progress_gb = bytes_good as f64 / 1_073_741_824.0;
+        s.output_file = ctx.filename.clone();
+        s.tmdb_title = ctx.tmdb_title.clone();
+        s.tmdb_year = ctx.tmdb_year;
+        s.tmdb_poster = ctx.tmdb_poster.clone();
+        s.tmdb_overview = ctx.tmdb_overview.clone();
+        s.duration = ctx.duration.clone();
+        s.codecs = ctx.codecs.clone();
+        s.pass = pass;
+        s.total_passes = total_passes;
+        s.bytes_good = bytes_good;
+        s.bytes_maybe = bytes_maybe;
+        s.bytes_lost = bytes_lost;
+        s.bytes_total_disc = ctx.bytes_total_disc;
+        s.preferred_batch = ctx.batch;
+        s.current_batch = ctx.batch;
+    });
 }
 
 #[cfg(test)]
@@ -1443,6 +1474,153 @@ mod tests {
         assert_eq!(snap.preferred_batch, 60, "preferred_batch wiped");
         assert_eq!(snap.progress_pct, 42, "new field not applied");
         assert_eq!(snap.status, "ripping", "new field not applied");
+    }
+
+    fn minimal_pass_ctx(device: &str) -> PassContext {
+        PassContext {
+            device: device.to_string(),
+            display_name: "Test Disc".to_string(),
+            disc_format: "uhd".to_string(),
+            tmdb_title: String::new(),
+            tmdb_year: 0,
+            tmdb_poster: String::new(),
+            tmdb_overview: String::new(),
+            duration: String::new(),
+            codecs: String::new(),
+            filename: "test.mkv".to_string(),
+            bytes_total_disc: 50 * 1_073_741_824, // 50 GB
+            batch: 32,
+            max_retries: 5,
+        }
+    }
+
+    /// Regression: set_pass_progress must not zero total_progress_pct /
+    /// total_progress_eta that were set by a previous pass's push_pass_state.
+    /// Before the fix, the `..Default::default()` in the full RipState
+    /// replacement zeroed those fields at the start of every new pass, causing
+    /// the UI total-progress bar to visibly drop to 0 between passes.
+    #[test]
+    fn set_pass_progress_preserves_total_progress_fields() {
+        let dev = format!("test-spp-preserve-{}", std::process::id());
+        // Simulate what push_pass_state would have written at the end of Pass 1.
+        update_state_with(&dev, |s| {
+            s.status = "ripping".to_string();
+            s.total_progress_pct = 48;
+            s.total_eta = "1:30:00".to_string();
+            s.pass_progress_pct = 100;
+            s.errors = 12;
+            s.total_lost_ms = 500.0;
+        });
+        // Now call set_pass_progress as it is at the start of Pass 2.
+        let ctx = minimal_pass_ctx(&dev);
+        set_pass_progress(
+            &ctx,
+            2,                  // pass
+            7,                  // total_passes
+            40 * 1_073_741_824, // bytes_good
+            1_048_576,          // bytes_maybe
+            2048,               // bytes_lost
+        );
+        let snap = STATE
+            .lock()
+            .unwrap()
+            .get(&dev)
+            .cloned()
+            .expect("entry must exist");
+        // These fields must survive the pass-boundary update.
+        assert_eq!(
+            snap.total_progress_pct, 48,
+            "total_progress_pct must not be zeroed by set_pass_progress"
+        );
+        assert_eq!(
+            snap.total_eta, "1:30:00",
+            "total_eta must not be cleared by set_pass_progress"
+        );
+        // pass-specific fields are updated to the new pass.
+        assert_eq!(snap.pass, 2, "pass not updated");
+        assert_eq!(snap.total_passes, 7, "total_passes not updated");
+        // damage fields must also survive (were written by push_pass_state).
+        assert_eq!(
+            snap.errors, 12,
+            "errors must not be zeroed by set_pass_progress"
+        );
+        assert!(
+            (snap.total_lost_ms - 500.0).abs() < 0.001,
+            "total_lost_ms must not be zeroed by set_pass_progress"
+        );
+    }
+
+    /// Regression: the post-promotion damage snapshot pushed via
+    /// update_state_with must reflect the final Unreadable sectors
+    /// (NonTrimmed promoted → Unreadable) and produce non-zero damage
+    /// fields.  This guards the build_bad_ranges + update_state_with
+    /// pattern used in mod.rs after the promotion+flush block.
+    #[test]
+    fn post_promotion_damage_push_is_non_zero_for_damaged_rip() {
+        let dev = format!("test-promo-damage-{}", std::process::id());
+        // Start with a "clean" state — as push_pass_state would leave it
+        // if the last pass saw everything as NonTrimmed (not yet promoted).
+        update_state_with(&dev, |s| {
+            s.errors = 0;
+            s.total_lost_ms = 0.0;
+            s.bad_ranges = vec![];
+            s.num_bad_ranges = 0;
+        });
+        // Build a mapfile with some Unreadable sectors (as if promotion
+        // already ran and converted NonTrimmed → Unreadable). Total must
+        // cover the highest byte position we record at: sector 30050 ×
+        // 2048 = 61,542,400 bytes → round up to 100,000 sectors × 2048.
+        let total_bytes = 100_000u64 * 2048;
+        let (_dir, mut map) = tmp_map("promo-damage", total_bytes);
+        // Record two separate Unreadable ranges (by byte position).
+        map.record(5_000 * 2048, 200 * 2048, SectorStatus::Unreadable)
+            .unwrap();
+        map.record(30_000 * 2048, 50 * 2048, SectorStatus::Unreadable)
+            .unwrap();
+        let title = minimal_title();
+        let bps = 40_000.0 * 2048.0; // 40k sectors/s
+
+        // Mirror the fix: re-derive damage from the promoted map and push.
+        let (bad_ranges, num_bad, truncated, total_lost_ms, largest_gap_ms) =
+            build_bad_ranges(&map, &title, bps);
+        let main_title_bad = map.ranges_with(&[SectorStatus::Unreadable]);
+        let main_bad_bytes = libfreemkv::disc::bytes_bad_in_title(&title, &main_title_bad);
+        let main_lost_ms = if bps > 0.0 {
+            main_bad_bytes as f64 * 1000.0 / bps
+        } else {
+            0.0
+        };
+        let errors = (map.stats().bytes_unreadable / 2048) as u32;
+        update_state_with(&dev, |s| {
+            s.errors = errors;
+            s.total_lost_ms = total_lost_ms;
+            s.main_lost_ms = main_lost_ms;
+            s.bad_ranges = bad_ranges;
+            s.num_bad_ranges = num_bad;
+            s.bad_ranges_truncated = truncated;
+            s.largest_gap_ms = largest_gap_ms;
+        });
+
+        let snap = STATE
+            .lock()
+            .unwrap()
+            .get(&dev)
+            .cloned()
+            .expect("entry must exist");
+        // The marker_damage read from STATE must see non-zero damage.
+        assert_eq!(
+            snap.errors, 250,
+            "errors must reflect promoted unreadable sectors"
+        );
+        assert!(
+            snap.total_lost_ms > 0.0,
+            "total_lost_ms must be non-zero after promotion push"
+        );
+        assert_eq!(
+            snap.num_bad_ranges, 2,
+            "num_bad_ranges must reflect both unreadable ranges"
+        );
+        assert!(snap.largest_gap_ms > 0.0, "largest_gap_ms must be non-zero");
     }
 
     #[test]

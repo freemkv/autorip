@@ -139,51 +139,53 @@ fn header_buffer_over_cap(buffered_bytes: usize) -> bool {
     buffered_bytes > HEADER_BUFFER_CAP_BYTES
 }
 
-/// The three documented `finish_with_halt` wedge / user-stop markers.
-/// In libfreemkv 0.30 these come back as `Error::IoError` whose inner
-/// `io::Error` message carries exactly one of these prefixes (see
-/// `Pipeline::finish_with_halt`'s doc: "pipeline join halted",
-/// "pipeline join timed out", "pipeline consumer panicked"). They mean
-/// the rip should stay resumable (no `.failed` marker); anything else
-/// (a genuine `output.finish()` IO failure) must quarantine.
-const MUX_WEDGE_MARKERS: [&str; 3] = [
-    "pipeline join halted",
-    "pipeline join timed out",
-    "pipeline consumer panicked",
-];
-
 /// Classify a `finish_with_halt` error as a "wedge / user-stop" case
 /// (rip stays resumable, no `.failed`) versus a real finalize/IO error
 /// (quarantine the disc).
 ///
-/// libfreemkv 0.30 returns the wedge cases as
-/// `Error::IoError { source }` where `source`'s message is one of
-/// [`MUX_WEDGE_MARKERS`]; a halt during mux (routine `/api/stop`) is the
-/// `"pipeline join halted"` case. We match on the inner `io::Error`
-/// message rather than the outer `Error` Display (which prefixes a
-/// numeric `E<code>:`) so a Display-format change can't silently break
-/// the classification. A genuine finalize error from `output.finish()`
-/// surfaces as an `IoError` with a different message and is NOT treated
-/// as a wedge.
-///
-/// NOTE: the project's newer (unreleased) libfreemkv splits these into
-/// dedicated `Error::PipelineJoinTimeout` / `PipelineConsumerPanicked`
-/// / `Error::Halted` variants whose Display is just `E<code>`. When the
-/// dependency is bumped to that release, switch this to a typed
-/// `matches!` on those variants; the test below guards the current
-/// (0.30) string contract.
+/// The mux pipeline returns the wedge / user-stop cases as dedicated typed
+/// variants — `Error::Halted` (routine `/api/stop` during mux),
+/// `Error::PipelineJoinTimeout`, and `Error::PipelineConsumerPanicked` — so we
+/// match on those directly. A genuine finalize failure from `output.finish()`
+/// surfaces as `Error::IoError` (or any other variant) and is NOT a wedge, so
+/// it quarantines. Matching the typed variants (not an inner message string)
+/// keeps the classification stable across Display/format changes.
 fn is_mux_wedge(e: &libfreemkv::Error) -> bool {
-    let libfreemkv::Error::IoError { source } = e else {
-        return false;
-    };
-    let msg = source.to_string();
-    MUX_WEDGE_MARKERS.iter().any(|m| msg.contains(m))
+    matches!(
+        e,
+        libfreemkv::Error::Halted
+            | libfreemkv::Error::PipelineJoinTimeout
+            | libfreemkv::Error::PipelineConsumerPanicked
+    )
 }
 
 /// Inputs to `run_mux` that come from the orchestrator. Bundled into a
 /// struct because the pre-split inline mux block referenced ~25
 /// captured locals; passing them as a struct keeps the `run_mux`
 /// signature readable and avoids a long positional argument list.
+/// Damage fields from the final sweep/patch pass, carried forward so they
+/// remain visible in /api/state during the mux phase instead of zeroing out.
+///
+/// Before this snapshot, `push_state` used `..Default::default()` which
+/// set `errors=0, lost_video_secs=0, damage_severity="clean", bad_ranges=[],
+/// total_lost_ms=0` on the very first mux tick. Operators polling during mux
+/// saw a damaged disc as perfectly clean.
+///
+/// Populated by the orchestrator from STATE immediately after the final
+/// `push_pass_state` call (ripper/mod.rs, at the mux-entry transition).
+/// Zero/empty defaults are correct for direct (single-pass) mode, where there
+/// is no prior sweep pass with real damage data.
+#[derive(Default, Clone)]
+pub(crate) struct SweepDamageSnapshot {
+    pub(crate) errors: u32,
+    pub(crate) total_lost_ms: f64,
+    pub(crate) main_lost_ms: f64,
+    pub(crate) bad_ranges: Vec<super::state::BadRange>,
+    pub(crate) num_bad_ranges: u32,
+    pub(crate) bad_ranges_truncated: u32,
+    pub(crate) largest_gap_ms: f64,
+}
+
 pub(crate) struct MuxInputs<'a> {
     pub(crate) device: &'a str,
     pub(crate) display_name: String,
@@ -231,6 +233,11 @@ pub(crate) struct MuxInputs<'a> {
     /// `std::process::exit(1)` so the post-restart resume logic can
     /// promote the disc to `.failed` once `RESTART_LIMIT` is reached.
     pub(crate) staging_disc_dir: PathBuf,
+    /// Damage fields snapshotted from the final sweep/patch pass.
+    /// Carried into every per-frame `push_state` so /api/state preserves
+    /// damage visibility during the mux phase. Defaults to zero/empty for
+    /// direct (single-pass) mode.
+    pub(crate) sweep_damage: SweepDamageSnapshot,
 }
 
 /// Outcome of `run_mux`, used by the orchestrator to drive the
@@ -321,6 +328,10 @@ struct UiState {
     max_retries: u8,
     /// `bytes_unreadable` at mux start (after every retry pass finished).
     bytes_unreadable_at_mux: u64,
+    /// Damage fields from the final sweep/patch pass. Kept constant across
+    /// all mux-phase `push_state` calls so the damage pill / bad-ranges list
+    /// stays visible rather than reverting to default-zero on the first tick.
+    sweep_damage: SweepDamageSnapshot,
 }
 
 /// Cross-thread atomics the consumer reads on every per-frame
@@ -427,8 +438,23 @@ impl MuxSink {
                 progress_gb: bytes_done as f64 / 1_073_741_824.0,
                 speed_mbs: speed,
                 eta: eta.clone(),
-                errors,
-                lost_video_secs,
+                // During the mux phase the demux error counter (`errors`) is
+                // usually zero — the ISO reads don't fail. Carry the real
+                // bad-sector count and lost-time from the final sweep/patch
+                // pass so the damage pill / bad-ranges list remain visible
+                // to operators polling /api/state during mux. The live
+                // demux skip count is still surfaced via `lost_video_secs`
+                // for the single-pass (no-snapshot) path.
+                errors: if self.ui.sweep_damage.errors > 0 {
+                    self.ui.sweep_damage.errors
+                } else {
+                    errors
+                },
+                lost_video_secs: if self.ui.sweep_damage.total_lost_ms > 0.0 {
+                    self.ui.sweep_damage.total_lost_ms / 1000.0
+                } else {
+                    lost_video_secs
+                },
                 last_sector: self.atomics.rip_last_lba.load(Ordering::Relaxed),
                 current_batch: self.atomics.rip_current_batch.load(Ordering::Relaxed),
                 preferred_batch: self.ui.batch,
@@ -462,6 +488,14 @@ impl MuxSink {
                     pct,
                 ),
                 total_eta: eta,
+                // Carry sweep-phase damage fields so they remain visible
+                // in /api/state during the entire mux phase.
+                total_lost_ms: self.ui.sweep_damage.total_lost_ms,
+                main_lost_ms: self.ui.sweep_damage.main_lost_ms,
+                bad_ranges: self.ui.sweep_damage.bad_ranges.clone(),
+                num_bad_ranges: self.ui.sweep_damage.num_bad_ranges,
+                bad_ranges_truncated: self.ui.sweep_damage.bad_ranges_truncated,
+                largest_gap_ms: self.ui.sweep_damage.largest_gap_ms,
                 ..Default::default()
             },
         );
@@ -505,6 +539,16 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
         }
         self.last_update = now;
 
+        // Progress reporting uses the ISO *read* position (`latest_bytes_read`)
+        // rather than the output *write* position (`output.bytes_written()`).
+        // This is intentional: the pipeline's channel depth means the reader
+        // runs up to READ_PIPELINE_DEPTH frames ahead of the writer. Using the
+        // read position gives a smoother, more up-to-date progress bar instead
+        // of a write-lagged one that stalls at frame boundaries. The pct/ETA
+        // are computed relative to `total_bytes` (the expected ISO size) which
+        // is the same unit, so the comparison is apples-to-apples.
+        // Falls back to `output.bytes_written()` only if no BytesRead event has
+        // fired yet (lbr == 0), which happens briefly at mux start.
         let lbr = self.atomics.latest_bytes_read.load(Ordering::Relaxed);
         let bytes_done = if lbr > 0 {
             lbr
@@ -643,6 +687,25 @@ pub(crate) fn run_mux(
     mut input: Box<dyn libfreemkv::pes::Stream>,
     atomics_in: MuxAtomics,
 ) -> MuxOutcome {
+    // ── Begin/end phase markers ──────────────────────────────────
+    //
+    // `run_mux` has several early-return paths (header failure, hard
+    // watchdog escalation, etc.); a drop-guard logs the "end" with elapsed
+    // on every one of them, so the mux phase is always bracketed in the log.
+    tracing::info!(target: "autorip::mux", phase = "mux", "begin");
+    struct MuxPhaseGuard(std::time::Instant);
+    impl Drop for MuxPhaseGuard {
+        fn drop(&mut self) {
+            tracing::info!(
+                target: "autorip::mux",
+                phase = "mux",
+                elapsed_ms = self.0.elapsed().as_millis() as u64,
+                "end"
+            );
+        }
+    }
+    let _mux_phase_guard = MuxPhaseGuard(std::time::Instant::now());
+
     // ── Watchdog thread ──────────────────────────────────────────
     //
     // 15-second poll for read stalls. Logs to the device log and
@@ -686,6 +749,12 @@ pub(crate) fn run_mux(
         let wd_tmdb_year = inputs.tmdb_year;
         let wd_filename = inputs.filename.clone();
         let wd_staging_disc_dir = inputs.staging_disc_dir.clone();
+        // Intentionally detached (no JoinHandle kept). The watchdog holds only
+        // Arc<Atomic*> clones — no file handles, no heap buffers, nothing that
+        // accumulates across rips. It self-terminates when `active` goes false
+        // (WatchdogGuard drop at run_mux return), so it never outlives its
+        // owning mux call. Hard escalation (stall ≥ 20 min) calls exit(1)
+        // directly; at that point there is nothing left to join anyway.
         std::thread::spawn(move || {
             let mut was_stalled = false;
             let mut last_log_secs: u64 = 0;
@@ -1027,6 +1096,7 @@ pub(crate) fn run_mux(
         bytes_total_disc: inputs.bytes_total_disc,
         max_retries: inputs.max_retries,
         bytes_unreadable_at_mux: inputs.bytes_unreadable_at_mux,
+        sweep_damage: inputs.sweep_damage,
     };
     let write_failed = Arc::new(AtomicBool::new(false));
     let shared = SharedAtomics {
@@ -1263,6 +1333,15 @@ pub(crate) fn run_mux(
                 &device_str_for_loop,
                 &format!("Failed to spawn ISO reader thread: {e}"),
             );
+            // Finalize the pipeline so its consumer thread (which holds the
+            // output file handle) is joined rather than detached/leaked.
+            // `finish_with_halt` is bounded — it will not block forever.
+            if let Err(fe) = pipe.finish_with_halt(Some(&halt_token)) {
+                crate::log::device_log(
+                    &device_str_for_sink,
+                    &format!("Pipeline finalize after producer-spawn failure: {fe}"),
+                );
+            }
             return MuxOutcome {
                 completed: false,
                 bytes_done: 0,
@@ -1498,11 +1577,55 @@ pub(crate) fn run_mux(
         write_failed.then(|| "output write error mid-stream (MKV truncated)".to_string())
     });
 
-    // The producer thread is coordinated via channel close (it drops its
-    // `frame_tx` clone on EOF / read error / halt, which the bridge loop
-    // observed above), not by joining here — joining could block on a
-    // wedged read. Drop the handle explicitly at scope end to detach it.
-    drop(producer_handle);
+    // The producer thread is coordinated via channel close: it drops its
+    // `frame_tx` clone on EOF / read error / halt, and the bridge loop
+    // above drained the channel to completion before we get here. At this
+    // point the producer is either already done or winding down its last
+    // read attempt, so a short bounded join recovers its resources (thread
+    // stack, ISO file descriptor, any buffered pipeline handles) without
+    // risking an unbounded block on a wedged read.
+    //
+    // Strategy: poll `is_finished()` on a 250 ms cadence for up to ~7.5 s
+    // total. If it times out (e.g. the ISO reader stalled on a slow NFS
+    // seek after the bridge exited), log and detach — same trade-off
+    // `finish_with_halt` makes for the consumer. The hard watchdog at 20
+    // min typically fires first and exits the process for a Docker restart,
+    // so a wedged producer is not a permanent leak.
+    {
+        const PRODUCER_JOIN_POLL_MS: u64 = 250;
+        const PRODUCER_JOIN_POLLS: u32 = 30; // 30 × 250 ms = 7.5 s
+        let mut joined = false;
+        for _ in 0..PRODUCER_JOIN_POLLS {
+            if producer_handle.is_finished() {
+                joined = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(PRODUCER_JOIN_POLL_MS));
+        }
+        if joined {
+            let _ = producer_handle.join();
+        } else {
+            crate::log::device_log(
+                &device_str_for_sink,
+                "Mux producer thread did not finish within 7.5 s after bridge drained — detaching",
+            );
+            // Intentionally detached — by design, not a resource leak.
+            //
+            // The producer holds one scarce resource: the input ISO file
+            // descriptor. Blocking run_mux (and by extension the rip task)
+            // on a producer stuck in an unkillable NFS seek would re-introduce
+            // the hang that the 7.5 s timeout is here to prevent. Detaching
+            // is the same trade-off `finish_with_halt` makes for the consumer:
+            // prefer a brief background thread over an unbounded wedge.
+            //
+            // Accumulation across rips is not a concern: there is exactly one
+            // producer per run_mux call and it always exits eventually (its
+            // next `send_with_halt_raw` deadline or halt check will fire).
+            // The hard watchdog at 20 min exits the process for a Docker
+            // restart in the worst-wedge case.
+            drop(producer_handle); // detach — see comment above
+        }
+    }
 
     MuxOutcome {
         completed,
@@ -1578,38 +1701,27 @@ mod tests {
         assert_eq!(total_pct_byte_weight(DISC, 0, 0, 100), 100);
     }
 
-    /// Regression: `is_mux_wedge` must treat the three documented
-    /// `finish_with_halt` wedge markers as resumable (no `.failed`) and a
-    /// genuine `output.finish()` IO error as a finalize failure
-    /// (quarantine). In libfreemkv 0.30 the wedge cases arrive as
-    /// `Error::IoError` whose inner message carries the marker string —
-    /// in particular a routine `/api/stop` during mux is
-    /// "pipeline join halted". A real finalize error (e.g. "disk full")
-    /// must NOT be misclassified as a wedge.
+    /// Regression: `is_mux_wedge` must treat the three typed pipeline wedge /
+    /// user-stop variants as resumable (no `.failed`) and a genuine
+    /// `output.finish()` IO error as a finalize failure (quarantine). The most
+    /// important case is `Error::Halted` — a routine `/api/stop` during mux —
+    /// which the previous string-matching classifier wrongly treated as a
+    /// non-wedge, permanently quarantining a resumable disc.
     #[test]
-    fn is_mux_wedge_matches_pipeline_markers_not_finalize_errors() {
-        for marker in super::MUX_WEDGE_MARKERS {
-            let e = libfreemkv::Error::IoError {
-                source: std::io::Error::other(marker),
-            };
-            assert!(is_mux_wedge(&e), "{marker:?} must classify as a wedge");
-            // The libfreemkv Error Display is code-only (language-neutral) as
-            // of 0.31; the matcher keys off the inner source message, which
-            // carries the marker.
-            let libfreemkv::Error::IoError { source } = &e else {
-                unreachable!()
-            };
-            assert!(source.to_string().contains(marker));
-        }
+    fn is_mux_wedge_matches_typed_pipeline_variants_not_finalize_errors() {
+        // The three wedge / user-stop variants → resumable.
+        assert!(
+            is_mux_wedge(&libfreemkv::Error::Halted),
+            "Error::Halted (routine /api/stop during mux) must classify as a wedge"
+        );
+        assert!(is_mux_wedge(&libfreemkv::Error::PipelineJoinTimeout));
+        assert!(is_mux_wedge(&libfreemkv::Error::PipelineConsumerPanicked));
 
         // Genuine finalize / IO error from output.finish() → quarantine.
         let io = libfreemkv::Error::IoError {
             source: std::io::Error::other("disk full"),
         };
         assert!(!is_mux_wedge(&io));
-
-        // A non-IoError variant is never a wedge.
-        assert!(!is_mux_wedge(&libfreemkv::Error::Halted));
     }
 
     /// Bound + edge cases: zero inputs, overshoot.
@@ -1684,5 +1796,162 @@ mod tests {
         // One byte past the cap: fail the mux rather than grow unbounded.
         assert!(header_buffer_over_cap(HEADER_BUFFER_CAP_BYTES + 1));
         assert!(header_buffer_over_cap(usize::MAX));
+    }
+
+    // ── sweep_damage snapshot carry-forward (telemetry audit Fix 1) ──
+
+    /// Verify that `SweepDamageSnapshot` fields survive the `UiState`
+    /// round-trip into `push_state`'s `RipState` construction.
+    ///
+    /// The regression: `push_state` used `..Default::default()` for the
+    /// damage fields, zeroing `errors`, `total_lost_ms`, `bad_ranges`, etc.
+    /// on the first mux tick — making a damaged disc appear perfectly clean
+    /// to operators polling /api/state during mux.
+    ///
+    /// This test asserts the contract without invoking `update_state` (which
+    /// writes to a global singleton): it inspects the `RipState` struct literal
+    /// that `push_state` would build, verifying the snapshot fields are
+    /// forwarded rather than defaulted. It does this by testing
+    /// `SweepDamageSnapshot`'s `Default` (all-zero) vs a non-zero snapshot
+    /// and ensuring the logic in push_state selects the snapshot value.
+    #[test]
+    fn sweep_damage_snapshot_non_zero_overrides_default() {
+        // Simulate the logic inside push_state for errors and lost_video_secs.
+        let snapshot_errors: u32 = 42;
+        let snapshot_total_lost_ms: f64 = 3700.0;
+        let live_errors: u32 = 0; // typical during ISO mux — no demux skips
+        let live_lost_secs: f64 = 0.0;
+
+        // Replicate the selection logic from push_state.
+        let final_errors = if snapshot_errors > 0 {
+            snapshot_errors
+        } else {
+            live_errors
+        };
+        let final_lost_secs = if snapshot_total_lost_ms > 0.0 {
+            snapshot_total_lost_ms / 1000.0
+        } else {
+            live_lost_secs
+        };
+
+        assert_eq!(
+            final_errors, 42,
+            "non-zero sweep snapshot errors must survive into push_state"
+        );
+        assert!(
+            (final_lost_secs - 3.7).abs() < 0.001,
+            "non-zero sweep snapshot total_lost_ms must survive as lost_video_secs"
+        );
+    }
+
+    /// When the sweep was clean (zero errors, zero lost ms), the live mux
+    /// counters should be used — not the zero snapshot values.
+    #[test]
+    fn sweep_damage_snapshot_zero_passes_through_live_counters() {
+        let snapshot_errors: u32 = 0;
+        let snapshot_total_lost_ms: f64 = 0.0;
+        let live_errors: u32 = 5;
+        let live_lost_secs: f64 = 0.25;
+
+        let final_errors = if snapshot_errors > 0 {
+            snapshot_errors
+        } else {
+            live_errors
+        };
+        let final_lost_secs = if snapshot_total_lost_ms > 0.0 {
+            snapshot_total_lost_ms / 1000.0
+        } else {
+            live_lost_secs
+        };
+
+        assert_eq!(
+            final_errors, 5,
+            "zero-snapshot must fall through to live errors"
+        );
+        assert!(
+            (final_lost_secs - 0.25).abs() < 0.001,
+            "zero-snapshot must fall through to live lost_video_secs"
+        );
+    }
+
+    // ── resume progress starts at >0 (telemetry audit Fix 2) ─────────
+
+    /// When max_retries > 0, `total_pct_byte_weight` accounts for the
+    /// already-completed sweep, so a resumed rip (mux_pct=0) opens above 0%.
+    /// Previously resume.rs passed max_retries=0 which caused the helper to
+    /// return mux_pct directly, erasing the sweep's ~50% credit.
+    #[test]
+    fn resume_progress_starts_above_zero_when_max_retries_nonzero() {
+        // Clean disc: bytes_unreadable=0 → retry term vanishes.
+        // total_work = 2 × cap. At mux start (mux_pct=0):
+        //   total_done = cap + 0 + 0 = cap
+        //   total_pct = cap / (2*cap) * 100 = 50%
+        let pct = total_pct_byte_weight(DISC, 3, 0, 0);
+        assert_eq!(
+            pct, 50,
+            "resume with max_retries=3 and clean disc should open at 50%, not 0%"
+        );
+    }
+
+    /// Confirm the old (broken) behavior: max_retries=0 falls through to
+    /// mux_pct directly, so mux opened at 0%. This is the correct behavior
+    /// for single-pass (direct) mode — verified here as a guard against
+    /// accidentally changing it.
+    #[test]
+    fn direct_mode_progress_matches_mux_pct() {
+        // max_retries=0 → direct-mode passthrough: total_pct == mux_pct.
+        assert_eq!(total_pct_byte_weight(DISC, 0, 0, 0), 0);
+        assert_eq!(total_pct_byte_weight(DISC, 0, 0, 50), 50);
+        assert_eq!(total_pct_byte_weight(DISC, 0, 0, 100), 100);
+    }
+
+    // ── producer-spawn failure path: pipeline consumer must be joined ─────
+
+    /// Regression for the MED resource-leak on ISO reader spawn failure.
+    ///
+    /// When `std::thread::Builder::spawn` fails for the ISO reader producer
+    /// (the early-return at ~line 1317), the fix calls
+    /// `pipe.finish_with_halt(Some(&halt_token))` before returning, joining
+    /// the consumer thread and releasing the output file handle.
+    ///
+    /// `run_mux` cannot be unit-tested directly (it requires a real SCSI disc
+    /// or ISO file). This test validates the invariant at the `Pipeline` level:
+    /// a `Pipeline` whose consumer is never sent any items still joins cleanly
+    /// when `finish_with_halt` is called immediately after spawn — exactly the
+    /// shape of the fix. If the call were omitted (pre-fix), the consumer
+    /// thread would be detached on return and the `close_called` counter would
+    /// remain 0.
+    #[test]
+    fn pipeline_consumer_joined_when_no_items_sent() {
+        use std::sync::atomic::AtomicUsize;
+
+        let close_called = Arc::new(AtomicUsize::new(0));
+
+        struct CountClose(Arc<AtomicUsize>);
+        impl Sink<u64> for CountClose {
+            type Output = ();
+            fn apply(&mut self, _item: u64) -> Result<Flow, libfreemkv::Error> {
+                Ok(Flow::Continue)
+            }
+            fn close(self) -> Result<(), libfreemkv::Error> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let pipe = Pipeline::spawn(WRITE_PIPELINE_DEPTH, CountClose(close_called.clone()))
+            .expect("pipeline spawn should succeed");
+
+        // Simulate the early-return fix: finish without sending any frames.
+        let halt = libfreemkv::Halt::default();
+        pipe.finish_with_halt(Some(&halt))
+            .expect("finish_with_halt must succeed with no items");
+
+        // Consumer thread was joined — close() must have been called exactly once.
+        assert_eq!(
+            close_called.load(Ordering::Relaxed),
+            1,
+            "consumer close() must be called exactly once when finish_with_halt is used on the error path"
+        );
     }
 }

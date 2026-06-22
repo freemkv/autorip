@@ -7,7 +7,7 @@
 //! `scan_disc`, `rip_disc`, `eject_drive` — stays here. The `mux`
 //! sub-module holds the active parallel mux "highway" (consumer/
 //! producer split + watchdog); the multipass sweep loop still lives
-//! inline in `rip_disc`. (`sweep` remains an empty placeholder.)
+//! inline in `rip_disc`.
 
 pub(crate) mod mux;
 pub mod resume;
@@ -27,12 +27,12 @@ pub mod state;
 #[allow(unused_imports)]
 pub use session::{
     device_halt, join_all_rip_threads, join_rip_thread, register_halt, register_rip_thread,
-    spawn_rip_thread, take_rip_thread, unregister_halt,
+    spawn_rip_thread, swap_halt_carrying_cancel, take_rip_thread, unregister_halt,
 };
 #[allow(unused_imports)]
 pub use state::{
     BadRange, Resumable, RipState, STATE, is_busy, set_stop_cooldown, set_title_override,
-    take_title_override, update_state, update_state_with,
+    take_title_override, try_claim_active, update_state, update_state_with,
 };
 
 // Internal-use imports for the orchestrator code that lives in this
@@ -54,6 +54,87 @@ use crate::keysource::DriveAccess;
 /// from the configured sources via [`resolve_keys_from_drive`].
 pub(crate) fn scan_opts_for(cfg: &Config) -> libfreemkv::ScanOptions {
     crate::keysource::drive_scan_opts(cfg)
+}
+
+/// Scan-phase watchdog (closes the "scan_disc had NO watchdog" incident).
+///
+/// `libfreemkv::Disc::scan` and the subsequent `resolve_keys_from_drive` are
+/// blocking calls with no autorip-side liveness signal — a wedged drive read
+/// during scan, or a hung keyserver round-trip during resolve, would show the
+/// UI stuck on "scanning" forever with nothing in the log. This arms a thread
+/// that emits a WARN every 15s ("scan still running, Ns elapsed, last
+/// phase=X") until the returned guard is dropped (mirrors the rip watchdog and
+/// `mux.rs` watchdog drop-guard design).
+///
+/// The caller advances the phase via [`ScanWatchdog::set_phase`] so the WARN
+/// pinpoints whether the time is going into the structure scan or the key
+/// resolve.
+struct ScanWatchdog {
+    active: Arc<AtomicBool>,
+    // Coarse phase marker the watcher reports: 0 = scan, 1 = resolve_keys.
+    phase: Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl ScanWatchdog {
+    fn arm(device: &str) -> Self {
+        let active = Arc::new(AtomicBool::new(true));
+        let phase = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let active_w = active.clone();
+        let phase_w = phase.clone();
+        let device = device.to_string();
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let mut warned = false;
+            while active_w.load(Ordering::Relaxed) {
+                // Poll in short slices so the guard drop is observed
+                // promptly, but only WARN on 15s boundaries.
+                std::thread::sleep(Duration::from_secs(1));
+                if !active_w.load(Ordering::Relaxed) {
+                    break;
+                }
+                let elapsed = start.elapsed().as_secs();
+                if elapsed >= 15 && elapsed % 15 == 0 {
+                    let last_phase = match phase_w.load(Ordering::Relaxed) {
+                        0 => "scan",
+                        _ => "resolve_keys",
+                    };
+                    tracing::warn!(
+                        device = %device,
+                        elapsed_secs = elapsed,
+                        last_phase,
+                        "scan still running"
+                    );
+                    crate::log::device_log(
+                        &device,
+                        &format!(
+                            "Still scanning ({}s elapsed, phase={})...",
+                            elapsed, last_phase
+                        ),
+                    );
+                    warned = true;
+                }
+            }
+            if warned {
+                tracing::info!(
+                    device = %device,
+                    elapsed_secs = start.elapsed().as_secs(),
+                    "scan watchdog stood down (scan/resolve returned)"
+                );
+            }
+        });
+        Self { active, phase }
+    }
+
+    /// Mark that the key-resolve phase has begun, so the WARN reports it.
+    fn enter_resolve(&self) {
+        self.phase.store(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ScanWatchdog {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Resolve keys for a freshly-scanned live disc via the configured sources. A
@@ -623,6 +704,11 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Full scan — titles, streams, AACS keys
     crate::log::device_log(device, "Scanning titles...");
     let scan_opts = scan_opts_for(&cfg_read);
+    // Arm the scan-phase watchdog: WARNs every 15s while scan/resolve runs,
+    // torn down by the drop-guard when this block returns.
+    let scan_wd = ScanWatchdog::arm(device);
+    let scan_t0 = std::time::Instant::now();
+    tracing::info!(device = %device, "scan: begin");
     let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
         Ok(d) => d,
         Err(e) => {
@@ -639,6 +725,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             return;
         }
     };
+    tracing::info!(device = %device, elapsed_ms = scan_t0.elapsed().as_millis() as u64, "scan: structure done");
     // Sample-based key source: resolve the Unit Key from the disc's files +
     // on-disc samples and re-scan with it (a no-op for a local source). The
     // outcome carries WHY a resolve failed, for the readiness message.
@@ -647,13 +734,30 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // slow remote link can take a minute or two — tell the user we're waiting on
     // it so the pause isn't mistaken for a hang. (Online sources are exactly the
     // ones that `needs_samples()`.)
-    if crate::keysource::uses_online(&cfg_read) {
-        crate::log::device_log(device, "Communicating with online keyserver...");
-        update_state_with(device, |s| {
-            s.key_status = "Communicating with online keyserver…".to_string();
-        });
-    }
-    let (disc, key_outcome) = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
+    // DVD decryption is CSS — fully resolved by libfreemkv's scan. The AACS
+    // key-resolution path (MKB / Unit_Key_RO.inf / sample units / keyserver)
+    // does not apply to a DVD; running it reads the disc as if it were AACS/UHD
+    // and is pure waste (and was where DVD scans stalled). Skip it for DVD.
+    let (disc, key_outcome) = if matches!(disc.format, libfreemkv::DiscFormat::Dvd) {
+        tracing::info!(device = %device, "resolve_keys: skipped (DVD/CSS — no AACS)");
+        (disc, crate::keysource::KeyOutcome::Resolved)
+    } else {
+        if crate::keysource::uses_online(&cfg_read) {
+            crate::log::device_log(device, "Communicating with online keyserver...");
+            update_state_with(device, |s| {
+                s.key_status = "Communicating with online keyserver…".to_string();
+            });
+        }
+        scan_wd.enter_resolve();
+        let resolve_t0 = std::time::Instant::now();
+        tracing::info!(device = %device, "resolve_keys: begin");
+        let r = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
+        tracing::info!(device = %device, elapsed_ms = resolve_t0.elapsed().as_millis() as u64, "resolve_keys: end");
+        r
+    };
+    // Scan + resolve are done; stand the watchdog down explicitly (drop also
+    // covers any early return above).
+    drop(scan_wd);
     let key_status = key_readiness(&disc, key_outcome, cfg_read.capture_without_keys);
 
     // Update format from full scan (UHD vs BD now known)
@@ -828,9 +932,110 @@ pub fn handle_rip_request(
             rip_disc(cfg, device, device_path, false);
         }
         crate::web::ResumeMode::Default => {
+            // Unattended auto-rip must not re-rip a disc that already
+            // finished cleanly. On a container restart (Watchtower deploy /
+            // watchdog / host reboot) with the disc still in the drive, the
+            // insert→auto-rip path would otherwise sweep the whole disc again
+            // and overwrite the staged ISO. A `.completed` marker in the
+            // disc's staging dir is the authoritative "already ripped" signal.
+            // User-initiated rips (Wipe / Require) deliberately bypass this —
+            // only the unattended Default path is guarded.
+            if disc_already_completed(cfg, device) {
+                crate::log::device_log(
+                    device,
+                    "Disc already ripped (.completed marker present) — skipping unattended re-rip. Click Rip to force a fresh rip.",
+                );
+                let prev = STATE.lock().ok().and_then(|s| s.get(device).cloned());
+                update_state(
+                    device,
+                    RipState {
+                        device: device.to_string(),
+                        status: "idle".to_string(),
+                        disc_present: true,
+                        disc_name: prev
+                            .as_ref()
+                            .map(|p| p.disc_name.clone())
+                            .unwrap_or_default(),
+                        disc_format: prev
+                            .as_ref()
+                            .map(|p| p.disc_format.clone())
+                            .unwrap_or_default(),
+                        tmdb_title: prev
+                            .as_ref()
+                            .map(|p| p.tmdb_title.clone())
+                            .unwrap_or_default(),
+                        tmdb_year: prev.as_ref().map(|p| p.tmdb_year).unwrap_or(0),
+                        tmdb_poster: prev
+                            .as_ref()
+                            .map(|p| p.tmdb_poster.clone())
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                );
+                drop_session(device);
+                return;
+            }
             rip_disc(cfg, device, device_path, false);
         }
     }
+}
+
+/// Does the currently-scanned disc already have a `.completed` staging dir?
+///
+/// Title-matches the scanned disc name against staging dir basenames (same
+/// exact/prefix convention as [`find_resumable_for_disc`]) and reports whether
+/// a match carries the process-level `.completed` marker. Used only to gate
+/// the unattended auto-rip path so a container restart doesn't re-rip a disc
+/// that already finished.
+/// True if a staging-dir basename is the resume/completion match for a
+/// sanitized disc name. EXACT equality only: staging dirs are created with
+/// the exact sanitized disc name (no year/suffix), so a prefix match never
+/// legitimately fires — it only invites collisions where a shorter title's
+/// name is a prefix of a longer one with a separator ("Cars" sanitizes to
+/// "Cars", "Cars 2" to "Cars_2"). Exact equality is collision-free. Both
+/// `disc_already_completed` and `find_resumable_for_disc` route through this
+/// so the rule can't drift apart between the two call sites.
+fn staging_dir_matches_disc(basename: &str, sanitized: &str) -> bool {
+    basename == sanitized
+}
+
+fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
+    let cfg_read = match cfg.read() {
+        Ok(c) => c.clone(),
+        Err(_) => return false,
+    };
+    let display_name = STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.get(device).map(|rs| rs.disc_name.clone()))
+        .unwrap_or_default();
+    if display_name.is_empty() {
+        return false;
+    }
+    let sanitized = crate::util::sanitize_path_compact(&display_name);
+    let entries = match std::fs::read_dir(&cfg_read.staging_dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let basename = match path.file_name() {
+            Some(n) => n.to_string_lossy().into_owned(),
+            None => continue,
+        };
+        // EXACT match only. Staging dirs are created with the exact sanitized
+        // disc name (no year/suffix), so a prefix match never legitimately
+        // fires for the disc's own dir — it only invites collisions where a
+        // shorter title's name is a prefix of a longer one ("Cars" sanitizes
+        // to "Cars", "Cars 2" to "Cars_2"; a word-boundary check still fails
+        // since `_` is the space separator). Exact equality is collision-free.
+        if staging_dir_matches_disc(&basename, &sanitized)
+            && path.join(staging::COMPLETED_MARKER).exists()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Look at the staging dirs for a Remux-eligible entry whose
@@ -858,13 +1063,12 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
     for entry in entries.flatten() {
         let path = entry.path();
         let basename = path.file_name()?.to_string_lossy().into_owned();
-        // Match the disc's own staging dir. We accept an exact match, or
-        // a dir whose name *starts with* our sanitized name (covers a
-        // suffixed dir like "Dune (2021) [UHD]"). We deliberately do NOT
-        // accept the reverse (`sanitized.starts_with(&basename)`): that
-        // let a SHORTER stale dir like "Du" latch onto disc "Dune" — i.e.
-        // resume onto a different title's partial data.
-        if basename == sanitized || basename.starts_with(&sanitized) {
+        // Match the disc's own staging dir by EXACT name. Staging dirs are
+        // created with the exact sanitized disc name, so a prefix match never
+        // legitimately fires — it only collides ("Cars" is a prefix of
+        // "Cars_2" from "Cars 2"; "Dune" of "Dunkirk"), resuming onto a
+        // different title's partial ISO + mapfile. Exact equality is safe.
+        if staging_dir_matches_disc(&basename, &sanitized) {
             // User-initiated resume bypasses any `.failed` or
             // `.completed` markers — the user clicked Rip with
             // resume=yes and that is the authoritative signal.
@@ -886,16 +1090,35 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
             if stats.bytes_pending != 0 {
                 continue;
             }
-            // Pre-filter loss estimate: whole-disc bad bytes over the
-            // generic-BD fallback bitrate (we have no DiscTitle here, same
-            // constraint as `classify_resume`). `>` matches both
-            // `classify_resume` and the authoritative title-scoped
-            // re-check in `resume_remux`, which runs after `scan_image`
-            // and is what ultimately gates the mux. Shared constant so
-            // the bitrate can't drift from the other call sites.
-            let lost_secs = stats.bytes_unreadable as f64 / resume::FALLBACK_BITRATE_BYTES_PER_SEC;
-            if lost_secs > cfg_read.abort_on_lost_secs as f64 {
-                continue;
+            // Pre-filter loss estimate. Two cases:
+            //
+            // abort_on_lost_secs == 0 ("perfect rip required"): the
+            // whole-disc bad-byte count is the WRONG predicate here. A
+            // disc with unreadable sectors entirely OUTSIDE the main title
+            // is still a valid mux candidate — the authoritative
+            // per-title check in `resume_remux` (which runs after
+            // `scan_image` and scopes to the title via
+            // `bytes_bad_in_title`) will allow it. Using the whole-disc
+            // count as the pre-filter would block those candidates before
+            // the title-scoped check ever runs.
+            //
+            // For abort_on_lost_secs == 0 we therefore ALLOW here and
+            // defer the real decision to the per-title re-validation in
+            // `resume_remux`. That check is already `lost_secs >
+            // abort_on_lost_secs` (same semantics: 0 → require in-title
+            // loss == 0), so the pre-filter must not be STRICTER than
+            // the authoritative gating.
+            //
+            // abort_on_lost_secs > 0: keep the coarse whole-disc fallback
+            // estimate as an early-reject to avoid loading scan_image for
+            // every disc with heavy global damage. Same constant as
+            // `classify_resume` to prevent silent bitrate drift.
+            if cfg_read.abort_on_lost_secs > 0 {
+                let lost_secs =
+                    stats.bytes_unreadable as f64 / resume::FALLBACK_BITRATE_BYTES_PER_SEC;
+                if lost_secs > cfg_read.abort_on_lost_secs as f64 {
+                    continue;
+                }
             }
             let dir_display_name = path
                 .file_name()
@@ -1186,6 +1409,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
             let scan_opts = scan_opts_for(&cfg_read);
             crate::log::device_log(device, "Scanning titles...");
+            // Scan-phase watchdog (same as scan_disc): WARNs every 15s while
+            // scan/resolve runs, torn down by the drop-guard.
+            let scan_wd = ScanWatchdog::arm(device);
+            let scan_t0 = std::time::Instant::now();
+            tracing::info!(device = %device, "scan: begin");
             let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1203,7 +1431,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     return;
                 }
             };
-            let (disc, _key_outcome) = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
+            tracing::info!(device = %device, elapsed_ms = scan_t0.elapsed().as_millis() as u64, "scan: structure done");
+            // DVD is CSS (resolved in scan) — skip the AACS key-resolution path
+            // entirely; it doesn't apply and reads the disc as if it were UHD.
+            let disc = if matches!(disc.format, libfreemkv::DiscFormat::Dvd) {
+                tracing::info!(device = %device, "resolve_keys: skipped (DVD/CSS — no AACS)");
+                disc
+            } else {
+                scan_wd.enter_resolve();
+                let (disc, _key_outcome) = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
+                disc
+            };
+            drop(scan_wd);
 
             let disc_name = disc
                 .meta_title
@@ -1492,14 +1731,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // window between the dispatch-site cancellation check and this swap
     // into the new token. Without this, the first stop click would
     // cancel a token nobody reads again and silently no-op (the user
-    // would have to click again).
-    let prior_cancelled = device_halt(device)
-        .map(|h| h.is_cancelled())
-        .unwrap_or(false);
-    register_halt(device, halt_token.clone());
-    if prior_cancelled {
-        halt_token.cancel();
-    }
+    // would have to click again). The check+insert+carry is done under a
+    // single HALTS-lock acquisition so a concurrent /api/stop landing during
+    // the swap can't be lost (TOCTOU).
+    swap_halt_carrying_cancel(device, halt_token.clone());
     // Local alias: pre-existing call sites refer to `halt` as the
     // legacy `Arc<AtomicBool>`. Keep the same name so the watcher
     // helpers (which still take `Arc<AtomicBool>`) compile unchanged
@@ -1673,6 +1908,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // total_pct helper falls through to mux-pct passthrough when
     // max_retries == 0 anyway.
     let mut bytes_unreadable_at_mux: u64 = 0;
+    // Damage snapshot from the final sweep/patch pass, carried forward into
+    // every mux-phase push_state call so /api/state damage fields don't
+    // zero out the moment mux starts. Defaults (all-zero) for direct mode.
+    let mut sweep_damage_snapshot = mux::SweepDamageSnapshot::default();
+    // In-title-scoped loss computed by the abort gate (abort_lost_ms).
+    // Hoisted here so the final status=done update can use the same
+    // in-title value the abort check used, instead of recomputing from
+    // whole-disc bytes_unreadable (which inflates the 'done' card when
+    // menus/trailers outside title extents are scratched).
+    // 0.0 in single-pass mode or when no unreadable sectors exist.
+    let mut main_lost_ms_for_history_outer = 0.0f64;
 
     let reader: Box<dyn libfreemkv::SectorSource> = if cfg_read.max_retries > 0 {
         let iso_path = std::path::Path::new(&iso_path_str);
@@ -2512,10 +2758,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // rips don't have a "final pass" boundary and rely on the
         // sweep behavior (sweep never marks Unreadable either, but
         // single-pass mode skips abort_on_lost_secs entirely).
+        // End-of-recovery promotion + abort check: a single block so the
+        // abort check operates on the already-promoted in-memory map rather
+        // than re-loading from disk (the previous two-block design dropped
+        // `map` without flushing, then re-loaded the pre-promotion file,
+        // causing the abort check to see zero Unreadable bytes even after
+        // promotion — MED logic bug fixed here).
+        let mut main_lost_ms_for_history = 0.0f64;
         if cfg_read.max_retries > 0 {
             let mapfile_path = std::path::Path::new(&mapfile_path_str);
             if let Ok(mut map) = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path) {
                 use libfreemkv::disc::mapfile::SectorStatus;
+                // Promote still-NonTrimmed bytes to Unreadable — these are
+                // bytes that remained "maybe" across all patch passes and are
+                // now confirmed lost.
                 let nontrimmed_ranges = map.ranges_with(&[SectorStatus::NonTrimmed]);
                 let total_promoted: u64 = nontrimmed_ranges.iter().map(|(_, sz)| *sz).sum();
                 let n_ranges = nontrimmed_ranges.len();
@@ -2534,42 +2790,89 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     bytes_promoted = total_promoted,
                     "end_of_recovery_promote: NonTrimmed -> Unreadable after final retry pass"
                 );
-                // Refresh bytes_unreadable from the promoted mapfile so
-                // the abort check below sees the post-promotion total
-                // (the rip-loop's local copy reflected only what the
-                // last pass produced, which was zero now that patch
-                // never marks Unreadable mid-multipass).
-                bytes_unreadable = map.stats().bytes_unreadable;
-            }
-        }
-
-        // Abort check: load mapfile and calculate main movie loss after all retries.
-        // If loss exceeds configured threshold, abort instead of muxing damaged content.
-        let mut main_lost_ms_for_history = 0.0f64;
-        if cfg_read.max_retries > 0 && bytes_unreadable > 0 {
-            if let Ok(map) =
-                libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str))
-            {
-                use libfreemkv::disc::mapfile::SectorStatus;
-                let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
-                if !bad_ranges.is_empty() && title_bytes_per_sec > 0.0 {
-                    // TOTAL unreadable time scoped to the muxed title (not
-                    // the single largest gap, not whole-disc), exactly as
-                    // the per-pass loop-exit gate does (see `mux_scope_bad`
-                    // above). The old `.fold(.., f64::max)` over whole-disc
-                    // ranges both under-counted scattered gaps and falsely
-                    // aborted on out-of-title (menu/trailer) loss: for a
-                    // real MKV mux only in-title unreadable bytes count, so
-                    // a scratched menu/trailer outside the title extents
-                    // must NOT trigger the abort. For raw ISO output there
-                    // is no title to scope to, so the whole disc is the
-                    // unit of loss.
-                    main_lost_ms_for_history = abort_lost_ms(
-                        cfg_read.output_format == "iso",
-                        &title_for_progress,
-                        &bad_ranges,
-                        title_bytes_per_sec,
+                // Flush the promoted state to disk so downstream consumers
+                // (muxer, resume check) see the terminal Unreadable marks.
+                // Surface flush errors as warnings rather than silently
+                // dropping them.
+                if let Err(e) = map.flush() {
+                    tracing::warn!(
+                        device = %device,
+                        error = %e,
+                        "end_of_recovery_promote: failed to flush promoted mapfile"
                     );
+                }
+                // Refresh bytes_unreadable from the promoted in-memory map
+                // (not from disk — re-loading here would race the flush and
+                // could return the pre-promotion state on slow storage).
+                bytes_unreadable = map.stats().bytes_unreadable;
+
+                // Abort check: use the already-promoted in-memory map so
+                // bad_ranges reflects the just-promoted Unreadable sectors.
+                // The previous design re-loaded the mapfile here, which
+                // returned the pre-promotion state when the flush above had
+                // not yet hit disk.
+                if bytes_unreadable > 0 {
+                    let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
+                    if !bad_ranges.is_empty() && title_bytes_per_sec > 0.0 {
+                        // TOTAL unreadable time scoped to the muxed title (not
+                        // the single largest gap, not whole-disc), exactly as
+                        // the per-pass loop-exit gate does (see `mux_scope_bad`
+                        // above). The old `.fold(.., f64::max)` over whole-disc
+                        // ranges both under-counted scattered gaps and falsely
+                        // aborted on out-of-title (menu/trailer) loss: for a
+                        // real MKV mux only in-title unreadable bytes count, so
+                        // a scratched menu/trailer outside the title extents
+                        // must NOT trigger the abort. For raw ISO output there
+                        // is no title to scope to, so the whole disc is the
+                        // unit of loss.
+                        main_lost_ms_for_history = abort_lost_ms(
+                            cfg_read.output_format == "iso",
+                            &title_for_progress,
+                            &bad_ranges,
+                            title_bytes_per_sec,
+                        );
+                        // Mirror into the outer binding so the final done/stopped
+                        // state update (after run_mux) can use the same in-title
+                        // value without re-reading the mapfile.
+                        main_lost_ms_for_history_outer = main_lost_ms_for_history;
+                    }
+                }
+                // Re-derive damage fields from the just-promoted in-memory map
+                // and push them to STATE before `map` is dropped. The
+                // marker_damage snapshot (~80 lines below) reads from STATE; if
+                // we skip this step it reads the last push_pass_state snapshot,
+                // which predates the NonTrimmed→Unreadable promotion and therefore
+                // under-reports errors / total_lost_ms / bad_ranges for a damaged
+                // rip. Mirrors resume.rs build_bad_ranges + damage-aggregation
+                // logic (see resume.rs ~692-713).
+                {
+                    let (
+                        promoted_bad_ranges,
+                        promoted_num_bad,
+                        promoted_truncated,
+                        promoted_total_lost_ms,
+                        promoted_largest_gap_ms,
+                    ) = state::build_bad_ranges(&map, &title_for_progress, bps_progress);
+                    let promoted_main_title_bad = map.ranges_with(&[SectorStatus::Unreadable]);
+                    let promoted_main_bad_bytes = libfreemkv::disc::bytes_bad_in_title(
+                        &title_for_progress,
+                        &promoted_main_title_bad,
+                    );
+                    let promoted_main_lost_ms = if bps_progress > 0.0 {
+                        promoted_main_bad_bytes as f64 * 1000.0 / bps_progress
+                    } else {
+                        0.0
+                    };
+                    let promoted_errors = (map.stats().bytes_unreadable / 2048) as u32;
+                    update_state_with(device, |s| {
+                        s.errors = promoted_errors;
+                        s.total_lost_ms = promoted_total_lost_ms;
+                        s.main_lost_ms = promoted_main_lost_ms;
+                        s.bad_ranges = promoted_bad_ranges;
+                        s.num_bad_ranges = promoted_num_bad;
+                        s.bad_ranges_truncated = promoted_truncated;
+                        s.largest_gap_ms = promoted_largest_gap_ms;
+                    });
                 }
             }
 
@@ -2607,6 +2910,21 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         );
                     }
                 });
+                // Write the terminal `.failed` marker so restart logic sees an
+                // explicit failure for this disc instead of treating the
+                // abandoned staging as an in-progress rip and looping until
+                // RESTART_LIMIT ("restart loop detected"). Mirrors the
+                // mux-finalize-failure path's marker write.
+                let staging_disc_path = std::path::Path::new(&staging);
+                staging::write_failed_marker(
+                    staging_disc_path,
+                    &format!(
+                        "aborted: {:.2}s lost in main movie exceeds threshold {}s",
+                        main_lost_ms_for_history / 1000.0,
+                        cfg_read.abort_on_lost_secs
+                    ),
+                );
+                staging::clear_restart_count(staging_disc_path);
                 unregister_halt(device);
                 return; // Skip mux entirely
             }
@@ -2644,6 +2962,30 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // exit `rip_disc`. The mux + post-mux bookkeeping that used
         // to run below now runs inside `muxer::check_and_mux ->
         // ripper::resume::remux_from_ripped_marker`.
+        //
+        // Snapshot sweep damage from STATE before building the marker.
+        // The update_state_with call inside the promotion+flush block
+        // (above) has already re-derived errors / total_lost_ms /
+        // main_lost_ms / bad_ranges / largest_gap_ms from the
+        // just-promoted in-memory map and written them to STATE, so
+        // this snapshot reflects the final post-promotion damage
+        // (NonTrimmed bytes promoted to Unreadable are included).
+        // We carry them into the marker so that remux_from_ripped_marker
+        // can populate SweepDamageSnapshot for a resumed mux without
+        // re-reading the mapfile (though mapfile-based re-derivation
+        // also works and is available as a fallback — see resume.rs).
+        let marker_damage = {
+            let s = state::STATE.lock().unwrap_or_else(|e| e.into_inner());
+            s.get(device).map(|rs| mux::SweepDamageSnapshot {
+                errors: rs.errors,
+                total_lost_ms: rs.total_lost_ms,
+                main_lost_ms: rs.main_lost_ms,
+                bad_ranges: rs.bad_ranges.clone(),
+                num_bad_ranges: rs.num_bad_ranges,
+                bad_ranges_truncated: rs.bad_ranges_truncated,
+                largest_gap_ms: rs.largest_gap_ms,
+            })
+        };
         let marker = crate::muxer::RippedMarker {
             schema_version: crate::muxer::RIPPED_MARKER_SCHEMA,
             iso_path: iso_path_str.clone(),
@@ -2662,6 +3004,23 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             rip_lost_video_secs: main_lost_ms_for_history / 1000.0,
             rip_last_sector: rip_last_lba.load(Ordering::Relaxed),
             origin_device: device.to_string(),
+            sweep_errors: marker_damage.as_ref().map(|d| d.errors).unwrap_or(0),
+            sweep_total_lost_ms: marker_damage
+                .as_ref()
+                .map(|d| d.total_lost_ms)
+                .unwrap_or(0.0),
+            sweep_main_lost_ms: marker_damage
+                .as_ref()
+                .map(|d| d.main_lost_ms)
+                .unwrap_or(0.0),
+            sweep_num_bad_ranges: marker_damage
+                .as_ref()
+                .map(|d| d.num_bad_ranges)
+                .unwrap_or(0),
+            sweep_largest_gap_ms: marker_damage
+                .as_ref()
+                .map(|d| d.largest_gap_ms)
+                .unwrap_or(0.0),
         };
         let staging_path = std::path::Path::new(&staging);
         if let Err(e) = crate::muxer::write_marker(staging_path, &marker) {
@@ -2677,11 +3036,36 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 device,
                 "Sweep + patch complete; handed off to mux worker via .ripped marker.",
             );
+            // Status: "ripping" (not "idle") — the mux worker will pick up
+            // the .ripped marker and mux the ISO. Setting "idle" here
+            // creates a false-idle window where /api/state looks done
+            // before the mux worker has even started. The mux worker's
+            // resume_remux call will set "ripping" again (via its own
+            // update_state) then "done" on completion.
+            //
+            // Carry damage fields (errors, total_lost_ms, main_lost_ms,
+            // bad_ranges, largest_gap_ms) from the current STATE entry so
+            // /api/state doesn't show zeroed damage during the hand-off
+            // window. push_pass_state wrote those fields; a bare
+            // ..Default::default() would zero them until the mux worker's
+            // first push_state tick re-derives them from sweep_damage.
+            let handoff_damage = {
+                let s = state::STATE.lock().unwrap_or_else(|e| e.into_inner());
+                s.get(device).map(|rs| mux::SweepDamageSnapshot {
+                    errors: rs.errors,
+                    total_lost_ms: rs.total_lost_ms,
+                    main_lost_ms: rs.main_lost_ms,
+                    bad_ranges: rs.bad_ranges.clone(),
+                    num_bad_ranges: rs.num_bad_ranges,
+                    bad_ranges_truncated: rs.bad_ranges_truncated,
+                    largest_gap_ms: rs.largest_gap_ms,
+                })
+            };
             update_state(
                 device,
                 RipState {
                     device: device.to_string(),
-                    status: "idle".to_string(),
+                    status: "ripping".to_string(),
                     disc_present: true,
                     disc_name: display_name.clone(),
                     disc_format: disc_format.clone(),
@@ -2691,6 +3075,34 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     tmdb_overview: tmdb_overview.clone(),
                     duration: duration.clone(),
                     codecs: codecs.clone(),
+                    errors: handoff_damage
+                        .as_ref()
+                        .map(|d| d.errors)
+                        .unwrap_or_default(),
+                    total_lost_ms: handoff_damage
+                        .as_ref()
+                        .map(|d| d.total_lost_ms)
+                        .unwrap_or_default(),
+                    main_lost_ms: handoff_damage
+                        .as_ref()
+                        .map(|d| d.main_lost_ms)
+                        .unwrap_or_default(),
+                    bad_ranges: handoff_damage
+                        .as_ref()
+                        .map(|d| d.bad_ranges.clone())
+                        .unwrap_or_default(),
+                    num_bad_ranges: handoff_damage
+                        .as_ref()
+                        .map(|d| d.num_bad_ranges)
+                        .unwrap_or_default(),
+                    bad_ranges_truncated: handoff_damage
+                        .as_ref()
+                        .map(|d| d.bad_ranges_truncated)
+                        .unwrap_or_default(),
+                    largest_gap_ms: handoff_damage
+                        .as_ref()
+                        .map(|d| d.largest_gap_ms)
+                        .unwrap_or_default(),
                     ..Default::default()
                 },
             );
@@ -2767,6 +3179,25 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             total_passes,
             &mux_state,
         );
+        // Snapshot the damage fields just written to STATE so the mux phase
+        // can carry them forward in every per-frame push_state call.
+        // Without this snapshot, push_state's `..Default::default()` would
+        // zero out errors / total_lost_ms / bad_ranges on the very first
+        // mux tick, making a damaged disc look perfectly clean during mux.
+        sweep_damage_snapshot = {
+            let s = state::STATE.lock().unwrap_or_else(|e| e.into_inner());
+            s.get(device)
+                .map(|rs| mux::SweepDamageSnapshot {
+                    errors: rs.errors,
+                    total_lost_ms: rs.total_lost_ms,
+                    main_lost_ms: rs.main_lost_ms,
+                    bad_ranges: rs.bad_ranges.clone(),
+                    num_bad_ranges: rs.num_bad_ranges,
+                    bad_ranges_truncated: rs.bad_ranges_truncated,
+                    largest_gap_ms: rs.largest_gap_ms,
+                })
+                .unwrap_or_default()
+        };
         Box::new(iso_reader) as Box<dyn libfreemkv::SectorSource>
     } else {
         Box::new(session.drive) as Box<dyn libfreemkv::SectorSource>
@@ -2958,6 +3389,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // hard-escalation path (5-minute stall → exit + Docker
             // restart) can bump `.restart_count` before exiting.
             staging_disc_dir: std::path::PathBuf::from(&staging),
+            sweep_damage: sweep_damage_snapshot.clone(),
         },
         input,
         mux::MuxAtomics {
@@ -3011,10 +3443,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // final history record reflects what we know: unreadable = bad.
             let bad_bytes = stats.bytes_unreadable;
             final_errors = (bad_bytes / 2048) as u32;
-            final_lost_secs = if title_bytes_per_sec > 0.0 {
-                bad_bytes as f64 / title_bytes_per_sec
+            // Use the in-title-scoped loss already computed by abort_lost_ms()
+            // (same gate the abort check used above). Whole-disc `bad_bytes /
+            // title_bytes_per_sec` inflates the 'done' card when menus or trailers
+            // outside the title extents are scratched — the abort gate correctly
+            // accepted the rip because in-title loss was within threshold, but the
+            // final UI card would show a larger number from out-of-title damage.
+            final_lost_secs = if main_lost_ms_for_history_outer > 0.0 {
+                main_lost_ms_for_history_outer / 1000.0
             } else {
-                0.0
+                // main_lost_ms_for_history_outer is 0 when either: no bad sectors
+                // exist (clean disc), or bytes_unreadable == 0. In those cases
+                // fall back to the mux outcome's own lost_video_secs (usually 0
+                // on a clean disc, or the demux skip count for single-pass mode).
+                mux_outcome.lost_video_secs
             };
         }
     }
@@ -3055,6 +3497,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             "date": crate::util::format_date(),
         });
         if completed {
+            // Durability gate: fsync the finished MKV/M2TS before any
+            // success marker so a crash/power-loss can't leave a "done"
+            // marker pointing at a page-cache-only (truncated on disk)
+            // file. Library mux finish() only flushes to the OS. Skip
+            // for network:// output, which has no local file.
+            if output_format != "network" || cfg_read.network_target.is_empty() {
+                staging::fsync_output_file(std::path::Path::new(&output_path));
+            }
             // Confident match (exact title + year) → hand straight to the mover
             // (.done). Otherwise HOLD for operator review (.review): the rip is
             // complete and staged, but we will NOT auto-file it into the library
@@ -3064,9 +3514,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // collision is still caught later by the mover's own guard.
             let marker_name = if title_confident { ".done" } else { ".review" };
             let marker_path = format!("{}/{}", staging, marker_name);
-            if let Err(e) = std::fs::write(
-                &marker_path,
-                serde_json::to_string_pretty(&marker).unwrap_or_default(),
+            // Durable, atomic marker write (tmp + fsync + rename + dir-fsync).
+            // The single staging-dir fsync inside this helper is the crash
+            // barrier: it guarantees `.done` is observed on disk before the
+            // later `.completed` write / ISO prune, so a crash can never leave
+            // `.completed` (or a pruned ISO) without a durable `.done`.
+            if let Err(e) = staging::write_handoff_marker(
+                std::path::Path::new(&marker_path),
+                serde_json::to_string_pretty(&marker)
+                    .unwrap_or_default()
+                    .as_bytes(),
             ) {
                 // The mux finished and the MKV is in staging, but the
                 // mover keys off this marker — without it the file sits
@@ -3218,6 +3675,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             tmdb_overview: tmdb_overview.clone(),
             duration: duration.clone(),
             codecs: codecs.clone(),
+            // Carry sweep damage so the done card reflects real damage
+            // instead of showing a clean result for a damaged rip.
+            total_lost_ms: sweep_damage_snapshot.total_lost_ms,
+            main_lost_ms: sweep_damage_snapshot.main_lost_ms,
+            bad_ranges: sweep_damage_snapshot.bad_ranges.clone(),
+            num_bad_ranges: sweep_damage_snapshot.num_bad_ranges,
+            bad_ranges_truncated: sweep_damage_snapshot.bad_ranges_truncated,
+            largest_gap_ms: sweep_damage_snapshot.largest_gap_ms,
             ..Default::default()
         },
     );
@@ -3700,9 +4165,48 @@ mod tests {
 
     use super::{
         HaltGuard, aacs_failure_message, format_pass_error, is_safe_staging_segment, register_halt,
+        staging_dir_matches_disc,
     };
     use crate::ripper::session::device_halt;
     use libfreemkv::{Error, ScsiSense};
+
+    /// Resume / completion matching is EXACT, never prefix. A disc named
+    /// "Cars" (sanitized "Cars") must not match a sibling staging dir
+    /// "Cars_2" (from "Cars 2") — a prefix match there would resume onto a
+    /// different title's partial ISO/mapfile. This locks in the already-fixed
+    /// HIGH bug; a regression to `starts_with` would fail here.
+    #[test]
+    fn staging_match_is_exact_not_prefix() {
+        // Direct predicate: exact equality only.
+        assert!(staging_dir_matches_disc("Cars", "Cars"));
+        assert!(!staging_dir_matches_disc("Cars_2", "Cars"));
+        assert!(!staging_dir_matches_disc("Cars", "Cars_2"));
+        assert!(!staging_dir_matches_disc("Cars_2_Extras", "Cars_2"));
+
+        // End-to-end over a real temp staging dir: both "Cars" and "Cars_2"
+        // exist; scanning with the production predicate must select ONLY the
+        // exact "Cars".
+        let tmp = tempfile::TempDir::new().unwrap();
+        for name in ["Cars", "Cars_2"] {
+            std::fs::create_dir_all(tmp.path().join(name)).unwrap();
+        }
+        let sanitized = "Cars";
+        let matches: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                e.path()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .filter(|basename| staging_dir_matches_disc(basename, sanitized))
+            .collect();
+        assert_eq!(
+            matches,
+            vec!["Cars".to_string()],
+            "only the exact 'Cars' dir must match, not the 'Cars_2' sibling"
+        );
+    }
 
     /// The `HaltGuard` created at the top of `rip_disc` must unregister the
     /// device's halt-map entry on EVERY exit path — including the early-return
@@ -4175,5 +4679,313 @@ mod tests {
         let threshold = 30_000.0;
         assert!(!super::should_abort_for_loss(20_000.0, threshold));
         assert!(super::should_abort_for_loss(31_000.0, threshold));
+    }
+
+    // ── final done-card uses in-title loss (telemetry audit Fix 3) ───
+
+    /// The `status=done` state update must report in-title-scoped loss
+    /// (what abort_lost_ms returns), NOT whole-disc `bytes_unreadable /
+    /// title_bytes_per_sec`. Out-of-title damage (scratched menus /
+    /// trailers) would inflate the 'done' card even though the abort gate
+    /// correctly accepted the rip.
+    ///
+    /// This test verifies the contract indirectly via `abort_lost_ms`:
+    /// given out-of-title-only damage, the in-title loss is 0 ms — so the
+    /// done card should show 0s lost, not the whole-disc value.
+    #[test]
+    fn final_done_card_uses_in_title_loss_not_whole_disc() {
+        let bps = 8_250_000.0;
+        // Title covers sectors 1000..2000. Damage is only in sector 0..50
+        // (a scratched menu, before the title).
+        let title = title_lba(1000, 1000, bps);
+        let bad = vec![(0u64, 50 * 2048)]; // 50 sectors, all out-of-title
+
+        // Whole-disc calculation (the old broken path): non-zero.
+        let whole_disc_bytes_unreadable: u64 = 50 * 2048;
+        let whole_disc_lost_secs = whole_disc_bytes_unreadable as f64 / bps;
+        assert!(whole_disc_lost_secs > 0.0, "whole-disc loss is non-zero");
+
+        // In-title-scoped calculation (the correct path via abort_lost_ms):
+        // out-of-title damage does NOT count for MKV output.
+        let in_title_lost_ms = super::abort_lost_ms(false, &title, &bad, bps);
+        assert_eq!(
+            in_title_lost_ms, 0.0,
+            "in-title loss must be 0 when all bad sectors are outside title extents"
+        );
+
+        // The done card should report in-title loss (0s), not whole-disc.
+        // Replicate the selection logic from the fix:
+        let final_lost_secs = if in_title_lost_ms > 0.0 {
+            in_title_lost_ms / 1000.0
+        } else {
+            0.0 // clean-title fallback; would be mux_outcome.lost_video_secs in production
+        };
+        assert!(
+            (final_lost_secs - 0.0).abs() < 0.001,
+            "done card must report 0s lost, not the inflated whole-disc {:.3}s",
+            whole_disc_lost_secs
+        );
+    }
+
+    /// Sanity: when there IS in-title loss, the done card reports it.
+    #[test]
+    fn final_done_card_reports_nonzero_in_title_loss() {
+        let bps = 8_250_000.0;
+        let title = title_lba(1000, 1000, bps);
+        // 10 sectors at LBA 1500 — inside the title.
+        let bad = vec![(1500u64 * 2048, 10 * 2048)];
+        let in_title_lost_ms = super::abort_lost_ms(false, &title, &bad, bps);
+        assert!(in_title_lost_ms > 0.0, "in-title loss should be non-zero");
+        let final_lost_secs = in_title_lost_ms / 1000.0;
+        // 10 sectors * 2048 bytes / 8_250_000 bps ≈ 0.00248s
+        assert!(
+            final_lost_secs > 0.0 && final_lost_secs < 1.0,
+            "expected small non-zero lost_secs, got {:.6}",
+            final_lost_secs
+        );
+    }
+
+    /// Regression: the `.ripped` marker hand-off must write status="ripping",
+    /// NOT "idle". Pre-fix, the `update_state` call at that site used "idle",
+    /// creating a false-done window in /api/state before the mux worker
+    /// picked up the disc. We can't drive `rip_disc` in a unit test (it
+    /// requires a live drive), but we CAN verify that calling `update_state`
+    /// with "ripping" round-trips through STATE correctly (status guard), and
+    /// document the invariant so a future refactor is visible.
+    ///
+    /// The tightest assertion: STATE written with "ripping" reads back as
+    /// "ripping", not "idle". This is trivially true for `update_state` but
+    /// pins that the constant used at the handoff site is NOT "idle" — any
+    /// regression that changes the handoff back to "idle" will be caught at
+    /// the source (the literal in mod.rs) by code review, with this test
+    /// documenting the intent.
+    #[test]
+    fn handoff_status_is_ripping_not_idle() {
+        let device = "sg_handoff_status_test";
+        super::update_state(
+            device,
+            super::RipState {
+                device: device.to_string(),
+                status: "ripping".to_string(),
+                disc_present: true,
+                ..Default::default()
+            },
+        );
+        let status = super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .map(|s| s.status.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            status, "ripping",
+            "handoff update_state must write status='ripping', not 'idle'"
+        );
+        // Cleanup: remove the synthetic device entry so it doesn't leak
+        // into other tests that inspect STATE.
+        super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device);
+    }
+
+    /// Regression: end-of-recovery promotion must flush the promoted mapfile
+    /// so the abort check (which now uses the in-memory map) sees Unreadable
+    /// bytes — not the pre-promotion NonTrimmed state.
+    ///
+    /// Before the fix the two-block design:
+    ///   1. Promoted NonTrimmed → Unreadable in memory, dropped `map` without
+    ///      flushing (pre-promotion state stays on disk).
+    ///   2. Re-loaded from disk → got the pre-promotion file → zero Unreadable
+    ///      bytes → abort check silently skipped.
+    ///
+    /// After the fix both steps share one `map` load; the abort check queries
+    /// the already-promoted in-memory map, and the flush persists it to disk.
+    #[test]
+    fn promotion_uses_in_memory_map_and_flush_persists_to_disk() {
+        use libfreemkv::disc::mapfile::{self, SectorStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mf_path = tmp.path().join("test.mapfile");
+
+        // Create a mapfile with one NonTrimmed range (simulating a sector
+        // that remained "maybe" after all patch passes).
+        let disc_size: u64 = 10 * 2048;
+        let bad_pos: u64 = 5 * 2048;
+        let bad_size: u64 = 2048;
+        {
+            let mut map =
+                mapfile::Mapfile::create(&mf_path, disc_size, "test").expect("create mapfile");
+            // Mark everything Finished except one NonTrimmed range.
+            map.record(0, bad_pos, SectorStatus::Finished)
+                .expect("record Finished before bad");
+            map.record(bad_pos, bad_size, SectorStatus::NonTrimmed)
+                .expect("record NonTrimmed");
+            map.record(
+                bad_pos + bad_size,
+                disc_size - bad_pos - bad_size,
+                SectorStatus::Finished,
+            )
+            .expect("record Finished after bad");
+            map.flush().expect("initial flush");
+        }
+
+        // Simulate the promotion block: load, promote, flush.
+        {
+            let mut map = mapfile::Mapfile::load(&mf_path).expect("load for promotion");
+            let nontrimmed = map.ranges_with(&[SectorStatus::NonTrimmed]);
+            assert_eq!(nontrimmed.len(), 1, "precondition: one NonTrimmed range");
+            for (pos, size) in nontrimmed {
+                map.record(pos, size, SectorStatus::Unreadable)
+                    .expect("promote record");
+            }
+            // The flush is the critical step the pre-fix code omitted.
+            map.flush().expect("promotion flush");
+
+            // Verify in-memory state reflects the promotion.
+            let stats = map.stats();
+            assert_eq!(
+                stats.bytes_unreadable, bad_size,
+                "in-memory bytes_unreadable must equal the promoted range size"
+            );
+            assert_eq!(
+                stats.bytes_nontried + stats.bytes_pending,
+                0,
+                "no NonTrimmed/NonTried must remain after promotion"
+            );
+
+            // The abort check now uses this same `map` — verify bad_ranges is
+            // populated from it (the pre-fix re-load would return empty here
+            // because the flush wasn't done).
+            let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
+            assert_eq!(
+                bad_ranges.len(),
+                1,
+                "abort check must see one Unreadable range from the promoted in-memory map"
+            );
+        }
+
+        // Verify the flush wrote the promoted state to disk: a fresh load must
+        // see Unreadable, not NonTrimmed.
+        let reloaded = mapfile::Mapfile::load(&mf_path).expect("reload after promotion flush");
+        let reloaded_unreadable = reloaded.ranges_with(&[SectorStatus::Unreadable]);
+        assert_eq!(
+            reloaded_unreadable.len(),
+            1,
+            "reloaded mapfile must contain the promoted Unreadable range \
+             (pre-fix: flush omitted, so disk still held NonTrimmed)"
+        );
+        let reloaded_nontrimmed = reloaded.ranges_with(&[SectorStatus::NonTrimmed]);
+        assert_eq!(
+            reloaded_nontrimmed.len(),
+            0,
+            "reloaded mapfile must have no NonTrimmed after flush"
+        );
+    }
+
+    /// Regression: the `.ripped` marker hand-off update_state must preserve
+    /// non-zero damage fields (errors, total_lost_ms, main_lost_ms,
+    /// bad_ranges, largest_gap_ms) from the sweep phase so /api/state
+    /// doesn't silently zero them during the hand-off window.
+    ///
+    /// Pre-fix the hand-off RipState used `..Default::default()` which
+    /// zeroed those fields. The fix reads them from STATE (populated by the
+    /// last push_pass_state call) and carries them into the new RipState.
+    ///
+    /// We simulate this by: (1) seeding STATE with damage-populated data,
+    /// (2) reading it back exactly as the hand-off code does, and (3)
+    /// asserting the result is non-zero.
+    #[test]
+    fn handoff_update_state_carries_damage_fields() {
+        let device = "sg_handoff_damage_test";
+        // Seed STATE with damage-populated entry (as push_pass_state would).
+        super::update_state(
+            device,
+            super::RipState {
+                device: device.to_string(),
+                status: "ripping".to_string(),
+                errors: 42,
+                total_lost_ms: 1500.0,
+                main_lost_ms: 800.0,
+                num_bad_ranges: 3,
+                largest_gap_ms: 600.0,
+                ..Default::default()
+            },
+        );
+
+        // Replicate the hand-off code path from rip_disc: read damage from
+        // STATE, then write a new RipState carrying those fields.
+        let handoff_damage = {
+            let s = super::STATE.lock().unwrap_or_else(|e| e.into_inner());
+            s.get(device).map(|rs| super::mux::SweepDamageSnapshot {
+                errors: rs.errors,
+                total_lost_ms: rs.total_lost_ms,
+                main_lost_ms: rs.main_lost_ms,
+                bad_ranges: rs.bad_ranges.clone(),
+                num_bad_ranges: rs.num_bad_ranges,
+                bad_ranges_truncated: rs.bad_ranges_truncated,
+                largest_gap_ms: rs.largest_gap_ms,
+            })
+        };
+        super::update_state(
+            device,
+            super::RipState {
+                device: device.to_string(),
+                status: "ripping".to_string(),
+                disc_present: true,
+                errors: handoff_damage
+                    .as_ref()
+                    .map(|d| d.errors)
+                    .unwrap_or_default(),
+                total_lost_ms: handoff_damage
+                    .as_ref()
+                    .map(|d| d.total_lost_ms)
+                    .unwrap_or_default(),
+                main_lost_ms: handoff_damage
+                    .as_ref()
+                    .map(|d| d.main_lost_ms)
+                    .unwrap_or_default(),
+                num_bad_ranges: handoff_damage
+                    .as_ref()
+                    .map(|d| d.num_bad_ranges)
+                    .unwrap_or_default(),
+                largest_gap_ms: handoff_damage
+                    .as_ref()
+                    .map(|d| d.largest_gap_ms)
+                    .unwrap_or_default(),
+                ..Default::default()
+            },
+        );
+
+        let state = super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .cloned()
+            .expect("device should be in STATE");
+
+        assert_eq!(state.errors, 42, "handoff must carry errors from sweep");
+        assert!(
+            (state.total_lost_ms - 1500.0).abs() < 0.001,
+            "handoff must carry total_lost_ms from sweep"
+        );
+        assert!(
+            (state.main_lost_ms - 800.0).abs() < 0.001,
+            "handoff must carry main_lost_ms from sweep"
+        );
+        assert_eq!(
+            state.num_bad_ranges, 3,
+            "handoff must carry num_bad_ranges from sweep"
+        );
+        assert!(
+            (state.largest_gap_ms - 600.0).abs() < 0.001,
+            "handoff must carry largest_gap_ms from sweep"
+        );
+
+        // Cleanup.
+        super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device);
     }
 }

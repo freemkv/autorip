@@ -6,7 +6,7 @@
 Automatic disc ripper. Insert a disc, get an MKV.
 
 Uses [libfreemkv](https://github.com/freemkv/libfreemkv) directly -- no subprocess, no text parsing.
-Works with DVD, Blu-ray, and 4K UHD discs. Built-in keys cover DVDs and Blu-rays (AACS 1.0); a `keydb.cfg` is only needed for UHD (AACS 2.0 / 2.1).
+Works with DVD, Blu-ray, and 4K UHD discs. DVDs (CSS) work out of the box; Blu-ray and UHD (AACS) require a `keydb.cfg`.
 
 ## Quick Start
 
@@ -20,9 +20,20 @@ docker-compose up -d
 
 Open http://localhost:8080
 
-**First-time setup:** DVDs and Blu-rays (AACS 1.0) work out of the box — no key setup needed. For UHD (AACS 2.0 / 2.1) discs, go to Settings and enter a KEYDB Update URL; autorip will fetch and refresh `keydb.cfg` automatically. TMDB API key is optional (enables automatic title/poster lookup).
+**First-time setup:** DVDs (CSS) work out of the box — no key setup needed. For Blu-ray and UHD (AACS) discs, go to Settings and enter a KEYDB Update URL; autorip will fetch and refresh `keydb.cfg` automatically. TMDB API key is optional (enables automatic title/poster lookup).
 
-For operator-supplied keys (additional device keys, processing keys, or VUKs you have derived), drop a `local_keys.cfg` into the bind-mounted config directory at `config/keys/`. Same syntax as `keydb.cfg`; entries are loaded additively on top of the built-in keys and any main `keydb.cfg`.
+### Bare binary (no Docker)
+
+Prefer not to run a container? Download a single static binary and run it
+as a systemd service. See [INSTALL.md](INSTALL.md) for the bare-metal
+setup — drive permissions (add the service user to the `cdrom` group or a
+udev rule instead of `--privileged`), a sample systemd unit, and local
+path configuration (the in-container NFS auto-mount is Docker-only).
+
+```bash
+curl -sLO https://github.com/freemkv/autorip/releases/latest/download/autorip-x86_64-linux
+chmod +x autorip-x86_64-linux && sudo mv autorip-x86_64-linux /usr/local/bin/autorip
+```
 
 ### Build from source
 
@@ -143,6 +154,26 @@ All endpoints are served on port 8080 (configurable via `PORT`). The web UI is a
 | POST | `/api/eject/{device}` | Eject disc tray, reset state |
 | POST | `/api/verify/{device}` | Start disc health verification |
 | POST | `/api/update-keydb` | Download KEYDB.cfg from configured URL |
+
+## Getting a debug log (for bug reports)
+
+1. **Turn on debug logging** (no restart): `curl -X POST http://<host>:8080/api/debug -d '{"enabled":true}'`
+   (or the Debug toggle in the web UI). This raises both autorip and the rip
+   library to debug, including per-stage phase markers and heartbeats.
+2. **Reproduce** the issue (insert the disc / start the rip).
+3. **Collect the log** — easiest is the stable JSONL file:
+   ```bash
+   docker cp autorip:/config/logs/autorip.jsonl ./autorip-debug.jsonl
+   ```
+   (or `curl 'http://<host>:8080/api/debug?n=5000' > autorip-debug.log`, or grab
+   `{AUTORIP_DIR}/logs/rips/<device>_<timestamp>.log` for a single rip's story).
+4. **Attach** it to your report. If a rip or scan hangs, the watchdog logs
+   `stalled Ns, last phase=…` every 15 s and the last `phase=… "alive"` heartbeat
+   names the loop + position. **No key material, bearer tokens, or keydb
+   credentials are ever written to logs** — secrets are redacted at every sink.
+
+To pin a level for a whole session, set `AUTORIP_LOG_LEVEL=autorip=debug,libfreemkv=debug`
+in the compose file (this overrides and disables the `/api/debug` toggle).
 
 ## Contributing
 

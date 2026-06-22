@@ -198,3 +198,96 @@ fn resume_remux_preserves_state_on_classifier_rejection() {
     // Counter must NOT have been touched by classify_resume.
     assert_eq!(staging::restart_count(&dir), 1);
 }
+
+/// Write a mapfile whose sectors are fully settled (bytes_pending == 0) but
+/// contain some Unreadable bytes. Used to simulate a disc with bad sectors
+/// that are entirely outside the main title.
+fn write_mapfile_with_unreadable(path: &Path, total_bytes: u64, unreadable_bytes: u64) {
+    use libfreemkv::disc::mapfile::{Mapfile, SectorStatus};
+    assert!(
+        unreadable_bytes < total_bytes,
+        "unreadable_bytes must be less than total_bytes"
+    );
+    let good_bytes = total_bytes - unreadable_bytes;
+    let mut map = Mapfile::create(path, total_bytes, "test").expect("mapfile create");
+    map.record(0, good_bytes, SectorStatus::Finished)
+        .expect("record good");
+    map.record(good_bytes, unreadable_bytes, SectorStatus::Unreadable)
+        .expect("record unreadable");
+    map.flush().expect("mapfile flush");
+}
+
+/// Regression: abort_on_lost_secs==0 with whole-disc unreadable bytes must
+/// still classify as Remux. Pre-fix, the coarse pre-filter would convert
+/// the whole-disc bad-byte count to estimated lost-seconds and return
+/// NotEligible whenever any unreadable bytes were present — even though those
+/// sectors might be entirely outside the main title. The real per-title check
+/// in `resume_remux` (run after `scan_image`) is the authoritative gate.
+#[test]
+fn classify_resume_allows_out_of_title_damage_when_abort_on_lost_secs_is_zero() {
+    let td = tmpdir();
+    let dir = td.path().join("MyDisc");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MyDisc.iso"), b"").unwrap();
+
+    // Disc: 50 MB total, 1 MB unreadable — enough whole-disc lost-secs
+    // to have been blocked by the old pre-filter under abort_on_lost_secs=0.
+    let total: u64 = 50 * 1024 * 1024;
+    let bad: u64 = 1024 * 1024;
+    write_mapfile_with_unreadable(&dir.join("MyDisc.iso.mapfile"), total, bad);
+
+    let hint = make_hint(
+        dir.clone(),
+        ResumeAction::ResumePreserved {
+            attempt: 1,
+            has_iso: true,
+            has_mapfile: true,
+            has_mkv: false,
+        },
+    );
+
+    // abort_on_lost_secs=0 → pre-filter must ALLOW; real decision deferred
+    // to the title-scoped check in resume_remux.
+    match classify_resume(&hint, 0) {
+        ResumeClass::Remux { display_name, .. } => {
+            assert_eq!(display_name, "MyDisc");
+        }
+        other => panic!(
+            "expected Remux (out-of-title damage should not block at pre-filter), got {:?}",
+            other
+        ),
+    }
+}
+
+/// Complementary: abort_on_lost_secs>0 keeps the coarse whole-disc
+/// pre-filter — a disc whose estimated whole-disc loss already exceeds the
+/// threshold is still rejected early (avoids scan_image overhead).
+#[test]
+fn classify_resume_rejects_heavy_damage_when_abort_on_lost_secs_positive() {
+    let td = tmpdir();
+    let dir = td.path().join("MyDisc");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MyDisc.iso"), b"").unwrap();
+
+    // Use a threshold of 1 second. The fallback bitrate is 8.25 MB/s, so
+    // 1 s ≈ 8.25 MB. Write 20 MB unreadable — well above the threshold.
+    let total: u64 = 100 * 1024 * 1024;
+    let bad: u64 = 20 * 1024 * 1024;
+    write_mapfile_with_unreadable(&dir.join("MyDisc.iso.mapfile"), total, bad);
+
+    let hint = make_hint(
+        dir,
+        ResumeAction::ResumePreserved {
+            attempt: 1,
+            has_iso: true,
+            has_mapfile: true,
+            has_mkv: false,
+        },
+    );
+
+    // abort_on_lost_secs=1 → coarse pre-filter fires; must reject.
+    assert!(
+        matches!(classify_resume(&hint, 1), ResumeClass::NotEligible),
+        "heavy whole-disc damage should be rejected as NotEligible when abort_on_lost_secs>0"
+    );
+}

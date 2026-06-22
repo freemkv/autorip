@@ -62,10 +62,17 @@ pub fn is_running() -> bool {
 
 /// Atomically claim the verify slot: while holding the lock, if a verify is
 /// already "running" bail (return false); otherwise install a "running"
-/// placeholder state and return true. This closes a TOCTOU where the previous
-/// design only set "running" *inside* the spawned thread after a slow disc
-/// scan — two triggers arriving during that window both passed the busy check
-/// and both spawned a verify against the same drive. Only the lock winner spawns.
+/// placeholder state, reset STOP_FLAG, and return true. This closes a TOCTOU
+/// where the previous design only set "running" *inside* the spawned thread
+/// after a slow disc scan — two triggers arriving during that window both
+/// passed the busy check and both spawned a verify against the same drive.
+/// Only the lock winner spawns.
+///
+/// The STOP_FLAG reset is inside the lock so it is atomic with the slot
+/// claim: a `/api/stop` call arriving between the claim and a pre-claim reset
+/// would otherwise clobber the new run's stop flag before the worker ever
+/// checked it, silently discarding the stop. Resetting here guarantees that
+/// every stop after the claim is honored and no stop before it leaks through.
 fn try_claim_running(disc_name: &str) -> bool {
     // Recover a poisoned lock rather than returning false: a panic in the
     // progress callback poisons VERIFY_STATE permanently, and a bare
@@ -78,6 +85,10 @@ fn try_claim_running(disc_name: &str) -> bool {
             return false;
         }
     }
+    // Reset STOP_FLAG while the mutex is still held so the reset and slot
+    // claim are atomic w.r.t. request_stop(): a concurrent stop cannot
+    // arrive between the claim and the reset.
+    STOP_FLAG.store(false, Ordering::Release);
     *vs = Some(VerifyState {
         status: "running".into(),
         disc_name: disc_name.into(),
@@ -98,18 +109,11 @@ pub fn run_verify(device: &str, device_path: &str, keydb_path: Option<String>) {
         return;
     }
 
-    // Clear any STOP_FLAG left over from a PRIOR verify BEFORE claiming the
-    // slot. The reset must happen before the claim, not after the spawn: once
-    // `try_claim_running` flips status to "running" the slot is visible to
-    // `/api/stop` (→ `request_stop` sets STOP_FLAG). If the worker reset the
-    // flag as its first act instead, a Stop issued in the window between the
-    // claim and the worker's reset would be silently cleared and lost. The
-    // worker only ever READS the flag, so resetting here means every stop
-    // after the claim is honored.
-    STOP_FLAG.store(false, Ordering::Relaxed);
-
     // Claim the slot synchronously BEFORE spawning so a second trigger that
     // races in (e.g. during the slow drive scan) cannot also start a verify.
+    // STOP_FLAG is reset atomically inside try_claim_running (under the same
+    // mutex that guards the slot) so no concurrent /api/stop can arrive
+    // between the slot claim and the flag reset.
     if !try_claim_running("Starting…") {
         crate::log::device_log(device, "Verify: already running");
         return;
@@ -415,11 +419,11 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Both tests below mutate the process-global `VERIFY_STATE` and one of
-    /// them deliberately poisons it, so they cannot run concurrently (the
-    /// default multi-threaded test runner would otherwise interleave them).
-    /// Serialize them on this guard. Recover from poison so a panicking test
-    /// can't wedge the guard for the other.
+    /// All tests below mutate the process-global `VERIFY_STATE` / `STOP_FLAG`
+    /// and one of them deliberately poisons the mutex, so they cannot run
+    /// concurrently (the default multi-threaded test runner would otherwise
+    /// interleave them). Serialize them on this guard. Recover from poison so a
+    /// panicking test can't wedge the guard for the others.
     static SERIAL: Mutex<()> = Mutex::new(());
 
     /// Reset `VERIFY_STATE` to a clean slot, tolerating a poisoned lock (the
@@ -456,6 +460,45 @@ mod tests {
 
         // Cleanup so we don't leave a stray "running" state for other tests.
         reset_state();
+    }
+
+    /// Regression: STOP_FLAG must be reset INSIDE try_claim_running (under the
+    /// mutex), not before it. If the reset happened before the claim, a
+    /// concurrent request_stop() arriving between the reset and the claim would
+    /// be clobbered — the new run would never see the stop.
+    ///
+    /// This test simulates the race by:
+    /// 1. Setting STOP_FLAG = true (simulating a "stop the previous run" call).
+    /// 2. Calling try_claim_running — which must reset the flag atomically.
+    /// 3. Verifying STOP_FLAG is false after the claim (the reset happened).
+    /// 4. Verifying that request_stop() AFTER the claim correctly sets it.
+    #[test]
+    fn stop_flag_reset_is_atomic_with_slot_claim() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset_state();
+
+        // Seed a stale STOP_FLAG=true (left over from a prior stopped verify).
+        STOP_FLAG.store(true, Ordering::Relaxed);
+
+        // Claim the slot. The reset must happen inside try_claim_running.
+        assert!(try_claim_running("Disc X"));
+
+        // After the claim, STOP_FLAG must be false — the new run starts clean.
+        assert!(
+            !STOP_FLAG.load(Ordering::Relaxed),
+            "STOP_FLAG must be false after try_claim_running resets it"
+        );
+
+        // A stop issued AFTER the claim must be observed.
+        request_stop();
+        assert!(
+            STOP_FLAG.load(Ordering::Relaxed),
+            "STOP_FLAG must be true after request_stop"
+        );
+
+        reset_state();
+        // Leave STOP_FLAG clean for subsequent tests.
+        STOP_FLAG.store(false, Ordering::Relaxed);
     }
 
     /// Simulate the exact failure mode the poison-recovery fix targets:

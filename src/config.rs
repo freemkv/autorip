@@ -82,16 +82,14 @@ pub struct Config {
     pub webhook_urls: Vec<String>,
     pub autorip_dir: String,
 
-    /// v0.25.7: number of threads for AACS decryption. 0 = auto (all
-    /// available cores, capped at libfreemkv's MAX_THREADS). Was the
-    /// `FREEMKV_THREADS` env var pre-0.25.7. Applied at startup and
+    /// Number of threads for AACS decryption. 0 = auto (all available
+    /// cores, capped at libfreemkv's MAX_THREADS). Applied at startup and
     /// whenever the UI POSTs a change via
     /// `libfreemkv::decrypt::set_decrypt_threads`.
     pub decrypt_threads: usize,
 
-    /// v0.25.7: how long to keep per-device `.log` files in
-    /// `$AUTORIP_DIR/logs` before the in-process prune thread
-    /// deletes them. Was the `LOG_RETENTION_DAYS` env var pre-0.25.7.
+    /// How long to keep per-device `.log` files in `$AUTORIP_DIR/logs`
+    /// before the in-process prune thread deletes them.
     pub log_retention_days: u64,
 }
 
@@ -135,9 +133,9 @@ impl std::fmt::Debug for Config {
             )
             .field("tmdb_api_key", &redact(&self.tmdb_api_key))
             .field("keydb_path", &self.keydb_path)
-            .field("keydb_url", &self.keydb_url)
+            .field("keydb_url", &redact(&self.keydb_url))
             .field("key_source", &self.key_source)
-            .field("keyserver_url", &self.keyserver_url)
+            .field("keyserver_url", &redact(&self.keyserver_url))
             .field("keyserver_secret", &redact(&self.keyserver_secret))
             .field(
                 "webhook_urls",
@@ -210,11 +208,48 @@ impl Config {
     }
 }
 
+/// True if `p` is an existing directory we can create a file in.
+fn dir_is_writable(p: &str) -> bool {
+    let probe = std::path::Path::new(p).join(".autorip-write-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resolve the base config directory. `AUTORIP_DIR` always wins. Otherwise
+/// prefer `/config` when it exists and is writable — the Docker image creates
+/// it, so the container path is unchanged. On a bare install (downloadable
+/// binary, no container mounts) fall back to `$XDG_CONFIG_HOME/autorip` or
+/// `~/.config/autorip` so `./autorip` just works without root.
+pub fn default_autorip_dir() -> String {
+    if let Ok(d) = std::env::var("AUTORIP_DIR") {
+        if !d.is_empty() {
+            return d;
+        }
+    }
+    if std::path::Path::new("/config").is_dir() && dir_is_writable("/config") {
+        return "/config".to_string();
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return format!("{xdg}/autorip");
+        }
+    }
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => format!("{h}/.config/autorip"),
+        _ => "/config".to_string(),
+    }
+}
+
 pub fn load() -> Arc<RwLock<Config>> {
     // Only the two bootstrap-only env vars are read here. Everything
     // else comes from settings.json (or Config::default if it's a
     // first boot with no settings file).
-    let autorip_dir = std::env::var("AUTORIP_DIR").unwrap_or_else(|_| "/config".to_string());
+    let autorip_dir = default_autorip_dir();
     // PORT is bootstrap-only and can't be changed after the server binds,
     // so a typo'd or out-of-range value must not be silently swallowed —
     // that would bind 8080 while the operator believes their value took
@@ -239,6 +274,32 @@ pub fn load() -> Arc<RwLock<Config>> {
         ..Config::default()
     };
     cfg = load_saved(cfg);
+
+    // Bare-run (no container): when staging/output are still the container
+    // defaults and those root paths aren't writable, relocate them under the
+    // resolved config dir so the downloadable binary runs without /staging and
+    // /output mounts. In Docker (where both exist and are writable) this is a
+    // no-op. Then ensure every dir we use exists (bootstrap normally does this
+    // in the container; bare run has no bootstrap).
+    // Use existence, NOT writability, to detect "no container mount". In Docker
+    // both dirs exist (mounted); a *transient* NFS unwritability at container
+    // start must not relocate staging/output to the config dir — that would
+    // orphan an in-progress ISO and split data across two directories. Bare run
+    // (downloadable binary, no mounts) is the only case where they don't exist.
+    if cfg.staging_dir == "/staging" && !std::path::Path::new("/staging").exists() {
+        cfg.staging_dir = format!("{}/staging", cfg.autorip_dir);
+    }
+    if cfg.output_dir == "/output" && !std::path::Path::new("/output").exists() {
+        cfg.output_dir = format!("{}/output", cfg.autorip_dir);
+    }
+    for d in [
+        cfg.log_dir(),
+        format!("{}/freemkv", cfg.autorip_dir),
+        cfg.staging_dir.clone(),
+        cfg.output_dir.clone(),
+    ] {
+        let _ = std::fs::create_dir_all(&d);
+    }
 
     // Apply the persisted decrypt thread count to libfreemkv's
     // global pool. Subsequent UI POSTs re-apply via the same fn.
@@ -354,7 +415,7 @@ fn load_saved(mut cfg: Config) -> Config {
         }
     }
     if let Some(v) = saved.get("output_format").and_then(|v| v.as_str()) {
-        if matches!(v, "mkv" | "m2ts" | "iso") {
+        if matches!(v, "mkv" | "m2ts" | "iso" | "network") {
             cfg.output_format = v.to_string();
         } else {
             tracing::warn!(value = %v, "settings.json output_format has unknown value - using default");
@@ -479,11 +540,17 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
     );
     let write_result = (|| -> std::io::Result<()> {
         use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
+        // settings.json holds secrets (tmdb_api_key, keyserver_secret, webhook
+        // tokens). Create the temp file 0600 so those bytes are never briefly
+        // world-readable before the rename publishes them.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
         f.write_all(json.as_bytes())?;
         f.sync_all()?;
         Ok(())

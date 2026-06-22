@@ -16,7 +16,10 @@ static LOGS: once_cell::sync::Lazy<Mutex<HashMap<String, VecDeque<String>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn log_dir() -> String {
-    std::env::var("AUTORIP_DIR").unwrap_or_else(|_| "/config".to_string())
+    // Same resolution as config: AUTORIP_DIR, else writable /config (Docker),
+    // else ~/.config/autorip (bare run) — so logs land somewhere writable
+    // without a container mount.
+    crate::config::default_autorip_dir()
 }
 
 /// Neutralize a device string into a safe single path component for the

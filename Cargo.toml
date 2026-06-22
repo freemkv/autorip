@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-autorip"
-version = "0.31.6"
+version = "1.0.0-rc.1"
 edition = "2024"
 rust-version = "1.86"
 license = "AGPL-3.0-only"
@@ -15,8 +15,8 @@ name = "autorip"
 path = "src/main.rs"
 
 [dependencies]
-libfreemkv = "0.31.6"
-freemkv-keysources = "0.31"
+libfreemkv = "1.0.0-rc.1"
+freemkv-keysources = "1.0.0-rc.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -49,3 +49,8 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Local build override: build against the in-tree libfreemkv (carries the mux
+# fixes — param-set re-assert, clip-boundary PTS continuity) instead of the
+# published 0.31.6. Remove once the next libfreemkv is published and the
+# dependency above is bumped to it. Mirrors freemkv/Cargo.toml's override.

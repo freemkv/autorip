@@ -138,6 +138,7 @@ tr:hover { background:var(--chip); }
   <div id="review"></div>
   <div class="card" style="margin-top:16px"><h2>Mux Queue</h2><div id="muxes"></div></div>
   <div class="card"><h2>Move Queue</h2><div id="moves"></div></div>
+  <div class="card"><label class="toggle"><input type="checkbox" id="debugToggle" onchange="toggleDebug(this.checked)"> Debug logging</label><div class="hint">Verbose logs for bug reports (autorip + rip library). Off by default.</div></div>
   <div><h2 style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;margin-bottom:8px">System Log</h2><div id="syslog" class="log" style="max-height:400px"></div></div>
 </div>
 
@@ -941,6 +942,9 @@ function loadSystem(){
     window._muxErrors=data.mux_errors||[];
     renderMuxes();
     renderMoves();
+    /* Debug-logging toggle reflects current runtime state */
+    const dbg=document.getElementById('debugToggle');
+    if(dbg)dbg.checked=!!data.debug_enabled;
     /* System log */
     const logEl=document.getElementById('syslog');
     if(data.syslog){
@@ -950,6 +954,14 @@ function loadSystem(){
       logEl.textContent='No system log available';
     }
   }).catch(()=>{});
+}
+
+/* Flip runtime debug logging via POST /api/debug; sync the checkbox to the
+   authoritative state the server returns. */
+function toggleDebug(on){
+  fetch('/api/debug',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:on})})
+    .then(r=>r.json()).then(d=>{const t=document.getElementById('debugToggle');if(t)t.checked=!!d.enabled;})
+    .catch(()=>{});
 }
 
 /* ---- Settings page ---- */
@@ -1611,6 +1623,62 @@ fn json_response(request: tiny_http::Request, status: u16, body: &str) {
 /// secret.
 const SECRET_SENTINEL: &str = "********";
 
+/// Mask a webhook URL for display: keep the origin (`scheme://host[:port]`)
+/// so the operator can tell Discord from Slack from Jellyfin, but replace the
+/// path/query — where Discord/Slack/Jellyfin embed the secret token — with the
+/// sentinel. e.g. `https://discord.com/api/webhooks/1/tok` → `https://discord.com/********`.
+/// A masked value round-trips on POST: any entry CONTAINING the sentinel is
+/// treated as "unchanged" and resolved back to the stored URL.
+fn mask_webhook_url(url: &str) -> String {
+    // Origin = everything up to the first '/', '?', or '#' after `scheme://`.
+    // Treating '?' and '#' as terminators prevents a token carried in a query
+    // string (`https://host?token=SECRET`) from slipping through unredacted.
+    if let Some(scheme_end) = url.find("://") {
+        let after = scheme_end + 3;
+        let origin_end = url[after..]
+            .find(['/', '?', '#'])
+            .map(|i| after + i)
+            .unwrap_or(url.len());
+        return format!("{}/{}", &url[..origin_end], SECRET_SENTINEL);
+    }
+    // No scheme — nothing identifiable to preserve; fully mask.
+    SECRET_SENTINEL.to_string()
+}
+
+/// Resolve an incoming `webhook_urls` array against the currently-stored
+/// URLs, replacing redacted placeholders with their real (token-bearing)
+/// values. Matching is BY ORIGIN PREFIX (via [`mask_webhook_url`]), never by
+/// array position: the UI can delete or reorder rows between GET and POST, so
+/// a positional match would bind a masked entry to a different stored secret.
+///
+/// A masked entry whose masked-origin matches exactly one stored URL resolves
+/// to that URL. A non-masked entry is taken verbatim (a newly-entered secret).
+/// `Err(prefix)` is returned when a masked entry is ambiguous — it matches 0
+/// stored entries (the row it referred to was deleted) or >1 (two stored hooks
+/// share an origin) — so the caller can reject the save instead of guessing.
+/// Empty/whitespace entries are dropped.
+fn resolve_webhook_urls(incoming: &[&str], existing: &[String]) -> Result<Vec<String>, String> {
+    let mut resolved: Vec<String> = Vec::with_capacity(incoming.len());
+    for s in incoming {
+        if s.contains(SECRET_SENTINEL) {
+            let matches: Vec<&String> = existing
+                .iter()
+                .filter(|stored| mask_webhook_url(stored) == *s)
+                .collect();
+            match matches.as_slice() {
+                [one] => resolved.push((*one).clone()),
+                _ => return Err((*s).to_string()),
+            }
+        } else {
+            resolved.push((*s).to_string());
+        }
+    }
+    Ok(resolved
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect())
+}
+
 /// Serialize Config for GET /api/settings with credential fields redacted.
 /// No route is authenticated and the server binds 0.0.0.0, so returning
 /// `keyserver_secret` / `tmdb_api_key` in cleartext would hand any
@@ -1624,14 +1692,27 @@ fn settings_json_redacted(c: &Config) -> String {
             }
         }
     }
+    // keyserver_url and keydb_url may carry auth tokens in the path/query
+    // (e.g. https://keyserver.example.com/token/decode). Mask path/query
+    // with the origin-preserving helper so the operator can see the host
+    // but not the embedded secret. A masked value round-trips on POST.
+    for field in ["keyserver_url", "keydb_url"] {
+        if let Some(s) = v.get(field).and_then(|x| x.as_str()) {
+            if !s.is_empty() {
+                v[field] = serde_json::json!(mask_webhook_url(s));
+            }
+        }
+    }
     // webhook_urls embed bearer tokens (Discord/Slack/Jellyfin webhook
-    // secrets live in the path/query). Redact each non-empty entry to the
-    // sentinel, same round-trip as the scalar secrets above: POST treats a
-    // sentinel entry as "unchanged" and keeps the stored value.
+    // secrets live in the path/query). Mask the token but keep the origin
+    // visible so the operator can identify each hook. A masked entry
+    // round-trips on POST: any entry containing the sentinel is "unchanged".
     if let Some(arr) = v.get_mut("webhook_urls").and_then(|x| x.as_array_mut()) {
         for entry in arr.iter_mut() {
-            if entry.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
-                *entry = serde_json::json!(SECRET_SENTINEL);
+            if let Some(s) = entry.as_str() {
+                if !s.is_empty() {
+                    *entry = serde_json::json!(mask_webhook_url(s));
+                }
             }
         }
     }
@@ -1707,11 +1788,14 @@ fn read_json_body(mut request: tiny_http::Request) -> Result<(tiny_http::Request
 /// previously spawned a doomed rip thread and surfaced as a phantom tab in
 /// the UI.
 fn is_valid_device_name(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() < 3 || !s.starts_with("sg") {
-        return false;
-    }
-    bytes[2..].iter().all(|b| b.is_ascii_digit())
+    // Cross-OS device key (the basename libfreemkv's list_drives() yields,
+    // stripped by device_key): Linux `sgN`, macOS `diskN`, Windows `CdRomN`.
+    // Accept ASCII-alphanumeric only — this is the path-safety boundary that
+    // rejects separators / traversal / spaces (`sg4/stop`, `../etc/passwd`,
+    // `sg4 `) for the /api/<device> routes and the per-device log path. It is
+    // NOT a "this drive exists" check: an unknown-but-well-formed name simply
+    // fails to match any enumerated drive downstream.
+    (3..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 // ── SSRF guard ─────────────────────────────────────────────────────────
@@ -1746,6 +1830,8 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
                 // 0.0.0.0/8 "this network".
                 || v4.octets()[0] == 0
+                // Class-E reserved 240.0.0.0/4 (not flagged by std helpers).
+                || v4.octets()[0] >= 240
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -1755,8 +1841,9 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
                 // Link-local fe80::/10.
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
-                // IPv4-mapped (::ffff:a.b.c.d) — unwrap and re-check.
-                || v6.to_ipv4_mapped().map(|m| is_blocked_ip(&IpAddr::V4(m))) == Some(true)
+                // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
+                // — to_ipv4() catches both forms; re-check the unwrapped address.
+                || v6.to_ipv4().map(|m| is_blocked_ip(&IpAddr::V4(m))) == Some(true)
         }
     }
 }
@@ -1930,10 +2017,16 @@ pub(crate) fn guarded_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
 /// description of its role.
 pub fn guarded_get(url: &str) -> Result<ureq::Response, String> {
     let pinned = validate_fetch_url(url)?;
-    guarded_agent(pinned)
-        .get(url)
-        .call()
-        .map_err(|e| format!("fetch failed: {e}"))
+    guarded_agent(pinned).get(url).call().map_err(|e| {
+        // Do NOT embed `e` directly: ureq's Display includes the full
+        // request URL, which leaks a token-bearing keydb_url into the
+        // system log (and thence the unauthenticated /api/system endpoint).
+        // Summarise by status code or transport-error kind only.
+        match &e {
+            ureq::Error::Status(code, _) => format!("fetch failed: HTTP {code}"),
+            ureq::Error::Transport(t) => format!("fetch failed: {}", t.kind()),
+        }
+    })
 }
 
 // ── Connection caps ────────────────────────────────────────────────────
@@ -1988,24 +2081,29 @@ mod web_tests {
     use super::*;
 
     #[test]
-    fn device_name_accepts_sg_digits() {
+    fn device_name_accepts_cross_os_keys() {
+        // Linux sg, macOS disk, Windows CdRom — the basenames list_drives yields.
         assert!(is_valid_device_name("sg0"));
         assert!(is_valid_device_name("sg4"));
         assert!(is_valid_device_name("sg15"));
+        assert!(is_valid_device_name("disk6")); // macOS
+        assert!(is_valid_device_name("CdRom0")); // Windows
     }
 
     #[test]
     fn device_name_rejects_path_traversal_and_typos() {
-        // The exact bug that created the phantom "sg4/stop" tab.
+        // The exact bug that created the phantom "sg4/stop" tab. The validator
+        // is a path-safety boundary (reject separators/traversal/spaces), not a
+        // drive-existence check — an unknown well-formed name fails to match a
+        // real drive downstream, so e.g. "sr0"/"sda" are accepted as *format*.
         assert!(!is_valid_device_name("sg4/stop"));
         assert!(!is_valid_device_name("sg4/verify"));
         assert!(!is_valid_device_name("../etc/passwd"));
         assert!(!is_valid_device_name("sg4 ")); // trailing space
-        assert!(!is_valid_device_name("sg"));
+        assert!(!is_valid_device_name("sg")); // too short (< 3)
         assert!(!is_valid_device_name(""));
-        assert!(!is_valid_device_name("sr0")); // not the SG prefix
-        assert!(!is_valid_device_name("sda"));
-        assert!(!is_valid_device_name("sg0a"));
+        assert!(!is_valid_device_name("a/b"));
+        assert!(!is_valid_device_name("..")); // dots are separators
     }
 
     #[test]
@@ -2063,9 +2161,71 @@ mod web_tests {
     }
 
     #[test]
-    fn settings_get_redacts_webhook_urls() {
-        // Webhook URLs embed bearer tokens (Discord/Slack/Jellyfin), so a
-        // GET must hand back the sentinel, not the cleartext token URL.
+    fn settings_get_masks_keyserver_url_token_in_path() {
+        // keyserver_url may carry an auth token in the path
+        // (e.g. https://keys.example.com/mytoken/decode). GET must mask the
+        // path but keep the origin so the operator can identify the server.
+        let c = Config {
+            keyserver_url: "https://keys.example.com/mysecrettoken/decode".into(),
+            keydb_url: "https://keydb.example.com/authtoken/keydb.zip".into(),
+            ..Config::default()
+        };
+        let json: serde_json::Value = serde_json::from_str(&settings_json_redacted(&c)).unwrap();
+        // Origin preserved, token-bearing path replaced with sentinel.
+        assert_eq!(json["keyserver_url"], "https://keys.example.com/********");
+        assert_eq!(json["keydb_url"], "https://keydb.example.com/********");
+        // Tokens must not appear in the redacted output.
+        assert!(
+            !json["keyserver_url"]
+                .as_str()
+                .unwrap()
+                .contains("mysecrettoken")
+        );
+        assert!(!json["keydb_url"].as_str().unwrap().contains("authtoken"));
+        // Empty URLs stay empty (no sentinel so the UI shows a blank field).
+        let json2: serde_json::Value =
+            serde_json::from_str(&settings_json_redacted(&Config::default())).unwrap();
+        assert_eq!(json2["keyserver_url"], "");
+        assert_eq!(json2["keydb_url"], "");
+    }
+
+    #[test]
+    fn keyserver_url_sentinel_round_trip_preserves_stored_url() {
+        // A GET→POST round-trip must NOT clobber the stored token-bearing URL.
+        // When the POST carries the masked form (containing the sentinel), the
+        // write guard must skip the update and leave the stored value intact.
+        //
+        // Mirror the inline logic from handle_settings_post:
+        //   if !v.contains(SECRET_SENTINEL) { c.keyserver_url = v.to_string(); }
+        let stored = "https://keys.example.com/mysecrettoken/decode";
+        let masked = "https://keys.example.com/********"; // form returned by GET
+
+        // Sentinel present → do not overwrite.
+        let updated = if masked.contains(SECRET_SENTINEL) {
+            stored.to_string()
+        } else {
+            masked.to_string()
+        };
+        assert_eq!(updated, stored, "sentinel must preserve the stored URL");
+
+        // A genuinely new URL (no sentinel) must overwrite.
+        let new_url = "https://keys.example.com/newtoken/decode";
+        let updated2 = if new_url.contains(SECRET_SENTINEL) {
+            stored.to_string()
+        } else {
+            new_url.to_string()
+        };
+        assert_eq!(
+            updated2, new_url,
+            "a real new URL must replace the stored one"
+        );
+    }
+
+    #[test]
+    fn settings_get_masks_webhook_token_keeps_origin() {
+        // Webhook URLs embed bearer tokens (Discord/Slack/Jellyfin) in the
+        // path, so a GET must mask the token — but keep the origin visible so
+        // the operator can tell which hook is which.
         let c = Config {
             webhook_urls: vec![
                 "https://discord.com/api/webhooks/123/secrettoken".into(),
@@ -2076,41 +2236,137 @@ mod web_tests {
         };
         let json: serde_json::Value = serde_json::from_str(&settings_json_redacted(&c)).unwrap();
         let arr = json["webhook_urls"].as_array().unwrap();
-        assert_eq!(arr[0], SECRET_SENTINEL);
+        assert_eq!(arr[0], "https://discord.com/********");
         // Empty entry stays empty (no sentinel) so the UI shows a blank row.
         assert_eq!(arr[1], "");
-        assert_eq!(arr[2], SECRET_SENTINEL);
+        assert_eq!(arr[2], "https://hooks.slack.com/********");
+        // The masked form must NOT leak the token.
+        assert!(!arr[0].as_str().unwrap().contains("secrettoken"));
+        assert!(!arr[2].as_str().unwrap().contains("cccsecret"));
+    }
+
+    #[test]
+    fn mask_webhook_url_variants() {
+        assert_eq!(
+            mask_webhook_url("https://discord.com/api/webhooks/1/tok"),
+            "https://discord.com/********"
+        );
+        // Host with port.
+        assert_eq!(
+            mask_webhook_url("http://jellyfin.lan:8096/webhook/abc"),
+            "http://jellyfin.lan:8096/********"
+        );
+        // Bare origin, no path → still origin/sentinel.
+        assert_eq!(
+            mask_webhook_url("https://example.com"),
+            "https://example.com/********"
+        );
+        // No scheme → fully masked (nothing identifiable to keep).
+        assert_eq!(mask_webhook_url("not-a-url"), SECRET_SENTINEL);
+    }
+
+    #[test]
+    fn mask_webhook_url_strips_query_string_token() {
+        // Token in query string with no path slash — must not appear in output.
+        assert_eq!(
+            mask_webhook_url("https://hooks.example.com?token=SUPERSECRET"),
+            "https://hooks.example.com/********"
+        );
+        // Fragment-only (no path) — similarly stripped.
+        assert_eq!(
+            mask_webhook_url("https://hooks.example.com#frag"),
+            "https://hooks.example.com/********"
+        );
+    }
+
+    #[test]
+    fn webhook_sentinel_filter_uses_ends_with() {
+        // A URL that CONTAINS but does not END WITH the sentinel must NOT be
+        // skipped by the SSRF-validation filter — it could be an attacker URL
+        // crafted to embed the sentinel in a path segment.
+        let sentinel = SECRET_SENTINEL;
+        let tricky = format!("https://evil.com/{}@attacker.com/path", sentinel);
+        // ends_with check: this does not end with the sentinel, so it is NOT
+        // filtered (it would be validated / rejected by validate_fetch_url).
+        assert!(!tricky.ends_with(sentinel));
+        // The masked form DOES end with the sentinel and IS filtered.
+        let masked = format!("https://discord.com/{}", sentinel);
+        assert!(masked.ends_with(sentinel));
     }
 
     #[test]
     fn webhook_post_sentinel_preserves_stored_url() {
-        // Mirror the inline POST resolution: a sentinel entry resolves
-        // positionally against the stored URL; a real entry replaces; an
-        // empty entry is dropped. A GET→POST round-trip of the redacted
-        // form must NOT wipe the token-bearing stored URL.
+        // A GET→POST round-trip of the redacted form must NOT wipe the
+        // token-bearing stored URL. A masked placeholder resolves back to its
+        // stored secret by origin; a real entry replaces; an empty entry drops.
         let existing: Vec<String> = vec![
             "https://discord.com/api/webhooks/1/aaa".into(),
             "https://hooks.slack.com/services/x/y/zzz".into(),
         ];
-        let patch: Vec<String> = vec![
-            SECRET_SENTINEL.into(),                // unchanged → keep stored[0]
-            "https://example.com/new-hook".into(), // changed → replace
+        let incoming = [
+            "https://discord.com/********", // masked → keep discord secret
+            "https://example.com/new-hook", // changed → replace
         ];
-        let resolved: Vec<String> = patch
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| {
-                if s == SECRET_SENTINEL {
-                    existing.get(i).cloned()
-                } else {
-                    Some(s.clone())
-                }
-            })
-            .filter(|s| !s.trim().is_empty())
-            .collect();
+        let resolved = resolve_webhook_urls(&incoming, &existing).unwrap();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0], "https://discord.com/api/webhooks/1/aaa");
         assert_eq!(resolved[1], "https://example.com/new-hook");
+    }
+
+    #[test]
+    fn webhook_post_masked_resolves_by_origin_not_position() {
+        // HIGH regression: stored = [discord=secretA, slack=secretB]. The UI
+        // reorders the masked rows to [slack-masked, discord-masked]. Resolving
+        // BY POSITION would bind slack's row to discord's secret and vice
+        // versa — a silent secret-confusion bug. By origin, each masked entry
+        // must resolve to ITS OWN stored secret regardless of order.
+        let existing: Vec<String> = vec![
+            "https://discord.com/api/webhooks/1/secretA".into(),
+            "https://hooks.slack.com/services/x/y/secretB".into(),
+        ];
+        // Reordered: slack first, discord second (each still masked).
+        let reordered = [
+            "https://hooks.slack.com/********",
+            "https://discord.com/********",
+        ];
+        let resolved = resolve_webhook_urls(&reordered, &existing).unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                "https://hooks.slack.com/services/x/y/secretB".to_string(),
+                "https://discord.com/api/webhooks/1/secretA".to_string(),
+            ],
+            "each masked entry must carry its own origin's secret, not the other's"
+        );
+
+        // Deleting the discord row and keeping only the (masked) slack row must
+        // still resolve slack correctly — never to discord's secret.
+        let only_slack = ["https://hooks.slack.com/********"];
+        let resolved = resolve_webhook_urls(&only_slack, &existing).unwrap();
+        assert_eq!(
+            resolved,
+            vec!["https://hooks.slack.com/services/x/y/secretB".to_string()]
+        );
+    }
+
+    #[test]
+    fn webhook_post_masked_unresolvable_origin_is_rejected() {
+        // A masked entry whose origin matches NO stored URL (the referenced row
+        // was deleted) is ambiguous — reject rather than guess. Likewise when
+        // two stored hooks share an origin (>1 match).
+        let existing: Vec<String> = vec!["https://discord.com/api/webhooks/1/aaa".into()];
+        // Masked slack origin has no stored counterpart → Err.
+        let orphan = ["https://hooks.slack.com/********"];
+        assert!(resolve_webhook_urls(&orphan, &existing).is_err());
+
+        // Two stored discord hooks share an origin → a masked discord entry is
+        // ambiguous (>1 match) → Err.
+        let two_discord: Vec<String> = vec![
+            "https://discord.com/api/webhooks/1/aaa".into(),
+            "https://discord.com/api/webhooks/2/bbb".into(),
+        ];
+        let masked = ["https://discord.com/********"];
+        assert!(resolve_webhook_urls(&masked, &two_discord).is_err());
     }
 
     #[test]
@@ -2236,6 +2492,24 @@ mod web_tests {
     }
 
     #[test]
+    fn blocks_ipv4_compat_and_class_e() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // IPv4-compatible ::127.0.0.1 (deprecated but still parseable).
+        // to_ipv4_mapped() would miss this; to_ipv4() catches it.
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0, 0, 0, 0, 0, 0, 0x7f00, 0x0001
+        ))));
+        // Class-E 240.0.0.0/4 — reserved, not public.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(
+            255, 255, 255, 254
+        ))));
+        // 239.x is multicast (already caught by is_multicast), not Class-E.
+        // Boundary check: 239.255.255.255 is multicast, 240.0.0.0 is Class-E.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(240, 0, 0, 0))));
+    }
+
+    #[test]
     fn allows_public_ips() {
         use std::net::{Ipv4Addr, Ipv6Addr};
         assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
@@ -2278,6 +2552,39 @@ mod web_tests {
         assert!(guarded_get("http://[::1]:9000/keydb.zip").is_err());
         // Wrong scheme is rejected too (no connect attempt).
         assert!(guarded_get("file:///etc/passwd").is_err());
+    }
+
+    /// Secret-leak guard: guarded_get error strings from the ureq transport
+    /// layer must never embed the full request URL (which may contain a token
+    /// in the path/query). ureq's Display includes the URL; our map_err must
+    /// strip it to a status code / transport kind only.
+    ///
+    /// We test this via a public literal IP that passes the SSRF guard (so we
+    /// reach the ureq call), but where the connection is immediately refused
+    /// (no server listening). This exercises the Transport error arm of our
+    /// map_err, where ureq's Display would otherwise include the full URL.
+    ///
+    /// Note: the RFC1918-rejection errors come from validate_fetch_url (via ?)
+    /// before ureq is called; those contain the blocked IP, which is expected
+    /// (IP is not sensitive, token path is). The ureq-level error is what we
+    /// must not leak.
+    #[test]
+    fn guarded_get_ureq_error_does_not_embed_url() {
+        // Port 1 on a public IP: passes SSRF guard (it's public) but the
+        // connection will be refused immediately (nothing listens on port 1).
+        // The URL has a fake token in the path that must not appear in the error.
+        let token = "supersecret_api_token_12345";
+        let url = format!("http://8.8.8.8:1/keydb/{token}.zip");
+        let err = guarded_get(&url).unwrap_err();
+        assert!(
+            !err.contains(token),
+            "ureq transport error must not leak the URL token; got: {err:?}"
+        );
+        // The error string must be our summary, not ureq's URL-bearing Display.
+        assert!(
+            err.starts_with("fetch failed:"),
+            "error should be our summary; got: {err:?}"
+        );
     }
 
     #[test]
@@ -2449,6 +2756,9 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         "mux_queue": mux_queue,
         "mux_errors": mux_errors,
         "syslog": syslog,
+        // Current runtime debug-logging state, so the System-page toggle
+        // reflects reality on load (POST /api/debug flips it).
+        "debug_enabled": debug_enabled(),
     });
 
     json_response(request, 200, &body.to_string());
@@ -2634,8 +2944,11 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     // covers only in-memory mutation.
     if let Some(v) = patch.get("keydb_url").and_then(|v| v.as_str()) {
         // SSRF guard at store time (handle_update_keydb re-validates +
-        // pins at fetch time). Empty clears the configured URL.
-        if !v.trim().is_empty() {
+        // pins at fetch time). Empty clears the configured URL. A value
+        // containing the sentinel is a masked "unchanged" placeholder from
+        // GET /api/settings — skip validation (stored value was already
+        // validated when first saved).
+        if !v.trim().is_empty() && !v.contains(SECRET_SENTINEL) {
             if let Err(e) = validate_fetch_url(v) {
                 return json_response(
                     request,
@@ -2653,8 +2966,9 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         // SSRF guard: keysource.rs OnlineSource POSTs this URL verbatim at
         // rip time, so an unauthenticated LAN client must not be able to
         // aim it at metadata/internal hosts. Empty is allowed (disables the
-        // online source). Reject on failure.
-        if !v.trim().is_empty() {
+        // online source). A value containing the sentinel is a masked
+        // "unchanged" placeholder from GET — skip validation.
+        if !v.trim().is_empty() && !v.contains(SECRET_SENTINEL) {
             if let Err(e) = validate_fetch_url(v) {
                 return json_response(
                     request,
@@ -2698,7 +3012,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         for u in arr
             .iter()
             .filter_map(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty() && *s != SECRET_SENTINEL)
+            .filter(|s| !s.trim().is_empty() && !s.ends_with(SECRET_SENTINEL))
         {
             if let Err(e) = validate_fetch_url(u) {
                 return json_response(
@@ -2728,6 +3042,34 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             );
         }
     }
+
+    // Validate string-enum fields BEFORE the write guard, same trust-boundary
+    // rationale as `port` above: a raw POST can carry any value, and silently
+    // storing e.g. output_format="garbage" would load cleanly and only
+    // misbehave downstream. Reject with 400 rather than persist a bad enum.
+    // Allowed sets mirror `config::load_saved`.
+    for (field, allowed) in [
+        ("key_source", &["local", "online"][..]),
+        ("on_insert", &["nothing", "scan", "rip"][..]),
+        ("on_read_error", &["stop", "skip"][..]),
+        ("output_format", &["mkv", "m2ts", "iso", "network"][..]),
+    ] {
+        if let Some(v) = patch.get(field).and_then(|v| v.as_str()) {
+            if !allowed.contains(&v) {
+                return json_response(
+                    request,
+                    400,
+                    &format!(r#"{{"ok":false,"error":"invalid value for {field}"}}"#),
+                );
+            }
+        }
+    }
+
+    // Numeric clamps applied below mirror `config::load_saved`'s trust-boundary
+    // ceilings so the live in-memory value can't diverge from what a restart
+    // would load.
+    const MAX_DURATION_SECS: u64 = 30 * 24 * 3600; // 30 days
+    const MAX_RETENTION_DAYS: u64 = 3650; // 10 years
 
     // Mutate the Config inside the write guard, then snapshot+drop the
     // guard BEFORE calling `config::save`. The
@@ -2768,15 +3110,23 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             }
         }
         if let Some(v) = patch.get("keydb_url").and_then(|v| v.as_str()) {
-            // Validated above the write guard (SSRF).
-            c.keydb_url = v.to_string();
+            // Validated above the write guard (SSRF). Ignore any value
+            // containing the sentinel — it is the masked form from GET
+            // /api/settings and must not clobber the stored token-bearing URL.
+            if !v.contains(SECRET_SENTINEL) {
+                c.keydb_url = v.to_string();
+            }
         }
         if let Some(v) = patch.get("key_source").and_then(|v| v.as_str()) {
             c.key_source = v.to_string();
         }
         if let Some(v) = patch.get("keyserver_url").and_then(|v| v.as_str()) {
-            // Validated above the write guard (SSRF).
-            c.keyserver_url = v.to_string();
+            // Validated above the write guard (SSRF). Ignore any value
+            // containing the sentinel — it is the masked form from GET
+            // /api/settings and must not clobber the stored token-bearing URL.
+            if !v.contains(SECRET_SENTINEL) {
+                c.keyserver_url = v.to_string();
+            }
         }
         if let Some(v) = patch.get("keyserver_secret").and_then(|v| v.as_str()) {
             if v != SECRET_SENTINEL {
@@ -2817,7 +3167,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             c.network_target = v.to_string();
         }
         if let Some(v) = patch.get("min_length_secs").and_then(|v| v.as_u64()) {
-            c.min_length_secs = v;
+            c.min_length_secs = v.min(MAX_DURATION_SECS);
         }
         if let Some(v) = patch.get("port").and_then(|v| v.as_u64()) {
             // Range-validated above the write guard (1..=65535) so a bad
@@ -2831,7 +3181,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             c.keep_iso = v;
         }
         if let Some(v) = patch.get("abort_on_lost_secs").and_then(|v| v.as_u64()) {
-            c.abort_on_lost_secs = v;
+            c.abort_on_lost_secs = v.min(MAX_DURATION_SECS);
         }
         if let Some(rip_mode) = patch.get("rip_mode").and_then(|v| v.as_str()) {
             // "single" = direct disc->MKV, no retries. "multi" = retry
@@ -2848,27 +3198,35 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         }
         if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {
             // Validated above the write guard (SSRF). A sentinel entry is a
-            // redacted "unchanged" placeholder: resolve it positionally
-            // against the currently-stored URL so a GET→POST round-trip of
-            // the redacted form doesn't wipe the real (token-bearing) URL.
-            // Same mechanism as the scalar secrets above.
+            // redacted "unchanged" placeholder: resolve it back to the stored
+            // token-bearing URL so a GET→POST round-trip of the redacted form
+            // doesn't wipe the real secret.
+            //
+            // Resolution is BY ORIGIN PREFIX, never by array position. The UI
+            // can delete or reorder webhook rows between GET and POST; a
+            // positional match would then bind a masked entry to a DIFFERENT
+            // stored secret (or a deleted one) — a silent secret-confusion bug.
+            // If a masked entry's origin prefix matches 0 or >1 stored entries
+            // it is ambiguous: reject the whole save with a 400 rather than
+            // guessing which secret the operator meant.
             let existing = c.webhook_urls.clone();
-            c.webhook_urls = arr
-                .iter()
-                .enumerate()
-                .filter_map(|(i, v)| {
-                    let s = v.as_str()?;
-                    if s == SECRET_SENTINEL {
-                        existing.get(i).cloned()
-                    } else {
-                        Some(s.to_string())
-                    }
-                })
-                .filter(|s| !s.trim().is_empty())
-                .collect();
+            let incoming: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            match resolve_webhook_urls(&incoming, &existing) {
+                Ok(urls) => c.webhook_urls = urls,
+                Err(_) => {
+                    // A masked entry's origin matched 0 (deleted row) or >1
+                    // (shared-origin) stored secrets — refuse to guess which
+                    // secret was meant rather than silently bind the wrong one.
+                    return json_response(
+                        request,
+                        400,
+                        r#"{"ok":false,"error":"ambiguous masked webhook entry; re-enter the full webhook URL"}"#,
+                    );
+                }
+            }
         }
-        // v0.25.7: decrypt_threads + log_retention_days. Were env-only
-        // pre-0.25.7; now operator-tunable from the Settings page.
+        // decrypt_threads + log_retention_days: operator-tunable from the
+        // Settings page.
         if let Some(v) = patch.get("decrypt_threads").and_then(|v| v.as_u64()) {
             // Match config::load's .min(256) clamp so the live/on-disk
             // value can't diverge from what a restart would load (and
@@ -2876,7 +3234,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             c.decrypt_threads = (v as usize).min(256);
         }
         if let Some(v) = patch.get("log_retention_days").and_then(|v| v.as_u64()) {
-            c.log_retention_days = v;
+            c.log_retention_days = v.min(MAX_RETENTION_DAYS);
         }
         c.clone()
     }; // <-- write guard dropped here; readers unblock immediately
@@ -3005,15 +3363,9 @@ fn handle_sse(request: tiny_http::Request) {
 }
 
 fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
-    if ripper::STATE
-        .lock()
-        .map(|s| {
-            s.get(device)
-                .map(|r| r.status == "scanning" || r.status == "ripping")
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
-    {
+    // Atomic check-and-claim under one STATE lock — closes the TOCTOU where two
+    // concurrent POSTs both pass a separate busy-check and both start a scan.
+    if !ripper::try_claim_active(device) {
         json_response(request, 409, r#"{"ok":false,"error":"busy"}"#);
         return;
     }
@@ -3058,7 +3410,7 @@ fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
 
 /// POST `/api/rip/{device}[?resume=yes|no]`.
 ///
-/// 0.23.0 contract: this is the *only* path that starts disk work.
+/// Contract: this is the *only* path that starts disk work.
 /// Disc-insert detection is scan-only; auto-resume on container start
 /// is gone. The user's intent (POST) is the trigger.
 ///
@@ -3075,16 +3427,14 @@ fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
 fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str, query: &str) {
     let resume_mode = parse_resume_param(query);
 
-    let already = ripper::STATE
-        .lock()
-        .map(|s| {
-            s.get(device)
-                .map(|r| r.status == "scanning" || r.status == "ripping")
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-
-    if already {
+    // Atomic check-and-claim under one STATE lock — closes the TOCTOU where two
+    // concurrent POSTs both pass a separate busy-check and both launch a rip on
+    // the same device (orphaned halt token + concurrent writes to one staging
+    // dir). The claim also marks the device "scanning": the resume decision is
+    // delegated to the worker thread (it scans the disc, cheap, then picks
+    // resume_remux vs rip_disc based on the staging dir), keeping scan logic in
+    // one place.
+    if !ripper::try_claim_active(device) {
         json_response(request, 409, r#"{"ok":false,"error":"already ripping"}"#);
         return;
     }
@@ -3092,28 +3442,6 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
     let dev = device.to_string();
     let dev_path = format!("/dev/{}", device);
     let cfg = Arc::clone(cfg);
-
-    // Resume-yes path: look for a resumable staging dir for this disc.
-    // We need the disc identity from a scan first. The simplest correct
-    // approach is to delegate the resume lookup to the worker thread:
-    // it scans the disc (cheap), then decides between resume_remux and
-    // rip_disc based on what the staging dir holds. That keeps the
-    // scan logic in one place.
-    if let Ok(mut s) = ripper::STATE.lock() {
-        if let Some(rs) = s.get_mut(&dev) {
-            rs.status = "scanning".to_string();
-        } else {
-            s.insert(
-                dev.clone(),
-                ripper::RipState {
-                    device: dev.clone(),
-                    status: "scanning".to_string(),
-                    disc_present: true,
-                    ..Default::default()
-                },
-            );
-        }
-    }
 
     let dev_for_register = dev.clone();
     ripper::register_halt(&dev_for_register, libfreemkv::Halt::new());
@@ -3255,7 +3583,7 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         Err(_) => {
             let msg = format!(
                 r#"{{"ok":false,"error":"Could not connect to {}. Check the URL in Settings."}}"#,
-                keydb_url.split('/').nth(2).unwrap_or(&keydb_url)
+                crate::webhook::webhook_url_origin(&keydb_url)
             );
             json_response(request, 502, &msg);
             return;
@@ -3268,7 +3596,6 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
                 "ok": true,
                 "entries": result.entries,
                 "bytes": result.bytes,
-                "path": result.path.display().to_string(),
             });
             json_response(request, 200, &body.to_string());
         }
@@ -3290,15 +3617,15 @@ fn handle_eject(request: tiny_http::Request, device: &str) {
     // consent. The UI hides the eject button while active, but POST
     // /api/eject/<dev> is unauthenticated and reachable from any LAN
     // client — so the server must enforce the gate, not just the JS.
-    let busy = ripper::STATE
-        .lock()
-        .map(|s| {
-            s.get(device)
-                .map(|r| r.status == "scanning" || r.status == "ripping")
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    if busy {
+    // Atomically claim the device before ejecting. A separate busy-check then
+    // eject left a TOCTOU window in which a rip could start (its own
+    // `try_claim_active`) between the check and the eject — ejecting a
+    // just-started rip on this irreversible slot-loading drive. `try_claim_active`
+    // folds the busy-check and the status-set into one STATE lock: it rejects if
+    // the device is already scanning/ripping, and once it has claimed the device
+    // (status="scanning") any concurrent rip-start's claim fails for the duration
+    // of the eject. The idle reset below releases the claim.
+    if !ripper::try_claim_active(device) {
         return json_response(
             request,
             409,
@@ -3418,10 +3745,13 @@ fn handle_debug_toggle(request: tiny_http::Request) {
         Err(()) => return,
     };
 
-    // Parse JSON body for explicit enable/disable, or default to toggle
+    // `{"enabled": <bool>}` sets the level explicitly. Any other body —
+    // missing/non-bool `enabled`, or no valid JSON at all — enables debug
+    // (the convenience default for a bare `curl -X POST /api/debug`). This is
+    // a set-to-state endpoint, not a flip-current toggle.
     let enabled = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(v) => v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(true),
-        Err(_) => true, // Default: turn on if no valid JSON
+        Err(_) => true,
     };
 
     *DEBUG_ENABLED

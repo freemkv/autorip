@@ -1,5 +1,69 @@
 # Changelog
 
+## [1.0.0-rc.1] - UNRELEASED
+
+First release candidate for 1.0.
+
+### Added
+
+- **DVD/CSS support.** autorip rips and muxes CSS-protected DVDs end-to-end.
+  AACS key resolution is skipped for DVDs; the CSS title key is recovered
+  keylessly from the swept disc by libfreemkv's Stevenson attack. No
+  `keydb.cfg` is required for DVDs.
+- **Bare-run mode.** `autorip` (or `autorip serve`) runs the daemon directly
+  with no container bootstrap, storing config under `~/.config/autorip`. Useful
+  for the downloadable static binary on a bare Linux host. See `INSTALL.md` for
+  install instructions, non-root drive access via the `cdrom` group or a udev
+  rule, and a hardened systemd unit.
+- **Static-binary releases.** Each tagged release attaches
+  `autorip-x86_64-linux` and `autorip-aarch64-linux` static binaries with a
+  `.sha256` checksum, alongside the existing Docker image.
+- **Runtime debug-logging toggle.** `POST /api/debug {"enabled":true/false}`
+  swaps the active tracing filter without a container restart, surfacing
+  libfreemkv debug events (mux stalls, sector retries) in `docker logs`.
+- **`.completed` restart guard.** The muxer checks for a `.completed` marker
+  before re-processing a staging directory, so a container restart cannot
+  trigger a duplicate mux on a disc that already finished successfully.
+
+### Changed
+
+- Built on libfreemkv 1.0.0-rc.1, inheriting correct DVD MPEG-2 muxing,
+  HEVC/H.264/VC-1 param-set keyframe correctness, short-read rejection, and
+  `BlockDuration` timescale fix. Output MKVs record `freemkv 1.0.0-rc.1` in
+  their Writing-application field.
+- `Config` implements a manual `Debug` that redacts `tmdb_api_key`,
+  `keydb_url`, `keyserver_url`, and `keyserver_secret`, so diagnostic log
+  output does not leak secrets.
+- Staging-directory relocation at startup uses existence (`Path::exists`) to
+  decide whether `/staging` is mounted, not a write probe. A transient NFS
+  hiccup at container start no longer orphans an in-progress ISO by relocating
+  staging to the config directory mid-rip.
+
+### Fixed
+
+- `POST /api/stop` during the mux phase no longer quarantines a resumable disc
+  as `.failed`. Stop-versus-failure is now classified on typed error variants
+  (`Halted`, `PipelineJoinTimeout`, `PipelineConsumerPanicked`) rather than
+  error-message strings, so a routine operator stop keeps the disc resumable.
+- Abort-on-loss after retries are exhausted now writes a `.failed` staging
+  marker, preventing the muxer from retrying a disc that was deliberately
+  abandoned due to unrecoverable data loss.
+- The eject-then-clear-session sequence is now performed atomically under the
+  device lock, eliminating a TOCTOU race where a disc insert between eject and
+  state clear could produce a stale session.
+- `/api/settings` POST validates string-enum fields (including `output_format`,
+  `on_insert`, and `on_read_error`) and applies numeric clamps, rejecting
+  malformed values before mutating the in-memory config.
+- Mux staging-directory scan handles `DirEntry` I/O errors per-entry (logs and
+  skips) instead of aborting the entire scan on a single unreadable entry.
+
+### Security
+
+- CSS disc/title keys inherited from libfreemkv are redacted in autorip's logs
+  (logged as `<redacted>` with a 1-byte fingerprint).
+- `settings.json` is persisted with owner-only (0600) permissions, since it
+  may hold `keyserver_secret` and `tmdb_api_key`.
+
 ## 0.31.1 (2026-06-08)
 
 - Builds against libfreemkv 0.31.1, which fixes the UDF Long-AD extent read.

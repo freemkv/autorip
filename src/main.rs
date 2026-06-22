@@ -39,8 +39,9 @@ fn main() {
             println!(
                 "autorip {} — automated optical-disc rip service\n\n\
                  Usage:\n  \
-                   autorip                  Run the daemon (env-var driven)\n  \
-                   autorip --bootstrap      Initialize container env, then run the daemon\n  \
+                   autorip                  Run the daemon (bare — config under ~/.config/autorip)\n  \
+                   autorip serve            Same as no-arg: run the daemon without container bootstrap\n  \
+                   autorip --bootstrap      Initialize container env (NFS mount), then run the daemon\n  \
                    autorip --healthcheck    Probe http://127.0.0.1:$PORT/api/state (exit 0/1)\n  \
                    autorip --version        Print version and exit",
                 env!("CARGO_PKG_VERSION")
@@ -50,9 +51,19 @@ fn main() {
         Some("--bootstrap") => {
             // Bootstrap then fall through to the daemon below. Errors
             // are logged but non-fatal — the daemon's panic hook will
-            // catch anything genuinely catastrophic later.
+            // catch anything genuinely catastrophic later. Container-init
+            // is Linux-only; on macOS/Windows this is a no-op and the
+            // daemon runs directly.
+            #[cfg(unix)]
             run_bootstrap();
+            #[cfg(not(unix))]
+            eprintln!("autorip: --bootstrap is Linux-only; running the daemon directly");
         }
+        // Bare run (no Docker): run the daemon WITHOUT the container bootstrap
+        // (no NFS mount, no chown, no /staging). Config/staging/output default
+        // under ~/.config/autorip (see config::default_autorip_dir). `serve`
+        // is an explicit alias for the bare no-arg invocation.
+        Some("serve") => {}
         Some(other) => {
             eprintln!("autorip: unknown argument '{other}' (try --help)");
             std::process::exit(2);
@@ -173,7 +184,10 @@ fn main() {
                         Err(e) => log::syslog(&format!("KEYDB download read failed: {e}")),
                     }
                 }
-                Err(e) => log::syslog(&format!("KEYDB download failed: {e}")),
+                Err(e) => log::syslog(&format!(
+                    "KEYDB download failed for {}: {e}",
+                    crate::webhook::webhook_url_origin(&url)
+                )),
             }
         }
     }
@@ -228,7 +242,7 @@ fn main() {
                 if online || url.is_empty() {
                     continue;
                 }
-                tracing::info!(url = %url, "keydb: starting daily update");
+                tracing::info!(url_origin = %crate::webhook::webhook_url_origin(&url), "keydb: starting daily update");
                 // SSRF-guarded fetch (see web::guarded_get) — the daily
                 // refresh must not bypass the address allow-list that the
                 // settings save and manual update already enforce.
@@ -251,7 +265,10 @@ fn main() {
                             tracing::warn!("keydb: response read failed");
                         }
                     }
-                    Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
+                    Err(e) => log::syslog(&format!(
+                        "KEYDB update failed for {}: {e}",
+                        crate::webhook::webhook_url_origin(&url)
+                    )),
                 }
             }
             tracing::info!("keydb update thread stopping");
@@ -434,6 +451,11 @@ fn run_healthcheck() -> i32 {
 /// non-fatal — a transient mount failure shouldn't trip the
 /// restart loop; the mover will simply fail to write to the empty
 /// dir until the next container start retries the mount.
+///
+/// Linux-only: it manipulates `/etc/passwd`, chowns the working dirs, and
+/// mounts NFS — all container-init concerns that don't exist on macOS or
+/// Windows, where the daemon runs directly. cfg-gated out of those builds.
+#[cfg(unix)]
 fn run_bootstrap() {
     use std::io::Write;
     use std::os::unix::fs::symlink;
@@ -620,6 +642,7 @@ fn is_valid_username(user: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
+#[cfg(unix)]
 fn ensure_user_entry(user: &str) {
     use std::io::Write;
     let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
@@ -636,6 +659,7 @@ fn ensure_user_entry(user: &str) {
     }
 }
 
+#[cfg(unix)]
 fn chown_recursive(path: &std::path::Path, user: &str) -> std::io::Result<()> {
     use std::ffi::CString;
     let c_user =

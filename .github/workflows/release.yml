@@ -64,10 +64,24 @@ jobs:
   build:
     needs: verify
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            asset: autorip-x86_64-linux
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            asset: autorip-aarch64-linux
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            asset: autorip-x86_64-macos
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset: autorip-aarch64-macos
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            asset: autorip-x86_64-windows.exe
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -85,6 +99,7 @@ jobs:
           shared-key: autorip-release-${{ matrix.target }}
 
       - name: Install musl cross-compilation tools
+        if: contains(matrix.target, 'linux-musl')
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-x86-64-linux-gnu musl-tools
@@ -119,21 +134,52 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cross build --locked --release --target ${{ matrix.target }}
 
-      - name: Build (cross)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cross build --locked --release --target ${{ matrix.target }}
+      # macOS (x86_64 + aarch64) and Windows build natively on their own
+      # runners — no cross toolchain. libfreemkv's IOKit (macOS) and SPTI
+      # (Windows) SCSI transports compile here; autorip's Linux-only service
+      # glue (udev rip-on-insert, container bootstrap) is cfg-gated so `serve`
+      # runs on every platform via the polling drive watcher.
+      - name: Build (native, macOS/Windows)
+        if: runner.os != 'Linux'
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
+          # Versioned + unversioned tarballs (existing convention).
           tar czf "../../../autorip-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" autorip
           tar czf "../../../autorip-${{ matrix.target }}.tar.gz" autorip
+          cd ../../..
+          # Plain, runnable binary asset (download → chmod +x → run).
+          cp "target/${{ matrix.target }}/release/autorip" "${{ matrix.asset }}"
+          chmod +x "${{ matrix.asset }}"
+          # sha256 checksums for every asset this matrix leg uploads.
+          shasum -a 256 \
+            "autorip-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" \
+            "autorip-${{ matrix.target }}.tar.gz" \
+            "${{ matrix.asset }}" \
+            > "${{ matrix.asset }}.sha256"
 
-      - name: Upload tarball to release
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/autorip.exe" -DestinationPath "autorip-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/autorip.exe" -DestinationPath "autorip-${{ matrix.target }}.zip"
+          # Plain, runnable binary asset.
+          Copy-Item "target/${{ matrix.target }}/release/autorip.exe" "${{ matrix.asset }}"
+          $h = Get-FileHash -Algorithm SHA256 "${{ matrix.asset }}"
+          "$($h.Hash.ToLower())  ${{ matrix.asset }}" | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
+
+      - name: Upload assets to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             *.tar.gz
+            *.zip
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
 
       # 0.18.13: hand the musl-static binary off to the docker job
       # via an artifact instead of having that job re-run the same

@@ -209,6 +209,31 @@ pub fn device_halt(device: &str) -> Option<Halt> {
     halts.get(device).cloned()
 }
 
+/// Atomically swap in a new [`Halt`] for `device`, carrying forward a Stop
+/// that landed on the outgoing token. Under a SINGLE acquisition of the
+/// `HALTS` lock this: reads the outgoing token's `is_cancelled()`, inserts
+/// `new`, and — if the old token was already cancelled — cancels `new`.
+///
+/// This closes a TOCTOU race at the placeholder→real token swap in
+/// `rip_disc`: doing read-then-insert-then-cancel as three separate steps let
+/// a concurrent `/api/stop` (which calls `device_halt(device).cancel()`)
+/// landing between the read and the insert get lost — the user's Stop would
+/// cancel a token nobody polls again, hanging the drain. Holding the lock
+/// across the whole check+insert+carry serialises the two paths.
+pub fn swap_halt_carrying_cancel(device: &str, new: Halt) {
+    // Recover from poison (same convention as register_halt / device_halt):
+    // a dropped swap would strand /api/stop on a token no phase loop reads.
+    let mut halts = HALTS.lock().unwrap_or_else(|e| e.into_inner());
+    let prior_cancelled = halts.get(device).map(|h| h.is_cancelled()).unwrap_or(false);
+    if prior_cancelled {
+        // Cancel BEFORE inserting so the token is already in its final state
+        // when it becomes visible; a concurrent /api/stop now either sees the
+        // old token (and we carry it) or the new cancelled one.
+        new.cancel();
+    }
+    halts.insert(device.to_string(), new);
+}
+
 /// Drop the device's registered [`Halt`]. Called from the rip-thread
 /// cleanup paths (every early-return branch in `rip_disc`) so a
 /// subsequent rip on the same device starts with a fresh token.

@@ -3,12 +3,12 @@
 ## Quick Reference
 
 ```bash
-# 1. Pre-commit (run locally)
-cd freemkv && ./precommit.sh [libfreemkv|autorip]
+# 1. Pre-commit (run locally, Rust 1.86 — matches CI)
+cargo +1.86 fmt --check && cargo +1.86 clippy --locked -- -D warnings && cargo +1.86 test
 
 # 2. Tag and push
-git tag -a v0.18.1 -m "v0.18.1"
-git push origin v0.18.1
+git tag -a v1.0.0-rc.1 -m "v1.0.0-rc.1"
+git push origin v1.0.0-rc.1
 
 # 3. Wait for CI + Release (~3 min)
 gh run list --repo freemkv/autorip --limit 1
@@ -24,11 +24,11 @@ docker compose pull && docker compose up -d
 Run lint + tests before pushing:
 
 ```bash
-# All crates
-./precommit.sh
+# Whole workspace (Rust 1.86 — matches CI)
+cargo +1.86 fmt --check && cargo +1.86 clippy --locked -- -D warnings && cargo +1.86 test
 
 # Single crate
-./precommit.sh autorip
+cargo +1.86 clippy -p freemkv-autorip --locked -- -D warnings && cargo +1.86 test -p freemkv-autorip
 ```
 
 This runs:
@@ -44,10 +44,10 @@ git add -A
 git commit -m "description"
 
 # Tag with semver
-git tag -a v0.18.1 -m "v0.18.1"
+git tag -a v1.0.0-rc.1 -m "v1.0.0-rc.1"
 
 # Push commit AND tag
-git push origin main v0.18.1
+git push origin main v1.0.0-rc.1
 ```
 
 **Important:** Push the tag! Release workflow only runs when a tag is pushed, not on every commit.
@@ -79,7 +79,7 @@ docker compose up -d
 ## Troubleshooting
 
 ### Release didn't build
-- Check the tag was pushed: `git tag` and `git push origin v0.18.1`
+- Check the tag was pushed: `git tag` and `git push origin <tag>`
 - CI must pass before Release runs
 
 ### Container still running old version
@@ -98,5 +98,5 @@ docker compose up -d
 | Push | Image |
 |------|-------|
 | `main` branch | Not built |
-| `v0.18.1` tag | `ghcr.io/freemkv/autorip:0.18.1` |
+| `v1.0.0-rc.1` tag | `ghcr.io/freemkv/autorip:v1.0.0-rc.1` |
 | Tag push | `ghcr.io/freemkv/autorip:latest` + tag |

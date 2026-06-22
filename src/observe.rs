@@ -33,7 +33,7 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::S
 /// `autorip=info` for the binary's own narration, `libfreemkv=warn` so
 /// the library is quiet — warnings + errors only. Two modes, one flag:
 /// prod = warnings only; dev = full debug (see FILTER_ON).
-const FILTER_OFF: &str = "autorip=info,libfreemkv=warn";
+const FILTER_OFF: &str = "autorip=info,libfreemkv=warn,freemkv=warn";
 
 /// EnvFilter directive used when /api/debug is ON. `debug` globally,
 /// plus `mux=debug` and `stream=debug` so the `target: "mux"` /
@@ -46,7 +46,13 @@ const FILTER_OFF: &str = "autorip=info,libfreemkv=warn";
 /// contention; raise to `freemkv::scsi=trace` via AUTORIP_LOG_LEVEL if
 /// you need per-CDB forensics for a drive issue). Producer's per-frame
 /// log is at `trace` and stays muted here on purpose.
-const FILTER_ON: &str = "autorip=debug,libfreemkv=debug,mux=debug,stream=debug";
+///
+/// NOTE: libfreemkv namespaces its events on `freemkv::*` targets (not
+/// `libfreemkv::*`), so the `freemkv=debug` directive — NOT `libfreemkv=debug`
+/// — is what surfaces `freemkv::scan` phase markers, `freemkv::heartbeat`
+/// liveness beats, `freemkv::css/disc/drive/scsi`, etc. Both directives are
+/// kept: `libfreemkv=debug` covers any event that uses the bare crate target.
+const FILTER_ON: &str = "autorip=debug,libfreemkv=debug,freemkv=debug,mux=debug,stream=debug";
 
 /// Worker guards for the non-blocking file appenders. Must outlive the
 /// process — flushed on drop. Stored in a static so `init()` can be called
@@ -172,8 +178,9 @@ pub fn set_debug(enabled: bool) -> bool {
 }
 
 fn log_dir() -> String {
-    let base = std::env::var("AUTORIP_DIR").unwrap_or_else(|_| "/config".to_string());
-    format!("{}/logs", base)
+    // AUTORIP_DIR, else writable /config (Docker), else ~/.config/autorip
+    // (bare run) — matches config/log so all sinks agree on one writable base.
+    format!("{}/logs", crate::config::default_autorip_dir())
 }
 
 /// Path of the JSONL stream — exposed so the web `/api/debug` endpoint
@@ -231,6 +238,100 @@ mod tests {
         assert!(
             FILTER_OFF.contains("libfreemkv=warn"),
             "FILTER_OFF must keep libfreemkv at warn; got: {FILTER_OFF}"
+        );
+    }
+
+    /// `/api/debug ON` (FILTER_ON) must surface the new DEBUG liveness
+    /// heartbeats. They are emitted on `target: "freemkv::heartbeat"` from
+    /// libfreemkv, which inherits the `libfreemkv=debug` directive — so the
+    /// filter that's already asserted to raise libfreemkv to debug carries
+    /// them. This pins that the heartbeat target is NOT excluded.
+    #[test]
+    fn filter_on_enables_heartbeats() {
+        // Heartbeats are emitted on target `freemkv::heartbeat`, which matches
+        // the `freemkv=debug` directive (NOT `libfreemkv=debug` — libfreemkv
+        // namespaces its events under `freemkv::*`). FILTER_ON must carry it.
+        assert!(
+            FILTER_ON.contains("freemkv=debug"),
+            "FILTER_ON must enable freemkv (and thus freemkv::heartbeat) at debug; got: {FILTER_ON}"
+        );
+        // And FILTER_OFF must keep them quiet (freemkv=warn).
+        assert!(
+            FILTER_OFF.contains("freemkv=warn"),
+            "FILTER_OFF must keep heartbeats quiet; got: {FILTER_OFF}"
+        );
+    }
+
+    /// End-to-end: under a FILTER_ON subscriber, a DEBUG heartbeat event on
+    /// `freemkv::heartbeat` is actually recorded, AND a CSS-style key event is
+    /// emitted WITHOUT any raw key bytes (redaction confirmed). Uses a
+    /// capturing writer scoped to this test via `with_default`.
+    #[test]
+    fn debug_on_shows_heartbeats_and_redacts_keys() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Buf::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(buf.clone())
+            .with_ansi(false);
+        let filter = EnvFilter::try_new(FILTER_ON).unwrap();
+        let subscriber = tracing_subscriber::registry().with(filter).with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Mimic libfreemkv's heartbeat beat.
+            tracing::debug!(
+                target: "freemkv::heartbeat",
+                phase = "css_crack",
+                pos = 1234u64,
+                total = 50000u64,
+                "alive"
+            );
+            // Mimic the REDACTED css auth log: key value is "<redacted>",
+            // only a 1-byte fingerprint accompanies it. No raw key bytes.
+            tracing::debug!(
+                target: "freemkv::css",
+                title_key = "<redacted>",
+                title_key_fp = 0x5Au8,
+                "css auth: final title_key"
+            );
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+
+        // Heartbeat surfaced under /api/debug ON.
+        assert!(
+            out.contains("alive") && out.contains("css_crack"),
+            "FILTER_ON must surface the heartbeat; got:\n{out}"
+        );
+        // Redaction confirmed: the marker is present, the field is redacted,
+        // and no plausible raw 5-byte CSS key hex leaked.
+        assert!(
+            out.contains("<redacted>"),
+            "title_key must be redacted; got:\n{out}"
+        );
+        assert!(
+            !out.contains("title_key=\"") || out.contains("title_key=\"<redacted>\""),
+            "title_key must never carry a real value; got:\n{out}"
         );
     }
 

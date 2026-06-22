@@ -84,9 +84,66 @@ pub fn restart_count(staging_disc_dir: &Path) -> u64 {
 pub fn increment_restart_count(staging_disc_dir: &Path) -> io::Result<u64> {
     let next = restart_count(staging_disc_dir).saturating_add(1);
     let p = staging_disc_dir.join(RESTART_COUNT_FILE);
-    let mut f = std::fs::File::create(&p)?;
-    writeln!(f, "{}", next)?;
+    // Atomic write: a crash between create()-truncate and the writeln would
+    // otherwise leave an empty/torn file that restart_count() reads back as 0,
+    // silently downgrading the counter and defeating the restart-loop guard.
+    // Write a temp file, fsync it, then rename(2) over the target (atomic
+    // within a filesystem) so the counter is never observed half-written.
+    let tmp = staging_disc_dir.join(format!("{}.tmp", RESTART_COUNT_FILE));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        writeln!(f, "{}", next)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &p)?;
     Ok(next)
+}
+
+/// fsync a directory so prior `rename(2)`s into it are durable. On a crash a
+/// renamed file can otherwise be lost even though the rename returned — the
+/// directory entry is still page-cache-only. Best-effort: opening a directory
+/// for read and `sync_all()`ing it is the POSIX way to flush its metadata.
+pub fn fsync_dir(dir: &Path) {
+    match std::fs::File::open(dir) {
+        Ok(f) => {
+            if let Err(e) = f.sync_all() {
+                tracing::warn!(path = %dir.display(), error = %e, "failed to fsync directory");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), error = %e, "could not open directory to fsync");
+        }
+    }
+}
+
+/// Durably write a marker file: write `<path>.tmp`, `sync_all()` it, rename(2)
+/// over the final name, then fsync the containing directory. A crash mid-write
+/// thus never leaves an empty/torn marker — readers observe either the old
+/// state or the complete new one. Mirrors `increment_restart_count`.
+fn write_marker_durable(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let tmp = match path.file_name() {
+        Some(name) => {
+            let mut t = name.to_os_string();
+            t.push(".tmp");
+            path.with_file_name(t)
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "marker has no file name",
+            ));
+        }
+    };
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent);
+    }
+    Ok(())
 }
 
 /// Best-effort delete of `.restart_count`. Not finding the file is not
@@ -115,7 +172,7 @@ pub fn write_failed_marker(staging_disc_dir: &Path, reason: &str) {
     // then parse as `None`, masking the failure reason.
     let serialized =
         serde_json::to_string_pretty(&body).expect("json! value is always serialisable");
-    if let Err(e) = std::fs::write(&p, serialized) {
+    if let Err(e) = write_marker_durable(&p, serialized.as_bytes()) {
         tracing::warn!(path = %p.display(), error = %e, "failed to write .failed marker");
     }
 }
@@ -133,8 +190,52 @@ pub fn read_failed_reason(staging_disc_dir: &Path) -> Option<String> {
 /// signal. Best-effort; logs on failure.
 pub fn write_completed_marker(staging_disc_dir: &Path) {
     let p = staging_disc_dir.join(COMPLETED_MARKER);
-    if let Err(e) = std::fs::write(&p, b"") {
+    if let Err(e) = write_marker_durable(&p, b"") {
         tracing::warn!(path = %p.display(), error = %e, "failed to write .completed marker");
+    }
+}
+
+/// Durably write a hand-off/review marker (`.done` / `.review`) containing
+/// JSON the mover parses. Returns the same `io::Result` shape as a plain
+/// write so the caller's error handling is unchanged, but the bytes hit disk
+/// atomically (tmp + fsync + rename + dir-fsync) — a crash mid-write never
+/// leaves an empty/torn marker the mover would mis-handle.
+pub fn write_handoff_marker(marker_path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_marker_durable(marker_path, contents)
+}
+
+/// Force the just-muxed output file to durable storage before any
+/// success marker (`.done` / `.completed`) is written.
+///
+/// The library's mux `finish()` only flushes its `BufWriter` down to the
+/// OS — the bytes can still be sitting in the page cache when autorip
+/// writes the staging markers and the mover acts on them. On a crash or
+/// power loss in that window the marker says "done" but the file on disk
+/// is truncated. `sync_all()` (fsync) closes that gap.
+///
+/// Best-effort: a warn is logged on error but the rip is NOT aborted —
+/// the file is already fully written, this only hardens durability. Call
+/// this ONLY on the success path, immediately before the marker write,
+/// and only for a real local output file (skip `network://` sinks, which
+/// have no local path).
+pub fn fsync_output_file(output_path: &Path) {
+    match std::fs::File::open(output_path) {
+        Ok(f) => {
+            if let Err(e) = f.sync_all() {
+                tracing::warn!(
+                    path = %output_path.display(),
+                    error = %e,
+                    "failed to fsync mux output before completion marker"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %output_path.display(),
+                error = %e,
+                "could not open mux output to fsync before completion marker"
+            );
+        }
     }
 }
 
@@ -586,6 +687,30 @@ mod tests {
         clear_restart_count(&d);
         assert_eq!(restart_count(&d), 0);
         clear_restart_count(&d); // already gone — must not error
+    }
+
+    /// `increment_restart_count` must round-trip the incremented value and
+    /// leave NO `.restart_count.tmp` behind — the temp file is renamed over
+    /// the target (atomic), so a dangling `.tmp` would mean the rename never
+    /// happened (torn write) or a stray file the resume scan could trip on.
+    #[test]
+    fn increment_roundtrips_and_cleans_up_tmp() {
+        let d = tmpdir();
+        let tmp = d.join(format!("{}.tmp", RESTART_COUNT_FILE));
+
+        let v1 = increment_restart_count(&d).unwrap();
+        assert_eq!(v1, 1);
+        assert_eq!(restart_count(&d), 1, "incremented value must round-trip");
+        assert!(
+            !tmp.exists(),
+            "{} must be renamed away, not left behind",
+            tmp.display()
+        );
+
+        let v2 = increment_restart_count(&d).unwrap();
+        assert_eq!(v2, 2);
+        assert_eq!(restart_count(&d), 2);
+        assert!(!tmp.exists(), "tmp file must not persist across increments");
     }
 
     #[test]

@@ -233,6 +233,11 @@ fn copy_counting(
         written.store(total, Ordering::Relaxed);
     }
     writer.flush()?;
+    // fsync before returning: move_file unlinks the source once this returns
+    // Ok, so the destination must be durable on stable storage first. On a
+    // cross-fs (NFS) move, flush() on a File is a no-op — without sync_all a
+    // server/host crash in the close-to-commit window would lose the only copy.
+    writer.sync_all()?;
     Ok(total)
 }
 
@@ -481,7 +486,24 @@ fn check_and_move(cfg: &Config) {
 
         // Read marker for TMDB metadata
         let marker: serde_json::Value = match std::fs::read_to_string(&marker_path) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
+            Ok(data) => match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(e) => {
+                    // An empty or torn `.done` (e.g. a crash mid-write before
+                    // the durable-marker fix landed, or a partial NFS write)
+                    // parses as an error. Treat it as NOT READY: skip — do NOT
+                    // `unwrap_or_default()` into a `null` marker, which would
+                    // give empty title+disc_name and blind-move the file to the
+                    // output root under a garbage name. Leaving the dir in
+                    // staging lets the next pass (or a rewritten marker) recover.
+                    tracing::warn!(
+                        marker = %marker_path.display(),
+                        error = %e,
+                        "mover: .done marker is empty/unparsable; skipping staging dir (not ready)"
+                    );
+                    continue;
+                }
+            },
             Err(e) => {
                 // A .done read failure (NFS ESTALE, permission denied)
                 // leaves the dir in staging looking healthy from the
@@ -497,6 +519,18 @@ fn check_and_move(cfg: &Config) {
 
         let disc_name = marker["disc_name"].as_str().unwrap_or("").to_string();
         let display_name = marker["title"].as_str().unwrap_or(&disc_name).to_string();
+
+        // A parsable-but-content-empty marker (both `title` and `disc_name`
+        // absent/empty) carries no usable destination name. Filing it would
+        // route the MKV to the output root under an empty name. Treat as NOT
+        // READY and skip — never `remove_dir_all` or blind-move on this path.
+        if display_name.trim().is_empty() {
+            tracing::warn!(
+                marker = %marker_path.display(),
+                "mover: .done marker has empty title and disc_name; skipping staging dir (not ready)"
+            );
+            continue;
+        }
 
         // Build TMDB result from marker
         let tmdb_result = if !marker["title"].is_null() {
@@ -1030,11 +1064,16 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             }
             Ok(Err(e)) => {
                 let _ = copy_handle.join();
+                // Remove the partial/truncated destination so the next tick
+                // retries cleanly instead of seeing a phantom size-mismatch
+                // Collision (which would wedge the move permanently).
+                let _ = std::fs::remove_file(&dest_str);
                 crate::log::syslog(&format!("fs::copy failed for {}: {}", dest_str, e));
                 return MoveOutcome::Failed;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 // Sender dropped without sending — worker panicked.
+                let _ = std::fs::remove_file(&dest_str);
                 crate::log::syslog(&format!("fs::copy thread panicked for {}", dest_str));
                 return MoveOutcome::Failed;
             }
@@ -1046,6 +1085,10 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 // the worker (bounded to its current chunk write) and bail.
                 if crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = copy_handle.join();
+                    // Drop the partial destination (see Ok(Err) arm) so a
+                    // restart's first tick doesn't wedge on a size-mismatch
+                    // Collision against this interrupted copy.
+                    let _ = std::fs::remove_file(&dest_str);
                     crate::log::syslog(&format!("Move aborted (shutdown) mid-copy: {}", dest_str));
                     return MoveOutcome::Failed;
                 }
@@ -1254,6 +1297,40 @@ mod tests {
         let outcome = move_file(&src, &dest, &noop_progress);
         assert_eq!(outcome, MoveOutcome::Moved);
         assert_eq!(std::fs::read(&dest).unwrap(), b"new full content");
+    }
+
+    /// Partial-dest cleanup contract (already-landed fix). When the copy
+    /// path fails, `move_file` must NOT leave a partial/garbage destination
+    /// behind — otherwise the next mover tick sees a phantom size-mismatch
+    /// Collision and wedges the move permanently.
+    ///
+    /// Forcing a *mid-copy* truncation deterministically needs fault
+    /// injection (a writer that fails after N bytes), which isn't available
+    /// here. Instead we force the copy branch (rename must fail first) and a
+    /// copy failure, and assert the outcome is `Failed` with no leftover
+    /// dest. The complementary "stale partial dest doesn't wedge the next
+    /// tick" case is covered by `move_file_overwrites_when_dest_size_differs`
+    /// above (a pre-existing partial is cleanly overwritten).
+    #[test]
+    fn move_file_copy_failure_leaves_no_partial_dest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.mkv");
+        std::fs::write(&src, b"source bytes").unwrap();
+
+        // dest sits under a path whose "parent" is a regular FILE, not a
+        // directory. Both rename(2) and File::create(dest) then fail with
+        // ENOTDIR — exercising the copy branch's failure cleanup without a
+        // cross-filesystem mount. No dest can ever be created here, so the
+        // post-condition "no partial dest left" must hold.
+        let not_a_dir = tmp.path().join("blocker");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let dest = not_a_dir.join("b.mkv");
+
+        let outcome = move_file(&src, &dest, &noop_progress);
+        assert_eq!(outcome, MoveOutcome::Failed, "copy failure → Failed");
+        assert!(!dest.exists(), "no partial destination may be left behind");
+        // Source is the only copy and must be preserved on any failure.
+        assert!(src.exists(), "source must survive a failed move");
     }
 
     #[test]
