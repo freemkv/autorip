@@ -120,7 +120,7 @@ pub fn fsync_dir(dir: &Path) {
 /// over the final name, then fsync the containing directory. A crash mid-write
 /// thus never leaves an empty/torn marker — readers observe either the old
 /// state or the complete new one. Mirrors `increment_restart_count`.
-fn write_marker_durable(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_marker_durable(path: &Path, contents: &[u8]) -> io::Result<()> {
     let tmp = match path.file_name() {
         Some(name) => {
             let mut t = name.to_os_string();
@@ -213,12 +213,18 @@ pub fn write_handoff_marker(marker_path: &Path, contents: &[u8]) -> io::Result<(
 /// power loss in that window the marker says "done" but the file on disk
 /// is truncated. `sync_all()` (fsync) closes that gap.
 ///
-/// Best-effort: a warn is logged on error but the rip is NOT aborted —
-/// the file is already fully written, this only hardens durability. Call
-/// this ONLY on the success path, immediately before the marker write,
-/// and only for a real local output file (skip `network://` sinks, which
-/// have no local path).
-pub fn fsync_output_file(output_path: &Path) {
+/// Returns `true` only when the output was provably synced to durable
+/// storage. The library's mux `finish()` swallows an fsync timeout/halt
+/// (returns Ok to bound the hang), so durability cannot be assumed from a
+/// successful mux alone — this fsync is the gate. A `false` return means
+/// the open or fsync failed; the caller MUST NOT write the
+/// `.done`/`.completed` success marker this cycle, leaving the staging dir
+/// resumable so a later attempt re-runs the durable flush.
+///
+/// Call this ONLY on the success path, immediately before the marker
+/// write, and only for a real local output file (skip `network://` sinks,
+/// which have no local path).
+pub fn fsync_output_file(output_path: &Path) -> bool {
     match std::fs::File::open(output_path) {
         Ok(f) => {
             if let Err(e) = f.sync_all() {
@@ -227,7 +233,9 @@ pub fn fsync_output_file(output_path: &Path) {
                     error = %e,
                     "failed to fsync mux output before completion marker"
                 );
+                return false;
             }
+            true
         }
         Err(e) => {
             tracing::warn!(
@@ -235,6 +243,7 @@ pub fn fsync_output_file(output_path: &Path) {
                 error = %e,
                 "could not open mux output to fsync before completion marker"
             );
+            false
         }
     }
 }
@@ -930,5 +939,51 @@ mod tests {
             other => panic!("unexpected action: {:?}", other),
         }
         assert!(disc.join("foo.iso").exists());
+    }
+
+    /// Regression (HIGH audit #7): if the durable hand-off (`.done`) marker
+    /// write FAILS, the caller must NOT proceed to write `.completed` or clear
+    /// `.restart_count`. Otherwise the staging dir looks terminal-complete
+    /// while the mover has no `.done` to act on and the resume detector never
+    /// re-runs — a data-integrity gap.
+    ///
+    /// This pins the early-return invariant in `rip_disc`'s marker-write block:
+    /// `write_handoff_marker` Err ⇒ leave the dir resumable (no `.completed`,
+    /// `.restart_count` preserved).
+    #[test]
+    fn failed_done_write_leaves_no_completed_and_preserves_restart_count() {
+        let disc = tmpdir();
+
+        // Seed a restart counter so we can prove it is NOT cleared.
+        increment_restart_count(&disc).unwrap();
+        assert_eq!(restart_count(&disc), 1);
+
+        // Force the `.done` write to fail by targeting a path whose parent is
+        // a non-existent subdirectory (the durable write can't create the tmp
+        // file there). This mirrors a real I/O failure at the marker site.
+        let bad_done = disc.join("missing-subdir").join(DONE_MARKER);
+        let handoff = write_handoff_marker(&bad_done, b"{}");
+        assert!(
+            handoff.is_err(),
+            "precondition: the hand-off marker write must fail for this test"
+        );
+
+        // The fix: on that Err, `rip_disc` returns early — so the following
+        // two calls are SKIPPED. We assert the post-state that skipping yields.
+        // (We deliberately do NOT call write_completed_marker / clear_restart_count.)
+
+        assert!(
+            !disc.join(COMPLETED_MARKER).exists(),
+            ".completed must not exist when the .done write failed"
+        );
+        assert!(
+            !disc.join(DONE_MARKER).exists(),
+            "no durable .done landed in the staging dir"
+        );
+        assert_eq!(
+            restart_count(&disc),
+            1,
+            ".restart_count must be preserved (not cleared) when .done failed"
+        );
     }
 }

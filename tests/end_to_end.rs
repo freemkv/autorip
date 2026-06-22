@@ -65,6 +65,7 @@ fn test_state_json_serialization_round_trip() {
         started_epoch_secs: 0,
         key_status: String::new(),
         resumable: None,
+        claim_gen: 0,
     };
 
     // Serialize the same way get_state_json does: serde_json::to_value.

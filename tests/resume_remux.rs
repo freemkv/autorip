@@ -24,6 +24,15 @@ fn make_hint(dir: PathBuf, action: ResumeAction) -> StagingResumeHint {
     StagingResumeHint { dir, action }
 }
 
+/// Write a placeholder ISO of exactly `size_bytes` so it satisfies the
+/// resume classifier's ISO-size gate (a settled Pass-1 ISO must be at least
+/// as large as the mapfile claims). The bytes don't matter — classify_resume
+/// only stats the length, it doesn't read content.
+fn write_iso(path: &Path, size_bytes: u64) {
+    let f = std::fs::File::create(path).expect("iso create");
+    f.set_len(size_bytes).expect("iso set_len");
+}
+
 fn write_mapfile(path: &Path, size_bytes: u64, status: libfreemkv::disc::mapfile::SectorStatus) {
     use libfreemkv::disc::mapfile::Mapfile;
     let mut map = Mapfile::create(path, size_bytes, "test").expect("mapfile create");
@@ -36,7 +45,7 @@ fn resume_classifies_clean_mapfile_as_remux() {
     let td = tmpdir();
     let dir = td.path().join("MyDisc");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("MyDisc.iso"), b"").unwrap();
+    write_iso(&dir.join("MyDisc.iso"), 4096);
     write_mapfile(
         &dir.join("MyDisc.iso.mapfile"),
         4096,
@@ -71,7 +80,7 @@ fn resume_classifies_partial_mapfile_as_not_remux() {
     let td = tmpdir();
     let dir = td.path().join("MyDisc");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("MyDisc.iso"), b"").unwrap();
+    write_iso(&dir.join("MyDisc.iso"), 4096);
     // NonTried = pending → bytes_pending != 0 → ineligible.
     write_mapfile(
         &dir.join("MyDisc.iso.mapfile"),
@@ -79,6 +88,38 @@ fn resume_classifies_partial_mapfile_as_not_remux() {
         libfreemkv::disc::mapfile::SectorStatus::NonTried,
     );
 
+    let hint = make_hint(
+        dir,
+        ResumeAction::ResumePreserved {
+            attempt: 1,
+            has_iso: true,
+            has_mapfile: true,
+            has_mkv: false,
+        },
+    );
+    assert!(matches!(
+        classify_resume(&hint, 0),
+        ResumeClass::NotEligible
+    ));
+}
+
+#[test]
+fn resume_classifies_short_iso_as_not_remux() {
+    // Regression for the truncated-ISO / short total_size case: a settled
+    // mapfile (bytes_pending==0) whose ISO is SHORTER than its declared
+    // total_size means the ISO is incomplete (or the mapfile undercounts the
+    // disc, hiding NonTried tail sectors). Either way, jumping to mux would
+    // emit a truncated/zero-filled movie — reject and re-sweep fresh.
+    let td = tmpdir();
+    let dir = td.path().join("MyDisc");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Mapfile claims 4096 bytes, but the ISO is only 2048 bytes long.
+    write_iso(&dir.join("MyDisc.iso"), 2048);
+    write_mapfile(
+        &dir.join("MyDisc.iso.mapfile"),
+        4096,
+        libfreemkv::disc::mapfile::SectorStatus::Finished,
+    );
     let hint = make_hint(
         dir,
         ResumeAction::ResumePreserved {
@@ -228,12 +269,11 @@ fn classify_resume_allows_out_of_title_damage_when_abort_on_lost_secs_is_zero() 
     let td = tmpdir();
     let dir = td.path().join("MyDisc");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("MyDisc.iso"), b"").unwrap();
-
     // Disc: 50 MB total, 1 MB unreadable — enough whole-disc lost-secs
     // to have been blocked by the old pre-filter under abort_on_lost_secs=0.
     let total: u64 = 50 * 1024 * 1024;
     let bad: u64 = 1024 * 1024;
+    write_iso(&dir.join("MyDisc.iso"), total);
     write_mapfile_with_unreadable(&dir.join("MyDisc.iso.mapfile"), total, bad);
 
     let hint = make_hint(
@@ -267,12 +307,11 @@ fn classify_resume_rejects_heavy_damage_when_abort_on_lost_secs_positive() {
     let td = tmpdir();
     let dir = td.path().join("MyDisc");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("MyDisc.iso"), b"").unwrap();
-
     // Use a threshold of 1 second. The fallback bitrate is 8.25 MB/s, so
     // 1 s ≈ 8.25 MB. Write 20 MB unreadable — well above the threshold.
     let total: u64 = 100 * 1024 * 1024;
     let bad: u64 = 20 * 1024 * 1024;
+    write_iso(&dir.join("MyDisc.iso"), total);
     write_mapfile_with_unreadable(&dir.join("MyDisc.iso.mapfile"), total, bad);
 
     let hint = make_hint(

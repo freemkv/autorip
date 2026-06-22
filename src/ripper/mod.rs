@@ -27,12 +27,14 @@ pub mod state;
 #[allow(unused_imports)]
 pub use session::{
     device_halt, join_all_rip_threads, join_rip_thread, register_halt, register_rip_thread,
-    spawn_rip_thread, swap_halt_carrying_cancel, take_rip_thread, unregister_halt,
+    rollback_failed_spawn, spawn_rip_thread, swap_halt_carrying_cancel, take_rip_thread,
+    unregister_halt,
 };
 #[allow(unused_imports)]
 pub use state::{
-    BadRange, Resumable, RipState, STATE, is_busy, set_stop_cooldown, set_title_override,
-    take_title_override, try_claim_active, update_state, update_state_with,
+    BadRange, Resumable, RipState, STATE, current_claim_gen, device_known, is_busy,
+    set_stop_cooldown, set_title_override, take_title_override, try_claim_active, update_state,
+    update_state_with,
 };
 
 // Internal-use imports for the orchestrator code that lives in this
@@ -448,7 +450,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     tracing::info!(device = %device, "disc inserted");
                 }
 
-                if is_new_insert && !is_busy(&device) && !is_in_cooldown(&device) {
+                if is_new_insert && !is_in_cooldown(&device) {
                     let on_insert = cfg
                         .read()
                         .ok()
@@ -468,21 +470,27 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         continue;
                     }
 
+                    // Atomically claim the device under one STATE lock, exactly
+                    // like the /api/scan and /api/rip web handlers. The old
+                    // `!is_busy(&device)` gate plus a separate `update_state`
+                    // and `register_halt` was a TOCTOU: a concurrent /api/rip
+                    // could claim between the check and the spawn, yielding two
+                    // rip threads on one drive, an orphaned Halt, and a dropped
+                    // JoinHandle. If the claim loses, another path already owns
+                    // the device — skip the spawn.
+                    if !try_claim_active(&device) {
+                        continue;
+                    }
+
                     tracing::info!(
                         device = %device,
                         on_insert = %on_insert,
                         "spawning scan/rip thread"
                     );
 
-                    update_state(
-                        &device,
-                        RipState {
-                            device: device.clone(),
-                            status: "scanning".to_string(),
-                            disc_present: true,
-                            ..Default::default()
-                        },
-                    );
+                    // NOTE: try_claim_active already set status="scanning" +
+                    // disc_present=true under the STATE lock, so no separate
+                    // update_state is needed here.
 
                     let cfg = cfg.clone();
                     let dev_path = path.clone();
@@ -568,6 +576,11 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                             error = %e,
                             "failed to spawn rip thread"
                         );
+                        // The claim (status="scanning") + register_halt above
+                        // already ran. A bare warn here leaks the Halt and
+                        // wedges the device in "scanning" forever. Mirror the
+                        // web handlers' rollback.
+                        rollback_failed_spawn(&device);
                     }
                 } else if !is_new_insert && !is_busy(&device) {
                     if let Ok(mut s) = STATE.lock() {
@@ -1004,10 +1017,13 @@ fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
         Ok(c) => c.clone(),
         Err(_) => return false,
     };
+    // Recover from a poisoned mutex rather than silently returning false (which
+    // would re-rip an already-completed disc). Matches update_state/is_busy.
     let display_name = STATE
         .lock()
-        .ok()
-        .and_then(|s| s.get(device).map(|rs| rs.disc_name.clone()))
+        .unwrap_or_else(|e| e.into_inner())
+        .get(device)
+        .map(|rs| rs.disc_name.clone())
         .unwrap_or_default();
     if display_name.is_empty() {
         return false;
@@ -1229,11 +1245,11 @@ fn resumable_for_disc(cfg: &Config, display_name: &str) -> Option<Resumable> {
             Some(n) => n.to_string_lossy().into_owned(),
             None => continue,
         };
-        // Exact match or a dir suffixed past our sanitized name only.
-        // Not the reverse (`sanitized.starts_with(&basename)`), which
-        // would let a shorter stale dir ("Du") match disc "Dune" and
-        // resume onto the wrong title's partial data.
-        if !(basename == sanitized || basename.starts_with(&sanitized)) {
+        // EXACT match only. Staging dirs are created with the exact sanitized
+        // disc name (no year/suffix), so a prefix match never legitimately
+        // fires — it only invites the collision class (`Cars` prefixing
+        // `Cars_2`) fixed in staging_dir_matches_disc.
+        if basename != sanitized {
             continue;
         }
         let (_iso_path, mapfile_path) = match resume::find_iso_and_mapfile(&path) {
@@ -3500,10 +3516,31 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // Durability gate: fsync the finished MKV/M2TS before any
             // success marker so a crash/power-loss can't leave a "done"
             // marker pointing at a page-cache-only (truncated on disk)
-            // file. Library mux finish() only flushes to the OS. Skip
-            // for network:// output, which has no local file.
-            if output_format != "network" || cfg_read.network_target.is_empty() {
-                staging::fsync_output_file(std::path::Path::new(&output_path));
+            // file. Library mux finish() only flushes to the OS and the
+            // bounded fsync inside it returns Ok even on timeout/halt — so
+            // THIS fsync is the real durability gate. Skip for network://
+            // output, which has no local file.
+            //
+            // If the fsync fails (false), do NOT write the
+            // `.done`/`.completed` markers: the output is not provably
+            // durable, so treat the rip as resumable this cycle. Leaving
+            // the staging dir intact lets a later attempt re-run the flush
+            // rather than handing a possibly-truncated file to the mover.
+            let is_network = output_format == "network" && !cfg_read.network_target.is_empty();
+            if !is_network && !staging::fsync_output_file(std::path::Path::new(&output_path)) {
+                crate::log::device_log(
+                    device,
+                    "Durability gate failed: could not fsync mux output to stable storage; \
+                     withholding .done/.completed and preserving staging for retry",
+                );
+                update_state_with(device, |s| {
+                    if s.last_error.is_empty() {
+                        s.last_error =
+                            "mux output not durable (fsync failed); rip preserved for retry"
+                                .to_string();
+                    }
+                });
+                return;
             }
             // Confident match (exact title + year) → hand straight to the mover
             // (.done). Otherwise HOLD for operator review (.review): the rip is
@@ -3542,6 +3579,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                             format!("MKV staged but {marker_name} marker write failed: {e}");
                     }
                 });
+                // The durable hand-off marker never landed. Do NOT proceed to
+                // `.completed` / `clear_restart_count`: that would make the
+                // staging dir look terminal-complete while the mover has no
+                // signal to pick it up, and the resume detector would never
+                // re-run — a data-integrity gap. Return early, leaving the dir
+                // resumable so a later attempt re-writes the marker.
+                return;
             }
             if !title_confident {
                 crate::log::device_log(

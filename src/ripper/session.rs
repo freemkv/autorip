@@ -244,6 +244,27 @@ pub fn unregister_halt(device: &str) {
     halts.remove(device);
 }
 
+/// Roll a device back to idle after a failed `spawn_rip_thread`.
+///
+/// A spawn failure after the device has been claimed (`try_claim_active`
+/// set status="scanning") and a `Halt` token registered would otherwise
+/// wedge the device in "scanning" forever (409 on every future scan/rip)
+/// and leak the Halt. This is the single rollback used by BOTH web
+/// handlers (`/api/scan`, `/api/rip`) and the disc-insert poll loop so
+/// they can't drift. The disc is assumed still present.
+pub fn rollback_failed_spawn(device: &str) {
+    super::unregister_halt(device);
+    super::update_state(
+        device,
+        super::RipState {
+            device: device.to_string(),
+            status: "idle".to_string(),
+            disc_present: true,
+            ..Default::default()
+        },
+    );
+}
+
 // ─── Per-device drive session ──────────────────────────────────────────────
 
 /// Persistent drive session — survives across scan → rip transitions.
@@ -453,5 +474,38 @@ fn probe_volume_id(path: &str) -> Option<String> {
         None
     } else {
         Some(vid.to_string())
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_failed_spawn_clears_halt_and_idles() {
+        let dev = format!("rollback-test-{}", std::process::id());
+        // Simulate the pre-spawn state: claim (sets status=scanning) +
+        // register a Halt, exactly as the poll loop / web handlers do.
+        assert!(super::super::try_claim_active(&dev), "claim must succeed");
+        super::super::register_halt(&dev, Halt::new());
+        assert!(super::super::device_halt(&dev).is_some(), "halt registered");
+
+        super::super::rollback_failed_spawn(&dev);
+
+        // Halt is gone (no leak) and the device is idle with the disc still
+        // present, so a future scan/rip is not wedged at 409.
+        assert!(
+            super::super::device_halt(&dev).is_none(),
+            "rollback must unregister the halt"
+        );
+        let snap = super::super::STATE
+            .lock()
+            .unwrap()
+            .get(&dev)
+            .cloned()
+            .expect("state entry exists");
+        assert_eq!(snap.status, "idle", "must roll back to idle");
+        assert!(snap.disc_present, "disc still present after rollback");
+        assert!(!super::super::is_busy(&dev), "device no longer busy");
     }
 }

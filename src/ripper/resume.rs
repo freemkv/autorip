@@ -164,12 +164,58 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
         tracing::info!(vid = %hex, mapfile = %mapfile_path.display(), "resume: recovered AACS Volume ID from mapfile");
     }
     let stats = map.stats();
+
+    // ISO-size validation. The `bytes_pending==0` and coverage gates below both
+    // trust the mapfile's `bytes_total`. If that total is short of the real
+    // disc, NonTried sectors past it are invisible to those checks. We can't
+    // stat the disc here, but we CAN stat the on-disk ISO: a settled Pass-1 ISO
+    // must be at least as large as the mapfile claims. If it's short, the ISO is
+    // truncated/incomplete — reject and re-sweep fresh.
+    match std::fs::metadata(&iso_path) {
+        Ok(meta) if meta.len() < stats.bytes_total => {
+            tracing::warn!(
+                iso = %iso_path.display(),
+                iso_len = meta.len(),
+                bytes_total = stats.bytes_total,
+                "resume: ISO is shorter than mapfile total_size; classifying as not-eligible (fresh sweep)"
+            );
+            return ResumeClass::NotEligible;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                iso = %iso_path.display(),
+                error = %e,
+                "resume: cannot stat ISO; classifying as not-eligible (fresh sweep)"
+            );
+            return ResumeClass::NotEligible;
+        }
+    }
+
     if stats.bytes_pending != 0 {
         // Pass 1 didn't fully settle the disc (some sectors still
         // NonTried / NonTrimmed / NonScraped) — let the regular rip
         // path resume sweep + retry instead of jumping to mux.
         return ResumeClass::NotEligible;
     }
+
+    // Coverage note (no live check here — intentionally): one might want to
+    // verify the mapfile's entries span its whole `bytes_total`. That check is
+    // DEAD: `Mapfile::load` partitions exactly [0, total_size) — leading and
+    // internal gaps are backfilled with synthetic NonTried entries and any
+    // trailing gap extends `bytes_total` — so after load,
+    // `bytes_good + bytes_unreadable + bytes_pending == bytes_total` is an
+    // identity, never a strict-less. (See `Mapfile::load`'s gap backfill.)
+    //
+    // The real protection against a SHORT mapfile (one truncated below the true
+    // disc capacity) is not in this function: `resume_remux` re-scans the
+    // actual on-disk ISO — which the sweep `set_len`s to full disc capacity
+    // regardless of the mapfile — and the ISO content (not the mapfile's
+    // bytes_total) drives the mux. A mapfile short of the real disc therefore
+    // can't cause silent tail loss at mux time. Plus the ISO-size guard above
+    // rejects an ISO shorter than the mapfile claims. So there is no gate to
+    // add here; this comment replaces a dead `bytes_accounted < bytes_total`
+    // identity check that gave a false sense of protection.
 
     // Bad-bytes pre-filter. Two cases:
     //
@@ -882,9 +928,29 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // here bypassed that hold for every resumed rip.
     // Durability gate: fsync the finished MKV/M2TS before any success
     // marker so a crash can't leave a "done" marker over a page-cache-only
-    // (on-disk-truncated) file. Skip network:// output (no local file).
-    if output_format != "network" || cfg_read.network_target.is_empty() {
-        staging::fsync_output_file(std::path::Path::new(&output_path));
+    // (on-disk-truncated) file. The library mux finish() swallows an fsync
+    // timeout/halt (returns Ok to bound the hang), so THIS fsync is the
+    // real durability gate. Skip network:// output (no local file).
+    //
+    // If the fsync fails, do NOT write .done/.completed: preserve the
+    // staging dir so the next restart's resume re-runs the durable flush
+    // rather than handing a possibly-truncated file to the mover.
+    let is_network = output_format == "network" && !cfg_read.network_target.is_empty();
+    if !is_network && !staging::fsync_output_file(std::path::Path::new(&output_path)) {
+        crate::log::device_log(
+            device,
+            "Auto-resume: durability gate failed (could not fsync mux output); \
+             preserving staging for next-restart retry.",
+        );
+        reset_status_after_ripping(
+            device,
+            "error",
+            &display_name,
+            &disc_format,
+            &duration,
+            Some("mux output not durable (fsync failed); preserved for retry".to_string()),
+        );
+        return;
     }
     let marker_name = if title_confident { ".done" } else { ".review" };
     let done_marker = serde_json::json!({

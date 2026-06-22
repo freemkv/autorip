@@ -219,25 +219,89 @@ fn copy_counting(
 ) -> std::io::Result<u64> {
     use std::io::{Read, Write};
     use std::sync::atomic::Ordering;
-    let mut reader = std::fs::File::open(src)?;
-    let mut writer = std::fs::File::create(dest)?;
-    let mut buf = vec![0u8; 4 * 1024 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+
+    // Write to a sibling temp on the DEST filesystem, fsync it, then
+    // rename(2) over the final name (atomic within the dest fs). Writing
+    // directly to the final path would leave a truncated file at the real
+    // name if we're SIGKILLed / OOM-killed / lose power mid-copy — the
+    // mover's post-copy size check would then see a wrong-size file and
+    // wedge the move on a phantom Collision. The temp+rename makes the
+    // final name appear only once the bytes are fully written and durable.
+    let tmp = {
+        let mut name = dest.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".part-{}", std::process::id()));
+        dest.with_file_name(name)
+    };
+    // Remove any stale temp from a prior interrupted run before we start.
+    let _ = std::fs::remove_file(&tmp);
+    // The temp name embeds OUR pid, so the line above only clears our own
+    // exact name. Orphaned `.part-<other-pid>` temps from prior crashed runs
+    // (different pid) would otherwise linger forever. Scan the dest parent for
+    // any `<dest-name>.part-*` and remove them before creating the new temp.
+    if let Some(parent) = dest.parent() {
+        if let Some(stem) = dest.file_name().and_then(|n| n.to_str()) {
+            let prefix = format!("{stem}.part-");
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.starts_with(&prefix) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
         }
-        writer.write_all(&buf[..n])?;
-        total += n as u64;
-        written.store(total, Ordering::Relaxed);
     }
-    writer.flush()?;
-    // fsync before returning: move_file unlinks the source once this returns
-    // Ok, so the destination must be durable on stable storage first. On a
-    // cross-fs (NFS) move, flush() on a File is a no-op — without sync_all a
-    // server/host crash in the close-to-commit window would lose the only copy.
-    writer.sync_all()?;
+
+    let copy_to_tmp = || -> std::io::Result<u64> {
+        let mut reader = std::fs::File::open(src)?;
+        let mut writer = std::fs::File::create(&tmp)?;
+        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n])?;
+            total += n as u64;
+            written.store(total, Ordering::Relaxed);
+        }
+        writer.flush()?;
+        // fsync the temp's data+metadata before the rename: move_file
+        // unlinks the source once this returns Ok, so the destination must
+        // be durable on stable storage first. On a cross-fs (NFS) move,
+        // flush() on a File is a no-op — without sync_all a server/host
+        // crash in the close-to-commit window would lose the only copy.
+        writer.sync_all()?;
+        Ok(total)
+    };
+
+    let total = match copy_to_tmp() {
+        Ok(t) => t,
+        Err(e) => {
+            // Drop the partial temp so the next attempt starts clean and
+            // no orphan lingers on the dest fs.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+
+    // fsync the dest parent dir so the temp's dirent is durable, then
+    // rename(2) over the final name (atomic within the fs), then fsync the
+    // dir again so the rename itself is durable before move_file unlinks
+    // the source. A crash at any point leaves either no final-name file or
+    // the complete one — never a truncated file at the real name.
+    if let Some(parent) = dest.parent() {
+        crate::ripper::staging::fsync_dir(parent);
+    }
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Some(parent) = dest.parent() {
+        crate::ripper::staging::fsync_dir(parent);
+    }
     Ok(total)
 }
 
@@ -480,9 +544,10 @@ fn check_and_move(cfg: &Config) {
         }
 
         let marker_path = dir.join(".done");
-        if !marker_path.exists() {
-            continue;
-        }
+        // No pre-flight exists() check: it races with the read below (a `.done`
+        // can be created or removed in the window between the two syscalls).
+        // The read_to_string Err arm is the single atomic gate — a NotFound is
+        // handled there (skip) exactly like any other read failure.
 
         // Read marker for TMDB metadata
         let marker: serde_json::Value = match std::fs::read_to_string(&marker_path) {
@@ -979,13 +1044,27 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
     if let (Ok(s), Ok(d)) = (&src_meta, &dest_meta) {
         if s.is_file() && d.is_file() && s.len() == d.len() && s.len() > 0 {
             if same_head_and_tail(src, dest) {
-                return MoveOutcome::Skipped;
+                // Equal length + matching head/tail still isn't proof of a
+                // DURABLE dest: a prior copy that failed post-copy validation
+                // (short/structurally-invalid on NFS) can leave a dest that
+                // happens to match these cheap probes. Run the same fresh-FD
+                // post-copy validation the copy path runs before accepting it
+                // as already-moved; on failure, fall through to a real copy.
+                if check_post_copy(src, dest).is_ok() {
+                    return MoveOutcome::Skipped;
+                }
+                crate::log::syslog(&format!(
+                    "Pre-existing destination failed post-copy validation; re-copying: {:?}",
+                    dest
+                ));
+                // Fall through to the copy path below.
+            } else {
+                crate::log::syslog(&format!(
+                    "Move blocked (destination same size but different content): {:?} vs {:?}",
+                    src, dest
+                ));
+                return MoveOutcome::Collision;
             }
-            crate::log::syslog(&format!(
-                "Move blocked (destination same size but different content): {:?} vs {:?}",
-                src, dest
-            ));
-            return MoveOutcome::Collision;
         }
     }
     // Pre-flight: src missing but dest present — earlier rename succeeded.
@@ -1066,8 +1145,18 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 let _ = copy_handle.join();
                 // Remove the partial/truncated destination so the next tick
                 // retries cleanly instead of seeing a phantom size-mismatch
-                // Collision (which would wedge the move permanently).
-                let _ = std::fs::remove_file(&dest_str);
+                // Collision (which would wedge the move permanently). If the
+                // removal ITSELF fails, the stuck partial silently wedges the
+                // move — surface it so the operator can delete it by hand.
+                if let Err(rm) = std::fs::remove_file(&dest_str) {
+                    record_error(
+                        &dest_str,
+                        "partial copy could not be removed",
+                        &format!(
+                            "partial copy could not be removed from {dest_str}; delete manually to unblock ({rm})"
+                        ),
+                    );
+                }
                 crate::log::syslog(&format!("fs::copy failed for {}: {}", dest_str, e));
                 return MoveOutcome::Failed;
             }
@@ -1264,8 +1353,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("a.mkv");
         let dest = tmp.path().join("b.mkv");
-        std::fs::write(&src, b"hello world").unwrap();
-        std::fs::write(&dest, b"hello world").unwrap();
+        // Valid EBML-framed payload: Skipped now requires the pre-existing
+        // dest to pass the same post-copy validation the copy path runs.
+        write_minimal_mkv(&src, b"hello world");
+        write_minimal_mkv(&dest, b"hello world");
         let outcome = move_file(&src, &dest, &noop_progress);
         assert_eq!(outcome, MoveOutcome::Skipped);
         assert!(src.exists(), "src must remain untouched on Skipped");
@@ -1331,6 +1422,35 @@ mod tests {
         assert!(!dest.exists(), "no partial destination may be left behind");
         // Source is the only copy and must be preserved on any failure.
         assert!(src.exists(), "source must survive a failed move");
+    }
+
+    #[test]
+    fn move_file_does_not_skip_an_invalid_same_size_dest() {
+        // Regression (finding 9): the Skipped pre-flight accepted a
+        // pre-existing dest on equal length + matching head/tail WITHOUT the
+        // post-copy validation the copy path runs. A dest left undurable by a
+        // prior failed copy (here: structurally invalid — no EBML magic) must
+        // NOT be treated as already-moved. With src present, rename now
+        // overwrites it → Moved, not Skipped.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.mkv");
+        let dest = tmp.path().join("b.mkv");
+        // Byte-identical, same length, matching head/tail — but no EBML magic,
+        // so check_post_copy rejects it.
+        let bytes = vec![0xAAu8; 4096];
+        std::fs::write(&src, &bytes).unwrap();
+        std::fs::write(&dest, &bytes).unwrap();
+        let outcome = move_file(&src, &dest, &noop_progress);
+        assert_ne!(
+            outcome,
+            MoveOutcome::Skipped,
+            "an invalid same-size dest must not be accepted as already-moved"
+        );
+        assert_eq!(
+            outcome,
+            MoveOutcome::Moved,
+            "rename overwrites the bad dest"
+        );
     }
 
     #[test]
@@ -1638,6 +1758,70 @@ mod tests {
         let dst = tmp.path().join("dst.bin");
         let written = AtomicU64::new(0);
         assert!(copy_counting(&src, &dst, &written).is_err());
+    }
+
+    /// Regression (temp + rename atomicity): a failed/interrupted copy must
+    /// NOT leave any file at the FINAL dest name — the bytes land on a
+    /// sibling `.part-<pid>` temp and only `rename(2)` over the real name
+    /// once fully written + fsynced. A truncated file at the real name
+    /// would fail the mover's post-copy size check and wedge the move.
+    #[test]
+    fn copy_counting_failure_leaves_no_file_at_final_name() {
+        use std::sync::atomic::AtomicU64;
+        let tmp = tempfile::tempdir().unwrap();
+        // Missing source → the copy errors out. (The same no-final-file
+        // invariant holds for a mid-stream SIGKILL: bytes only ever exist
+        // at the temp name until the atomic rename.)
+        let src = tmp.path().join("missing.bin");
+        let dst = tmp.path().join("final.mkv");
+        let written = AtomicU64::new(0);
+        assert!(copy_counting(&src, &dst, &written).is_err());
+        assert!(
+            !dst.exists(),
+            "a failed copy must leave no file at the final dest name"
+        );
+        // And no orphan temp lingers next to it.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("final.mkv.part-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "interrupted copy must not orphan a .part temp, found {leftovers:?}"
+        );
+    }
+
+    /// Positive path: a successful `copy_counting` produces the final file
+    /// atomically (via rename) with the exact source bytes, and leaves no
+    /// `.part-` temp behind.
+    #[test]
+    fn copy_counting_success_renames_atomically_and_cleans_temp() {
+        use std::sync::atomic::AtomicU64;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("final.bin");
+        let data = vec![0x5Au8; 3 * 1024 * 1024 + 5];
+        std::fs::write(&src, &data).unwrap();
+        let written = AtomicU64::new(0);
+        let n = copy_counting(&src, &dst, &written).unwrap();
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            data,
+            "final is a faithful copy"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".part-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "successful copy must leave no .part temp, found {leftovers:?}"
+        );
     }
 
     // ---- post-copy integrity + collision hardening tests ----

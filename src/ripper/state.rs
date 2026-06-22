@@ -161,6 +161,16 @@ pub struct RipState {
     /// when `None` so older dashboards don't see a stray field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resumable: Option<Resumable>,
+
+    /// Monotonic claim generation, bumped by every successful
+    /// [`try_claim_active`]. Lets a detached worker (e.g. a verify thread)
+    /// tell whether the device it claimed is *still* the one it owns: if a
+    /// newer claim (a rip, scan, eject, or a fresh verify) has landed since,
+    /// the generation will have moved and the stale worker must NOT reset the
+    /// device to idle — doing so would clobber the new owner's claim. Not
+    /// serialized: a pure server-side bookkeeping field the UI never reads.
+    #[serde(skip)]
+    pub claim_gen: u64,
 }
 
 impl Default for RipState {
@@ -210,6 +220,7 @@ impl Default for RipState {
             started_epoch_secs: 0,
             key_status: String::new(),
             resumable: None,
+            claim_gen: 0,
         }
     }
 }
@@ -280,6 +291,17 @@ pub(super) fn is_in_cooldown(device: &str) -> bool {
     false
 }
 
+/// True when `device` is a known drive tracked in STATE. Used by routes
+/// that mutate per-device state (e.g. the title override) to reject a
+/// request for an unknown device with 404 rather than silently storing an
+/// override for a drive that doesn't exist. Recovers a poisoned guard for
+/// the same reason `is_busy` does (a stale poison must not make every
+/// device look unknown).
+pub fn device_known(device: &str) -> bool {
+    let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    s.contains_key(device)
+}
+
 pub fn is_busy(device: &str) -> bool {
     // Recover the poisoned guard instead of treating poison as "not
     // busy". This is the double-rip guard: if a panic while holding
@@ -309,6 +331,14 @@ pub fn update_state(device: &str, mut state: RipState) {
     // the write — a dropped write freezes the dashboard on stale state
     // for the rest of the process. Matches `is_busy` / log.rs convention.
     let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    // Preserve the claim generation across pushes: callers build fresh
+    // RipStates with `..Default::default()` (claim_gen = 0), so without this
+    // carry-forward every state push would reset the generation and defeat the
+    // stale-worker ownership check.
+    let prev_claim_gen = s.get(device).map(|p| p.claim_gen).unwrap_or(0);
+    if state.claim_gen == 0 {
+        state.claim_gen = prev_claim_gen;
+    }
     let prev_started = s.get(device).map(|p| p.started_epoch_secs).unwrap_or(0);
     let now_active = is_active_status(&state.status);
     let was_active = s.get(device).is_some_and(|p| is_active_status(&p.status));
@@ -382,7 +412,21 @@ pub fn try_claim_active(device: &str) -> bool {
     });
     entry.status = "scanning".to_string();
     entry.disc_present = true;
+    // Bump the claim generation so a previously-detached worker (e.g. a stale
+    // verify) can detect that the device has been re-claimed and decline to
+    // reset it to idle. Monotonic per device; saturating so it never wraps to
+    // an old value mid-process.
+    entry.claim_gen = entry.claim_gen.saturating_add(1);
     true
+}
+
+/// The device's current claim generation (0 if the device is unknown). A
+/// detached worker reads this immediately after its own [`try_claim_active`]
+/// and again before releasing the claim: if it changed, a newer owner has the
+/// device and the worker must not reset it to idle.
+pub fn current_claim_gen(device: &str) -> u64 {
+    let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    s.get(device).map(|r| r.claim_gen).unwrap_or(0)
 }
 
 /// Shared context for the progress callbacks of a multi-pass rip. Built once

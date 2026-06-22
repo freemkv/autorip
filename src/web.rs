@@ -3,7 +3,7 @@ use crate::ripper;
 use once_cell::sync::Lazy;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
@@ -138,7 +138,7 @@ tr:hover { background:var(--chip); }
   <div id="review"></div>
   <div class="card" style="margin-top:16px"><h2>Mux Queue</h2><div id="muxes"></div></div>
   <div class="card"><h2>Move Queue</h2><div id="moves"></div></div>
-  <div class="card"><label class="toggle"><input type="checkbox" id="debugToggle" onchange="toggleDebug(this.checked)"> Debug logging</label><div class="hint">Verbose logs for bug reports (autorip + rip library). Off by default.</div></div>
+  <div class="card"><div class="setting"><label class="toggle"><input type="checkbox" id="debugToggle" onchange="toggleDebug(this.checked)"> Debug logging</label><div class="hint">Verbose logs for bug reports (autorip + rip library). Off by default.</div></div></div>
   <div><h2 style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;margin-bottom:8px">System Log</h2><div id="syslog" class="log" style="max-height:400px"></div></div>
 </div>
 
@@ -1439,8 +1439,13 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             return json_response(request, 400, r#"{"error":"invalid device name"}"#);
         }
         let dev_path = format!("/dev/{}", device);
-        if crate::verify::is_running() {
-            json_response(request, 409, r#"{"error":"verify already running"}"#);
+        // Gate on the unified per-device claim, not a verify-local "already
+        // running" check: a rip/scan/eject in progress must also reject a
+        // verify (and vice-versa). try_claim_active is the single source of
+        // truth; reject early here so the caller gets a 409, then let
+        // run_verify perform the actual atomic claim it will hold.
+        if ripper::is_busy(&device) || crate::verify::is_running(&device) {
+            json_response(request, 409, r#"{"error":"device busy"}"#);
         } else {
             let keydb = cfg.read().ok().and_then(|c| c.keydb_path.clone());
             crate::verify::run_verify(&device, &dev_path, keydb);
@@ -1489,6 +1494,13 @@ fn is_valid_poster_url(url: &str) -> bool {
 /// Stored as a one-shot override `rip_disc` consumes; also reflected on the live
 /// card immediately.
 fn handle_title_override(request: tiny_http::Request, device: &str) {
+    // Gate on a known device: an override for a drive that isn't tracked in
+    // STATE has nothing to attach to and would just persist orphaned. Match
+    // how other per-device routes validate (404 unknown). This runs before
+    // the body is read so we reject early.
+    if !ripper::device_known(device) {
+        return json_response(request, 404, r#"{"ok":false,"error":"unknown device"}"#);
+    }
     let (request, body) = match read_json_body(request) {
         Ok(rb) => rb,
         Err(()) => return,
@@ -1497,7 +1509,10 @@ fn handle_title_override(request: tiny_http::Request, device: &str) {
         Ok(v) => v,
         Err(_) => return json_response(request, 400, r#"{"ok":false,"error":"invalid json"}"#),
     };
-    let title = v["title"].as_str().unwrap_or("").trim().to_string();
+    // Clamp operator-supplied free text on char boundaries before it's
+    // persisted and re-broadcast to every dashboard client (mirrors the
+    // 200-char `q` cap). Caps: title ~300, overview ~2000, poster_url ~1000.
+    let title = clamp_chars(v["title"].as_str().unwrap_or("").trim(), 300);
     if title.is_empty() {
         return json_response(request, 400, r#"{"ok":false,"error":"title required"}"#);
     }
@@ -1509,8 +1524,8 @@ fn handle_title_override(request: tiny_http::Request, device: &str) {
     if !poster_raw.is_empty() && !is_valid_poster_url(poster_raw) {
         return json_response(request, 400, r#"{"ok":false,"error":"invalid poster_url"}"#);
     }
-    let poster = poster_raw.to_string();
-    let overview = v["overview"].as_str().unwrap_or("").to_string();
+    let poster = clamp_chars(poster_raw, 1000);
+    let overview = clamp_chars(v["overview"].as_str().unwrap_or(""), 2000);
     let media_type = v["media_type"].as_str().unwrap_or("movie").to_string();
     ripper::set_title_override(
         device,
@@ -1547,7 +1562,9 @@ fn handle_review_resolve(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>)
         Ok(v) => v,
         Err(_) => return json_response(request, 400, r#"{"ok":false,"error":"invalid json"}"#),
     };
-    let dir = v["dir"].as_str().unwrap_or("").to_string();
+    // Cap operator-supplied strings before they reach a filesystem marker,
+    // mirroring handle_title_override (clamp_chars by char count, not bytes).
+    let dir = clamp_chars(v["dir"].as_str().unwrap_or("").trim(), 300);
     let staging = cfg
         .read()
         .map(|c| c.staging_dir.clone())
@@ -1556,7 +1573,7 @@ fn handle_review_resolve(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>)
         "proceed" => crate::review::Resolve::Proceed,
         "cancel" => crate::review::Resolve::Cancel,
         "retitle" => {
-            let title = v["title"].as_str().unwrap_or("").trim().to_string();
+            let title = clamp_chars(v["title"].as_str().unwrap_or("").trim(), 300);
             if title.is_empty() {
                 return json_response(request, 400, r#"{"ok":false,"error":"title required"}"#);
             }
@@ -1587,11 +1604,34 @@ fn handle_tmdb_search(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, ur
     // (split_once("?q=") only matched q as the first query parameter, so
     // e.g. /api/tmdb/search?version=2&q=movie yielded an empty query).
     let q = parse_query(url).get("q").cloned().unwrap_or_default();
+    let q = q.trim();
+    // Reject empty queries and cap length so we never forward an abusive
+    // request to TMDB.
+    if q.is_empty() || q.len() > 200 {
+        return json_response(request, 400, r#"{"error":"invalid query"}"#);
+    }
+    // Global cooldown: an unauthenticated LAN client could otherwise flood
+    // TMDB through this proxy. Gate on the time since the last forwarded
+    // search; reply 429 if a request arrived too recently.
+    {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        static LAST_TMDB_SEARCH: Mutex<Option<Instant>> = Mutex::new(None);
+        const TMDB_MIN_INTERVAL: Duration = Duration::from_millis(500);
+        let mut last = LAST_TMDB_SEARCH.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < TMDB_MIN_INTERVAL {
+                return json_response(request, 429, r#"{"error":"rate limited"}"#);
+            }
+        }
+        *last = Some(now);
+    }
     let key = cfg
         .read()
         .map(|c| c.tmdb_api_key.clone())
         .unwrap_or_default();
-    let results = crate::tmdb::search(&q, &key, 8);
+    let results = crate::tmdb::search(q, &key, 8);
     json_response(
         request,
         200,
@@ -1639,10 +1679,55 @@ fn mask_webhook_url(url: &str) -> String {
             .find(['/', '?', '#'])
             .map(|i| after + i)
             .unwrap_or(url.len());
-        return format!("{}/{}", &url[..origin_end], SECRET_SENTINEL);
+        // The authority span is `url[after..origin_end]`. If it carries HTTP
+        // basic-auth userinfo (`user:pass@host`), the masked value would otherwise
+        // LEAK the credentials to the client. Drop everything up to and including
+        // the last '@' so only `scheme://host[:port]` survives.
+        let authority = &url[after..origin_end];
+        let host_start = match authority.rfind('@') {
+            Some(at) => after + at + 1,
+            None => after,
+        };
+        return format!(
+            "{}{}/{}",
+            &url[..after],
+            &url[host_start..origin_end],
+            SECRET_SENTINEL
+        );
     }
     // No scheme — nothing identifiable to preserve; fully mask.
     SECRET_SENTINEL.to_string()
+}
+
+/// Mask a webhook URL for display, embedding a STABLE per-entry identifier
+/// (its index in the stored `webhook_urls` array) so resolution on POST is by
+/// identity, not by origin. Two distinct webhooks that share an origin
+/// (e.g. two Discord hooks) mask to DIFFERENT placeholders and so round-trip
+/// unambiguously — the origin-only mask used to collide them and force the
+/// save to be rejected.
+///
+/// Form: `https://discord.com/********#<idx>` — the `#<idx>` fragment is
+/// appended to the origin-masked value. [`resolve_webhook_urls`] reads it back.
+fn mask_webhook_url_indexed(url: &str, idx: usize) -> String {
+    format!("{}#{idx}", mask_webhook_url(url))
+}
+
+/// True if `s` is a redacted webhook placeholder produced by
+/// [`mask_webhook_url`] / [`mask_webhook_url_indexed`] — i.e. it ends with the
+/// sentinel, or with `********#<digits>` (the indexed form). Used to skip
+/// re-validating / re-fetching a masked round-trip. Deliberately strict: a
+/// hostile URL that merely *embeds* the sentinel mid-path (e.g.
+/// `https://evil/********@host/x`) does NOT match and is still validated.
+fn is_masked_webhook(s: &str) -> bool {
+    if s.ends_with(SECRET_SENTINEL) {
+        return true;
+    }
+    if let Some((head, idx)) = s.rsplit_once('#') {
+        return head.ends_with(SECRET_SENTINEL)
+            && !idx.is_empty()
+            && idx.bytes().all(|b| b.is_ascii_digit());
+    }
+    false
 }
 
 /// Resolve an incoming `webhook_urls` array against the currently-stored
@@ -1661,6 +1746,26 @@ fn resolve_webhook_urls(incoming: &[&str], existing: &[String]) -> Result<Vec<St
     let mut resolved: Vec<String> = Vec::with_capacity(incoming.len());
     for s in incoming {
         if s.contains(SECRET_SENTINEL) {
+            // Preferred path: the masked form carries a stable `#<idx>`
+            // identifier (see mask_webhook_url_indexed). Resolve by that index
+            // so two same-origin webhooks round-trip unambiguously. The index
+            // must both be in range AND still mask to exactly this placeholder
+            // (so a reordered/deleted row can't silently bind the wrong secret).
+            if let Some((origin_mask, idx_str)) = s.rsplit_once('#') {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    match existing.get(idx) {
+                        Some(stored) if mask_webhook_url(stored) == origin_mask => {
+                            resolved.push(stored.clone());
+                            continue;
+                        }
+                        // Index stale (row deleted/reordered) — reject rather
+                        // than guess.
+                        _ => return Err((*s).to_string()),
+                    }
+                }
+            }
+            // Fallback: no embedded index (older client). Match by origin; only
+            // unambiguous when exactly one stored URL shares the origin.
             let matches: Vec<&String> = existing
                 .iter()
                 .filter(|stored| mask_webhook_url(stored) == *s)
@@ -1707,11 +1812,23 @@ fn settings_json_redacted(c: &Config) -> String {
     // secrets live in the path/query). Mask the token but keep the origin
     // visible so the operator can identify each hook. A masked entry
     // round-trips on POST: any entry containing the sentinel is "unchanged".
+    // keydb_path is an absolute container path; leaking it to any LAN/host
+    // client exposes the internal filesystem layout. Return only the filename
+    // component (enough for the operator to confirm which file is in use).
+    if let Some(s) = v.get("keydb_path").and_then(|x| x.as_str()) {
+        if !s.is_empty() {
+            let name = std::path::Path::new(s)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            v["keydb_path"] = serde_json::json!(name);
+        }
+    }
     if let Some(arr) = v.get_mut("webhook_urls").and_then(|x| x.as_array_mut()) {
-        for entry in arr.iter_mut() {
+        for (idx, entry) in arr.iter_mut().enumerate() {
             if let Some(s) = entry.as_str() {
                 if !s.is_empty() {
-                    *entry = serde_json::json!(mask_webhook_url(s));
+                    *entry = serde_json::json!(mask_webhook_url_indexed(s, idx));
                 }
             }
         }
@@ -1798,6 +1915,16 @@ fn is_valid_device_name(s: &str) -> bool {
     (3..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// Clamp `s` to at most `max` characters (Unicode scalar values), never
+/// splitting a multi-byte char. Used to bound operator-supplied free text
+/// (title/overview/poster_url) before it's persisted and re-broadcast.
+fn clamp_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((byte_idx, _)) => s[..byte_idx].to_string(),
+        None => s.to_string(),
+    }
+}
+
 // ── SSRF guard ─────────────────────────────────────────────────────────
 //
 // Any operator-supplied URL that autorip later fetches/POSTs to from
@@ -1855,6 +1982,52 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 /// a blocked class. On success returns the resolved+validated socket
 /// addresses so the caller can pin the connection to them (avoiding a
 /// re-resolve race). `Err(msg)` carries an operator-facing reason.
+/// Resolve `host:port` to socket addresses with a bounded deadline.
+///
+/// `ToSocketAddrs` performs a blocking DNS lookup, which can hang for the OS
+/// resolver timeout (potentially tens of seconds) and freeze the calling
+/// (unauthenticated) handler thread. Run it on a spawned thread and join with
+/// a short deadline; error on timeout. Shared by `validate_fetch_url` and
+/// `validate_network_target` so neither can re-introduce an unbounded lookup.
+pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    const DNS_TIMEOUT: Duration = Duration::from_secs(4);
+    // On timeout the spawned resolver thread can't be cancelled — it lingers
+    // until the blocking `to_socket_addrs` returns. To stop these accumulating
+    // unboundedly under repeated timeouts, cap the number of detached resolvers
+    // in flight. When at the cap, fail fast as if timed out rather than spawning
+    // (and leaking) yet another thread.
+    const MAX_INFLIGHT: usize = 8;
+    static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+    if INFLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT {
+        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+        return Err("DNS resolution timed out".to_string());
+    }
+
+    let host = host.to_string();
+    // Bounded channel of capacity 1: the resolver thread's single send never
+    // blocks forever (the buffer always has room for its one message), so the
+    // thread always exits cleanly once resolution completes — even if the
+    // receiver has already timed out and gone away.
+    let (tx, rx) = mpsc::sync_channel::<Result<Vec<SocketAddr>, std::io::Error>>(1);
+    std::thread::spawn(move || {
+        let res = (host.as_str(), port)
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<SocketAddr>>());
+        // Receiver may be gone after the timeout — ignore the send error.
+        let _ = tx.send(res);
+        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    });
+    match rx.recv_timeout(DNS_TIMEOUT) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(format!("could not resolve host: {e}")),
+        Err(_) => Err("DNS resolution timed out".to_string()),
+    }
+}
+
 pub(crate) fn validate_fetch_url(url: &str) -> Result<Vec<SocketAddr>, String> {
     let url = url.trim();
     if url.is_empty() {
@@ -1905,11 +2078,8 @@ pub(crate) fn validate_fetch_url(url: &str) -> Result<Vec<SocketAddr>, String> {
         return Err("URL has no host".to_string());
     }
 
-    // Resolve once. ToSocketAddrs over (host, port) performs DNS.
-    let addrs: Vec<SocketAddr> = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|e| format!("could not resolve host: {e}"))?
-        .collect();
+    // Resolve once, with a bounded deadline (see resolve_with_timeout).
+    let addrs: Vec<SocketAddr> = resolve_with_timeout(&host, port)?;
     if addrs.is_empty() {
         return Err("host did not resolve to any address".to_string());
     }
@@ -1958,10 +2128,9 @@ pub(crate) fn validate_network_target(target: &str) -> Result<(), String> {
         return Err("network target has no host".to_string());
     }
 
-    let addrs: Vec<SocketAddr> = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|e| format!("could not resolve host: {e}"))?
-        .collect();
+    // Bounded DNS — same shared helper validate_fetch_url uses, so an
+    // unauthenticated settings POST can't freeze the handler on a slow resolver.
+    let addrs: Vec<SocketAddr> = resolve_with_timeout(&host, port)?;
     if addrs.is_empty() {
         return Err("host did not resolve to any address".to_string());
     }
@@ -2079,6 +2248,33 @@ impl Drop for ConnGuard {
 #[allow(clippy::items_after_test_module)]
 mod web_tests {
     use super::*;
+
+    #[test]
+    fn keydb_body_under_cap_is_accepted() {
+        let body = vec![b'x'; 100];
+        let out = read_capped_keydb_body(&body[..], 10 * 1024 * 1024).unwrap();
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn keydb_body_exactly_at_cap_is_accepted() {
+        // The cap is inclusive: a body of exactly max_bytes must pass (no
+        // false-positive on a legitimately cap-sized keydb).
+        let cap: u64 = 4096;
+        let body = vec![b'x'; cap as usize];
+        let out = read_capped_keydb_body(&body[..], cap).unwrap();
+        assert_eq!(out.len() as u64, cap);
+    }
+
+    #[test]
+    fn keydb_body_over_cap_is_rejected() {
+        // Regression (finding 2): a body one byte past the cap must be
+        // detected as TooLarge, not silently truncated to the cap.
+        let cap: u64 = 4096;
+        let body = vec![b'x'; cap as usize + 1];
+        let err = read_capped_keydb_body(&body[..], cap).unwrap_err();
+        assert_eq!(err, KeydbReadError::TooLarge);
+    }
 
     #[test]
     fn device_name_accepts_cross_os_keys() {
@@ -2236,10 +2432,12 @@ mod web_tests {
         };
         let json: serde_json::Value = serde_json::from_str(&settings_json_redacted(&c)).unwrap();
         let arr = json["webhook_urls"].as_array().unwrap();
-        assert_eq!(arr[0], "https://discord.com/********");
+        // Masked form now carries a stable per-entry index (#<pos>) so two
+        // same-origin hooks round-trip unambiguously (#8).
+        assert_eq!(arr[0], "https://discord.com/********#0");
         // Empty entry stays empty (no sentinel) so the UI shows a blank row.
         assert_eq!(arr[1], "");
-        assert_eq!(arr[2], "https://hooks.slack.com/********");
+        assert_eq!(arr[2], "https://hooks.slack.com/********#2");
         // The masked form must NOT leak the token.
         assert!(!arr[0].as_str().unwrap().contains("secrettoken"));
         assert!(!arr[2].as_str().unwrap().contains("cccsecret"));
@@ -2276,6 +2474,36 @@ mod web_tests {
         assert_eq!(
             mask_webhook_url("https://hooks.example.com#frag"),
             "https://hooks.example.com/********"
+        );
+    }
+
+    #[test]
+    fn mask_webhook_url_strips_basic_auth_userinfo() {
+        // user:pass@host must NOT leak into the masked value returned to the
+        // client. Only scheme://host[:port] survives.
+        assert_eq!(
+            mask_webhook_url("https://user:pass@host/x"),
+            "https://host/********"
+        );
+        // Userinfo + explicit port.
+        assert_eq!(
+            mask_webhook_url("https://user:pass@host:8443/webhook/tok"),
+            "https://host:8443/********"
+        );
+        // user-only (no colon) userinfo also stripped.
+        assert_eq!(
+            mask_webhook_url("http://alice@example.com/hook"),
+            "http://example.com/********"
+        );
+        // An '@' only inside the path (no userinfo in authority) is untouched.
+        assert_eq!(
+            mask_webhook_url("https://example.com/a@b/c"),
+            "https://example.com/********"
+        );
+        // A bare-origin URL with userinfo (no path) is still stripped.
+        assert_eq!(
+            mask_webhook_url("https://user:pass@example.com"),
+            "https://example.com/********"
         );
     }
 
@@ -2367,6 +2595,39 @@ mod web_tests {
         ];
         let masked = ["https://discord.com/********"];
         assert!(resolve_webhook_urls(&masked, &two_discord).is_err());
+    }
+
+    #[test]
+    fn webhook_two_same_origin_round_trip_by_index() {
+        // Regression (#8): two webhooks that share an origin used to mask to the
+        // SAME placeholder, so a GET→POST round-trip was ambiguous (>1 origin
+        // match) and the save was permanently rejected. With a stable per-entry
+        // index embedded in the mask, each resolves to its OWN stored secret.
+        let existing: Vec<String> = vec![
+            "https://discord.com/api/webhooks/1/secretA".into(),
+            "https://discord.com/api/webhooks/2/secretB".into(),
+        ];
+        // Exactly what GET /api/settings now emits.
+        let masked0 = mask_webhook_url_indexed(&existing[0], 0);
+        let masked1 = mask_webhook_url_indexed(&existing[1], 1);
+        assert_ne!(masked0, masked1, "same-origin masks must differ by index");
+
+        let incoming = [masked0.as_str(), masked1.as_str()];
+        let resolved = resolve_webhook_urls(&incoming, &existing).unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                "https://discord.com/api/webhooks/1/secretA".to_string(),
+                "https://discord.com/api/webhooks/2/secretB".to_string(),
+            ],
+            "each indexed mask must resolve to its own stored secret"
+        );
+
+        // A stale index whose origin mask no longer matches must be rejected,
+        // not silently bound to the wrong secret.
+        let stale = [mask_webhook_url_indexed("https://discord.com/x", 5)];
+        let stale = [stale[0].as_str()];
+        assert!(resolve_webhook_urls(&stale, &existing).is_err());
     }
 
     #[test]
@@ -2613,6 +2874,31 @@ mod web_tests {
     }
 
     #[test]
+    fn resolve_with_timeout_resolves_literal() {
+        // A numeric literal resolves without touching DNS and returns within
+        // the deadline. Shared by validate_network_target + validate_fetch_url.
+        let addrs = resolve_with_timeout("9.9.9.9", 853).expect("literal resolves");
+        assert!(addrs.iter().any(|a| a.port() == 853 && a.ip().is_ipv4()));
+    }
+
+    #[test]
+    fn resolve_with_timeout_does_not_leak_inflight_slots() {
+        // Regression for the unbounded-thread leak: the in-flight cap is 8.
+        // A completed resolve must release its slot, so many sequential
+        // resolves (far more than the cap) all succeed — if slots leaked, the
+        // 9th+ call would fail fast with a spurious timeout. Each literal
+        // resolve still spawns + joins its detached thread, which decrements
+        // the counter, so the cap never saturates.
+        for _ in 0..40 {
+            let addrs = resolve_with_timeout("9.9.9.9", 853).expect("literal resolves");
+            assert!(addrs.iter().any(|a| a.port() == 853));
+            // Let the detached resolver thread run its fetch_sub before the
+            // next iteration so the slot is reliably released.
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
     fn validate_fetch_url_accepts_public_literal() {
         // A public numeric host (no DNS needed) should validate and yield
         // the pinned address with the default port for the scheme.
@@ -2678,10 +2964,7 @@ fn get_state_json() -> String {
     // RipState seeded by the mux worker — see the dashboard JS at the
     // `_mux` field), serialized below as part of `state`. There is no
     // separate live MuxState struct.
-    let verify_state = crate::verify::VERIFY_STATE
-        .lock()
-        .ok()
-        .and_then(|vs| vs.clone());
+    let verify_state = crate::verify::dashboard_state();
     let mut obj = serde_json::to_value(&*state).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(ms) = move_state {
         obj["_move"] = serde_json::to_value(&ms).unwrap_or_default();
@@ -2707,8 +2990,12 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         }
     };
 
+    // Cap on how many queue entries we serialize so a staging dir holding a
+    // pathological number of subdirs can't produce an unbounded response.
+    const QUEUE_DISPLAY_CAP: usize = 100;
+
     // Move queue: scan staging for .done markers (pending moves)
-    let move_queue: Vec<String> = std::fs::read_dir(&cfg.staging_dir)
+    let move_all: Vec<String> = std::fs::read_dir(&cfg.staging_dir)
         .ok()
         .map(|entries| {
             entries
@@ -2721,6 +3008,8 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
                 .collect()
         })
         .unwrap_or_default();
+    let move_full_count = move_all.len();
+    let move_queue: Vec<String> = move_all.into_iter().take(QUEUE_DISPLAY_CAP).collect();
 
     // Mover errors: stuck staging dirs the user needs to act on.
     let move_errors: Vec<crate::mover::MoverError> = crate::mover::MOVE_ERRORS
@@ -2732,7 +3021,13 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // sweep+patch done, awaiting the mux worker. Empty in v0.25.3
     // until rip_disc starts writing the marker; the UI panel exists
     // so the wiring is ready for the cut-over.
-    let mux_queue = crate::muxer::pending_queue(std::path::Path::new(&cfg.staging_dir));
+    let mut mux_queue = crate::muxer::pending_queue(std::path::Path::new(&cfg.staging_dir));
+    let mux_full_count = mux_queue.len();
+    mux_queue.truncate(QUEUE_DISPLAY_CAP);
+    // Number of move/mux entries dropped from the response by the display cap,
+    // so the UI can show "+N more" rather than silently hiding them.
+    let truncation_count = move_full_count.saturating_sub(QUEUE_DISPLAY_CAP)
+        + mux_full_count.saturating_sub(QUEUE_DISPLAY_CAP);
     let mux_errors: Vec<crate::muxer::MuxerError> = crate::muxer::MUX_ERRORS
         .lock()
         .map(|m| m.values().cloned().collect())
@@ -2755,6 +3050,7 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         "move_errors": move_errors,
         "mux_queue": mux_queue,
         "mux_errors": mux_errors,
+        "truncation_count": truncation_count,
         "syslog": syslog,
         // Current runtime debug-logging state, so the System-page toggle
         // reflects reality on load (POST /api/debug flips it).
@@ -2838,8 +3134,21 @@ fn handle_debug_log(request: tiny_http::Request, url: &str) {
         .unwrap_or(500)
         .min(5000);
     let level = params.get("level").map(|s| s.to_lowercase());
-    let device = params.get("device").cloned();
-    let q = params.get("q").cloned();
+    // Validate the device filter with the same strict predicate as every other
+    // device handler; ignore an invalid value rather than letting an arbitrary
+    // attacker-supplied substring into the line filter.
+    let device = params
+        .get("device")
+        .filter(|d| is_valid_device_name(d))
+        .cloned();
+    // Restrict the free-text grep filter to printable ASCII (0x20..=0x7E).
+    // The JSONL we grep is ASCII-only; rejecting non-printable/non-ASCII keeps
+    // an attacker from smuggling control bytes or arbitrary Unicode into the
+    // line filter. The 256-byte cap in parse_query already bounds its size.
+    let q = params
+        .get("q")
+        .filter(|s| s.bytes().all(|b| (0x20..=0x7E).contains(&b)))
+        .cloned();
 
     let path = crate::observe::json_log_path();
     let content = match tail_file(&path, DEBUG_TAIL_BYTES) {
@@ -2905,9 +3214,29 @@ fn parse_query(url: &str) -> std::collections::HashMap<String, String> {
         Some((_, q)) => q,
         None => return map,
     };
-    for pair in q.split('&') {
+    // Bound the work: cap the number of pairs and the length of each key/value
+    // so a hostile query string can't blow up the HashMap or the per-request
+    // allocation.
+    const MAX_PAIRS: usize = 32;
+    const MAX_FIELD_LEN: usize = 256;
+    // Truncate a &str to at most `n` bytes on a char boundary (raw query
+    // fields may carry multibyte UTF-8, so a blind byte slice could panic).
+    fn clamp(s: &str, n: usize) -> &str {
+        if s.len() <= n {
+            return s;
+        }
+        let mut end = n;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+    for pair in q.split('&').take(MAX_PAIRS) {
         if let Some((k, v)) = pair.split_once('=') {
-            map.insert(percent_decode(k), percent_decode(v));
+            map.insert(
+                percent_decode(clamp(k, MAX_FIELD_LEN)),
+                percent_decode(clamp(v, MAX_FIELD_LEN)),
+            );
         }
     }
     map
@@ -3012,7 +3341,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         for u in arr
             .iter()
             .filter_map(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty() && !s.ends_with(SECRET_SENTINEL))
+            .filter(|s| !s.trim().is_empty() && !is_masked_webhook(s))
         {
             if let Err(e) = validate_fetch_url(u) {
                 return json_response(
@@ -3060,6 +3389,69 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
                     request,
                     400,
                     &format!(r#"{{"ok":false,"error":"invalid value for {field}"}}"#),
+                );
+            }
+        }
+    }
+
+    // Validate directory-path fields BEFORE the write guard. These end up as
+    // filesystem roots autorip writes rips into and enumerates (the move queue
+    // scans `staging_dir` with `read_dir`), so a raw POST must not be able to
+    // point them at an arbitrary location for directory enumeration. Require an
+    // absolute path with no `..` traversal component — that confines them to
+    // real mount points (the legitimate configs are all absolute: /staging-local,
+    // /mnt/unraid-1/media/movies, …) while rejecting relative / climbing paths.
+    // Empty string is allowed: it means "unset / inherit default" for the
+    // optional movie_dir / tv_dir overrides.
+    for field in ["output_dir", "staging_dir", "movie_dir", "tv_dir"] {
+        if let Some(v) = patch.get(field).and_then(|v| v.as_str()) {
+            if v.is_empty() {
+                continue;
+            }
+            let p = std::path::Path::new(v);
+            let bad = !p.is_absolute()
+                || p.components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir));
+            if bad {
+                return json_response(
+                    request,
+                    400,
+                    &format!(
+                        r#"{{"ok":false,"error":"{field} must be an absolute path with no '..'"}}"#
+                    ),
+                );
+            }
+        }
+    }
+
+    // Validate keydb_path (the AACS keydb.cfg file path) BEFORE the write guard,
+    // same trust-boundary rationale as the directory fields: a raw POST must not
+    // be able to point the keydb at an arbitrary location. Require an absolute
+    // path, no `..` traversal, and prefer a `.cfg` extension. Two values are
+    // exempt: "" (unset → default) and the redacted basename round-trip (GET
+    // /api/settings returns keydb_path as just its filename to avoid leaking the
+    // absolute container path, and that bare value must round-trip unchanged).
+    if let Some(v) = patch.get("keydb_path").and_then(|v| v.as_str()) {
+        let is_redacted_roundtrip = !v.is_empty() && !v.contains('/') && {
+            let stored = cfg.read().ok().and_then(|c| c.keydb_path.clone());
+            stored.as_deref().is_some_and(|s| {
+                std::path::Path::new(s)
+                    .file_name()
+                    .map(|n| n == std::ffi::OsStr::new(v))
+                    .unwrap_or(false)
+            })
+        };
+        if !v.is_empty() && !is_redacted_roundtrip {
+            let p = std::path::Path::new(v);
+            let bad = !p.is_absolute()
+                || p.components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                || p.extension().and_then(|e| e.to_str()) != Some("cfg");
+            if bad {
+                return json_response(
+                    request,
+                    400,
+                    r#"{"ok":false,"error":"keydb_path must be an absolute .cfg path with no '..'"}"#,
                 );
             }
         }
@@ -3134,11 +3526,26 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             }
         }
         if let Some(v) = patch.get("keydb_path").and_then(|v| v.as_str()) {
-            c.keydb_path = if v.is_empty() {
-                None
-            } else {
-                Some(v.to_string())
-            };
+            // GET /api/settings redacts keydb_path to its filename component to
+            // avoid leaking the absolute container path. Treat a bare value
+            // that matches the stored path's basename as the unchanged
+            // round-trip of that redacted form — don't clobber the full path
+            // with just the filename.
+            let is_redacted_roundtrip = !v.is_empty()
+                && !v.contains('/')
+                && c.keydb_path.as_deref().is_some_and(|stored| {
+                    std::path::Path::new(stored)
+                        .file_name()
+                        .map(|n| n == std::ffi::OsStr::new(v))
+                        .unwrap_or(false)
+                });
+            if !is_redacted_roundtrip {
+                c.keydb_path = if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                };
+            }
         }
         if let Some(v) = patch.get("capture_without_keys").and_then(|v| v.as_bool()) {
             c.capture_without_keys = v;
@@ -3389,15 +3796,9 @@ fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
         tracing::error!(device = %dev_for_register, error = %e, "failed to spawn scan thread");
         // Roll the device state back to idle so a failed spawn doesn't
         // wedge the busy-check at "scanning" forever (409 on every
-        // future scan/rip until restart).
-        ripper::update_state(
-            &dev_for_register,
-            ripper::RipState {
-                device: dev_for_register.clone(),
-                status: "idle".to_string(),
-                ..Default::default()
-            },
-        );
+        // future scan/rip until restart). Shared helper so poll loop +
+        // both web handlers can't drift.
+        ripper::rollback_failed_spawn(&dev_for_register);
         json_response(
             request,
             500,
@@ -3465,18 +3866,11 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
         ripper::unregister_halt(&dev);
     }) {
         tracing::error!(device = %dev_for_register, error = %e, "failed to spawn rip thread");
-        ripper::unregister_halt(&dev_for_register);
         // Roll the device state back to idle so a failed spawn doesn't
         // wedge the busy-check at "scanning" forever (409 on every
-        // future scan/rip until restart).
-        ripper::update_state(
-            &dev_for_register,
-            ripper::RipState {
-                device: dev_for_register.clone(),
-                status: "idle".to_string(),
-                ..Default::default()
-            },
-        );
+        // future scan/rip until restart). Shared helper so poll loop +
+        // both web handlers can't drift.
+        ripper::rollback_failed_spawn(&dev_for_register);
         json_response(
             request,
             500,
@@ -3520,7 +3914,60 @@ fn parse_resume_param(query: &str) -> ResumeMode {
     ResumeMode::Default
 }
 
+/// Why a capped keydb body read failed.
+#[derive(Debug, PartialEq, Eq)]
+enum KeydbReadError {
+    /// The underlying reader errored.
+    Io,
+    /// The body exceeded the byte cap (oversized plain-text keydb).
+    TooLarge,
+}
+
+/// Read a keydb response body, rejecting bodies larger than `max_bytes`.
+///
+/// `Read::take(max_bytes)` would cap the read but SUCCEED at exactly the cap,
+/// silently truncating an oversized plain-text keydb into a half-valid file.
+/// Read one byte past the cap instead so an oversized body is detectable, and
+/// return `TooLarge` rather than a truncated buffer.
+fn read_capped_keydb_body<R: std::io::Read>(
+    reader: R,
+    max_bytes: u64,
+) -> std::result::Result<Vec<u8>, KeydbReadError> {
+    let mut buf = Vec::new();
+    reader
+        .take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| KeydbReadError::Io)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(KeydbReadError::TooLarge);
+    }
+    Ok(buf)
+}
+
 fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
+    // Serialize: only one keydb download may be in flight at a time. Each one
+    // buffers the whole file into memory, so concurrent unauthenticated calls
+    // could allocate many large buffers at once. A second caller gets 429.
+    static KEYDB_UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if KEYDB_UPDATE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return json_response(
+            request,
+            429,
+            r#"{"ok":false,"error":"A KEYDB update is already in progress."}"#,
+        );
+    }
+    // Release the in-flight flag on every exit path.
+    struct InFlightGuard;
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            KEYDB_UPDATE_IN_FLIGHT.store(false, Ordering::Release);
+        }
+    }
+    let _in_flight = InFlightGuard;
+
     let keydb_url = cfg
         .read()
         .ok()
@@ -3553,16 +4000,18 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     };
     let agent = guarded_agent(pinned);
 
+    // Wall-clock bound on the whole download so a slow-loris server can't hold
+    // the in-flight slot (and the handler thread) indefinitely.
+    const KEYDB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    // 10 MiB cap: the lean UHD keydb is well under this; anything larger is
+    // either a wrong URL or a hostile body and must not be buffered whole.
+    const KEYDB_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
     // Download via ureq (supports HTTPS) then save via libfreemkv
-    let body = match agent.get(&keydb_url).call() {
-        Ok(resp) => {
-            let mut buf = Vec::new();
-            if resp
-                .into_reader()
-                .take(100 * 1024 * 1024)
-                .read_to_end(&mut buf)
-                .is_err()
-            {
+    let body = match agent.get(&keydb_url).timeout(KEYDB_FETCH_TIMEOUT).call() {
+        Ok(resp) => match read_capped_keydb_body(resp.into_reader(), KEYDB_MAX_BYTES) {
+            Ok(buf) => buf,
+            Err(KeydbReadError::Io) => {
                 json_response(
                     request,
                     500,
@@ -3570,8 +4019,15 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
                 );
                 return;
             }
-            buf
-        }
+            Err(KeydbReadError::TooLarge) => {
+                json_response(
+                    request,
+                    413,
+                    r#"{"ok":false,"error":"KEYDB too large (>10 MB plain-text); use a gzip/zip URL"}"#,
+                );
+                return;
+            }
+        },
         Err(ureq::Error::Status(code, _)) => {
             let msg = format!(
                 r#"{{"ok":false,"error":"Server returned HTTP {}. Check the URL in Settings."}}"#,
@@ -3580,12 +4036,20 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             json_response(request, 502, &msg);
             return;
         }
-        Err(_) => {
-            let msg = format!(
-                r#"{{"ok":false,"error":"Could not connect to {}. Check the URL in Settings."}}"#,
-                crate::webhook::webhook_url_origin(&keydb_url)
+        Err(e) => {
+            // Do NOT echo the configured KEYDB origin/hostname back to the
+            // client — that leaks server-side configuration to any LAN caller.
+            // Keep the detail (URL origin + underlying error) in the log only.
+            tracing::warn!(
+                origin = %crate::webhook::webhook_url_origin(&keydb_url),
+                error = %e,
+                "keydb update: could not connect to configured KEYDB server"
             );
-            json_response(request, 502, &msg);
+            json_response(
+                request,
+                502,
+                r#"{"ok":false,"error":"Could not connect to the configured KEYDB server. Check the URL in Settings."}"#,
+            );
             return;
         }
     };
@@ -3598,6 +4062,16 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
                 "bytes": result.bytes,
             });
             json_response(request, 200, &body.to_string());
+        }
+        Err(e) if e.code() == libfreemkv::error::E_KEYDB_WRITE => {
+            // A write/persist failure is an environment problem (disk full,
+            // permissions on the keys dir) — not invalid content. Surface it
+            // distinctly so the operator fixes the right thing.
+            json_response(
+                request,
+                500,
+                r#"{"ok":false,"error":"Failed to save KEYDB to disk (check space/permissions)"}"#,
+            );
         }
         Err(_) => {
             json_response(
@@ -3679,13 +4153,37 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     if let Some(halt) = ripper::device_halt(device) {
         halt.cancel();
     }
-    crate::verify::request_stop();
+    crate::verify::request_stop(device);
 
     if ripper::join_rip_thread(device, std::time::Duration::from_secs(60)).is_err() {
         tracing::warn!(
             device = %device,
             "rip thread did not drain within 60s of stop"
         );
+    }
+
+    // Drain the detached verify worker before resetting STATE. The verify
+    // thread is NOT in RIP_THREADS, so join_rip_thread above returns
+    // immediately for it; without this bounded wait we'd reset STATE to idle
+    // while run_verify_inner still holds an open Drive, and a concurrent
+    // /api/rip could claim+open the same drive (double-open). request_stop
+    // already cancelled the drive halt, so the in-flight read bails within a
+    // poll interval; poll is_running until it clears, up to the same 60 s drain
+    // budget the rip thread gets. A timeout is logged, not fatal — the worker's
+    // own release_claim is generation-checked, so a late finish can't clobber a
+    // newer owner even if we proceed.
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while crate::verify::is_running(device) {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    device = %device,
+                    "verify worker did not drain within 60s of stop"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     let existed = ripper::STATE
@@ -3746,12 +4244,12 @@ fn handle_debug_toggle(request: tiny_http::Request) {
     };
 
     // `{"enabled": <bool>}` sets the level explicitly. Any other body —
-    // missing/non-bool `enabled`, or no valid JSON at all — enables debug
-    // (the convenience default for a bare `curl -X POST /api/debug`). This is
-    // a set-to-state endpoint, not a flip-current toggle.
+    // missing/non-bool `enabled`, or no valid JSON at all — defaults to OFF
+    // (safe-off). A malformed/empty POST must not silently turn verbose debug
+    // logging on; the caller must opt in explicitly with `{"enabled":true}`.
     let enabled = match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(v) => v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(true),
-        Err(_) => true,
+        Ok(v) => v.get("enabled").and_then(|b| b.as_bool()).unwrap_or(false),
+        Err(_) => false,
     };
 
     *DEBUG_ENABLED

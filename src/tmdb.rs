@@ -39,10 +39,34 @@ fn search_multi_url(query: &str, api_key: &str) -> String {
 /// log instead of silently collapsing to "no results" — which would route
 /// every disc to the needs-review queue with no actionable cause. A 401 is
 /// throttled (once per minute) so a stuck-bad-key loop can't spam syslog.
+/// Cap on the TMDB response body we'll buffer. A real `search/multi` response
+/// is tens of KB; 2 MiB is generous headroom. Bounding it stops a hostile or
+/// broken endpoint from streaming an unbounded body into memory (DoS).
+const MAX_TMDB_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Read at most `MAX_TMDB_BYTES` from the response body, rejecting anything
+/// over the cap, then parse as JSON. Replaces `resp.into_json()`, which reads
+/// the whole body with no upper bound.
+fn read_capped_json(resp: ureq::Response) -> std::io::Result<serde_json::Value> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(MAX_TMDB_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_TMDB_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tmdb response exceeded size cap",
+        ));
+    }
+    serde_json::from_slice(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 fn fetch_multi(query: &str, api_key: &str) -> Option<serde_json::Value> {
     let url = search_multi_url(query, api_key);
     match AGENT.get(&url).call() {
-        Ok(resp) => match resp.into_json::<serde_json::Value>() {
+        Ok(resp) => match read_capped_json(resp) {
             Ok(json) => Some(json),
             Err(e) => {
                 tracing::warn!(query = %query, error = %e, "tmdb: response was not valid JSON");

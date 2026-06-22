@@ -127,7 +127,18 @@ pub fn resolve(staging_root: &str, dir: &str, action: Resolve) -> Result<(), Str
     }
     match action {
         Resolve::Proceed => {
-            std::fs::rename(&review, d.join(".done")).map_err(|e| e.to_string())?;
+            // Carry the marker's JSON forward into a DURABLE `.done` rather than
+            // a bare rename (rename alone doesn't fsync the new dirent — a crash
+            // can lose it, leaving the rip invisible to the mover). Write `.done`
+            // durably, then remove `.review`.
+            // Read the override marker BEFORE writing `.done` / removing
+            // `.review`. A swallowed read error (e.g. a transient NFS failure)
+            // would otherwise write an EMPTY `.done` and delete `.review` —
+            // permanent loss of the user's override. Short-circuit instead.
+            let body = std::fs::read(&review).map_err(|e| e.to_string())?;
+            crate::ripper::staging::write_handoff_marker(&d.join(".done"), &body)
+                .map_err(|e| e.to_string())?;
+            std::fs::remove_file(&review).map_err(|e| e.to_string())?;
         }
         Resolve::Retitle { title, year } => {
             // Reject a blank title at the library boundary: `resolve` is a
@@ -157,7 +168,8 @@ pub fn resolve(staging_root: &str, dir: &str, action: Resolve) -> Result<(), Str
             // lingering `.review` is harmless since `list_held` excludes
             // dirs that have `.done`), and propagate the removal error so a
             // failed cleanup is visible instead of silently leaving both.
-            std::fs::write(d.join(".done"), serialized).map_err(|e| e.to_string())?;
+            crate::ripper::staging::write_handoff_marker(&d.join(".done"), serialized.as_bytes())
+                .map_err(|e| e.to_string())?;
             std::fs::remove_file(&review).map_err(|e| e.to_string())?;
         }
         Resolve::Cancel => {
@@ -167,8 +179,11 @@ pub fn resolve(staging_root: &str, dir: &str, action: Resolve) -> Result<(), Str
             // `.failed` marker at all — invisible to the mover, the UI, and
             // the re-rip guard — while still reporting success to the
             // operator.
-            std::fs::write(d.join(".failed"), "cancelled by operator\n")
-                .map_err(|e| e.to_string())?;
+            crate::ripper::staging::write_handoff_marker(
+                &d.join(".failed"),
+                b"cancelled by operator\n",
+            )
+            .map_err(|e| e.to_string())?;
             std::fs::remove_file(&review).map_err(|e| e.to_string())?;
         }
     }
@@ -247,6 +262,36 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "not a held rip", "dotted title must clear the guard");
+    }
+
+    #[test]
+    fn proceed_carries_marker_body_into_durable_done() {
+        // Regression (finding 7): Proceed now writes a DURABLE `.done`
+        // (write_handoff_marker: tmp + fsync + rename + dir-fsync) carrying the
+        // `.review` JSON forward, instead of a bare rename that doesn't fsync
+        // the new dirent. The `.review` is removed and the `.done` keeps the
+        // body so the mover sees the title.
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-proceed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let held = tmp.join("Keeper (2019)");
+        std::fs::create_dir_all(&held).unwrap();
+        let body = r#"{"title":"Keeper","year":2019,"media_type":"movie"}"#;
+        touch(&held.join(".review"), body);
+
+        resolve(tmp.to_str().unwrap(), "Keeper (2019)", Resolve::Proceed).unwrap();
+
+        assert!(held.join(".done").exists(), ".done must be written");
+        assert!(!held.join(".review").exists(), ".review must be removed");
+        let m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(held.join(".done")).unwrap()).unwrap();
+        assert_eq!(m["title"], "Keeper", "marker body carried into .done");
+        assert_eq!(m["year"], 2019);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

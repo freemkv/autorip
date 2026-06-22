@@ -94,7 +94,33 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
         return;
     }
     let body = payload.to_string();
+
+    // Bound the number of concurrent webhook-dispatch threads. Each event
+    // otherwise spawns an unbounded OS thread; a burst of events (or a hostile
+    // client triggering many) could exhaust threads. Past the cap, drop the
+    // event with a warning rather than spawning.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const MAX_INFLIGHT: usize = 8;
+    static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+    if INFLIGHT
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < MAX_INFLIGHT).then_some(n + 1)
+        })
+        .is_err()
+    {
+        crate::log::syslog("Webhook dropped: too many concurrent deliveries in flight");
+        return;
+    }
+    // Decrement the in-flight counter however the thread exits.
+    struct InflightGuard;
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     std::thread::spawn(move || {
+        let _guard = InflightGuard;
         for url in &urls {
             // SSRF guard at fire time (defence-in-depth; the URL is also
             // validated at store time in handle_settings_post). Resolve +

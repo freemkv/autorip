@@ -13,7 +13,7 @@
 //! that derives unit keys wins. The only drive-vs-ISO difference is the
 //! [`DiscKeyAccess`] impl.
 
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use freemkv_keysources::{
@@ -112,9 +112,9 @@ fn validate_keyserver_url(raw: &str) -> Result<(), String> {
             Ok(())
         };
     }
-    // Hostname — resolve and reject if ANY resolved address is blocked.
-    let addrs = (host.as_str(), port)
-        .to_socket_addrs()
+    // Hostname — resolve (with a bounded deadline so a hung resolver can't
+    // freeze the rip thread) and reject if ANY resolved address is blocked.
+    let addrs = crate::web::resolve_with_timeout(&host, port)
         .map_err(|e| format!("keyserver host {host} did not resolve: {e}"))?;
     let mut saw_any = false;
     for sa in addrs {

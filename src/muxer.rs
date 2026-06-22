@@ -81,7 +81,11 @@ pub fn write_marker(staging_dir: &Path, marker: &RippedMarker) -> std::io::Resul
     let path = staging_dir.join(RIPPED_MARKER_NAME);
     let json = serde_json::to_string_pretty(marker)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, json)
+    // Durable write (tmp + sync_all + rename + parent-dir fsync) via the same
+    // primitive the rest of autorip's markers use. A plain `fs::write` here
+    // could leave a torn/empty `.ripped` on a crash mid-write, which the mux
+    // worker would then fail to parse — losing the hand-off.
+    crate::ripper::staging::write_marker_durable(&path, json.as_bytes())
 }
 
 pub fn read_marker(staging_dir: &Path) -> std::io::Result<RippedMarker> {

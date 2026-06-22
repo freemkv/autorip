@@ -505,7 +505,9 @@ fn run_bootstrap() {
     // Symlink for KEYDB lookup path
     let freemkv_cfg = format!("/home/{rip_user}/.config/freemkv");
     if let Some(parent) = std::path::Path::new(&freemkv_cfg).parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("bootstrap: mkdir {}: {e}", parent.display());
+        }
     }
     let _ = std::fs::remove_file(&freemkv_cfg);
     let _ = std::fs::remove_dir_all(&freemkv_cfg);
