@@ -24,6 +24,7 @@
 use crossbeam_channel::{SendTimeoutError as CbSendTimeoutError, bounded as cb_bounded};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -693,6 +694,23 @@ fn mux_completed(
     loop_drained_naturally && pipe_ok && finalize_error_none && !write_failed && produced
 }
 
+/// Build the specific cause string for a hard producer `read()` error.
+///
+/// The stream yields an `io::Error`; mapping it back to a coded
+/// `libfreemkv::Error` lets a non-generic `E####` (DiscRead, AACS/CSS
+/// decrypt manifesting mid-stream, etc.) be named in the terminal,
+/// user-facing reason instead of a fixed generic truncation string. The
+/// `io::Error` Display already carries the coded message text, so it is
+/// included as the human-readable tail.
+fn producer_read_error_cause(e: &std::io::Error) -> String {
+    let code = libfreemkv::error::Error::from(std::io::Error::new(e.kind(), e.to_string())).code();
+    if code == libfreemkv::error::E_IO_ERROR {
+        format!("read error mid-stream: {e}")
+    } else {
+        format!("read error mid-stream (E{code}): {e}")
+    }
+}
+
 pub(crate) fn run_mux(
     inputs: MuxInputs<'_>,
     mut input: Box<dyn libfreemkv::pes::Stream>,
@@ -1173,6 +1191,18 @@ pub(crate) fn run_mux(
     // and the completion gate records a cause.
     let producer_read_failed = Arc::new(AtomicBool::new(false));
     let producer_read_failed_for_thread = producer_read_failed.clone();
+    // Holds the SPECIFIC cause behind `producer_read_failed`. The bool
+    // alone conflates three distinct faults — a hard `read()` error (which
+    // may itself be a decrypt/AACS/CSS failure or a coded `DiscRead`/
+    // `IoError`), a send-deadline timeout, and a closed bridge channel —
+    // and the terminal user-facing reason was a fixed generic string, so
+    // the actual root cause (logged once, earlier) never reached
+    // `last_error`. The producer stores a clean cause string here before
+    // breaking; the terminal "this is why the mux didn't complete" line
+    // threads it through so the operator sees the real fault (e.g. the
+    // coded `E####`) without digging back through the device log.
+    let producer_read_cause: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let producer_read_cause_for_thread = producer_read_cause.clone();
     // The orchestrator normally registers the device's halt token
     // before calling run_mux, but a resume/remux entry path or a
     // register/run_mux race could leave it absent. Fall back to a fresh
@@ -1332,6 +1362,11 @@ pub(crate) fn run_mux(
                                     &device_str,
                                     "Producer: send deadline elapsed or channel closed (consumer aborted)",
                                 );
+                                if let Ok(mut slot) = producer_read_cause_for_thread.lock() {
+                                    slot.get_or_insert_with(|| {
+                                        "send deadline elapsed or bridge channel closed (consumer aborted)".to_string()
+                                    });
+                                }
                                 producer_read_failed_for_thread.store(true, Ordering::Relaxed);
                                 break;
                             }
@@ -1342,7 +1377,14 @@ pub(crate) fn run_mux(
                         return;
                     }
                     Err(e) => {
+                        // Capture the SPECIFIC cause, not just the bool, so the
+                        // terminal reason can name a coded `E####` instead of a
+                        // fixed generic truncation string.
+                        let cause = producer_read_error_cause(&e);
                         crate::log::device_log(&device_str, &format!("Producer read error: {e}"));
+                        if let Ok(mut slot) = producer_read_cause_for_thread.lock() {
+                            slot.get_or_insert(cause);
+                        }
                         producer_read_failed_for_thread.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -1572,9 +1614,19 @@ pub(crate) fn run_mux(
         // stays resumable (a transient drive / NFS read may succeed on a
         // later attempt) — distinct from a structural `finalize_error`,
         // which quarantines the staging dir with `.failed`.
+        // Name the SPECIFIC cause the producer captured rather than the old
+        // fixed generic string, which conflated read error / send deadline /
+        // decrypt and never carried the coded root cause. Fall back to the
+        // generic wording only if the slot is somehow empty (e.g. a poisoned
+        // lock) so the line is never blank.
+        let cause = producer_read_cause
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| "read error or send deadline".to_string());
         crate::log::device_log(
             &device_str_for_sink,
-            "Mux incomplete: producer aborted mid-stream — read error or send deadline (MKV truncated)",
+            &format!("Mux incomplete: producer aborted mid-stream — {cause} (MKV truncated)"),
         );
     }
 
@@ -1714,6 +1766,53 @@ mod tests {
     use super::*;
 
     const DISC: u64 = 60_000_000_000; // 60 GB stand-in for a UHD
+
+    /// Regression: a hard producer read error must surface the SPECIFIC
+    /// coded cause, not a generic truncation string. A coded
+    /// `libfreemkv::Error` reaches the producer as an `io::Error` whose
+    /// Display already carries the `E####:` prefix; the cause string must
+    /// preserve it so an operator sees the real fault (decrypt / DiscRead /
+    /// AACS) in `last_error` without digging through the device log.
+    #[test]
+    fn producer_read_error_cause_preserves_coded_root_cause() {
+        // A decrypt failure manifesting mid-stream.
+        let decrypt_io: std::io::Error = libfreemkv::Error::DecryptFailed.into();
+        let decrypt_code = libfreemkv::Error::DecryptFailed.code();
+        let cause = producer_read_error_cause(&decrypt_io);
+        assert!(
+            cause.contains(&format!("E{decrypt_code}")),
+            "decrypt cause must name the coded fault, got: {cause}"
+        );
+        assert!(cause.contains("read error mid-stream"), "got: {cause}");
+
+        // A coded disc read error (the genuine bad-sector / drive fault).
+        let disc_err = libfreemkv::Error::DiscRead {
+            sector: 12345,
+            status: None,
+            sense: None,
+        };
+        let disc_code = disc_err.code();
+        let disc_io: std::io::Error = disc_err.into();
+        let cause = producer_read_error_cause(&disc_io);
+        assert!(
+            cause.contains(&format!("E{disc_code}")),
+            "disc-read cause must name the coded fault, got: {cause}"
+        );
+    }
+
+    /// A plain (non-coded) io error must NOT get a spurious `E####`
+    /// numeric prefix — its message round-trips to the generic IoError
+    /// code, so only the `{e}` tail describes it.
+    #[test]
+    fn producer_read_error_cause_handles_plain_io_error() {
+        let plain = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read");
+        let cause = producer_read_error_cause(&plain);
+        assert!(cause.contains("short read"), "got: {cause}");
+        assert!(
+            !cause.contains(&format!("(E{})", libfreemkv::error::E_IO_ERROR)),
+            "plain io error must not carry a synthetic code prefix, got: {cause}"
+        );
+    }
 
     /// Clean disc (no bad sectors): retry term vanishes, total_work
     /// reduces to 2 × capacity. Mux opens at exactly 50%, climbs
