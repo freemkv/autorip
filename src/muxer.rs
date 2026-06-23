@@ -212,6 +212,55 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
     tracing::info!("mux loop stopping");
 }
 
+/// Verdict for whether the mux worker should act on one staging dir this
+/// tick. Pure projection of the dir's marker state so the full
+/// present/absent matrix is unit-testable (`mux_dispatch_verdict`) without
+/// standing up a real mux pipeline. The driving loop in `check_and_mux`
+/// translates `Dispatch` into an actual `remux_from_ripped_marker` call and
+/// every `Skip*` into `continue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MuxVerdict {
+    /// `.ripped` present, no terminal marker, listing trustworthy — run the mux.
+    Dispatch,
+    /// `.completed` or `.failed` present — finished or quarantined, never re-mux.
+    SkipTerminal,
+    /// No `.ripped` hand-off marker — nothing for the worker to do here.
+    SkipNoMarker,
+    /// Snapshot is `None` — the dir's contents are UNKNOWN (read_dir / DirEntry
+    /// errors mid-scan). Skip this tick rather than dispatch on an untrustworthy
+    /// listing; retry next tick.
+    SkipUnknown,
+}
+
+/// Pure dispatch decider for the mux worker. `snap` is the result of
+/// `snapshot_staging_disc` for the dir (`None` ⇒ UNKNOWN contents).
+///
+/// Order matters and mirrors `check_and_mux`'s former inline guards:
+/// 1. `None` snapshot ⇒ `SkipUnknown` (don't dispatch on a degraded listing).
+/// 2. `.completed` OR `.failed` ⇒ `SkipTerminal` — terminal regardless of
+///    whether `.ripped` still lingers (the post-mux-abort `.ripped`+`.failed`
+///    re-mux loop, da16f00, lives or dies on this arm).
+/// 3. `.ripped` absent ⇒ `SkipNoMarker`.
+/// 4. otherwise ⇒ `Dispatch`.
+///
+/// `has_ripped` is read from the same primed `read_dir` view as the snapshot
+/// so a cold-cache NFS miss can't race `.ripped` to "absent" while the
+/// snapshot surfaces a terminal marker — see `StagingSnapshot::has_ripped`.
+pub(crate) fn mux_dispatch_verdict(
+    snap: Option<&crate::ripper::staging::StagingSnapshot>,
+) -> MuxVerdict {
+    let Some(snap) = snap else {
+        return MuxVerdict::SkipUnknown;
+    };
+    if snap.completed || snap.failed_reason.is_some() {
+        return MuxVerdict::SkipTerminal;
+    }
+    if !snap.has_ripped {
+        return MuxVerdict::SkipNoMarker;
+    }
+    MuxVerdict::Dispatch
+}
+
 /// Find all staging dirs with a `.ripped` marker and dispatch each
 /// through the resume-mux path. Serialized — only one mux runs at a
 /// time inside this worker thread (the next one waits on the loop
@@ -265,9 +314,6 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         if !dir.is_dir() {
             continue;
         }
-        if !dir.join(RIPPED_MARKER_NAME).exists() {
-            continue;
-        }
         // Never re-mux an already-completed dir. `remux_from_ripped_marker`
         // deletes `.ripped` on success, but if that delete fails (a
         // persistent NFS / permission error on the marker file) the
@@ -292,15 +338,18 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         // are UNKNOWN (read_dir/DirEntry errors mid-scan): skip this tick
         // and retry next rather than re-dispatching on an untrustworthy
         // listing.
-        match crate::ripper::staging::snapshot_staging_disc(&dir) {
-            // `.completed` AND `.failed` are both terminal — skip either. A
-            // post-mux abort (e.g. demux-loss gate over `abort_on_lost_secs`)
-            // writes `.failed` WITHOUT `.completed` and, because the `.ripped`
-            // marker is only deleted on success, the dir would otherwise be
-            // re-dispatched every tick forever (re-mux → re-abort → re-fail).
-            Some(snap) if snap.completed || snap.failed_reason.is_some() => continue,
-            Some(_) => {}
-            None => continue,
+        //
+        // The dispatch decision (`.ripped` present? terminal marker? listing
+        // trustworthy?) is factored into the pure `mux_dispatch_verdict` so
+        // the full present/absent marker matrix is unit-testable without a
+        // real mux pipeline — the gap that let the .ripped+.failed re-mux
+        // loop (commit da16f00) ship untested.
+        let snap = crate::ripper::staging::snapshot_staging_disc(&dir);
+        match mux_dispatch_verdict(snap.as_ref()) {
+            MuxVerdict::Dispatch => {}
+            MuxVerdict::SkipTerminal | MuxVerdict::SkipNoMarker | MuxVerdict::SkipUnknown => {
+                continue;
+            }
         }
         let marker = match read_marker(&dir) {
             Ok(m) => m,
@@ -777,6 +826,255 @@ mod tests {
         assert!(
             !rs.damage_severity.is_empty(),
             "damage_severity must be set for a damaged done card (got empty — update_state must derive it from errors/total_lost_ms)"
+        );
+    }
+
+    // ===================================================================
+    // EXHAUSTIVE mux-worker dispatch matrix (rc4 hardening).
+    //
+    // The mux worker is one of the three staging-state deciders. Its job:
+    // for each per-disc staging dir, decide whether to (re)run the mux
+    // (`Dispatch`) or skip (terminal / no-marker / unknown-listing). The
+    // real loop in `check_and_mux` calls `snapshot_staging_disc` then
+    // `mux_dispatch_verdict`; these tests drive that exact pair against a
+    // real TempDir for every meaningful marker combination, closing the
+    // coverage gap that let the `.ripped` + `.failed` re-mux-forever loop
+    // (commit da16f00) ship untested.
+    // ===================================================================
+
+    /// The staging-side constant must equal the muxer's own marker name,
+    /// or `snapshot_staging_disc` would observe `.ripped` under a different
+    /// name than the worker writes and `has_ripped` would never be set.
+    #[test]
+    fn ripped_marker_name_matches_staging_constant() {
+        assert_eq!(
+            RIPPED_MARKER_NAME,
+            crate::ripper::staging::RIPPED_MARKER,
+            "the muxer's .ripped marker name and the staging-scan constant must agree"
+        );
+    }
+
+    /// Marker tokens a dispatch-matrix row can place in a staging dir.
+    #[derive(Clone, Copy)]
+    enum M {
+        Ripped,
+        Completed,
+        Failed,
+        Done,
+        Review,
+        Iso,
+        Mapfile,
+        Mkv,
+    }
+
+    /// Build a populated per-disc staging dir for the given markers, run the
+    /// real snapshot+verdict pair, and return the verdict.
+    fn verdict_for(markers: &[M]) -> MuxVerdict {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("Disc");
+        std::fs::create_dir_all(&dir).unwrap();
+        for m in markers {
+            match m {
+                M::Ripped => {
+                    // A real, schema-valid .ripped marker (so this dir is
+                    // indistinguishable from a true hand-off).
+                    write_marker(&dir, &sample_marker()).unwrap();
+                }
+                M::Completed => crate::ripper::staging::write_completed_marker(&dir),
+                M::Failed => crate::ripper::staging::write_failed_marker(&dir, "test failure"),
+                M::Done => std::fs::write(dir.join(".done"), b"{}").unwrap(),
+                M::Review => std::fs::write(dir.join(".review"), b"{}").unwrap(),
+                M::Iso => std::fs::write(dir.join("Disc.iso"), b"x").unwrap(),
+                M::Mapfile => std::fs::write(dir.join("Disc.iso.mapfile"), b"x").unwrap(),
+                M::Mkv => std::fs::write(dir.join("Disc.mkv"), b"x").unwrap(),
+            }
+        }
+        let snap = crate::ripper::staging::snapshot_staging_disc(&dir);
+        mux_dispatch_verdict(snap.as_ref())
+    }
+
+    #[test]
+    fn mux_dispatch_matrix() {
+        use M::*;
+        // (markers present, expected verdict, why)
+        let table: &[(&[M], MuxVerdict, &str)] = &[
+            // --- nothing / no hand-off marker -> no-op ---
+            (&[], MuxVerdict::SkipNoMarker, "empty dir: nothing to mux"),
+            (
+                &[Iso],
+                MuxVerdict::SkipNoMarker,
+                "ISO but no .ripped: not the worker's job",
+            ),
+            (
+                &[Iso, Mapfile],
+                MuxVerdict::SkipNoMarker,
+                "ISO+mapfile, no hand-off marker",
+            ),
+            (&[Mkv], MuxVerdict::SkipNoMarker, "stray MKV, no .ripped"),
+            // --- the canonical dispatch case ---
+            (
+                &[Ripped],
+                MuxVerdict::Dispatch,
+                ".ripped only: the hand-off to mux",
+            ),
+            (
+                &[Ripped, Iso, Mapfile],
+                MuxVerdict::Dispatch,
+                ".ripped + ISO + mapfile: normal hand-off",
+            ),
+            // --- terminal: .completed wins over everything ---
+            (
+                &[Ripped, Completed],
+                MuxVerdict::SkipTerminal,
+                ".ripped lingered after a successful mux (delete failed) — .completed is terminal, must NOT re-mux",
+            ),
+            (
+                &[Completed],
+                MuxVerdict::SkipTerminal,
+                ".completed alone: finished",
+            ),
+            (
+                &[Completed, Mkv],
+                MuxVerdict::SkipTerminal,
+                "finished with output present",
+            ),
+            // --- terminal: .failed is terminal too (the da16f00 fix) ---
+            (
+                &[Ripped, Failed],
+                MuxVerdict::SkipTerminal,
+                "THE BUG: post-mux abort wrote .failed but .ripped lingered — must be terminal, not re-dispatched forever",
+            ),
+            (
+                &[Failed],
+                MuxVerdict::SkipTerminal,
+                ".failed alone: quarantined",
+            ),
+            (
+                &[Ripped, Iso, Mapfile, Failed],
+                MuxVerdict::SkipTerminal,
+                "aborted hand-off with artifacts still present — terminal",
+            ),
+            // --- conflict: .completed + .failed both present ---
+            (
+                &[Completed, Failed],
+                MuxVerdict::SkipTerminal,
+                "conflicting terminals: still terminal either way (skip)",
+            ),
+            (
+                &[Ripped, Completed, Failed],
+                MuxVerdict::SkipTerminal,
+                ".ripped + both terminals: terminal, never re-mux",
+            ),
+            // --- .done / .review are NOT terminal for the mux worker ---
+            // (.done/.review are the MOVER's hand-off, written alongside
+            //  .completed; on their own without .completed they don't gate
+            //  the mux worker — but a lone .ripped+.done is anomalous. The
+            //  worker only treats .completed/.failed as terminal, so a
+            //  .ripped+.done (no .completed) would still Dispatch. This row
+            //  documents that contract.)
+            (
+                &[Ripped, Done],
+                MuxVerdict::Dispatch,
+                ".done without .completed does not gate the mux worker (.completed is the authoritative signal)",
+            ),
+            (
+                &[Ripped, Review],
+                MuxVerdict::Dispatch,
+                ".review without .completed likewise does not gate the mux worker",
+            ),
+        ];
+        for (markers, expected, why) in table {
+            let got = verdict_for(markers);
+            assert_eq!(got, *expected, "dispatch matrix row failed: {why}");
+        }
+    }
+
+    /// UNKNOWN listing (snapshot None) must skip — never dispatch on a
+    /// degraded read_dir view. Driven directly since a real per-entry NFS
+    /// error can't be provoked from the local FS.
+    #[test]
+    fn mux_dispatch_unknown_snapshot_skips() {
+        assert_eq!(mux_dispatch_verdict(None), MuxVerdict::SkipUnknown);
+    }
+
+    /// Named explicit cells the matrix also covers, called out per the rc4
+    /// brief so a future reader sees them by name.
+    #[test]
+    fn mux_dispatch_ripped_only_dispatches() {
+        assert_eq!(verdict_for(&[M::Ripped]), MuxVerdict::Dispatch);
+    }
+    #[test]
+    fn mux_dispatch_ripped_plus_completed_skips() {
+        assert_eq!(
+            verdict_for(&[M::Ripped, M::Completed]),
+            MuxVerdict::SkipTerminal
+        );
+    }
+    #[test]
+    fn mux_dispatch_ripped_plus_failed_skips_the_fixed_bug() {
+        // The exact cell the infinite-loop bug lived in. Pin it hard.
+        assert_eq!(
+            verdict_for(&[M::Ripped, M::Failed]),
+            MuxVerdict::SkipTerminal,
+            ".ripped + .failed MUST be terminal (da16f00) — re-dispatch here is the loop bug"
+        );
+    }
+    #[test]
+    fn mux_dispatch_nothing_present_is_noop() {
+        assert_eq!(verdict_for(&[]), MuxVerdict::SkipNoMarker);
+    }
+
+    /// TRANSITION: ripped → mux success → completed → (mover takes over).
+    /// After the worker writes `.completed`, a lingering `.ripped` (delete
+    /// failed) must flip the verdict from Dispatch to SkipTerminal, so the
+    /// worker doesn't wipe the just-written MKV and re-mux.
+    #[test]
+    fn mux_transition_ripped_to_completed_stops_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("Disc");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_marker(&dir, &sample_marker()).unwrap();
+        std::fs::write(dir.join("Disc.iso"), b"x").unwrap();
+
+        // State 1: fresh hand-off → Dispatch.
+        let s1 = crate::ripper::staging::snapshot_staging_disc(&dir);
+        assert_eq!(mux_dispatch_verdict(s1.as_ref()), MuxVerdict::Dispatch);
+
+        // Mux succeeds, writes .completed, but the .ripped delete fails
+        // (simulated by leaving .ripped in place).
+        crate::ripper::staging::write_completed_marker(&dir);
+
+        // State 2: terminal → SkipTerminal (loop broken).
+        let s2 = crate::ripper::staging::snapshot_staging_disc(&dir);
+        assert_eq!(
+            mux_dispatch_verdict(s2.as_ref()),
+            MuxVerdict::SkipTerminal,
+            "after .completed the worker must stop dispatching even if .ripped lingers"
+        );
+    }
+
+    /// TRANSITION: ripped → loss-abort → failed → not re-dispatched.
+    /// Mirrors the resume loss-abort branch, which writes `.failed` (and
+    /// deletes `.ripped`). Even if `.ripped` survives, the verdict must be
+    /// terminal — the re-mux-forever loop is impossible.
+    #[test]
+    fn mux_transition_ripped_to_failed_stops_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("Disc");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_marker(&dir, &sample_marker()).unwrap();
+
+        let s1 = crate::ripper::staging::snapshot_staging_disc(&dir);
+        assert_eq!(mux_dispatch_verdict(s1.as_ref()), MuxVerdict::Dispatch);
+
+        // Loss-abort quarantines the dir.
+        crate::ripper::staging::write_failed_marker(&dir, "aborted: demux loss exceeds threshold");
+
+        let s2 = crate::ripper::staging::snapshot_staging_disc(&dir);
+        assert_eq!(
+            mux_dispatch_verdict(s2.as_ref()),
+            MuxVerdict::SkipTerminal,
+            "after .failed the worker must never re-dispatch (the re-mux-forever loop)"
         );
     }
 }
