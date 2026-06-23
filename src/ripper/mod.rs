@@ -4176,6 +4176,31 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
              Disc hash not found in available keys."
         ),
 
+        // No host cert available at all — the OEM auth route can't run
+        // because there's nothing to authenticate with. Distinct from
+        // cert-rejected (7003/7005/7007/7015): there a cert existed but
+        // the drive HRL blocked it; here no cert was present.
+        ec::E_AACS_NO_HOST_CERT => format!(
+            "No host cert (E{code})\n\
+             No host cert available, so the OEM auth route can't run."
+        ),
+
+        // Drive identity didn't match any bundled profile, so the
+        // per-drive CDB templates needed for the OEM VID route aren't
+        // available.
+        ec::E_DRIVE_PROFILE_MISSING => format!(
+            "Drive profile missing (E{code})\n\
+             This drive isn't in the profile database, so the OEM VID route can't run."
+        ),
+
+        // Drive profile is present but carries no VID-retrieval CDB
+        // template (older profile blob, or a drive class without an OEM
+        // VID path).
+        ec::E_VID_CDB_UNAVAILABLE => format!(
+            "No VID command (E{code})\n\
+             Drive profile lacks a VID-retrieval command (older profile); can't run the OEM VID route."
+        ),
+
         // Other 7xxx — known AACS category but unmapped. Use a
         // generic-but-honest message rather than `({e:?})` debug-dump.
         7000..=7999 => format!(
@@ -4860,6 +4885,48 @@ mod tests {
     }
 
     #[test]
+    fn aacs_failure_drive_profile_missing_has_dedicated_arm() {
+        // E7020 — drive not in profile DB; must not fall through to the
+        // generic "report at github.com" catch-all.
+        let e = Error::DriveProfileMissing;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("Drive profile missing"), "msg: {s}");
+        assert!(s.contains("E7020"), "msg: {s}");
+        assert!(
+            !s.contains("github.com"),
+            "msg must not say report a bug: {s}"
+        );
+    }
+
+    #[test]
+    fn aacs_failure_vid_cdb_unavailable_has_dedicated_arm() {
+        // E7021 — profile present but no VID-retrieval CDB template.
+        let e = Error::VidCdbUnavailable;
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("No VID command"), "msg: {s}");
+        assert!(s.contains("E7021"), "msg: {s}");
+        assert!(
+            !s.contains("github.com"),
+            "msg must not say report a bug: {s}"
+        );
+    }
+
+    #[test]
+    fn aacs_failure_no_host_cert_has_dedicated_arm() {
+        // E7024 — no host cert available; the OEM auth route can't run.
+        let e = Error::AacsNoHostCert {
+            path: "<no host cert>".into(),
+        };
+        let s = aacs_failure_message(Some(&e));
+        assert!(s.starts_with("No host cert"), "msg: {s}");
+        assert!(s.contains("E7024"), "msg: {s}");
+        assert!(
+            !s.contains("github.com"),
+            "msg must not say report a bug: {s}"
+        );
+    }
+
+    #[test]
     fn aacs_failure_message_is_two_lines() {
         // Format contract: heading on line 1, body on line 2. UI
         // renderers can wrap on the newline to give the heading
@@ -4872,6 +4939,11 @@ mod tests {
             Error::AacsVidUnavailable,
             Error::AacsMkUnavailable,
             Error::AacsVukNotInKeydb,
+            Error::DriveProfileMissing,
+            Error::VidCdbUnavailable,
+            Error::AacsNoHostCert {
+                path: "<no host cert>".into(),
+            },
         ] {
             let s = aacs_failure_message(Some(&e));
             assert!(s.contains('\n'), "{e:?} message missing newline: {s}");
