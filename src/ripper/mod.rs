@@ -2771,9 +2771,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // and the final Cosmetic-vs-Maybe display.
         //
         // Only runs in multi-pass mode (max_retries > 0); single-pass
-        // rips don't have a "final pass" boundary and rely on the
-        // sweep behavior (sweep never marks Unreadable either, but
-        // single-pass mode skips abort_on_lost_secs entirely).
+        // rips don't have a "final pass" boundary and have no mapfile,
+        // so their abort_on_lost_secs check runs AFTER the mux instead,
+        // gating on the demux skip count (see the single-pass abort gate
+        // below `run_mux`). Sweep never marks Unreadable either.
         // End-of-recovery promotion + abort check: a single block so the
         // abort check operates on the already-promoted in-memory map rather
         // than re-loading from disk (the previous two-block design dropped
@@ -3474,6 +3475,92 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // on a clean disc, or the demux skip count for single-pass mode).
                 mux_outcome.lost_video_secs
             };
+        }
+    }
+
+    // Single-pass abort gate (max_retries == 0).
+    //
+    // The post-retry abort_on_lost_secs check above only runs in
+    // multi-pass mode, where a mapfile exists and per-sector loss is
+    // known before the mux. Single-pass mode streams the disc directly
+    // to the MKV with no mapfile, so loss is only knowable AFTER the mux
+    // (from the demux skip count, surfaced as `final_lost_secs`). The
+    // file is therefore already written by the time we get here — but we
+    // can still honour the abort_on_lost_secs contract by refusing to
+    // hand a lossy result to the mover: quarantine the staging dir with
+    // `.failed` (no `.done`/`.completed`) instead of delivering it. This
+    // closes the divergence where `abort_on_lost_secs=0` ("require a
+    // perfect rip") silently produced a lossy MKV in single-pass mode.
+    //
+    // `final_lost_secs` here is the demux-skip estimate, which is already
+    // in-title-scoped (the mux only reads the muxed title's sectors), so
+    // it is the right quantity to compare against the threshold — the
+    // same semantics as `abort_lost_ms` in the multi-pass gate.
+    if completed && cfg_read.max_retries == 0 {
+        let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
+        if should_abort_for_loss(final_lost_secs * 1000.0, abort_threshold_ms) {
+            crate::log::device_log(
+                device,
+                &format!(
+                    "ABORT: strategy=abort_check triggered — {:.2}s lost in main movie (threshold: {}s)",
+                    final_lost_secs, cfg_read.abort_on_lost_secs
+                ),
+            );
+            crate::log::device_log(
+                device,
+                &format!(
+                    "STRATEGY_FAILURE: abort_check FAILED — data loss ({:.2}s) exceeds threshold ({}s)",
+                    final_lost_secs, cfg_read.abort_on_lost_secs
+                ),
+            );
+            crate::log::device_log(
+                device,
+                "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. Single-pass mode (max_retries=0) cannot retry bad sectors; RAISE max_retries to retry the damaged ranges, or RAISE abort_on_lost_secs to accept some loss.",
+            );
+            // Quarantine the lossy MKV: write `.failed` so the mover never
+            // files it and the resume detector treats the dir as
+            // terminal-failed (mirrors the multi-pass abort + mux-finalize
+            // failure paths). No `.done`/`.completed` is written.
+            let staging_disc_path = std::path::Path::new(&staging);
+            staging::write_failed_marker(
+                staging_disc_path,
+                &format!(
+                    "aborted: {:.2}s lost in main movie exceeds threshold {}s",
+                    final_lost_secs, cfg_read.abort_on_lost_secs
+                ),
+            );
+            staging::clear_restart_count(staging_disc_path);
+            update_state(
+                device,
+                RipState {
+                    device: device.to_string(),
+                    status: "error".to_string(),
+                    disc_present: true,
+                    disc_name: display_name.clone(),
+                    disc_format: disc_format.clone(),
+                    errors: final_errors,
+                    lost_video_secs: final_lost_secs,
+                    last_sector: final_last_sector,
+                    current_batch: final_current_batch,
+                    preferred_batch: batch,
+                    tmdb_title: tmdb_title.clone(),
+                    tmdb_year,
+                    tmdb_poster: tmdb_poster.clone(),
+                    tmdb_overview: tmdb_overview.clone(),
+                    duration: duration.clone(),
+                    codecs: codecs.clone(),
+                    last_error: format!(
+                        "aborted — {:.2}s lost in main movie (threshold: {}s)",
+                        final_lost_secs, cfg_read.abort_on_lost_secs
+                    ),
+                    failure_reason: Some(format!(
+                        "aborted: {:.2}s lost in main movie exceeds threshold {}s",
+                        final_lost_secs, cfg_read.abort_on_lost_secs
+                    )),
+                    ..Default::default()
+                },
+            );
+            return;
         }
     }
 
@@ -4786,6 +4873,74 @@ mod tests {
             final_lost_secs > 0.0 && final_lost_secs < 1.0,
             "expected small non-zero lost_secs, got {:.6}",
             final_lost_secs
+        );
+    }
+
+    // ── single-pass (max_retries == 0) abort gate ───────────────────
+
+    /// Regression: in single-pass mode the abort_on_lost_secs check runs
+    /// AFTER the mux, gating on the demux skip count rather than a
+    /// mapfile. This pins the loss-from-skip-count → abort-decision
+    /// chain the post-mux single-pass gate relies on, mirroring the
+    /// in-production derivation:
+    ///   lost_secs = skip_sectors * 2048 / title_bytes_per_sec
+    ///   abort     = should_abort_for_loss(lost_secs * 1000, threshold_ms)
+    fn single_pass_lost_secs(skip_sectors: u64, title_bytes_per_sec: f64) -> f64 {
+        if title_bytes_per_sec > 0.0 {
+            (skip_sectors as f64) * 2048.0 / title_bytes_per_sec
+        } else {
+            0.0
+        }
+    }
+
+    #[test]
+    fn single_pass_any_loss_aborts_at_threshold_zero() {
+        // abort_on_lost_secs=0 ("require a perfect rip") must abort a
+        // single-pass rip that skipped ANY sectors — the divergence this
+        // fix closes (previously single-pass silently delivered a lossy
+        // MKV at threshold 0).
+        let bps = 8_250_000.0;
+        let threshold_ms = 0.0; // abort_on_lost_secs = 0
+        let lost = single_pass_lost_secs(10, bps); // 10 skipped sectors
+        assert!(lost > 0.0, "skipped sectors must produce positive loss");
+        assert!(
+            super::should_abort_for_loss(lost * 1000.0, threshold_ms),
+            "single-pass rip with skipped sectors must abort at threshold 0"
+        );
+    }
+
+    #[test]
+    fn single_pass_clean_rip_does_not_abort_at_threshold_zero() {
+        // A perfect single-pass rip (zero skips) must NOT abort even at
+        // threshold 0 — the gate uses strict `>`.
+        let bps = 8_250_000.0;
+        let threshold_ms = 0.0;
+        let lost = single_pass_lost_secs(0, bps);
+        assert_eq!(lost, 0.0);
+        assert!(
+            !super::should_abort_for_loss(lost * 1000.0, threshold_ms),
+            "a clean single-pass rip must NOT abort at threshold 0"
+        );
+    }
+
+    #[test]
+    fn single_pass_loss_within_threshold_does_not_abort() {
+        // abort_on_lost_secs=30: a single-pass rip whose skip-derived loss
+        // is under 30s proceeds; over 30s aborts.
+        let bps = 8_250_000.0;
+        let threshold_ms = 30_000.0;
+        // ~1000 skipped sectors ≈ 0.248s lost — well under 30s.
+        let small = single_pass_lost_secs(1000, bps);
+        assert!(
+            !super::should_abort_for_loss(small * 1000.0, threshold_ms),
+            "single-pass loss under threshold must NOT abort, got {small:.3}s"
+        );
+        // Enough skips to exceed 30s: 30 * bps / 2048 sectors + slack.
+        let big_sectors = (31.0 * bps / 2048.0) as u64;
+        let big = single_pass_lost_secs(big_sectors, bps);
+        assert!(
+            super::should_abort_for_loss(big * 1000.0, threshold_ms),
+            "single-pass loss over threshold must abort, got {big:.3}s"
         );
     }
 
