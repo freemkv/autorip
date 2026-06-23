@@ -23,28 +23,80 @@ static RIP_THREADS: once_cell::sync::Lazy<
     Mutex<std::collections::HashMap<String, JoinHandle<()>>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Outcome of attempting to register a rip-thread `JoinHandle`.
+///
+/// `register_rip_thread` returns `Err(RegisterError)` instead of
+/// silently overwriting (and thus orphaning) a prior handle that is
+/// still running. The variant carries the rejected handle back to the
+/// caller so it is never dropped on the floor — `spawn_rip_thread`
+/// joins it so the just-spawned worker can't leak, and a test can
+/// inspect it.
+#[derive(Debug)]
+pub enum RegisterError {
+    /// A prior rip thread for this device is still *running*. We refuse
+    /// to overwrite it (dropping a running handle breaks
+    /// drain-before-wipe — the v0.13.6 bug class). The new handle the
+    /// caller passed in is returned untouched so the caller can reap it.
+    PriorThreadRunning(JoinHandle<()>),
+}
+
 /// Register a rip-thread JoinHandle for `device`. Production calls
-/// this from the poll-loop spawn site; the integration tests under
-/// `tests/halt_drain.rs` also call it to plug a synthetic thread
-/// into the same machinery `handle_stop` uses.
-pub fn register_rip_thread(device: &str, handle: JoinHandle<()>) {
+/// this (via [`spawn_rip_thread`]) from the poll-loop and web spawn
+/// sites; the integration tests under `tests/halt_drain.rs` also call
+/// it to plug a synthetic thread into the same machinery `handle_stop`
+/// uses.
+///
+/// Reap-or-reject semantics for a pre-existing entry (the device map
+/// holds at most one handle):
+///
+/// * **Prior handle finished** → it is removed and joined *inside the
+///   lock*. `JoinHandle::is_finished() == true` guarantees `join()`
+///   returns without blocking, so holding `RIP_THREADS` across the
+///   join cannot deadlock. This quietly reaps the common benign case
+///   (a completed scan thread still registered when the rip thread
+///   spawns) that previously logged a scary "prior thread not reaped"
+///   warning. The new handle then takes its place and we return
+///   `Ok(())`.
+/// * **Prior handle still running** → we must NOT overwrite it; a
+///   dropped running handle can never be joined, so a later
+///   stop/eject/shutdown drain returns before the thread actually
+///   exits (staging could be wiped mid-write — the v0.13.6 bug class).
+///   We leave the running prior in place and return
+///   `Err(RegisterError::PriorThreadRunning(new))`, handing the new
+///   handle back so the caller reaps the worker it just spawned. In
+///   practice the spawn sites gate on [`try_claim_active`] (STATE-level
+///   mutual exclusion) so this branch should be unreachable, but we
+///   defend it rather than trust that invariant.
+pub fn register_rip_thread(device: &str, handle: JoinHandle<()>) -> Result<(), RegisterError> {
     // Recover from poison rather than silently dropping the handle: a
     // dropped JoinHandle here can never be reaped, breaking
     // drain-before-wipe (the v0.13.6 bug class). Same recover-and-proceed
     // convention as update_state/is_busy/log.rs.
     let mut t = RIP_THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    // If an old entry is still here (e.g. prior thread crashed
-    // without being reaped, or a stop that timed out and was never
-    // reclaimed), drop the stale handle — we only keep one live
-    // handle per device. Warn so double-registration is detectable
-    // in production (the dropped thread can no longer be reaped).
-    if t.contains_key(device) {
-        tracing::warn!(
-            device = %device,
-            "register_rip_thread: overwriting existing rip-thread handle (prior thread not reaped)"
-        );
+    if let Some(prior) = t.get(device) {
+        if prior.is_finished() {
+            // Safe to join under the lock: is_finished()==true means
+            // join() won't block. Reap quietly — no warning.
+            if let Some(prior) = t.remove(device) {
+                if let Err(e) = prior.join() {
+                    tracing::error!(
+                        device = %device,
+                        "reaped prior rip thread had panicked: {:?}", e
+                    );
+                }
+            }
+        } else {
+            // A still-running prior would be orphaned by an overwrite.
+            // Refuse and hand the new handle back to be reaped.
+            tracing::warn!(
+                device = %device,
+                "register_rip_thread: prior rip thread still running — refusing to overwrite (the new worker will be drained)"
+            );
+            return Err(RegisterError::PriorThreadRunning(handle));
+        }
     }
     t.insert(device.to_string(), handle);
+    Ok(())
 }
 
 pub fn take_rip_thread(device: &str) -> Option<JoinHandle<()>> {
@@ -66,8 +118,27 @@ where
 {
     let name = format!("{}-{}", role, device);
     let handle = std::thread::Builder::new().name(name).spawn(f)?;
-    register_rip_thread(device, handle);
-    Ok(())
+    match register_rip_thread(device, handle) {
+        Ok(()) => Ok(()),
+        Err(RegisterError::PriorThreadRunning(new_handle)) => {
+            // A prior worker for this device is still running and owns
+            // the registration slot. We just spawned a duplicate — reap
+            // it so it can't leak (its work closure shares no exclusive
+            // resources yet because the caller gates on try_claim_active,
+            // but join it to be sure it exits) and surface failure so the
+            // caller runs its existing spawn-failure rollback path.
+            if let Err(e) = new_handle.join() {
+                tracing::error!(
+                    device = %device,
+                    "duplicate-spawn worker panicked while being drained: {:?}", e
+                );
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "a rip thread is already running for this device",
+            ))
+        }
+    }
 }
 
 /// Wait (up to `timeout`) for the rip thread for `device` to exit.
