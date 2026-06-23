@@ -285,7 +285,27 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
 pub(super) fn find_iso_and_mapfile(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut isos: Vec<PathBuf> = Vec::new();
     let mut mapfiles: Vec<PathBuf> = Vec::new();
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+    for entry in std::fs::read_dir(dir).ok()? {
+        // Don't `.flatten()` away per-entry errors: a partial NFS
+        // degradation can error on individual DirEntry I/O while the dir
+        // is genuinely populated. Silently dropping such an entry could
+        // hide the ISO or its mapfile, making this return None and the
+        // orchestrator re-sweep a disc that was already ripped. We can't
+        // trust a partial listing to pick the unique ISO / pin its
+        // mapfile, so bail loudly rather than guess. Mirrors the
+        // per-entry defense in `snapshot_staging_disc` (staging.rs).
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "resume: read_dir entry errored (partial NFS degradation?) — \
+                     staging contents unknown, not resuming from this dir"
+                );
+                return None;
+            }
+        };
         let p = entry.path();
         let name = match p.file_name() {
             Some(n) => n.to_string_lossy().into_owned(),
@@ -1361,6 +1381,24 @@ mod find_iso_tests {
         let d = tmpdir();
         fs::write(d.join("Movie.iso"), b"x").unwrap();
         assert!(find_iso_and_mapfile(&d).is_none());
+    }
+
+    // Regression: the loop no longer uses `.flatten()` (which silently
+    // dropped per-DirEntry I/O errors). Per-entry error handling must not
+    // break the happy path — extra unrelated entries alongside the ISO +
+    // mapfile must still pair correctly.
+    #[test]
+    fn pairs_despite_extra_entries() {
+        let d = tmpdir();
+        fs::write(d.join("Movie.iso"), b"x").unwrap();
+        fs::write(d.join("Movie.iso.mapfile"), b"x").unwrap();
+        // Noise the scan must skip over.
+        fs::write(d.join("Movie.mkv"), b"x").unwrap();
+        fs::write(d.join(".keep"), b"x").unwrap();
+        fs::create_dir(d.join("subdir")).unwrap();
+        let (iso, map) = find_iso_and_mapfile(&d).expect("should pair");
+        assert!(iso.ends_with("Movie.iso"));
+        assert!(map.ends_with("Movie.iso.mapfile"));
     }
 }
 
