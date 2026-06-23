@@ -1063,35 +1063,39 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         );
     }
 
+    // Prefer the codecs the mux frame loop wrote into STATE (the
+    // `_mux` worker path seeds an empty codecs and only fills it
+    // during mux); fall back to the pre-mux snapshot. Resolved once
+    // here so both the done-state card and the completion webhook
+    // below report the same codec string.
+    let done_codecs = resolve_done_codecs(
+        super::STATE
+            .lock()
+            .ok()
+            .and_then(|s| s.get(device).map(|rs| rs.codecs.clone())),
+        state_codecs,
+    );
+
     super::update_state(
         device,
         super::RipState {
             device: device.to_string(),
             status: "done".to_string(),
             disc_present: true,
-            disc_name: display_name,
-            disc_format,
+            disc_name: display_name.clone(),
+            disc_format: disc_format.clone(),
             progress_pct: 100,
-            output_file: staging_str,
-            duration,
+            output_file: staging_str.clone(),
+            duration: duration.clone(),
             // Carry the TMDB metadata + codecs into the done card, mirroring
             // rip_disc's terminal state. Without these the done-card for a
             // resumed rip loses the poster, TMDB title (showing only the
             // sanitized disc name), year, and codec badge.
             tmdb_title,
             tmdb_year,
-            tmdb_poster,
+            tmdb_poster: tmdb_poster.clone(),
             tmdb_overview,
-            // Prefer the codecs the mux frame loop wrote into STATE (the
-            // `_mux` worker path seeds an empty codecs and only fills it
-            // during mux); fall back to the pre-mux snapshot.
-            codecs: resolve_done_codecs(
-                super::STATE
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.get(device).map(|rs| rs.codecs.clone())),
-                state_codecs,
-            ),
+            codecs: done_codecs.clone(),
             // Carry sweep damage so the done card reflects real damage
             // instead of showing a clean result for a damaged rip.
             errors: done_sweep_damage.errors,
@@ -1105,6 +1109,32 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         },
     );
     crate::log::device_log(device, "Auto-resume complete");
+
+    // Fire the completion webhook, mirroring rip_disc's terminal
+    // branch. Both the cold auto-resume (`?resume=yes`) path and the
+    // `_mux` worker `.ripped` hand-off reach success here; without this
+    // an operator configured for completion notifications (Discord,
+    // Plex, etc.) silently received nothing when a rip finished via
+    // resume or the mux worker — only inline rip_disc completions
+    // notified. Metadata is the same set rip_disc sends.
+    crate::webhook::send_rich(
+        &cfg_read,
+        &crate::webhook::RipEvent {
+            event: "rip_complete",
+            title: &display_name,
+            year: tmdb_year,
+            format: &disc_format,
+            poster_url: &tmdb_poster,
+            duration: &duration,
+            codecs: &done_codecs,
+            size_gb: mux_outcome.bytes_done as f64 / 1_073_741_824.0,
+            speed_mbs: mux_outcome.speed_mbs,
+            elapsed_secs: mux_outcome.elapsed_secs,
+            output_path: &staging_str,
+            errors: done_sweep_damage.errors,
+            lost_video_secs: done_sweep_damage.main_lost_ms / 1000.0,
+        },
+    );
 
     // Honor auto_eject after a successful resume the same way
     // rip_disc's terminal branch does. Pre-0.25.2 the resume path
@@ -1449,6 +1479,49 @@ mod resume_remux_log_archive_tests {
         );
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod resume_remux_webhook_tests {
+    /// Regression: the success path of `resume_remux` must fire the
+    /// `rip_complete` webhook, exactly as `rip_disc`'s terminal branch
+    /// does. Both the cold auto-resume (`?resume=yes`) path and the
+    /// `_mux` worker `.ripped` hand-off complete through `resume_remux`,
+    /// so without this call an operator with completion webhooks
+    /// configured (Discord, Plex, etc.) silently received nothing on any
+    /// rip that finished via resume or the mux worker.
+    ///
+    /// A full behavioural test would need a real openable ISO + mapfile
+    /// + decrypt + mux pipeline plus a mock HTTP endpoint, which is out
+    /// of proportion to a single call site. Instead this pins, at source
+    /// level, that the success region of `resume_remux` (between the
+    /// "Auto-resume complete" log line and the `auto_eject` honoring)
+    /// invokes `send_rich`, so a refactor can't silently drop it again.
+    #[test]
+    fn success_path_fires_completion_webhook() {
+        let src = include_str!("resume.rs");
+        let start = src
+            .find("Auto-resume complete")
+            .expect("resume.rs should log \"Auto-resume complete\" on the success path");
+        // Bound the search to the success region: from the completion log
+        // line up to the auto_eject comment that immediately follows it.
+        let end = src[start..]
+            .find("Honor auto_eject after a successful resume")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let region = &src[start..end];
+        assert!(
+            region.contains("crate::webhook::send_rich"),
+            "resume_remux success path must fire send_rich (the rip_complete \
+             webhook), matching rip_disc; none found between \"Auto-resume \
+             complete\" and the auto_eject branch"
+        );
+        assert!(
+            region.contains("event: \"rip_complete\""),
+            "the resume completion webhook must use the rip_complete event \
+             name, matching rip_disc"
+        );
     }
 }
 
