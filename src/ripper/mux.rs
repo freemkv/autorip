@@ -678,8 +678,9 @@ fn mux_completed(
     pipe_ok: bool,
     finalize_error_none: bool,
     write_failed: bool,
+    produced: bool,
 ) -> bool {
-    loop_drained_naturally && pipe_ok && finalize_error_none && !write_failed
+    loop_drained_naturally && pipe_ok && finalize_error_none && !write_failed && produced
 }
 
 pub(crate) fn run_mux(
@@ -1564,18 +1565,45 @@ pub(crate) fn run_mux(
     // loop cannot distinguish from a real EOF. Any side false → "stopped"
     // / "failed", so a truncated MKV never earns a success marker.
     let write_failed = write_failed.load(Ordering::Relaxed);
+    // Theme A fix #3: a mux that drained naturally with ZERO frames produced
+    // (and zero output bytes) must NOT flip status="done", move the file to
+    // the library, or fire rip_complete — that is the empty/garbage-output
+    // silent failure (e.g. undecryptable input → the demuxer emits nothing,
+    // the bridge sees an immediate clean EOF, and every other success signal
+    // lies). `frame_count` is the bridge-loop count of frames forwarded to the
+    // consumer; `bytes_done` is the finalized output size. Require both > 0.
+    let produced = frame_count > 0 && bytes_done > 0;
+    if loop_drained_naturally && pipe_ok && finalize_error.is_none() && !write_failed && !produced {
+        crate::log::device_log(
+            &device_str_for_sink,
+            "Mux produced no frames/bytes — refusing to mark complete (empty/undecryptable output)",
+        );
+    }
     let completed = mux_completed(
         loop_drained_naturally,
         pipe_ok,
         finalize_error.is_none(),
         write_failed,
+        produced,
     ) && !producer_read_error;
     // Surface the write failure as a finalize_error reason so the
     // orchestrator logs "Mux failed: ..." and records it, rather than
     // silently reporting a stopped rip with no cause.
-    let finalize_error = finalize_error.or_else(|| {
-        write_failed.then(|| "output write error mid-stream (MKV truncated)".to_string())
-    });
+    let finalize_error = finalize_error
+        .or_else(|| {
+            write_failed.then(|| "output write error mid-stream (MKV truncated)".to_string())
+        })
+        .or_else(|| {
+            // A natural-drain-but-empty mux is a structural failure (the output
+            // is header-only / garbage), not a resumable stop — record a cause
+            // so the orchestrator quarantines instead of silently "stopping".
+            (loop_drained_naturally
+                && pipe_ok
+                && !write_failed
+                && !producer_read_error
+                && !produced)
+                .then(|| "mux produced no frames (empty/undecryptable output)".to_string())
+        });
 
     // The producer thread is coordinated via channel close: it drops its
     // `frame_tx` clone on EOF / read error / halt, and the bridge loop
@@ -1739,8 +1767,8 @@ mod tests {
     #[test]
     fn clean_mux_is_completed() {
         // Natural EOF + clean pipeline join + no finalize error + no
-        // write failure → completed.
-        assert!(mux_completed(true, true, true, false));
+        // write failure + frames/bytes produced → completed.
+        assert!(mux_completed(true, true, true, false, true));
     }
 
     #[test]
@@ -1752,7 +1780,7 @@ mod tests {
         // write_failed flag must veto `completed` so a truncated MKV is
         // never published as `.done`/`.completed`.
         assert!(
-            !mux_completed(true, true, true, true),
+            !mux_completed(true, true, true, true, true),
             "a mid-stream write error must mark the run NOT completed"
         );
     }
@@ -1760,11 +1788,32 @@ mod tests {
     #[test]
     fn halt_or_finalize_error_is_not_completed() {
         // Loop broke early (halt / send deadline) → not completed.
-        assert!(!mux_completed(false, true, true, false));
+        assert!(!mux_completed(false, true, true, false, true));
         // Pipeline join failed → not completed.
-        assert!(!mux_completed(true, false, true, false));
+        assert!(!mux_completed(true, false, true, false, true));
         // close()/finish() finalize error → not completed.
-        assert!(!mux_completed(true, true, false, false));
+        assert!(!mux_completed(true, true, false, false, true));
+    }
+
+    #[test]
+    fn zero_frame_natural_drain_is_not_completed() {
+        // Theme A fix #3: a natural drain where the mux produced NOTHING
+        // (frame_count==0 && bytes_done==0 → produced=false) must NOT be
+        // reported complete, even though every other signal says success
+        // (drained naturally, clean join, no finalize/write error). This is
+        // the empty/undecryptable-output silent failure: the bridge sees an
+        // immediate clean EOF and the file is header-only / garbage.
+        assert!(
+            !mux_completed(true, true, true, false, false),
+            "a zero-frame natural drain must mark the run NOT completed"
+        );
+        // Mirror the run_mux `produced` derivation: any of frame_count==0 or
+        // bytes_done==0 makes produced false.
+        let produced = |frames: u64, bytes: u64| frames > 0 && bytes > 0;
+        assert!(!produced(0, 0), "no frames, no bytes");
+        assert!(!produced(0, 1000), "frames forwarded but zero output bytes");
+        assert!(!produced(5, 0), "frames counted but nothing finalized");
+        assert!(produced(5, 1000), "real frames + real bytes → produced");
     }
 
     #[test]
@@ -1776,7 +1825,7 @@ mod tests {
         // `!producer_read_error` (which the SendFailed path now sets) so the
         // truncated MKV is still reported NOT completed. Mirror that exact
         // composition here.
-        let mux_ok = mux_completed(true, true, true, false);
+        let mux_ok = mux_completed(true, true, true, false, true);
         assert!(mux_ok, "premature-EOF inputs alone look complete");
         let producer_read_error = true; // SendFailed flagged the abort.
         let completed = mux_ok && !producer_read_error;
