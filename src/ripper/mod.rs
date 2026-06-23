@@ -4345,10 +4345,27 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
     // KeydbLoad is a structural pre-condition failure, not an AACS
     // resolution failure — surface it with its own messaging before
     // the numeric dispatch.
-    if let Some(libfreemkv::Error::KeydbLoad { path: _ }) = err {
+    //
+    // The library populates `path` with either the real filesystem path
+    // that failed to load or the sentinel `<no keydb in search paths>`.
+    // The sentinel means "nothing configured" — point the operator at
+    // Settings. A real path means a *configured* keydb failed to load
+    // (wrong path, NFS not mounted, permissions): include it so the
+    // operator can diagnose the load failure instead of being told to
+    // configure a source that already exists.
+    if let Some(libfreemkv::Error::KeydbLoad { path }) = err {
+        const KEYDB_SENTINEL: &str = "<no keydb in search paths>";
+        if path == KEYDB_SENTINEL {
+            return format!(
+                "No keys available (E{})\n\
+                 Configure a key source in Settings.",
+                ec::E_KEYDB_LOAD
+            );
+        }
         return format!(
-            "No keys available (E{})\n\
-             Configure a key source in Settings.",
+            "Couldn't load key source (E{})\n\
+             Configured key source failed to load: {path}. Check that the path \
+             exists and is readable.",
             ec::E_KEYDB_LOAD
         );
     }
@@ -5208,12 +5225,19 @@ mod tests {
 
     #[test]
     fn aacs_failure_keydb_load_corrupt() {
-        let e = Error::KeydbLoad {
-            path: "/srv/autorip/config/keys/keydb.cfg".into(),
-        };
+        // A *configured* keydb that failed to load (real path, not the
+        // sentinel) must surface that path so the operator can diagnose
+        // the load failure, and must NOT collapse to the generic
+        // "configure a key source" message reserved for the no-keydb case.
+        let path = "/config/keys/keydb.cfg";
+        let e = Error::KeydbLoad { path: path.into() };
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No keys available"), "msg: {s}");
         assert!(s.contains("E8005"), "msg: {s}");
+        assert!(s.contains(path), "msg must include the failing path: {s}");
+        assert!(
+            !s.contains("Configure a key source in Settings"),
+            "configured-but-failed must not show the no-keydb message: {s}"
+        );
         assert!(!s.contains("KEYDB"), "msg must not name the source: {s}");
     }
 
