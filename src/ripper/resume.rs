@@ -1212,6 +1212,16 @@ pub(crate) struct MuxHandoffOutcome {
     pub codecs: String,
     pub duration: String,
     pub output_file: String,
+    /// The full bad-ranges drilldown list (plus its truncation count),
+    /// captured off the `_mux` done-state — which recomputed it from the
+    /// mapfile in `resume_remux`. The `RippedMarker` carries only the
+    /// summary counts (`sweep_num_bad_ranges`, `sweep_largest_gap_ms`),
+    /// not the list, so without plumbing these through, the origin
+    /// device's secondary done card would show the damage count but an
+    /// empty drilldown — diverging from the inline fresh-rip and cold
+    /// auto-resume done cards, which both populate `bad_ranges`.
+    pub bad_ranges: Vec<super::state::BadRange>,
+    pub bad_ranges_truncated: u32,
 }
 
 pub(crate) fn remux_from_ripped_marker(
@@ -1282,6 +1292,12 @@ pub(crate) fn remux_from_ripped_marker(
                 outcome.codecs = rs.codecs.clone();
                 outcome.duration = rs.duration.clone();
                 outcome.output_file = rs.output_file.clone();
+                // Carry the full bad-ranges drilldown (recomputed from the
+                // mapfile by resume_remux) so the origin device's done card
+                // matches the `_mux` card and the fresh-rip card instead of
+                // showing an empty drilldown for a damaged disc.
+                outcome.bad_ranges = rs.bad_ranges.clone();
+                outcome.bad_ranges_truncated = rs.bad_ranges_truncated;
             }
             // Clean up the synthetic STATE entry so the device tile grid
             // (which already filters underscore keys, but still — be tidy)
@@ -1774,6 +1790,22 @@ mod sweep_damage_marker_tests {
     fn mux_handoff_outcome_captures_mux_derived_fields() {
         // A private device key so this doesn't race the shared "_mux".
         let key = "_mux_test_capture";
+        let bad_ranges = vec![
+            super::super::state::BadRange {
+                lba: 100,
+                count: 32,
+                duration_ms: 1500.0,
+                chapter: Some(2),
+                time_offset_secs: Some(42.0),
+            },
+            super::super::state::BadRange {
+                lba: 5000,
+                count: 8,
+                duration_ms: 375.0,
+                chapter: None,
+                time_offset_secs: None,
+            },
+        ];
         super::super::update_state(
             key,
             super::super::RipState {
@@ -1782,6 +1814,8 @@ mod sweep_damage_marker_tests {
                 codecs: "HEVC · TrueHD".into(),
                 duration: "2:14".into(),
                 output_file: "/staging/Foo".into(),
+                bad_ranges: bad_ranges.clone(),
+                bad_ranges_truncated: 3,
                 ..Default::default()
             },
         );
@@ -1796,6 +1830,8 @@ mod sweep_damage_marker_tests {
                 outcome.codecs = rs.codecs.clone();
                 outcome.duration = rs.duration.clone();
                 outcome.output_file = rs.output_file.clone();
+                outcome.bad_ranges = rs.bad_ranges.clone();
+                outcome.bad_ranges_truncated = rs.bad_ranges_truncated;
             }
             s.remove(key);
         }
@@ -1803,6 +1839,13 @@ mod sweep_damage_marker_tests {
         assert_eq!(outcome.codecs, "HEVC · TrueHD");
         assert_eq!(outcome.duration, "2:14");
         assert_eq!(outcome.output_file, "/staging/Foo");
+        // The bad-ranges drilldown list + truncation count must survive the
+        // capture so the origin device's done card isn't left with an empty
+        // drilldown for a damaged disc.
+        assert_eq!(outcome.bad_ranges.len(), 2);
+        assert_eq!(outcome.bad_ranges[0].lba, 100);
+        assert_eq!(outcome.bad_ranges[1].count, 8);
+        assert_eq!(outcome.bad_ranges_truncated, 3);
         // STATE entry is cleaned up so the origin update can't read it later.
         assert!(super::super::STATE.lock().unwrap().get(key).is_none());
     }
