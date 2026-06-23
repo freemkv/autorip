@@ -603,17 +603,33 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     {
         use libfreemkv::disc::mapfile::SectorStatus;
         let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
-        let bad_in_title = libfreemkv::disc::bytes_bad_in_title(&title, &bad_ranges);
-        let lost_secs = if title_bytes_per_sec > 0.0 {
-            bad_in_title as f64 / title_bytes_per_sec
-        } else {
-            0.0
-        };
+        // Scope the loss exactly as the fresh-rip post-retry abort gate does
+        // (`abort_lost_ms` in mod.rs): for `output_format == "iso"` every
+        // sector matters, so loss is the whole-disc bad-byte sum; for a real
+        // MKV/M2TS mux only in-title damage counts. Computing in-title loss
+        // unconditionally here would make resume ACCEPT a disc with
+        // `output_format=iso` + `abort_on_lost_secs=0` and unreadable sectors
+        // OUTSIDE the title, while a fresh rip of the same disc + config would
+        // ABORT — the two paths must reach the same verdict.
+        let lost_secs = super::abort_lost_ms(
+            cfg_read.output_format == "iso",
+            &title,
+            &bad_ranges,
+            title_bytes_per_sec,
+        ) / 1000.0;
         if lost_secs > cfg_read.abort_on_lost_secs as f64 {
+            // "disc loss" for raw ISO (whole-disc scope), "title loss" for a
+            // muxed MKV/M2TS (in-title scope) — matching how `lost_secs` was
+            // computed just above.
+            let scope = if cfg_read.output_format == "iso" {
+                "disc"
+            } else {
+                "title"
+            };
             crate::log::device_log(
                 device,
                 &format!(
-                    "Auto-resume aborted: title loss {:.2}s exceeds threshold {}s",
+                    "Auto-resume aborted: {scope} loss {:.2}s exceeds threshold {}s",
                     lost_secs, cfg_read.abort_on_lost_secs
                 ),
             );
@@ -624,7 +640,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 &disc_format,
                 &duration,
                 Some(format!(
-                    "title loss {:.2}s exceeds threshold {}s",
+                    "{scope} loss {:.2}s exceeds threshold {}s",
                     lost_secs, cfg_read.abort_on_lost_secs
                 )),
             );
@@ -1240,6 +1256,59 @@ mod find_iso_tests {
         let d = tmpdir();
         fs::write(d.join("Movie.iso"), b"x").unwrap();
         assert!(find_iso_and_mapfile(&d).is_none());
+    }
+}
+
+// Regression guard for the resume abort-gate scoping. The fresh-rip
+// post-retry abort check scopes loss by `output_format` via
+// `abort_lost_ms` (whole-disc for iso, in-title for mkv/m2ts). The
+// `resume_remux` re-validation previously hard-coded in-title scoping,
+// so a disc with `output_format=iso`, `abort_on_lost_secs=0`, and
+// unreadable sectors OUTSIDE the title was ABORTED on a fresh rip but
+// ACCEPTED on resume — opposite verdicts on the same disc + config.
+// resume_remux now routes through the same `abort_lost_ms` helper; these
+// tests pin the scoping the resume gate must use so the two paths stay
+// in lockstep.
+#[cfg(test)]
+mod resume_abort_scope_tests {
+    fn title_lba(start_lba: u32, sector_count: u32) -> libfreemkv::DiscTitle {
+        let mut t = libfreemkv::DiscTitle::empty();
+        t.extents.push(libfreemkv::disc::Extent {
+            start_lba,
+            sector_count,
+        });
+        t
+    }
+
+    #[test]
+    fn iso_resume_counts_out_of_title_loss() {
+        // Out-of-title unreadable range only. For output_format=iso the
+        // resume gate must see positive loss (whole-disc scope) — same as
+        // a fresh ISO rip would, so both abort under abort_on_lost_secs=0.
+        let bps = 8_250_000.0;
+        let title = title_lba(1000, 1000);
+        let bad = vec![(0u64, 50 * 2048)];
+        let lost_secs =
+            crate::ripper::abort_lost_ms(/* output_is_iso */ true, &title, &bad, bps) / 1000.0;
+        assert!(
+            lost_secs > 0.0,
+            "iso resume must count whole-disc (out-of-title) loss"
+        );
+    }
+
+    #[test]
+    fn mkv_resume_ignores_out_of_title_loss() {
+        // Same out-of-title range, mkv/m2ts output → in-title scope → 0,
+        // so the resume gate proceeds to mux (matching fresh-rip mkv).
+        let bps = 8_250_000.0;
+        let title = title_lba(1000, 1000);
+        let bad = vec![(0u64, 50 * 2048)];
+        let lost_secs =
+            crate::ripper::abort_lost_ms(/* output_is_iso */ false, &title, &bad, bps) / 1000.0;
+        assert_eq!(
+            lost_secs, 0.0,
+            "mkv resume must ignore out-of-title loss (in-title scope)"
+        );
     }
 }
 
