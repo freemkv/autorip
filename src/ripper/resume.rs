@@ -1200,6 +1200,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             ),
         );
         staging::clear_restart_count(&staging_dir);
+        // Remove the `.ripped` hand-off marker: this job is now terminal-failed,
+        // so the mux worker must not re-dispatch it. The worker also treats
+        // `.failed` as terminal (muxer.rs), but deleting `.ripped` here removes
+        // the re-queue source outright — belt and suspenders against the
+        // re-mux-forever loop.
+        let _ = crate::muxer::delete_marker(&staging_dir);
         reset_status_after_ripping(
             device,
             "error",
