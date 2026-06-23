@@ -67,7 +67,52 @@ pub(super) fn staging_free_bytes(path: &str) -> Option<u64> {
     Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
-#[cfg(not(unix))]
+/// Available bytes at the given path's volume on Windows, via
+/// `GetDiskFreeSpaceExW`. Returns None on any error (path missing, not a real
+/// volume), matching the unix `statvfs` contract so the pre-flight check
+/// behaves identically across platforms. Without this the guard was dead on
+/// Windows (`cfg(not(unix)) → None`), so a too-small staging volume would
+/// ENOSPC mid-rip with no warning.
+#[cfg(windows)]
+pub(super) fn staging_free_bytes(path: &str) -> Option<u64> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    // Wide, NUL-terminated path for the …W API.
+    let wide: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // `lpFreeBytesAvailableToCaller` is the quota-aware free space for the
+    // calling user — the closest analogue to statvfs `f_bavail`.
+    #[allow(non_snake_case)]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let mut free_to_caller: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    // Win32 BOOL: nonzero = success.
+    if ok == 0 {
+        return None;
+    }
+    Some(free_to_caller)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(super) fn staging_free_bytes(_path: &str) -> Option<u64> {
     None
 }
@@ -111,23 +156,6 @@ pub fn increment_restart_count(staging_disc_dir: &Path) -> io::Result<u64> {
     Ok(next)
 }
 
-/// fsync a directory so prior `rename(2)`s into it are durable. On a crash a
-/// renamed file can otherwise be lost even though the rename returned — the
-/// directory entry is still page-cache-only. Best-effort: opening a directory
-/// for read and `sync_all()`ing it is the POSIX way to flush its metadata.
-pub fn fsync_dir(dir: &Path) {
-    match std::fs::File::open(dir) {
-        Ok(f) => {
-            if let Err(e) = f.sync_all() {
-                tracing::warn!(path = %dir.display(), error = %e, "failed to fsync directory");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(path = %dir.display(), error = %e, "could not open directory to fsync");
-        }
-    }
-}
-
 /// Durably write a marker file: write `<path>.tmp`, `sync_all()` it, rename(2)
 /// over the final name, then fsync the containing directory. A crash mid-write
 /// thus never leaves an empty/torn marker — readers observe either the old
@@ -159,7 +187,7 @@ pub(crate) fn write_marker_durable(path: &Path, contents: &[u8]) -> io::Result<(
         return Err(e);
     }
     if let Some(parent) = path.parent() {
-        fsync_dir(parent);
+        libfreemkv::io::fsync::dir(parent);
     }
     Ok(())
 }
@@ -243,23 +271,19 @@ pub fn write_handoff_marker(marker_path: &Path, contents: &[u8]) -> io::Result<(
 /// write, and only for a real local output file (skip `network://` sinks,
 /// which have no local path).
 pub fn fsync_output_file(output_path: &Path) -> bool {
-    match std::fs::File::open(output_path) {
-        Ok(f) => {
-            if let Err(e) = f.sync_all() {
-                tracing::warn!(
-                    path = %output_path.display(),
-                    error = %e,
-                    "failed to fsync mux output before completion marker"
-                );
-                return false;
-            }
-            true
-        }
+    // Delegate to the shared, platform-aware durability primitive. It opens the
+    // file read+write before `sync_all` so the flush works on Windows, where
+    // `FlushFileBuffers` rejects a read-only handle with `ERROR_ACCESS_DENIED`
+    // (os error 5). A read-only open was legal on Linux/macOS but made this gate
+    // fail every cycle on Windows — the `.done` marker was never written, so
+    // auto-resume re-muxed the same ISO forever.
+    match libfreemkv::io::fsync::file_durable(output_path) {
+        Ok(()) => true,
         Err(e) => {
             tracing::warn!(
                 path = %output_path.display(),
                 error = %e,
-                "could not open mux output to fsync before completion marker"
+                "failed to fsync mux output before completion marker"
             );
             false
         }
@@ -760,6 +784,28 @@ mod tests {
         clear_restart_count(&d);
         assert_eq!(restart_count(&d), 0);
         clear_restart_count(&d); // already gone — must not error
+    }
+
+    /// `fsync_output_file` is the mux durability gate: `true` only when the
+    /// output was provably synced (lets the `.done` marker be written), `false`
+    /// when there is no file to sync (caller must preserve staging and retry).
+    /// The rc.4.1 Windows remux loop was this returning `false` forever because
+    /// it opened the output read-only and `FlushFileBuffers` rejects a
+    /// read-only handle; it now delegates to `io::fsync::file_durable`, which
+    /// opens read+write. This test pins both arms of the contract.
+    #[test]
+    fn fsync_output_file_true_for_real_false_for_missing() {
+        let d = tmpdir();
+        let f = d.join("out.mkv");
+        fs::write(&f, b"muxed bytes").unwrap();
+        assert!(
+            fsync_output_file(&f),
+            "an existing output file must fsync successfully (gate passes)"
+        );
+        assert!(
+            !fsync_output_file(&d.join("never-written.mkv")),
+            "a missing output file must fail the gate so staging is preserved"
+        );
     }
 
     /// `increment_restart_count` must round-trip the incremented value and

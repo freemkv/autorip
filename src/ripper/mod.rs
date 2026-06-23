@@ -5245,9 +5245,10 @@ mod tests {
              'skipped' rather than silently proceeding"
         );
 
-        // A real, existing directory → Some(free bytes) on unix (statvfs).
-        // The non-unix stub always returns None, so only assert Some there.
-        #[cfg(unix)]
+        // A real, existing directory → Some(free bytes): unix via statvfs,
+        // Windows via GetDiskFreeSpaceExW. Only the bare-fallback stub (neither
+        // unix nor windows) returns None, so assert Some on both real targets.
+        #[cfg(any(unix, windows))]
         assert!(
             staging_free_bytes(&tmp.path().to_string_lossy()).is_some(),
             "an existing staging path must return Some(free_bytes)"
