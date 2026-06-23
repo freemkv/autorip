@@ -242,7 +242,27 @@ fn copy_counting(
         if let Some(stem) = dest.file_name().and_then(|n| n.to_str()) {
             let prefix = format!("{stem}.part-");
             if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries.flatten() {
+                for entry in entries {
+                    // Don't `.flatten()` away per-entry errors: a partial
+                    // NFS degradation can error on an individual DirEntry,
+                    // skipping a `.part-*` orphan we'd otherwise remove. The
+                    // current copy still writes its own fresh `.part-<pid>`,
+                    // so correctness is unaffected — but without this WARN a
+                    // persistently degraded mount would let orphaned temps
+                    // accumulate with no operator signal at all. (Mirrors the
+                    // no-`flatten()` rationale in `list_staging_basenames`.)
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                dir = %parent.display(),
+                                "mover: cannot read dir entry while clearing orphaned \
+                                 .part-* temps; an orphan may be left behind"
+                            );
+                            continue;
+                        }
+                    };
                     if let Some(name) = entry.file_name().to_str() {
                         if name.starts_with(&prefix) {
                             let _ = std::fs::remove_file(entry.path());
@@ -1883,6 +1903,33 @@ mod tests {
             leftovers.is_empty(),
             "successful copy must leave no .part temp, found {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn copy_counting_clears_orphaned_part_temps_from_other_pids() {
+        use std::sync::atomic::AtomicU64;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("final.bin");
+        std::fs::write(&src, vec![0x11u8; 1024]).unwrap();
+        // Simulate orphaned temps left by prior crashed copies of THIS dest
+        // under different pids. The current copy must sweep them before
+        // writing its own fresh `.part-<pid>`.
+        let orphan_a = tmp.path().join("final.bin.part-999991");
+        let orphan_b = tmp.path().join("final.bin.part-999992");
+        std::fs::write(&orphan_a, b"stale").unwrap();
+        std::fs::write(&orphan_b, b"stale").unwrap();
+        // An unrelated `.part-*` for a DIFFERENT dest must be left untouched.
+        let unrelated = tmp.path().join("other.bin.part-999993");
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        let written = AtomicU64::new(0);
+        copy_counting(&src, &dst, &written).unwrap();
+
+        assert!(!orphan_a.exists(), "orphaned .part for this dest removed");
+        assert!(!orphan_b.exists(), "orphaned .part for this dest removed");
+        assert!(unrelated.exists(), "unrelated .part for other dest kept");
+        assert_eq!(std::fs::read(&dst).unwrap(), vec![0x11u8; 1024]);
     }
 
     // ---- post-copy integrity + collision hardening tests ----
