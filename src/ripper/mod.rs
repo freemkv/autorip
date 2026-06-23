@@ -341,6 +341,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     }
                     had_disc.remove(&device);
                     warned_probe_fail.remove(&device);
+                    device_first_seen.remove(&device);
                     // No eject/scan boundary fires here, so the device's
                     // in-memory log ring would otherwise linger for the
                     // container's lifetime. Evict it like archive_device_log
