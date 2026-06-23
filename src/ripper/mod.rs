@@ -3163,6 +3163,96 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // bounded only by its own work + libfreemkv's stall watchdogs, so
         // there is no cap-fire failure signal to gate the mux on.)
 
+        // ISO output: the deliverable is the whole-disc image we just swept,
+        // not a re-muxed title. The settings UI promises "ISO copies the whole
+        // disc; the other formats mux selected titles" — so skip the title mux
+        // entirely and hand the operator the intermediate `<name>.iso`. The
+        // abort gate above already scoped loss whole-disc for this mode, and
+        // the mover validates + moves `.iso` (its move filter is widened for
+        // ISO output via `retain_intermediate_iso`, and the ISO is never
+        // pruned here). Without this branch an ISO rip would fall through to
+        // the MKV mux below and the user would receive a `.mkv` selected-title
+        // mux — the opposite of what was requested.
+        if output_is_iso_image(&cfg_read.output_format) {
+            let iso_path = std::path::Path::new(&iso_path_str);
+            // Durability gate before the success markers, mirroring the MKV
+            // path's fsync-before-.done: a crash must not leave a `.done`
+            // pointing at a page-cache-only ISO. If the fsync fails, withhold
+            // the markers and preserve staging so a later attempt re-runs the
+            // flush rather than handing the mover a possibly-truncated image.
+            if !staging::fsync_output_file(iso_path) {
+                crate::log::device_log(
+                    device,
+                    "Durability gate failed: could not fsync ISO image to stable storage; \
+                     withholding .done/.completed and preserving staging for retry",
+                );
+                update_state_with(device, |s| {
+                    if s.last_error.is_empty() {
+                        s.last_error =
+                            "ISO image not durable (fsync failed); rip preserved for retry"
+                                .to_string();
+                    }
+                });
+                unregister_halt(device);
+                return;
+            }
+            let staging_path = std::path::Path::new(&staging);
+            let marker = serde_json::json!({
+                "title": display_name,
+                "disc_name": disc_name,
+                "format": disc_format,
+                "year": tmdb_year,
+                "media_type": tmdb_media_type,
+                "poster_url": tmdb_poster,
+                "overview": tmdb_overview,
+                "date": crate::util::format_date(),
+            });
+            // Confident match → `.done` (mover files it); otherwise `.review`
+            // (operator confirms the title before it leaves staging). Mirrors
+            // the MKV completion path's marker selection.
+            let marker_name = if title_confident { ".done" } else { ".review" };
+            if let Err(e) = staging::write_handoff_marker(
+                &staging_path.join(marker_name),
+                serde_json::to_string_pretty(&marker)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            ) {
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "{marker_name} marker write failed ({e}); ISO is staged but the mover cannot pick it up"
+                    ),
+                );
+                update_state_with(device, |s| {
+                    if s.last_error.is_empty() {
+                        s.last_error = format!("{marker_name} marker write failed: {e}");
+                    }
+                });
+                unregister_halt(device);
+                return;
+            }
+            staging::write_completed_marker(staging_path);
+            staging::clear_restart_count(staging_path);
+            crate::log::device_log(
+                device,
+                &format!("ISO output complete — disc image staged as {iso_filename}"),
+            );
+            update_state_with(device, |s| {
+                s.status = "done".to_string();
+                s.output_file = iso_filename.clone();
+            });
+            if cfg_read.auto_eject {
+                if let Some(h) = device_halt(device) {
+                    h.cancel();
+                }
+                eject_drive(device_path);
+            } else {
+                drop(session);
+                unregister_halt(device);
+            }
+            return;
+        }
+
         // v0.25.3 parallel pipeline hand-off — sweep + patch are done,
         // the ISO is on disk, the drive is no longer needed. Write
         // the `.ripped` marker so the muxer worker can pick this
@@ -4134,7 +4224,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         std::path::Path::new(&iso_path_str),
         std::path::Path::new(&mapfile_path_str),
         cfg_read.max_retries,
-        cfg_read.keep_iso,
+        retain_intermediate_iso(cfg_read.keep_iso, &cfg_read.output_format),
     );
 
     crate::log::device_log(device, "Rip complete");
@@ -4274,6 +4364,29 @@ pub(super) fn abort_lost_ms(
 /// whenever any out-of-title sector was unreadable.
 fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
     lost_ms > abort_threshold_ms
+}
+
+/// Whether the rip's deliverable is the whole-disc ISO itself rather than a
+/// muxed MKV/M2TS title.
+///
+/// The settings UI advertises `output_format == "iso"` as "ISO copies the whole
+/// disc; the other formats mux selected titles". For that promise to hold the
+/// orchestrator must hand the operator the disc image it swept (the intermediate
+/// `<name>.iso`), NOT re-mux the selected title to an `.mkv` and prune the ISO.
+/// So in ISO mode we skip the title mux entirely and deliver the ISO: the abort
+/// gate already scopes loss whole-disc (`abort_lost_ms`), and the mover already
+/// validates + moves `.iso` files. This is the single predicate every
+/// deliverable/prune/mux-skip decision keys off so the two completion routes
+/// (`rip_disc`'s inline terminal and `resume::resume_remux`) can't diverge.
+fn output_is_iso_image(output_format: &str) -> bool {
+    output_format == "iso"
+}
+
+/// Whether the intermediate ISO must be retained as the deliverable rather than
+/// pruned. True when the operator asked to keep it (`keep_iso`) OR when ISO is
+/// the selected output (the ISO *is* the deliverable — see `output_is_iso_image`).
+fn retain_intermediate_iso(keep_iso: bool, output_format: &str) -> bool {
+    keep_iso || output_is_iso_image(output_format)
 }
 
 /// Whether an `output_format == "iso"` rip must be rejected because it was
@@ -5697,6 +5810,47 @@ mod tests {
             assert!(
                 !super::iso_output_needs_multipass(fmt, 5),
                 "{fmt} multi-pass ok"
+            );
+        }
+    }
+
+    #[test]
+    fn iso_output_delivers_the_disc_image_not_a_mux() {
+        // Regression: the settings UI advertises `output_format="iso"` as
+        // "ISO copies the whole disc; the other formats mux selected titles".
+        // Previously both rip paths special-cased only "m2ts" and defaulted
+        // everything else (including "iso") to an `.mkv` selected-title mux,
+        // then PRUNED the swept ISO — so the operator received the opposite of
+        // what was requested. `output_is_iso_image` is the single predicate the
+        // mux-skip + deliverable + prune decisions now key off.
+        assert!(
+            super::output_is_iso_image("iso"),
+            "iso output must be recognised as a whole-disc deliverable"
+        );
+        for fmt in ["mkv", "m2ts", "network", "garbage", ""] {
+            assert!(
+                !super::output_is_iso_image(fmt),
+                "{fmt} muxes a title and must NOT be treated as a disc image"
+            );
+        }
+    }
+
+    #[test]
+    fn iso_output_retains_its_disc_image_even_without_keep_iso() {
+        // The swept ISO is the deliverable for iso output, so it must never be
+        // pruned regardless of `keep_iso` — pruning it would leave the staging
+        // dir with no file for the mover to promote.
+        assert!(
+            super::retain_intermediate_iso(false, "iso"),
+            "iso output must retain its ISO even when keep_iso is off"
+        );
+        assert!(super::retain_intermediate_iso(true, "iso"));
+        // `keep_iso` still governs ISO retention for the mux formats.
+        assert!(super::retain_intermediate_iso(true, "mkv"));
+        for fmt in ["mkv", "m2ts", "network"] {
+            assert!(
+                !super::retain_intermediate_iso(false, fmt),
+                "{fmt} without keep_iso must prune the intermediate ISO"
             );
         }
     }
