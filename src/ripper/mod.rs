@@ -3673,6 +3673,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let final_last_sector = rip_last_lba.load(Ordering::Relaxed);
     let final_current_batch = rip_current_batch.load(Ordering::Relaxed);
     let mut final_lost_secs = mux_outcome.lost_video_secs;
+    // Demux-time loss (sectors that read into the ISO fine but fail AACS/CSS
+    // decrypt at mux, or codec-corruption demux skips that zero-fill output).
+    // This is the in-title-scoped demux-skip estimate from `run_mux`, the same
+    // quantity the single-pass (mod.rs) and resume (resume.rs) post-mux gates
+    // compare against the threshold. Captured BEFORE the multipass overwrite
+    // below replaces `final_lost_secs` with the sweep-mapfile loss for the UI
+    // card, so the post-mux gate can still gate fresh multi-pass rips on it.
+    let demux_lost_secs = mux_outcome.lost_video_secs;
     // In multipass mode the `input.errors` counter above counts ISO→MKV demux
     // skips (usually zero — ISO reads don't fail). The real bad-sector count
     // lives in the mapfile sidecar. Prefer that when present.
@@ -3705,44 +3713,53 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         }
     }
 
-    // Single-pass abort gate (max_retries == 0).
+    // Post-mux demux-skip abort gate (all fresh-rip paths).
     //
-    // The post-retry abort_on_lost_secs check above only runs in
-    // multi-pass mode, where a mapfile exists and per-sector loss is
-    // known before the mux. Single-pass mode streams the disc directly
-    // to the MKV with no mapfile, so loss is only knowable AFTER the mux
-    // (from the demux skip count, surfaced as `final_lost_secs`). The
-    // file is therefore already written by the time we get here — but we
-    // can still honour the abort_on_lost_secs contract by refusing to
-    // hand a lossy result to the mover: quarantine the staging dir with
-    // `.failed` (no `.done`/`.completed`) instead of delivering it. This
-    // closes the divergence where `abort_on_lost_secs=0` ("require a
-    // perfect rip") silently produced a lossy MKV in single-pass mode.
+    // The pre-mux abort_on_lost_secs check (multi-pass only) sees the
+    // mapfile's per-sector `Unreadable` loss BEFORE the mux. It cannot see
+    // demux-time loss: sectors that read into the ISO fine but fail AACS/CSS
+    // decrypt at mux, or codec-level corruption that forces the demuxer to
+    // skip — both zero-fill the output and surface only as
+    // `demux_lost_secs` (`mux_outcome.lost_video_secs`). Single-pass mode
+    // has no pre-mux gate at all, so for it this is the ONLY loss gate.
     //
-    // `final_lost_secs` here is the demux-skip estimate, which is already
-    // in-title-scoped (the mux only reads the muxed title's sectors), so
-    // it is the right quantity to compare against the threshold — the
-    // same semantics as `abort_lost_ms` in the multi-pass gate.
-    if completed && cfg_read.max_retries == 0 {
+    // The file is already written by the time we reach here, but we still
+    // honour the abort_on_lost_secs contract by refusing to hand a lossy
+    // result to the mover: quarantine the staging dir with `.failed` (no
+    // `.done`/`.completed`) instead of delivering it. This runs for BOTH
+    // single- and multi-pass so a fresh multi-pass rip reaches the same
+    // verdict as the single-pass path and a resume of the identical ISO
+    // (resume.rs post-mux gate) — closing the divergence where
+    // `abort_on_lost_secs=0` ("require a perfect rip") silently produced a
+    // lossy MKV whenever loss appeared only at mux time.
+    //
+    // We gate on `demux_lost_secs` (not `final_lost_secs`): in multi-pass
+    // mode `final_lost_secs` was just overwritten with the sweep-mapfile
+    // loss, which the pre-mux gate already enforced. The NEW information at
+    // this point is the demux skip count. In single-pass mode the overwrite
+    // block is skipped, so `demux_lost_secs == final_lost_secs` and behaviour
+    // is unchanged. Both quantities are in-title-scoped (the mux only reads
+    // the muxed title's sectors), matching the threshold's semantics.
+    if completed {
         let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
-        if should_abort_for_loss(final_lost_secs * 1000.0, abort_threshold_ms) {
+        if should_abort_for_loss(demux_lost_secs * 1000.0, abort_threshold_ms) {
             crate::log::device_log(
                 device,
                 &format!(
-                    "ABORT: strategy=abort_check triggered — {:.2}s lost in main movie (threshold: {}s)",
-                    final_lost_secs, cfg_read.abort_on_lost_secs
+                    "ABORT: strategy=abort_check triggered — {:.2}s lost at mux (demux/decrypt skips) exceeds threshold {}s",
+                    demux_lost_secs, cfg_read.abort_on_lost_secs
                 ),
             );
             crate::log::device_log(
                 device,
                 &format!(
                     "STRATEGY_FAILURE: abort_check FAILED — data loss ({:.2}s) exceeds threshold ({}s)",
-                    final_lost_secs, cfg_read.abort_on_lost_secs
+                    demux_lost_secs, cfg_read.abort_on_lost_secs
                 ),
             );
             crate::log::device_log(
                 device,
-                "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. Single-pass mode (max_retries=0) cannot retry bad sectors; RAISE max_retries to retry the damaged ranges, or RAISE abort_on_lost_secs to accept some loss.",
+                "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. This loss appeared at mux time (decrypt/codec skips), which retries cannot recover. RAISE abort_on_lost_secs to accept some loss, or check that the disc's decryption keys are current.",
             );
             // Quarantine the lossy MKV: write `.failed` so the mover never
             // files it and the resume detector treats the dir as
@@ -3752,8 +3769,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             staging::write_failed_marker(
                 staging_disc_path,
                 &format!(
-                    "aborted: {:.2}s lost in main movie exceeds threshold {}s",
-                    final_lost_secs, cfg_read.abort_on_lost_secs
+                    "aborted: {:.2}s lost at mux exceeds threshold {}s",
+                    demux_lost_secs, cfg_read.abort_on_lost_secs
                 ),
             );
             staging::clear_restart_count(staging_disc_path);
@@ -3766,7 +3783,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     disc_name: display_name.clone(),
                     disc_format: disc_format.clone(),
                     errors: final_errors,
-                    lost_video_secs: final_lost_secs,
+                    // Operator-facing total loss = accepted sweep loss (in
+                    // `final_lost_secs` for multi-pass; 0 for single-pass) plus
+                    // the demux loss that tripped this gate. In single-pass
+                    // `final_lost_secs == demux_lost_secs`, so report the demux
+                    // value alone to avoid double-counting.
+                    lost_video_secs: if cfg_read.max_retries == 0 {
+                        demux_lost_secs
+                    } else {
+                        final_lost_secs + demux_lost_secs
+                    },
                     last_sector: final_last_sector,
                     current_batch: final_current_batch,
                     preferred_batch: batch,
@@ -3777,12 +3803,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     duration: duration.clone(),
                     codecs: codecs.clone(),
                     last_error: format!(
-                        "aborted — {:.2}s lost in main movie (threshold: {}s)",
-                        final_lost_secs, cfg_read.abort_on_lost_secs
+                        "aborted — {:.2}s lost at mux (threshold: {}s)",
+                        demux_lost_secs, cfg_read.abort_on_lost_secs
                     ),
                     failure_reason: Some(format!(
-                        "aborted: {:.2}s lost in main movie exceeds threshold {}s",
-                        final_lost_secs, cfg_read.abort_on_lost_secs
+                        "aborted: {:.2}s lost at mux exceeds threshold {}s",
+                        demux_lost_secs, cfg_read.abort_on_lost_secs
                     )),
                     ..Default::default()
                 },
@@ -6131,5 +6157,60 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let missing = tmp.path().join("does-not-exist");
         assert_eq!(list_staging_basenames(&missing), None);
+    }
+
+    /// Regression: the fresh-rip post-mux loss gate must run for BOTH
+    /// single- AND multi-pass, gating on the demux-skip estimate
+    /// (`demux_lost_secs`). Demux-time loss (AACS/CSS decrypt failures or
+    /// codec-corruption demux skips that zero-fill output) never appears in
+    /// the sweep mapfile, so the pre-mux multi-pass gate cannot see it. If
+    /// this gate were guarded by `max_retries == 0` (single-pass only), a
+    /// fresh multi-pass rip whose sweep recovered cleanly but whose MUX
+    /// skipped sectors would be filed `.done` with a lossy MKV — while the
+    /// single-pass path and a resume of the identical ISO (resume.rs gate)
+    /// both quarantine `.failed` under `abort_on_lost_secs=0`. The three
+    /// paths must reach the same verdict.
+    ///
+    /// A full behavioural test needs a real lossy ISO + mux pipeline (same
+    /// rationale as resume.rs's `resume_enforces_post_mux_loss_gate`);
+    /// instead this pins, at source level, that the post-mux gate region
+    /// (a) is not re-narrowed to single-pass and (b) compares
+    /// `demux_lost_secs` via `should_abort_for_loss`, quarantining with
+    /// `write_failed_marker`.
+    #[test]
+    fn fresh_rip_post_mux_gate_covers_multipass() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("Post-mux demux-skip abort gate (all fresh-rip paths)")
+            .expect("mod.rs should have the post-mux demux-skip gate");
+        // Bound to the gate block: up to the final mux summary line that
+        // follows it.
+        let end = src[start..]
+            .find("Emit a final mux summary line")
+            .map(|i| start + i)
+            .expect("mod.rs should have the final mux-summary section after the gate");
+        let region = &src[start..end];
+
+        // The gate's outer guard must be `if completed {` — NOT narrowed to
+        // single-pass with `max_retries == 0`, which would skip multi-pass.
+        assert!(
+            region.contains("if completed {"),
+            "post-mux gate must run for all completed fresh rips (single + multi-pass)"
+        );
+        assert!(
+            !region.contains("cfg_read.max_retries == 0 {\n        let abort_threshold_ms"),
+            "post-mux gate must not be re-guarded to single-pass only"
+        );
+        // It must gate on the demux-skip estimate (the only signal carrying
+        // mux-time loss), via the shared comparator.
+        assert!(
+            region.contains("should_abort_for_loss(demux_lost_secs * 1000.0, abort_threshold_ms)"),
+            "post-mux gate must compare demux_lost_secs via should_abort_for_loss"
+        );
+        // Over-threshold loss must quarantine `.failed` (no `.done`).
+        assert!(
+            region.contains("write_failed_marker"),
+            "post-mux gate must quarantine an over-threshold lossy mux with write_failed_marker"
+        );
     }
 }
