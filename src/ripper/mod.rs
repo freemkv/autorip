@@ -2008,12 +2008,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let required = bytes_total_disc.saturating_mul(2);
             if let Some(avail) = staging_free_bytes(&staging) {
                 if avail < required {
-                    let msg = format!(
-                        "E5000: insufficient staging disk space — need ≥ {:.1} GB free at {} (2× disc capacity), have {:.1} GB. Free up space or point STAGING_DIR at a larger volume.",
-                        required as f64 / 1_073_741_824.0,
-                        &staging,
-                        avail as f64 / 1_073_741_824.0,
-                    );
+                    let msg = disk_space_preflight_message(required, &staging, avail);
                     crate::log::device_log(device, &msg);
                     update_state_with(device, |s| {
                         s.status = "error".to_string();
@@ -4218,6 +4213,28 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
 }
 
 /// Translate a libfreemkv read-error into a user-facing message for
+/// Operator-facing message for the multipass disk-space preflight failure.
+///
+/// This is NOT a libfreemkv `Error` — there is no `Error::IoError`/E5000
+/// raised by the preflight; it's a local autorip guard. Its text lands
+/// directly in `/api/state`'s `last_error` and is rendered as-is in the web
+/// UI red banner, so it must read like the other clean operator strings in
+/// this module. It deliberately carries NO raw `EXXXX:` code prefix: a
+/// hand-assembled "E5000:" would be an unlocalised literal that the freemkv
+/// CLI would route to the `error.E5000` key while the dashboard showed the
+/// raw code as diagnostic noise, and would diverge silently if the real
+/// `E_IO_ERROR` display convention ever changed.
+///
+/// `required` and `avail` are byte counts; `staging` is the staging path.
+fn disk_space_preflight_message(required: u64, staging: &str, avail: u64) -> String {
+    format!(
+        "Insufficient staging disk space — need ≥ {:.1} GB free at {} (2× disc capacity), have {:.1} GB. Free up space or point STAGING_DIR at a larger volume.",
+        required as f64 / 1_073_741_824.0,
+        staging,
+        avail as f64 / 1_073_741_824.0,
+    )
+}
+
 /// /api/state's last_error field. Raw libfreemkv errors like
 /// `E6000: 19965280 0x02/0x04/0x3e` are diagnostic-grade — fine for
 /// logs, terrible for the UI. This helper renders the same condition
@@ -4417,8 +4434,8 @@ mod tests {
     //! State-only helpers and their tests live in `state.rs`.
 
     use super::{
-        HaltGuard, aacs_failure_message, format_pass_error, is_safe_staging_segment, register_halt,
-        staging_dir_matches_disc, staging_free_bytes,
+        HaltGuard, aacs_failure_message, disk_space_preflight_message, format_pass_error,
+        is_safe_staging_segment, register_halt, staging_dir_matches_disc, staging_free_bytes,
     };
     use crate::ripper::session::device_halt;
     use libfreemkv::{Error, ScsiSense};
@@ -4765,6 +4782,35 @@ mod tests {
         let s = aacs_failure_message(Some(&e));
         assert!(s.starts_with("Host cert rejected"), "msg: {s}");
         assert!(s.contains("E7005"), "msg: {s}");
+    }
+
+    /// The disk-space preflight message is operator-facing (it lands in
+    /// last_error and the web UI red banner as-is). It must NOT carry a raw
+    /// "EXXXX:" code prefix — there is no libfreemkv Error raised here, so a
+    /// hand-assembled "E5000:" would be unlocalised diagnostic noise to the
+    /// operator. Guards against re-introducing the prefix.
+    #[test]
+    fn disk_space_preflight_message_has_no_raw_error_code_prefix() {
+        let required = 100u64 * 1_073_741_824; // 100 GiB
+        let avail = 40u64 * 1_073_741_824; // 40 GiB
+        let s = disk_space_preflight_message(required, "/staging-local", avail);
+        assert!(
+            !s.contains("E5000"),
+            "raw E5000 code leaked into operator message: {s}"
+        );
+        // No "ENNNN:" code prefix anywhere (digits-after-E followed by colon).
+        for (i, _) in s.match_indices('E') {
+            let tail = &s[i + 1..];
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            assert!(
+                digits.is_empty() || !tail[digits.len()..].starts_with(':'),
+                "raw EXXXX: code prefix leaked into operator message: {s}"
+            );
+        }
+        // Still reports both the requirement and the actual free space.
+        assert!(s.contains("100.0 GB"), "missing required figure: {s}");
+        assert!(s.contains("40.0 GB"), "missing available figure: {s}");
+        assert!(s.contains("/staging-local"), "missing staging path: {s}");
     }
 
     #[test]
