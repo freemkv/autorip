@@ -293,7 +293,12 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         // and retry next rather than re-dispatching on an untrustworthy
         // listing.
         match crate::ripper::staging::snapshot_staging_disc(&dir) {
-            Some(snap) if snap.completed => continue,
+            // `.completed` AND `.failed` are both terminal — skip either. A
+            // post-mux abort (e.g. demux-loss gate over `abort_on_lost_secs`)
+            // writes `.failed` WITHOUT `.completed` and, because the `.ripped`
+            // marker is only deleted on success, the dir would otherwise be
+            // re-dispatched every tick forever (re-mux → re-abort → re-fail).
+            Some(snap) if snap.completed || snap.failed_reason.is_some() => continue,
             Some(_) => {}
             None => continue,
         }
@@ -427,7 +432,11 @@ pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
         // when delete_marker fails post-mux (NFS, see resume.rs). The
         // `.completed` marker is the authoritative "done" signal — skip
         // the dir so a finished title doesn't report "(queued)" forever.
-        if dir.join(crate::ripper::staging::COMPLETED_MARKER).exists() {
+        // `.failed` is equally terminal (post-mux abort): skip it too so an
+        // aborted title doesn't report "(queued)" indefinitely.
+        if dir.join(crate::ripper::staging::COMPLETED_MARKER).exists()
+            || dir.join(crate::ripper::staging::FAILED_MARKER).exists()
+        {
             continue;
         }
         if let Ok(m) = read_marker(&dir) {
@@ -610,6 +619,50 @@ mod tests {
         assert!(
             q.is_empty(),
             "a dir with .completed present must be skipped, got {q:?}"
+        );
+    }
+
+    // Regression (re-mux-forever loop): a post-mux abort writes `.failed`
+    // WITHOUT `.completed`, and `.ripped` is only deleted on success — so a
+    // `.ripped` + `.failed` dir must be recognised as TERMINAL by both the
+    // check_and_mux guard (via `failed_reason`) and pending_queue, or the
+    // worker re-dispatches it every tick forever (re-mux → re-abort → repeat).
+    #[test]
+    fn completion_guard_sees_failed_via_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let movie = tmp.path().join("Border_Town");
+        std::fs::create_dir_all(&movie).unwrap();
+        write_marker(&movie, &sample_marker()).unwrap();
+        crate::ripper::staging::write_failed_marker(
+            &movie,
+            "aborted: demux loss exceeds threshold",
+        );
+
+        let snap = crate::ripper::staging::snapshot_staging_disc(&movie)
+            .expect("a populated dir must yield a snapshot");
+        assert!(!snap.completed, ".failed dir is not .completed");
+        assert!(
+            snap.failed_reason.is_some(),
+            "snapshot must report failed_reason for a .failed dir; the \
+             check_and_mux guard relies on this to avoid the re-mux-forever loop"
+        );
+    }
+
+    #[test]
+    fn pending_queue_skips_failed_dir() {
+        let tmp = TempDir::new().unwrap();
+        let movie = tmp.path().join("Border_Town");
+        std::fs::create_dir_all(&movie).unwrap();
+        write_marker(&movie, &sample_marker()).unwrap();
+        crate::ripper::staging::write_failed_marker(
+            &movie,
+            "aborted: demux loss exceeds threshold",
+        );
+
+        let q = pending_queue(tmp.path());
+        assert!(
+            q.is_empty(),
+            "a dir with .failed present is terminal and must be skipped, got {q:?}"
         );
     }
 
