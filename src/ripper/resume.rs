@@ -395,6 +395,16 @@ fn reset_status_after_ripping(
 /// failure (scan_image, mux open, mux loop): preserves the partial
 /// state and leaves the counter intact so the next-startup pass
 /// promotes the dir to `.failed` once `RESTART_LIMIT` is reached.
+/// Pick the codecs string for the resumed-rip done card. The mux frame
+/// loop writes the real codecs into STATE during muxing (the `_mux`
+/// worker path starts from an empty seed), so prefer the post-mux STATE
+/// value; fall back to the pre-mux snapshot when STATE has nothing useful.
+fn resolve_done_codecs(post_mux_state: Option<String>, pre_mux_snapshot: String) -> String {
+    post_mux_state
+        .filter(|c| !c.is_empty())
+        .unwrap_or(pre_mux_snapshot)
+}
+
 pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: ResumeClass) {
     let ResumeClass::Remux {
         iso_path,
@@ -901,12 +911,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             device,
             display_name: display_name.clone(),
             disc_format: disc_format.clone(),
-            tmdb_title,
+            tmdb_title: tmdb_title.clone(),
             tmdb_year,
-            tmdb_poster,
-            tmdb_overview,
+            tmdb_poster: tmdb_poster.clone(),
+            tmdb_overview: tmdb_overview.clone(),
             duration: duration.clone(),
-            codecs: state_codecs,
+            codecs: state_codecs.clone(),
             filename: filename.clone(),
             total_bytes,
             title_bytes_per_sec,
@@ -1064,6 +1074,24 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             progress_pct: 100,
             output_file: staging_str,
             duration,
+            // Carry the TMDB metadata + codecs into the done card, mirroring
+            // rip_disc's terminal state. Without these the done-card for a
+            // resumed rip loses the poster, TMDB title (showing only the
+            // sanitized disc name), year, and codec badge.
+            tmdb_title,
+            tmdb_year,
+            tmdb_poster,
+            tmdb_overview,
+            // Prefer the codecs the mux frame loop wrote into STATE (the
+            // `_mux` worker path seeds an empty codecs and only fills it
+            // during mux); fall back to the pre-mux snapshot.
+            codecs: resolve_done_codecs(
+                super::STATE
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.get(device).map(|rs| rs.codecs.clone())),
+                state_codecs,
+            ),
             // Carry sweep damage so the done card reflects real damage
             // instead of showing a clean result for a damaged rip.
             errors: done_sweep_damage.errors,
@@ -1539,5 +1567,37 @@ mod sweep_damage_marker_tests {
         let json = serde_json::to_string(&marker).expect("serialize");
         let back: crate::muxer::RippedMarker = serde_json::from_str(&json).expect("deserialize");
         assert!(!back.title_confident);
+    }
+
+    /// Regression: the resumed-rip done card must carry codecs. The `_mux`
+    /// worker path seeds an empty codecs into STATE and only fills it during
+    /// muxing, so the done state must prefer the post-mux STATE value over the
+    /// (empty) pre-mux snapshot. The user-triggered path has codecs in the
+    /// pre-mux snapshot already; either way the done card must not be blank.
+    #[test]
+    fn resolve_done_codecs_prefers_post_mux_then_snapshot() {
+        // _mux path: pre-mux snapshot empty, post-mux STATE has real codecs.
+        assert_eq!(
+            super::resolve_done_codecs(Some("HEVC · TrueHD".into()), String::new()),
+            "HEVC · TrueHD",
+            "post-mux codecs must win when present"
+        );
+        // User-triggered path: STATE empty post-mux, snapshot carries codecs.
+        assert_eq!(
+            super::resolve_done_codecs(Some(String::new()), "AVC · DTS".into()),
+            "AVC · DTS",
+            "empty post-mux STATE must fall back to the pre-mux snapshot"
+        );
+        // No STATE entry at all → snapshot.
+        assert_eq!(
+            super::resolve_done_codecs(None, "AVC · DTS".into()),
+            "AVC · DTS",
+            "absent STATE must fall back to the pre-mux snapshot"
+        );
+        // Both populated → post-mux is the fresher truth.
+        assert_eq!(
+            super::resolve_done_codecs(Some("HEVC".into()), "AVC".into()),
+            "HEVC"
+        );
     }
 }
