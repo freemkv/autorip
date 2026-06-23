@@ -3978,7 +3978,7 @@ fn audio_purpose_tag(p: libfreemkv::LabelPurpose) -> Option<&'static str> {
 /// fully-recovered main movie just because some out-of-title sector was
 /// lost (the Top Gun false-positive). Mirrors the per-pass loop-exit
 /// gate's `mux_scope_bad` scoping.
-fn abort_lost_ms(
+pub(super) fn abort_lost_ms(
     output_is_iso: bool,
     title: &libfreemkv::DiscTitle,
     bad_ranges: &[(u64, u64)],
