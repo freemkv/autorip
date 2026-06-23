@@ -276,9 +276,11 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         [0u8; 16]
     });
 
-    // Read content samples only if some source validates against ciphertext
-    // (an online key service); a keydb / mapfile keys on disc identity alone and
-    // the keydb's UK-first ordering already hands the terminal key out first.
+    // Read content samples only if some source needs ciphertext validation:
+    // an online key service, OR a keydb (it can hand out a per-disc terminal
+    // `Key::Unit` that `decrypt_with` applies as-is — a hash-matching but
+    // wrong UK is only disproved by descrambling real ciphertext). A mapfile
+    // alone keys on already-validated unit keys and needs no sample.
     let need_samples = sources.iter().any(|s| s.needs_samples());
     let samples = if need_samples {
         match disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() {
