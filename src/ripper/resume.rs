@@ -66,6 +66,15 @@ pub enum ResumeClass {
         /// has run yet); the sanitized form is what every other
         /// downstream path keys on anyway.
         display_name: String,
+        /// Operator-confidence carried from the fresh-rip hand-off, when
+        /// known. `Some(true)` means the rip side already decided the title
+        /// is auto-file-worthy (exact match OR an explicit operator
+        /// override); `resume_remux` ORs it into its own match check so an
+        /// override whose chosen title differs from the disc's own label
+        /// isn't second-guessed into `.review`. `None` on the cold
+        /// auto-resume path (no hand-off marker, no override concept) —
+        /// `resume_remux` then relies on the match check alone.
+        title_confident: Option<bool>,
     },
     /// Hint is `ResumePreserved` but doesn't satisfy the auto-resume
     /// criteria. The orchestrator should fall through to the regular
@@ -256,6 +265,10 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
         iso_path,
         mapfile_path,
         display_name,
+        // Cold auto-resume from preserved staging: no `.ripped` hand-off
+        // and no operator-override concept here, so confidence is unknown.
+        // resume_remux falls back to its own match check.
+        title_confident: None,
     }
 }
 
@@ -387,6 +400,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         iso_path,
         mapfile_path,
         display_name,
+        title_confident: carried_confident,
     } = classification
     else {
         // Caller bug — should never happen. Log loudly so a future
@@ -840,8 +854,15 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // bypassing the operator-review hold the fresh-rip path enforces.
     // Compute confidence the same way: an exact normalized-title match
     // that carries a year, comparing the resolved TMDB title against the
-    // disc's own label. No operator-override concept exists on the resume
-    // path, so confidence is purely the match check.
+    // disc's own label. On the PRIMARY multipass path (the `.ripped`
+    // hand-off), the fresh-rip side already made this verdict — and folded
+    // in any operator '✎ change' override — so it carries it in
+    // `carried_confident`. We OR that in: an operator's deliberate pick
+    // (whose chosen title intentionally differs from the disc's own, often
+    // cryptic, label) must NOT be second-guessed back into `.review` by
+    // recomputing the match check here. On the cold auto-resume path
+    // (`carried_confident == None`) there is no hand-off and no override
+    // concept, so confidence is purely the match check.
     let disc_label = disc
         .meta_title
         .as_deref()
@@ -852,11 +873,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     } else {
         tmdb_title.clone()
     };
-    let title_confident = crate::tmdb::is_confident_match(
-        &crate::tmdb::clean_title(&disc_label),
-        &title_for_match,
-        tmdb_year,
-    );
+    let title_confident = carried_confident.unwrap_or(false)
+        || crate::tmdb::is_confident_match(
+            &crate::tmdb::clean_title(&disc_label),
+            &title_for_match,
+            tmdb_year,
+        );
 
     let mux_outcome = super::mux::run_mux(
         super::mux::MuxInputs {
@@ -1095,6 +1117,10 @@ pub(crate) fn remux_from_ripped_marker(
         iso_path: iso_path.clone(),
         mapfile_path: mapfile_path.clone(),
         display_name: marker.display_name.clone(),
+        // Carry the fresh-rip confidence verdict (incl. operator override)
+        // from the hand-off marker so resume_remux doesn't recompute it
+        // from the match check alone.
+        title_confident: Some(marker.title_confident),
     };
     resume_remux(cfg, mux_device, classification);
 
@@ -1276,6 +1302,7 @@ mod resume_remux_log_archive_tests {
             iso_path: d.join("does-not-exist.iso"),
             mapfile_path: d.join("does-not-exist.iso.mapfile"),
             display_name: "Nonexistent".to_string(),
+            title_confident: None,
         };
         let cfg = Arc::new(RwLock::new(Config::default()));
 
@@ -1333,6 +1360,7 @@ mod sweep_damage_marker_tests {
             sweep_main_lost_ms: 1200.0,
             sweep_num_bad_ranges: 5,
             sweep_largest_gap_ms: 900.0,
+            title_confident: false,
         };
 
         // Serialize then deserialize (mirrors write_marker / read_marker).
@@ -1390,5 +1418,57 @@ mod sweep_damage_marker_tests {
             marker.sweep_largest_gap_ms, 0.0,
             "missing field must default to 0.0"
         );
+        assert!(
+            !marker.title_confident,
+            "missing title_confident must default to false (prior match-check-only behavior)"
+        );
+    }
+
+    /// Regression: an operator title override (or any high-confidence
+    /// fresh-rip verdict) must survive the `.ripped` hand-off so the mux
+    /// worker's resume_remux auto-files into `.done` instead of holding it
+    /// for review. Before the fix, RippedMarker did not carry the verdict
+    /// and resume_remux recomputed it from `is_confident_match(disc_label,
+    /// title, year)` alone — which an override (chosen title != disc label)
+    /// fails by construction, forcing the deliberate pick into `.review`.
+    #[test]
+    fn ripped_marker_title_confident_round_trips() {
+        let mut marker = crate::muxer::RippedMarker {
+            schema_version: crate::muxer::RIPPED_MARKER_SCHEMA,
+            iso_path: "/staging/Baz/Baz.iso".into(),
+            mapfile_path: "/staging/Baz/Baz.iso.mapfile".into(),
+            display_name: "Operator Chosen Title".into(),
+            disc_format: "uhd".into(),
+            mkv_filename: "Operator_Chosen_Title.mkv".into(),
+            tmdb_title: "Operator Chosen Title".into(),
+            tmdb_year: 2024,
+            tmdb_poster: String::new(),
+            tmdb_overview: String::new(),
+            max_retries: 3,
+            abort_on_lost_secs: 0,
+            rip_elapsed_secs: 0.0,
+            rip_errors: 0,
+            rip_lost_video_secs: 0.0,
+            rip_last_sector: 0,
+            origin_device: "sg0".into(),
+            sweep_errors: 0,
+            sweep_total_lost_ms: 0.0,
+            sweep_main_lost_ms: 0.0,
+            sweep_num_bad_ranges: 0,
+            sweep_largest_gap_ms: 0.0,
+            title_confident: true,
+        };
+        let json = serde_json::to_string(&marker).expect("serialize");
+        let back: crate::muxer::RippedMarker = serde_json::from_str(&json).expect("deserialize");
+        assert!(
+            back.title_confident,
+            "operator-confident verdict must survive the .ripped hand-off"
+        );
+
+        // And the low-confidence case round-trips as false.
+        marker.title_confident = false;
+        let json = serde_json::to_string(&marker).expect("serialize");
+        let back: crate::muxer::RippedMarker = serde_json::from_str(&json).expect("deserialize");
+        assert!(!back.title_confident);
     }
 }

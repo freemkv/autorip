@@ -1144,6 +1144,10 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
                 iso_path,
                 mapfile_path,
                 display_name: dir_display_name,
+                // Cold disc-insert resume from preserved staging: no `.ripped`
+                // hand-off and no operator-override concept, so confidence is
+                // unknown — resume_remux falls back to its own match check.
+                title_confident: None,
             });
         }
     }
@@ -3056,6 +3060,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 .as_ref()
                 .map(|d| d.largest_gap_ms)
                 .unwrap_or(0.0),
+            // Carry the fresh-rip confidence verdict (which already folds in
+            // the operator '✎ change' override) so the mux worker's
+            // resume_remux doesn't recompute confidence from the match check
+            // alone and second-guess a deliberate operator pick into .review.
+            title_confident,
         };
         let staging_path = std::path::Path::new(&staging);
         if let Err(e) = crate::muxer::write_marker(staging_path, &marker) {

@@ -66,6 +66,7 @@ fn resume_classifies_clean_mapfile_as_remux() {
             iso_path,
             mapfile_path,
             display_name,
+            ..
         } => {
             assert_eq!(iso_path, dir.join("MyDisc.iso"));
             assert_eq!(mapfile_path, dir.join("MyDisc.iso.mapfile"));

@@ -72,6 +72,19 @@ pub struct RippedMarker {
     pub sweep_num_bad_ranges: u32,
     #[serde(default)]
     pub sweep_largest_gap_ms: f64,
+    /// Operator-confidence of the resolved title at hand-off time. True
+    /// when the fresh-rip path decided the title is trustworthy enough to
+    /// auto-file (`.done`) — either an exact normalized match with a year
+    /// OR an explicit operator override via the '✎ change' picker. The mux
+    /// worker's `resume_remux` ORs this into its own match check so an
+    /// operator's deliberate pick isn't second-guessed when the chosen
+    /// title differs from the disc's own (often cryptic) label.
+    ///
+    /// Optional (serde default `false`) for backward-compat with pre-rc.4
+    /// markers that lack the field — those fall back to the match check
+    /// alone, the prior behavior.
+    #[serde(default)]
+    pub title_confident: bool,
 }
 
 pub const RIPPED_MARKER_NAME: &str = ".ripped";
@@ -420,6 +433,7 @@ mod tests {
             sweep_main_lost_ms: 0.0,
             sweep_num_bad_ranges: 0,
             sweep_largest_gap_ms: 0.0,
+            title_confident: false,
         }
     }
 
