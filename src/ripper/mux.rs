@@ -722,9 +722,41 @@ fn mux_completed(
 fn producer_read_error_cause(e: &std::io::Error) -> String {
     match coded_prefix(&e.to_string()) {
         Some(code) if code != libfreemkv::error::E_IO_ERROR => {
-            format!("read error mid-stream (E{code}): {e}")
+            // The library `Display` is code-only, so `{e}` stringifies to a
+            // bare `E####` for argument-less variants (e.g. DecryptFailed →
+            // `E7013`). Attach a short English label so the operator reads a
+            // human cause in the red banner, not `(E7013): E7013`. This keeps
+            // the mux read-error path consistent with the sweep/patch path,
+            // which labels via `non_scsi_error_label` / `format_pass_error`.
+            format!(
+                "read error mid-stream (E{code}): {}",
+                coded_error_label(code)
+            )
         }
         _ => format!("read error mid-stream: {e}"),
+    }
+}
+
+/// Short English label for a coded `libfreemkv` fault that reaches the mux
+/// producer as an `io::Error`. The library `Display` is code-only, and the
+/// code is the only thing that survives the `Error → io::Error` round-trip
+/// (`From<io::Error> for Error` collapses everything to `E_IO_ERROR`), so we
+/// map the parsed `u16` to text here rather than matching on an `Error`
+/// variant. Mirrors the sweep/patch path's `non_scsi_error_label`; any
+/// unmapped code falls back to a generic phrase that still carries the code
+/// in the parenthetical so a new variant never leaves the operator stranded.
+fn coded_error_label(code: u16) -> &'static str {
+    use libfreemkv::error as ec;
+    match code {
+        c if c == ec::E_DECRYPT_FAILED => "decryption failed",
+        c if c == ec::E_DISC_READ => "disc read error",
+        c if c == ec::E_HALTED => "rip stopped by user",
+        c if c == ec::E_MAPFILE_INVALID => "recovery mapfile invalid",
+        c if c == ec::E_NO_STREAMS => "no playable streams on disc",
+        c if c == ec::E_DISC_CAPACITY_OVERFLOW || c == ec::E_DISC_CAPACITY_MALFORMED => {
+            "drive reported unusable disc capacity"
+        }
+        _ => "read failed mid-stream",
     }
 }
 
@@ -1844,6 +1876,47 @@ mod tests {
         assert!(
             cause.contains(&format!("(E{disc_code})")),
             "disc-read cause must name the coded fault in the annotation, got: {cause}"
+        );
+    }
+
+    /// Regression (rc4): the mux read-error cause must carry an English
+    /// description of the fault, not a bare duplicated `E####`. Before the
+    /// fix a mid-mux decrypt failure rendered as
+    /// `read error mid-stream (E7013): E7013` — a raw code with no English,
+    /// inconsistent with the sweep/patch path that labels via
+    /// `non_scsi_error_label`. The cause must now read e.g.
+    /// `read error mid-stream (E7013): decryption failed`.
+    #[test]
+    fn producer_read_error_cause_carries_english_label() {
+        let decrypt_io: std::io::Error = libfreemkv::Error::DecryptFailed.into();
+        let decrypt_code = libfreemkv::Error::DecryptFailed.code();
+        let cause = producer_read_error_cause(&decrypt_io);
+        assert!(
+            cause.contains("decryption failed"),
+            "decrypt cause must read in English, got: {cause}"
+        );
+        // The bare code must not appear as the trailing description (the
+        // original leaked `(E7013): E7013` defect).
+        assert!(
+            !cause.ends_with(&format!("E{decrypt_code}")),
+            "cause must not end with a bare duplicated code, got: {cause}"
+        );
+        assert!(
+            !cause.contains(&format!("): E{decrypt_code}")),
+            "cause must not render the code as its own description, got: {cause}"
+        );
+
+        // A coded disc-read fault gets its English label too.
+        let disc_io: std::io::Error = libfreemkv::Error::DiscRead {
+            sector: 42,
+            status: None,
+            sense: None,
+        }
+        .into();
+        let cause = producer_read_error_cause(&disc_io);
+        assert!(
+            cause.contains("disc read error"),
+            "disc-read cause must read in English, got: {cause}"
         );
     }
 
