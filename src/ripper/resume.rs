@@ -984,12 +984,16 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             "date": crate::util::format_date(),
             "resumed": true,
         });
-        if let Err(e) = staging::write_handoff_marker(
-            &staging_dir.join(marker_name),
-            serde_json::to_string_pretty(&done_marker)
-                .unwrap_or_default()
-                .as_bytes(),
-        ) {
+        // `to_string_pretty` on a `json!`-constructed Value is effectively
+        // infallible; `.expect` makes the invariant explicit (mirrors
+        // staging::write_failed_marker) so a real serialization failure
+        // surfaces as a panic rather than silently writing an empty marker
+        // that the mover skips, stranding the output in staging forever.
+        let marker_body =
+            serde_json::to_string_pretty(&done_marker).expect("json! value is always serialisable");
+        if let Err(e) =
+            staging::write_handoff_marker(&staging_dir.join(marker_name), marker_body.as_bytes())
+        {
             crate::log::device_log(
                 device,
                 &format!(
@@ -1225,12 +1229,14 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // The dir-fsync is the crash barrier: it guarantees this hand-off marker
     // is observed on disk before the later `.completed` write, so a crash can
     // never strand `.completed` (terminal) without a durable `.done`.
-    if let Err(e) = staging::write_handoff_marker(
-        &done_path,
-        serde_json::to_string_pretty(&done_marker)
-            .unwrap_or_default()
-            .as_bytes(),
-    ) {
+    // `to_string_pretty` on a `json!`-constructed Value is effectively
+    // infallible; `.expect` makes the invariant explicit (mirrors
+    // staging::write_failed_marker) so a real serialization failure surfaces
+    // as a panic rather than silently writing an empty marker that the mover
+    // skips, stranding the output in staging forever.
+    let marker_body =
+        serde_json::to_string_pretty(&done_marker).expect("json! value is always serialisable");
+    if let Err(e) = staging::write_handoff_marker(&done_path, marker_body.as_bytes()) {
         // The hand-off marker is what the mover / review UI keys on. If it
         // fails to write (NFS / perms), do NOT write .completed or clear
         // .restart_count — leaving the partial state intact means the
