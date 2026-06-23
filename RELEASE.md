@@ -1,5 +1,13 @@
 # Release Process
 
+> **Unified releases:** autorip ships at the same version as libfreemkv /
+> keysources / freemkv / bdemu. Use the one-shot release orchestrator
+> (see the main `freemkv/RELEASE.md` for the full fast-release model).
+> autorip git-tag-pins libfreemkv +
+> keysources via a committed `[patch.crates-io]`, so its build does NOT wait on
+> crates.io — it starts the instant the lib tags exist. The steps below are the
+> autorip-only tag/deploy view.
+
 ## Quick Reference
 
 ```bash
@@ -59,12 +67,12 @@ git push origin main v1.0.0-rc.1
 gh run list --repo freemkv/autorip --limit 1
 ```
 
-Flow:
+Flow (fast-release — test is a parallel tripwire, NOT a gate):
 ```
-push tag → CI workflow (lint + test) → Release workflow (docker build + push)
+push tag → verify → { test (parallel),  build matrix → docker → GHCR }
 ```
-
-Expected: ~3 min total.
+`build` does NOT `needs: test`; the docker image starts as soon as the x86_64
+musl build leg finishes. Tag → image is typically ~3 min.
 
 ### Step 4: Deploy
 
