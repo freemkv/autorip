@@ -1044,6 +1044,19 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         return;
     }
 
+    // Operator-facing loss for an ACCEPTED resume = sweep loss + demux loss.
+    // The abort gate above only refuses a resume whose demux loss EXCEEDS the
+    // threshold; a resume accepted under a non-zero `abort_on_lost_secs` can
+    // still carry real demux-time loss (undecryptable sectors zero-filled,
+    // codec-corruption demux skips) that the sweep mapfile never saw. Reporting
+    // `done_sweep_damage` alone would file such a disc as clean/low-loss even
+    // though the MKV is materially lossier — the same demux loss the fresh
+    // single-pass path surfaces via `final_lost_secs` (mod.rs). The two sources
+    // are disjoint (sweep = Unreadable sectors baked into the ISO; demux =
+    // decrypt/codec skips at mux), so they add.
+    let done_errors = done_sweep_damage.errors.saturating_add(mux_outcome.errors);
+    let done_lost_video_secs = done_sweep_damage.main_lost_ms / 1000.0 + demux_lost_secs;
+
     // 5. Success — write .completed marker, drop the hand-off marker for
     // the mover, clear .restart_count. Same shape as the rip_disc
     // completion path so the mover treats this output identically.
@@ -1184,10 +1197,17 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             tmdb_overview,
             codecs: done_codecs.clone(),
             // Carry sweep damage so the done card reflects real damage
-            // instead of showing a clean result for a damaged rip.
-            errors: done_sweep_damage.errors,
-            total_lost_ms: done_sweep_damage.total_lost_ms,
-            main_lost_ms: done_sweep_damage.main_lost_ms,
+            // instead of showing a clean result for a damaged rip. `errors`
+            // and the headline `lost_video_secs` additionally fold in
+            // demux-time loss (see `done_errors` / `done_lost_video_secs`
+            // above) so an accepted-but-lossy resume reports the loss the
+            // single-pass path also surfaces, instead of the sweep-only zero.
+            // `main_lost_ms` likewise includes the demux loss so the damage
+            // classifier rates the disc on the loss actually in the MKV.
+            errors: done_errors,
+            lost_video_secs: done_lost_video_secs,
+            total_lost_ms: done_sweep_damage.total_lost_ms + demux_lost_secs * 1000.0,
+            main_lost_ms: done_sweep_damage.main_lost_ms + demux_lost_secs * 1000.0,
             bad_ranges: done_sweep_damage.bad_ranges.clone(),
             num_bad_ranges: done_sweep_damage.num_bad_ranges,
             bad_ranges_truncated: done_sweep_damage.bad_ranges_truncated,
@@ -1218,8 +1238,11 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             speed_mbs: mux_outcome.speed_mbs,
             elapsed_secs: mux_outcome.elapsed_secs,
             output_path: &staging_str,
-            errors: done_sweep_damage.errors,
-            lost_video_secs: done_sweep_damage.main_lost_ms / 1000.0,
+            // Sweep loss + demux loss (same combined figures as the done
+            // card) so the completion notification reports the real loss in
+            // the delivered MKV, not the sweep-mapfile-only subset.
+            errors: done_errors,
+            lost_video_secs: done_lost_video_secs,
         },
     );
 
@@ -1691,6 +1714,62 @@ mod post_mux_loss_gate_tests {
             region.contains("write_failed_marker"),
             "resume post-mux region must quarantine an over-threshold lossy \
              mux with write_failed_marker (no .done), matching single-pass"
+        );
+    }
+
+    /// Regression: an ACCEPTED resume (demux loss within `abort_on_lost_secs`)
+    /// must report sweep loss + demux loss to the operator, not the sweep
+    /// mapfile alone. The abort gate only refuses resumes whose demux loss
+    /// EXCEEDS the threshold; loss within the threshold is real loss in the
+    /// delivered MKV that the fresh single-pass path surfaces (mod.rs
+    /// `final_lost_secs = mux_outcome.lost_video_secs`). Previously the resume
+    /// done card and `rip_complete` webhook sourced `errors` /
+    /// `lost_video_secs` solely from `done_sweep_damage`, so any demux-time
+    /// loss (undecryptable sectors, codec corruption) was invisible and the
+    /// disc was filed as clean.
+    ///
+    /// A behavioural test would need a real lossy ISO + mux pipeline (same
+    /// rationale as the gate test above); instead this pins, at source level,
+    /// that the accepted-success region folds the demux loss into the
+    /// reported figures.
+    #[test]
+    fn resume_reports_demux_loss_on_accepted_rip() {
+        let src = include_str!("resume.rs");
+        // Bound to the accepted-success region: from the post-mux abort gate's
+        // combined-loss computation up to the auto-eject tail.
+        let start = src
+            .find("Operator-facing loss for an ACCEPTED resume")
+            .expect("resume.rs should compute combined accepted-resume loss");
+        let end = src[start..]
+            .find("Honor auto_eject after a successful resume")
+            .map(|i| start + i)
+            .expect("resume.rs should have the auto_eject tail after success");
+        let region = &src[start..end];
+
+        // The combined figures must be derived from BOTH sweep damage and the
+        // demux loss signal.
+        assert!(
+            region.contains("done_sweep_damage.errors.saturating_add(mux_outcome.errors)"),
+            "accepted resume must add demux errors to sweep errors"
+        );
+        assert!(
+            region.contains("done_sweep_damage.main_lost_ms / 1000.0 + demux_lost_secs"),
+            "accepted resume must add demux lost seconds to sweep main loss"
+        );
+        // Both the done card and the webhook must consume the combined figures,
+        // not the sweep-only fields.
+        assert!(
+            region.contains("errors: done_errors"),
+            "done card / webhook must report combined errors (done_errors)"
+        );
+        assert!(
+            region.contains("lost_video_secs: done_lost_video_secs"),
+            "done card / webhook must report combined loss (done_lost_video_secs)"
+        );
+        // Guard against regressing to the sweep-only webhook figures.
+        assert!(
+            !region.contains("lost_video_secs: done_sweep_damage.main_lost_ms / 1000.0"),
+            "webhook must not report sweep-only loss, hiding demux loss"
         );
     }
 }
