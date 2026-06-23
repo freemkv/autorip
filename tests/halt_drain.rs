@@ -98,7 +98,7 @@ fn test_handle_stop_waits_for_thread_drain() {
     // Plug the synthetic thread into the same per-device JoinHandle
     // table that production's spawn site uses, so handle_stop_today's
     // `join_rip_thread` call can drain it.
-    ripper::register_rip_thread(device, handle);
+    ripper::register_rip_thread(device, handle).expect("no prior handle for this device");
 
     // Give the thread a moment to start its loop so the halt-flag
     // observation isn't racing with spawn() returning.
@@ -182,5 +182,164 @@ fn test_eject_does_not_double_drop() {
         "Drive::drop ran {} times — expected exactly 1. \
          If >1, eject + rip-exit are racing without a synchronized take().",
         drops
+    );
+}
+
+/// (a) A prior handle that has already *finished* is reaped quietly:
+/// `register_rip_thread` joins it under the lock (safe — `is_finished()`
+/// guarantees `join()` won't block) and returns `Ok(())` with no
+/// "prior thread not reaped" warning. Models the observed benign case:
+/// an `on_insert=scan` thread completes, then the rip thread registers
+/// over its already-finished handle.
+#[test]
+fn test_register_reaps_finished_prior_quietly() {
+    let device = "sg_reap_finished_test";
+
+    // Prior worker that signals when it's about to return, so we can
+    // wait for it to actually finish before registering over it.
+    let prior_started = Arc::new(AtomicBool::new(false));
+    let prior_started_t = prior_started.clone();
+    let prior = std::thread::Builder::new()
+        .name(format!("prior-{device}"))
+        .spawn(move || {
+            prior_started_t.store(true, Ordering::Relaxed);
+        })
+        .expect("spawn prior");
+    ripper::register_rip_thread(device, prior).expect("first registration succeeds");
+
+    // Wait until the prior has run its body AND a moment longer so the OS
+    // thread has truly exited (is_finished() observes the join state).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !prior_started.load(Ordering::Relaxed) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    // New handle registers; the finished prior must be reaped and this
+    // must succeed (Ok), not be rejected.
+    let exited = Arc::new(AtomicBool::new(false));
+    let exited_t = exited.clone();
+    let next = std::thread::Builder::new()
+        .name(format!("next-{device}"))
+        .spawn(move || {
+            exited_t.store(true, Ordering::Relaxed);
+        })
+        .expect("spawn next");
+    let result = ripper::register_rip_thread(device, next);
+    assert!(
+        result.is_ok(),
+        "registering over a FINISHED prior must reap it and succeed, got {result:?}"
+    );
+
+    // Drain the live one so the test leaves no registered handle behind.
+    let _ = ripper::join_rip_thread(device, Duration::from_secs(5));
+    assert!(exited.load(Ordering::Relaxed), "next worker ran");
+}
+
+/// (b) A prior handle that is still *running* is NOT overwritten:
+/// `register_rip_thread` returns `Err(PriorThreadRunning(handle))`,
+/// handing back the new handle (so it is never dropped on the floor)
+/// and leaving the running prior registered so stop/eject/shutdown can
+/// still drain it. This is the latent-hazard branch (the v0.13.6 bug
+/// class) the fix defends against.
+#[test]
+fn test_register_rejects_running_prior_without_orphaning() {
+    let device = "sg_reject_running_test";
+
+    // A prior worker that stays alive until we cancel its halt.
+    let prior_halt = Halt::new();
+    let prior_halt_t = prior_halt.clone();
+    let prior = std::thread::Builder::new()
+        .name(format!("prior-{device}"))
+        .spawn(move || {
+            while !prior_halt_t.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .expect("spawn prior");
+    ripper::register_rip_thread(device, prior).expect("first registration succeeds");
+    // Let the prior enter its loop so is_finished() reads false.
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Attempt to register a second handle for the same device.
+    let new_ran = Arc::new(AtomicBool::new(false));
+    let new_ran_t = new_ran.clone();
+    let new_handle = std::thread::Builder::new()
+        .name(format!("new-{device}"))
+        .spawn(move || {
+            new_ran_t.store(true, Ordering::Relaxed);
+        })
+        .expect("spawn new");
+
+    match ripper::register_rip_thread(device, new_handle) {
+        Err(ripper::RegisterError::PriorThreadRunning(returned)) => {
+            // The rejected handle is handed back, never dropped — reap it.
+            returned.join().expect("rejected handle joins cleanly");
+        }
+        other => panic!("expected PriorThreadRunning, got {other:?}"),
+    }
+
+    // The running prior is still registered and drainable. Cancel its
+    // halt so join_rip_thread reaps it (the stop/drain path still works).
+    prior_halt.cancel();
+    assert!(
+        ripper::join_rip_thread(device, Duration::from_secs(5)).is_ok(),
+        "running prior must still drain after a rejected registration"
+    );
+    assert!(
+        new_ran.load(Ordering::Relaxed),
+        "the new worker did run to completion"
+    );
+}
+
+/// (c) The spawn-site guard prevents a double-spawn while a worker is
+/// running, and the running worker still drains via stop. Drives
+/// `spawn_rip_thread` (the production helper all three spawn sites use):
+/// the first spawn registers; a second spawn for the same device while
+/// the first is still running returns `Err(AlreadyExists)` (the same
+/// error shape the callers' spawn-failure rollback handles), and the
+/// first worker remains drainable.
+#[test]
+fn test_spawn_guard_blocks_double_spawn_and_drain_still_works() {
+    let device = "sg_double_spawn_test";
+
+    let halt = Halt::new();
+    ripper::register_halt(device, halt.clone());
+
+    let first_done = Arc::new(AtomicBool::new(false));
+    let first_done_t = first_done.clone();
+    let halt_first = halt.clone();
+    ripper::spawn_rip_thread(device, "rip", move || {
+        while !halt_first.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        first_done_t.store(true, Ordering::Relaxed);
+    })
+    .expect("first spawn registers");
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Second spawn for the SAME device while the first runs: must be
+    // rejected, not silently stomp the first handle.
+    let second_ran = Arc::new(AtomicBool::new(false));
+    let second_ran_t = second_ran.clone();
+    let err = ripper::spawn_rip_thread(device, "rip", move || {
+        second_ran_t.store(true, Ordering::Relaxed);
+    })
+    .expect_err("second spawn while first runs must fail");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "double-spawn rejection must surface as AlreadyExists, got {err:?}"
+    );
+
+    // Stop/drain the first worker — drain-before-wipe still works.
+    halt.cancel();
+    assert!(
+        ripper::join_rip_thread(device, Duration::from_secs(5)).is_ok(),
+        "first worker drains after the duplicate spawn was rejected"
+    );
+    assert!(
+        first_done.load(Ordering::Relaxed),
+        "first worker reached its exit branch"
     );
 }

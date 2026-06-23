@@ -26,9 +26,9 @@ pub mod state;
 // integration tests under `tests/` do, so the re-exports must stay.
 #[allow(unused_imports)]
 pub use session::{
-    device_halt, join_all_rip_threads, join_rip_thread, register_halt, register_rip_thread,
-    rollback_failed_spawn, spawn_rip_thread, swap_halt_carrying_cancel, take_rip_thread,
-    unregister_halt,
+    RegisterError, device_halt, join_all_rip_threads, join_rip_thread, register_halt,
+    register_rip_thread, rollback_failed_spawn, spawn_rip_thread, swap_halt_carrying_cancel,
+    take_rip_thread, unregister_halt,
 };
 #[allow(unused_imports)]
 pub use state::{
