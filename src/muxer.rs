@@ -301,8 +301,8 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             "mux worker: dispatching .ripped marker"
         );
         crate::log::syslog(&format!("Muxing: {} (worker)", title));
-        let ok = crate::ripper::resume::remux_from_ripped_marker(cfg_arc, &dir, &marker);
-        if ok {
+        let outcome = crate::ripper::resume::remux_from_ripped_marker(cfg_arc, &dir, &marker);
+        if outcome.success {
             clear_error(&dir.to_string_lossy());
             tracing::info!(staging = %dir.display(), title = %title, "mux worker: completed");
             crate::log::syslog(&format!("Muxed: {}", title));
@@ -337,6 +337,16 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                             tmdb_year: marker.tmdb_year,
                             tmdb_poster: marker.tmdb_poster.clone(),
                             tmdb_overview: marker.tmdb_overview.clone(),
+                            // Carry the mux-derived display fields (codecs +
+                            // duration + output_file from the `_mux` done-state)
+                            // and the marker's lost-video estimate so the origin
+                            // device's done card matches the inline fresh-rip
+                            // done card instead of dropping the codec badge,
+                            // duration, output path, and lost-video figure.
+                            codecs: outcome.codecs.clone(),
+                            duration: outcome.duration.clone(),
+                            output_file: outcome.output_file.clone(),
+                            lost_video_secs: marker.rip_lost_video_secs,
                             ..Default::default()
                         },
                     );

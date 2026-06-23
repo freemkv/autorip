@@ -1132,11 +1132,27 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
 /// Returns true on a clean mux (`.completed` marker written, `.ripped`
 /// safe to delete). False on any failure path that left `.ripped` in
 /// place for next-tick retry.
+/// Result of a `.ripped` hand-off mux. `success` mirrors the prior
+/// `bool` return; the rest carries the mux-derived display fields the
+/// `_mux` done-state computed (codecs/duration/output_file) so the
+/// origin-device's secondary done-state update in `crate::muxer` can
+/// show the same codec badge, duration, and output path the inline
+/// fresh-rip done card does. These are captured from the synthetic
+/// `_mux` STATE entry just before it's removed; empty when the mux
+/// didn't succeed.
+#[derive(Default)]
+pub(crate) struct MuxHandoffOutcome {
+    pub success: bool,
+    pub codecs: String,
+    pub duration: String,
+    pub output_file: String,
+}
+
 pub(crate) fn remux_from_ripped_marker(
     cfg: &Arc<RwLock<Config>>,
     staging_dir: &std::path::Path,
     marker: &crate::muxer::RippedMarker,
-) -> bool {
+) -> MuxHandoffOutcome {
     let iso_path = std::path::PathBuf::from(&marker.iso_path);
     let mapfile_path = std::path::PathBuf::from(&marker.mapfile_path);
     let mux_device = "_mux";
@@ -1172,6 +1188,10 @@ pub(crate) fn remux_from_ripped_marker(
     // Anything else (halt, scan_image failure, mux loop break)
     // leaves `.completed` absent.
     let success = staging_dir.join(".completed").exists();
+    let mut outcome = MuxHandoffOutcome {
+        success,
+        ..Default::default()
+    };
     if success {
         // Hand-off consumed. Drop the marker so this dir doesn't get
         // re-queued on the next muxer tick. If the delete fails, surface
@@ -1185,14 +1205,25 @@ pub(crate) fn remux_from_ripped_marker(
                 "failed to delete .ripped marker after successful mux; .completed guard prevents re-mux"
             );
         }
-        // Clean up the synthetic STATE entry so the device tile grid
-        // (which already filters underscore keys, but still — be tidy)
-        // doesn't accumulate per-mux ghosts.
+        // Capture the mux-derived display fields the `_mux` done-state
+        // wrote (codecs filled by the frame loop, duration + output_file
+        // from the resumed-rip terminal state) BEFORE removing the entry
+        // below — the caller carries them into the origin device's
+        // secondary done-state so its tile shows the codec badge and
+        // duration, matching the inline fresh-rip done card.
         if let Ok(mut s) = super::STATE.lock() {
+            if let Some(rs) = s.get(mux_device) {
+                outcome.codecs = rs.codecs.clone();
+                outcome.duration = rs.duration.clone();
+                outcome.output_file = rs.output_file.clone();
+            }
+            // Clean up the synthetic STATE entry so the device tile grid
+            // (which already filters underscore keys, but still — be tidy)
+            // doesn't accumulate per-mux ghosts.
             s.remove(mux_device);
         }
     }
-    success
+    outcome
 }
 
 /// Resolve keys for a resumed disc via the configured source. A thin ISO/mapfile
@@ -1599,5 +1630,53 @@ mod sweep_damage_marker_tests {
             super::resolve_done_codecs(Some("HEVC".into()), "AVC".into()),
             "HEVC"
         );
+    }
+
+    /// Regression: the origin device's secondary done-state update (in
+    /// `crate::muxer::check_and_mux`) was dropping the codec badge,
+    /// duration, and output_file because `remux_from_ripped_marker`
+    /// returned a bare `bool` and the worker had nothing to plumb them
+    /// from — the `_mux` STATE entry it would read had already been
+    /// removed on success. The fix captures those three mux-derived
+    /// fields off the `_mux` done-state just before removal and returns
+    /// them in `MuxHandoffOutcome`. This exercises that exact capture
+    /// expression against the real STATE map; `lost_video_secs` comes
+    /// from `marker.rip_lost_video_secs` (asserted in the round-trip
+    /// tests above), not the captured STATE.
+    #[test]
+    fn mux_handoff_outcome_captures_mux_derived_fields() {
+        // A private device key so this doesn't race the shared "_mux".
+        let key = "_mux_test_capture";
+        super::super::update_state(
+            key,
+            super::super::RipState {
+                device: key.to_string(),
+                status: "done".to_string(),
+                codecs: "HEVC · TrueHD".into(),
+                duration: "2:14".into(),
+                output_file: "/staging/Foo".into(),
+                ..Default::default()
+            },
+        );
+
+        // Mirror the capture-then-remove block in remux_from_ripped_marker.
+        let mut outcome = super::MuxHandoffOutcome {
+            success: true,
+            ..Default::default()
+        };
+        if let Ok(mut s) = super::super::STATE.lock() {
+            if let Some(rs) = s.get(key) {
+                outcome.codecs = rs.codecs.clone();
+                outcome.duration = rs.duration.clone();
+                outcome.output_file = rs.output_file.clone();
+            }
+            s.remove(key);
+        }
+
+        assert_eq!(outcome.codecs, "HEVC · TrueHD");
+        assert_eq!(outcome.duration, "2:14");
+        assert_eq!(outcome.output_file, "/staging/Foo");
+        // STATE entry is cleaned up so the origin update can't read it later.
+        assert!(super::super::STATE.lock().unwrap().get(key).is_none());
     }
 }
