@@ -231,17 +231,42 @@ pub fn default_autorip_dir() -> String {
             return d;
         }
     }
-    if std::path::Path::new("/config").is_dir() && dir_is_writable("/config") {
-        return "/config".to_string();
-    }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return format!("{xdg}/autorip");
+    // Native Windows (e.g. a downloaded autorip.exe): keep ALL state
+    // self-contained in a `config` folder NEXT TO the executable. Without
+    // this, the Docker `/config` convention below resolves to the drive root
+    // (`C:\config`) — scattering staging/output/keys outside the app. Portable:
+    // move the folder, the app's state moves with it.
+    #[cfg(windows)]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                return parent.join("config").to_string_lossy().into_owned();
+            }
         }
+        // Exe path unavailable — prefer %APPDATA% over ever touching C:\config.
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.is_empty() {
+                return format!("{appdata}\\autorip");
+            }
+        }
+        return "config".to_string(); // last resort: cwd-relative, never C:\config
     }
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => format!("{h}/.config/autorip"),
-        _ => "/config".to_string(),
+    // Docker/Linux: the container bind-mounts /config. (Windows never reaches
+    // here — the `/config` path means the drive root there, which we avoid.)
+    #[cfg(not(windows))]
+    {
+        if std::path::Path::new("/config").is_dir() && dir_is_writable("/config") {
+            return "/config".to_string();
+        }
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return format!("{xdg}/autorip");
+            }
+        }
+        match std::env::var("HOME") {
+            Ok(h) if !h.is_empty() => format!("{h}/.config/autorip"),
+            _ => "/config".to_string(),
+        }
     }
 }
 
