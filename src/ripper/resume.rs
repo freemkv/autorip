@@ -1028,6 +1028,18 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             s.output_file = iso_name;
         });
         super::unregister_halt(device);
+        // Honor auto_eject on the resume ISO path the same way the
+        // resume MKV terminal (below) and the fresh-rip ISO terminal
+        // (mod.rs) do. When resume_remux is entered for a real device
+        // (operator clicked Resume with output_format=iso), a disc is
+        // physically present and auto_eject=true expects it ejected on
+        // completion. Skip synthetic underscore-prefixed devices (the
+        // `_mux` worker): they reach this path after the drive thread
+        // already ejected, and the drive may hold a different disc.
+        if cfg_read.auto_eject && !device.starts_with('_') {
+            let device_path = format!("/dev/{}", device);
+            super::eject_drive(&device_path);
+        }
         return;
     }
 
@@ -1817,6 +1829,60 @@ mod resume_remux_webhook_tests {
             region.contains("event: \"rip_complete\""),
             "the resume completion webhook must use the rip_complete event \
              name, matching rip_disc"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resume_iso_auto_eject_tests {
+    /// Regression: the ISO-output success path of `resume_remux` must
+    /// honor `auto_eject`, exactly as the resume MKV terminal and the
+    /// fresh-rip ISO terminal (`mod.rs`) do. When `resume_remux` is
+    /// entered for a real device (operator clicked Resume with
+    /// `output_format=iso`) a disc is physically present, and an
+    /// operator with `auto_eject=true` expects it ejected on
+    /// completion. Pre-fix the ISO branch returned without ejecting, so
+    /// the finished disc stayed in the drive. The synthetic `_mux`
+    /// worker device reaches this branch too, so the guard must skip
+    /// underscore-prefixed devices (the drive thread already ejected and
+    /// may now hold a different disc) — mirroring the MKV terminal.
+    ///
+    /// A full behavioural test would need a real openable ISO + mapfile
+    /// plus an actual eject syscall against a device — out of proportion
+    /// to one call site (same rationale as
+    /// `success_path_fires_completion_webhook`). Instead this pins, at
+    /// source level, that the ISO success region (between its
+    /// "ISO output complete" log line and the `run_mux` call that begins
+    /// the MKV path) honors `cfg_read.auto_eject` with the synthetic
+    /// device guard.
+    #[test]
+    fn resume_iso_success_path_honors_auto_eject() {
+        let src = include_str!("resume.rs");
+        let start = src
+            .find("Auto-resume: ISO output complete")
+            .expect("resume.rs should log \"Auto-resume: ISO output complete\" on the ISO path");
+        // Bound the search to the ISO success region: from the ISO
+        // completion log line up to the run_mux call that opens the MKV
+        // path (the next distinct terminal in the function).
+        let end = src[start..]
+            .find("super::mux::run_mux")
+            .map(|i| start + i)
+            .expect("resume.rs should call run_mux after the ISO branch");
+        let region = &src[start..end];
+        assert!(
+            region.contains("cfg_read.auto_eject"),
+            "resume_remux ISO success path must honor cfg_read.auto_eject, \
+             matching the MKV terminal and the fresh-rip ISO terminal; none \
+             found between the ISO completion log and run_mux"
+        );
+        assert!(
+            region.contains("!device.starts_with('_')"),
+            "the ISO auto_eject branch must guard synthetic underscore-\
+             prefixed devices (the _mux worker), matching the MKV terminal"
+        );
+        assert!(
+            region.contains("super::eject_drive"),
+            "the ISO auto_eject branch must call super::eject_drive"
         );
     }
 }
