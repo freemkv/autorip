@@ -1392,6 +1392,19 @@ pub(crate) struct MuxHandoffOutcome {
     /// auto-resume done cards, which both populate `bad_ranges`.
     pub bad_ranges: Vec<super::state::BadRange>,
     pub bad_ranges_truncated: u32,
+    /// Combined sweep + mux-time loss figures, captured off the `_mux`
+    /// done-state — which folded demux/decrypt-time loss into the
+    /// sweep-only mapfile totals (`done_errors` / `done_lost_video_secs`
+    /// / `done_*_lost_ms` in `resume_remux`). The `RippedMarker` carries
+    /// only sweep-phase loss (`rip_lost_video_secs`, `sweep_*`), so without
+    /// plumbing these through the origin device's secondary done card would
+    /// understate the loss in the delivered MKV whenever a mux-phase
+    /// decrypt/codec skip added loss the sweep never saw — diverging from
+    /// the `_mux` tile and the completion webhook, which are correct.
+    pub lost_video_secs: f64,
+    pub errors: u32,
+    pub total_lost_ms: f64,
+    pub main_lost_ms: f64,
 }
 
 pub(crate) fn remux_from_ripped_marker(
@@ -1468,6 +1481,16 @@ pub(crate) fn remux_from_ripped_marker(
                 // showing an empty drilldown for a damaged disc.
                 outcome.bad_ranges = rs.bad_ranges.clone();
                 outcome.bad_ranges_truncated = rs.bad_ranges_truncated;
+                // Carry the COMBINED sweep + mux-time loss the `_mux`
+                // done-state computed (sweep mapfile loss folded with
+                // demux/decrypt skips). The marker only holds sweep-phase
+                // loss, so the origin device's secondary done card must
+                // take these to match the `_mux` tile and the webhook
+                // instead of understating loss in the delivered MKV.
+                outcome.lost_video_secs = rs.lost_video_secs;
+                outcome.errors = rs.errors;
+                outcome.total_lost_ms = rs.total_lost_ms;
+                outcome.main_lost_ms = rs.main_lost_ms;
             }
             // Clean up the synthetic STATE entry so the device tile grid
             // (which already filters underscore keys, but still — be tidy)
@@ -2112,9 +2135,11 @@ mod sweep_damage_marker_tests {
     /// removed on success. The fix captures those three mux-derived
     /// fields off the `_mux` done-state just before removal and returns
     /// them in `MuxHandoffOutcome`. This exercises that exact capture
-    /// expression against the real STATE map; `lost_video_secs` comes
-    /// from `marker.rip_lost_video_secs` (asserted in the round-trip
-    /// tests above), not the captured STATE.
+    /// expression against the real STATE map, including the combined
+    /// sweep + mux-time loss figures (`lost_video_secs` / `errors` /
+    /// `total_lost_ms` / `main_lost_ms`), which the `_mux` done-state
+    /// folds demux/decrypt loss into and the origin device's done card
+    /// must take instead of the marker's sweep-only subset.
     #[test]
     fn mux_handoff_outcome_captures_mux_derived_fields() {
         // A private device key so this doesn't race the shared "_mux".
@@ -2145,6 +2170,14 @@ mod sweep_damage_marker_tests {
                 output_file: "/staging/Foo".into(),
                 bad_ranges: bad_ranges.clone(),
                 bad_ranges_truncated: 3,
+                // Combined sweep + mux-time loss the `_mux` done-state writes:
+                // these must be captured so the origin device's done card
+                // reports the loss in the delivered MKV, not the sweep-only
+                // subset from the marker.
+                errors: 7,
+                lost_video_secs: 12.5,
+                total_lost_ms: 12500.0,
+                main_lost_ms: 9000.0,
                 ..Default::default()
             },
         );
@@ -2161,6 +2194,10 @@ mod sweep_damage_marker_tests {
                 outcome.output_file = rs.output_file.clone();
                 outcome.bad_ranges = rs.bad_ranges.clone();
                 outcome.bad_ranges_truncated = rs.bad_ranges_truncated;
+                outcome.lost_video_secs = rs.lost_video_secs;
+                outcome.errors = rs.errors;
+                outcome.total_lost_ms = rs.total_lost_ms;
+                outcome.main_lost_ms = rs.main_lost_ms;
             }
             s.remove(key);
         }
@@ -2175,6 +2212,14 @@ mod sweep_damage_marker_tests {
         assert_eq!(outcome.bad_ranges[0].lba, 100);
         assert_eq!(outcome.bad_ranges[1].count, 8);
         assert_eq!(outcome.bad_ranges_truncated, 3);
+        // Combined sweep + mux-time loss figures must survive the capture so
+        // the origin device's done card reports the loss in the delivered MKV
+        // (matching the `_mux` tile and the webhook), not the sweep-only
+        // subset the `RippedMarker` carries.
+        assert_eq!(outcome.errors, 7);
+        assert_eq!(outcome.lost_video_secs, 12.5);
+        assert_eq!(outcome.total_lost_ms, 12500.0);
+        assert_eq!(outcome.main_lost_ms, 9000.0);
         // STATE entry is cleaned up so the origin update can't read it later.
         assert!(super::super::STATE.lock().unwrap().get(key).is_none());
     }
