@@ -349,6 +349,16 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                             main_lost_ms: marker.sweep_main_lost_ms,
                             num_bad_ranges: marker.sweep_num_bad_ranges,
                             largest_gap_ms: marker.sweep_largest_gap_ms,
+                            // The bad-ranges drilldown list isn't in the
+                            // marker (RippedMarker carries only summary
+                            // counts), so plumb it from the mux outcome —
+                            // captured off the `_mux` done-state, which
+                            // recomputed it from the mapfile. Without this the
+                            // origin device's tile shows the damage count but
+                            // an empty drilldown, diverging from the fresh-rip
+                            // and cold auto-resume done cards.
+                            bad_ranges: outcome.bad_ranges.clone(),
+                            bad_ranges_truncated: outcome.bad_ranges_truncated,
                             tmdb_title: marker.tmdb_title.clone(),
                             tmdb_year: marker.tmdb_year,
                             tmdb_poster: marker.tmdb_poster.clone(),
