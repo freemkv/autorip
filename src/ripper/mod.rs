@@ -3631,6 +3631,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         }
     };
 
+    // Mux-phase progress denominator. The multipass/resume highway reads the
+    // WHOLE disc-capacity ISO, so its `BytesRead` climbs to `disc.capacity_bytes`
+    // — keep `total_bytes` (disc capacity) as-is there. The single-pass path
+    // (max_retries == 0) streams ONLY the selected title's extents over the live
+    // drive, so `DiscStream`'s `BytesRead` caps at the title's extent byte sum
+    // (`bytes_total_extents` = Σ sector_count × 2048). Using disc capacity as the
+    // denominator there made the live progress bar / ETA plateau at
+    // title_size ÷ disc_capacity (e.g. ~50% for a 25 GB title on a 50 GB disc).
+    // Scope the denominator to the same extent sum the read source reports so the
+    // bar reaches 100%. Computed before `title` is moved into the stream below.
+    let mux_total_bytes = mux_progress_denominator(cfg_read.max_retries, total_bytes, &title);
+
     let input: Box<dyn libfreemkv::pes::Stream> = if cfg_read.max_retries > 0 {
         // Multipass ISO mux → PipelinedPesStream highway. The
         // producer thread fires BytesRead events; BatchSizeChanged
@@ -3701,7 +3713,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             duration: duration.clone(),
             codecs: codecs.clone(),
             filename: filename.clone(),
-            total_bytes,
+            total_bytes: mux_total_bytes,
             title_bytes_per_sec,
             total_passes,
             bytes_total_disc: disc.capacity_bytes,
@@ -4391,6 +4403,36 @@ fn audio_purpose_tag(p: libfreemkv::LabelPurpose) -> Option<&'static str> {
 /// fully-recovered main movie just because some out-of-title sector was
 /// lost (the Top Gun false-positive). Mirrors the per-pass loop-exit
 /// gate's `mux_scope_bad` scoping.
+/// Pick the mux-phase progress denominator (used for percent + ETA).
+///
+/// Multipass / resume mux reads the whole disc-capacity ISO, so its read
+/// position climbs to `disc_capacity_bytes` (passed in as `total_bytes`) — keep
+/// that. The single-pass path (`max_retries == 0`) streams ONLY the selected
+/// title's extents over the live drive, so `DiscStream`'s `BytesRead` caps at
+/// `Σ sector_count × 2048` (the title extent byte sum). Using disc capacity as
+/// the denominator there made the bar plateau at `title_size ÷ disc_capacity`.
+/// Scope to the extent sum so single-pass progress reaches 100%. Falls back to
+/// `total_bytes` if the title has no extents (e.g. degenerate scan).
+fn mux_progress_denominator(
+    max_retries: u8,
+    total_bytes: u64,
+    title: &libfreemkv::DiscTitle,
+) -> u64 {
+    if max_retries != 0 {
+        return total_bytes;
+    }
+    let extent_bytes: u64 = title
+        .extents
+        .iter()
+        .map(|e| e.sector_count as u64 * 2048)
+        .sum();
+    if extent_bytes > 0 {
+        extent_bytes
+    } else {
+        total_bytes
+    }
+}
+
 pub(super) fn abort_lost_ms(
     output_is_iso: bool,
     title: &libfreemkv::DiscTitle,
@@ -5790,6 +5832,50 @@ mod tests {
         // we pass bps directly to the helpers, so leave them at zero.
         let _ = bps;
         t
+    }
+
+    #[test]
+    fn mux_denominator_scopes_to_title_extents_in_single_pass() {
+        // 25 GB main title on a 50 GB disc.
+        const GB: u64 = 1_073_741_824;
+        let disc_capacity = 50 * GB;
+        // A title whose single extent spans exactly 25 GB worth of sectors.
+        let sectors = (25 * GB / 2048) as u32;
+        let title = test_title(0, sectors);
+        let extent_bytes = sectors as u64 * 2048;
+
+        // Single-pass (max_retries == 0): denominator must be the title's
+        // extent byte sum — the cap DiscStream's BytesRead reaches — so the
+        // live progress bar reaches 100% instead of plateauing at ~50%.
+        let single = super::mux_progress_denominator(0, disc_capacity, &title);
+        assert_eq!(
+            single, extent_bytes,
+            "single-pass denominator must be the title extent sum, not disc capacity"
+        );
+        // Sanity: the old (buggy) behavior would have plateaued here.
+        let old_pct = extent_bytes * 100 / disc_capacity;
+        assert!(
+            old_pct < 60,
+            "precondition: title/disc ratio is the kind that plateaued ({old_pct}%)"
+        );
+
+        // Multipass (max_retries > 0): denominator stays disc capacity, since
+        // the ISO highway reads the whole disc image.
+        let multi = super::mux_progress_denominator(1, disc_capacity, &title);
+        assert_eq!(
+            multi, disc_capacity,
+            "multipass denominator must remain disc capacity"
+        );
+    }
+
+    #[test]
+    fn mux_denominator_falls_back_when_title_has_no_extents() {
+        // Degenerate title with no extents → fall back to the passed total
+        // rather than producing a zero denominator (divide-by-zero / no bar).
+        let mut title = test_title(0, 1000);
+        title.extents.clear();
+        let total = 12345;
+        assert_eq!(super::mux_progress_denominator(0, total, &title), total);
     }
 
     #[test]
