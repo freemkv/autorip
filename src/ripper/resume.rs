@@ -974,6 +974,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 &duration,
                 Some("ISO image not durable (fsync failed); preserved for retry".to_string()),
             );
+            super::unregister_halt(device);
             return;
         }
         let marker_name = if title_confident { ".done" } else { ".review" };
@@ -1009,6 +1010,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 &duration,
                 Some(format!("{} marker write failed: {}", marker_name, e)),
             );
+            super::unregister_halt(device);
             return;
         }
         staging::write_completed_marker(&staging_dir);
@@ -1025,6 +1027,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             s.status = "done".to_string();
             s.output_file = iso_name;
         });
+        super::unregister_halt(device);
         return;
     }
 
