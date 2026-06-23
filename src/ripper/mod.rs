@@ -1062,25 +1062,36 @@ fn staging_dir_matches_disc(basename: &str, sanitized: &str) -> bool {
 /// return None (falling through to a fresh sweep instead of resuming).
 ///
 /// Defense: retry `read_dir` up to 3 times (500 ms apart) whenever a pass
-/// fails to open OR yields any per-entry error, and return the largest
-/// basename set seen across attempts. A clean pass (opened, zero entry
-/// errors) is trusted immediately. Returns `None` only when no `read_dir`
-/// attempt ever opened the directory — callers then behave exactly as the
-/// old `.ok()? / return false` did (no listing → no match), rather than
-/// acting on a half-listing that dropped the disc's own dir.
+/// fails to open OR yields any per-entry error, and return the UNION of every
+/// basename seen across attempts. A clean pass (opened, zero entry errors) is
+/// trusted immediately. Returns `None` only when no `read_dir` attempt ever
+/// opened the directory — callers then behave exactly as the old
+/// `.ok()? / return false` did (no listing → no match), rather than acting on
+/// a half-listing that dropped the disc's own dir.
+///
+/// The union (rather than the single largest-count pass) matters because
+/// different degraded passes can surface disjoint partial views of the same
+/// mount: a disc's subdir present in an earlier, smaller pass but absent from
+/// a later, larger one would otherwise be silently dropped, defeating the
+/// whole point of the retry.
 fn list_staging_basenames(staging_dir: &std::path::Path) -> Option<Vec<String>> {
     let mut saw_read_ok = false;
-    let mut best: Vec<String> = Vec::new();
+    // Insertion-ordered union of every basename observed across passes; the
+    // set guards against duplicating a name seen in more than one pass.
+    let mut union: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for attempt in 0..3 {
         if let Ok(entries) = std::fs::read_dir(staging_dir) {
             saw_read_ok = true;
-            let mut names = Vec::new();
             let mut had_entry_error = false;
             for entry in entries {
                 match entry {
                     Ok(e) => {
                         if let Some(n) = e.path().file_name() {
-                            names.push(n.to_string_lossy().into_owned());
+                            let name = n.to_string_lossy().into_owned();
+                            if seen.insert(name.clone()) {
+                                union.push(name);
+                            }
                         }
                     }
                     // Don't `.flatten()` away per-entry errors: a partial
@@ -1090,12 +1101,11 @@ fn list_staging_basenames(staging_dir: &std::path::Path) -> Option<Vec<String>> 
                     Err(_) => had_entry_error = true,
                 }
             }
-            if names.len() > best.len() {
-                best = names;
-            }
             if !had_entry_error {
-                // Clean, complete listing — trust it immediately.
-                return Some(best);
+                // Clean, complete listing — trust it immediately. We still
+                // return the accumulated union: any name from a prior degraded
+                // pass that this clean pass happened not to surface stays in.
+                return Some(union);
             }
         }
         if attempt < 2 {
@@ -1103,10 +1113,10 @@ fn list_staging_basenames(staging_dir: &std::path::Path) -> Option<Vec<String>> 
         }
     }
     if saw_read_ok {
-        // Every pass that opened had at least one entry error; return the
-        // best (largest) basename set we observed rather than None, so a
-        // disc whose dir survived at least one pass is still matchable.
-        Some(best)
+        // Every pass that opened had at least one entry error; return the union
+        // of every basename we observed rather than None, so a disc whose dir
+        // appeared in any pass is still matchable.
+        Some(union)
     } else {
         // Never opened the directory across all retries — UNKNOWN. Behave
         // like the old `read_dir(...).ok()?` (no listing → no match).
@@ -6508,6 +6518,27 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let missing = tmp.path().join("does-not-exist");
         assert_eq!(list_staging_basenames(&missing), None);
+    }
+
+    // Regression for the largest-count-vs-union bug: a clean pass returns the
+    // accumulated UNION of every basename observed, and never duplicates a name
+    // it has already seen. On a healthy mount the very first pass opens cleanly
+    // and short-circuits, so a single child must appear exactly once (the union
+    // accumulator must not double-count). The cross-pass union (a name from an
+    // earlier degraded pass surviving a later, larger pass that dropped it)
+    // depends on injectable per-DirEntry NFS errors, which the real filesystem
+    // can't reproduce deterministically; the union code path is exercised by
+    // the accumulate-then-return wiring this test pins.
+    #[test]
+    fn list_staging_basenames_union_does_not_duplicate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("Dune")).unwrap();
+        std::fs::create_dir(tmp.path().join("Dune_Part_Two")).unwrap();
+
+        let got = list_staging_basenames(tmp.path()).expect("dir exists");
+        assert_eq!(got.len(), 2, "each child appears exactly once: {got:?}");
+        assert!(got.contains(&"Dune".to_string()));
+        assert!(got.contains(&"Dune_Part_Two".to_string()));
     }
 
     /// Regression: `resumable_for_disc` (the scan-complete tile's Resume-button
