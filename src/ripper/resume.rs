@@ -693,7 +693,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // re-attempt on its next tick, and once a KEYDB update / keydb refresh
     // provides keys, the same ISO muxes cleanly. This is the deferred-mux
     // half of the no-keys capture flow started in `rip_disc`.
-    if disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None) {
+    if disc.encrypted
+        && matches!(keys, libfreemkv::decrypt::DecryptKeys::None)
+        && !super::output_is_iso_image(&cfg_read.output_format)
+    {
         let msg = super::keyless_failure_message(&disc);
         crate::log::device_log(
             device,
@@ -925,6 +928,77 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             &title_for_match,
             tmdb_year,
         );
+
+    // ISO output: deliver the whole-disc image, don't re-mux a title. Mirrors
+    // rip_disc's inline ISO terminal so the two completion routes can't diverge
+    // (the fresh-rip path completes ISO in rip_disc and never hands off here;
+    // this branch covers cold auto-resume from preserved staging). The abort
+    // gate above already scoped loss whole-disc for this mode; the mover
+    // validates + moves `.iso` and the prune below retains it for ISO output.
+    if super::output_is_iso_image(&output_format) {
+        if !staging::fsync_output_file(&iso_path) {
+            crate::log::device_log(
+                device,
+                "Auto-resume: durability gate failed (could not fsync ISO image); \
+                 preserving staging for next-restart retry.",
+            );
+            reset_status_after_ripping(
+                device,
+                "error",
+                &display_name,
+                &disc_format,
+                &duration,
+                Some("ISO image not durable (fsync failed); preserved for retry".to_string()),
+            );
+            return;
+        }
+        let marker_name = if title_confident { ".done" } else { ".review" };
+        let done_marker = serde_json::json!({
+            "title": display_name,
+            "format": disc_format,
+            "year": tmdb_year,
+            "date": crate::util::format_date(),
+            "resumed": true,
+        });
+        if let Err(e) = staging::write_handoff_marker(
+            &staging_dir.join(marker_name),
+            serde_json::to_string_pretty(&done_marker)
+                .unwrap_or_default()
+                .as_bytes(),
+        ) {
+            crate::log::device_log(
+                device,
+                &format!(
+                    "Auto-resume: {} marker write failed ({}). Preserving staging for retry.",
+                    marker_name, e
+                ),
+            );
+            reset_status_after_ripping(
+                device,
+                "error",
+                &display_name,
+                &disc_format,
+                &duration,
+                Some(format!("{} marker write failed: {}", marker_name, e)),
+            );
+            return;
+        }
+        staging::write_completed_marker(&staging_dir);
+        staging::clear_restart_count(&staging_dir);
+        let iso_name = iso_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        crate::log::device_log(
+            device,
+            &format!("Auto-resume: ISO output complete — disc image staged as {iso_name}"),
+        );
+        super::update_state_with(device, |s| {
+            s.status = "done".to_string();
+            s.output_file = iso_name;
+        });
+        return;
+    }
 
     let mux_outcome = super::mux::run_mux(
         super::mux::MuxInputs {
@@ -1160,7 +1234,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         &iso_path,
         &mapfile_path,
         cfg_read.max_retries,
-        cfg_read.keep_iso,
+        super::retain_intermediate_iso(cfg_read.keep_iso, &output_format),
     );
 
     // Prefer the codecs the mux frame loop wrote into STATE (the

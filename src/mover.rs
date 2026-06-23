@@ -624,7 +624,11 @@ fn check_and_move(cfg: &Config) {
         // filter the ISO out at planning time; the staging-cleanup branch
         // below deletes any leftover .iso from disk before tearing the
         // dir down so we don't leak intermediate ISOs in /staging.
-        let move_iso = cfg.keep_iso;
+        //
+        // `output_format == "iso"` also moves the ISO: there the disc image
+        // IS the deliverable (the ripper skipped the title mux), so the
+        // staging dir holds no `.mkv` — only the `.iso` to promote.
+        let move_iso = cfg.keep_iso || cfg.output_format == "iso";
         let ripped_files: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
             Ok(entries) => entries
                 .filter_map(|e| e.ok())
