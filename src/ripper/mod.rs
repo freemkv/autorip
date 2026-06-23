@@ -2225,6 +2225,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                                 break 'pass1;
                             }
 
+                            // Engage the drive's disc-type read mode before any
+                            // read. Idempotent. Kept here to stay structurally
+                            // identical to scan_disc / the fresh-open path / the
+                            // initial session probe, which all call probe_disc()
+                            // after init().
+                            if let Err(e) = drive.probe_disc() {
+                                tracing::warn!(device = %device, error = %e, "drive probe_disc failed (continuing)");
+                            }
+
                             session.drive = drive;
                             session.device_path = p.to_string();
 
@@ -2307,6 +2316,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                                 log_init_recovery_failure(device, &e);
 
                                 break 'pass1;
+                            }
+
+                            // Engage the drive's disc-type read mode before any
+                            // read. Idempotent. Kept here to stay structurally
+                            // identical to scan_disc / the fresh-open path / the
+                            // initial session probe, which all call probe_disc()
+                            // after init().
+                            if let Err(e) = drive.probe_disc() {
+                                tracing::warn!(device = %device, error = %e, "drive probe_disc failed (continuing)");
                             }
 
                             session.drive = drive;
