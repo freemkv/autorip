@@ -1344,13 +1344,15 @@ fn resumable_for_disc(cfg: &Config, display_name: &str) -> Option<Resumable> {
         return None;
     }
     let sanitized = crate::util::sanitize_path_compact(display_name);
-    let entries = std::fs::read_dir(&cfg.staging_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let basename = match path.file_name() {
-            Some(n) => n.to_string_lossy().into_owned(),
-            None => continue,
-        };
+    // NFS-resilient listing (retries + surfaces per-entry errors) instead of
+    // `read_dir(...).flatten()`, which would silently drop the disc's own dir
+    // on a cold-cache DirEntry error and hide an existing resumable staging
+    // dir — making the scan-complete tile omit the Resume button and the
+    // operator re-sweep instead of resuming. Mirrors `disc_already_completed`.
+    let staging_root = std::path::Path::new(&cfg.staging_dir);
+    let basenames = list_staging_basenames(staging_root)?;
+    for basename in basenames {
+        let path = staging_root.join(&basename);
         // EXACT match only. Staging dirs are created with the exact sanitized
         // disc name (no year/suffix), so a prefix match never legitimately
         // fires — it only invites the collision class (`Cars` prefixing
@@ -4937,10 +4939,11 @@ mod tests {
     use super::{
         HaltGuard, aacs_failure_message, disk_space_preflight_message, format_pass_error,
         header_phase_outcome_is_failure, incomplete_mux_status, is_safe_staging_segment,
-        list_staging_basenames, prune_intermediate_iso, register_halt, staging_dir_matches_disc,
-        staging_free_bytes,
+        list_staging_basenames, prune_intermediate_iso, register_halt, resumable_for_disc,
+        staging_dir_matches_disc, staging_free_bytes,
     };
     use crate::ripper::session::device_halt;
+    use crate::ripper::state::Resumable;
     use libfreemkv::{Error, ScsiSense};
 
     /// Regression guard for the divergent disk-reclamation bug: the inline
@@ -6390,6 +6393,41 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let missing = tmp.path().join("does-not-exist");
         assert_eq!(list_staging_basenames(&missing), None);
+    }
+
+    /// Regression: `resumable_for_disc` (the scan-complete tile's Resume-button
+    /// detector) must find an existing resumable staging dir. It previously
+    /// walked the staging root with `read_dir(...).flatten()`, which silently
+    /// drops per-`DirEntry` I/O errors — on a cold NFS cache a transient
+    /// ESTALE/EIO on a single entry made the disc's own dir vanish and the
+    /// function return None, hiding the Resume button. It now routes through
+    /// `list_staging_basenames` (3-retry NFS defense) like the other staging
+    /// walkers. This test pins the happy path so the wiring can't silently
+    /// revert to a bare `read_dir().flatten()`.
+    #[test]
+    fn resumable_for_disc_detects_partial_sweep() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = crate::config::Config {
+            staging_dir: tmp.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let display_name = "Test Disc";
+        let sanitized = crate::util::sanitize_path_compact(display_name);
+
+        // Build a real staging layout: <staging>/<sanitized>/<sanitized>.iso
+        // plus its `<...>.iso.mapfile`. A freshly created mapfile is one big
+        // NonTried region (bytes_pending > 0) -> Resumable::Sweep.
+        let disc_dir = tmp.path().join(&sanitized);
+        std::fs::create_dir(&disc_dir).unwrap();
+        let iso = disc_dir.join(format!("{sanitized}.iso"));
+        std::fs::write(&iso, b"x").unwrap();
+        let mapfile_path = disc_dir.join(format!("{sanitized}.iso.mapfile"));
+        libfreemkv::disc::mapfile::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
+
+        assert_eq!(
+            resumable_for_disc(&cfg, display_name),
+            Some(Resumable::Sweep),
+        );
     }
 
     /// Regression: the fresh-rip post-mux loss gate must run for BOTH
