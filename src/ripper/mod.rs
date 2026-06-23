@@ -3223,11 +3223,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // (operator confirms the title before it leaves staging). Mirrors
             // the MKV completion path's marker selection.
             let marker_name = if title_confident { ".done" } else { ".review" };
+            // `to_string_pretty` on a `json!`-constructed Value is effectively
+            // infallible; `.expect` makes the invariant explicit (mirrors
+            // staging::write_failed_marker) so a real serialization failure
+            // surfaces as a panic rather than silently writing an empty marker
+            // that the mover skips, stranding the output in staging forever.
+            let marker_body =
+                serde_json::to_string_pretty(&marker).expect("json! value is always serialisable");
             if let Err(e) = staging::write_handoff_marker(
                 &staging_path.join(marker_name),
-                serde_json::to_string_pretty(&marker)
-                    .unwrap_or_default()
-                    .as_bytes(),
+                marker_body.as_bytes(),
             ) {
                 crate::log::device_log(
                     device,
@@ -4031,11 +4036,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // barrier: it guarantees `.done` is observed on disk before the
             // later `.completed` write / ISO prune, so a crash can never leave
             // `.completed` (or a pruned ISO) without a durable `.done`.
+            // `to_string_pretty` on a `json!`-constructed Value is effectively
+            // infallible; `.expect` makes the invariant explicit (mirrors
+            // staging::write_failed_marker) so a real serialization failure
+            // surfaces as a panic rather than silently writing an empty marker
+            // that the mover skips, stranding the output in staging forever.
+            let marker_body =
+                serde_json::to_string_pretty(&marker).expect("json! value is always serialisable");
             if let Err(e) = staging::write_handoff_marker(
                 std::path::Path::new(&marker_path),
-                serde_json::to_string_pretty(&marker)
-                    .unwrap_or_default()
-                    .as_bytes(),
+                marker_body.as_bytes(),
             ) {
                 // The mux finished and the MKV is in staging, but the
                 // mover keys off this marker — without it the file sits

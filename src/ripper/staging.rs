@@ -31,6 +31,7 @@ pub const RESTART_LIMIT: u64 = 3;
 /// Marker filenames — kept as constants so the resume-on-startup logic
 /// and the rip orchestrator agree on the on-disk vocabulary.
 pub const DONE_MARKER: &str = ".done";
+pub const REVIEW_MARKER: &str = ".review";
 pub const COMPLETED_MARKER: &str = ".completed";
 pub const FAILED_MARKER: &str = ".failed";
 pub const RESTART_COUNT_FILE: &str = ".restart_count";
@@ -95,7 +96,13 @@ pub fn increment_restart_count(staging_disc_dir: &Path) -> io::Result<u64> {
         writeln!(f, "{}", next)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, &p)?;
+    if let Err(e) = std::fs::rename(&tmp, &p) {
+        // A permanent rename failure (cross-device move, ESTALE, full
+        // directory) would otherwise leave the `.tmp` sibling on disk
+        // forever. Best-effort cleanup, then propagate the real error.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(next)
 }
 
@@ -139,7 +146,13 @@ pub(crate) fn write_marker_durable(path: &Path, contents: &[u8]) -> io::Result<(
         f.write_all(contents)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Clean up the `.tmp` sibling on a permanent rename failure
+        // (cross-device move, ESTALE, full directory) so it is not
+        // leaked. Best-effort, then propagate the real error.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Some(parent) = path.parent() {
         fsync_dir(parent);
     }
@@ -263,6 +276,15 @@ pub struct StagingSnapshot {
     /// state to be retried. Hoisting `.done` into the snapshot lets the
     /// resume gate short-circuit before the partial-state branch.
     pub has_done: bool,
+    /// `.review` hand-off marker present. When the rip's title match is
+    /// not confident the mux writes `.review` (instead of `.done`) before
+    /// `.completed` — the rip is finished and staged but held for operator
+    /// title confirmation rather than auto-filed. Like `.done`, a crash
+    /// between the `.review` and `.completed` writes leaves `.review`
+    /// present, `.completed` absent, and the ISO/mapfile still on disk, so
+    /// the resume scan must recognise this as a finished rip, not partial
+    /// state to be restart-counted (and eventually promoted to `.failed`).
+    pub has_review: bool,
     pub has_iso: bool,
     pub has_mapfile: bool,
     pub has_mkv: bool,
@@ -292,6 +314,7 @@ impl StagingSnapshot {
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanObservations {
     has_done: bool,
+    has_review: bool,
     has_completed: bool,
     has_failed: bool,
     has_iso: bool,
@@ -310,6 +333,7 @@ impl ScanObservations {
     /// act on.
     fn observed_nothing(&self) -> bool {
         !self.has_done
+            && !self.has_review
             && !self.has_completed
             && !self.has_failed
             && !self.has_iso
@@ -387,6 +411,8 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
                 let name = name.to_string_lossy();
                 if name == DONE_MARKER {
                     obs.has_done = true;
+                } else if name == REVIEW_MARKER {
+                    obs.has_review = true;
                 } else if name == COMPLETED_MARKER {
                     obs.has_completed = true;
                 } else if name == FAILED_MARKER {
@@ -448,6 +474,7 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
         completed: obs.has_completed,
         failed_reason,
         has_done: obs.has_done,
+        has_review: obs.has_review,
         has_iso: obs.has_iso,
         has_mapfile: obs.has_mapfile,
         has_mkv: obs.has_mkv,
@@ -531,6 +558,26 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
         // whenever `.done` exists, regardless of leftover ISO/mapfile.
         if snap.has_done {
             tracing::info!(path = %path.display(), "staging entry has .done — completed rip awaiting mover, leaving alone");
+            hints.push(StagingResumeHint {
+                dir: snap.dir,
+                action: ResumeAction::AlreadyCompleted,
+            });
+            continue;
+        }
+        // `.review` carve-out — same crash-window reasoning as `.done`
+        // above. When the title match isn't confident the mux writes
+        // `.review` (not `.done`) then `.completed` then prunes the ISO.
+        // A crash between `.review` and `.completed` leaves `.review`
+        // present, `.completed` absent, and the ISO/mapfile on disk
+        // (so `has_partial_state()` is true). That dir is a *finished*
+        // rip held for operator title confirmation, NOT partial state to
+        // be restart-counted — without this short-circuit it would fall
+        // through to the restart-loop path and, after RESTART_LIMIT
+        // crashes in that window, a completed rip would be wrongly marked
+        // `.failed`. Short-circuit to AlreadyCompleted whenever `.review`
+        // exists, regardless of leftover ISO/mapfile.
+        if snap.has_review {
+            tracing::info!(path = %path.display(), "staging entry has .review — completed rip held for operator review, leaving alone");
             hints.push(StagingResumeHint {
                 dir: snap.dir,
                 action: ResumeAction::AlreadyCompleted,
@@ -736,6 +783,35 @@ mod tests {
         assert_eq!(read_failed_reason(&d).as_deref(), Some("test reason"));
     }
 
+    /// A hand-off marker (`.done`/`.review`) must never be written empty: the
+    /// mover skips directories whose marker won't parse, so an empty marker
+    /// strands a finished output in staging with no operator-facing signal.
+    /// The hand-off sites serialize a `json!` Value and `.expect` the (today
+    /// infallible) result rather than falling back to empty bytes; this guards
+    /// that the durable write path produces a non-empty, parseable marker.
+    #[test]
+    fn handoff_marker_is_nonempty_and_parseable() {
+        let d = tmpdir();
+        let marker = serde_json::json!({
+            "title": "Some Movie",
+            "format": "Blu-ray",
+            "year": 2024,
+            "date": "2024-01-01",
+        });
+        let body =
+            serde_json::to_string_pretty(&marker).expect("json! value is always serialisable");
+        let path = d.join(".done");
+        write_handoff_marker(&path, body.as_bytes()).unwrap();
+
+        let written = fs::read(&path).unwrap();
+        assert!(!written.is_empty(), ".done marker must not be empty bytes");
+        let parsed: serde_json::Value = serde_json::from_slice(&written).unwrap();
+        assert_eq!(
+            parsed.get("title").and_then(|v| v.as_str()),
+            Some("Some Movie")
+        );
+    }
+
     #[test]
     fn resume_marks_failed_after_limit() {
         // Build a fake staging tree: <root>/<disc>/foo.iso plus
@@ -821,6 +897,38 @@ mod tests {
         // Data preserved for the mover.
         assert!(disc.join("foo.iso").exists());
         assert!(disc.join(DONE_MARKER).exists());
+    }
+
+    #[test]
+    fn review_marker_with_partial_state_is_completed_not_retried() {
+        // When the title match isn't confident the mux writes .review
+        // (instead of .done) then .completed. A crash between .review and
+        // .completed leaves .review + the ISO/mapfile/MKV on disk. The
+        // resume scan must treat this as a finished rip held for operator
+        // review, NOT bump .restart_count (which would promote a completed
+        // rip to .failed after RESTART_LIMIT restarts in that window).
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("foo.iso"), b"x").unwrap();
+        fs::write(disc.join("foo.iso.mapfile"), b"x").unwrap();
+        fs::write(disc.join("MyDisc.mkv"), b"x").unwrap();
+        fs::write(disc.join(REVIEW_MARKER), b"{}").unwrap();
+        // No .completed marker (the crash happened before it landed).
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::AlreadyCompleted),
+            "got {:?}",
+            hints[0].action
+        );
+        // Counter must NOT have been bumped — this was a finished rip.
+        assert_eq!(restart_count(&disc), 0);
+        assert!(!disc.join(FAILED_MARKER).exists());
+        // Data preserved for the operator/mover.
+        assert!(disc.join("MyDisc.mkv").exists());
+        assert!(disc.join(REVIEW_MARKER).exists());
     }
 
     #[test]
@@ -984,6 +1092,57 @@ mod tests {
             restart_count(&disc),
             1,
             ".restart_count must be preserved (not cleared) when .done failed"
+        );
+    }
+
+    /// A rename failure in `write_marker_durable` must not leak the `.tmp`
+    /// sibling. We force the failure by making the target `path` a non-empty
+    /// directory: `rename(file, non_empty_dir)` fails on both Linux and macOS,
+    /// and it fails AFTER the `.tmp` file has been created + fsynced — so it
+    /// exercises the cleanup-on-rename-error path specifically.
+    #[test]
+    fn marker_rename_failure_cleans_up_tmp() {
+        let d = tmpdir();
+        let target = d.join(".done");
+        // Make the target a non-empty directory so rename-over it fails.
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("occupant"), b"x").unwrap();
+
+        let res = write_marker_durable(&target, b"{}");
+        assert!(
+            res.is_err(),
+            "precondition: rename onto a non-empty dir must fail"
+        );
+
+        let tmp = d.join(".done.tmp");
+        assert!(
+            !tmp.exists(),
+            "the .tmp sibling must be cleaned up after a rename failure, found: {}",
+            tmp.display()
+        );
+    }
+
+    /// Same guarantee for `increment_restart_count`: a rename failure must not
+    /// leak `.restart_count.tmp`.
+    #[test]
+    fn restart_count_rename_failure_cleans_up_tmp() {
+        let d = tmpdir();
+        // Make the final target a non-empty directory so rename-over fails.
+        let target = d.join(RESTART_COUNT_FILE);
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("occupant"), b"x").unwrap();
+
+        let res = increment_restart_count(&d);
+        assert!(
+            res.is_err(),
+            "precondition: rename onto a non-empty dir must fail"
+        );
+
+        let tmp = d.join(format!("{}.tmp", RESTART_COUNT_FILE));
+        assert!(
+            !tmp.exists(),
+            "the .tmp sibling must be cleaned up after a rename failure, found: {}",
+            tmp.display()
         );
     }
 }
