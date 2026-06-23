@@ -2120,6 +2120,143 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ===================================================================
+    // EXHAUSTIVE mover decider matrix (rc4 hardening).
+    //
+    // The mover is the third staging-state decider. It keys ONLY on `.done`
+    // (the mux/resume hand-off): for each staging dir it either moves the
+    // muxed output to the library (and tears the dir down) or leaves the dir
+    // alone. These tests drive the REAL `check_and_move` against a real
+    // staging tree for every meaningful `.done`-state combination and assert
+    // the observable outcome (dest present? staging dir gone?).
+    // ===================================================================
+
+    /// Outcome of one mover decision, observed from the filesystem.
+    #[derive(Debug, PartialEq)]
+    enum MoverVerdict {
+        /// Output landed in the library and staging was torn down.
+        MovedAndCleaned,
+        /// Staging dir left in place, nothing moved to the library.
+        LeftAlone,
+    }
+
+    /// Build a single staging disc dir, run the real `check_and_move`, and
+    /// report whether the MKV reached the library and staging was cleaned.
+    /// `done_body`: `None` = no `.done` marker; `Some(bytes)` = that exact
+    /// `.done` content. `with_mkv`: whether a valid EBML MKV is staged.
+    /// `extra`: extra marker filenames to drop in (e.g. `.completed`).
+    fn mover_verdict(done_body: Option<&[u8]>, with_mkv: bool, extra: &[&str]) -> MoverVerdict {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let movie_dir = tmp.path().join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
+
+        let disc = staging.join("Disc");
+        std::fs::create_dir_all(&disc).unwrap();
+        if let Some(body) = done_body {
+            std::fs::write(disc.join(".done"), body).unwrap();
+        }
+        if with_mkv {
+            let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3];
+            mkv.extend_from_slice(&[0xAAu8; 1024]);
+            std::fs::write(disc.join("Disc.mkv"), &mkv).unwrap();
+        }
+        for e in extra {
+            std::fs::write(disc.join(e), b"x").unwrap();
+        }
+
+        // Clear any stale error for this dir before/after so the shared
+        // MOVE_ERRORS map doesn't leak across rows.
+        let key = disc.to_string_lossy().to_string();
+        clear_error(&key);
+        check_and_move(&cfg);
+        clear_error(&key);
+
+        let moved = movie_dir.join("Disc.mkv").exists()
+            || movie_dir
+                .join("Disc")
+                .join("Disc.mkv")
+                .exists()
+            // marker has title "Disc" → movie path is "Disc/Disc.mkv" with no year,
+            // but marker_json sets year 2024 → "Disc (2024)/Disc (2024).mkv".
+            || movie_dir.join("Disc (2024)/Disc (2024).mkv").exists();
+        let cleaned = !disc.exists();
+        if moved && cleaned {
+            MoverVerdict::MovedAndCleaned
+        } else {
+            MoverVerdict::LeftAlone
+        }
+    }
+
+    #[test]
+    fn mover_decider_matrix() {
+        let valid = marker_json("Disc");
+        let valid_b = valid.as_bytes();
+
+        // --- no .done marker: mover never acts ---
+        assert_eq!(
+            mover_verdict(None, true, &[]),
+            MoverVerdict::LeftAlone,
+            "no .done marker → mover must not move (it keys solely on .done)"
+        );
+        // .completed / .ripped without .done are not the mover's hand-off.
+        assert_eq!(
+            mover_verdict(None, true, &[".completed"]),
+            MoverVerdict::LeftAlone,
+            ".completed without .done is not the mover's signal"
+        );
+        assert_eq!(
+            mover_verdict(None, true, &[".ripped"]),
+            MoverVerdict::LeftAlone,
+            ".ripped without .done is the mux worker's signal, not the mover's"
+        );
+
+        // --- valid .done + movable output → move + clean ---
+        assert_eq!(
+            mover_verdict(Some(valid_b), true, &[]),
+            MoverVerdict::MovedAndCleaned,
+            "valid .done + MKV → move to library and tear down staging"
+        );
+
+        // --- valid .done but NO movable output → left alone ---
+        assert_eq!(
+            mover_verdict(Some(valid_b), false, &[]),
+            MoverVerdict::LeftAlone,
+            "valid .done but no .mkv/.m2ts to move → skip (nothing to promote)"
+        );
+
+        // --- torn / empty .done → not-ready, skip (never blind-move) ---
+        assert_eq!(
+            mover_verdict(Some(b""), true, &[]),
+            MoverVerdict::LeftAlone,
+            "empty .done (torn write) → not ready, skip"
+        );
+        assert_eq!(
+            mover_verdict(Some(b"{ this is not json"), true, &[]),
+            MoverVerdict::LeftAlone,
+            "unparseable .done → not ready, skip"
+        );
+
+        // --- parseable .done with empty title AND disc_name → skip ---
+        let empty_title = serde_json::json!({ "title": "", "disc_name": "" }).to_string();
+        assert_eq!(
+            mover_verdict(Some(empty_title.as_bytes()), true, &[]),
+            MoverVerdict::LeftAlone,
+            "parseable .done with empty title+disc_name → no usable dest name, skip"
+        );
+
+        // --- valid .done coexisting with .completed → still moves
+        //     (.completed does not block the mover; the mux worker's terminal
+        //     guard is separate). The mover only needs .done + output. ---
+        assert_eq!(
+            mover_verdict(Some(valid_b), true, &[".completed"]),
+            MoverVerdict::MovedAndCleaned,
+            "valid .done + .completed + MKV → mover still files it"
+        );
+    }
+
     #[test]
     fn same_head_and_tail_distinguishes_identical_from_different() {
         let dir = scratch_dir("headtail");

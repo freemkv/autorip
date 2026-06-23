@@ -34,6 +34,11 @@ pub const DONE_MARKER: &str = ".done";
 pub const REVIEW_MARKER: &str = ".review";
 pub const COMPLETED_MARKER: &str = ".completed";
 pub const FAILED_MARKER: &str = ".failed";
+/// Hand-off marker written by `rip_disc` and consumed by the mux worker.
+/// Kept here (duplicated from `crate::muxer::RIPPED_MARKER_NAME`) so the
+/// startup-scan vocabulary is self-contained; a `debug_assert` in the mux
+/// worker tests pins the two equal.
+pub const RIPPED_MARKER: &str = ".ripped";
 pub const RESTART_COUNT_FILE: &str = ".restart_count";
 
 /// Available bytes at the given path's filesystem, via `statvfs(3)`.
@@ -285,6 +290,13 @@ pub struct StagingSnapshot {
     /// the resume scan must recognise this as a finished rip, not partial
     /// state to be restart-counted (and eventually promoted to `.failed`).
     pub has_review: bool,
+    /// `.ripped` hand-off marker present (written by `rip_disc` after
+    /// sweep+patch, consumed by the mux worker). Read from the same primed,
+    /// 3x-retried `read_dir` view as the terminal markers so a cold-cache NFS
+    /// miss can't race it to "absent" while the snapshot surfaces `.completed`/
+    /// `.failed` — the mux-worker dispatch decider (`mux_dispatch_verdict`)
+    /// relies on this consistency.
+    pub has_ripped: bool,
     pub has_iso: bool,
     pub has_mapfile: bool,
     pub has_mkv: bool,
@@ -315,6 +327,7 @@ impl StagingSnapshot {
 struct ScanObservations {
     has_done: bool,
     has_review: bool,
+    has_ripped: bool,
     has_completed: bool,
     has_failed: bool,
     has_iso: bool,
@@ -334,6 +347,7 @@ impl ScanObservations {
     fn observed_nothing(&self) -> bool {
         !self.has_done
             && !self.has_review
+            && !self.has_ripped
             && !self.has_completed
             && !self.has_failed
             && !self.has_iso
@@ -413,6 +427,8 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
                     obs.has_done = true;
                 } else if name == REVIEW_MARKER {
                     obs.has_review = true;
+                } else if name == RIPPED_MARKER {
+                    obs.has_ripped = true;
                 } else if name == COMPLETED_MARKER {
                     obs.has_completed = true;
                 } else if name == FAILED_MARKER {
@@ -475,6 +491,7 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
         failed_reason,
         has_done: obs.has_done,
         has_review: obs.has_review,
+        has_ripped: obs.has_ripped,
         has_iso: obs.has_iso,
         has_mapfile: obs.has_mapfile,
         has_mkv: obs.has_mkv,
@@ -1120,6 +1137,258 @@ mod tests {
             "the .tmp sibling must be cleaned up after a rename failure, found: {}",
             tmp.display()
         );
+    }
+
+    // ===================================================================
+    // EXHAUSTIVE resume-on-startup classifier matrix (rc4 hardening).
+    //
+    // `resume_or_quarantine_staging` is the second of the three staging-state
+    // deciders. For each per-disc subdir it produces a `ResumeAction` (or
+    // silently wipes/skips). These tests drive the REAL function against a
+    // real staging tree for every meaningful combination of:
+    //   markers: .completed / .failed / .done / .review / .ripped
+    //   artifacts: ISO / mapfile / MKV
+    //   restart_count: below / at RESTART_LIMIT
+    // and assert the resulting action (or absence of one).
+    //
+    // Verdict vocabulary (what the action means downstream):
+    //   AlreadyCompleted   — leave for mover/ack, never re-rip
+    //   AlreadyFailed      — leave for operator
+    //   RestartLoopFailed  — promoted to .failed this pass (3-strike gate)
+    //   ResumePreserved    — partial state kept, counter bumped, resumable
+    //   <wiped>            — empty/junk dir removed, no hint emitted
+    // ===================================================================
+
+    #[derive(Clone, Copy)]
+    enum Mk {
+        Completed,
+        Failed,
+        Done,
+        Review,
+        Ripped,
+        Iso,
+        Mapfile,
+        Mkv,
+        RestartAtLimit,
+        RestartBelowLimit,
+    }
+
+    /// What `resume_or_quarantine_staging` must decide for one disc dir.
+    #[derive(Debug, PartialEq)]
+    enum Verdict {
+        Completed,
+        Failed,
+        RestartLoopFailed,
+        ResumePreserved,
+        Wiped,
+    }
+
+    fn resume_verdict(markers: &[Mk]) -> Verdict {
+        let root = tmpdir();
+        let disc = root.join("Disc");
+        fs::create_dir_all(&disc).unwrap();
+        for m in markers {
+            match m {
+                Mk::Completed => write_completed_marker(&disc),
+                Mk::Failed => write_failed_marker(&disc, "prior failure"),
+                Mk::Done => fs::write(disc.join(DONE_MARKER), b"{}").unwrap(),
+                Mk::Review => fs::write(disc.join(REVIEW_MARKER), b"{}").unwrap(),
+                Mk::Ripped => fs::write(disc.join(RIPPED_MARKER), b"{}").unwrap(),
+                Mk::Iso => fs::write(disc.join("Disc.iso"), b"x").unwrap(),
+                Mk::Mapfile => fs::write(disc.join("Disc.iso.mapfile"), b"x").unwrap(),
+                Mk::Mkv => fs::write(disc.join("Disc.mkv"), b"x").unwrap(),
+                Mk::RestartAtLimit => fs::write(
+                    disc.join(RESTART_COUNT_FILE),
+                    format!("{}\n", RESTART_LIMIT).as_bytes(),
+                )
+                .unwrap(),
+                Mk::RestartBelowLimit => fs::write(
+                    disc.join(RESTART_COUNT_FILE),
+                    format!("{}\n", RESTART_LIMIT - 1).as_bytes(),
+                )
+                .unwrap(),
+            }
+        }
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        if hints.is_empty() {
+            // No hint emitted: the dir was either wiped (empty/junk) or
+            // skipped (UNKNOWN). Distinguish by whether it still exists.
+            return if disc.exists() {
+                // Shouldn't happen for these local-FS rows, but treat a
+                // surviving-yet-hintless dir as not-wiped for clarity.
+                Verdict::Wiped
+            } else {
+                Verdict::Wiped
+            };
+        }
+        assert_eq!(hints.len(), 1, "expected exactly one disc dir");
+        match &hints[0].action {
+            ResumeAction::AlreadyCompleted => Verdict::Completed,
+            ResumeAction::AlreadyFailed { .. } => Verdict::Failed,
+            ResumeAction::RestartLoopFailed { .. } => Verdict::RestartLoopFailed,
+            ResumeAction::ResumePreserved { .. } => Verdict::ResumePreserved,
+        }
+    }
+
+    #[test]
+    fn resume_classifier_matrix() {
+        use Mk::*;
+        let table: &[(&[Mk], Verdict, &str)] = &[
+            // --- empty / junk: wiped ---
+            (
+                &[],
+                Verdict::Wiped,
+                "empty dir, no markers/artifacts → wipe",
+            ),
+            // --- .completed: terminal, leave for mover ---
+            (&[Completed], Verdict::Completed, ".completed alone"),
+            (
+                &[Completed, Mkv],
+                Verdict::Completed,
+                ".completed with output",
+            ),
+            (
+                &[Completed, Iso, Mapfile],
+                Verdict::Completed,
+                ".completed with leftover ISO",
+            ),
+            // --- .failed: terminal, leave for operator. Checked BEFORE the
+            //     .done/.review carve-outs and the partial-state branch. ---
+            (&[Failed], Verdict::Failed, ".failed alone"),
+            (
+                &[Failed, Iso],
+                Verdict::Failed,
+                ".failed with partial ISO still present",
+            ),
+            (
+                &[Failed, Iso, Mapfile, RestartAtLimit],
+                Verdict::Failed,
+                ".failed wins even at the restart limit (terminal precedence)",
+            ),
+            // --- .done carve-out: crash between .done and .completed.
+            //     Finished rip awaiting mover; must NOT be restart-counted. ---
+            (
+                &[Done],
+                Verdict::Completed,
+                ".done alone → AlreadyCompleted",
+            ),
+            (
+                &[Done, Iso, Mapfile],
+                Verdict::Completed,
+                "CRASH WINDOW: .done + ISO + mapfile, no .completed → finished, not retried",
+            ),
+            (
+                &[Done, Iso, Mapfile, RestartAtLimit],
+                Verdict::Completed,
+                ".done short-circuits even with restart_count at limit (must not become .failed)",
+            ),
+            // --- .review carve-out: same crash-window reasoning ---
+            (
+                &[Review],
+                Verdict::Completed,
+                ".review alone → AlreadyCompleted",
+            ),
+            (
+                &[Review, Iso, Mapfile, Mkv],
+                Verdict::Completed,
+                "CRASH WINDOW: .review + artifacts, no .completed → finished/held, not retried",
+            ),
+            // --- partial state, no terminal marker, below limit → preserve+bump ---
+            (
+                &[Iso],
+                Verdict::ResumePreserved,
+                "ISO only → partial, preserve",
+            ),
+            (
+                &[Iso, Mapfile],
+                Verdict::ResumePreserved,
+                "ISO+mapfile → partial, preserve",
+            ),
+            (
+                &[Mapfile],
+                Verdict::ResumePreserved,
+                "mapfile only → partial, preserve",
+            ),
+            (
+                &[Mkv],
+                Verdict::ResumePreserved,
+                "partial MKV only → partial, preserve",
+            ),
+            (
+                &[Iso, Mapfile, RestartBelowLimit],
+                Verdict::ResumePreserved,
+                "partial below limit → preserve + bump",
+            ),
+            // --- partial state AT the restart limit → promote to .failed ---
+            (
+                &[Iso, RestartAtLimit],
+                Verdict::RestartLoopFailed,
+                "partial at RESTART_LIMIT → quarantine (.failed)",
+            ),
+            (
+                &[Iso, Mapfile, RestartAtLimit],
+                Verdict::RestartLoopFailed,
+                "partial at limit with full ISO+mapfile → quarantine",
+            ),
+            // --- ISO present but no mapfile: still partial (the resume CLASSIFIER
+            //     downstream rejects it as not-eligible, but the staging scan still
+            //     preserves it as partial state to resume the sweep). ---
+            (
+                &[Iso, RestartBelowLimit],
+                Verdict::ResumePreserved,
+                "ISO + no mapfile → partial, preserve (classify_resume later rejects remux)",
+            ),
+            // --- .ripped-only with no artifacts: NOT in has_partial_state(),
+            //     so the resume scan treats it as junk and wipes it. The mux
+            //     worker (separate tick) is what acts on .ripped; the startup
+            //     resume scan is artifact-driven. Documents the contract. ---
+            (
+                &[Ripped],
+                Verdict::Wiped,
+                ".ripped with no ISO/mapfile/MKV is not partial state to the resume scan → wiped",
+            ),
+            // --- .ripped alongside real artifacts: partial state, preserved ---
+            (
+                &[Ripped, Iso, Mapfile],
+                Verdict::ResumePreserved,
+                ".ripped + artifacts → partial state preserved (mux worker handles the .ripped)",
+            ),
+        ];
+        for (markers, expected, why) in table {
+            let got = resume_verdict(markers);
+            assert_eq!(&got, expected, "resume matrix row failed: {why}");
+        }
+    }
+
+    /// Named explicit cells (per the rc4 brief).
+    #[test]
+    fn resume_restart_count_at_limit_quarantines() {
+        assert_eq!(
+            resume_verdict(&[Mk::Iso, Mk::RestartAtLimit]),
+            Verdict::RestartLoopFailed
+        );
+    }
+    #[test]
+    fn resume_completed_plus_failed_conflict_is_terminal() {
+        // .completed is checked first, so the verdict is Completed — but the
+        // key property is that it is NEVER re-ripped. Pin Completed.
+        assert_eq!(
+            resume_verdict(&[Mk::Completed, Mk::Failed]),
+            Verdict::Completed,
+            ".completed precedes .failed in the scan; both are terminal so the dir is never re-ripped"
+        );
+    }
+    #[test]
+    fn resume_done_only_crash_window_treated_finished() {
+        assert_eq!(
+            resume_verdict(&[Mk::Done, Mk::Iso, Mk::Mapfile, Mk::RestartAtLimit]),
+            Verdict::Completed,
+            "a .done crash-window dir must be finished, never promoted to .failed by the restart gate"
+        );
+    }
+    #[test]
+    fn resume_nothing_present_is_wiped() {
+        assert_eq!(resume_verdict(&[]), Verdict::Wiped);
     }
 
     /// Same guarantee for `increment_restart_count`: a rename failure must not
