@@ -356,9 +356,15 @@ struct SharedAtomics {
     wd_bytes: Arc<AtomicU64>,
     /// Snapshot of `input.errors` after the most recent `read()`. The
     /// producer updates it after every frame; the consumer reads it
-    /// inside `apply` to compute `lost_video_secs`. Atomic so we don't
+    /// inside `apply` to surface the skip-event count. Atomic so we don't
     /// need to put the input stream behind a mutex.
     input_errors: Arc<AtomicU32>,
+    /// Snapshot of `input.lost_bytes` after the most recent `read()` —
+    /// the actual bytes zero-filled past read errors. Used (not
+    /// `input_errors`) to compute `lost_video_secs`: an AACS skip event
+    /// covers a whole 6144-byte unit, so `errors * 2048` understates loss
+    /// by the alignment factor. Produced/consumed like `input_errors`.
+    input_lost_bytes: Arc<AtomicU64>,
     /// Set by `MuxSink::apply` when `output.write()` fails mid-stream.
     /// The pipeline keeps draining `frame_rx` after `Flow::Stop` (so the
     /// producer reaches a clean EOF and `loop_drained_naturally` stays
@@ -612,8 +618,12 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
         }
 
         let skip_errors = self.atomics.input_errors.load(Ordering::Relaxed);
+        // Scale lost-video time by the bytes actually skipped, not the
+        // skip-event count: one AACS skip event zero-fills a whole
+        // 6144-byte unit, so `errors * 2048` undercounts loss ~3x.
+        let lost_bytes = self.atomics.input_lost_bytes.load(Ordering::Relaxed);
         let lost_video_secs = if self.ui.title_bytes_per_sec > 0.0 {
-            (skip_errors as f64) * 2048.0 / self.ui.title_bytes_per_sec
+            lost_bytes as f64 / self.ui.title_bytes_per_sec
         } else {
             0.0
         };
@@ -1100,6 +1110,12 @@ pub(crate) fn run_mux(
         sweep_damage: inputs.sweep_damage,
     };
     let write_failed = Arc::new(AtomicBool::new(false));
+    // Bytes actually zero-filled past read errors. Local to run_mux (not
+    // part of the externally-built MuxAtomics) — the producer stores
+    // `input.lost_bytes()` here and both the consumer and the final
+    // lost-video-secs computation read it. Distinct from input_errors,
+    // which stays the skip-*event* count for the UI "errors" field.
+    let input_lost_bytes = Arc::new(AtomicU64::new(0));
     let shared = SharedAtomics {
         latest_bytes_read: atomics_in.latest_bytes_read.clone(),
         rip_last_lba: atomics_in.rip_last_lba.clone(),
@@ -1107,6 +1123,7 @@ pub(crate) fn run_mux(
         wd_last_frame: atomics_in.wd_last_frame.clone(),
         wd_bytes: wd_bytes.clone(),
         input_errors: atomics_in.input_errors.clone(),
+        input_lost_bytes: input_lost_bytes.clone(),
         write_failed: write_failed.clone(),
     };
     let start = Instant::now();
@@ -1146,6 +1163,7 @@ pub(crate) fn run_mux(
     let (frame_tx, frame_rx) = cb_bounded::<PesFrame>(READ_PIPELINE_DEPTH);
 
     let input_errors_for_thread = atomics_in.input_errors.clone();
+    let input_lost_bytes_for_thread = input_lost_bytes.clone();
     // Set by the producer when it breaks on a hard `read()` error
     // (distinct from Ok(None) EOF). The bridge loop drains the channel
     // to natural EOF regardless of *why* the producer stopped, so
@@ -1262,6 +1280,7 @@ pub(crate) fn run_mux(
                     }
                 }
                 input_errors_for_thread.store(u32::try_from(local_input.errors()).unwrap_or(u32::MAX), Ordering::Relaxed);
+                input_lost_bytes_for_thread.store(local_input.lost_bytes(), Ordering::Relaxed);
             }
 
             loop {
@@ -1273,6 +1292,8 @@ pub(crate) fn run_mux(
                     Ok(Some(frame)) => {
                         input_errors_for_thread
                             .store(u32::try_from(local_input.errors()).unwrap_or(u32::MAX), Ordering::Relaxed);
+                        input_lost_bytes_for_thread
+                            .store(local_input.lost_bytes(), Ordering::Relaxed);
                         // Producer per-frame log is the developer firehose
                         // (~hundreds of frames/sec on a UHD rip). Lives at
                         // `trace` so a normal /api/debug toggle (which raises
@@ -1522,8 +1543,14 @@ pub(crate) fn run_mux(
     } else {
         0.0
     };
+    // Scale by the bytes actually skipped, not the skip-event count: an
+    // AACS skip event zero-fills a whole 6144-byte unit, so
+    // `errors * 2048` understates loss ~3x. This `lost_video_secs` feeds
+    // the single-pass abort gate (max_retries==0), which would otherwise
+    // accept a lossy rip that exceeded abort_on_lost_secs.
+    let lost_bytes = input_lost_bytes.load(Ordering::Relaxed);
     let lost_video_secs = if inputs.title_bytes_per_sec > 0.0 {
-        (errors as f64) * 2048.0 / inputs.title_bytes_per_sec
+        lost_bytes as f64 / inputs.title_bytes_per_sec
     } else {
         0.0
     };
