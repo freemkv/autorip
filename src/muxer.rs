@@ -344,9 +344,17 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                             disc_name: marker.display_name.clone(),
                             disc_format: marker.disc_format.clone(),
                             progress_pct: 100,
-                            errors: marker.sweep_errors,
-                            total_lost_ms: marker.sweep_total_lost_ms,
-                            main_lost_ms: marker.sweep_main_lost_ms,
+                            // Combined sweep + mux-time loss from the mux
+                            // outcome (the `_mux` done-state folded demux/
+                            // decrypt skips into the sweep mapfile totals).
+                            // The marker's `sweep_*` fields are sweep-only, so
+                            // using them here would understate the loss in the
+                            // delivered MKV whenever a mux-phase decrypt/codec
+                            // skip added loss — diverging from the `_mux` tile
+                            // and the webhook, which report the combined figure.
+                            errors: outcome.errors,
+                            total_lost_ms: outcome.total_lost_ms,
+                            main_lost_ms: outcome.main_lost_ms,
                             num_bad_ranges: marker.sweep_num_bad_ranges,
                             largest_gap_ms: marker.sweep_largest_gap_ms,
                             // The bad-ranges drilldown list isn't in the
@@ -372,7 +380,11 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                             codecs: outcome.codecs.clone(),
                             duration: outcome.duration.clone(),
                             output_file: outcome.output_file.clone(),
-                            lost_video_secs: marker.rip_lost_video_secs,
+                            // Combined sweep + mux-time loss (see `errors`
+                            // above). `marker.rip_lost_video_secs` is sweep-only
+                            // and would understate the headline loss figure on a
+                            // disc with accepted mux-phase decrypt loss.
+                            lost_video_secs: outcome.lost_video_secs,
                             ..Default::default()
                         },
                     );
