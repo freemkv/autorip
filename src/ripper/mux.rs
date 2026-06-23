@@ -301,6 +301,17 @@ pub(crate) struct MuxOutcome {
     /// `.done` / `.completed` got written for unseekable MKVs — the
     /// validation audit's #1 "Reasonable tier" item.
     pub(crate) finalize_error: Option<String>,
+    /// Set (with the specific cause) when the producer thread aborted
+    /// mid-stream on a hard read error — i.e. `on_read_error=stop` saw
+    /// an unrecoverable read `Err` and dropped its sender, truncating
+    /// the MKV. Distinct from `finalize_error` (a structural MKV defect
+    /// that quarantines the dir with `.failed`): a read error leaves the
+    /// disc resumable, but it is NOT a user-initiated stop. The
+    /// orchestrator uses this to report `status="error"` with a clear
+    /// `last_error` instead of the silent "stopped → idle" path that a
+    /// genuine operator halt takes — so `/api/state` signals the read
+    /// failure rather than looking like an idle, user-stopped rip.
+    pub(crate) read_error: Option<String>,
 }
 
 /// Per-frame UI state that the consumer needs to fill in the
@@ -978,6 +989,7 @@ pub(crate) fn run_mux(
                 lost_video_secs: 0.0,
                 output_opened: false,
                 finalize_error: None,
+                read_error: None,
             };
         }
         match input.read() {
@@ -1012,6 +1024,7 @@ pub(crate) fn run_mux(
                         lost_video_secs: 0.0,
                         output_opened: false,
                         finalize_error: Some(msg),
+                        read_error: None,
                     };
                 }
             }
@@ -1044,6 +1057,7 @@ pub(crate) fn run_mux(
             lost_video_secs: 0.0,
             output_opened: false,
             finalize_error: Some(msg),
+            read_error: None,
         };
     }
     crate::log::device_log(
@@ -1092,6 +1106,7 @@ pub(crate) fn run_mux(
                 lost_video_secs: 0.0,
                 output_opened: false,
                 finalize_error: None,
+                read_error: None,
             };
         }
     };
@@ -1165,6 +1180,7 @@ pub(crate) fn run_mux(
                 // gets written, status=stopped.
                 output_opened: true,
                 finalize_error: None,
+                read_error: None,
             };
         }
     };
@@ -1415,6 +1431,7 @@ pub(crate) fn run_mux(
                 lost_video_secs: 0.0,
                 output_opened: true,
                 finalize_error: None,
+                read_error: None,
             };
         }
     };
@@ -1605,6 +1622,9 @@ pub(crate) fn run_mux(
     // stores the flag before dropping its sender, so the store
     // happens-before the loop observes channel close.
     let producer_read_error = producer_read_failed.load(Ordering::Relaxed);
+    // Carries the specific read-error cause out to the `MuxOutcome` so the
+    // orchestrator can put it in `last_error` (see `read_error` field).
+    let mut read_error_cause: Option<String> = None;
     if producer_read_error {
         // Always record the cause so the resumable stop isn't silent in
         // the log — the orchestrator's "stopped → idle" branch (no
@@ -1628,6 +1648,7 @@ pub(crate) fn run_mux(
             &device_str_for_sink,
             &format!("Mux incomplete: producer aborted mid-stream — {cause} (MKV truncated)"),
         );
+        read_error_cause = Some(cause);
     }
 
     // `completed` is the orchestrator's gate for writing `.done` /
@@ -1743,6 +1764,7 @@ pub(crate) fn run_mux(
         lost_video_secs,
         output_opened: true,
         finalize_error,
+        read_error: read_error_cause,
     }
 }
 

@@ -3589,6 +3589,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // timeout / panic — those are wedge cases handled by the existing
     // "stopped" path so the user can retry.
     let finalize_error = mux_outcome.finalize_error.clone();
+    // A hard producer read error (on_read_error=stop saw an unrecoverable
+    // read Err and truncated the MKV) is reported here, distinct from a
+    // user-initiated halt. Both yield `completed=false` with no
+    // `finalize_error`, but only a halt should fall through to the silent
+    // "stopped → idle" path: a read failure must surface on `/api/state`
+    // (status="error" + last_error) so the operator sees the rip failed
+    // due to a read error rather than a user stop. The disc stays
+    // resumable (no `.failed` quarantine — a transient drive/NFS read may
+    // succeed on retry), matching run_mux's resumable-stop semantics.
+    let read_error = mux_outcome.read_error.clone();
     let mut final_errors = mux_outcome.errors;
     let final_last_sector = rip_last_lba.load(Ordering::Relaxed);
     let final_current_batch = rip_current_batch.load(Ordering::Relaxed);
@@ -3872,15 +3882,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // through to the pre-existing "stopped → idle" behaviour
         // (halt / write error / wedge).
         let (log_prefix, ui_status, ui_failure_reason) =
-            if let Some(reason) = finalize_error.as_ref() {
-                (
-                    format!("Failed (mux finalize): {reason}"),
-                    "failed".to_string(),
-                    Some(format!("mux finalize failed: {reason}")),
-                )
-            } else {
-                ("Stopped".to_string(), "idle".to_string(), None)
-            };
+            incomplete_mux_status(finalize_error.as_deref(), read_error.as_deref());
         crate::log::device_log(
             device,
             &format!(
@@ -4190,6 +4192,42 @@ fn prune_intermediate_iso(
 ///     prior `status="ripping"`.
 fn header_phase_outcome_is_failure(output_opened: bool, finalize_error: Option<&str>) -> bool {
     !output_opened && finalize_error.is_some()
+}
+
+/// Decide the log prefix, `/api/state` status, and `last_error`/`failure_reason`
+/// for a mux that finished with `completed == false`. Three cases, in priority
+/// order:
+///   1. `finalize_error` → the MKV is structurally broken (Cues/trailer never
+///      landed). `status="failed"`; the caller quarantines with `.failed`.
+///   2. `read_error` → a hard producer read error truncated the MKV under
+///      `on_read_error=stop`. `status="error"` with the cause, so `/api/state`
+///      signals the failure. This is NOT a user halt: the caller leaves staging
+///      resumable (no `.failed`), but the operator must still see why it stopped.
+///   3. neither → a genuine user-initiated halt / wedge. The pre-existing
+///      "stopped → idle" path, with no `last_error`.
+///
+/// `read_error` is only consulted when `finalize_error` is `None`: a structural
+/// finalize failure is the stronger signal (a broken file on disk) and already
+/// implies the body was truncated.
+fn incomplete_mux_status(
+    finalize_error: Option<&str>,
+    read_error: Option<&str>,
+) -> (String, String, Option<String>) {
+    if let Some(reason) = finalize_error {
+        (
+            format!("Failed (mux finalize): {reason}"),
+            "failed".to_string(),
+            Some(format!("mux finalize failed: {reason}")),
+        )
+    } else if let Some(cause) = read_error {
+        (
+            format!("Failed (read error): {cause}"),
+            "error".to_string(),
+            Some(format!("rip stopped: read error — {cause}")),
+        )
+    } else {
+        ("Stopped".to_string(), "idle".to_string(), None)
+    }
 }
 
 /// User-facing message for the "encrypted disc, no keys resolved" failure.
@@ -4611,8 +4649,8 @@ mod tests {
 
     use super::{
         HaltGuard, aacs_failure_message, disk_space_preflight_message, format_pass_error,
-        header_phase_outcome_is_failure, is_safe_staging_segment, prune_intermediate_iso,
-        register_halt, staging_dir_matches_disc, staging_free_bytes,
+        header_phase_outcome_is_failure, incomplete_mux_status, is_safe_staging_segment,
+        prune_intermediate_iso, register_halt, staging_dir_matches_disc, staging_free_bytes,
     };
     use crate::ripper::session::device_halt;
     use libfreemkv::{Error, ScsiSense};
@@ -4759,6 +4797,43 @@ mod tests {
             true,
             Some("post-mux finalize error")
         ));
+    }
+
+    /// Regression: single-pass `on_read_error=stop` with a hard read error.
+    /// `run_mux` returns `completed=false` with `read_error=Some` and no
+    /// `finalize_error`. The orchestrator's incomplete-mux branch must map
+    /// that to `status="error"` with a non-empty cause — NOT the silent
+    /// "stopped → idle" path a genuine user halt takes — so `/api/state`
+    /// signals the read failure rather than looking like an idle, user-
+    /// stopped rip with no `last_error`.
+    #[test]
+    fn read_error_surfaces_as_error_status_not_silent_idle() {
+        // A read-error truncation: status="error", reason names the cause.
+        let (log_prefix, status, reason) =
+            incomplete_mux_status(None, Some("E7015 read failed at LBA 42"));
+        assert_eq!(status, "error");
+        let reason = reason.expect("read error must carry a failure_reason / last_error");
+        assert!(
+            reason.contains("E7015 read failed at LBA 42"),
+            "failure_reason must name the read-error cause, got: {reason}"
+        );
+        assert!(log_prefix.contains("read error"));
+
+        // A genuine user halt (no finalize_error, no read_error) stays the
+        // pre-existing silent stop → idle with no last_error.
+        let (_, status, reason) = incomplete_mux_status(None, None);
+        assert_eq!(status, "idle");
+        assert!(
+            reason.is_none(),
+            "a user halt must NOT fabricate a failure_reason"
+        );
+
+        // A structural finalize error still wins over a read error (broken
+        // file on disk is the stronger signal → quarantine path).
+        let (_, status, reason) =
+            incomplete_mux_status(Some("cues seek-back failed"), Some("read error too"));
+        assert_eq!(status, "failed");
+        assert!(reason.unwrap().contains("cues seek-back failed"));
     }
 
     /// The disk-space pre-flight in `rip_disc` branches on
