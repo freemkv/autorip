@@ -2023,6 +2023,23 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     drop_session(device);
                     return;
                 }
+            } else {
+                // statvfs failed: staging path doesn't exist yet, the
+                // volume isn't mounted, or the path isn't a POSIX
+                // filesystem. We can't compute free space, so the 2×
+                // requirement can't be checked. Don't silently skip the
+                // preflight — tell the operator why, so an eventual
+                // mid-stream ENOSPC (e.g. an unmounted staging volume)
+                // isn't a surprise. Mirrors the unknown-capacity branch.
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "disk-space preflight skipped: could not read free space at {} \
+                         (path missing or volume not mounted?); a too-small or unmounted \
+                         staging volume will ENOSPC mid-rip",
+                        &staging,
+                    ),
+                );
             }
         }
 
@@ -4376,7 +4393,7 @@ mod tests {
 
     use super::{
         HaltGuard, aacs_failure_message, format_pass_error, is_safe_staging_segment, register_halt,
-        staging_dir_matches_disc,
+        staging_dir_matches_disc, staging_free_bytes,
     };
     use crate::ripper::session::device_halt;
     use libfreemkv::{Error, ScsiSense};
@@ -4416,6 +4433,34 @@ mod tests {
             matches,
             vec!["Cars".to_string()],
             "only the exact 'Cars' dir must match, not the 'Cars_2' sibling"
+        );
+    }
+
+    /// The disk-space pre-flight in `rip_disc` branches on
+    /// `staging_free_bytes`: `Some(avail)` runs the 2×-capacity gate,
+    /// `None` must take the diagnostic-log branch (NOT silently skip).
+    /// This locks in the contract that branch relies on — a missing /
+    /// unmounted staging path yields `None` so the operator gets a
+    /// "preflight skipped" warning instead of a silent slide into a
+    /// mid-rip ENOSPC. A real, existing path must yield `Some`.
+    #[test]
+    fn staging_free_bytes_none_for_missing_path_some_for_real() {
+        // Nonexistent path → statvfs fails → None (drives the else/warn
+        // branch in the rip_disc preflight).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist-staging-volume");
+        assert!(
+            staging_free_bytes(&missing.to_string_lossy()).is_none(),
+            "a missing staging path must return None so the preflight logs \
+             'skipped' rather than silently proceeding"
+        );
+
+        // A real, existing directory → Some(free bytes) on unix (statvfs).
+        // The non-unix stub always returns None, so only assert Some there.
+        #[cfg(unix)]
+        assert!(
+            staging_free_bytes(&tmp.path().to_string_lossy()).is_some(),
+            "an existing staging path must return Some(free_bytes)"
         );
     }
 
