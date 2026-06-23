@@ -313,14 +313,14 @@ fn copy_counting(
     // the source. A crash at any point leaves either no final-name file or
     // the complete one — never a truncated file at the real name.
     if let Some(parent) = dest.parent() {
-        crate::ripper::staging::fsync_dir(parent);
+        libfreemkv::io::fsync::dir(parent);
     }
     if let Err(e) = std::fs::rename(&tmp, dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     if let Some(parent) = dest.parent() {
-        crate::ripper::staging::fsync_dir(parent);
+        libfreemkv::io::fsync::dir(parent);
     }
     Ok(total)
 }
