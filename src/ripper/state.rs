@@ -291,6 +291,23 @@ pub(super) fn is_in_cooldown(device: &str) -> bool {
     false
 }
 
+/// Drop the per-device entries in the auxiliary maps (`TITLE_OVERRIDES`,
+/// `STOP_COOLDOWNS`) on hot-unplug. STATE/log/session are evicted by the
+/// caller; these two maps are the only other per-device state, and without
+/// this they'd accumulate stale entries if device paths churn over a long
+/// container lifetime. Recover-and-proceed on poison (same convention as
+/// the rest of this module).
+pub(super) fn forget_device_state(device: &str) {
+    TITLE_OVERRIDES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(device);
+    STOP_COOLDOWNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(device);
+}
+
 /// True when `device` is a known drive tracked in STATE. Used by routes
 /// that mutate per-device state (e.g. the title override) to reject a
 /// request for an unknown device with 404 rather than silently storing an
@@ -1729,6 +1746,47 @@ mod tests {
             !is_busy(&dev),
             "after spawn-failure reset the device must no longer be busy \
              (else every future scan/rip 409s until restart)"
+        );
+    }
+
+    #[test]
+    fn forget_device_state_clears_title_override_and_cooldown() {
+        // Regression: on hot-unplug, TITLE_OVERRIDES and STOP_COOLDOWNS were
+        // the only per-device maps not evicted, so stale entries accumulated
+        // as device paths churned. forget_device_state must drop both.
+        let dev = "/dev/sg-forget-test";
+        set_title_override(
+            dev,
+            crate::tmdb::TmdbResult {
+                title: "Test".to_string(),
+                year: 2000,
+                poster_url: String::new(),
+                overview: String::new(),
+                media_type: "movie".to_string(),
+            },
+        );
+        set_stop_cooldown(dev);
+        assert!(is_in_cooldown(dev), "cooldown must be set before eviction");
+
+        forget_device_state(dev);
+
+        assert!(
+            !TITLE_OVERRIDES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(dev),
+            "title override must be gone after forget_device_state"
+        );
+        assert!(
+            !STOP_COOLDOWNS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(dev),
+            "stop cooldown must be gone after forget_device_state"
+        );
+        assert!(
+            !is_in_cooldown(dev),
+            "device must not read as in cooldown after eviction"
         );
     }
 }
