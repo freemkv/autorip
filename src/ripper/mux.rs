@@ -707,19 +707,40 @@ fn mux_completed(
 
 /// Build the specific cause string for a hard producer `read()` error.
 ///
-/// The stream yields an `io::Error`; mapping it back to a coded
-/// `libfreemkv::Error` lets a non-generic `E####` (DiscRead, AACS/CSS
-/// decrypt manifesting mid-stream, etc.) be named in the terminal,
-/// user-facing reason instead of a fixed generic truncation string. The
-/// `io::Error` Display already carries the coded message text, so it is
-/// included as the human-readable tail.
+/// The stream yields an `io::Error`; when the underlying fault was a
+/// coded `libfreemkv::Error` (DiscRead, AACS/CSS decrypt manifesting
+/// mid-stream, etc.) it reached the producer via `From<Error> for
+/// io::Error`, which stringifies the original through `Error`'s
+/// `Display` — so the `io::Error` message already begins with an
+/// `E####:` prefix. We surface that code in a parenthetical annotation
+/// so an operator sees the real fault identifier in `last_error`.
+///
+/// Note: reconstructing the code by `Error::from(io::Error)` does NOT
+/// work — `From<io::Error> for Error` is unconditionally `Error::IoError`,
+/// whose `.code()` is always `E_IO_ERROR`. The code only survives in the
+/// stringified message, so we parse it back out of the leading token.
 fn producer_read_error_cause(e: &std::io::Error) -> String {
-    let code = libfreemkv::error::Error::from(std::io::Error::new(e.kind(), e.to_string())).code();
-    if code == libfreemkv::error::E_IO_ERROR {
-        format!("read error mid-stream: {e}")
-    } else {
-        format!("read error mid-stream (E{code}): {e}")
+    match coded_prefix(&e.to_string()) {
+        Some(code) if code != libfreemkv::error::E_IO_ERROR => {
+            format!("read error mid-stream (E{code}): {e}")
+        }
+        _ => format!("read error mid-stream: {e}"),
     }
+}
+
+/// Parse a leading `E<digits>` code token from a `libfreemkv::Error`
+/// `Display` string (e.g. `"E6000: 12345 0x.."` → `Some(6000)`). Returns
+/// `None` for a plain (non-coded) io-error message, so those don't get a
+/// spurious code annotation.
+fn coded_prefix(msg: &str) -> Option<u16> {
+    let rest = msg.strip_prefix('E')?;
+    // The code is the run of ASCII digits up to the `:` separator (or end,
+    // for argument-less variants like `E1024`).
+    let digits: &str = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 pub(crate) fn run_mux(
@@ -1801,9 +1822,13 @@ mod tests {
         let decrypt_io: std::io::Error = libfreemkv::Error::DecryptFailed.into();
         let decrypt_code = libfreemkv::Error::DecryptFailed.code();
         let cause = producer_read_error_cause(&decrypt_io);
+        // The annotated parenthetical form must actually be emitted — not
+        // just an incidental `E####` in the message tail. (Guards the dead
+        // `else` branch the code-extraction round-trip used to leave
+        // unreachable.)
         assert!(
-            cause.contains(&format!("E{decrypt_code}")),
-            "decrypt cause must name the coded fault, got: {cause}"
+            cause.contains(&format!("(E{decrypt_code})")),
+            "decrypt cause must name the coded fault in the annotation, got: {cause}"
         );
         assert!(cause.contains("read error mid-stream"), "got: {cause}");
 
@@ -1817,8 +1842,8 @@ mod tests {
         let disc_io: std::io::Error = disc_err.into();
         let cause = producer_read_error_cause(&disc_io);
         assert!(
-            cause.contains(&format!("E{disc_code}")),
-            "disc-read cause must name the coded fault, got: {cause}"
+            cause.contains(&format!("(E{disc_code})")),
+            "disc-read cause must name the coded fault in the annotation, got: {cause}"
         );
     }
 
@@ -1833,6 +1858,21 @@ mod tests {
         assert!(
             !cause.contains(&format!("(E{})", libfreemkv::error::E_IO_ERROR)),
             "plain io error must not carry a synthetic code prefix, got: {cause}"
+        );
+        // No parenthetical annotation at all for a non-coded message.
+        assert!(
+            !cause.contains("(E"),
+            "plain io error must not carry any code annotation, got: {cause}"
+        );
+
+        // A coded error that maps to the generic IoError code must also not
+        // gain a spurious `(E5000)` annotation — only its tail names it.
+        let io_coded: std::io::Error =
+            libfreemkv::Error::from(std::io::Error::new(std::io::ErrorKind::Other, "boom")).into();
+        let cause = producer_read_error_cause(&io_coded);
+        assert!(
+            !cause.contains(&format!("(E{})", libfreemkv::error::E_IO_ERROR)),
+            "IoError-coded fault must not carry the generic annotation, got: {cause}"
         );
     }
 
