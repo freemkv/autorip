@@ -640,7 +640,19 @@ fn check_and_move(cfg: &Config) {
                         .unwrap_or(false)
                 })
                 .collect(),
-            Err(_) => continue,
+            Err(e) => {
+                // Enumerating the staging dir's contents failed (e.g. a
+                // transient NFS read_dir error). Without this arm the dir
+                // would be skipped silently every tick — a `.done` marker
+                // that never gets acted on, invisible on the System page.
+                // Surface it like every other error path in this function.
+                record_error(
+                    &dir.to_string_lossy(),
+                    &format!("cannot list staging directory {}: {}", dir.display(), e),
+                    "check that the staging mount is healthy and readable",
+                );
+                continue;
+            }
         };
 
         if ripped_files.is_empty() {
@@ -1695,6 +1707,51 @@ mod tests {
         assert!(
             !disc_dir.exists(),
             "staging disc dir should have been removed after successful MKV move"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_and_move_records_error_when_inner_read_dir_fails() {
+        // Regression: when read_dir on the staging disc dir fails (e.g. a
+        // transient NFS error) after the .done marker is already parsed,
+        // the dir must NOT be skipped silently. Pre-fix the `Err(_) =>
+        // continue` arm dropped the failure with no record_error and no
+        // log, leaving a .done-marked dir that the mover re-evaluated and
+        // re-skipped every tick, invisible on the System page.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let movie_dir = tmp.path().join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
+
+        let disc_dir = staging.join("Unlistable");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Unlistable")).unwrap();
+
+        let dir_str = disc_dir.to_string_lossy().to_string();
+        clear_error(&dir_str);
+
+        // Owner execute-only (0o100): search bit lets read_to_string open
+        // the known-path .done, but read bit cleared makes read_dir EACCES.
+        std::fs::set_permissions(&disc_dir, std::fs::Permissions::from_mode(0o100)).unwrap();
+
+        check_and_move(&cfg);
+
+        // Restore perms so tempdir teardown can recurse.
+        std::fs::set_permissions(&disc_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let recorded = {
+            let m = MOVE_ERRORS.lock().unwrap();
+            m.get(&dir_str).cloned()
+        };
+        clear_error(&dir_str);
+        assert!(
+            recorded.is_some(),
+            "a read_dir failure on the staging dir must record a mover error"
         );
     }
 
