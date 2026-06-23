@@ -236,8 +236,13 @@ pub fn default_autorip_dir() -> String {
     // this, the Docker `/config` convention below resolves to the drive root
     // (`C:\config`) — scattering staging/output/keys outside the app. Portable:
     // move the folder, the app's state moves with it.
+    // Always resolve to a REAL ABSOLUTE path (deduced at runtime from the exe
+    // location, then %APPDATA%, then the working dir) so the UI/logs show the
+    // actual folder — e.g. `D:\Users\matthew\Downloads\autorip\config` — never a
+    // relative `.\config` the user has to guess the meaning of.
     #[cfg(windows)]
     {
+        // current_exe() is absolute, so its parent is too.
         if let Ok(exe) = std::env::current_exe() {
             if let Some(parent) = exe.parent() {
                 return parent.join("config").to_string_lossy().into_owned();
@@ -249,7 +254,12 @@ pub fn default_autorip_dir() -> String {
                 return format!("{appdata}\\autorip");
             }
         }
-        return "config".to_string(); // last resort: cwd-relative, never C:\config
+        // Last resort: the ABSOLUTE working directory + `config`, never a bare
+        // relative `config` (which would display as `.\config`).
+        if let Ok(cwd) = std::env::current_dir() {
+            return cwd.join("config").to_string_lossy().into_owned();
+        }
+        return "config".to_string();
     }
     // Docker/Linux: the container bind-mounts /config. (Windows never reaches
     // here — the `/config` path means the drive root there, which we avoid.)
@@ -312,10 +322,18 @@ pub fn load() -> Arc<RwLock<Config>> {
     // orphan an in-progress ISO and split data across two directories. Bare run
     // (downloadable binary, no mounts) is the only case where they don't exist.
     if cfg.staging_dir == "/staging" && !std::path::Path::new("/staging").exists() {
-        cfg.staging_dir = format!("{}/staging", cfg.autorip_dir);
+        // Native join so the derived path uses the platform separator (clean
+        // `...\config\staging` on Windows, not a mixed-slash `config/staging`).
+        cfg.staging_dir = std::path::Path::new(&cfg.autorip_dir)
+            .join("staging")
+            .to_string_lossy()
+            .into_owned();
     }
     if cfg.output_dir == "/output" && !std::path::Path::new("/output").exists() {
-        cfg.output_dir = format!("{}/output", cfg.autorip_dir);
+        cfg.output_dir = std::path::Path::new(&cfg.autorip_dir)
+            .join("output")
+            .to_string_lossy()
+            .into_owned();
     }
     for d in [
         cfg.log_dir(),
