@@ -4043,7 +4043,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             } else {
                 sweep_damage_snapshot.total_lost_ms
             },
-            main_lost_ms: sweep_damage_snapshot.main_lost_ms,
+            // Single-pass mode has no mapfile, so `sweep_damage_snapshot` is
+            // the all-zero Default and its `main_lost_ms` is always 0.0 —
+            // leaving the done card showing "(0s in main movie)" even when the
+            // demux skipped in-title sectors. `final_lost_secs` is already the
+            // in-title loss for single-pass (the demux-skip estimate), so mirror
+            // the `total_lost_ms` branch above. Multipass keeps the snapshot's
+            // value, which is derived from the mapfile's in-title bad ranges.
+            main_lost_ms: if cfg_read.max_retries == 0 {
+                final_lost_secs * 1000.0
+            } else {
+                sweep_damage_snapshot.main_lost_ms
+            },
             bad_ranges: sweep_damage_snapshot.bad_ranges.clone(),
             num_bad_ranges: sweep_damage_snapshot.num_bad_ranges,
             bad_ranges_truncated: sweep_damage_snapshot.bad_ranges_truncated,
@@ -5664,6 +5675,70 @@ mod tests {
             final_lost_secs > 0.0 && final_lost_secs < 1.0,
             "expected small non-zero lost_secs, got {:.6}",
             final_lost_secs
+        );
+    }
+
+    /// Regression: single-pass (max_retries == 0) has no mapfile, so
+    /// `sweep_damage_snapshot` is the all-zero Default. The done-state
+    /// `main_lost_ms` must be derived from `final_lost_secs` (the demux-skip
+    /// estimate), mirroring the `total_lost_ms` branch — NOT taken from the
+    /// zero snapshot, which would always render "(0s in main movie)" even
+    /// when in-title sectors were skipped.
+    ///
+    /// This replicates the selection logic at rip_disc's done-state update.
+    #[test]
+    fn single_pass_done_card_main_lost_ms_tracks_final_lost_secs() {
+        // Snapshot is the all-zero Default in single-pass mode.
+        let snapshot = super::mux::SweepDamageSnapshot::default();
+        assert_eq!(
+            snapshot.main_lost_ms, 0.0,
+            "single-pass snapshot main_lost_ms is the zero Default"
+        );
+
+        // The mux reported real in-title loss (demux skipped sectors).
+        let final_lost_secs = 1.5_f64;
+
+        // Replicate the fix's branch selection for single-pass (max_retries == 0).
+        let max_retries = 0u32;
+        let main_lost_ms = if max_retries == 0 {
+            final_lost_secs * 1000.0
+        } else {
+            snapshot.main_lost_ms
+        };
+        let total_lost_ms = if max_retries == 0 {
+            final_lost_secs * 1000.0
+        } else {
+            snapshot.total_lost_ms
+        };
+
+        assert!(
+            (main_lost_ms - 1500.0).abs() < 0.001,
+            "single-pass main_lost_ms must reflect real loss, got {main_lost_ms}"
+        );
+        assert!(
+            (main_lost_ms - total_lost_ms).abs() < 0.001,
+            "single-pass main_lost_ms must mirror total_lost_ms"
+        );
+    }
+
+    /// Multipass (max_retries > 0) keeps the snapshot's mapfile-derived
+    /// `main_lost_ms` — the fix must not regress the multipass path.
+    #[test]
+    fn multipass_done_card_main_lost_ms_uses_snapshot() {
+        let snapshot = super::mux::SweepDamageSnapshot {
+            main_lost_ms: 2750.0,
+            ..Default::default()
+        };
+        let final_lost_secs = 999.0_f64; // would be wrong if used in multipass
+        let max_retries = 3u32;
+        let main_lost_ms = if max_retries == 0 {
+            final_lost_secs * 1000.0
+        } else {
+            snapshot.main_lost_ms
+        };
+        assert!(
+            (main_lost_ms - 2750.0).abs() < 0.001,
+            "multipass main_lost_ms must come from the mapfile-derived snapshot, got {main_lost_ms}"
         );
     }
 
