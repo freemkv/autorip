@@ -52,6 +52,12 @@ pub struct RippedMarker {
     pub tmdb_year: u16,
     pub tmdb_poster: String,
     pub tmdb_overview: String,
+    /// TMDB media type ("movie" or "tv"). `#[serde(default)]` (empty
+    /// string) for backward-compat with pre-rc.4 markers that predate
+    /// this field; the resume mux path falls back to "movie" when empty,
+    /// matching the mover's own default.
+    #[serde(default)]
+    pub tmdb_media_type: String,
     pub max_retries: u8,
     pub abort_on_lost_secs: u32,
     pub rip_elapsed_secs: f64,
@@ -469,6 +475,7 @@ mod tests {
             tmdb_year: 2024,
             tmdb_poster: "https://image.tmdb.org/poster.jpg".into(),
             tmdb_overview: "Synopsis".into(),
+            tmdb_media_type: "tv".into(),
             max_retries: 5,
             abort_on_lost_secs: 30,
             rip_elapsed_secs: 1234.0,
@@ -494,6 +501,39 @@ mod tests {
         assert_eq!(back.display_name, "Border Town");
         assert_eq!(back.tmdb_year, 2024);
         assert_eq!(back.schema_version, RIPPED_MARKER_SCHEMA);
+        // media_type must survive the hand-off: the resume mux path seeds it
+        // into STATE and writes it into the `.done`/`.review` marker so the
+        // mover routes a resumed TV rip to the TV library, not movies.
+        assert_eq!(back.tmdb_media_type, "tv");
+    }
+
+    /// Backward-compat: a pre-rc.4 `.ripped` marker on disk has no
+    /// `tmdb_media_type` field. It must deserialize (serde default = empty
+    /// string) rather than failing the resume. The resume mux path then
+    /// falls back to "movie" — identical to the mover's own default.
+    #[test]
+    fn marker_without_media_type_defaults_empty() {
+        let json = r#"{
+            "schema_version": 1,
+            "iso_path": "/staging/Old/Old.iso",
+            "mapfile_path": "/staging/Old/Old.iso.mapfile",
+            "display_name": "Old",
+            "disc_format": "uhd",
+            "mkv_filename": "Old.mkv",
+            "tmdb_title": "Old",
+            "tmdb_year": 2020,
+            "tmdb_poster": "",
+            "tmdb_overview": "",
+            "max_retries": 3,
+            "abort_on_lost_secs": 0,
+            "rip_elapsed_secs": 0.0,
+            "rip_errors": 0,
+            "rip_lost_video_secs": 0.0,
+            "rip_last_sector": 0,
+            "origin_device": "sg0"
+        }"#;
+        let marker: RippedMarker = serde_json::from_str(json).unwrap();
+        assert_eq!(marker.tmdb_media_type, "");
     }
 
     #[test]
