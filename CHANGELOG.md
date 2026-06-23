@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.0.0-rc.4.2]
+
+Windows durability fixes.
+
+### Fixed
+
+- **Windows re-mux loop.** The post-mux durability gate opened the
+  finished output read-only, so on Windows the flush (`FlushFileBuffers`)
+  was rejected with `ERROR_ACCESS_DENIED`; the `.done` marker was never
+  written and auto-resume re-muxed the same disc indefinitely. The gate
+  now opens the output read+write so the flush succeeds on every platform.
+- **Windows free-space preflight.** `staging_free_bytes` was a no-op on
+  Windows, so the staging out-of-space check never ran; it now reads free
+  space via `GetDiskFreeSpaceExW`.
+- **Windows log noise.** Directory fsync (a POSIX concept) is now a no-op
+  on Windows instead of failing to open the directory and warning on every
+  marker and mapfile write.
+
 ## [1.0.0-rc.4] — UNRELEASED
 
 Plain-English failure reasons, accurate loss accounting on done cards,
