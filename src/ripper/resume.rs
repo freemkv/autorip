@@ -993,6 +993,57 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         return;
     }
 
+    // Post-mux loss abort gate — mirror the fresh single-pass gate
+    // (mod.rs, "Single-pass abort gate"). The PRE-mux gate above
+    // (resume.rs §3) only sees mapfile `Unreadable` sectors. It cannot
+    // see demux-time loss: sectors that read into the ISO fine but fail
+    // AACS/CSS decrypt at mux time, or codec-level corruption that forces
+    // the demuxer to skip — both zero-fill and surface only as
+    // `mux_outcome.lost_video_secs`. Without this gate a resumed rip would
+    // auto-file (`.done`) a disc whose identical loss the fresh single-pass
+    // path quarantines (`.failed`) under `abort_on_lost_secs=0`. The two
+    // paths must reach the same verdict.
+    //
+    // `lost_video_secs` from `run_mux` is the live demux-skip estimate
+    // (bytes skipped / title_bytes_per_sec), already in-title-scoped — the
+    // same quantity and semantics the single-pass gate compares.
+    let demux_lost_secs = mux_outcome.lost_video_secs;
+    let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
+    if super::should_abort_for_loss(demux_lost_secs * 1000.0, abort_threshold_ms) {
+        crate::log::device_log(
+            device,
+            &format!(
+                "Auto-resume aborted: {:.2}s lost at mux (demux/decrypt skips) exceeds threshold {}s",
+                demux_lost_secs, cfg_read.abort_on_lost_secs
+            ),
+        );
+        // Quarantine the lossy output: write `.failed` (no `.done`/
+        // `.completed`) so the mover never files it and the resume detector
+        // treats the dir as terminal-failed — exactly as the single-pass
+        // gate does. Clear the restart count so a benign restart doesn't
+        // re-attempt a deterministically-lossy mux.
+        staging::write_failed_marker(
+            &staging_dir,
+            &format!(
+                "aborted: {:.2}s lost at mux exceeds threshold {}s",
+                demux_lost_secs, cfg_read.abort_on_lost_secs
+            ),
+        );
+        staging::clear_restart_count(&staging_dir);
+        reset_status_after_ripping(
+            device,
+            "error",
+            &display_name,
+            &disc_format,
+            &duration,
+            Some(format!(
+                "aborted: {:.2}s lost at mux exceeds threshold {}s",
+                demux_lost_secs, cfg_read.abort_on_lost_secs
+            )),
+        );
+        return;
+    }
+
     // 5. Success — write .completed marker, drop the hand-off marker for
     // the mover, clear .restart_count. Same shape as the rip_disc
     // completion path so the mover treats this output identically.
@@ -1591,6 +1642,55 @@ mod resume_remux_webhook_tests {
             region.contains("event: \"rip_complete\""),
             "the resume completion webhook must use the rip_complete event \
              name, matching rip_disc"
+        );
+    }
+}
+
+#[cfg(test)]
+mod post_mux_loss_gate_tests {
+    /// Regression: `resume_remux` must enforce the SAME post-mux loss
+    /// abort gate the fresh single-pass path does. The PRE-mux gate only
+    /// counts mapfile `Unreadable` sectors; demux-time loss (AACS/CSS
+    /// decrypt failures during ISO mux, codec-corruption demux skips) is
+    /// invisible there and surfaces only as `mux_outcome.lost_video_secs`.
+    /// Without a post-mux check, a resumed rip auto-files (`.done`) a disc
+    /// whose identical loss the single-pass path quarantines (`.failed`)
+    /// under `abort_on_lost_secs=0`.
+    ///
+    /// A full behavioural test would need a real ISO that decodes into
+    /// demux skips plus a mux pipeline — out of proportion to one call
+    /// site (same rationale as `success_path_fires_completion_webhook`).
+    /// Instead this pins, at source level, that the region between the
+    /// mux-incomplete early-return and the `.completed` success marker
+    /// inspects `lost_video_secs`, compares it via `should_abort_for_loss`,
+    /// and quarantines with `write_failed_marker` on exceedance.
+    #[test]
+    fn resume_enforces_post_mux_loss_gate() {
+        let src = include_str!("resume.rs");
+        // Bound to the post-mux success region: from the mux-incomplete
+        // early-return up to the success-marker section header.
+        let start = src
+            .find("Auto-resume mux did not complete")
+            .expect("resume.rs should have the mux-incomplete early-return");
+        let end = src[start..]
+            .find("5. Success — write .completed marker")
+            .map(|i| start + i)
+            .expect("resume.rs should have the success-marker section");
+        let region = &src[start..end];
+        assert!(
+            region.contains("mux_outcome.lost_video_secs"),
+            "resume post-mux region must read mux_outcome.lost_video_secs \
+             (the only signal carrying demux-time loss)"
+        );
+        assert!(
+            region.contains("should_abort_for_loss"),
+            "resume post-mux region must gate loss via should_abort_for_loss, \
+             matching the single-pass gate"
+        );
+        assert!(
+            region.contains("write_failed_marker"),
+            "resume post-mux region must quarantine an over-threshold lossy \
+             mux with write_failed_marker (no .done), matching single-pass"
         );
     }
 }
