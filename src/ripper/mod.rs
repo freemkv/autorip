@@ -667,13 +667,14 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
         Ok(d) => d,
         Err(e) => {
-            crate::log::device_log(device, &format!("Cannot open drive: {}", e));
+            let msg = format!("Cannot open drive: {}", e);
+            crate::log::device_log(device, &msg);
             update_state(
                 device,
                 RipState {
                     device: device.to_string(),
                     status: "error".to_string(),
-                    last_error: format!("{}", e),
+                    last_error: msg,
                     ..Default::default()
                 },
             );
