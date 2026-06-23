@@ -1056,14 +1056,36 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     super::unregister_halt(device);
 
     if !mux_outcome.output_opened || !mux_outcome.completed {
+        // Mirror rip_disc's incomplete-mux handling (mod.rs): a mid-mux
+        // finalize failure or hard producer read error must surface, not be
+        // silently flattened to "idle". `incomplete_mux_status` maps
+        // finalize_error → status="failed", read_error → status="error" with
+        // the cause string, and only a genuine user halt (both None) →
+        // "idle"/no last_error. Previously this path discarded both causes,
+        // so an auto-resume mux that died on an ISO/drive read error showed
+        // "idle" — indistinguishable from a clean /api/stop — leaving the
+        // operator no clue why it stopped or that staging is still resumable.
+        let (log_prefix, ui_status, ui_failure_reason) = super::incomplete_mux_status(
+            mux_outcome.finalize_error.as_deref(),
+            mux_outcome.read_error.as_deref(),
+        );
         crate::log::device_log(
             device,
-            "Auto-resume mux did not complete — preserving partial state for next restart",
+            &format!(
+                "Auto-resume mux did not complete ({log_prefix}) — preserving partial state for next restart",
+            ),
         );
-        // Reset from "ripping" → "idle" so the next /api/rip isn't
-        // blocked by the "already ripping" gate. Halt-via-/api/stop is
-        // the common path here. Mirrors rip_disc's stopped → "idle".
-        reset_status_after_ripping(device, "idle", &display_name, &disc_format, &duration, None);
+        // Reset from "ripping" → the verdict status so the next /api/rip isn't
+        // blocked by the "already ripping" gate. Staging is preserved either
+        // way (no `.failed` written here) so the next restart can resume.
+        reset_status_after_ripping(
+            device,
+            &ui_status,
+            &display_name,
+            &disc_format,
+            &duration,
+            ui_failure_reason,
+        );
         return;
     }
 
@@ -1844,6 +1866,60 @@ mod post_mux_loss_gate_tests {
         assert!(
             !region.contains("lost_video_secs: done_sweep_damage.main_lost_ms / 1000.0"),
             "webhook must not report sweep-only loss, hiding demux loss"
+        );
+    }
+
+    /// Regression: the mux-incomplete early-return in `resume_remux` must route
+    /// through `incomplete_mux_status` (mirroring rip_disc in mod.rs) so a
+    /// mid-mux finalize error or hard producer read error surfaces. Previously
+    /// this branch hardcoded `status="idle"` with `last_error=None`, silently
+    /// discarding `mux_outcome.read_error` / `finalize_error`: an auto-resume
+    /// mux that died on an ISO/drive read error showed plain "idle" — visually
+    /// identical to a clean /api/stop — leaving the operator no indication of
+    /// the failure or that staging was still resumable.
+    ///
+    /// A behavioural test would need a mux pipeline that fails mid-stream (same
+    /// rationale as the gate tests above); instead this pins, at source level,
+    /// that the early-return consults both causes and no longer hardcodes the
+    /// idle/None verdict.
+    #[test]
+    fn resume_incomplete_mux_surfaces_read_error_not_silent_idle() {
+        let src = include_str!("resume.rs");
+        // Bound to the mux-incomplete early-return: from the guard up to the
+        // post-mux loss-abort gate comment that follows it.
+        let start = src
+            .find("if !mux_outcome.output_opened || !mux_outcome.completed {")
+            .expect("resume.rs should have the mux-incomplete guard");
+        let end = src[start..]
+            .find("Post-mux loss abort gate")
+            .map(|i| start + i)
+            .expect("resume.rs should have the post-mux loss gate after the guard");
+        let region = &src[start..end];
+
+        assert!(
+            region.contains("super::incomplete_mux_status("),
+            "resume mux-incomplete branch must route through incomplete_mux_status, \
+             matching rip_disc, so finalize/read-error causes surface"
+        );
+        assert!(
+            region.contains("mux_outcome.read_error.as_deref()"),
+            "resume mux-incomplete branch must pass mux_outcome.read_error so a \
+             mid-mux drive/ISO read error surfaces as status=error with the cause"
+        );
+        assert!(
+            region.contains("mux_outcome.finalize_error.as_deref()"),
+            "resume mux-incomplete branch must pass mux_outcome.finalize_error so a \
+             structural mux finalize failure surfaces as status=failed"
+        );
+        // Guard against regressing to the silent idle/None verdict that
+        // discarded the cause and looked like a clean /api/stop.
+        assert!(
+            !region.contains(
+                "reset_status_after_ripping(device, \"idle\", &display_name, \
+                 &disc_format, &duration, None)"
+            ),
+            "resume mux-incomplete branch must not hardcode idle/None, hiding the \
+             read-error cause and aliasing a failure to a clean stop"
         );
     }
 }
