@@ -294,7 +294,13 @@ static DISC_IDENTITY: once_cell::sync::Lazy<Mutex<std::collections::HashMap<Stri
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 pub(super) fn take_session(device: &str) -> Option<DriveSession> {
-    SESSIONS.lock().ok()?.remove(device)
+    // Recover-and-proceed on poison (matching store_session / register_halt):
+    // returning None here would have the caller open a fresh drive even though
+    // a usable session was sitting under the poisoned lock.
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(device)
 }
 
 pub(super) fn store_session(device: &str, session: DriveSession) {
@@ -349,9 +355,13 @@ pub(super) fn session_is_scanned(device: &str) -> bool {
 }
 
 pub(super) fn drop_session(device: &str) {
-    if let Ok(mut s) = SESSIONS.lock() {
-        s.remove(device);
-    }
+    // Recover-and-proceed on poison (matching store_session / take_session):
+    // silently no-op'ing here would leak a stale DriveSession in the map, so a
+    // later store_session would overwrite it and warn about a missing removal.
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(device);
 }
 
 /// After a USB re-enumeration (bridge crash), the sg device number may
@@ -507,5 +517,29 @@ mod rollback_tests {
         assert_eq!(snap.status, "idle", "must roll back to idle");
         assert!(snap.disc_present, "disc still present after rollback");
         assert!(!super::super::is_busy(&dev), "device no longer busy");
+    }
+
+    /// Regression: `take_session` and `drop_session` must recover from a
+    /// poisoned `SESSIONS` lock (unwrap_or_else into_inner), not silently
+    /// no-op as the old `.lock().ok()?` / `if let Ok(..)` forms did. A
+    /// silent no-op in `drop_session` would leak a stale session; a silent
+    /// no-op in `take_session` discards a usable one. We poison the lock
+    /// (panic while holding it, caught) and assert neither helper panics.
+    #[test]
+    fn session_helpers_recover_from_poison() {
+        // Poison SESSIONS by panicking while the guard is held.
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = SESSIONS.lock().unwrap();
+            panic!("intentional poison");
+        });
+        assert!(SESSIONS.is_poisoned(), "lock must be poisoned for the test");
+
+        let dev = format!("poison-test-{}", std::process::id());
+        // Neither helper may panic on the poisoned lock; both must run.
+        assert!(
+            take_session(&dev).is_none(),
+            "take_session on poisoned lock returns None for an absent device, not panic"
+        );
+        drop_session(&dev); // must not panic
     }
 }
