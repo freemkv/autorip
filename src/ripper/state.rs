@@ -1091,6 +1091,38 @@ mod tests {
         (dir, map)
     }
 
+    /// Regression guard: the single-pass done card must feed the real
+    /// in-title loss (lost_video_secs * 1000) into the damage classifier,
+    /// not the all-zero `sweep_damage_snapshot.total_lost_ms` (which is the
+    /// Default in direct mode, since single-pass has no mapfile).
+    ///
+    /// A rip that skipped only a handful of sectors but each covered a
+    /// large unit at low bitrate can lose >1s of video. With total_lost_ms
+    /// starved to 0.0, classify_damage's ms-branch never fires and the rip
+    /// is mis-rated "cosmetic" (10 < 51 sector threshold) when it should be
+    /// "moderate" (>=1000 ms lost).
+    #[test]
+    fn single_pass_done_card_total_lost_ms_drives_severity() {
+        // 10 skipped sectors -> below the 51-sector Moderate threshold, so
+        // severity is decided purely by the ms-branch.
+        let errors: u32 = 10;
+        let lost_video_secs: f64 = 1.5; // 1500 ms lost
+
+        // Buggy behavior: total_lost_ms starved to 0.0 -> Cosmetic.
+        assert_eq!(
+            damage_severity_for(errors, 0.0),
+            "cosmetic",
+            "starved total_lost_ms under-classifies a >1s loss"
+        );
+
+        // Fixed behavior: feed the real loss -> Moderate.
+        assert_eq!(
+            damage_severity_for(errors, lost_video_secs * 1000.0),
+            "moderate",
+            "single-pass done card must derive total_lost_ms from lost_video_secs"
+        );
+    }
+
     fn minimal_title() -> libfreemkv::DiscTitle {
         // Build an almost-empty DiscTitle — enough for the helpers that
         // only touch extents, chapters, duration_secs, size_bytes.

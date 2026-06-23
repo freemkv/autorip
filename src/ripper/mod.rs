@@ -3955,7 +3955,22 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             codecs: codecs.clone(),
             // Carry sweep damage so the done card reflects real damage
             // instead of showing a clean result for a damaged rip.
-            total_lost_ms: sweep_damage_snapshot.total_lost_ms,
+            //
+            // Single-pass mode (max_retries == 0) has no mapfile, so
+            // `sweep_damage_snapshot` is the all-zero Default (see the
+            // comment where it's declared). Feeding its `total_lost_ms`
+            // (0.0) into update_state's damage_severity_for() starves the
+            // ms-branch of classify_damage: a rip that skipped a handful
+            // of sectors but lost >1s of low-bitrate video would be rated
+            // Cosmetic instead of Moderate. Derive total_lost_ms from the
+            // real in-title loss (`final_lost_secs`) instead. Multipass
+            // keeps the snapshot's whole-disc value, which is genuinely
+            // computed from the mapfile's per-range durations.
+            total_lost_ms: if cfg_read.max_retries == 0 {
+                final_lost_secs * 1000.0
+            } else {
+                sweep_damage_snapshot.total_lost_ms
+            },
             main_lost_ms: sweep_damage_snapshot.main_lost_ms,
             bad_ranges: sweep_damage_snapshot.bad_ranges.clone(),
             num_bad_ranges: sweep_damage_snapshot.num_bad_ranges,
