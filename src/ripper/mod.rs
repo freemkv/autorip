@@ -4143,6 +4143,31 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         return;
     }
 
+    // Operator-facing ACCEPTED-done figures fold in demux-time loss the same
+    // way the single-pass path (above) and the resume path (resume.rs) do, so a
+    // fresh multi-pass rip and a resume of the IDENTICAL ISO reach the same
+    // verdict whenever demux loss is non-zero but within `abort_on_lost_secs`.
+    //
+    // Single-pass (max_retries == 0): the 3812 overwrite block was skipped, so
+    // `final_lost_secs == demux_lost_secs` and `final_errors == mux_outcome.errors`
+    // already — report them as-is to avoid double-counting.
+    //
+    // Multi-pass (max_retries > 0): `final_lost_secs` was overwritten with the
+    // sweep-mapfile loss and `final_errors` with the mapfile bad-sector count;
+    // both are disjoint from the demux skip count (sweep = Unreadable sectors
+    // baked into the ISO; demux = decrypt/codec skips at mux), so add the demux
+    // loss / errors. This mirrors the ABORTED multipass branch above, which
+    // already reports `final_lost_secs + demux_lost_secs`.
+    let (done_errors, done_lost_secs, done_demux_extra_ms) = if cfg_read.max_retries == 0 {
+        (final_errors, final_lost_secs, 0.0)
+    } else {
+        (
+            final_errors.saturating_add(mux_outcome.errors),
+            final_lost_secs + demux_lost_secs,
+            demux_lost_secs * 1000.0,
+        )
+    };
+
     crate::log::device_log(
         device,
         &format!(
@@ -4150,8 +4175,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             bytes_done as f64 / 1_073_741_824.0,
             elapsed,
             speed,
-            final_errors,
-            final_lost_secs,
+            done_errors,
+            done_lost_secs,
         ),
     );
 
@@ -4164,8 +4189,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             disc_name: display_name.clone(),
             disc_format: disc_format.clone(),
             progress_pct: 100,
-            errors: final_errors,
-            lost_video_secs: final_lost_secs,
+            errors: done_errors,
+            lost_video_secs: done_lost_secs,
             last_sector: final_last_sector,
             current_batch: final_current_batch,
             preferred_batch: batch,
@@ -4192,7 +4217,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             total_lost_ms: if cfg_read.max_retries == 0 {
                 final_lost_secs * 1000.0
             } else {
-                sweep_damage_snapshot.total_lost_ms
+                sweep_damage_snapshot.total_lost_ms + done_demux_extra_ms
             },
             // Single-pass mode has no mapfile, so `sweep_damage_snapshot` is
             // the all-zero Default and its `main_lost_ms` is always 0.0 —
@@ -4204,7 +4229,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             main_lost_ms: if cfg_read.max_retries == 0 {
                 final_lost_secs * 1000.0
             } else {
-                sweep_damage_snapshot.main_lost_ms
+                sweep_damage_snapshot.main_lost_ms + done_demux_extra_ms
             },
             bad_ranges: sweep_damage_snapshot.bad_ranges.clone(),
             num_bad_ranges: sweep_damage_snapshot.num_bad_ranges,
@@ -4244,8 +4269,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             speed_mbs: speed,
             elapsed_secs: elapsed,
             output_path: &staging,
-            errors: final_errors,
-            lost_video_secs: final_lost_secs,
+            // Sweep loss + demux loss (same combined figures as the done card)
+            // so the completion notification reports the real loss in the
+            // delivered MKV, not the sweep-mapfile-only subset.
+            errors: done_errors,
+            lost_video_secs: done_lost_secs,
         },
     );
 }
@@ -5984,24 +6012,111 @@ mod tests {
     }
 
     /// Multipass (max_retries > 0) keeps the snapshot's mapfile-derived
-    /// `main_lost_ms` — the fix must not regress the multipass path.
+    /// sweep loss but additionally folds in the demux-time loss — matching
+    /// the single-pass path (which surfaces demux loss via `final_lost_secs`)
+    /// and the resume path (resume.rs, which adds `demux_lost_secs * 1000`).
+    /// The whole-disc `final_lost_secs` value must NOT replace the snapshot.
     #[test]
-    fn multipass_done_card_main_lost_ms_uses_snapshot() {
+    fn multipass_done_card_main_lost_ms_uses_snapshot_plus_demux() {
         let snapshot = super::mux::SweepDamageSnapshot {
             main_lost_ms: 2750.0,
+            total_lost_ms: 4000.0,
             ..Default::default()
         };
-        let final_lost_secs = 999.0_f64; // would be wrong if used in multipass
+        let demux_lost_secs = 1.25_f64;
         let max_retries = 3u32;
-        let main_lost_ms = if max_retries == 0 {
-            final_lost_secs * 1000.0
+        // Replicate the fix's done_demux_extra_ms branch.
+        let done_demux_extra_ms = if max_retries == 0 {
+            0.0
         } else {
-            snapshot.main_lost_ms
+            demux_lost_secs * 1000.0
+        };
+        let main_lost_ms = if max_retries == 0 {
+            0.0
+        } else {
+            snapshot.main_lost_ms + done_demux_extra_ms
+        };
+        let total_lost_ms = if max_retries == 0 {
+            0.0
+        } else {
+            snapshot.total_lost_ms + done_demux_extra_ms
         };
         assert!(
-            (main_lost_ms - 2750.0).abs() < 0.001,
-            "multipass main_lost_ms must come from the mapfile-derived snapshot, got {main_lost_ms}"
+            (main_lost_ms - 4000.0).abs() < 0.001,
+            "multipass main_lost_ms must be sweep snapshot (2750) + demux (1250), got {main_lost_ms}"
         );
+        assert!(
+            (total_lost_ms - 5250.0).abs() < 0.001,
+            "multipass total_lost_ms must be sweep snapshot (4000) + demux (1250), got {total_lost_ms}"
+        );
+    }
+
+    /// Regression for the cross-path-asymmetry bug: an ACCEPTED fresh
+    /// multipass done card must fold demux-time loss into the headline
+    /// `errors` / `lost_video_secs`, matching the resume path
+    /// (`done_errors`/`done_lost_video_secs` in resume.rs) and the single-pass
+    /// path. Before the fix, multipass reported sweep-mapfile figures ALONE,
+    /// so a fresh multipass rip looked cleaner than a resume of the identical
+    /// ISO. Single-pass must remain unchanged (its `final_*` already equals
+    /// the demux figures), with no double-counting.
+    #[test]
+    fn accepted_done_card_folds_demux_loss_into_headline() {
+        // Replicate the (done_errors, done_lost_secs, done_demux_extra_ms)
+        // selection from the accepted-done block.
+        fn headline(
+            max_retries: u32,
+            final_errors: u32,
+            final_lost_secs: f64,
+            mux_errors: u32,
+            demux_lost_secs: f64,
+        ) -> (u32, f64, f64) {
+            if max_retries == 0 {
+                (final_errors, final_lost_secs, 0.0)
+            } else {
+                (
+                    final_errors.saturating_add(mux_errors),
+                    final_lost_secs + demux_lost_secs,
+                    demux_lost_secs * 1000.0,
+                )
+            }
+        }
+
+        // Single-pass: final_* already carry the demux figures (final_errors ==
+        // mux_errors, final_lost_secs == demux_lost_secs). No addition, so no
+        // double-counting.
+        let (errs, lost, extra) = headline(0, 7, 1.5, 7, 1.5);
+        assert_eq!(errs, 7, "single-pass errors unchanged");
+        assert!((lost - 1.5).abs() < 0.001, "single-pass lost unchanged");
+        assert!(
+            (extra - 0.0).abs() < 0.001,
+            "single-pass adds no demux extra"
+        );
+
+        // Multipass: final_errors is the mapfile bad-sector count (disjoint
+        // from the mux demux skips); final_lost_secs is the sweep main loss.
+        // Both must gain the demux contribution.
+        let (errs, lost, extra) = headline(3, 4, 2.0, 5, 1.0);
+        assert_eq!(errs, 9, "multipass errors = sweep 4 + demux 5");
+        assert!(
+            (lost - 3.0).abs() < 0.001,
+            "multipass lost = sweep 2.0 + demux 1.0"
+        );
+        assert!(
+            (extra - 1000.0).abs() < 0.001,
+            "multipass demux extra = 1.0s in ms"
+        );
+
+        // A clean-mux multipass (zero demux loss) must equal the old behavior.
+        let (errs, lost, extra) = headline(3, 4, 2.0, 0, 0.0);
+        assert_eq!(
+            errs, 4,
+            "no demux loss leaves multipass errors at sweep count"
+        );
+        assert!(
+            (lost - 2.0).abs() < 0.001,
+            "no demux loss leaves multipass lost at sweep value"
+        );
+        assert!((extra - 0.0).abs() < 0.001, "no demux loss adds no extra");
     }
 
     // ── single-pass (max_retries == 0) abort gate ───────────────────
