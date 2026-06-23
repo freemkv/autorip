@@ -2280,7 +2280,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 Err(e) => {
                     if halt.load(Ordering::Relaxed) {
                         crate::log::device_log(device, &format!("Pass 1 cancelled (halt): {e}"));
-                        unregister_halt(device);
+                        // `_halt_guard` unregisters this device's Halt token on
+                        // drop (i.e. on this `return`); no explicit call needed.
                         return;
                     }
 
