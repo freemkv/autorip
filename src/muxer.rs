@@ -272,8 +272,24 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         // on success and is the authoritative "this dir is finished"
         // signal, so it breaks the loop regardless of why the marker
         // delete failed.
-        if dir.join(crate::ripper::staging::COMPLETED_MARKER).exists() {
-            continue;
+        //
+        // Probe completion via `snapshot_staging_disc` rather than a bare
+        // `Path::exists()` on `.completed`. On NFS with a cold attribute
+        // cache (typical on a Watchtower-driven container restart), a
+        // single-shot stat can return "absent" for a marker that is
+        // durably on the server — re-dispatching a finished dir, which
+        // `delete_partial_output` then wipes before re-muxing from
+        // scratch. The snapshot reads `.completed` from a primed,
+        // 3x-retried `read_dir` view (the same defense the startup resume
+        // scan relies on), so a transient cold-cache miss can't race the
+        // marker to "absent". A `None` snapshot means the dir's contents
+        // are UNKNOWN (read_dir/DirEntry errors mid-scan): skip this tick
+        // and retry next rather than re-dispatching on an untrustworthy
+        // listing.
+        match crate::ripper::staging::snapshot_staging_disc(&dir) {
+            Some(snap) if snap.completed => continue,
+            Some(_) => {}
+            None => continue,
         }
         let marker = match read_marker(&dir) {
             Ok(m) => m,
@@ -491,6 +507,29 @@ mod tests {
         assert_eq!(q.len(), 1);
         assert!(q[0].contains("Border Town"));
         assert!(q[0].contains("queued"));
+    }
+
+    // Regression: the `check_and_mux` completion guard must consult
+    // `snapshot_staging_disc` (which reads `.completed` from a primed,
+    // 3x-retried `read_dir` view) instead of a bare `Path::exists()`.
+    // A finished dir (`.ripped` + `.completed`) must report
+    // `completed == true` so the guard short-circuits and the dir is NOT
+    // re-dispatched to remux (which would wipe the just-written MKV).
+    #[test]
+    fn completion_guard_sees_completed_via_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let movie = tmp.path().join("Border_Town");
+        std::fs::create_dir_all(&movie).unwrap();
+        write_marker(&movie, &sample_marker()).unwrap();
+        crate::ripper::staging::write_completed_marker(&movie);
+
+        let snap = crate::ripper::staging::snapshot_staging_disc(&movie)
+            .expect("a populated dir must yield a snapshot");
+        assert!(
+            snap.completed,
+            "snapshot must report completed=true for a dir with .completed; \
+             the check_and_mux guard relies on this to avoid re-muxing a finished dir"
+        );
     }
 
     #[test]
