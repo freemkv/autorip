@@ -1762,6 +1762,39 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let format = disc.content_format;
 
     let output_format = cfg_read.output_format.clone();
+
+    // `output_format == "iso"` means "capture the whole disc image", and its
+    // abort accounting is whole-disc scoped: every unreadable sector counts,
+    // including scratched menus / trailers OUTSIDE any title's extents (see the
+    // multi-pass pre-mux gate and `abort_lost_ms`). Single-pass mode streams
+    // only the selected title's sectors straight to the muxer — it never reads
+    // (let alone recovers) out-of-title sectors and produces no whole-disc ISO.
+    // So single-pass cannot honour ISO semantics: its post-mux gate would scope
+    // loss IN-TITLE, accepting a disc that the multi-pass / resume paths would
+    // ABORT on (whole-disc scope) under `abort_on_lost_secs=0` with damage
+    // outside the title — the verdict would diverge by rip mode for identical
+    // input. Refuse the incoherent combination up front and point the operator
+    // at multi-pass (the only path that captures a real whole-disc ISO and
+    // applies whole-disc loss accounting), mirroring the single-pass no-keys
+    // guidance below.
+    if iso_output_needs_multipass(&output_format, cfg_read.max_retries) {
+        crate::log::device_log(
+            device,
+            "ISO output requires multi-pass mode — single-pass streams only the \
+             selected title and cannot capture a whole-disc image. Enable multi-pass \
+             mode (Retry Passes > 0) to rip an ISO.",
+        );
+        update_state_with(device, |s| {
+            s.status = "error".to_string();
+            if s.last_error.is_empty() {
+                s.last_error =
+                    "ISO output requires multi-pass mode (enable Retry Passes).".to_string();
+            }
+        });
+        unregister_halt(device);
+        return;
+    }
+
     let ext = match output_format.as_str() {
         "m2ts" => "m2ts",
         _ => "mkv",
@@ -4243,6 +4276,23 @@ fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
     lost_ms > abort_threshold_ms
 }
 
+/// Whether an `output_format == "iso"` rip must be rejected because it was
+/// requested in single-pass mode (`max_retries == 0`).
+///
+/// ISO output is whole-disc: the deliverable is the entire image and its abort
+/// accounting counts every unreadable sector, including damage OUTSIDE any
+/// title's extents (see `abort_lost_ms` and the multi-pass / resume pre-mux
+/// gates). Single-pass streams only the selected title to the muxer — it never
+/// reads out-of-title sectors and captures no whole-disc ISO, so its post-mux
+/// gate scopes loss in-title. Allowing single-pass ISO would therefore let it
+/// ACCEPT a disc that the multi-pass / resume paths ABORT on (whole-disc scope)
+/// for identical input under `abort_on_lost_secs=0` — the verdict would diverge
+/// by rip mode. Only multi-pass captures a real ISO and applies whole-disc
+/// scope, so ISO output requires it.
+fn iso_output_needs_multipass(output_format: &str, max_retries: u8) -> bool {
+    output_format == "iso" && max_retries == 0
+}
+
 /// Prune the disc-sized intermediate ISO and its mapfile sidecar on a
 /// successful multipass completion, unless `keep_iso` is set.
 ///
@@ -5620,6 +5670,35 @@ mod tests {
             !super::should_abort_for_loss(in_title_lost_ms, abort_threshold_ms),
             "a fully-recovered title must NOT abort on out-of-title loss at threshold 0"
         );
+    }
+
+    #[test]
+    fn iso_output_rejected_in_single_pass_only() {
+        // Regression: `output_format="iso"` is whole-disc scoped for abort
+        // accounting (every unreadable sector counts, including out-of-title
+        // damage). Single-pass (max_retries=0) reads only the title and scopes
+        // loss in-title, so it would ACCEPT a disc the multi-pass / resume paths
+        // ABORT on for identical input — a rip-mode-dependent verdict. ISO must
+        // therefore require multi-pass.
+        assert!(
+            super::iso_output_needs_multipass("iso", 0),
+            "single-pass ISO must be rejected (it cannot honour whole-disc scope)"
+        );
+        // Multi-pass ISO is allowed (captures the whole-disc image + applies
+        // whole-disc scope).
+        assert!(!super::iso_output_needs_multipass("iso", 1));
+        assert!(!super::iso_output_needs_multipass("iso", 5));
+        // Non-ISO formats are unaffected in either mode.
+        for fmt in ["mkv", "m2ts", "network"] {
+            assert!(
+                !super::iso_output_needs_multipass(fmt, 0),
+                "{fmt} single-pass ok"
+            );
+            assert!(
+                !super::iso_output_needs_multipass(fmt, 5),
+                "{fmt} multi-pass ok"
+            );
+        }
     }
 
     #[test]
