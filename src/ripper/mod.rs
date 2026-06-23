@@ -3511,11 +3511,64 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         },
     );
 
-    // Output never opened (stop during headers, or `libfreemkv::output`
-    // failed): the pre-split code returned early without writing a
-    // history record. Preserve that.
+    // Output never opened. Two sub-cases:
+    //
+    //   a) `finalize_error == None` — a clean stop during header read
+    //      (halt / EOF with headers already resolvable but cancelled).
+    //      The pre-split code returned early without writing a history
+    //      record or marker, leaving the dir resumable. Preserve that.
+    //
+    //   b) `finalize_error == Some(msg)` — run_mux gave up in the header
+    //      phase because the stream is structurally unusable: the header
+    //      buffer exceeded its cap before codec_privates resolved, or EOF
+    //      / a read error hit before `headers_ready()` (the
+    //      header-resolution-incomplete path). No output file exists, but
+    //      this is a terminal failure, not a resumable stop. Falling
+    //      through to the bare return drops the reason on the floor: no
+    //      `.failed` marker (so resume-on-startup may re-resume a dir that
+    //      can never succeed) and the device tile stays in its prior
+    //      `status="ripping"` with the reason only in the device log.
+    //      Quarantine + surface it, mirroring the post-finalize failure
+    //      path below (write `.failed`, status="failed", reason in
+    //      `last_error`). No output file to fsync (none was opened).
     if !mux_outcome.output_opened {
         unregister_halt(device);
+        if header_phase_outcome_is_failure(
+            mux_outcome.output_opened,
+            mux_outcome.finalize_error.as_deref(),
+        ) {
+            let reason = mux_outcome
+                .finalize_error
+                .as_ref()
+                .expect("finalize_error is Some when header_phase_outcome_is_failure() is true");
+            crate::log::device_log(device, &format!("Mux failed: {reason}"));
+            let staging_disc_path = std::path::Path::new(&staging);
+            staging::write_failed_marker(
+                staging_disc_path,
+                &format!("mux header phase failed: {reason}"),
+            );
+            staging::clear_restart_count(staging_disc_path);
+            let failure_reason = Some(format!("mux header phase failed: {reason}"));
+            update_state(
+                device,
+                RipState {
+                    device: device.to_string(),
+                    status: "failed".to_string(),
+                    disc_present: true,
+                    disc_name: display_name.clone(),
+                    disc_format: disc_format.clone(),
+                    tmdb_title: tmdb_title.clone(),
+                    tmdb_year,
+                    tmdb_poster: tmdb_poster.clone(),
+                    tmdb_overview: tmdb_overview.clone(),
+                    duration: duration.clone(),
+                    codecs: codecs.clone(),
+                    last_error: failure_reason.clone().unwrap_or_default(),
+                    failure_reason,
+                    ..Default::default()
+                },
+            );
+        }
         return;
     }
 
@@ -4071,6 +4124,25 @@ fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
     lost_ms > abort_threshold_ms
 }
 
+/// Whether a `run_mux` outcome that never opened its output
+/// (`output_opened == false`) is a terminal failure that must be
+/// quarantined (`.failed` marker + `status="failed"`) rather than a clean,
+/// resumable stop.
+///
+/// `output_opened == false` covers two header-phase exits:
+///   * clean stop during header read (halt / cancelled): `finalize_error`
+///     is `None` — leave the staging dir resumable, surface nothing.
+///   * structurally-unusable stream: `finalize_error` is `Some` — the
+///     header buffer overflowed before codec_privates resolved, or EOF / a
+///     read error hit before `headers_ready()`
+///     (header-resolution-incomplete). No output exists and the dir can
+///     never succeed, so it must be quarantined or resume-on-startup would
+///     re-resume it forever and the device tile would stay stuck in its
+///     prior `status="ripping"`.
+fn header_phase_outcome_is_failure(output_opened: bool, finalize_error: Option<&str>) -> bool {
+    !output_opened && finalize_error.is_some()
+}
+
 /// User-facing message for the "encrypted disc, no keys resolved" failure.
 /// Switches on the libfreemkv error surfaced via `Disc::aacs_error` so the
 /// UI tells the user *which* failure they're looking at instead of always
@@ -4435,7 +4507,8 @@ mod tests {
 
     use super::{
         HaltGuard, aacs_failure_message, disk_space_preflight_message, format_pass_error,
-        is_safe_staging_segment, register_halt, staging_dir_matches_disc, staging_free_bytes,
+        header_phase_outcome_is_failure, is_safe_staging_segment, register_halt,
+        staging_dir_matches_disc, staging_free_bytes,
     };
     use crate::ripper::session::device_halt;
     use libfreemkv::{Error, ScsiSense};
@@ -4476,6 +4549,43 @@ mod tests {
             vec!["Cars".to_string()],
             "only the exact 'Cars' dir must match, not the 'Cars_2' sibling"
         );
+    }
+
+    /// Regression: a `run_mux` header-phase exit with `output_opened=false`
+    /// AND `finalize_error=Some` (header buffer overflow before
+    /// codec_privates resolved, or EOF / read error before
+    /// `headers_ready()`) must be classified as a terminal failure so the
+    /// orchestrator quarantines the staging dir (`.failed`) and flips the
+    /// device tile to `status="failed"`. A clean stop during headers
+    /// (`finalize_error=None`) must NOT be classified as a failure — it
+    /// stays resumable. Before the fix the `finalize_error=Some` case took
+    /// the bare early-return: reason dropped, no marker, tile stuck in
+    /// `status="ripping"`.
+    #[test]
+    fn header_phase_finalize_error_is_terminal_failure() {
+        // finalize_error=Some → terminal failure (quarantine).
+        assert!(
+            header_phase_outcome_is_failure(false, Some("header buffer exceeded cap")),
+            "output never opened with a finalize_error must be a terminal failure"
+        );
+        assert!(
+            header_phase_outcome_is_failure(false, Some("header resolution incomplete")),
+            "header-resolution-incomplete must be a terminal failure"
+        );
+
+        // finalize_error=None → clean stop, stays resumable (not a failure).
+        assert!(
+            !header_phase_outcome_is_failure(false, None),
+            "a clean header-phase stop (halt) must stay resumable, not quarantined"
+        );
+
+        // output_opened=true → not a header-phase failure (handled by the
+        // post-finalize path further down rip_disc, never this branch).
+        assert!(!header_phase_outcome_is_failure(true, None));
+        assert!(!header_phase_outcome_is_failure(
+            true,
+            Some("post-mux finalize error")
+        ));
     }
 
     /// The disk-space pre-flight in `rip_disc` branches on
