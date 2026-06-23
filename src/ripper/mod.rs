@@ -1044,6 +1044,72 @@ fn staging_dir_matches_disc(basename: &str, sanitized: &str) -> bool {
     basename == sanitized
 }
 
+/// List the immediate-child basenames of the staging root with the same
+/// NFS cold-cache discipline as [`staging::snapshot_staging_disc`].
+///
+/// `disc_already_completed` and `find_resumable_for_disc` both walk the
+/// staging root to find the current disc's per-disc subdir. The naive
+/// `read_dir(...).flatten()` silently drops per-`DirEntry` I/O errors,
+/// which on a Watchtower restart with a cold NFS attribute cache can make
+/// the matching subdir vanish from the listing for one scan — exactly the
+/// degradation `snapshot_staging_disc` already defends against (observed
+/// 2026-05-15). A dropped entry would make `disc_already_completed` return
+/// false (re-sweeping an already-done disc) or `find_resumable_for_disc`
+/// return None (falling through to a fresh sweep instead of resuming).
+///
+/// Defense: retry `read_dir` up to 3 times (500 ms apart) whenever a pass
+/// fails to open OR yields any per-entry error, and return the largest
+/// basename set seen across attempts. A clean pass (opened, zero entry
+/// errors) is trusted immediately. Returns `None` only when no `read_dir`
+/// attempt ever opened the directory — callers then behave exactly as the
+/// old `.ok()? / return false` did (no listing → no match), rather than
+/// acting on a half-listing that dropped the disc's own dir.
+fn list_staging_basenames(staging_dir: &std::path::Path) -> Option<Vec<String>> {
+    let mut saw_read_ok = false;
+    let mut best: Vec<String> = Vec::new();
+    for attempt in 0..3 {
+        if let Ok(entries) = std::fs::read_dir(staging_dir) {
+            saw_read_ok = true;
+            let mut names = Vec::new();
+            let mut had_entry_error = false;
+            for entry in entries {
+                match entry {
+                    Ok(e) => {
+                        if let Some(n) = e.path().file_name() {
+                            names.push(n.to_string_lossy().into_owned());
+                        }
+                    }
+                    // Don't `.flatten()` away per-entry errors: a partial
+                    // NFS degradation can error on an individual DirEntry
+                    // while the dir is genuinely populated. Retry the whole
+                    // listing rather than trust this undercounted pass.
+                    Err(_) => had_entry_error = true,
+                }
+            }
+            if names.len() > best.len() {
+                best = names;
+            }
+            if !had_entry_error {
+                // Clean, complete listing — trust it immediately.
+                return Some(best);
+            }
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    if saw_read_ok {
+        // Every pass that opened had at least one entry error; return the
+        // best (largest) basename set we observed rather than None, so a
+        // disc whose dir survived at least one pass is still matchable.
+        Some(best)
+    } else {
+        // Never opened the directory across all retries — UNKNOWN. Behave
+        // like the old `read_dir(...).ok()?` (no listing → no match).
+        None
+    }
+}
+
 fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
     let cfg_read = match cfg.read() {
         Ok(c) => c.clone(),
@@ -1061,16 +1127,16 @@ fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
         return false;
     }
     let sanitized = crate::util::sanitize_path_compact(&display_name);
-    let entries = match std::fs::read_dir(&cfg_read.staging_dir) {
-        Ok(e) => e,
-        Err(_) => return false,
+    // NFS-resilient listing (retries + surfaces per-entry errors) instead of
+    // `read_dir(...).flatten()`, which would silently drop the disc's own dir
+    // on a cold-cache DirEntry error and wrongly re-rip a completed disc.
+    let staging_root = std::path::Path::new(&cfg_read.staging_dir);
+    let basenames = match list_staging_basenames(staging_root) {
+        Some(b) => b,
+        None => return false,
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let basename = match path.file_name() {
-            Some(n) => n.to_string_lossy().into_owned(),
-            None => continue,
-        };
+    for basename in basenames {
+        let path = staging_root.join(&basename);
         // EXACT match only. Staging dirs are created with the exact sanitized
         // disc name (no year/suffix), so a prefix match never legitimately
         // fires for the disc's own dir — it only invites collisions where a
@@ -1107,10 +1173,14 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
         return None;
     }
     let sanitized = crate::util::sanitize_path_compact(&display_name);
-    let entries = std::fs::read_dir(&cfg_read.staging_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let basename = path.file_name()?.to_string_lossy().into_owned();
+    // NFS-resilient listing (retries + surfaces per-entry errors) instead of
+    // `read_dir(...).flatten()`, which would silently drop the disc's own dir
+    // on a cold-cache DirEntry error and fall through to a fresh sweep rather
+    // than resuming the existing ISO.
+    let staging_root = std::path::Path::new(&cfg_read.staging_dir);
+    let basenames = list_staging_basenames(staging_root)?;
+    for basename in basenames {
+        let path = staging_root.join(&basename);
         // Match the disc's own staging dir by EXACT name. Staging dirs are
         // created with the exact sanitized disc name, so a prefix match never
         // legitimately fires — it only collides ("Cars" is a prefix of
@@ -1168,14 +1238,10 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
                     continue;
                 }
             }
-            let dir_display_name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
             return Some(resume::ResumeClass::Remux {
                 iso_path,
                 mapfile_path,
-                display_name: dir_display_name,
+                display_name: basename,
                 // Cold disc-insert resume from preserved staging: no `.ripped`
                 // hand-off and no operator-override concept, so confidence is
                 // unknown — resume_remux falls back to its own match check.
@@ -4650,7 +4716,8 @@ mod tests {
     use super::{
         HaltGuard, aacs_failure_message, disk_space_preflight_message, format_pass_error,
         header_phase_outcome_is_failure, incomplete_mux_status, is_safe_staging_segment,
-        prune_intermediate_iso, register_halt, staging_dir_matches_disc, staging_free_bytes,
+        list_staging_basenames, prune_intermediate_iso, register_halt, staging_dir_matches_disc,
+        staging_free_bytes,
     };
     use crate::ripper::session::device_halt;
     use libfreemkv::{Error, ScsiSense};
@@ -5927,5 +5994,39 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(device);
+    }
+
+    // Regression guard for the `entries.flatten()` silent-drop bug in
+    // `disc_already_completed` / `find_resumable_for_disc`: both now route
+    // their staging-root walk through `list_staging_basenames`, which lists
+    // every immediate child and (unlike `.flatten()`) is built to retry and
+    // surface per-DirEntry NFS errors rather than silently undercount.
+    #[test]
+    fn list_staging_basenames_returns_all_children() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("Cars")).unwrap();
+        std::fs::create_dir(tmp.path().join("Cars_2")).unwrap();
+        std::fs::write(tmp.path().join("loose.txt"), b"x").unwrap();
+
+        let mut got = list_staging_basenames(tmp.path()).expect("dir exists");
+        got.sort();
+        assert_eq!(got, vec!["Cars", "Cars_2", "loose.txt"]);
+    }
+
+    #[test]
+    fn list_staging_basenames_empty_dir_is_some_empty() {
+        // A genuinely empty staging root must return Some([]) (a trustworthy
+        // "no match"), not None — None is reserved for "never opened".
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(list_staging_basenames(tmp.path()), Some(Vec::new()));
+    }
+
+    #[test]
+    fn list_staging_basenames_missing_dir_is_none() {
+        // read_dir never opens -> UNKNOWN -> None, so callers behave exactly
+        // like the old `read_dir(...).ok()? / return false` (no false match).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(list_staging_basenames(&missing), None);
     }
 }
