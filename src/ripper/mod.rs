@@ -347,6 +347,10 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     // container's lifetime. Evict it like archive_device_log
                     // does on the planned-eject path.
                     crate::log::forget_device(&device);
+                    // TITLE_OVERRIDES + STOP_COOLDOWNS are the only other
+                    // per-device state; evict them too so stale entries
+                    // don't accumulate as device paths churn.
+                    state::forget_device_state(&device);
                 }
             }
             drive_paths = fresh_paths;
