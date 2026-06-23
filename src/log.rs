@@ -176,6 +176,22 @@ pub fn archive_device_log(device: &str) {
     }
 }
 
+/// Drop a device's in-memory ring buffer without archiving it.
+///
+/// Called when a drive is hot-unplugged: there is no eject/scan boundary
+/// to trigger `archive_device_log`, so without this the device's `LOGS`
+/// entry would linger for the container's lifetime. Distinct device
+/// strings (e.g. enumeration churn or paths that change across reconnects)
+/// would then accumulate dead entries. The on-disk `device_*.log` is left
+/// in place — it is the durable record and is reclaimed on the next scan's
+/// `archive_device_log` if the device returns; this only evicts the live
+/// UI ring for a device that is gone.
+pub fn forget_device(device: &str) {
+    if let Ok(mut logs) = LOGS.lock() {
+        logs.remove(device);
+    }
+}
+
 /// Log to system log (not device-specific).
 pub fn syslog(msg: &str) {
     device_log("system", msg);
@@ -354,6 +370,45 @@ mod tests {
             std::path::Path::new(&live).exists(),
             "live log file must remain on disk after a failed archive"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn forget_device_clears_ring_without_archiving() {
+        // Hot-unplug eviction: forget_device drops the in-memory ring but
+        // leaves the on-disk device log in place (no archive).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tmpdir("forget");
+        unsafe {
+            std::env::set_var("AUTORIP_DIR", &d);
+        }
+        let dev = format!("test_forget_{}", std::process::id());
+        device_log(&dev, "before unplug");
+        assert!(!get_device_log(&dev, 100).is_empty());
+        let live = device_log_path(&dev);
+        assert!(std::path::Path::new(&live).exists());
+
+        forget_device(&dev);
+
+        // Ring evicted...
+        assert!(
+            get_device_log(&dev, 100).is_empty(),
+            "in-memory ring must be evicted on hot-unplug"
+        );
+        // ...but the durable on-disk log is left untouched (no archive).
+        assert!(
+            std::path::Path::new(&live).exists(),
+            "device log file must remain on disk after forget_device"
+        );
+        let rips_dir = d.join("logs").join("rips");
+        if rips_dir.exists() {
+            let archived: Vec<_> = std::fs::read_dir(&rips_dir)
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(&dev))
+                .collect();
+            assert!(archived.is_empty(), "forget_device must not archive");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
