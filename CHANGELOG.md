@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.0.0-rc.4] — UNRELEASED
+
+Plain-English failure reasons, accurate loss accounting on done cards,
+and a round of resume/abort and hot-unplug correctness fixes.
+
+### Fixed
+
+- **No more re-mux loop.** A DVD that hit a post-mux loss abort could be
+  re-muxed indefinitely; the `.failed` marker is now terminal in the mux
+  worker, so an aborted disc stays aborted.
+- **Readable failure reasons.** Mux and scan read errors, AACS handshake
+  failures, and CSS crack failures are now reported as English text with
+  the specific cause (and the failing keydb path on a key error) instead
+  of a bare `E`-code. Pass 1 exhaustion and non-SCSI pass errors are
+  likewise labeled.
+- **Accurate loss accounting.** Done cards report combined sweep + mux
+  (demux-skip) loss; single-pass done cards no longer show `0s`
+  main-movie loss or under-classify damage severity, and bad-range
+  drilldowns are populated. Fresh and resumed multipass rips gate on
+  post-mux demux-skip loss, so a disc with decrypt/demux loss can't be
+  accepted as perfect. `NaN` loss is treated as an abort.
+- **Resume correctness.** The resume path enforces the same
+  abort-on-loss gate, honors `auto_eject` and the `iso` output format,
+  carries title/metadata/codecs into the done card, and no longer leaks
+  halt tokens.
+- **Single-pass.** `abort_on_lost_secs` is now enforced in single-pass
+  rips, the loss gate scales by bytes skipped rather than skip count,
+  single-pass ISO output is rejected so abort scope matches multi-pass,
+  and read-error truncation surfaces on `/api/state`.
+- **ISO output.** `output_format=iso` now delivers a disc image instead
+  of muxing an MKV.
+- **Hot-unplug cleanup.** Title overrides, stop cooldowns, the device
+  log ring, and first-seen tracking are evicted when a drive is
+  unplugged.
+- **Durability.** NFS `DirEntry` read errors are no longer silently
+  dropped across staging, resume, and mover scans; staging basenames are
+  unioned across NFS retries; mux header-phase failures are quarantined
+  rather than silently swallowed; a poisoned config lock surfaces an
+  error state instead of panicking; and the hand-off marker is never
+  written empty.
+- The raw `E5000` code prefix was dropped from the disk-space preflight
+  message, and that preflight warns when it can't read free space.
+
 ## [1.0.0-rc.2]
 
 Second release candidate for 1.0. Adds end-to-end DVD/CSS support and a bare-run
