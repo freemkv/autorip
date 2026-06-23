@@ -2097,6 +2097,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         const MAX_PASS1_ATTEMPTS: u32 = 10;
         let mut attempt = 0;
         let mut result = None;
+        // The most recent sweep error, kept so the `result = None`
+        // fallthrough can translate the underlying SCSI cause through
+        // `format_pass_error` rather than surfacing a bare internal
+        // strategy identifier to the operator.
+        let mut last_sweep_err: Option<libfreemkv::Error> = None;
 
         'pass1: loop {
             attempt += 1;
@@ -2176,8 +2181,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         return;
                     }
 
-                    // Transport failure — bridge crashed. Drop stale drive,
-                    // wait for USB re-enumeration, re-open on new path.
+                    // Transport failure — bridge crashed. Remember the
+                    // underlying cause so the exhaustion fallthrough can
+                    // translate it to operator-facing text via
+                    // `format_pass_error` rather than leaking the internal
+                    // strategy identifier. (`e` is unused past here; the
+                    // recovery arms shadow it with their own local errors.)
+                    last_sweep_err = Some(e);
+
+                    // Drop stale drive, wait for USB re-enumeration, re-open
+                    // on new path.
                     crate::log::device_log(
                         device,
                         &format!(
@@ -2454,16 +2467,22 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     ),
                 );
 
+                // Translate the underlying SCSI cause into operator-facing
+                // text. `format_pass_error` turns sense data into an
+                // actionable message (e.g. "power-cycle the drive"); fall
+                // back to a plain message only if no error was captured.
+                let user_msg = match &last_sweep_err {
+                    Some(e) => format_pass_error("Pass 1", e),
+                    None => "Pass 1 failed — see logs for detailed error breakdown".to_string(),
+                };
+
                 update_state(
                     device,
                     RipState {
                         device: device.to_string(),
                         status: "error".to_string(),
                         disc_present: true,
-                        last_error: format!(
-                            "Pass 1 failed: {} — see logs for detailed error breakdown",
-                            failure_reason
-                        ),
+                        last_error: user_msg,
                         disc_name: display_name.clone(),
                         disc_format: disc_format.clone(),
                         tmdb_title: tmdb_title.clone(),
@@ -4567,6 +4586,49 @@ mod tests {
         let s = format_pass_error("Pass 1", &e);
         assert!(s.to_lowercase().contains("rejected command"));
         assert!(s.to_lowercase().contains("power-cycle"));
+    }
+
+    #[test]
+    fn pass1_exhaustion_message_translates_cause_not_strategy_id() {
+        // Regression: the Pass 1 `result = None` exhaustion fallthrough must
+        // surface the underlying SCSI cause via `format_pass_error`, never a
+        // bare internal strategy identifier. This mirrors the fallthrough's
+        // translation of the captured `last_sweep_err`.
+        let last_sweep_err = Some(Error::DiscRead {
+            sector: 1_000,
+            status: Some(2),
+            sense: Some(ScsiSense {
+                sense_key: 4,
+                asc: 0x3E,
+                ascq: 0,
+            }),
+        });
+
+        let user_msg = match &last_sweep_err {
+            Some(e) => format_pass_error("Pass 1", e),
+            None => "Pass 1 failed — see logs for detailed error breakdown".to_string(),
+        };
+
+        // Operator-facing, actionable.
+        assert!(user_msg.to_lowercase().contains("power-cycle"));
+        // Never leaks the internal strategy identifiers.
+        assert!(!user_msg.contains("transport_failure_recovery_exhausted"));
+        assert!(!user_msg.contains("unrecoverable_error"));
+    }
+
+    #[test]
+    fn pass1_exhaustion_message_falls_back_when_no_error_captured() {
+        // If no sweep error was captured (e.g. recovery broke out before any
+        // sweep failed), the fallthrough uses a plain message rather than a
+        // strategy identifier.
+        let last_sweep_err: Option<Error> = None;
+        let user_msg = match &last_sweep_err {
+            Some(e) => format_pass_error("Pass 1", e),
+            None => "Pass 1 failed — see logs for detailed error breakdown".to_string(),
+        };
+        assert!(!user_msg.contains("transport_failure_recovery_exhausted"));
+        assert!(!user_msg.contains("unrecoverable_error"));
+        assert!(user_msg.contains("Pass 1 failed"));
     }
 
     #[test]
