@@ -3967,23 +3967,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         eject_drive(device_path);
     }
 
-    // Prune intermediate ISO + mapfile unless keep_iso is set. Only runs in
-    // multipass mode (max_retries > 0) — direct mode never produced an ISO.
-    if cfg_read.max_retries > 0 && !cfg_read.keep_iso {
-        match std::fs::remove_file(&iso_path_str) {
-            Ok(_) => crate::log::device_log(device, "Pruned intermediate ISO"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => crate::log::device_log(device, &format!("ISO prune warning: {e}")),
-        }
-        // Mirror the ISO arm: a lingering mapfile in staging could be
-        // misread as a partial rip by the resume classifier on next startup,
-        // so surface any unexpected removal error instead of swallowing it.
-        match std::fs::remove_file(&mapfile_path_str) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => crate::log::device_log(device, &format!("mapfile prune warning: {e}")),
-        }
-    }
+    // Prune intermediate ISO + mapfile unless keep_iso is set. Shared with the
+    // resume/`.ripped` completion path (resume::resume_remux) so the
+    // keep_iso=false reclaim can't diverge between the two completion routes.
+    prune_intermediate_iso(
+        device,
+        std::path::Path::new(&iso_path_str),
+        std::path::Path::new(&mapfile_path_str),
+        cfg_read.max_retries,
+        cfg_read.keep_iso,
+    );
 
     crate::log::device_log(device, "Rip complete");
     crate::webhook::send_rich(
@@ -4122,6 +4115,45 @@ pub(super) fn abort_lost_ms(
 /// whenever any out-of-title sector was unreadable.
 fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
     lost_ms > abort_threshold_ms
+}
+
+/// Prune the disc-sized intermediate ISO and its mapfile sidecar on a
+/// successful multipass completion, unless `keep_iso` is set.
+///
+/// Shared by both completion routes — `rip_disc`'s inline terminal path and
+/// the resume / `.ripped` hand-off path (`resume::resume_remux`) — so the
+/// `keep_iso=false` disk reclaim can't diverge between them. The mover frees
+/// the ISO when it tears down a `.done` staging dir, but a low-confidence
+/// `.review` hold (mover skips it) or a no-output-dir setup never relocates,
+/// so without this prune a 90+ GB UHD ISO would leak in those cases.
+///
+/// Gated on `max_retries > 0`: an intermediate ISO only exists in multipass
+/// mode (direct mode rips disc → MKV with no ISO). A `NotFound` removal is
+/// silent (already gone / never written); any other error is surfaced to the
+/// device log without failing the rip.
+fn prune_intermediate_iso(
+    device: &str,
+    iso_path: &std::path::Path,
+    mapfile_path: &std::path::Path,
+    max_retries: u8,
+    keep_iso: bool,
+) {
+    if max_retries == 0 || keep_iso {
+        return;
+    }
+    match std::fs::remove_file(iso_path) {
+        Ok(_) => crate::log::device_log(device, "Pruned intermediate ISO"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => crate::log::device_log(device, &format!("ISO prune warning: {e}")),
+    }
+    // Mirror the ISO arm: a lingering mapfile in staging could be misread as a
+    // partial rip by the resume classifier on next startup, so surface any
+    // unexpected removal error instead of swallowing it.
+    match std::fs::remove_file(mapfile_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => crate::log::device_log(device, &format!("mapfile prune warning: {e}")),
+    }
 }
 
 /// Whether a `run_mux` outcome that never opened its output
@@ -4507,11 +4539,80 @@ mod tests {
 
     use super::{
         HaltGuard, aacs_failure_message, disk_space_preflight_message, format_pass_error,
-        header_phase_outcome_is_failure, is_safe_staging_segment, register_halt,
-        staging_dir_matches_disc, staging_free_bytes,
+        header_phase_outcome_is_failure, is_safe_staging_segment, prune_intermediate_iso,
+        register_halt, staging_dir_matches_disc, staging_free_bytes,
     };
     use crate::ripper::session::device_halt;
     use libfreemkv::{Error, ScsiSense};
+
+    /// Regression guard for the divergent disk-reclamation bug: the inline
+    /// (`rip_disc`) and resume (`resume::resume_remux`) completion paths now
+    /// share `prune_intermediate_iso`, so a `keep_iso=false` multipass
+    /// completion frees the disc-sized ISO + mapfile on BOTH routes. Before
+    /// the fix, a `.review` (low-confidence) or no-mover resume leaked a 90+ GB
+    /// ISO that the inline path would have freed.
+    #[test]
+    fn prune_removes_iso_and_mapfile_when_keep_iso_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let iso = tmp.path().join("Movie.iso");
+        let map = tmp.path().join("Movie.iso.mapfile");
+        std::fs::write(&iso, b"iso").unwrap();
+        std::fs::write(&map, b"map").unwrap();
+
+        prune_intermediate_iso(
+            "sr0", &iso, &map, /* max_retries */ 1, /* keep_iso */ false,
+        );
+
+        assert!(!iso.exists(), "ISO must be pruned when keep_iso=false");
+        assert!(!map.exists(), "mapfile must be pruned when keep_iso=false");
+    }
+
+    #[test]
+    fn prune_keeps_iso_and_mapfile_when_keep_iso_true() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let iso = tmp.path().join("Movie.iso");
+        let map = tmp.path().join("Movie.iso.mapfile");
+        std::fs::write(&iso, b"iso").unwrap();
+        std::fs::write(&map, b"map").unwrap();
+
+        prune_intermediate_iso(
+            "sr0", &iso, &map, /* max_retries */ 1, /* keep_iso */ true,
+        );
+
+        assert!(iso.exists(), "ISO must be retained when keep_iso=true");
+        assert!(map.exists(), "mapfile must be retained when keep_iso=true");
+    }
+
+    #[test]
+    fn prune_is_noop_in_direct_mode() {
+        // max_retries == 0 is direct mode: no intermediate ISO is ever
+        // produced, so the prune must not touch unrelated files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let iso = tmp.path().join("Movie.iso");
+        let map = tmp.path().join("Movie.iso.mapfile");
+        std::fs::write(&iso, b"iso").unwrap();
+        std::fs::write(&map, b"map").unwrap();
+
+        prune_intermediate_iso(
+            "sr0", &iso, &map, /* max_retries */ 0, /* keep_iso */ false,
+        );
+
+        assert!(iso.exists(), "direct mode (max_retries=0) must not prune");
+        assert!(map.exists(), "direct mode (max_retries=0) must not prune");
+    }
+
+    #[test]
+    fn prune_tolerates_already_absent_files() {
+        // NotFound is silent: re-running prune, or a path where the mover
+        // already relocated/removed the ISO, must not error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let iso = tmp.path().join("Gone.iso");
+        let map = tmp.path().join("Gone.iso.mapfile");
+        // Neither file exists.
+        prune_intermediate_iso("sr0", &iso, &map, 1, false);
+        assert!(!iso.exists());
+        assert!(!map.exists());
+    }
 
     /// Resume / completion matching is EXACT, never prefix. A disc named
     /// "Cars" (sanitized "Cars") must not match a sibling staging dir

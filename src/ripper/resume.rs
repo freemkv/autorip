@@ -1063,6 +1063,22 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         );
     }
 
+    // Prune the disc-sized intermediate ISO + its mapfile unless keep_iso is
+    // set, mirroring rip_disc's inline terminal path. The mover normally frees
+    // the ISO when it tears down a `.done` staging dir, but a low-confidence
+    // match writes `.review` instead (mover skips it) and a setup with no
+    // output/mover dir never relocates at all — in both cases the inline path
+    // would have freed a 90+ GB UHD ISO immediately while the resume path
+    // leaked it. The `keep_iso=false` reclaim must not diverge between the two
+    // completion routes; both now share `prune_intermediate_iso`.
+    super::prune_intermediate_iso(
+        device,
+        &iso_path,
+        &mapfile_path,
+        cfg_read.max_retries,
+        cfg_read.keep_iso,
+    );
+
     // Prefer the codecs the mux frame loop wrote into STATE (the
     // `_mux` worker path seeds an empty codecs and only fills it
     // during mux); fall back to the pre-mux snapshot. Resolved once
