@@ -4341,6 +4341,28 @@ fn disk_space_preflight_message(required: u64, staging: &str, avail: u64) -> Str
     )
 }
 
+/// Short English label for a non-SCSI libfreemkv error variant, used to
+/// annotate the code-only `Display` in `format_pass_error`'s no-sense arm.
+/// Without this the operator sees e.g. "Pass 1 failed: E6010" with no hint
+/// that E6010 is a user-requested stop. Returns a stable label for the
+/// structural failures actually reachable on the sweep/patch path; any
+/// unmapped variant falls back to a generic phrase so a new libfreemkv
+/// variant never breaks the build.
+fn non_scsi_error_label(e: &libfreemkv::Error) -> &'static str {
+    use libfreemkv::Error;
+    match e {
+        Error::Halted => "rip stopped by user",
+        Error::MapfileInvalid { .. } => "recovery mapfile invalid",
+        Error::DiscRead { .. } => "disc read error",
+        Error::DecryptFailed => "decryption failed",
+        Error::NoStreams => "no playable streams on disc",
+        Error::DiscCapacityOverflow | Error::DiscCapacityMalformed => {
+            "drive reported unusable disc capacity"
+        }
+        _ => "unexpected error",
+    }
+}
+
 /// /api/state's last_error field. Raw libfreemkv errors like
 /// `E6000: 19965280 0x02/0x04/0x3e` are diagnostic-grade — fine for
 /// logs, terrible for the UI. This helper renders the same condition
@@ -4368,9 +4390,15 @@ fn format_pass_error(pass_label: &str, e: &libfreemkv::Error) -> String {
         // Non-SCSI error (transport / IO / other) — surface the inner
         // io::Error detail. The libfreemkv Error Display is code-only
         // (language-neutral) as of 0.31; its `source` carries the message.
+        //
+        // For IoError we have the inner io::Error message. For any other
+        // non-SCSI variant the bare Display is code-only (e.g. "E6010" for
+        // Halted, "E6011: hex" for MapfileInvalid), which leaves the operator
+        // reading an opaque code. Prefix those with a short English label so
+        // the message names what failed, not just its number.
         let detail = match e {
             libfreemkv::Error::IoError { source } => source.to_string(),
-            other => other.to_string(),
+            other => format!("{} ({})", other, non_scsi_error_label(other)),
         };
         return format!("{}{} failed: {}", pass_label, location, detail);
     };
@@ -4941,6 +4969,32 @@ mod tests {
         let s = format_pass_error("Pass 1", &e);
         assert!(s.contains("Pass 1"));
         assert!(s.contains("io test"));
+    }
+
+    #[test]
+    fn format_pass_error_no_sense_non_io_gets_english_label() {
+        // Regression: a non-SCSI, non-IoError error (no sense triple) must
+        // carry an English label, not just the bare code-only Display.
+        // Halted ("rip stopped by user") is the actionable example — a user
+        // stop propagated into the sweep.
+        let s = format_pass_error("Pass 1", &Error::Halted);
+        assert!(s.contains("Pass 1 failed"), "msg: {s}");
+        // Still routable: the numeric code is preserved.
+        assert!(s.contains("E6010"), "msg must keep the code: {s}");
+        // ...but no longer opaque: an English label identifies it.
+        assert!(
+            s.to_lowercase().contains("stopped by user"),
+            "msg must label the code: {s}"
+        );
+
+        // MapfileInvalid carries a `kind` payload in its Display; the label
+        // must still be appended after it.
+        let s = format_pass_error("Pass 2", &Error::MapfileInvalid { kind: "hex" });
+        assert!(s.contains("E6011"), "msg: {s}");
+        assert!(
+            s.to_lowercase().contains("mapfile invalid"),
+            "msg must label the code: {s}"
+        );
     }
 
     // ── aacs_failure_message dispatch ────────────────────────────────
