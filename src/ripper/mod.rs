@@ -4412,8 +4412,14 @@ pub(super) fn abort_lost_ms(
 /// loss, but proceed to mux when in-title loss is exactly zero. With
 /// `>=` a zero-loss title (`lost_ms == 0.0 >= 0.0`) would wrongly abort
 /// whenever any out-of-title sector was unreadable.
+///
+/// A NaN `lost_ms` is treated as "abort": `NaN > x` is `false`, so a
+/// plain comparison would silently decline to abort and mark the rip
+/// complete. This is the single chokepoint deciding perfect-rip vs.
+/// quarantine, so an unquantifiable loss must fail safe (abort), not
+/// pass as a silent success.
 fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
-    lost_ms > abort_threshold_ms
+    lost_ms.is_nan() || lost_ms > abort_threshold_ms
 }
 
 /// Whether the rip's deliverable is the whole-disc ISO itself rather than a
@@ -5922,6 +5928,15 @@ mod tests {
         let threshold = 30_000.0;
         assert!(!super::should_abort_for_loss(20_000.0, threshold));
         assert!(super::should_abort_for_loss(31_000.0, threshold));
+    }
+
+    #[test]
+    fn nan_loss_aborts() {
+        // A NaN loss is unquantifiable and must fail safe (abort), not
+        // pass as a silent success. `NaN > x` is false, so a plain
+        // comparison would wrongly proceed to mark the rip complete.
+        assert!(super::should_abort_for_loss(f64::NAN, 0.0));
+        assert!(super::should_abort_for_loss(f64::NAN, 30_000.0));
     }
 
     // ── final done-card uses in-title loss (telemetry audit Fix 3) ───
