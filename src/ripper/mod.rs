@@ -614,6 +614,28 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
 
 // ─── Scan ──────────────────────────────────────────────────────────────────
 
+/// Push an "error" state for `device` after a poisoned config `RwLock` forced
+/// an early return out of `scan_disc` / `rip_disc`.
+///
+/// `try_claim_active` sets `status="scanning"` before either thread is spawned,
+/// so without this the tile would stay wedged in "scanning" forever with an
+/// empty `last_error`. Surfacing an error state (plus a device-log line) keeps
+/// the failure visible and self-explanatory, matching the other early-exit
+/// paths in those functions. `op` is the user-facing verb ("Scan" / "Rip").
+fn mark_config_lock_poisoned(device: &str, op: &str) {
+    crate::log::device_log(device, &format!("{op} aborted: config lock poisoned"));
+    update_state(
+        device,
+        RipState {
+            device: device.to_string(),
+            status: "error".to_string(),
+            disc_present: true,
+            last_error: "Internal error: config lock poisoned".to_string(),
+            ..Default::default()
+        },
+    );
+}
+
 /// Scan a disc — open, init, identify, TMDB, full scan. Stores session for rip.
 pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Snapshot Config (it's Clone) and drop the read guard immediately —
@@ -622,7 +644,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // settings POST that races with a scan.
     let cfg_read = match cfg.read() {
         Ok(c) => c.clone(),
-        Err(_) => return,
+        Err(_) => {
+            mark_config_lock_poisoned(device, "Scan");
+            return;
+        }
     };
 
     update_state(
@@ -1355,7 +1380,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // /api/system stopped responding mid-rip until the rip ended.
     let cfg_read = match cfg.read() {
         Ok(c) => c.clone(),
-        Err(_) => return,
+        Err(_) => {
+            // `_halt_guard` still unregisters the Halt token on return.
+            mark_config_lock_poisoned(device, "Rip");
+            return;
+        }
     };
 
     // Preserve UI state
@@ -5014,6 +5043,51 @@ mod tests {
         );
         // Cleanup: remove the synthetic device entry so it doesn't leak
         // into other tests that inspect STATE.
+        super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device);
+    }
+
+    /// Regression: a poisoned config `RwLock` must NOT leave the tile wedged in
+    /// "scanning". `try_claim_active` sets status="scanning" before scan_disc /
+    /// rip_disc run, and both bail out early on `cfg.read()` failure. Pre-fix
+    /// that early return was bare (`Err(_) => return`), so the device stayed
+    /// "scanning" forever with an empty last_error. The shared
+    /// `mark_config_lock_poisoned` helper that both sites now call must flip the
+    /// state to "error" with a populated last_error.
+    #[test]
+    fn config_lock_poisoned_marks_error_not_stuck_scanning() {
+        let device = "sg_config_poison_test";
+        // Simulate the pre-spawn claim: tile is already "scanning".
+        assert!(super::try_claim_active(device));
+        let claimed = super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .map(|s| s.status.clone())
+            .unwrap_or_default();
+        assert_eq!(claimed, "scanning", "claim should set status=scanning");
+
+        // The poisoned-lock early-exit path.
+        super::mark_config_lock_poisoned(device, "Scan");
+
+        let st = super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .cloned()
+            .expect("device state present");
+        assert_eq!(
+            st.status, "error",
+            "poisoned config lock must mark the tile 'error', not leave it 'scanning'"
+        );
+        assert!(
+            !st.last_error.is_empty(),
+            "poisoned config lock must populate last_error so the operator sees why"
+        );
+
+        // Cleanup so the synthetic device doesn't leak into other tests.
         super::STATE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
