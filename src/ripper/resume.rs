@@ -834,6 +834,36 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let done_sweep_damage = sweep_damage_for_resume.clone();
 
     let reader: Box<dyn libfreemkv::SectorSource> = Box::new(iso_reader_for_mux);
+
+    // Progress + watchdog atomics shared between the stream-event
+    // callback (below), this function's terminal-state updates, and
+    // `run_mux`'s `MuxAtomics`. Created before `build_iso_pipeline` so
+    // the producer-thread `BytesRead` events can update them in place.
+    let latest_bytes_read = Arc::new(AtomicU64::new(0));
+    let rip_last_lba = Arc::new(AtomicU64::new(0));
+    let rip_current_batch = Arc::new(AtomicU16::new(batch));
+    let wd_last_frame = Arc::new(AtomicU64::new(crate::util::epoch_secs()));
+    let mux_input_errors = Arc::new(AtomicU32::new(0));
+
+    // Stream-event callback — mirrors `rip_disc`'s multipass highway
+    // wiring (mod.rs). The producer thread fires `BytesRead` on every
+    // sector read from the ISO; we feed that into `latest_bytes_read`
+    // (so the progress bar tracks read-ahead, not write-lagged output)
+    // and refresh `wd_last_frame` (so the soft-stall watchdog observes
+    // a pre-frame read stall, e.g. a slow NFS seek before the first
+    // frame). `BatchSizeChanged` / `SectorSkipped` never fire on the
+    // highway (no adaptive retry — the ISO is already zero-filled for
+    // any sweep-pass loss), so only `BytesRead` is handled here.
+    let wdf_stream = wd_last_frame.clone();
+    let lbr_stream = latest_bytes_read.clone();
+    let stream_event_fn = move |event: libfreemkv::event::Event| {
+        use std::sync::atomic::Ordering;
+        wdf_stream.store(crate::util::epoch_secs(), Ordering::Relaxed);
+        if let libfreemkv::event::EventKind::BytesRead { bytes, .. } = event.kind {
+            lbr_stream.store(bytes, Ordering::Relaxed);
+        }
+    };
+
     // Resume path routes through the same `PipelinedPesStream`
     // highway as multipass mux — same 3-stage threaded pipeline,
     // same producer-thread BytesRead events for the UI. No skip-
@@ -846,7 +876,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         batch,
         format,
         Some(halt_token.clone()),
-        None,
+        Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
     ) {
         Ok(s) => Box::new(s),
         Err(e) => {
@@ -869,12 +899,6 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             return;
         }
     };
-
-    let latest_bytes_read = Arc::new(AtomicU64::new(0));
-    let rip_last_lba = Arc::new(AtomicU64::new(0));
-    let rip_current_batch = Arc::new(AtomicU16::new(batch));
-    let wd_last_frame = Arc::new(AtomicU64::new(crate::util::epoch_secs()));
-    let mux_input_errors = Arc::new(AtomicU32::new(0));
 
     // Pick up the TMDB metadata + codecs string that scan_disc
     // populated in STATE before this path was entered. Without this,
