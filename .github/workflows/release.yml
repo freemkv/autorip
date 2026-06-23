@@ -22,10 +22,19 @@ jobs:
           fi
           echo "Version match: $CARGO_VER"
 
-      - name: Verify Cargo.lock libfreemkv is from crates.io
+      # The binary no longer pulls libfreemkv from crates.io — the committed
+      # [patch.crates-io] in Cargo.toml redirects it (and the transitive ref
+      # from freemkv-unlock-ld / freemkv-keysources) to a GIT TAG, so the build
+      # starts the instant that tag exists instead of waiting on the crates.io
+      # publish + index propagation. This check therefore asserts the Cargo.lock
+      # libfreemkv comes from THIS release's git tag (git+...?tag=v<this>), not
+      # from a crates.io registry source or a local path.
+      - name: Verify Cargo.lock libfreemkv is from the expected git tag
         run: |
-          python3 <<'PY'
+          TAG="${{ github.ref_name }}"
+          python3 - "$TAG" <<'PY'
           import sys, re
+          tag = sys.argv[1]
           try:
               with open("Cargo.lock") as f:
                   text = f.read()
@@ -39,8 +48,7 @@ jobs:
           blocks = re.split(r'(?m)^\[\[package\]\]\s*$', text)
           matches = []
           for b in blocks:
-              name_m = re.search(r'(?m)^name\s*=\s*"libfreemkv"\s*$', b)
-              if not name_m:
+              if not re.search(r'(?m)^name\s*=\s*"libfreemkv"\s*$', b):
                   continue
               ver_m = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', b)
               src_m = re.search(r'(?m)^source\s*=\s*"([^"]+)"\s*$', b)
@@ -50,22 +58,63 @@ jobs:
               print("::error::Cargo.lock has no libfreemkv entry")
               sys.exit(1)
           if len(matches) > 1:
-              print(f"::error::Cargo.lock has {len(matches)} libfreemkv entries: {matches}")
+              print(f"::error::Cargo.lock has {len(matches)} libfreemkv entries "
+                    f"(direct + transitive not unified by the [patch.crates-io] git redirect): {matches}")
               sys.exit(1)
           lock_ver, lock_src = matches[0]
-          if not lock_src or not lock_src.startswith("registry+https://github.com/rust-lang/crates.io"):
-              print(f"::error::Cargo.lock libfreemkv must come from crates.io registry, not local path. "
-                    f"Run rm Cargo.lock && cargo generate-lockfile with [patch.crates-io] disabled. "
+          expected = f"?tag={tag}"
+          if not lock_src or "git+https://github.com/freemkv/libfreemkv" not in lock_src:
+              print(f"::error::Cargo.lock libfreemkv must come from the libfreemkv git repo, "
+                    f"not crates.io or a local path. Regenerate with the release script "
+                    f"(the committed [patch.crates-io] redirects it to the git tag). "
                     f"(saw source={lock_src!r})")
               sys.exit(1)
-          print(f"Cargo.lock libfreemkv = {lock_ver} from crates.io (OK)")
+          if expected not in lock_src:
+              print(f"::error::Cargo.lock libfreemkv git source is {lock_src!r} but this "
+                    f"release tag is {tag}; expected the source to pin {expected}. "
+                    f"The release script must re-pin the [patch.crates-io] tag before regen.")
+              sys.exit(1)
+          print(f"Cargo.lock libfreemkv = {lock_ver} from {lock_src} (OK)")
           PY
 
+  # Tests run as a PARALLEL TRIPWIRE: they fail the run if they fail, but the
+  # build/docker jobs do NOT `needs:` this job, so artifact build starts
+  # immediately rather than serializing behind the test suite. The tag decision
+  # was already gated by the local precommit (same Rust 1.86, same commit) — CI
+  # tests here are a safety net, not the gate.
+  test:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: autorip-release-test
+      - name: Install musl cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-x86-64-linux-gnu musl-tools
+      - name: Test
+        run: |
+          export CC=x86_64-linux-gnu-gcc
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-gnu-gcc
+          export CFLAGS="-U_FORTIFY_SOURCE"
+          cargo test --locked --target x86_64-unknown-linux-musl
+
   build:
+    # NOTE: deliberately does NOT `needs: test` — see the test job above.
+    # Tests are a parallel tripwire; the build starts the moment `verify` passes.
     needs: verify
     strategy:
       fail-fast: false
       matrix:
+        # x86_64-apple-darwin is intentionally dropped: it has a pre-existing
+        # linker issue on the macOS runners and built nothing (a no-op leg that
+        # only added wall-clock to the matrix). aarch64-apple-darwin covers
+        # macOS. If x86_64 macOS support is ever needed, fix the linker first.
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
@@ -73,9 +122,6 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             asset: autorip-aarch64-linux
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            asset: autorip-x86_64-macos
           - target: aarch64-apple-darwin
             os: macos-latest
             asset: autorip-aarch64-macos
@@ -114,11 +160,9 @@ jobs:
           curl -sL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz | tar xz
           sudo mv cross /usr/local/bin/
 
-      # 0.18.13: dropped the redundant `cargo check --locked` step.
-      # `cargo build --release` below does typechecking already; the
-      # check step was pure waste (~30-45s) and only saved time when
-      # type errors were caught before the codegen pass — but on a
-      # tagged release, the local precommit hook already caught those.
+      # The per-target test step was removed from the build matrix: tests now
+      # run once in the dedicated parallel `test` job, off the build critical
+      # path. (0.18.13 had already dropped the redundant `cargo check --locked`.)
 
       - name: Build (native musl with x86_64-linux-gnu-gcc)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -138,11 +182,11 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cross build --locked --release --target ${{ matrix.target }}
 
-      # macOS (x86_64 + aarch64) and Windows build natively on their own
-      # runners — no cross toolchain. libfreemkv's IOKit (macOS) and SPTI
-      # (Windows) SCSI transports compile here; autorip's Linux-only service
-      # glue (udev rip-on-insert, container bootstrap) is cfg-gated so `serve`
-      # runs on every platform via the polling drive watcher.
+      # macOS (aarch64) and Windows build natively on their own runners — no
+      # cross toolchain. libfreemkv's IOKit (macOS) and SPTI (Windows) SCSI
+      # transports compile here; autorip's Linux-only service glue (udev
+      # rip-on-insert, container bootstrap) is cfg-gated so `serve` runs on
+      # every platform via the polling drive watcher.
       - name: Build (native, macOS/Windows)
         if: runner.os != 'Linux'
         run: cargo build --locked --release --target ${{ matrix.target }}
@@ -176,6 +220,9 @@ jobs:
           $h = Get-FileHash -Algorithm SHA256 "${{ matrix.asset }}"
           "$($h.Hash.ToLower())  ${{ matrix.asset }}" | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
 
+      # Per-target artifacts upload as each matrix leg finishes (fail-fast:
+      # false), so a "released" binary for a fast target isn't gated on the
+      # slowest one.
       - name: Upload assets to release
         uses: softprops/action-gh-release@v2
         with:
@@ -199,6 +246,9 @@ jobs:
           retention-days: 1
 
   docker:
+    # Only needs the x86_64 musl binary artifact (produced by `build`); it does
+    # NOT need the test job or the slower macOS/Windows legs. As soon as the
+    # Linux build leg finishes, the GHCR image starts.
     needs: build
     runs-on: ubuntu-latest
     permissions:
