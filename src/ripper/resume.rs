@@ -398,6 +398,14 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         return;
     };
 
+    // Archive the prior session's per-device log so the live log shows
+    // only this resumed-mux operation. Mirrors what scan_disc and
+    // rip_disc do on entry. On the common "scan then resume" path
+    // (session_is_scanned=true) scan_disc is skipped entirely, so
+    // without this the resumed-mux entries would interleave with the
+    // prior scan's log, making errors hard to correlate.
+    crate::log::archive_device_log(device);
+
     let cfg_read = match cfg.read() {
         Ok(c) => c.clone(),
         Err(_) => {
@@ -1206,6 +1214,86 @@ mod find_iso_tests {
         let d = tmpdir();
         fs::write(d.join("Movie.iso"), b"x").unwrap();
         assert!(find_iso_and_mapfile(&d).is_none());
+    }
+}
+
+#[cfg(test)]
+mod resume_remux_log_archive_tests {
+    use super::*;
+
+    fn tmpdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!(
+                "autorip-resume-archive-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+            ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(p.join("logs")).unwrap();
+        p
+    }
+
+    /// Regression: resume_remux did not archive the prior session's
+    /// per-device log on entry (unlike scan_disc and rip_disc), so on the
+    /// common "scan then resume" path the resumed-mux log entries
+    /// interleaved with the prior scan's log.
+    ///
+    /// This drives resume_remux through its real entry path: a prior log
+    /// entry is seeded, then resume_remux runs with a Remux classification
+    /// pointing at a non-openable ISO (it archives, logs the resume line,
+    /// then aborts on ISO open). The in-memory live ring (keyed by the
+    /// unique device name, independent of AUTORIP_DIR) must afterwards
+    /// contain only the new operation's entries — the prior line must have
+    /// been archived out.
+    #[test]
+    fn resume_remux_archives_prior_device_log() {
+        let d = tmpdir();
+        // Route logs to the tempdir for this test. SAFETY: env access in
+        // tests; the assertion that matters reads the in-memory ring
+        // (keyed by the unique device name), not the env-routed file.
+        unsafe {
+            std::env::set_var("AUTORIP_DIR", &d);
+        }
+
+        let dev = format!("test_resume_archive_sg_{}", std::process::id());
+
+        // Seed a prior session's log line, as a scan/rip would leave behind.
+        crate::log::device_log(&dev, "PRIOR-SESSION-SCAN-LINE");
+        assert!(
+            crate::log::get_device_log(&dev, 100)
+                .iter()
+                .any(|l| l.contains("PRIOR-SESSION-SCAN-LINE")),
+            "prior line should be present before resume"
+        );
+
+        // A Remux classification pointing at a non-existent ISO so the
+        // function archives + logs the resume line, then aborts on open.
+        let class = ResumeClass::Remux {
+            iso_path: d.join("does-not-exist.iso"),
+            mapfile_path: d.join("does-not-exist.iso.mapfile"),
+            display_name: "Nonexistent".to_string(),
+        };
+        let cfg = Arc::new(RwLock::new(Config::default()));
+
+        resume_remux(&cfg, &dev, class);
+
+        let live = crate::log::get_device_log(&dev, 100);
+        assert!(
+            !live.iter().any(|l| l.contains("PRIOR-SESSION-SCAN-LINE")),
+            "prior session line must be archived out of the live log, got: {:?}",
+            live
+        );
+        assert!(
+            live.iter().any(|l| l.contains("Auto-resume: re-muxing")),
+            "live log should contain the new resume entry, got: {:?}",
+            live
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 
