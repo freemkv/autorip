@@ -2164,6 +2164,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             tmdb_year,
             tmdb_poster: tmdb_poster.clone(),
             tmdb_overview: tmdb_overview.clone(),
+            tmdb_media_type: tmdb_media_type.clone(),
             duration: duration.clone(),
             codecs: codecs.clone(),
             filename: filename.clone(),
@@ -3313,6 +3314,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             tmdb_year,
             tmdb_poster: tmdb_poster.clone(),
             tmdb_overview: tmdb_overview.clone(),
+            tmdb_media_type: tmdb_media_type.clone(),
             max_retries: cfg_read.max_retries,
             abort_on_lost_secs: cfg_read.abort_on_lost_secs as u32,
             rip_elapsed_secs: 0.0, // mux worker re-derives elapsed from its own start

@@ -108,6 +108,12 @@ pub struct RipState {
     pub tmdb_year: u16,
     pub tmdb_poster: String,
     pub tmdb_overview: String,
+    /// TMDB media type ("movie" or "tv"). Carried into STATE so the
+    /// auto-resume mux path can write a correct `media_type` into the
+    /// `.done`/`.review` hand-off marker — otherwise the mover defaults
+    /// every resumed rip to "movie" and files TV shows under the movie
+    /// library. Empty string when unresolved.
+    pub tmdb_media_type: String,
     pub duration: String,
     pub codecs: String,
 
@@ -209,6 +215,7 @@ impl Default for RipState {
             tmdb_year: 0,
             tmdb_poster: String::new(),
             tmdb_overview: String::new(),
+            tmdb_media_type: String::new(),
             duration: String::new(),
             codecs: String::new(),
             pass_progress_pct: 0,
@@ -458,6 +465,7 @@ pub(super) struct PassContext {
     pub(super) tmdb_year: u16,
     pub(super) tmdb_poster: String,
     pub(super) tmdb_overview: String,
+    pub(super) tmdb_media_type: String,
     pub(super) duration: String,
     pub(super) codecs: String,
     pub(super) filename: String,
@@ -970,6 +978,7 @@ pub(super) fn push_pass_state(
             tmdb_year: ctx.tmdb_year,
             tmdb_poster: ctx.tmdb_poster.clone(),
             tmdb_overview: ctx.tmdb_overview.clone(),
+            tmdb_media_type: ctx.tmdb_media_type.clone(),
             duration: ctx.duration.clone(),
             codecs: ctx.codecs.clone(),
             pass,
@@ -1070,6 +1079,7 @@ pub(super) fn set_pass_progress(
         s.tmdb_year = ctx.tmdb_year;
         s.tmdb_poster = ctx.tmdb_poster.clone();
         s.tmdb_overview = ctx.tmdb_overview.clone();
+        s.tmdb_media_type = ctx.tmdb_media_type.clone();
         s.duration = ctx.duration.clone();
         s.codecs = ctx.codecs.clone();
         s.pass = pass;
@@ -1578,6 +1588,7 @@ mod tests {
             tmdb_year: 0,
             tmdb_poster: String::new(),
             tmdb_overview: String::new(),
+            tmdb_media_type: String::new(),
             duration: String::new(),
             codecs: String::new(),
             filename: "test.mkv".to_string(),

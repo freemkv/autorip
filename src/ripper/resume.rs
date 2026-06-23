@@ -425,6 +425,21 @@ fn resolve_done_codecs(post_mux_state: Option<String>, pre_mux_snapshot: String)
         .unwrap_or(pre_mux_snapshot)
 }
 
+/// Resolve the `media_type` written into the resume `.done`/`.review` marker.
+/// The mover routes by this field (movie library vs TV library) and defaults a
+/// missing/empty value to "movie"; we resolve the same default here so a cold
+/// auto-resume — where STATE is empty and no media_type was carried — writes an
+/// explicit value rather than relying on the reader's fallback. A carried
+/// "movie"/"tv" (warm `_mux` resume, seeded from the `.ripped` hand-off) passes
+/// through unchanged, fixing the prior bug where TV resumes were filed as movies.
+fn resolve_media_type(carried: &str) -> String {
+    if carried.is_empty() {
+        "movie".to_string()
+    } else {
+        carried.to_string()
+    }
+}
+
 pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: ResumeClass) {
     let ResumeClass::Remux {
         iso_path,
@@ -905,20 +920,27 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // the mux's per-frame `update_state` would overwrite them with
     // empty strings and the dashboard would lose the poster / title /
     // year / codec badge for the entire mux phase.
-    let (tmdb_title, tmdb_year, tmdb_poster, tmdb_overview, state_codecs) = super::STATE
-        .lock()
-        .ok()
-        .and_then(|s| s.get(device).cloned())
-        .map(|rs| {
-            (
-                rs.tmdb_title,
-                rs.tmdb_year,
-                rs.tmdb_poster,
-                rs.tmdb_overview,
-                rs.codecs,
-            )
-        })
-        .unwrap_or_default();
+    let (tmdb_title, tmdb_year, tmdb_poster, tmdb_overview, tmdb_media_type, state_codecs) =
+        super::STATE
+            .lock()
+            .ok()
+            .and_then(|s| s.get(device).cloned())
+            .map(|rs| {
+                (
+                    rs.tmdb_title,
+                    rs.tmdb_year,
+                    rs.tmdb_poster,
+                    rs.tmdb_overview,
+                    rs.tmdb_media_type,
+                    rs.codecs,
+                )
+            })
+            .unwrap_or_default();
+    // The mover routes by `media_type` (movie_dir vs tv_dir) and defaults a
+    // missing/empty value to "movie". Resolve the same default here so a cold
+    // auto-resume (empty STATE, no carried media_type) is explicit in the
+    // marker rather than relying on the reader's fallback.
+    let media_type = resolve_media_type(&tmdb_media_type);
 
     // Title-confidence gate — mirror rip_disc's completion path
     // (mod.rs: `if title_confident { ".done" } else { ".review" }`).
@@ -978,10 +1000,19 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             return;
         }
         let marker_name = if title_confident { ".done" } else { ".review" };
+        // Mirror the fresh-rip ISO marker (mod.rs) field-for-field so the
+        // mover gets identical metadata on a resume: `disc_name` (the disc's
+        // own label, distinct from the resolved `title`), `media_type` (mover
+        // routing — TV vs movie), `poster_url`, and `overview`. Omitting these
+        // surfaced empty poster/overview in Plex and filed TV resumes as movies.
         let done_marker = serde_json::json!({
             "title": display_name,
+            "disc_name": disc_label,
             "format": disc_format,
             "year": tmdb_year,
+            "media_type": media_type,
+            "poster_url": tmdb_poster,
+            "overview": tmdb_overview,
             "date": crate::util::format_date(),
             "resumed": true,
         });
@@ -1232,10 +1263,18 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         return;
     }
     let marker_name = if title_confident { ".done" } else { ".review" };
+    // Mirror the fresh-rip MKV marker (mod.rs) field-for-field: `disc_name`,
+    // `media_type`, `poster_url`, `overview`. Without them a resume completion
+    // handed the mover impoverished metadata vs a fresh rip of the same disc
+    // (empty poster/overview, TV shows misfiled as movies).
     let done_marker = serde_json::json!({
         "title": display_name,
+        "disc_name": disc_label,
         "format": disc_format,
         "year": tmdb_year,
+        "media_type": media_type,
+        "poster_url": tmdb_poster,
+        "overview": tmdb_overview,
         "date": crate::util::format_date(),
         "resumed": true,
     });
@@ -1473,6 +1512,7 @@ pub(crate) fn remux_from_ripped_marker(
             tmdb_year: marker.tmdb_year,
             tmdb_poster: marker.tmdb_poster.clone(),
             tmdb_overview: marker.tmdb_overview.clone(),
+            tmdb_media_type: marker.tmdb_media_type.clone(),
             ..Default::default()
         },
     );
@@ -2070,6 +2110,7 @@ mod sweep_damage_marker_tests {
             tmdb_year: 2024,
             tmdb_poster: String::new(),
             tmdb_overview: String::new(),
+            tmdb_media_type: String::new(),
             max_retries: 3,
             abort_on_lost_secs: 0,
             rip_elapsed_secs: 0.0,
@@ -2166,6 +2207,7 @@ mod sweep_damage_marker_tests {
             tmdb_year: 2024,
             tmdb_poster: String::new(),
             tmdb_overview: String::new(),
+            tmdb_media_type: String::new(),
             max_retries: 3,
             abort_on_lost_secs: 0,
             rip_elapsed_secs: 0.0,
@@ -2223,6 +2265,26 @@ mod sweep_damage_marker_tests {
         assert_eq!(
             super::resolve_done_codecs(Some("HEVC".into()), "AVC".into()),
             "HEVC"
+        );
+    }
+
+    /// Regression: resume `.done`/`.review` markers omitted `media_type`, so the
+    /// mover defaulted every resumed rip to "movie" and filed TV-show resumes
+    /// under the movie library. The resume path now resolves media_type the same
+    /// way the mover reads it: a carried "tv"/"movie" passes through, and an
+    /// empty value (cold auto-resume, no carried metadata) becomes "movie".
+    #[test]
+    fn resolve_media_type_defaults_empty_to_movie() {
+        assert_eq!(
+            super::resolve_media_type("tv"),
+            "tv",
+            "a carried TV media_type must survive into the marker, not collapse to movie"
+        );
+        assert_eq!(super::resolve_media_type("movie"), "movie");
+        assert_eq!(
+            super::resolve_media_type(""),
+            "movie",
+            "empty (cold resume) must resolve to the mover's own default"
         );
     }
 
