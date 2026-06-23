@@ -187,7 +187,7 @@ fn key_readiness(
         // A resolve that still left the disc keyless: defer to the libfreemkv
         // AACS failure heading.
         KeyOutcome::Resolved => {
-            let msg = aacs_failure_message(disc.aacs_error.as_ref());
+            let msg = keyless_failure_message(disc);
             msg.lines().next().unwrap_or("no keys").to_string()
         }
     };
@@ -1646,7 +1646,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     //   * disabled → don't rip; surface the explicit reason and stop here.
     let keys_missing = disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None);
     if keys_missing {
-        let msg = aacs_failure_message(disc.aacs_error.as_ref());
+        let msg = keyless_failure_message(&disc);
         if cfg_read.capture_without_keys {
             crate::log::device_log(
                 device,
@@ -3329,7 +3329,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     //     intermediate. There's nothing to defer to, but we must NOT write a
     //     garbage MKV. Skip and surface the deferral reason.
     if keys_missing {
-        let msg = aacs_failure_message(disc.aacs_error.as_ref());
+        let msg = keyless_failure_message(&disc);
         if cfg_read.max_retries > 0 {
             crate::log::device_log(
                 device,
@@ -4189,8 +4189,35 @@ fn header_phase_outcome_is_failure(output_opened: bool, finalize_error: Option<&
 /// Dispatch is **code-based** (`e.code()`) using named libfreemkv constants.
 /// Codes outside the named set fall through to the 7xxx catch-all rather
 /// than breaking the build when libfreemkv adds a new variant.
+/// Operator-facing message for the "encrypted disc, no usable keys" failure,
+/// dispatched from the *whole disc* rather than just its AACS slot.
+///
+/// CSS (DVD) and AACS (Blu-ray/UHD) record their resolution failures in
+/// separate fields: a CSS known-plaintext crack failure lands in
+/// `disc.css_error` (`Error::CssKeyMissing`), while AACS lands in
+/// `disc.aacs_error`. The two are mutually exclusive in practice — a disc is
+/// either CSS- or AACS-encrypted — so prefer `css_error` when present and
+/// otherwise fall back to the AACS dispatch. Without this, a CSS crack failure
+/// (where `aacs_error` is `None`) would hit the AACS-oriented defensive
+/// fallback and mislead the operator into checking their KEYDB.
+fn keyless_failure_message(disc: &libfreemkv::Disc) -> String {
+    aacs_failure_message(disc.css_error.as_ref().or(disc.aacs_error.as_ref()))
+}
+
 fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
     use libfreemkv::error as ec;
+
+    // CssKeyMissing is a CSS (DVD) crack failure, not an AACS resolution
+    // failure — surface it with CSS-specific messaging before the AACS
+    // numeric dispatch so the operator isn't pointed at the KEYDB.
+    if let Some(libfreemkv::Error::CssKeyMissing) = err {
+        return format!(
+            "Couldn't unscramble disc (E{})\n\
+             CSS-protected disc; no title key could be recovered. The disc may be \
+             damaged or use an unsupported protection variant.",
+            ec::E_CSS_KEY_MISSING
+        );
+    }
 
     // KeydbLoad is a structural pre-condition failure, not an AACS
     // resolution failure — surface it with its own messaging before
@@ -5264,6 +5291,32 @@ mod tests {
             assert!(!heading.is_empty(), "{e:?} empty heading");
             assert!(!body.is_empty(), "{e:?} empty body");
         }
+    }
+
+    #[test]
+    fn css_crack_failure_is_not_aacs_messaging() {
+        // Regression: a CSS (DVD) known-plaintext crack failure records
+        // `Error::CssKeyMissing` in `disc.css_error` (not `aacs_error`).
+        // The keyless-disc message must surface the CSS heading, NOT the
+        // AACS-oriented "check the key source" fallback that the bare
+        // `aacs_failure_message(None)` path produced.
+        let msg = aacs_failure_message(Some(&Error::CssKeyMissing));
+        let heading = msg.lines().next().unwrap();
+        assert!(
+            heading.to_lowercase().contains("unscramble") || heading.to_lowercase().contains("css"),
+            "CSS failure heading should name the CSS problem, got: {heading}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("key source in settings"),
+            "CSS failure must not point the operator at the (AACS) key source: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("E{}", libfreemkv::error::E_CSS_KEY_MISSING)),
+            "CSS failure should carry its E-code: {msg}"
+        );
+        // Two-line contract (same as the AACS messages).
+        let (h, body) = msg.split_once('\n').unwrap();
+        assert!(!h.is_empty() && !body.is_empty());
     }
 
     #[test]

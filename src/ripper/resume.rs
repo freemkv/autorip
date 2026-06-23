@@ -694,7 +694,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // provides keys, the same ISO muxes cleanly. This is the deferred-mux
     // half of the no-keys capture flow started in `rip_disc`.
     if disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None) {
-        let msg = super::aacs_failure_message(disc.aacs_error.as_ref());
+        let msg = super::keyless_failure_message(&disc);
         crate::log::device_log(
             device,
             &format!(
