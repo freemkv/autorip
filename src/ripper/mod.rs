@@ -704,7 +704,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 RipState {
                     device: device.to_string(),
                     status: "error".to_string(),
-                    last_error: format!("{}", e),
+                    last_error: format!("Identify failed: {}", e),
                     ..Default::default()
                 },
             );
@@ -763,7 +763,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
                 RipState {
                     device: device.to_string(),
                     status: "error".to_string(),
-                    last_error: format!("{}", e),
+                    last_error: format!("Scan failed: {}", e),
                     ..Default::default()
                 },
             );
