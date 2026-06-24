@@ -1178,10 +1178,13 @@ fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
 /// fingerprint (UDF volume_id) instead of sanitized title.
 fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<resume::ResumeClass> {
     let cfg_read = cfg.read().ok()?.clone();
+    // Recover from a poisoned mutex rather than silently returning None (which
+    // would fail to resume a valid staged ISO). Matches disc_already_completed.
     let display_name = STATE
         .lock()
-        .ok()
-        .and_then(|s| s.get(device).map(|rs| rs.disc_name.clone()))
+        .unwrap_or_else(|e| e.into_inner())
+        .get(device)
+        .map(|rs| rs.disc_name.clone())
         .unwrap_or_default();
     if display_name.is_empty() {
         return None;
