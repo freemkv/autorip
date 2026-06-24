@@ -285,7 +285,19 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
 pub(super) fn find_iso_and_mapfile(dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut isos: Vec<PathBuf> = Vec::new();
     let mut mapfiles: Vec<PathBuf> = Vec::new();
-    for entry in std::fs::read_dir(dir).ok()? {
+    let read_dir_iter = match std::fs::read_dir(dir) {
+        Ok(iter) => iter,
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "resume: read_dir failed (NFS ESTALE or missing dir?) — \
+                 staging contents unknown, not resuming from this dir"
+            );
+            return None;
+        }
+    };
+    for entry in read_dir_iter {
         // Don't `.flatten()` away per-entry errors: a partial NFS
         // degradation can error on individual DirEntry I/O while the dir
         // is genuinely populated. Silently dropping such an entry could
