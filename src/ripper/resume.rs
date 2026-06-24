@@ -983,7 +983,16 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     } else {
         tmdb_title.clone()
     };
-    let title_confident = carried_confident.unwrap_or(false)
+    // When TMDB is NOT configured (no API key), there is no metadata source
+    // that could ever yield a confident match, so EVERY rip would otherwise
+    // land in `.review` and never auto-file. Operators running without a TMDB
+    // key expect the disc-label filename, not a review hold they may not know
+    // exists. Treat "no API key" as confident: file under the disc label and
+    // write `.done` so the mover promotes it. The review hold is preserved
+    // ONLY when TMDB IS configured but returns a low-confidence match.
+    let tmdb_unconfigured = cfg_read.tmdb_api_key.trim().is_empty();
+    let title_confident = tmdb_unconfigured
+        || carried_confident.unwrap_or(false)
         || crate::tmdb::is_confident_match(
             &crate::tmdb::clean_title(&disc_label),
             &title_for_match,
