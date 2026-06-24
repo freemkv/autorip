@@ -1110,12 +1110,13 @@ function saveSettings(){
   });
   s.webhook_urls=hooks;
  /* v0.13.19: translate the virtual `rip_mode` selector back to the backend
-      fields. Single → max_retries=0 + keep_iso=false (no ISO ever exists).
-      Multi → keep whatever max_retries the user set; default to 5 if they
-      flipped to multi without ever touching the count. The `rip_mode` key
-      itself is never persisted — the backend already infers it from
-      max_retries on the next render. */
-   if(s.rip_mode==='single'){s.max_retries=0;s.keep_iso=false}
+      fields. Single → max_retries=0. Keep keep_iso unchanged so the stored
+      preference survives a mode switch (the server no longer clobbers it
+      from rip_mode either). Multi → keep whatever max_retries the user set;
+      default to 5 if they flipped to multi without ever touching the count.
+      The `rip_mode` key itself is never persisted — the backend already
+      infers it from max_retries on the next render. */
+   if(s.rip_mode==='single'){s.max_retries=0}
    else if(s.rip_mode==='multi'&&(!s.max_retries||s.max_retries<1)){s.max_retries=5}
    delete s.rip_mode;
   /* Loud, hard-to-miss feedback on save. The previous version flashed
