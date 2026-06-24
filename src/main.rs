@@ -577,7 +577,9 @@ fn run_bootstrap() {
             let opts = std::env::var("NFS_OPTS").unwrap_or_else(|_| {
                 "vers=4.1,nconnect=4,nolock,actimeo=3,hard,retry=1,_netdev".into()
             });
-            let _ = std::fs::create_dir_all(&mountpoint);
+            if let Err(e) = std::fs::create_dir_all(&mountpoint) {
+                eprintln!("bootstrap: cannot create NFS mountpoint {mountpoint}: {e}");
+            }
             if !is_mountpoint(&mountpoint) {
                 let source = format!("{host}:{export}");
                 eprintln!("bootstrap: mounting {source} -> {mountpoint} ({opts})");
