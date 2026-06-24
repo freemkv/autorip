@@ -3121,7 +3121,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
                 crate::log::device_log(
                     device,
-                    "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. To let a rip complete despite some loss, RAISE abort_on_lost_secs to the number of seconds of main-movie loss you can tolerate (e.g. 5 or 30).",
+                    &if cfg_read.abort_on_lost_secs == 0 {
+                        "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. To let a rip complete despite some loss, RAISE abort_on_lost_secs to the number of seconds of main-movie loss you can tolerate (e.g. 5 or 30).".to_string()
+                    } else {
+                        format!(
+                            "RECOVERY_GUIDANCE: abort_on_lost_secs={}s limit exceeded — raise abort_on_lost_secs further or accept the loss after disc recovery.",
+                            cfg_read.abort_on_lost_secs
+                        )
+                    },
                 );
                 update_state_with(device, |s| {
                     s.status = "error".to_string();
@@ -3914,7 +3921,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             );
             crate::log::device_log(
                 device,
-                "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. This loss appeared at mux time (decrypt/codec skips), which retries cannot recover. RAISE abort_on_lost_secs to accept some loss, or check that the disc's decryption keys are current.",
+                &if cfg_read.abort_on_lost_secs == 0 {
+                    "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. This loss appeared at mux time (decrypt/codec skips), which retries cannot recover. RAISE abort_on_lost_secs to accept some loss, or check that the disc's decryption keys are current.".to_string()
+                } else {
+                    format!(
+                        "RECOVERY_GUIDANCE: abort_on_lost_secs={}s limit exceeded — raise abort_on_lost_secs further or accept the loss after disc recovery. This loss appeared at mux time (decrypt/codec skips), which retries cannot recover.",
+                        cfg_read.abort_on_lost_secs
+                    )
+                },
             );
             // Quarantine the lossy MKV: write `.failed` so the mover never
             // files it and the resume detector treats the dir as
