@@ -220,11 +220,6 @@ fn dir_is_writable(p: &str) -> bool {
     }
 }
 
-/// Resolve the base config directory. `AUTORIP_DIR` always wins. Otherwise
-/// prefer `/config` when it exists and is writable — the Docker image creates
-/// it, so the container path is unchanged. On a bare install (downloadable
-/// binary, no container mounts) fall back to `$XDG_CONFIG_HOME/autorip` or
-/// `~/.config/autorip` so `./autorip` just works without root.
 /// Resolve where autorip keeps all its state (settings.json, logs, keys,
 /// staging, output). Identical logic on EVERY OS — no per-platform branches —
 /// and always returns a REAL ABSOLUTE path the UI/logs can show verbatim.
