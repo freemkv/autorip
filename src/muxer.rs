@@ -391,8 +391,9 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             if !origin.is_empty() {
                 let still_ripping = crate::ripper::STATE
                     .lock()
-                    .ok()
-                    .and_then(|s| s.get(origin.as_str()).map(|rs| rs.status == "ripping"))
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(origin.as_str())
+                    .map(|rs| rs.status == "ripping")
                     .unwrap_or(false);
                 if still_ripping {
                     crate::ripper::update_state(
