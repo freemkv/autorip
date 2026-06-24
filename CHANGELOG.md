@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0-rc.5.1]
+
+### Fixed
+
+- **Mover no longer warns on every poll for an in-progress staging dir.**
+  The mover emitted a spurious ".done marker" warning on every 10-second
+  poll when it encountered a staging directory that was still being
+  written to. The warning is now suppressed for directories actively in
+  use; it fires only when a directory is genuinely stranded (i.e. present
+  with no corresponding active rip after a restart or crash).
+
 ## [1.0.0-rc.4.2]
 
 Windows durability fixes.

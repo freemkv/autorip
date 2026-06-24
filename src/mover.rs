@@ -525,6 +525,33 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
     tracing::info!("mover loop stopping");
 }
 
+/// How the mover should treat a failed `.done` read on a staging dir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoneAbsence {
+    /// `.done` is absent but a governing marker (`.ripped`/`.completed`/
+    /// `.failed`/`.review`) shows the ripper/mux worker still owns the dir —
+    /// expected "not ready yet" state. Quiet debug, skip (no WARN).
+    InProgress,
+    /// A real fault: non-NotFound read error (NFS ESTALE, EACCES), or a
+    /// NotFound on a stranded dir with no governing marker. Worth a WARN.
+    Fault,
+}
+
+/// Classify a `.done` read error. NotFound + any governing marker present is
+/// the by-design in-progress state; everything else is a fault. Pulled out so
+/// the warn-vs-debug split is unit-testable without a tracing capture.
+fn classify_done_absence(err_kind: std::io::ErrorKind, dir: &Path) -> DoneAbsence {
+    if err_kind == std::io::ErrorKind::NotFound {
+        let governed = [".ripped", ".completed", ".failed", ".review"]
+            .iter()
+            .any(|m| dir.join(m).exists());
+        if governed {
+            return DoneAbsence::InProgress;
+        }
+    }
+    DoneAbsence::Fault
+}
+
 fn check_and_move(cfg: &Config) {
     // Scan staging directory for completed rips (directories with .done marker)
     let staging_root = &cfg.staging_dir;
@@ -590,23 +617,32 @@ fn check_and_move(cfg: &Config) {
                 }
             },
             Err(e) => {
-                // A `.done` that is simply ABSENT because the rip is held for
-                // operator review (sibling `.review` present) is the expected,
-                // by-design state — not an error. Logging a WARN every sweep
-                // (~every 10s for the life of the held dir) is misleading spam
-                // that looks like the mover is broken. Emit a single quiet
-                // debug line instead and skip.
-                if e.kind() == std::io::ErrorKind::NotFound && dir.join(".review").exists() {
+                // A `.done` that is simply ABSENT is the EXPECTED state for any
+                // staging dir the ripper/mux worker still governs — the mover
+                // is not the dir's hand-off until `.done` lands. The lifecycle
+                // is: `.ripped` (sweep+patch done, awaiting mux) → mux runs →
+                // `.done`/`.review` + `.completed`. For the whole rip+mux phase
+                // (which for a long disc is many minutes, i.e. tens of 10s
+                // ticks) the dir has a `.ripped`/`.completed`/`.failed`/`.review`
+                // marker but no `.done`. WARNing every tick on that absence is
+                // misleading spam that looks like the mover is broken (seen
+                // live: 182 warns for one in-progress disc that ultimately
+                // ripped and moved cleanly). Treat NotFound while a governing
+                // marker is present as the by-design "not ready yet" state:
+                // quiet debug, skip. Only a `.done` NotFound on a dir with NO
+                // governing marker (truly stranded) — or any non-NotFound read
+                // error (NFS ESTALE, EACCES) — is a real fault worth a WARN.
+                if classify_done_absence(e.kind(), &dir) == DoneAbsence::InProgress {
                     tracing::debug!(
                         dir = %dir.display(),
-                        "mover: staging dir held for operator review (.review); skipping"
+                        "mover: staging dir in progress (no .done yet); skipping"
                     );
                     continue;
                 }
                 // A genuine .done read failure (NFS ESTALE, permission denied,
-                // or NotFound with no review hold) leaves the dir in staging
-                // looking healthy from the mover's view until the handle
-                // recovers; surface it.
+                // or NotFound on a stranded dir with no governing marker) leaves
+                // the dir in staging looking healthy from the mover's view until
+                // the handle recovers; surface it.
                 tracing::warn!(
                     marker = %marker_path.display(),
                     error = %e,
@@ -2296,6 +2332,49 @@ mod tests {
             MoverVerdict::MovedAndCleaned,
             "valid .done + .completed + MKV → mover still files it"
         );
+    }
+
+    #[test]
+    fn done_absence_in_progress_vs_fault() {
+        use std::io::ErrorKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("disc");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Bare dir, .done NotFound, no governing marker → stranded → Fault (WARN).
+        assert_eq!(
+            classify_done_absence(ErrorKind::NotFound, &dir),
+            DoneAbsence::Fault,
+            "NotFound with no governing marker is a stranded dir → WARN"
+        );
+
+        // A non-NotFound read error is always a fault, even mid-rip.
+        assert_eq!(
+            classify_done_absence(ErrorKind::PermissionDenied, &dir),
+            DoneAbsence::Fault,
+            "EACCES/ESTALE etc. → WARN regardless of governing marker"
+        );
+
+        // Each governing marker turns a .done NotFound into the by-design
+        // in-progress state (quiet skip, no WARN). This is the 182-warn bug:
+        // a long rip sits at .ripped (then .completed/.failed/.review) with no
+        // .done for many ticks while the mux worker runs.
+        for m in [".ripped", ".completed", ".failed", ".review"] {
+            let governed = tmp.path().join(format!("disc{m}"));
+            std::fs::create_dir_all(&governed).unwrap();
+            std::fs::write(governed.join(m), b"x").unwrap();
+            assert_eq!(
+                classify_done_absence(ErrorKind::NotFound, &governed),
+                DoneAbsence::InProgress,
+                "NotFound while {m} present is the in-progress state → no WARN"
+            );
+            // ...but a non-NotFound error on the same dir is still a fault.
+            assert_eq!(
+                classify_done_absence(ErrorKind::Other, &governed),
+                DoneAbsence::Fault,
+                "non-NotFound error is a fault even with {m} present"
+            );
+        }
     }
 
     #[test]
