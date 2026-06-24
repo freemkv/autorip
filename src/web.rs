@@ -4111,19 +4111,14 @@ fn handle_eject(request: tiny_http::Request, device: &str) {
     }
     let device_path = format!("/dev/{}", device);
     crate::ripper::eject_drive(&device_path);
-    ripper::STATE
-        .lock()
-        .map(|mut s| {
-            s.insert(
-                device.to_string(),
-                ripper::RipState {
-                    device: device.to_string(),
-                    status: "idle".to_string(),
-                    ..Default::default()
-                },
-            );
-        })
-        .ok();
+    ripper::update_state(
+        device,
+        ripper::RipState {
+            device: device.to_string(),
+            status: "idle".to_string(),
+            ..Default::default()
+        },
+    );
     json_response(request, 200, r#"{"ok":true}"#);
 }
 
