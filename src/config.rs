@@ -322,7 +322,9 @@ pub fn load() -> Arc<RwLock<Config>> {
         cfg.staging_dir.clone(),
         cfg.output_dir.clone(),
     ] {
-        let _ = std::fs::create_dir_all(&d);
+        if let Err(e) = std::fs::create_dir_all(&d) {
+            tracing::warn!(path = %d, error = %e, "could not create required directory");
+        }
     }
 
     // Apply the persisted decrypt thread count to libfreemkv's
