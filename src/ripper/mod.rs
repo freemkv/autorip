@@ -463,9 +463,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 if is_new_insert && !is_in_cooldown(&device) {
                     let on_insert = cfg
                         .read()
-                        .ok()
-                        .map(|c| c.on_insert.clone())
-                        .unwrap_or_else(|| "scan".to_string());
+                        .unwrap_or_else(|e| e.into_inner())
+                        .on_insert
+                        .clone();
 
                     if on_insert == "nothing" {
                         update_state(
