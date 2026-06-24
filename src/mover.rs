@@ -590,9 +590,23 @@ fn check_and_move(cfg: &Config) {
                 }
             },
             Err(e) => {
-                // A .done read failure (NFS ESTALE, permission denied)
-                // leaves the dir in staging looking healthy from the
-                // mover's view until the handle recovers; surface it.
+                // A `.done` that is simply ABSENT because the rip is held for
+                // operator review (sibling `.review` present) is the expected,
+                // by-design state — not an error. Logging a WARN every sweep
+                // (~every 10s for the life of the held dir) is misleading spam
+                // that looks like the mover is broken. Emit a single quiet
+                // debug line instead and skip.
+                if e.kind() == std::io::ErrorKind::NotFound && dir.join(".review").exists() {
+                    tracing::debug!(
+                        dir = %dir.display(),
+                        "mover: staging dir held for operator review (.review); skipping"
+                    );
+                    continue;
+                }
+                // A genuine .done read failure (NFS ESTALE, permission denied,
+                // or NotFound with no review hold) leaves the dir in staging
+                // looking healthy from the mover's view until the handle
+                // recovers; surface it.
                 tracing::warn!(
                     marker = %marker_path.display(),
                     error = %e,

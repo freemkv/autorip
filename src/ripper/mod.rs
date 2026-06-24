@@ -1687,7 +1687,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Confident = an exact title match WITH a year. Carried to the finalize block
     // to decide auto-file (.done) vs hold-for-review (.review). disc_name is the
     // disc's volume label; display_name is the resolved (TMDB) title.
-    let title_confident = overridden
+    //
+    // When TMDB is NOT configured (no API key) no rip can ever produce a
+    // confident match, so every rip would land in `.review` and never
+    // auto-file. Operators running without a TMDB key expect the disc-label
+    // filename, not a review hold. Treat "no API key" as confident so the rip
+    // files under the disc label and writes `.done`. The review hold is
+    // preserved ONLY when TMDB IS configured but returns low confidence.
+    let title_confident = cfg_read.tmdb_api_key.trim().is_empty()
+        || overridden
         || crate::tmdb::is_confident_match(
             &crate::tmdb::clean_title(&disc_name),
             &display_name,
