@@ -377,7 +377,18 @@ impl<'a> IsoAccess<'a> {
 
 impl DiscKeyAccess for IsoAccess<'_> {
     fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        libfreemkv::Disc::read_aacs_inputs(self.iso_path).ok()
+        match libfreemkv::Disc::read_aacs_inputs(self.iso_path) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    phase = "key_resolve",
+                    path = %self.iso_path.display(),
+                    error = %e,
+                    "read_aacs_inputs failed"
+                );
+                None
+            }
+        }
     }
     fn volume_id(&self) -> Option<[u8; 16]> {
         libfreemkv::disc::mapfile::Mapfile::load(self.mapfile_path)
