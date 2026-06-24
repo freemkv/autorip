@@ -1220,7 +1220,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // `.failed` as terminal (muxer.rs), but deleting `.ripped` here removes
         // the re-queue source outright — belt and suspenders against the
         // re-mux-forever loop.
-        let _ = crate::muxer::delete_marker(&staging_dir);
+        if let Err(e) = crate::muxer::delete_marker(&staging_dir) {
+            tracing::warn!(
+                staging = %staging_dir.display(),
+                error = %e,
+                "failed to delete .ripped marker after abort-on-lost-secs; .failed guard prevents re-mux"
+            );
+        }
         reset_status_after_ripping(
             device,
             "error",
