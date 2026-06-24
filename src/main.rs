@@ -256,20 +256,19 @@ fn main() {
                 match web::guarded_get(&url) {
                     Ok(resp) => {
                         let mut buf = Vec::new();
-                        if resp
+                        if let Err(e) = resp
                             .into_reader()
                             .take(100 * 1024 * 1024)
                             .read_to_end(&mut buf)
-                            .is_ok()
                         {
+                            log::syslog(&format!("KEYDB daily update: response read failed: {e}"));
+                        } else {
                             match libfreemkv::keydb::save(&buf) {
                                 Ok(r) => {
                                     log::syslog(&format!("KEYDB updated: {} entries", r.entries))
                                 }
                                 Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
                             }
-                        } else {
-                            tracing::warn!("keydb: response read failed");
                         }
                     }
                     Err(e) => log::syslog(&format!(
