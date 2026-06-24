@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use freemkv_keysources::{
     DiscInputs, KeySource, KeydbSource, MapfileSource, MultiSource, OnlineSource,
-    read_sample_units, resolve_and_apply,
 };
+use libfreemkv::{read_encrypted_units, resolve_and_apply};
 
 use crate::config::Config;
 
@@ -365,7 +365,7 @@ impl DiscKeyAccess for DriveAccess<'_> {
         self.vid
     }
     fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>> {
-        read_sample_units(self.drive, title, n)
+        read_encrypted_units(self.drive, title, n)
     }
 }
 
@@ -407,7 +407,7 @@ impl DiscKeyAccess for IsoAccess<'_> {
     }
     fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>> {
         match libfreemkv::FileSectorSource::open(self.iso_path) {
-            Ok(mut r) => read_sample_units(&mut r, title, n),
+            Ok(mut r) => read_encrypted_units(&mut r, title, n),
             Err(err) => {
                 // Without samples an online key request fires with no
                 // units_b64 and can fail later as NoKey with no visible cause;
@@ -535,7 +535,7 @@ mod tests {
         ));
     }
 
-    /// Cross-side agreement: autorip's sample selector (`read_sample_units`)
+    /// Cross-side agreement: autorip's sample selector (`read_encrypted_units`)
     /// hands the key service only units the service's own gate accepts —
     /// because both sides call the SAME predicate,
     /// `libfreemkv::aacs::is_aacs_scrambled`.
@@ -567,7 +567,7 @@ mod tests {
             codec_privates: Vec::new(),
         };
 
-        let units = read_sample_units(&mut reader, &title, SAMPLE_UNITS);
+        let units = read_encrypted_units(&mut reader, &title, SAMPLE_UNITS);
         assert_eq!(units.len(), SAMPLE_UNITS, "should collect 4 sample units");
         for u in &units {
             assert_eq!(u.len(), 6144);
