@@ -387,9 +387,10 @@ pub(super) fn store_session(device: &str, session: DriveSession) {
         .map(|d| d.volume_id.trim())
         .filter(|v| !v.is_empty())
     {
-        if let Ok(mut ids) = DISC_IDENTITY.lock() {
-            ids.insert(device.to_string(), vid.to_string());
-        }
+        DISC_IDENTITY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(device.to_string(), vid.to_string());
     }
     // Recover-and-proceed on poison (matching register_halt / register_rip_thread):
     // dropping the session silently would make session_is_scanned return false
