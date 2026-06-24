@@ -12,7 +12,6 @@ mod verify;
 mod web;
 mod webhook;
 
-use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[global_allocator]
@@ -173,22 +172,17 @@ fn main() {
             // keydb_url reach loopback / RFC1918 / cloud-metadata.
             match web::guarded_get(&url) {
                 Ok(resp) => {
-                    let mut buf = Vec::new();
-                    match resp
-                        .into_reader()
-                        .take(100 * 1024 * 1024)
-                        .read_to_end(&mut buf)
-                    {
-                        Ok(_) => match libfreemkv::keydb::save(&buf) {
+                    match web::read_capped_keydb_body(resp.into_reader(), web::KEYDB_MAX_BYTES) {
+                        Ok(buf) => match libfreemkv::keydb::save(&buf) {
                             Ok(r) => {
                                 log::syslog(&format!("KEYDB downloaded: {} entries", r.entries))
                             }
                             Err(e) => log::syslog(&format!("KEYDB save failed: {e}")),
                         },
-                        // Match the daily-refresh path, which logs "response
-                        // read failed"; without this a truncated transfer /
-                        // disk-full on first boot was dropped silently.
-                        Err(e) => log::syslog(&format!("KEYDB download read failed: {e}")),
+                        Err(web::KeydbReadError::TooLarge) => {
+                            log::syslog("KEYDB download failed: response exceeded size limit")
+                        }
+                        Err(web::KeydbReadError::Io) => log::syslog("KEYDB download read failed"),
                     }
                 }
                 Err(e) => log::syslog(&format!(
@@ -255,19 +249,19 @@ fn main() {
                 // settings save and manual update already enforce.
                 match web::guarded_get(&url) {
                     Ok(resp) => {
-                        let mut buf = Vec::new();
-                        if let Err(e) = resp
-                            .into_reader()
-                            .take(100 * 1024 * 1024)
-                            .read_to_end(&mut buf)
+                        match web::read_capped_keydb_body(resp.into_reader(), web::KEYDB_MAX_BYTES)
                         {
-                            log::syslog(&format!("KEYDB daily update: response read failed: {e}"));
-                        } else {
-                            match libfreemkv::keydb::save(&buf) {
+                            Ok(buf) => match libfreemkv::keydb::save(&buf) {
                                 Ok(r) => {
                                     log::syslog(&format!("KEYDB updated: {} entries", r.entries))
                                 }
                                 Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
+                            },
+                            Err(web::KeydbReadError::TooLarge) => {
+                                log::syslog("KEYDB daily update: response exceeded size limit")
+                            }
+                            Err(web::KeydbReadError::Io) => {
+                                log::syslog("KEYDB daily update: response read failed")
                             }
                         }
                     }

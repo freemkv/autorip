@@ -3917,9 +3917,14 @@ fn parse_resume_param(query: &str) -> ResumeMode {
     ResumeMode::Default
 }
 
+/// Shared cap for all three KEYDB download paths (startup, daily refresh, web
+/// handler). All paths use `read_capped_keydb_body` so overflow is detected
+/// rather than silently truncating at the cap.
+pub(crate) const KEYDB_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Why a capped keydb body read failed.
 #[derive(Debug, PartialEq, Eq)]
-enum KeydbReadError {
+pub(crate) enum KeydbReadError {
     /// The underlying reader errored.
     Io,
     /// The body exceeded the byte cap (oversized plain-text keydb).
@@ -3932,7 +3937,7 @@ enum KeydbReadError {
 /// silently truncating an oversized plain-text keydb into a half-valid file.
 /// Read one byte past the cap instead so an oversized body is detectable, and
 /// return `TooLarge` rather than a truncated buffer.
-fn read_capped_keydb_body<R: std::io::Read>(
+pub(crate) fn read_capped_keydb_body<R: std::io::Read>(
     reader: R,
     max_bytes: u64,
 ) -> std::result::Result<Vec<u8>, KeydbReadError> {
@@ -4006,13 +4011,14 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // Wall-clock bound on the whole download so a slow-loris server can't hold
     // the in-flight slot (and the handler thread) indefinitely.
     const KEYDB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    // 10 MiB cap: the lean UHD keydb is well under this; anything larger is
-    // either a wrong URL or a hostile body and must not be buffered whole.
-    const KEYDB_MAX_BYTES: u64 = 10 * 1024 * 1024;
+    // Cap is the shared module-level KEYDB_MAX_BYTES (100 MiB); using
+    // read_capped_keydb_body means an oversized body returns 413 rather than
+    // silently truncating at the limit.
+    let keydb_cap = KEYDB_MAX_BYTES;
 
     // Download via ureq (supports HTTPS) then save via libfreemkv
     let body = match agent.get(&keydb_url).timeout(KEYDB_FETCH_TIMEOUT).call() {
-        Ok(resp) => match read_capped_keydb_body(resp.into_reader(), KEYDB_MAX_BYTES) {
+        Ok(resp) => match read_capped_keydb_body(resp.into_reader(), keydb_cap) {
             Ok(buf) => buf,
             Err(KeydbReadError::Io) => {
                 json_response(
@@ -4026,7 +4032,7 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
                 json_response(
                     request,
                     413,
-                    r#"{"ok":false,"error":"KEYDB too large (>10 MB plain-text); use a gzip/zip URL"}"#,
+                    r#"{"ok":false,"error":"KEYDB too large (>100 MB plain-text); use a gzip/zip URL"}"#,
                 );
                 return;
             }
