@@ -1115,7 +1115,7 @@ function saveSettings(){
       flipped to multi without ever touching the count. The `rip_mode` key
       itself is never persisted — the backend already infers it from
       max_retries on the next render. */
-   if(s.rip_mode==='single'){s.max_retries=0;s.keep_iso=false;s.abort_on_lost_secs=0}
+   if(s.rip_mode==='single'){s.max_retries=0;s.keep_iso=false}
    else if(s.rip_mode==='multi'&&(!s.max_retries||s.max_retries<1)){s.max_retries=5}
    delete s.rip_mode;
   /* Loud, hard-to-miss feedback on save. The previous version flashed
