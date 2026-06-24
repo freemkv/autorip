@@ -3274,6 +3274,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 if let Some(h) = device_halt(device) {
                     h.cancel();
                 }
+                drop(session);
                 eject_drive(device_path);
             } else {
                 drop(session);
@@ -3447,6 +3448,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 if let Some(h) = device_halt(device) {
                     h.cancel();
                 }
+                drop(session);
                 eject_drive(device_path);
             } else {
                 drop(session);
