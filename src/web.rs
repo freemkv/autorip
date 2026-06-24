@@ -3383,6 +3383,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         ("on_insert", &["nothing", "scan", "rip"][..]),
         ("on_read_error", &["stop", "skip"][..]),
         ("output_format", &["mkv", "m2ts", "iso", "network"][..]),
+        ("rip_mode", &["single", "multi"][..]),
     ] {
         if let Some(v) = patch.get(field).and_then(|v| v.as_str()) {
             if !allowed.contains(&v) {
