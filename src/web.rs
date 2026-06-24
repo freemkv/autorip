@@ -3566,6 +3566,9 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         if let Some(false) = patch.get("abort_on_error").and_then(|v| v.as_bool()) {
             c.on_read_error = "skip".to_string();
         }
+        if let Some(true) = patch.get("abort_on_error").and_then(|v| v.as_bool()) {
+            c.on_read_error = "stop".to_string();
+        }
         if let Some(v) = patch.get("output_format").and_then(|v| v.as_str()) {
             c.output_format = v.to_string();
         }
