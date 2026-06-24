@@ -141,11 +141,14 @@ pub fn increment_restart_count(staging_disc_dir: &Path) -> io::Result<u64> {
     // Write a temp file, fsync it, then rename(2) over the target (atomic
     // within a filesystem) so the counter is never observed half-written.
     let tmp = staging_disc_dir.join(format!("{}.tmp", RESTART_COUNT_FILE));
-    {
+    (|| -> io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         writeln!(f, "{}", next)?;
-        f.sync_all()?;
-    }
+        f.sync_all()
+    })()
+    .inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
     if let Err(e) = std::fs::rename(&tmp, &p) {
         // A permanent rename failure (cross-device move, ESTALE, full
         // directory) would otherwise leave the `.tmp` sibling on disk
