@@ -349,7 +349,17 @@ impl<'a> DriveAccess<'a> {
 
 impl DiscKeyAccess for DriveAccess<'_> {
     fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        libfreemkv::Disc::read_aacs_inputs_from_drive(self.drive).ok()
+        match libfreemkv::Disc::read_aacs_inputs_from_drive(self.drive) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    phase = "key_resolve",
+                    error = %e,
+                    "read_aacs_inputs_from_drive failed"
+                );
+                None
+            }
+        }
     }
     fn volume_id(&self) -> Option<[u8; 16]> {
         self.vid
