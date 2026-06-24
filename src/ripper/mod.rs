@@ -4625,7 +4625,17 @@ fn incomplete_mux_status(
 /// (where `aacs_error` is `None`) would hit the AACS-oriented defensive
 /// fallback and mislead the operator into checking their KEYDB.
 fn keyless_failure_message(disc: &libfreemkv::Disc) -> String {
-    aacs_failure_message(disc.css_error.as_ref().or(disc.aacs_error.as_ref()))
+    keyless_failure_message_for(disc.css_error.as_ref(), disc.aacs_error.as_ref())
+}
+
+/// CSS-over-AACS priority dispatch, split out from [`keyless_failure_message`]
+/// so the `.or()` ordering (css_error preferred when both are set, and
+/// consulted at all) is unit-testable without constructing a full `Disc`.
+fn keyless_failure_message_for(
+    css_error: Option<&libfreemkv::Error>,
+    aacs_error: Option<&libfreemkv::Error>,
+) -> String {
+    aacs_failure_message(css_error.or(aacs_error))
 }
 
 fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
@@ -5808,6 +5818,35 @@ mod tests {
     }
 
     #[test]
+    fn keyless_failure_message_prefers_css_error_over_aacs() {
+        // The `.or()` dispatch in keyless_failure_message must consult
+        // css_error first. With both set (CSS crack failed, plus a stale
+        // AACS error) it must surface CSS messaging.
+        let css = Error::CssKeyMissing;
+        let aacs = Error::KeydbLoad {
+            path: "<no keydb in search paths>".to_string(),
+        };
+        let msg = super::keyless_failure_message_for(Some(&css), Some(&aacs));
+        let heading = msg.lines().next().unwrap().to_lowercase();
+        assert!(
+            heading.contains("unscramble") || heading.contains("css"),
+            "css_error must take priority over aacs_error: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("E{}", libfreemkv::error::E_CSS_KEY_MISSING)),
+            "expected CSS E-code: {msg}"
+        );
+
+        // css_error alone (aacs_error None) — the field-based branch is
+        // consulted at all, not just the AACS fallback.
+        let msg2 = super::keyless_failure_message_for(Some(&css), None);
+        assert!(
+            msg2.to_lowercase().contains("unscramble") || msg2.to_lowercase().contains("css"),
+            "css_error-only disc must surface CSS messaging: {msg2}"
+        );
+    }
+
+    #[test]
     fn device_key_strips_unix_path() {
         // autorip keys its state map by the trailing path component
         // ("sg4", "disk2", "CdRom0"); `device_key` strips the leading
@@ -6743,6 +6782,31 @@ mod tests {
         assert!(
             region.contains("write_failed_marker"),
             "post-mux gate must quarantine an over-threshold lossy mux with write_failed_marker"
+        );
+    }
+
+    #[test]
+    fn post_mux_gate_decision_function_aborts_above_threshold() {
+        // Behavioural companion to the source-inspection test above: exercise
+        // the actual decision the post-mux gate makes, using the exact
+        // expression from the gate (`demux_lost_secs * 1000.0` vs the ms
+        // threshold). A nonzero loss above threshold must abort; below or at
+        // threshold must not.
+        let abort_threshold_ms = 30_000.0; // abort_on_lost_secs = 30
+        let over_demux_lost_secs = 45.0;
+        let under_demux_lost_secs = 10.0;
+        assert!(
+            super::should_abort_for_loss(over_demux_lost_secs * 1000.0, abort_threshold_ms),
+            "45s demux loss over a 30s threshold must abort"
+        );
+        assert!(
+            !super::should_abort_for_loss(under_demux_lost_secs * 1000.0, abort_threshold_ms),
+            "10s demux loss under a 30s threshold must not abort"
+        );
+        // Perfect-required (threshold 0): any nonzero loss aborts.
+        assert!(
+            super::should_abort_for_loss(0.001 * 1000.0, 0.0),
+            "any demux loss must abort when abort_on_lost_secs = 0"
         );
     }
 }

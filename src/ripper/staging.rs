@@ -1258,14 +1258,10 @@ mod tests {
         let hints = resume_or_quarantine_staging(root.to_str().unwrap());
         if hints.is_empty() {
             // No hint emitted: the dir was either wiped (empty/junk) or
-            // skipped (UNKNOWN). Distinguish by whether it still exists.
-            return if disc.exists() {
-                // Shouldn't happen for these local-FS rows, but treat a
-                // surviving-yet-hintless dir as not-wiped for clarity.
-                Verdict::Wiped
-            } else {
-                Verdict::Wiped
-            };
+            // skipped (UNKNOWN). For these local-FS test rows both cases
+            // collapse to Wiped — the dir's continued existence makes no
+            // difference to the verdict here.
+            return Verdict::Wiped;
         }
         assert_eq!(hints.len(), 1, "expected exactly one disc dir");
         match &hints[0].action {
