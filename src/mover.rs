@@ -650,11 +650,34 @@ fn check_and_move(cfg: &Config) {
         // staging dir holds no `.mkv` — only the `.iso` to promote.
         let move_iso = cfg.keep_iso || cfg.output_format == "iso";
         let ripped_files: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension()
+            Ok(entries) => {
+                // Don't `.filter_map(|e| e.ok())` away per-entry errors: on a
+                // cold-cache or degraded NFS mount a single DirEntry I/O error
+                // can silently drop the only .mkv, leaving `ripped_files` empty
+                // and the job skipped every tick with no operator visibility.
+                // Mirror the outer staging-root loop (line ~550) and
+                // `find_iso_and_mapfile` (resume.rs): match each entry
+                // explicitly and surface the error via record_error.
+                let mut files = Vec::new();
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(e) => {
+                            record_error(
+                                &dir.to_string_lossy(),
+                                &format!(
+                                    "per-entry error listing staging directory {}: {}",
+                                    dir.display(),
+                                    e
+                                ),
+                                "check that the staging mount is healthy and readable; \
+                                 staging contents are unknown for this directory",
+                            );
+                            continue;
+                        }
+                    };
+                    let p = entry.path();
+                    if p.extension()
                         .and_then(|x| x.to_str())
                         .map(|ext| match ext {
                             "mkv" | "m2ts" => true,
@@ -662,8 +685,12 @@ fn check_and_move(cfg: &Config) {
                             _ => false,
                         })
                         .unwrap_or(false)
-                })
-                .collect(),
+                    {
+                        files.push(p);
+                    }
+                }
+                files
+            }
             Err(e) => {
                 // Enumerating the staging dir's contents failed (e.g. a
                 // transient NFS read_dir error). Without this arm the dir
