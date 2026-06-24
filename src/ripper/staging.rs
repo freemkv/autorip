@@ -177,11 +177,14 @@ pub(crate) fn write_marker_durable(path: &Path, contents: &[u8]) -> io::Result<(
             ));
         }
     };
-    {
+    (|| -> io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents)?;
-        f.sync_all()?;
-    }
+        f.sync_all()
+    })()
+    .inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
     if let Err(e) = std::fs::rename(&tmp, path) {
         // Clean up the `.tmp` sibling on a permanent rename failure
         // (cross-device move, ESTALE, full directory) so it is not
