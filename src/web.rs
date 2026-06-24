@@ -3559,15 +3559,19 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         if let Some(v) = patch.get("auto_eject").and_then(|v| v.as_bool()) {
             c.auto_eject = v;
         }
+        let on_read_error_in_patch = patch.get("on_read_error").is_some();
         if let Some(v) = patch.get("on_read_error").and_then(|v| v.as_str()) {
             c.on_read_error = v.to_string();
         }
-        // Legacy: migrate abort_on_error bool to on_read_error string
-        if let Some(false) = patch.get("abort_on_error").and_then(|v| v.as_bool()) {
-            c.on_read_error = "skip".to_string();
-        }
-        if let Some(true) = patch.get("abort_on_error").and_then(|v| v.as_bool()) {
-            c.on_read_error = "stop".to_string();
+        // Legacy: migrate abort_on_error bool to on_read_error string.
+        // An explicit on_read_error in the PATCH always wins (mirrors config.rs::load_saved).
+        if !on_read_error_in_patch {
+            if let Some(false) = patch.get("abort_on_error").and_then(|v| v.as_bool()) {
+                c.on_read_error = "skip".to_string();
+            }
+            if let Some(true) = patch.get("abort_on_error").and_then(|v| v.as_bool()) {
+                c.on_read_error = "stop".to_string();
+            }
         }
         if let Some(v) = patch.get("output_format").and_then(|v| v.as_str()) {
             c.output_format = v.to_string();
