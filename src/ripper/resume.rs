@@ -662,7 +662,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             &bad_ranges,
             title_bytes_per_sec,
         ) / 1000.0;
-        if lost_secs > cfg_read.abort_on_lost_secs as f64 {
+        if super::should_abort_for_loss(
+            lost_secs * 1000.0,
+            (cfg_read.abort_on_lost_secs * 1000) as f64,
+        ) {
             // "disc loss" for raw ISO (whole-disc scope), "title loss" for a
             // muxed MKV/M2TS (in-title scope) — matching how `lost_secs` was
             // computed just above.
