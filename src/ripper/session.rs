@@ -235,9 +235,10 @@ pub fn join_rip_thread(device: &str, timeout: Duration) -> Result<(), ()> {
 pub fn join_all_rip_threads(timeout: Duration) {
     let devices: Vec<String> = RIP_THREADS
         .lock()
-        .ok()
-        .map(|t| t.keys().cloned().collect())
-        .unwrap_or_default();
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
     let deadline = std::time::Instant::now() + timeout;
     for device in devices {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
