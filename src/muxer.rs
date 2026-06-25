@@ -429,13 +429,12 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             // that was re-used for a new rip while this mux ran.
             let origin = &marker.origin_device;
             if !origin.is_empty() {
-                let still_ripping = crate::ripper::STATE
+                let origin_status = crate::ripper::STATE
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(origin.as_str())
-                    .map(|rs| rs.status == "ripping")
-                    .unwrap_or(false);
-                if still_ripping {
+                    .map(|rs| rs.status.clone());
+                if should_revert_origin_to_done(origin, origin_status.as_deref()) {
                     crate::ripper::update_state(
                         origin,
                         crate::ripper::RipState {
@@ -500,6 +499,27 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             );
         }
     }
+}
+
+/// Should the mux worker drive the origin device to "done" after a
+/// successful mux? Pure projection of the device key + its current status
+/// so the contract is unit-testable without standing up STATE + a real mux.
+///
+/// Two rules:
+/// 1. A real origin device only needs the revert if it is STILL "ripping"
+///    — the inline-mux FALLBACK path (the `.ripped` marker write failed, so
+///    `rip_disc` muxed inline while leaving the tile "ripping"). On the
+///    normal `.ripped` hand-off path the tile is already "done" (the read
+///    finished) and this is a no-op, so the synthetic `_mux` worker can
+///    never push a real "done" tile back through "ripping" (bug #1).
+/// 2. A synthetic underscore-prefixed `origin` (defensive — should not
+///    occur, the marker's `origin_device` is the physical drive) is never
+///    reverted: those carry no user-visible tile.
+///
+/// `status == None` (the device entry vanished — re-used / cleared) ⇒ no
+/// revert, matching the prior `.unwrap_or(false)`.
+pub(crate) fn should_revert_origin_to_done(origin: &str, status: Option<&str>) -> bool {
+    !origin.is_empty() && !origin.starts_with('_') && status == Some("ripping")
 }
 
 /// Scan the staging dir for pending mux jobs. Returns display names
@@ -817,11 +837,13 @@ mod tests {
 
     // Regression (bug #1): after the `.ripped` hand-off the REAL device is
     // already "done" (the read finished). The mux worker's post-mux revert
-    // only fires for a device still "ripping", so the synthetic `_mux`
-    // worker can NEVER push a real device's "done" tile back to "ripping".
+    // (`should_revert_origin_to_done`) only fires for a device still
+    // "ripping", so the synthetic `_mux` worker can NEVER push a real
+    // device's "done" tile back to "ripping". Drives the REAL production
+    // helper against STATE so the test and `check_and_mux` can't diverge.
     #[test]
     fn mux_worker_does_not_revert_done_origin_device() {
-        let device = "_test_origin_already_done";
+        let device = "sg_test_origin_already_done";
         // Hand-off set the real device straight to "done" (the new contract).
         crate::ripper::update_state(
             device,
@@ -834,23 +856,73 @@ mod tests {
                 ..Default::default()
             },
         );
-        // Replicate the mux worker's guard: it only acts if still "ripping".
-        let still_ripping = crate::ripper::STATE
+        let status = crate::ripper::STATE
             .lock()
             .unwrap()
             .get(device)
-            .map(|rs| rs.status == "ripping")
-            .unwrap_or(false);
+            .map(|rs| rs.status.clone());
         assert!(
-            !still_ripping,
-            "a device already 'done' at hand-off must not be seen as still ripping"
+            !should_revert_origin_to_done(device, status.as_deref()),
+            "a device already 'done' at hand-off must not be reverted by the mux worker"
         );
-        // Status must remain "done" — the worker's revert is a no-op here.
-        let s = crate::ripper::STATE.lock().unwrap();
-        assert_eq!(
-            s.get(device).map(|rs| rs.status.as_str()),
-            Some("done"),
-            "the synthetic mux worker must not revert a real device's done tile to ripping"
+        // Cleanup so the synthetic entry doesn't leak into other tests.
+        crate::ripper::STATE.lock().unwrap().remove(device);
+    }
+
+    // Companion (bug #1, the OTHER half): on the INLINE-MUX FALLBACK path
+    // (the `.ripped` marker write failed, so `rip_disc` muxed inline and
+    // left the tile "ripping"), the revert IS needed and MUST fire — the
+    // fix must not over-correct into never reverting. Here the worker's
+    // `origin_device` device is still "ripping", so the helper returns true.
+    #[test]
+    fn mux_worker_reverts_ripping_origin_on_inline_fallback() {
+        let device = "sg_test_origin_still_ripping";
+        crate::ripper::update_state(
+            device,
+            crate::ripper::RipState {
+                device: device.to_string(),
+                status: "ripping".to_string(),
+                disc_name: "Border Town".to_string(),
+                disc_format: "uhd".to_string(),
+                ..Default::default()
+            },
+        );
+        let status = crate::ripper::STATE
+            .lock()
+            .unwrap()
+            .get(device)
+            .map(|rs| rs.status.clone());
+        assert!(
+            should_revert_origin_to_done(device, status.as_deref()),
+            "a still-'ripping' origin device (inline-mux fallback) MUST be reverted to done"
+        );
+        crate::ripper::STATE.lock().unwrap().remove(device);
+    }
+
+    // The revert predicate edge cases: empty origin, synthetic origin, and a
+    // vanished/absent device entry are all no-ops; only a real, still-ripping
+    // device reverts.
+    #[test]
+    fn revert_origin_predicate_edge_cases() {
+        assert!(
+            !should_revert_origin_to_done("", Some("ripping")),
+            "empty origin must not revert"
+        );
+        assert!(
+            !should_revert_origin_to_done("_mux", Some("ripping")),
+            "a synthetic origin must not revert"
+        );
+        assert!(
+            !should_revert_origin_to_done("sg0", None),
+            "a vanished device entry (None status) must not revert"
+        );
+        assert!(
+            !should_revert_origin_to_done("sg0", Some("done")),
+            "an already-done device must not revert"
+        );
+        assert!(
+            should_revert_origin_to_done("sg0", Some("ripping")),
+            "a real, still-ripping device must revert"
         );
     }
 
