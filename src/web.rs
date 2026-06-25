@@ -4069,7 +4069,17 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         }
     };
 
-    match libfreemkv::keydb::save(&body) {
+    // Write to the service-canonical keydb path (the one the reads resolve via
+    // keysource::keydb_path), NOT libfreemkv's exe-local default — otherwise the
+    // "Update KEYDB" button reports success while every AACS rip keeps failing
+    // because the read side looks elsewhere.
+    let saved = cfg
+        .read()
+        .map_err(|_| libfreemkv::Error::KeydbWrite {
+            path: "<config lock poisoned>".into(),
+        })
+        .and_then(|c| crate::keysource::save_keydb(&c, &body));
+    match saved {
         Ok(result) => {
             let body = serde_json::json!({
                 "ok": true,
