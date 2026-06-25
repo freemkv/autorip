@@ -2419,6 +2419,58 @@ mod tests {
         );
     }
 
+    /// Precedence guard for the TOCTOU fix: the vanished-dir check runs BEFORE
+    /// the governing-marker probe. A marker on a SIBLING dir must not leak into
+    /// a vanished dir's classification, and a marker placed on the vanished
+    /// dir's would-be path doesn't exist (the dir is gone) so it can't rescue a
+    /// genuine stranded condition into a false InProgress.
+    #[test]
+    fn done_absence_vanished_dir_ignores_sibling_markers() {
+        use std::io::ErrorKind;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A live sibling dir that DOES carry a governing marker.
+        let sibling = tmp.path().join("disc-live");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join(".ripped"), b"x").unwrap();
+
+        // The dir we classify never existed — its marker join would resolve
+        // under it, not under the sibling.
+        let gone = tmp.path().join("disc-gone");
+        assert!(!gone.exists());
+
+        assert_eq!(
+            classify_done_absence(ErrorKind::NotFound, &gone),
+            DoneAbsence::InProgress,
+            "a vanished dir is InProgress on its own merits, independent of any \
+             sibling's markers"
+        );
+        // The sibling's classification is independent and unaffected: present
+        // dir + marker → InProgress.
+        assert_eq!(
+            classify_done_absence(ErrorKind::NotFound, &sibling),
+            DoneAbsence::InProgress
+        );
+    }
+
+    /// A dir that EXISTS but carries no governing marker is a genuine stranded
+    /// condition (Fault) — the vanished-dir early-return must NOT swallow it.
+    /// This pins that the `!dir.exists()` guard is specifically about
+    /// disappearance, not "absent marker".
+    #[test]
+    fn done_absence_present_dir_without_marker_is_fault() {
+        use std::io::ErrorKind;
+        let dir = scratch_dir("strandedfault");
+        assert!(dir.exists(), "dir is present");
+        // No .ripped/.completed/.failed/.review marker written.
+        assert_eq!(
+            classify_done_absence(ErrorKind::NotFound, &dir),
+            DoneAbsence::Fault,
+            "a present dir with no governing marker is genuinely stranded → WARN"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn same_head_and_tail_distinguishes_identical_from_different() {
         let dir = scratch_dir("headtail");
