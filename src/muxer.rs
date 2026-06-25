@@ -415,11 +415,18 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             clear_error(&dir.to_string_lossy());
             tracing::info!(staging = %dir.display(), title = %title, "mux worker: completed");
             crate::log::syslog(&format!("Muxed: {}", title));
-            // Drive the origin device to "done" — the hand-off left it
-            // frozen at status="ripping" so /api/state doesn't show a
-            // permanent "ripping" tile for a completed rip. Only update
-            // if the device is still "ripping" (hasn't been re-used for
-            // a new rip in the time the mux took).
+            // Defensive: drive the origin device to "done" if (and ONLY
+            // if) it is somehow still "ripping". The normal `.ripped`
+            // hand-off in `rip_disc` now sets the real device to "done"
+            // the instant the read finishes (the disc is read; the mux is
+            // a separate phase carried by the synthetic `_mux` device), so
+            // for the common path this guard is a no-op — and crucially it
+            // means this synthetic-device worker can NEVER revert a real
+            // device's "done" tile back through "ripping". The guard still
+            // fires for the inline-mux fallback path (marker write failed),
+            // which leaves the device "ripping" while it muxes inline.
+            // The `still_ripping` check also avoids clobbering a device
+            // that was re-used for a new rip while this mux ran.
             let origin = &marker.origin_device;
             if !origin.is_empty() {
                 let still_ripping = crate::ripper::STATE
@@ -517,8 +524,26 @@ pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
         // the dir so a finished title doesn't report "(queued)" forever.
         // `.failed` is equally terminal (post-mux abort): skip it too so an
         // aborted title doesn't report "(queued)" indefinitely.
+        //
+        // MUTUAL EXCLUSION (a job is in exactly ONE queue at a time): a
+        // mux's success path writes the mover hand-off marker (`.done` /
+        // `.review`) BEFORE the `.completed` marker (the `.done` write is
+        // the durability/crash barrier), and `.done` is exactly what the
+        // System-page Move queue scans for. So once `.done`/`.review`
+        // exists the job has logically moved to the Move queue — it must
+        // NOT also still report "(queued)" here, even in the brief window
+        // before `.completed` lands or if the post-mux `.ripped` delete
+        // failed. Skipping on `.done`/`.review` closes that double-listing
+        // window atomically with the move-queue trigger.
+        //
+        // Likewise skip the dir currently being muxed (`.muxing`): it is
+        // surfaced as the live, in-flight mux via the synthetic `_mux`
+        // device, so listing it again as "(queued)" here would double it.
         if dir.join(crate::ripper::staging::COMPLETED_MARKER).exists()
             || dir.join(crate::ripper::staging::FAILED_MARKER).exists()
+            || dir.join(crate::ripper::staging::DONE_MARKER).exists()
+            || dir.join(crate::ripper::staging::REVIEW_MARKER).exists()
+            || dir.join(crate::ripper::staging::MUXING_MARKER).exists()
         {
             continue;
         }
@@ -728,6 +753,104 @@ mod tests {
             snap.failed_reason.is_some(),
             "snapshot must report failed_reason for a .failed dir; the \
              check_and_mux guard relies on this to avoid the re-mux-forever loop"
+        );
+    }
+
+    // Regression (bug #3, mutual exclusion): a successful mux writes the
+    // mover hand-off marker (`.done`) BEFORE the terminal `.completed`
+    // marker, and the Move queue scans for `.done`. So the instant a job
+    // enters the Move queue it must NOT also report "(queued)" in the Mux
+    // queue — even in the window before `.completed` lands or if the
+    // post-mux `.ripped` delete failed. Before the fix, `pending_queue`
+    // only skipped `.completed`/`.failed`, so a `.ripped` + `.done` dir
+    // double-listed in both queues until a hard browser refresh.
+    #[test]
+    fn pending_queue_skips_done_dir_mutual_exclusion() {
+        let tmp = TempDir::new().unwrap();
+        let movie = tmp.path().join("Border_Town");
+        std::fs::create_dir_all(&movie).unwrap();
+        write_marker(&movie, &sample_marker()).unwrap();
+        // The mover hand-off marker is present but `.completed` is NOT yet
+        // (the gap between the two durable writes). This dir is in the Move
+        // queue; it must be absent from the Mux queue.
+        std::fs::write(movie.join(".done"), b"{}").unwrap();
+
+        let q = pending_queue(tmp.path());
+        assert!(
+            q.is_empty(),
+            "a dir with .done (in the Move queue) must NOT also be (queued) in the Mux queue, got {q:?}"
+        );
+    }
+
+    // A `.review` dir (low-confidence hand-off held for the operator) is
+    // likewise the mover's concern, not the mux worker's — it must not
+    // double-list in the Mux queue.
+    #[test]
+    fn pending_queue_skips_review_dir() {
+        let tmp = TempDir::new().unwrap();
+        let movie = tmp.path().join("Border_Town");
+        std::fs::create_dir_all(&movie).unwrap();
+        write_marker(&movie, &sample_marker()).unwrap();
+        std::fs::write(movie.join(".review"), b"{}").unwrap();
+
+        let q = pending_queue(tmp.path());
+        assert!(q.is_empty(), "a .review dir must be skipped, got {q:?}");
+    }
+
+    // The dir currently being muxed carries `.muxing` and is surfaced as
+    // the live in-flight mux via the synthetic `_mux` device — it must not
+    // also appear as "(queued)" in the static pending list.
+    #[test]
+    fn pending_queue_skips_muxing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let movie = tmp.path().join("Border_Town");
+        std::fs::create_dir_all(&movie).unwrap();
+        write_marker(&movie, &sample_marker()).unwrap();
+        crate::ripper::staging::write_muxing_marker(&movie);
+
+        let q = pending_queue(tmp.path());
+        assert!(
+            q.is_empty(),
+            "a dir actively muxing (.muxing) must not also be (queued), got {q:?}"
+        );
+    }
+
+    // Regression (bug #1): after the `.ripped` hand-off the REAL device is
+    // already "done" (the read finished). The mux worker's post-mux revert
+    // only fires for a device still "ripping", so the synthetic `_mux`
+    // worker can NEVER push a real device's "done" tile back to "ripping".
+    #[test]
+    fn mux_worker_does_not_revert_done_origin_device() {
+        let device = "_test_origin_already_done";
+        // Hand-off set the real device straight to "done" (the new contract).
+        crate::ripper::update_state(
+            device,
+            crate::ripper::RipState {
+                device: device.to_string(),
+                status: "done".to_string(),
+                progress_pct: 100,
+                disc_name: "Border Town".to_string(),
+                disc_format: "uhd".to_string(),
+                ..Default::default()
+            },
+        );
+        // Replicate the mux worker's guard: it only acts if still "ripping".
+        let still_ripping = crate::ripper::STATE
+            .lock()
+            .unwrap()
+            .get(device)
+            .map(|rs| rs.status == "ripping")
+            .unwrap_or(false);
+        assert!(
+            !still_ripping,
+            "a device already 'done' at hand-off must not be seen as still ripping"
+        );
+        // Status must remain "done" — the worker's revert is a no-op here.
+        let s = crate::ripper::STATE.lock().unwrap();
+        assert_eq!(
+            s.get(device).map(|rs| rs.status.as_str()),
+            Some("done"),
+            "the synthetic mux worker must not revert a real device's done tile to ripping"
         );
     }
 

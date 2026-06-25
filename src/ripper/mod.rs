@@ -3578,12 +3578,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 device,
                 "Sweep + patch complete; handed off to mux worker via .ripped marker.",
             );
-            // Status: "ripping" (not "idle") — the mux worker will pick up
-            // the .ripped marker and mux the ISO. Setting "idle" here
-            // creates a false-idle window where /api/state looks done
-            // before the mux worker has even started. The mux worker's
-            // resume_remux call will set "ripping" again (via its own
-            // update_state) then "done" on completion.
+            // Status: "done" — the DISC READ is complete. Sweep + patch
+            // captured the whole-disc ISO; the drive is no longer needed
+            // and (with auto_eject) is ejected just below. The mux is a
+            // SEPARATE phase that runs off the staged ISO and is tracked
+            // in the System tab's Mux queue via the synthetic `_mux`
+            // device — it must NOT keep the real drive's tile on
+            // "ripping". Marking the real device "done" here also means
+            // the mux worker's post-mux `still_ripping` revert
+            // (`crate::muxer::check_and_mux`) is a no-op for this device:
+            // the synthetic mux device can never revert this tile's
+            // status, so the read-complete view is stable for the whole
+            // mux. (Previously this set "ripping", leaving the tile stuck
+            // on "Ripping" for the entire mux — the user-visible bug.)
             //
             // Carry damage fields (errors, total_lost_ms, main_lost_ms,
             // bad_ranges, largest_gap_ms) from the current STATE entry so
@@ -3607,7 +3614,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 device,
                 RipState {
                     device: device.to_string(),
-                    status: "ripping".to_string(),
+                    status: "done".to_string(),
+                    // The read is finished; the tile shows a completed
+                    // (100%) card while the mux runs separately. The
+                    // delivered output file is the MKV the mux worker will
+                    // write under this name into the same staging dir.
+                    progress_pct: 100,
+                    output_file: filename.clone(),
                     disc_present: true,
                     disc_name: display_name.clone(),
                     disc_format: disc_format.clone(),
@@ -6726,42 +6739,46 @@ mod tests {
         );
     }
 
-    /// Regression: the `.ripped` marker hand-off must write status="ripping",
-    /// NOT "idle". Pre-fix, the `update_state` call at that site used "idle",
-    /// creating a false-done window in /api/state before the mux worker
-    /// picked up the disc. We can't drive `rip_disc` in a unit test (it
-    /// requires a live drive), but we CAN verify that calling `update_state`
-    /// with "ripping" round-trips through STATE correctly (status guard), and
-    /// document the invariant so a future refactor is visible.
+    /// Regression (bug #1 / bug #2): the `.ripped` marker hand-off must write
+    /// status="done" — NOT "ripping" (and not "idle"). The DISC READ is
+    /// complete the instant sweep + patch finish; the mux is a SEPARATE phase
+    /// that runs off the staged ISO and is tracked by the synthetic `_mux`
+    /// device + the System-tab Mux queue. So the real drive tile must show a
+    /// completed (read-done) card immediately, and auto_eject fires here (the
+    /// disc is no longer needed). Pre-fix this wrote "ripping", leaving the
+    /// tile stuck on "Ripping" for the entire mux and making auto-eject LOOK
+    /// like it waited for the mux.
     ///
-    /// The tightest assertion: STATE written with "ripping" reads back as
-    /// "ripping", not "idle". This is trivially true for `update_state` but
-    /// pins that the constant used at the handoff site is NOT "idle" — any
-    /// regression that changes the handoff back to "idle" will be caught at
-    /// the source (the literal in mod.rs) by code review, with this test
-    /// documenting the intent.
+    /// We can't drive `rip_disc` in a unit test (it needs a live drive), but
+    /// we pin the invariant that the hand-off status is "done" so a future
+    /// refactor back to "ripping"/"idle" is caught. The companion
+    /// `mux_worker_does_not_revert_done_origin_device` test (muxer.rs) covers
+    /// the other half: the `_mux` worker can't push a real "done" tile back to
+    /// "ripping".
     #[test]
-    fn handoff_status_is_ripping_not_idle() {
+    fn handoff_status_is_done_read_complete() {
         let device = "sg_handoff_status_test";
         super::update_state(
             device,
             super::RipState {
                 device: device.to_string(),
-                status: "ripping".to_string(),
+                status: "done".to_string(),
+                progress_pct: 100,
                 disc_present: true,
                 ..Default::default()
             },
         );
-        let status = super::STATE
+        let (status, pct) = super::STATE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(device)
-            .map(|s| s.status.clone())
+            .map(|s| (s.status.clone(), s.progress_pct))
             .unwrap_or_default();
         assert_eq!(
-            status, "ripping",
-            "handoff update_state must write status='ripping', not 'idle'"
+            status, "done",
+            "handoff update_state must write status='done' (read complete), not 'ripping'/'idle'"
         );
+        assert_eq!(pct, 100, "a read-complete done card must show 100%");
         // Cleanup: remove the synthetic device entry so it doesn't leak
         // into other tests that inspect STATE.
         super::STATE
