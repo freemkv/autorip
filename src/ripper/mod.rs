@@ -1188,11 +1188,22 @@ fn staging_disc_completed(staging_root: &std::path::Path, sanitized: &str) -> bo
         // shorter title's name is a prefix of a longer one ("Cars" sanitizes
         // to "Cars", "Cars 2" to "Cars_2"; a word-boundary check still fails
         // since `_` is the space separator). Exact equality is collision-free.
-        if staging_dir_matches_disc(&basename, sanitized)
-            && path.join(staging::COMPLETED_MARKER).exists()
-            && !path.join(staging::REVIEW_MARKER).exists()
-        {
-            return true;
+        if !staging_dir_matches_disc(&basename, sanitized) {
+            continue;
+        }
+        // Use the NFS-resilient snapshot (3-retry read_dir) rather than bare
+        // `path.join(MARKER).exists()` — on a cold NFS attribute cache an
+        // `.exists()` immediately after `write_completed_marker` can
+        // false-negative even though the marker is durably on disk, which
+        // would let the Default auto-insert path re-rip a finished disc and
+        // truncate the staged ISO the mux worker / mover is still using. The
+        // snapshot is the same view every other marker-detection caller
+        // (resume_or_quarantine_staging, check_and_mux, remux_from_ripped_marker)
+        // relies on for NFS consistency.
+        if let Some(snap) = staging::snapshot_staging_disc(&path) {
+            if snap.completed && !snap.has_review {
+                return true;
+            }
         }
     }
     false
@@ -7080,6 +7091,48 @@ mod tests {
         assert!(
             !staging_disc_completed(tmp.path(), san),
             ".completed + .review (held) must NOT count as already-ripped (M4)"
+        );
+    }
+
+    /// R2 finding 2 regression: `staging_disc_completed` must read its markers
+    /// through the NFS-resilient `snapshot_staging_disc` (3-retry read_dir), not
+    /// bare `path.join(MARKER).exists()`. We can't provoke a real NFS cold-cache
+    /// false-negative in a unit test, but we can pin that the detection now
+    /// keys off the same snapshot view every other caller uses and still works
+    /// with leftover artifacts present (the crash/cold-cache window where the
+    /// ISO+mapfile are still on disk alongside `.completed`). Under the old
+    /// `.exists()` path this same dir would be "completed"; the snapshot path
+    /// must agree so the Default auto-insert guard can't false-negative and
+    /// re-rip a finished disc, truncating the staged ISO.
+    #[test]
+    fn staging_disc_completed_uses_snapshot_with_leftover_artifacts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let san = "Finished_Movie";
+        // Completed rip whose ISO/mapfile haven't been pruned yet (crash
+        // between .completed and the ISO prune, or mover not yet run).
+        staging_disc_with_markers(
+            tmp.path(),
+            san,
+            &[
+                ".completed",
+                "Finished_Movie.iso",
+                "Finished_Movie.iso.mapfile",
+            ],
+        );
+        assert!(
+            staging_disc_completed(tmp.path(), san),
+            ".completed must be detected via snapshot even with leftover ISO/mapfile"
+        );
+        // No .completed at all → not completed (snapshot agrees).
+        let other = "Unfinished_Movie";
+        staging_disc_with_markers(
+            tmp.path(),
+            other,
+            &["Unfinished_Movie.iso", "Unfinished_Movie.iso.mapfile"],
+        );
+        assert!(
+            !staging_disc_completed(tmp.path(), other),
+            "no .completed → not already-completed"
         );
     }
 

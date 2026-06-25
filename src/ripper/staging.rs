@@ -758,19 +758,64 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
         // mid-sweep would leave `.sweeping` + ISO/mapfile on disk, the scan
         // would treat it as partial state, bump `.restart_count` every cold
         // restart, and after RESTART_LIMIT silently quarantine a healthy
-        // long-running rip as `.failed`. Skip without bumping the counter; a
-        // future stale-heartbeat policy can promote a genuinely dead sweep.
+        // long-running rip as `.failed`.
+        //
+        // BUT a deterministically-wedging sweep/mux that gets killed by the
+        // hard watchdog (mux.rs) re-acquires `.sweeping`/`.muxing` on every
+        // restart, so a pure "always skip" carve-out would defeat the
+        // watchdog's `.restart_count` guard and spin forever. The watchdog
+        // bumps `.restart_count` and exit(1)s WITHOUT clearing the marker (it
+        // kills the process, so no guard runs), so the count IS already on
+        // disk here. Honor it: a single benign restart of a healthy long sweep
+        // (count below the limit) is still skipped without re-rip-counting,
+        // but once the watchdog has crashed RESTART_LIMIT times we promote the
+        // dir to `.failed` rather than spin. This caps a deterministic wedge
+        // at RESTART_LIMIT crashes while preserving the healthy-long-sweep case.
         if snap.has_sweeping || snap.has_muxing {
-            tracing::info!(
-                path = %path.display(),
-                has_sweeping = snap.has_sweeping,
-                has_muxing = snap.has_muxing,
-                "staging entry is owned/in-progress (.sweeping/.muxing) — leaving alone, not restart-counting"
-            );
-            hints.push(StagingResumeHint {
-                dir: snap.dir,
-                action: ResumeAction::InProgress,
-            });
+            let rc = restart_count(&path);
+            if rc >= RESTART_LIMIT {
+                let reason = format!(
+                    "restart loop detected ({} attempts) on owned/in-progress dir ({}); state preserved at {}",
+                    rc,
+                    if snap.has_muxing {
+                        ".muxing"
+                    } else {
+                        ".sweeping"
+                    },
+                    path.display()
+                );
+                tracing::error!(
+                    path = %path.display(),
+                    restart_count = rc,
+                    has_sweeping = snap.has_sweeping,
+                    has_muxing = snap.has_muxing,
+                    "owned/in-progress staging entry exceeded restart limit — marking .failed"
+                );
+                write_failed_marker(&path, &reason);
+                if snap.has_muxing {
+                    clear_muxing_marker(&path);
+                }
+                if snap.has_sweeping {
+                    clear_sweeping_marker(&path);
+                }
+                clear_restart_count(&path);
+                hints.push(StagingResumeHint {
+                    dir: snap.dir,
+                    action: ResumeAction::RestartLoopFailed { reason },
+                });
+            } else {
+                tracing::info!(
+                    path = %path.display(),
+                    has_sweeping = snap.has_sweeping,
+                    has_muxing = snap.has_muxing,
+                    restart_count = rc,
+                    "staging entry is owned/in-progress (.sweeping/.muxing) — leaving alone"
+                );
+                hints.push(StagingResumeHint {
+                    dir: snap.dir,
+                    action: ResumeAction::InProgress,
+                });
+            }
             continue;
         }
         if !snap.has_partial_state() {
@@ -1574,10 +1619,21 @@ mod tests {
                 Verdict::InProgress,
                 "CRASH MID-SWEEP: .sweeping + artifacts → in-progress, not partial state",
             ),
+            // R2 finding 1: BELOW the limit a healthy long sweep is left
+            // InProgress (never restart-counted by the scan) — but a sweep
+            // that has wedged the watchdog RESTART_LIMIT times (the watchdog
+            // bumps the count and exit(1)s, leaving `.sweeping` on disk) MUST
+            // be promoted to `.failed`, else the carve-out defeats the
+            // watchdog's restart-loop guard and spins forever.
+            (
+                &[Sweeping, Iso, Mapfile, RestartBelowLimit],
+                Verdict::InProgress,
+                ".sweeping below limit → healthy long rip, leave alone",
+            ),
             (
                 &[Sweeping, Iso, Mapfile, RestartAtLimit],
-                Verdict::InProgress,
-                ".sweeping wins even at restart limit — a healthy long rip must NOT be quarantined",
+                Verdict::RestartLoopFailed,
+                ".sweeping AT restart limit → deterministic wedge, quarantine (honors watchdog guard)",
             ),
             // --- H1: .muxing exclusion lock. Owned by the mux worker; same
             //     in-progress treatment as .sweeping. ---
@@ -1587,9 +1643,14 @@ mod tests {
                 ".muxing + artifacts → mux worker owns it, in-progress",
             ),
             (
-                &[Muxing, Iso, Mapfile, RestartAtLimit],
+                &[Muxing, Iso, Mapfile, RestartBelowLimit],
                 Verdict::InProgress,
-                ".muxing wins even at restart limit",
+                ".muxing below limit → mux worker owns it, leave alone",
+            ),
+            (
+                &[Muxing, Iso, Mapfile, RestartAtLimit],
+                Verdict::RestartLoopFailed,
+                ".muxing AT restart limit → deterministically-wedging mux, quarantine",
             ),
             // --- M2: a non-JSON `.failed` body (review.rs operator-cancel)
             //     must still be TERMINAL — keyed on marker presence, not
@@ -1727,6 +1788,104 @@ mod tests {
         assert!(matches!(hints[0].action, ResumeAction::InProgress));
         assert_eq!(restart_count(&disc), 0);
         assert!(!disc.join(FAILED_MARKER).exists());
+    }
+
+    /// Convergence R2 finding 1 regression: a deterministically-wedging mux
+    /// killed by the hard watchdog re-acquires `.muxing` on every restart and
+    /// the watchdog leaves `.restart_count` bumped (it exit(1)s without running
+    /// any guard). The owned/in-progress carve-out must HONOR that counter:
+    /// once it reaches RESTART_LIMIT the dir is promoted to `.failed` (clearing
+    /// `.muxing` + the count), not left InProgress to re-dispatch and re-wedge
+    /// forever. Without the fix the carve-out short-circuits before the
+    /// restart-loop gate and the watchdog's guard is defeated.
+    #[test]
+    fn muxing_at_restart_limit_is_promoted_to_failed() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("MyDisc.iso"), b"x").unwrap();
+        fs::write(disc.join("MyDisc.iso.mapfile"), b"x").unwrap();
+        write_muxing_marker(&disc);
+        // Watchdog has crashed RESTART_LIMIT times; count is on disk.
+        fs::write(
+            disc.join(RESTART_COUNT_FILE),
+            format!("{}\n", RESTART_LIMIT).as_bytes(),
+        )
+        .unwrap();
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::RestartLoopFailed { .. }),
+            "wedging .muxing at the restart limit must be promoted to .failed, got {:?}",
+            hints[0].action
+        );
+        assert!(disc.join(FAILED_MARKER).exists());
+        // The lock is cleared so the dir reads terminal, not owned, next pass.
+        assert!(!disc.join(MUXING_MARKER).exists());
+        // Count cleared so a manual re-queue starts fresh.
+        assert_eq!(restart_count(&disc), 0);
+    }
+
+    /// Convergence R2 finding 1 companion: the `.sweeping` inline-mux path has
+    /// the same loop. A `.sweeping` dir whose `.restart_count` already reached
+    /// RESTART_LIMIT must be quarantined, with `.sweeping` cleared.
+    #[test]
+    fn sweeping_at_restart_limit_is_promoted_to_failed() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("MyDisc.iso"), b"x").unwrap();
+        fs::write(disc.join("MyDisc.iso.mapfile"), b"x").unwrap();
+        write_sweeping_marker(&disc);
+        fs::write(
+            disc.join(RESTART_COUNT_FILE),
+            format!("{}\n", RESTART_LIMIT).as_bytes(),
+        )
+        .unwrap();
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::RestartLoopFailed { .. }),
+            "wedging .sweeping at the restart limit must be promoted to .failed, got {:?}",
+            hints[0].action
+        );
+        assert!(disc.join(FAILED_MARKER).exists());
+        assert!(!disc.join(SWEEPING_MARKER).exists());
+        assert_eq!(restart_count(&disc), 0);
+    }
+
+    /// Convergence R2 finding 1 boundary: a single benign restart of a healthy
+    /// long sweep (count BELOW the limit) must still be left InProgress and
+    /// must NOT be restart-counted by the resume scan (the carve-out's original
+    /// intent). Only the watchdog bumps the counter; the scan must not.
+    #[test]
+    fn muxing_below_restart_limit_stays_in_progress() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("MyDisc.iso"), b"x").unwrap();
+        fs::write(disc.join("MyDisc.iso.mapfile"), b"x").unwrap();
+        write_muxing_marker(&disc);
+        fs::write(
+            disc.join(RESTART_COUNT_FILE),
+            format!("{}\n", RESTART_LIMIT - 1).as_bytes(),
+        )
+        .unwrap();
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::InProgress),
+            "below-limit .muxing must stay InProgress, got {:?}",
+            hints[0].action
+        );
+        assert!(!disc.join(FAILED_MARKER).exists());
+        assert!(disc.join(MUXING_MARKER).exists());
+        // The scan must NOT bump the counter — it stays exactly where the
+        // watchdog left it.
+        assert_eq!(restart_count(&disc), RESTART_LIMIT - 1);
     }
 
     /// H2/M1: the `.sweeping` marker is superseded by every terminal/hand-off
