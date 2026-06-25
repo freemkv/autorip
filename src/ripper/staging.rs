@@ -1674,6 +1674,43 @@ mod tests {
         assert!(disc.join(SWEEPING_MARKER).exists());
     }
 
+    /// Convergence M (findings 3 & 4): a STRUCTURAL mux failure in the inline
+    /// fallback (ISO-open / build_iso_pipeline) must quarantine the dir, not
+    /// leak `.sweeping`. The fix writes `.failed` (which clears `.sweeping`)
+    /// and clears the restart count. Verify the resulting dir — ISO + mapfile
+    /// present, `.sweeping` gone, `.failed` present — classifies terminal
+    /// `AlreadyFailed`, NOT stranded `InProgress`, so the operator sees the
+    /// failure and the dir isn't re-resumed against a permanent error.
+    #[test]
+    fn structural_mux_failure_quarantines_instead_of_stranding() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("MyDisc.iso"), b"x").unwrap();
+        fs::write(disc.join("MyDisc.iso.mapfile"), b"x").unwrap();
+        // Pre-state: `.sweeping` was written at staging-dir creation and the
+        // inline-mux fallback is only reached because the `.ripped` hand-off
+        // write failed, so `.sweeping` is still on disk here.
+        write_sweeping_marker(&disc);
+
+        // The fix's quarantine sequence (mirrors mod.rs's ISO-open /
+        // build_iso_pipeline Err arms).
+        write_failed_marker(&disc, "cannot open ISO for mux: ENOENT");
+        clear_restart_count(&disc);
+
+        // `.sweeping` superseded by `.failed`.
+        assert!(!disc.join(SWEEPING_MARKER).exists());
+        assert!(disc.join(FAILED_MARKER).exists());
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::AlreadyFailed { .. }),
+            "structural mux failure must be terminal AlreadyFailed, got {:?}",
+            hints[0].action
+        );
+    }
+
     /// H1 regression: a `.muxing` lock dir is owned by the mux worker — the
     /// resume scan must leave it alone (InProgress), not restart-count it.
     #[test]

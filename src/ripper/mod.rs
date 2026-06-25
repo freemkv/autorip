@@ -1520,6 +1520,32 @@ impl Drop for HaltGuard {
     }
 }
 
+/// RAII guard that clears the `.sweeping` in-progress marker on drop.
+///
+/// `.sweeping` is written immediately after the staging dir is created
+/// (before Pass 1) and governs the whole multi-hour sweep+patch window.
+/// The terminal-marker writers (`write_failed_marker` /
+/// `write_completed_marker`, and the `.ripped` hand-off in `muxer`) all
+/// clear it first, so on those success/`.ripped`/`.failed` paths this
+/// guard's clear is an idempotent no-op. It only fires on `rip_disc`'s
+/// many early-return error branches (disk-space preflight, Pass 1 halt /
+/// failure, transport-recovery exhausted, ISO-open / mux-build failures,
+/// durability-gate failures) and on panic — every one of which previously
+/// leaked a stale `.sweeping`. A leaked `.sweeping` makes the next
+/// startup's `resume_or_quarantine_staging` classify the dir `InProgress`
+/// forever (never restart-counted, never cold-resumed), stranding dirs
+/// that hold a complete ISO + clean mapfile. Holding the guard for the
+/// whole `rip_disc` body guarantees the marker is cleared on every exit.
+struct SweepingGuard {
+    staging: std::path::PathBuf,
+}
+
+impl Drop for SweepingGuard {
+    fn drop(&mut self) {
+        staging::clear_sweeping_marker(&self.staging);
+    }
+}
+
 /// Rip a disc. Reuses the existing drive session from scan_disc.
 /// If no session exists, opens fresh (for on_insert=rip).
 ///
@@ -1945,6 +1971,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // WARN-flood every 10s tick on the absent `.done`. Replaced by `.ripped`
     // (hand-off) or `.failed` (abort) on every exit path below.
     staging::write_sweeping_marker(std::path::Path::new(&staging));
+    // RAII cleanup for the `.sweeping` marker. The terminal-marker writers
+    // clear it first, so this is a no-op on success/`.ripped`/`.failed`
+    // paths and only fires on the early-return error branches and panic,
+    // preventing a stale `.sweeping` from stranding the dir `InProgress`
+    // across restarts.
+    let _sweeping_guard = SweepingGuard {
+        staging: std::path::PathBuf::from(&staging),
+    };
     let filename = format!(
         "{}.{}",
         crate::util::sanitize_path_compact(&display_name),
@@ -3590,13 +3624,27 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 }
                 Err(e) => {
                     crate::log::device_log(device, &format!("Open ISO failed: {e}"));
+                    // Cannot open the ISO for mux — if the sweep was
+                    // interrupted before any ISO data flushed (and the
+                    // `.ripped` hand-off also failed, which is the only way
+                    // this inline-mux fallback is reached), this ENOENT
+                    // repeats on every startup. Quarantine with `.failed`
+                    // so the restart scan classifies it terminal instead of
+                    // leaving it stranded `InProgress`.
+                    let staging_disc_path = std::path::Path::new(&staging);
+                    staging::write_failed_marker(
+                        staging_disc_path,
+                        &format!("cannot open ISO for mux: {e}"),
+                    );
+                    staging::clear_restart_count(staging_disc_path);
                     update_state(
                         device,
                         RipState {
                             device: device.to_string(),
-                            status: "error".to_string(),
+                            status: "failed".to_string(),
                             disc_present: true,
-                            last_error: format!("{e}"),
+                            last_error: format!("cannot open ISO for mux: {e}"),
+                            failure_reason: Some(format!("cannot open ISO for mux: {e}")),
                             disc_name: display_name,
                             disc_format,
                             tmdb_title,
@@ -3789,9 +3837,22 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             Err(e) => {
                 tracing::error!(target: "mux", device=%device, "build_iso_pipeline failed: {e}");
                 crate::log::device_log(device, &format!("Mux pipeline build failed: {e}"));
+                // A pipeline BUILD failure (header resolution, codec
+                // negotiation, format error) is structural and permanent —
+                // retries won't fix it. Quarantine the dir with `.failed`
+                // (mirrors the header-phase failure path below) so the
+                // restart scan classifies it terminal instead of leaving
+                // it stranded `InProgress`.
+                let staging_disc_path = std::path::Path::new(&staging);
+                staging::write_failed_marker(
+                    staging_disc_path,
+                    &format!("mux pipeline build failed: {e}"),
+                );
+                staging::clear_restart_count(staging_disc_path);
                 update_state_with(device, |s| {
-                    s.status = "error".to_string();
-                    s.last_error = format!("Mux pipeline build failed: {e}");
+                    s.status = "failed".to_string();
+                    s.last_error = format!("mux pipeline build failed: {e}");
+                    s.failure_reason = Some(format!("mux pipeline build failed: {e}"));
                 });
                 unregister_halt(device);
                 return;
@@ -5213,15 +5274,75 @@ mod tests {
     //! State-only helpers and their tests live in `state.rs`.
 
     use super::{
-        HaltGuard, aacs_failure_message, disk_space_preflight_message, format_pass_error,
-        header_phase_outcome_is_failure, incomplete_mux_status, is_safe_staging_segment,
-        list_staging_basenames, prune_intermediate_iso, register_halt, resumable_dir_blocked,
-        resumable_for_disc, staging_dir_matches_disc, staging_disc_completed,
-        staging_disc_owned_by_worker, staging_free_bytes,
+        HaltGuard, SweepingGuard, aacs_failure_message, disk_space_preflight_message,
+        format_pass_error, header_phase_outcome_is_failure, incomplete_mux_status,
+        is_safe_staging_segment, list_staging_basenames, prune_intermediate_iso, register_halt,
+        resumable_dir_blocked, resumable_for_disc, staging_dir_matches_disc,
+        staging_disc_completed, staging_disc_owned_by_worker, staging_free_bytes,
     };
     use crate::ripper::session::device_halt;
+    use crate::ripper::staging;
     use crate::ripper::state::Resumable;
     use libfreemkv::{Error, ScsiSense};
+
+    /// Convergence H1 regression: `SweepingGuard` is the RAII cleanup for the
+    /// `.sweeping` in-progress marker. Many `rip_disc` early-return error
+    /// branches exit without reaching a terminal-marker writer; before this
+    /// guard each of those leaked a stale `.sweeping`, which made the next
+    /// startup's `resume_or_quarantine_staging` classify the dir `InProgress`
+    /// forever (never restart-counted, never cold-resumed). The guard's `Drop`
+    /// must clear the marker on every exit path so a dir holding a complete
+    /// ISO + clean mapfile can still be picked up on restart.
+    #[test]
+    fn sweeping_guard_clears_marker_on_drop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        staging::write_sweeping_marker(&dir);
+        assert!(
+            dir.join(staging::SWEEPING_MARKER).exists(),
+            "marker should be present before the guard drops"
+        );
+        {
+            let _guard = SweepingGuard {
+                staging: dir.clone(),
+            };
+            // Still present inside the guard's scope (mirrors the live
+            // sweep+patch window).
+            assert!(dir.join(staging::SWEEPING_MARKER).exists());
+        }
+        // Guard dropped at scope end (the early-return / panic case) — marker
+        // gone, so the restart scan won't strand this dir `InProgress`.
+        assert!(
+            !dir.join(staging::SWEEPING_MARKER).exists(),
+            ".sweeping must be cleared when SweepingGuard drops"
+        );
+    }
+
+    /// Convergence H1: on the success / `.ripped` / `.failed` paths a terminal
+    /// writer already clears `.sweeping` before the guard drops, so the guard's
+    /// clear must be an idempotent no-op (not error, not resurrect state) — and
+    /// must not disturb a terminal marker that superseded `.sweeping`.
+    #[test]
+    fn sweeping_guard_is_idempotent_after_terminal_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        staging::write_sweeping_marker(&dir);
+        {
+            let _guard = SweepingGuard {
+                staging: dir.clone(),
+            };
+            // Terminal write (e.g. `.failed`) clears `.sweeping` first, as on
+            // the real quarantine paths.
+            staging::write_failed_marker(&dir, "boom");
+            assert!(!dir.join(staging::SWEEPING_MARKER).exists());
+        }
+        // Guard drop is a no-op: `.sweeping` stays gone and `.failed` survives.
+        assert!(!dir.join(staging::SWEEPING_MARKER).exists());
+        assert!(
+            dir.join(staging::FAILED_MARKER).exists(),
+            "guard drop must not remove the terminal .failed marker"
+        );
+    }
 
     /// Regression guard for the divergent disk-reclamation bug: the inline
     /// (`rip_disc`) and resume (`resume::resume_remux`) completion paths now

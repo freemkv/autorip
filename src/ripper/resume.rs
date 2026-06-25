@@ -1572,7 +1572,18 @@ pub(crate) fn remux_from_ripped_marker(
     // Success signal: `resume_remux` wrote `.completed` to staging.
     // Anything else (halt, scan_image failure, mux loop break)
     // leaves `.completed` absent.
-    let success = staging_dir.join(".completed").exists();
+    //
+    // Probe via `snapshot_staging_disc` (3-retry, NFS-resilient) rather
+    // than a bare `Path::exists()`. On NFS with a cold attribute cache —
+    // the scenario `snapshot_staging_disc` exists to defend against — a
+    // bare `.exists()` can false-negative immediately after
+    // `write_completed_marker`, making `check_and_mux` record a spurious
+    // `MuxerError` (the success path's `clear_error` is skipped) that
+    // sticks on the System page even though the MKV was fully written.
+    // This mirrors `check_and_mux`'s completion guard.
+    let success = crate::ripper::staging::snapshot_staging_disc(staging_dir)
+        .map(|s| s.completed)
+        .unwrap_or(false);
     let mut outcome = MuxHandoffOutcome {
         success,
         ..Default::default()
@@ -1734,6 +1745,68 @@ mod find_iso_tests {
         let (iso, map) = find_iso_and_mapfile(&d).expect("should pair");
         assert!(iso.ends_with("Movie.iso"));
         assert!(map.ends_with("Movie.iso.mapfile"));
+    }
+}
+
+// Convergence M (finding 5): `remux_from_ripped_marker` detects whether
+// `resume_remux` succeeded by checking for `.completed`. It must use the
+// NFS-resilient `snapshot_staging_disc(...).completed` (3-retry, primed
+// read) rather than a bare `Path::join(".completed").exists()`: on NFS with
+// a cold attribute cache the bare `.exists()` can false-negative right after
+// `write_completed_marker`, making `check_and_mux` record a spurious
+// `MuxerError` that sticks on the System page even though the MKV landed.
+// These tests pin the success-detection helper's contract on the two states
+// that matter.
+#[cfg(test)]
+mod completion_detection_tests {
+    use crate::ripper::staging;
+
+    fn tmpdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!(
+                "autorip-resume-complete-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+            ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// The exact success expression used by `remux_from_ripped_marker`. After
+    /// `write_completed_marker`, the snapshot must report `completed=true`, so
+    /// the success path runs `clear_error` and no spurious MuxerError sticks.
+    #[test]
+    fn snapshot_reports_completed_after_marker_write() {
+        let d = tmpdir();
+        staging::write_completed_marker(&d);
+        let success = staging::snapshot_staging_disc(&d)
+            .map(|s| s.completed)
+            .unwrap_or(false);
+        assert!(
+            success,
+            "snapshot_staging_disc must report completed after write_completed_marker"
+        );
+    }
+
+    /// And without the marker (halt / scan_image failure / mux loop break) it
+    /// must report `completed=false` so the failure path records the error.
+    #[test]
+    fn snapshot_reports_not_completed_without_marker() {
+        let d = tmpdir();
+        // A partial dir with ISO/mapfile but no `.completed`.
+        std::fs::write(d.join("Movie.iso"), b"x").unwrap();
+        std::fs::write(d.join("Movie.iso.mapfile"), b"x").unwrap();
+        let success = staging::snapshot_staging_disc(&d)
+            .map(|s| s.completed)
+            .unwrap_or(false);
+        assert!(
+            !success,
+            "snapshot_staging_disc must report not-completed without the marker"
+        );
     }
 }
 
