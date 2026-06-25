@@ -980,6 +980,30 @@ pub fn handle_rip_request(
             }
         }
         crate::web::ResumeMode::Wipe => {
+            // Never wipe a dir the mux worker is actively reading. Wipe
+            // deliberately bypasses `disc_already_completed` (the operator may
+            // legitimately want to re-rip a finished disc), but `remove_dir_all`
+            // under an in-flight mux deletes the ISO out from under the worker:
+            // its read stream fails with ENOENT, the MuxingGuard's clear hits a
+            // NotFound, the snapshot returns None, and the staging dir + ISO are
+            // permanently lost with no retry possible. The MuxingGuard (which the
+            // "deliberately bypasses" comment predates) is exactly what we honour
+            // here. Refuse the wipe and tell the operator to retry once the mux
+            // finishes.
+            if disc_owned_by_worker(cfg, device) {
+                crate::log::device_log(
+                    device,
+                    "Refusing to wipe staging: the mux worker is reading this disc's staged ISO (.ripped/.muxing). Wait for the mux to finish, then retry.",
+                );
+                update_state_with(device, |s| {
+                    s.status = "error".to_string();
+                    s.last_error =
+                        "Cannot wipe: staged ISO is owned by the mux worker. Retry after mux completes."
+                            .to_string();
+                });
+                drop_session(device);
+                return;
+            }
             wipe_staging_for_disc(cfg, device);
             rip_disc(cfg, device, device_path, false);
         }
@@ -1243,11 +1267,20 @@ fn staging_disc_owned_by_worker(staging_root: &std::path::Path, sanitized: &str)
     };
     for basename in basenames {
         let path = staging_root.join(&basename);
-        if staging_dir_matches_disc(&basename, sanitized)
-            && (path.join(staging::RIPPED_MARKER).exists()
-                || path.join(staging::MUXING_MARKER).exists())
-        {
-            return true;
+        if !staging_dir_matches_disc(&basename, sanitized) {
+            continue;
+        }
+        // Read `.ripped`/`.muxing` from the NFS-resilient, 3x-retried snapshot
+        // rather than two bare `.exists()` stats. On a cold-cache NFS mount after
+        // a container restart the marker can be momentarily invisible to a raw
+        // stat, making this return false; the Default auto-rip path then falls
+        // through to `rip_disc`, which O_TRUNCs the ISO the mux worker is
+        // reading. The snapshot matches `resumable_dir_blocked` /
+        // `find_resumable_for_disc`, which are already NFS-resilient.
+        if let Some(snap) = staging::snapshot_staging_disc(&path) {
+            if snap.has_ripped || snap.has_muxing {
+                return true;
+            }
         }
     }
     false
@@ -1482,6 +1515,20 @@ fn resumable_for_disc(cfg: &Config, display_name: &str) -> Option<Resumable> {
         // `Cars_2`) fixed in staging_dir_matches_disc.
         if basename != sanitized {
             continue;
+        }
+        // A terminal `.failed` (or held `.review`) dir is NOT resumable, even
+        // when its mapfile still shows pending bytes. Offering a Resume here is
+        // the data-stranding bug: the Sweep-resume branch in `handle_rip_request`
+        // re-rips WITHOUT clearing the stale `.failed`, so a successful re-rip's
+        // `.ripped` ends up shadowed by the lingering `.failed` and the mux
+        // worker skips it forever (`.failed` is terminal-by-presence). Mirror the
+        // Remux-branch policy (`resumable_dir_blocked`): a terminal/held dir
+        // forces the operator to explicitly Wipe. Snapshot first so this is read
+        // from the same NFS-resilient, primed view the markers come from.
+        if let Some(snap) = staging::snapshot_staging_disc(&path) {
+            if snap.has_failed || snap.has_review {
+                return None;
+            }
         }
         let (_iso_path, mapfile_path) = match resume::find_iso_and_mapfile(&path) {
             Some(p) => p,
@@ -7056,6 +7103,49 @@ mod tests {
             resumable_for_disc(&cfg, display_name),
             Some(Resumable::Sweep),
         );
+    }
+
+    /// R3 finding 1 regression: `resumable_for_disc` must return None (no Resume
+    /// affordance) when the disc's staging dir carries a terminal `.failed` or a
+    /// held `.review` marker, even though its mapfile still shows pending bytes
+    /// (Resumable::Sweep-worthy). Offering Resume on a `.failed` dir was the
+    /// data-stranding bug: the Sweep-resume branch re-rips WITHOUT clearing the
+    /// stale `.failed`, so the successful re-rip's `.ripped` is shadowed by the
+    /// lingering `.failed` (terminal-by-presence) and the mux worker skips it
+    /// forever. This mirrors the Remux-branch `resumable_dir_blocked` policy:
+    /// a terminal/held dir forces the operator to explicitly Wipe.
+    #[test]
+    fn resumable_for_disc_blocked_by_failed_or_review() {
+        let display_name = "Stranded Disc";
+        let sanitized = crate::util::sanitize_path_compact(display_name);
+
+        for marker in [".failed", ".review"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = crate::config::Config {
+                staging_dir: tmp.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            };
+            // Partial sweep (bytes_pending > 0) that WOULD be Resumable::Sweep…
+            let disc_dir = tmp.path().join(&sanitized);
+            std::fs::create_dir(&disc_dir).unwrap();
+            let iso = disc_dir.join(format!("{sanitized}.iso"));
+            std::fs::write(&iso, b"x").unwrap();
+            let mapfile_path = disc_dir.join(format!("{sanitized}.iso.mapfile"));
+            libfreemkv::disc::mapfile::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
+            // Sanity: without the terminal/held marker it IS Sweep-resumable.
+            assert_eq!(
+                resumable_for_disc(&cfg, display_name),
+                Some(Resumable::Sweep),
+                "precondition: partial sweep is resumable before {marker}"
+            );
+            // …but a terminal/held marker blocks the Resume affordance entirely.
+            std::fs::write(disc_dir.join(marker), b"{}").unwrap();
+            assert_eq!(
+                resumable_for_disc(&cfg, display_name),
+                None,
+                "{marker} must suppress the Resume affordance (operator must Wipe)"
+            );
+        }
     }
 
     /// Build `<root>/<sanitized>` and drop the named empty marker files in it.
