@@ -528,9 +528,10 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
 /// How the mover should treat a failed `.done` read on a staging dir.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoneAbsence {
-    /// `.done` is absent but a governing marker (`.ripped`/`.completed`/
-    /// `.failed`/`.review`) shows the ripper/mux worker still owns the dir —
-    /// expected "not ready yet" state. Quiet debug, skip (no WARN).
+    /// `.done` is absent but a governing marker (`.sweeping`/`.muxing`/
+    /// `.ripped`/`.completed`/`.failed`/`.review`) shows the ripper/mux worker
+    /// still owns the dir — expected "not ready yet" state. Quiet debug, skip
+    /// (no WARN).
     InProgress,
     /// A real fault: non-NotFound read error (NFS ESTALE, EACCES), or a
     /// NotFound on a stranded dir with no governing marker. Worth a WARN.
@@ -558,9 +559,22 @@ fn classify_done_absence(err_kind: std::io::ErrorKind, dir: &Path) -> DoneAbsenc
         if !dir.exists() {
             return DoneAbsence::InProgress;
         }
-        let governed = [".ripped", ".completed", ".failed", ".review"]
-            .iter()
-            .any(|m| dir.join(m).exists());
+        // `.sweeping` (multi-hour sweep+patch in progress, before `.ripped`)
+        // and `.muxing` (mux worker owns the dir) join the governed set so a
+        // dir in either phase is the by-design "not ready yet" state, not a
+        // stranded `Fault`. The `.sweeping` window was previously ungoverned:
+        // the mover saw no marker every 10s tick and WARN-flooded (182 warns
+        // for one healthy in-progress disc, see the comment in check_and_move).
+        let governed = [
+            ".sweeping",
+            ".muxing",
+            ".ripped",
+            ".completed",
+            ".failed",
+            ".review",
+        ]
+        .iter()
+        .any(|m| dir.join(m).exists());
         if governed {
             return DoneAbsence::InProgress;
         }
@@ -636,10 +650,12 @@ fn check_and_move(cfg: &Config) {
                 // A `.done` that is simply ABSENT is the EXPECTED state for any
                 // staging dir the ripper/mux worker still governs — the mover
                 // is not the dir's hand-off until `.done` lands. The lifecycle
-                // is: `.ripped` (sweep+patch done, awaiting mux) → mux runs →
-                // `.done`/`.review` + `.completed`. For the whole rip+mux phase
-                // (which for a long disc is many minutes, i.e. tens of 10s
-                // ticks) the dir has a `.ripped`/`.completed`/`.failed`/`.review`
+                // is: `.sweeping` (sweep+patch in progress) → `.ripped` (awaiting
+                // mux) → mux runs (`.muxing`) → `.done`/`.review` + `.completed`.
+                // For the whole rip+mux phase (which for a long disc is many
+                // minutes — the sweep alone can be hours, i.e. thousands of 10s
+                // ticks) the dir has a
+                // `.sweeping`/`.muxing`/`.ripped`/`.completed`/`.failed`/`.review`
                 // marker but no `.done`. WARNing every tick on that absence is
                 // misleading spam that looks like the mover is broken (seen
                 // live: 182 warns for one in-progress disc that ultimately
@@ -2373,9 +2389,18 @@ mod tests {
 
         // Each governing marker turns a .done NotFound into the by-design
         // in-progress state (quiet skip, no WARN). This is the 182-warn bug:
-        // a long rip sits at .ripped (then .completed/.failed/.review) with no
-        // .done for many ticks while the mux worker runs.
-        for m in [".ripped", ".completed", ".failed", ".review"] {
+        // a long rip sits at .sweeping (sweep), .ripped (awaiting mux),
+        // .muxing (mux running), then .completed/.failed/.review with no .done
+        // for many ticks. `.sweeping` is the load-bearing addition here — the
+        // multi-hour sweep window had no governing marker and WARN-flooded.
+        for m in [
+            ".sweeping",
+            ".muxing",
+            ".ripped",
+            ".completed",
+            ".failed",
+            ".review",
+        ] {
             let governed = tmp.path().join(format!("disc{m}"));
             std::fs::create_dir_all(&governed).unwrap();
             std::fs::write(governed.join(m), b"x").unwrap();
