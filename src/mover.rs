@@ -823,14 +823,48 @@ fn check_and_move(cfg: &Config) {
             planned_moves.push((file_path.clone(), dest));
         }
 
-        // Create destination directories
+        // FAIL-LOUD destination-root validation (Mercy incident hardening).
+        // Before creating ANY per-title subdir, confirm the configured root
+        // (the mount point: movie_dir / tv_dir / output_dir) ALREADY EXISTS,
+        // is a directory, is absolute, and is writable. If the mount has
+        // vanished, ERROR and PRESERVE the output in staging — never
+        // `create_dir_all` a fresh tree (which would resolve into the
+        // container's writable overlay and silently swallow an 80 GB rip).
+        let dest_root = destination_root(cfg, &tmdb_result);
+        if let Err(reason) = validate_destination_root(dest_root) {
+            record_error(
+                &dir_str,
+                &format!(
+                    "destination not available — refusing to move (output preserved in staging): {reason}"
+                ),
+                "the destination directory/mount is missing or not writable. \
+                 Check the configured movie/tv/output directory exists and its \
+                 bind-mount (e.g. the NAS share) is present and writable. The \
+                 mover will NOT auto-create the root — fix the mount, then it \
+                 retries on the next tick.",
+            );
+            crate::log::syslog(&format!(
+                "Move BLOCKED — destination root {} unavailable: {} (output preserved in staging: {})",
+                absolute_for_log(dest_root),
+                reason,
+                dir.display()
+            ));
+            continue;
+        }
+
+        // Create destination directories. The ROOT is confirmed present +
+        // writable above, so this only materializes the per-title subdir
+        // UNDER that real root — never the root (and thus mount) itself.
         let mut dest_ok = true;
         for (_, dest) in &planned_moves {
             if let Some(parent) = Path::new(dest).parent() {
                 if std::fs::create_dir_all(parent).is_err() {
                     record_error(
                         &dir_str,
-                        &format!("cannot create destination directory {}", parent.display()),
+                        &format!(
+                            "cannot create destination directory {}",
+                            absolute_for_log(&parent.to_string_lossy())
+                        ),
                         "check write permissions on the output / movie / tv directory",
                     );
                     dest_ok = false;
@@ -965,7 +999,15 @@ fn check_and_move(cfg: &Config) {
                         ));
                         announced_moving = true;
                     }
-                    crate::log::syslog(&format!("Moved to {}", dest));
+                    // Log the FULL ABSOLUTE destination (filename → path) so
+                    // the operator can always see exactly where the bytes
+                    // landed — never a cwd-relative "movies/Mercy/..." that
+                    // could hide a wrong-filesystem write (Mercy incident).
+                    crate::log::syslog(&format!(
+                        "Moved {} → {}",
+                        src.file_name().unwrap_or_default().to_string_lossy(),
+                        absolute_for_log(dest)
+                    ));
                 }
                 MoveOutcome::MovedDirty => {
                     if !announced_moving {
@@ -977,12 +1019,17 @@ fn check_and_move(cfg: &Config) {
                         announced_moving = true;
                     }
                     crate::log::syslog(&format!(
-                        "Moved to {} but source could not be removed",
-                        dest
+                        "Moved {} → {} but source could not be removed",
+                        src.file_name().unwrap_or_default().to_string_lossy(),
+                        absolute_for_log(dest)
                     ));
                 }
                 MoveOutcome::Failed => {
-                    crate::log::syslog(&format!("Failed to move {:?} to {}", src, dest));
+                    crate::log::syslog(&format!(
+                        "Failed to move {} → {}",
+                        src.display(),
+                        absolute_for_log(dest)
+                    ));
                 }
                 MoveOutcome::SizeMismatch => {
                     crate::log::syslog(&format!(
@@ -1156,6 +1203,154 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
             cfg.output_dir,
             crate::util::sanitize_path_display(filename)
         )
+    }
+}
+
+/// The configured destination ROOT directory that governs a planned move,
+/// mirroring `build_destination`'s root selection exactly. This is the
+/// mount point the operator configured (e.g. `/mnt/unraid-1/media/movies`),
+/// NOT the per-title subdirectory under it. Returned so the mover can
+/// validate the root is present + writable BEFORE creating any subdir tree
+/// under it — the guard against silently writing an 80 GB rip into a
+/// container overlay when the NAS bind-mount has vanished.
+///
+/// Selection must stay in lock-step with `build_destination`:
+///   - movie with a non-empty `movie_dir` → `movie_dir`
+///   - tv with a non-empty `tv_dir` → `tv_dir`
+///   - everything else (no tmdb, empty movie/tv dir) → `output_dir`
+fn destination_root<'a>(cfg: &'a Config, tmdb: &Option<tmdb::TmdbResult>) -> &'a str {
+    if let Some(result) = tmdb {
+        match result.media_type.as_str() {
+            "movie" if !cfg.movie_dir.is_empty() => return &cfg.movie_dir,
+            "tv" if !cfg.tv_dir.is_empty() => return &cfg.tv_dir,
+            _ => {}
+        }
+    }
+    &cfg.output_dir
+}
+
+/// Fail-loud destination-root validation: the configured root must ALREADY
+/// EXIST as a directory AND be writable. Returns `Err(reason)` otherwise —
+/// the caller then preserves the output in staging and surfaces the error
+/// rather than `create_dir_all`-ing a fresh (wrong) tree.
+///
+/// This is the code hardening for the 2026-06 "Mercy" incident: the
+/// docker-compose lost its `/mnt/unraid-1/media/movies` bind-mount, so
+/// `/movies` resolved to the container's writable overlay. The mover
+/// silently `create_dir_all`'d `/movies/Mercy (2024)/` there and wrote
+/// ~80 GB into the ephemeral layer, logging a relative-path "success".
+/// Requiring the root to pre-exist makes a missing mount a hard, loud
+/// error — a mount point is provisioned out-of-band (the bind target),
+/// never auto-created by the mover.
+///
+/// Crucially this does NOT create the root (that's the whole point); it
+/// only probes. The per-title subdir under a confirmed-present root is
+/// still created on demand by the caller.
+fn validate_destination_root(root: &str) -> Result<(), String> {
+    if root.is_empty() {
+        // An empty root means "no configured dir"; `build_destination`
+        // only routes here via `output_dir`, which defaults to a non-empty
+        // path. An empty string would `create_dir_all("")` → cwd-relative
+        // writes, exactly the silent-wrong-path failure we're closing.
+        return Err("destination root is empty (no output/movie/tv directory configured)".into());
+    }
+    let root_path = Path::new(root);
+    // 1. The root must be ABSOLUTE. A relative root (e.g. `movies`) resolves
+    //    against the process cwd — which is how the incident produced the
+    //    relative "Moved to movies/Mercy/..." log and wrote inside the
+    //    container. A destination mount is always an absolute path.
+    if !root_path.is_absolute() {
+        return Err(format!(
+            "destination root '{root}' is not an absolute path; \
+             a destination mount must be configured as an absolute path \
+             (e.g. /mnt/unraid-1/media/movies) so it can never resolve \
+             relative to the container's working directory"
+        ));
+    }
+    // 2. The root must already EXIST as a directory. If it doesn't, the
+    //    mount is absent — do NOT create it (that writes into the overlay).
+    match std::fs::metadata(root_path) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "destination root '{root}' exists but is not a directory"
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "destination root '{root}' does not exist (mount missing?): {e}"
+            ));
+        }
+    }
+    // 3. The root must be WRITABLE. Probe by creating + removing a unique
+    //    temp marker inside it (honest test of dir write/exec perms, RO
+    //    filesystem, NFS squash). Unique-named so concurrent ticks / a real
+    //    `<root>/.autorip-writable-probe` can't collide.
+    let probe = root_path.join(format!(
+        ".autorip-writable-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(format!("destination root '{root}' is not writable: {e}")),
+    }
+}
+
+/// Fail-loud-EARLY destination check, mirroring the CLI's `preflight_validate`
+/// intent: validate every configured destination root (movie / tv / output)
+/// that is non-empty, returning a `(root, reason)` for each that is missing,
+/// not a directory, relative, or not writable. Empty (unset/inherit) roots
+/// are skipped. Used at startup and after a settings save to warn the
+/// operator BEFORE a rip finishes and the per-move guard blocks it.
+///
+/// Non-fatal by design: a mount can be transiently down at boot / save time,
+/// and the per-move `validate_destination_root` gate is the hard stop that
+/// preserves output in staging. This just surfaces the problem early.
+pub(crate) fn check_configured_destinations(cfg: &Config) -> Vec<(String, String)> {
+    let mut problems = Vec::new();
+    // Deduplicate identical roots (movie_dir == output_dir is common) so the
+    // operator doesn't see the same warning twice.
+    let mut seen: Vec<&str> = Vec::new();
+    for root in [
+        cfg.movie_dir.as_str(),
+        cfg.tv_dir.as_str(),
+        cfg.output_dir.as_str(),
+    ] {
+        if root.is_empty() || seen.contains(&root) {
+            continue;
+        }
+        seen.push(root);
+        if let Err(reason) = validate_destination_root(root) {
+            problems.push((root.to_string(), reason));
+        }
+    }
+    problems
+}
+
+/// Render a destination path as an ABSOLUTE path for logging. The mover
+/// must always log where it wrote in unambiguous absolute terms (never a
+/// cwd-relative `movies/Mercy/...` that hides a wrong-filesystem write).
+/// Already-absolute paths pass through unchanged; a relative path is
+/// joined onto the process cwd so the log still names a real location.
+fn absolute_for_log(dest: &str) -> String {
+    let p = Path::new(dest);
+    if p.is_absolute() {
+        return dest.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p).to_string_lossy().to_string(),
+        Err(_) => dest.to_string(),
     }
 }
 
@@ -2561,5 +2756,198 @@ mod tests {
         std::fs::write(&d, &headdiff).unwrap();
         assert!(!same_head_and_tail(&a, &d), "head diff must not match");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===================================================================
+    // Fail-loud destination validation (Mercy incident hardening).
+    // The mover must ERROR + preserve-in-staging when the configured
+    // destination root is missing/unwritable, and must NEVER silently
+    // create the root (which, with a lost bind-mount, writes into the
+    // container's ephemeral overlay). It must also log FULL ABSOLUTE
+    // destination paths, never a cwd-relative path.
+    // ===================================================================
+
+    /// dest root MISSING → error, and the validation must NOT create it
+    /// (no silent `create_dir_all` of a dead mount point).
+    #[test]
+    fn validate_destination_root_errors_when_missing_and_does_not_create() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("movies-mount-gone");
+        let missing_str = missing.to_string_lossy().to_string();
+        // Precondition: it really is absent.
+        assert!(!missing.exists());
+
+        let res = validate_destination_root(&missing_str);
+        assert!(res.is_err(), "a missing destination root must be an error");
+        let reason = res.unwrap_err();
+        assert!(
+            reason.contains("does not exist"),
+            "error must explain the root is missing, got: {reason}"
+        );
+        // THE KEY GUARANTEE: validation did not auto-create the root. A real
+        // move would then preserve the output in staging, not write 80 GB
+        // into a fresh overlay dir.
+        assert!(
+            !missing.exists(),
+            "validate_destination_root must NOT create the missing root (no silent create)"
+        );
+    }
+
+    /// dest root PRESENT + WRITABLE → Ok, and the writability probe leaves
+    /// no marker file behind.
+    #[test]
+    fn validate_destination_root_ok_when_present_and_writable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_string_lossy().to_string();
+        assert!(validate_destination_root(&root).is_ok());
+        // The probe file must be cleaned up.
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".autorip-writable-probe")
+            })
+            .collect();
+        assert!(leftover.is_empty(), "writability probe must be removed");
+    }
+
+    /// A RELATIVE root is rejected — the exact shape that produced the
+    /// incident's "Moved to movies/Mercy/..." cwd-relative write.
+    #[test]
+    fn validate_destination_root_rejects_relative_path() {
+        let res = validate_destination_root("movies");
+        assert!(res.is_err(), "a relative root must be rejected");
+        assert!(res.unwrap_err().contains("absolute"));
+    }
+
+    /// An empty root is rejected (would `create_dir_all("")` → cwd writes).
+    #[test]
+    fn validate_destination_root_rejects_empty() {
+        assert!(validate_destination_root("").is_err());
+    }
+
+    /// A root that exists but is a FILE (not a directory) is rejected.
+    #[test]
+    fn validate_destination_root_rejects_non_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let res = validate_destination_root(&file.to_string_lossy());
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("not a directory"));
+    }
+
+    /// A present-but-read-only root is rejected by the writability probe.
+    #[cfg(unix)]
+    #[test]
+    fn validate_destination_root_rejects_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ro = tmp.path().join("ro-root");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let res = validate_destination_root(&ro.to_string_lossy());
+        // Restore perms so TempDir cleanup works regardless of the outcome.
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).ok();
+        // Root runs as uid 0 in some CI sandboxes and can write through 0o500;
+        // only assert the failure when the probe genuinely couldn't write.
+        if let Err(reason) = res {
+            assert!(
+                reason.contains("not writable"),
+                "read-only root must fail with a writability reason, got: {reason}"
+            );
+        }
+    }
+
+    /// `destination_root` selects the SAME root `build_destination` routes
+    /// to, for every media-type / configured-dir combination — so the
+    /// validation guards exactly the root the move will use.
+    #[test]
+    fn destination_root_matches_build_destination_root() {
+        let cfg = cfg_with_dirs("/mnt/movies", "/mnt/tv", "/mnt/out");
+        // movie with movie_dir set → movie_dir
+        assert_eq!(
+            destination_root(&cfg, &Some(tmdb_movie("X", 2024))),
+            "/mnt/movies"
+        );
+        // tv with tv_dir set → tv_dir
+        let tv = tmdb::TmdbResult {
+            title: "Y".into(),
+            year: 2024,
+            poster_url: String::new(),
+            overview: String::new(),
+            media_type: "tv".into(),
+        };
+        assert_eq!(destination_root(&cfg, &Some(tv)), "/mnt/tv");
+        // no tmdb → output_dir
+        assert_eq!(destination_root(&cfg, &None), "/mnt/out");
+        // movie but movie_dir empty → output_dir (matches build_destination
+        // fall-through)
+        let cfg2 = cfg_with_dirs("", "/mnt/tv", "/mnt/out");
+        assert_eq!(
+            destination_root(&cfg2, &Some(tmdb_movie("X", 2024))),
+            "/mnt/out"
+        );
+    }
+
+    /// `absolute_for_log` never yields a cwd-relative path: absolute passes
+    /// through; relative is anchored to an absolute cwd.
+    #[test]
+    fn absolute_for_log_is_always_absolute() {
+        assert_eq!(
+            absolute_for_log("/mnt/unraid-1/media/movies/Mercy (2024)/Mercy (2024).mkv"),
+            "/mnt/unraid-1/media/movies/Mercy (2024)/Mercy (2024).mkv"
+        );
+        let rel = absolute_for_log("movies/Mercy/Mercy.mkv");
+        assert!(
+            std::path::Path::new(&rel).is_absolute(),
+            "a relative dest must be rendered as an absolute path for logging, got: {rel}"
+        );
+        assert!(rel.ends_with("movies/Mercy/Mercy.mkv"));
+    }
+
+    /// `check_configured_destinations` reports each broken root once and
+    /// stays silent on good/empty roots.
+    #[test]
+    fn check_configured_destinations_reports_missing_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let good = tmp.path().join("good");
+        std::fs::create_dir(&good).unwrap();
+        let missing = tmp.path().join("missing");
+
+        // movie_dir missing, tv_dir empty (skipped), output_dir good.
+        let cfg = cfg_with_dirs(&missing.to_string_lossy(), "", &good.to_string_lossy());
+        let problems = check_configured_destinations(&cfg);
+        assert_eq!(
+            problems.len(),
+            1,
+            "only the missing movie_dir should be flagged"
+        );
+        assert_eq!(problems[0].0, missing.to_string_lossy());
+
+        // All-good config → no problems.
+        let cfg_ok = cfg_with_dirs(&good.to_string_lossy(), "", &good.to_string_lossy());
+        assert!(
+            check_configured_destinations(&cfg_ok).is_empty(),
+            "a fully-present config must report no problems"
+        );
+    }
+
+    /// Dedup: when movie_dir == output_dir and both are missing, the
+    /// operator sees ONE warning, not two.
+    #[test]
+    fn check_configured_destinations_deduplicates_identical_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("same-missing-root");
+        let m = missing.to_string_lossy().to_string();
+        let cfg = cfg_with_dirs(&m, "", &m); // movie_dir == output_dir
+        let problems = check_configured_destinations(&cfg);
+        assert_eq!(
+            problems.len(),
+            1,
+            "an identical movie/output root must be reported once, got {problems:?}"
+        );
     }
 }
