@@ -141,6 +141,23 @@ fn main() {
     // Load config
     let cfg = config::load();
 
+    // Fail-loud-EARLY destination check (Mercy incident hardening): on
+    // boot, warn loudly if any configured movie/tv/output directory is
+    // missing, not a directory, or not writable — the classic symptom of a
+    // lost bind-mount (e.g. the NAS share didn't come up). Non-blocking: the
+    // service still starts (a mount can come up moments later, and the
+    // mover's per-move guard preserves output in staging meanwhile), but the
+    // operator sees the problem at startup instead of after a multi-hour rip.
+    if let Ok(c) = cfg.read() {
+        for (root, reason) in mover::check_configured_destinations(&c) {
+            log::syslog(&format!(
+                "WARNING: configured destination '{root}' is not usable at startup: {reason}. \
+                 Finished rips will be PRESERVED in staging (not moved) until this is fixed \
+                 (check the directory exists and its bind-mount/NAS share is present and writable)."
+            ));
+        }
+    }
+
     // The local KEYDB only matters for the `local` key source. In `online`
     // mode keys come from the key service and a local keydb would only shadow
     // it (libfreemkv default-search), so skip the download entirely.

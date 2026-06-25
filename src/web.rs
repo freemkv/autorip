@@ -4168,6 +4168,20 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     // picks up the new size.
     config::apply_decrypt_threads(snapshot.decrypt_threads);
 
+    // Fail-loud-EARLY destination check (Mercy incident hardening): warn
+    // the operator NOW if a configured movie/tv/output directory is
+    // missing, not a directory, or not writable — rather than letting a
+    // rip run for hours and only discover the dead mount when the mover's
+    // per-move guard blocks the move. Non-blocking: the save still
+    // succeeds (a mount can be transiently down at save time), but the
+    // warning is loud on the System log.
+    for (root, reason) in crate::mover::check_configured_destinations(&snapshot) {
+        crate::log::syslog(&format!(
+            "WARNING: configured destination '{root}' is not usable: {reason}. \
+             Rips will be PRESERVED in staging (not moved) until this is fixed."
+        ));
+    }
+
     // Bounded-syscall pattern, hand-rolled because
     // `libfreemkv::io::bounded::bounded_syscall` is `pub(crate)` and
     // not reachable from autorip. Same shape: spawn a worker, await on
