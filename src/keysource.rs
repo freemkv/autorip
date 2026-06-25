@@ -516,6 +516,14 @@ impl DiscKeyAccess for IsoAccess<'_> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that drive `save_keydb` → `libfreemkv::keydb::save`,
+    /// which writes to the single process-wide exe-local `default_path()`
+    /// (`<exe_dir>/keydb.cfg`) before `save_keydb` relocates it. Two such tests
+    /// running in parallel race on that shared file: one renames it out from
+    /// under the other, surfacing a spurious `KeydbWrite`. The lock makes the
+    /// write→relocate sequence atomic across the test binary.
+    static SAVE_KEYDB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn ssrf_guard_blocks_metadata_and_internal_hosts() {
         // Cloud metadata endpoint — the canonical SSRF target.
@@ -683,6 +691,7 @@ mod tests {
     /// container "downloaded" a keydb every boot yet every AACS rip still failed.
     #[test]
     fn save_keydb_writes_to_service_path_and_existence_agrees() {
+        let _guard = SAVE_KEYDB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("keys").join("keydb.cfg");
 
@@ -727,5 +736,290 @@ mod tests {
             written.contains("0xDEADBEEF"),
             "keydb content must be present"
         );
+    }
+
+    // --- keydb path resolution: the four resolvers must agree (rc.6 WS3) -----
+
+    /// With no explicit `keydb_path`, all the resolvers fall through to the
+    /// SAME service default (`$HOME/.config/freemkv/keydb.cfg`): `keydb_path`,
+    /// `service_default_keydb`, and the read path (`drive_scan_opts` builds its
+    /// `KeydbSource` from `keydb_path`). The rc.6 bug was the reads going to
+    /// `$HOME/.config/freemkv` while the writes/gate went to libfreemkv's
+    /// exe-local default; this pins they resolve to one location.
+    ///
+    /// Reads the ambient `$HOME` rather than mutating it — mutating the global
+    /// env races with `libfreemkv::keydb::default_path()` in sibling tests.
+    #[test]
+    fn keydb_resolvers_all_agree_on_service_default() {
+        let Some(home) = std::env::var_os("HOME") else {
+            // No HOME in this environment — the default falls back to a bare
+            // relative "keydb.cfg"; assert that fallback instead.
+            let cfg = Config::default();
+            assert_eq!(keydb_path(&cfg), PathBuf::from("keydb.cfg"));
+            return;
+        };
+
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.keydb_path, None,
+            "default config must carry no explicit keydb_path"
+        );
+
+        let expected = PathBuf::from(home).join(".config/freemkv/keydb.cfg");
+        assert_eq!(
+            service_default_keydb(),
+            Some(expected.clone()),
+            "service default must live under $HOME/.config/freemkv"
+        );
+        assert_eq!(
+            keydb_path(&cfg),
+            expected,
+            "keydb_path with no override must resolve to the service default, \
+             NOT a bare relative path or libfreemkv's exe-local default"
+        );
+        // The existence gate resolves through the same path the reads use.
+        assert_eq!(keydb_exists(&cfg), expected.exists());
+    }
+
+    /// An explicit `keydb_path` in config overrides the service default, and the
+    /// existence gate + the read path both honor that override (so an operator
+    /// who points autorip at a non-standard keydb gets reads, writes, and the
+    /// startup gate all aimed at the same file).
+    #[test]
+    fn explicit_keydb_path_overrides_default_and_gate_honors_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let explicit = tmp.path().join("custom").join("mykeys.cfg");
+
+        let mut cfg = Config::default();
+        cfg.keydb_path = Some(explicit.to_string_lossy().into_owned());
+
+        assert_eq!(
+            keydb_path(&cfg),
+            explicit,
+            "explicit keydb_path must win over the service default"
+        );
+        assert!(!keydb_exists(&cfg), "file not created yet");
+
+        std::fs::create_dir_all(explicit.parent().unwrap()).unwrap();
+        std::fs::write(&explicit, b"0xAAAA\n").unwrap();
+        assert!(
+            keydb_exists(&cfg),
+            "existence gate must see the file at the explicit path"
+        );
+    }
+
+    /// `save_keydb` is idempotent on the dest path: when the validated file is
+    /// already AT the service-canonical destination (operator pointed
+    /// `keydb_path` straight at the exe-local default, or a single-binary
+    /// deploy), the early-return src==dest branch leaves the file in place and
+    /// reports that path — no spurious relocate, no data loss.
+    #[test]
+    fn save_keydb_is_idempotent_when_src_equals_dest() {
+        let _guard = SAVE_KEYDB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Point keydb_path at exactly libfreemkv's exe-local default so
+        // save()'s own write target equals our dest → src==dest branch.
+        let Ok(exe_local) = libfreemkv::keydb::default_path() else {
+            // No exe-local default resolvable in this environment — skip.
+            return;
+        };
+        let mut cfg = Config::default();
+        cfg.keydb_path = Some(exe_local.to_string_lossy().into_owned());
+        assert_eq!(keydb_path(&cfg), exe_local);
+
+        let result = save_keydb(&cfg, b"0xBEEF\n").expect("save must succeed");
+        assert_eq!(
+            result.path, exe_local,
+            "src==dest path must report the canonical (== exe-local here) target"
+        );
+        assert!(exe_local.exists(), "file must be present at the dest");
+        // Clean up the file we wrote to the shared exe-local default so we don't
+        // leak state into other tests / runs.
+        let _ = std::fs::remove_file(&exe_local);
+    }
+
+    // --- KeyOutcome reporting via resolve_keys (rc.6 WS3) --------------------
+
+    /// A minimal keyless, encrypted `Disc` for driving `resolve_keys` outcome
+    /// classification. No real AACS state — the outcome (MissingInputs / NoKey /
+    /// Unreachable) is decided by the fixtures' behavior, not the disc.
+    fn keyless_encrypted_disc() -> libfreemkv::Disc {
+        libfreemkv::Disc {
+            volume_id: "TEST_DISC".into(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::BluRay,
+            capacity_sectors: 0,
+            capacity_bytes: 0,
+            layers: 1,
+            titles: Vec::new(),
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: true,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        }
+    }
+
+    /// A `KeySource` fixture that hands out NO keys and never errors — models a
+    /// source that simply has no key for this disc (e.g. an empty keydb).
+    struct NoKeySource;
+    impl KeySource for NoKeySource {
+        fn next_key(&mut self, _inputs: &DiscInputs) -> Option<libfreemkv::Key> {
+            None
+        }
+    }
+
+    /// A `KeySource` fixture that hands out no keys but reports `errored()` —
+    /// models a source that FAILED (e.g. key service unreachable / unreadable
+    /// keydb), the distinction `resolve_keys` maps to `Unreachable`.
+    struct ErroringSource;
+    impl KeySource for ErroringSource {
+        fn next_key(&mut self, _inputs: &DiscInputs) -> Option<libfreemkv::Key> {
+            None
+        }
+        fn errored(&self) -> bool {
+            true
+        }
+    }
+
+    /// `DiscKeyAccess` fixture whose `key_files()` returns the given option;
+    /// `volume_id` is a fixed all-zero VID; `sample_units` yields nothing (none
+    /// of the outcome tests use a sample-needing source).
+    struct FixtureAccess {
+        key_files: Option<(Vec<u8>, Vec<u8>)>,
+    }
+    impl DiscKeyAccess for FixtureAccess {
+        fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+            self.key_files.clone()
+        }
+        fn volume_id(&self) -> Option<[u8; 16]> {
+            Some([0u8; 16])
+        }
+        fn sample_units(&mut self, _t: &libfreemkv::DiscTitle, _n: usize) -> Vec<Vec<u8>> {
+            Vec::new()
+        }
+    }
+
+    /// `key_files()` returning None → `MissingInputs`, regardless of what sources
+    /// are configured (we never even reach key resolution).
+    #[test]
+    fn resolve_keys_reports_missing_inputs_when_key_files_unreadable() {
+        let mut access = FixtureAccess { key_files: None };
+        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(NoKeySource)];
+        let (_disc, outcome) = resolve_keys(sources, &mut access, keyless_encrypted_disc());
+        assert_eq!(
+            outcome,
+            KeyOutcome::MissingInputs,
+            "unreadable key files must report MissingInputs, not NoKey"
+        );
+    }
+
+    /// Key files present, sources exhausted with NO key and NO error →
+    /// `NoKey` (a clean "no source has a key for this disc").
+    #[test]
+    fn resolve_keys_reports_no_key_when_sources_exhausted_clean() {
+        let mut access = FixtureAccess {
+            key_files: Some((b"inf".to_vec(), b"mkb".to_vec())),
+        };
+        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(NoKeySource)];
+        let (_disc, outcome) = resolve_keys(sources, &mut access, keyless_encrypted_disc());
+        assert_eq!(outcome, KeyOutcome::NoKey);
+    }
+
+    /// Key files present, a source FAILED (errored) and produced no key →
+    /// `Unreachable`. This is the distinction the dashboard tile renders as
+    /// "no key source could be reached" rather than "no key for this disc".
+    #[test]
+    fn resolve_keys_reports_unreachable_when_a_source_errored() {
+        let mut access = FixtureAccess {
+            key_files: Some((b"inf".to_vec(), b"mkb".to_vec())),
+        };
+        // Mix a clean no-key source with a failed one — `errored()` is an
+        // any() across the MultiSource, so the failure must dominate.
+        let sources: Vec<Box<dyn KeySource>> =
+            vec![Box::new(NoKeySource), Box::new(ErroringSource)];
+        let (_disc, outcome) = resolve_keys(sources, &mut access, keyless_encrypted_disc());
+        assert_eq!(
+            outcome,
+            KeyOutcome::Unreachable,
+            "a failed source must surface as Unreachable, not NoKey"
+        );
+    }
+
+    /// The four `KeyOutcome` variants are distinct — a regression guard so a
+    /// future refactor can't accidentally collapse e.g. Unreachable into NoKey
+    /// (which would erase the "check your keyserver/network" guidance).
+    #[test]
+    fn key_outcome_variants_are_distinct() {
+        let all = [
+            KeyOutcome::Resolved,
+            KeyOutcome::MissingInputs,
+            KeyOutcome::NoKey,
+            KeyOutcome::Unreachable,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(
+                    i == j,
+                    a == b,
+                    "{a:?} vs {b:?} equality must track identity"
+                );
+            }
+        }
+    }
+
+    // --- build_sources ordering / SSRF / fallback (rc.6 WS3) -----------------
+
+    /// `build_sources` puts the mapfile source FIRST (the resume fast-path) when
+    /// a mapfile is supplied, ahead of the configured local keydb.
+    #[test]
+    fn build_sources_puts_mapfile_first_then_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mf = tmp.path().join("disc.map");
+        let mut cfg = Config::default();
+        cfg.key_source = "local".into();
+        let sources = build_sources(&cfg, Some(&mf));
+        assert_eq!(sources.len(), 2, "mapfile + local keydb");
+        // The configured local keydb lands AFTER the mapfile (it labels itself
+        // "keydb"); index 0 is therefore the resume mapfile cache, which must be
+        // tried first. (MapfileSource keeps the default "source" label, so we
+        // pin the order via the keydb's distinguishing label at index 1.)
+        assert_eq!(
+            sources[1].label(),
+            "keydb",
+            "the configured local keydb must come after the resume mapfile cache"
+        );
+        // Sanity: with no mapfile, only the configured keydb is present.
+        let no_mf = build_sources(&cfg, None);
+        assert_eq!(no_mf.len(), 1);
+        assert_eq!(no_mf[0].label(), "keydb");
+    }
+
+    /// An online `key_source` with an SSRF-blocked URL drops the online source
+    /// entirely (rather than handing OnlineSource a URL we won't trust). With no
+    /// mapfile that leaves ZERO sources — the rip then surfaces NoKey instead of
+    /// exfiltrating disc-key material to an internal address.
+    #[test]
+    fn build_sources_drops_online_source_on_ssrf_blocked_url() {
+        let mut cfg = Config::default();
+        cfg.key_source = "online".into();
+        cfg.keyserver_url = "http://169.254.169.254/keys".into();
+        let sources = build_sources(&cfg, None);
+        assert!(
+            sources.is_empty(),
+            "SSRF-blocked online URL must yield no usable source"
+        );
+    }
+
+    /// An unrecognised `key_source` (operator typo like "onlnie") falls back to
+    /// the local keydb rather than silently producing no source.
+    #[test]
+    fn build_sources_unknown_key_source_falls_back_to_local_keydb() {
+        let mut cfg = Config::default();
+        cfg.key_source = "onlnie".into();
+        let sources = build_sources(&cfg, None);
+        assert_eq!(sources.len(), 1, "fallback to a single local keydb source");
+        assert!(!uses_online(&cfg), "a typo'd source is not 'online'");
     }
 }
