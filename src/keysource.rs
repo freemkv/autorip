@@ -149,13 +149,24 @@ pub enum KeyOutcome {
     Unreachable,
 }
 
-/// The configured keydb path, or the standard default location.
+/// The configured keydb path, or the service's standard default location.
 fn keydb_path(cfg: &Config) -> PathBuf {
     cfg.keydb_path
         .clone()
         .map(Into::into)
-        .or_else(|| libfreemkv::keydb::default_path().ok())
+        .or_else(service_default_keydb)
         .unwrap_or_else(|| PathBuf::from("keydb.cfg"))
+}
+
+/// autorip's default keydb location: `$HOME/.config/freemkv/keydb.cfg`.
+///
+/// The container bind-mounts the keydb to `/root/.config/freemkv`, so the
+/// service resolves it under the standard per-user config dir — NOT
+/// libfreemkv's `default_path()`, which is local to the executable (correct for
+/// the portable CLI, wrong for a containerized service whose binary and keydb
+/// live in different places).
+fn service_default_keydb() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/freemkv/keydb.cfg"))
 }
 
 /// ScanOptions for a **live-drive** structure scan. Lookup-free (the library
