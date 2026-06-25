@@ -3477,7 +3477,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 s.status = "done".to_string();
                 s.output_file = iso_filename.clone();
             });
-            if cfg_read.auto_eject {
+            if should_auto_eject(cfg_read.auto_eject, device) {
                 if let Some(h) = device_halt(device) {
                     h.cancel();
                 }
@@ -3661,7 +3661,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     ..Default::default()
                 },
             );
-            if cfg_read.auto_eject {
+            if should_auto_eject(cfg_read.auto_eject, device) {
                 // eject_drive handles drain + drop_session + unregister_halt
                 // internally. Cancel the halt first so any in-flight work
                 // exits cleanly before the eject SCSI command issues.
@@ -4577,6 +4577,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             lost_video_secs: done_lost_secs,
         },
     );
+}
+
+/// Pure decision: should this completion path auto-eject the drive?
+///
+/// Two rules, both load-bearing for the rip→mux→move state machine:
+/// 1. Only when the operator enabled `auto_eject`.
+/// 2. NEVER for a synthetic, underscore-prefixed device (`_mux`, etc.).
+///    Those carry the background mux/move work AFTER the drive thread has
+///    already handed off (and possibly already ejected). The synthetic
+///    `_mux` worker reaching a completion path must not issue a second
+///    eject against whatever disc the physical drive now holds. The real
+///    drive ejects exactly once, at the `.ripped` read-complete hand-off.
+///
+/// Centralizing this here makes the "fires once, at read-complete, never
+/// from the mux worker" contract a single unit-testable predicate instead
+/// of an inline `&&` duplicated across the fresh-rip and resume paths.
+pub(crate) fn should_auto_eject(auto_eject: bool, device: &str) -> bool {
+    auto_eject && !device.starts_with('_')
 }
 
 pub fn eject_drive(device_path: &str) {
@@ -6785,6 +6803,62 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(device);
+    }
+
+    // ===================================================================
+    // Auto-eject timing contract (bug #2): the drive ejects EXACTLY ONCE,
+    // at the `.ripped` read-complete hand-off, only when the operator
+    // enabled `auto_eject`, and NEVER from the synthetic `_mux` worker.
+    // `should_auto_eject` is the single predicate all four completion
+    // sites (fresh ISO/MKV, resume ISO/MKV) now gate on, so testing it
+    // covers the whole contract.
+    // ===================================================================
+
+    #[test]
+    fn auto_eject_fires_for_real_device_when_enabled() {
+        // A physical drive (sg0/sr1/…) with auto_eject on ejects.
+        assert!(super::should_auto_eject(true, "sg0"));
+        assert!(super::should_auto_eject(true, "sr1"));
+        assert!(super::should_auto_eject(true, "sg12"));
+    }
+
+    #[test]
+    fn auto_eject_does_not_fire_when_disabled() {
+        // auto_eject=false never ejects, regardless of device.
+        assert!(!super::should_auto_eject(false, "sg0"));
+        assert!(!super::should_auto_eject(false, "sr1"));
+        assert!(!super::should_auto_eject(false, "_mux"));
+    }
+
+    #[test]
+    fn auto_eject_never_fires_from_synthetic_mux_device() {
+        // The `_mux` worker reaches a completion path AFTER the drive
+        // thread already ejected at the hand-off; it must never issue a
+        // second eject (the drive may now hold a different disc). The
+        // guard keys on the underscore prefix, so even with auto_eject on
+        // a synthetic device is refused.
+        assert!(!super::should_auto_eject(true, "_mux"));
+        assert!(!super::should_auto_eject(true, "_move"));
+        assert!(!super::should_auto_eject(true, "_anything"));
+    }
+
+    /// The eject is "exactly once at read-complete": the fresh-rip `.ripped`
+    /// hand-off is the ONLY place the physical drive ejects on the multipass
+    /// path, and the LATER mux worker (synthetic `_mux`) is refused. This
+    /// pins both halves against the predicate so a refactor that lets the
+    /// mux worker re-eject (or that ejects twice) is caught.
+    #[test]
+    fn auto_eject_is_once_at_handoff_not_at_mux() {
+        // Hand-off (real device, enabled): eject.
+        assert!(
+            super::should_auto_eject(true, "sg0"),
+            "the physical drive must eject at the read-complete hand-off"
+        );
+        // Mux worker completing later (synthetic device): no second eject.
+        assert!(
+            !super::should_auto_eject(true, "_mux"),
+            "the mux worker must NOT re-eject after the hand-off already did"
+        );
     }
 
     /// Regression: a poisoned config `RwLock` must NOT leave the tile wedged in

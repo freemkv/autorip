@@ -1218,7 +1218,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // completion. Skip synthetic underscore-prefixed devices (the
         // `_mux` worker): they reach this path after the drive thread
         // already ejected, and the drive may hold a different disc.
-        if cfg_read.auto_eject && !device.starts_with('_') {
+        if super::should_auto_eject(cfg_read.auto_eject, device) {
             let device_path = format!("/dev/{}", device);
             super::eject_drive(&device_path);
         }
@@ -1599,11 +1599,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // silently skipped this, so a user with auto_eject=true would
     // find a finished disc still in the drive whenever a rip was
     // recovered after a container restart.
-    if cfg_read.auto_eject && !device.starts_with('_') {
-        // Underscore-prefixed devices are synthetic — used by the
-        // v0.25.3 mux worker which gets here from a `.ripped`
-        // hand-off after the drive thread already ejected. Don't
-        // re-eject; the drive may even hold a different disc by now.
+    // Underscore-prefixed devices are synthetic — used by the v0.25.3 mux
+    // worker which gets here from a `.ripped` hand-off after the drive
+    // thread already ejected. `should_auto_eject` encodes "only when
+    // enabled AND not a synthetic device" so the mux worker never re-ejects
+    // (the drive may even hold a different disc by now).
+    if super::should_auto_eject(cfg_read.auto_eject, device) {
         let device_path = format!("/dev/{}", device);
         super::eject_drive(&device_path);
     }
@@ -2151,19 +2152,150 @@ mod resume_iso_auto_eject_tests {
             .expect("resume.rs should call run_mux after the ISO branch");
         let region = &src[start..end];
         assert!(
-            region.contains("cfg_read.auto_eject"),
-            "resume_remux ISO success path must honor cfg_read.auto_eject, \
-             matching the MKV terminal and the fresh-rip ISO terminal; none \
-             found between the ISO completion log and run_mux"
-        );
-        assert!(
-            region.contains("!device.starts_with('_')"),
-            "the ISO auto_eject branch must guard synthetic underscore-\
-             prefixed devices (the _mux worker), matching the MKV terminal"
+            region.contains("should_auto_eject(cfg_read.auto_eject, device)"),
+            "resume_remux ISO success path must gate eject through \
+             should_auto_eject(cfg_read.auto_eject, device) — which encodes \
+             both \"only when enabled\" and \"never for a synthetic _mux \
+             device\" — matching the MKV terminal and the fresh-rip ISO \
+             terminal; none found between the ISO completion log and run_mux"
         );
         assert!(
             region.contains("super::eject_drive"),
             "the ISO auto_eject branch must call super::eject_drive"
+        );
+    }
+
+    /// The MKV resume terminal's eject must likewise route through the
+    /// shared `should_auto_eject` predicate (synthetic-device guard +
+    /// enable flag), not a bare `cfg_read.auto_eject` check that would let
+    /// the `_mux` worker re-eject the physical drive.
+    #[test]
+    fn resume_mkv_terminal_gates_eject_through_predicate() {
+        let src = include_str!("resume.rs");
+        let start = src
+            .find("Honor auto_eject after a successful resume")
+            .expect("resume.rs should have the MKV terminal auto_eject comment");
+        let region = &src[start..(start + 1000).min(src.len())];
+        assert!(
+            region.contains("should_auto_eject(cfg_read.auto_eject, device)"),
+            "the MKV resume terminal must gate eject through should_auto_eject"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resume_handoff_contract_tests {
+    //! The resume mux path (`remux_from_ripped_marker` → `resume_remux`)
+    //! must honor the SAME done + eject + queue-membership contract as the
+    //! fresh-rip path. Two halves:
+    //!   - eject: routes through `should_auto_eject` (covered behaviorally
+    //!     in mod.rs and at source level in `resume_iso_auto_eject_tests`).
+    //!   - queue membership: on success the resume path writes `.done`/
+    //!     `.review` + `.completed` and deletes `.ripped`, so the dir ends
+    //!     up in the Move queue ONLY — never lingering in the Mux queue.
+    //! These tests pin the marker-state outcomes that drive those views
+    //! without standing up a real ISO + mux pipeline.
+    use crate::ripper::staging;
+    use tempfile::TempDir;
+
+    /// On a CONFIDENT resume success the dir holds `.done` + `.completed`
+    /// (and `.ripped` deleted). `pending_queue` must skip it (Move queue
+    /// only); the resume-scan must treat it as a completed rip, not retry.
+    #[test]
+    fn resume_success_marker_state_is_move_queue_only() {
+        let tmp = TempDir::new().unwrap();
+        let disc = tmp.path().join("Resumed_Title");
+        std::fs::create_dir_all(&disc).unwrap();
+        // Post-resume-success marker state (the .ripped delete succeeded).
+        std::fs::write(disc.join(staging::DONE_MARKER), b"{}").unwrap();
+        staging::write_completed_marker(&disc);
+
+        // Mux queue: must NOT contain it (no .ripped, and .done/.completed
+        // are terminal/move-queue markers anyway).
+        let mux = crate::muxer::pending_queue(tmp.path());
+        assert!(
+            mux.is_empty(),
+            "a resumed-and-completed dir must not be (queued) for mux"
+        );
+
+        // The snapshot reports completed → the mux worker won't re-dispatch.
+        let snap = staging::snapshot_staging_disc(&disc).expect("populated dir yields snapshot");
+        assert!(
+            snap.completed,
+            "resume success must leave .completed for the mover"
+        );
+    }
+
+    /// If the post-resume `.ripped` delete FAILS (NFS), the dir holds
+    /// `.ripped` + `.done` + `.completed`. It STILL must be Move-queue only —
+    /// `pending_queue` skips on `.done`/`.completed` even though `.ripped`
+    /// lingers (the exact mutual-exclusion guarantee). And the mux worker's
+    /// dispatch verdict must be terminal (no re-mux).
+    #[test]
+    fn resume_success_with_lingering_ripped_is_still_move_only() {
+        let tmp = TempDir::new().unwrap();
+        let disc = tmp.path().join("Resumed_Title");
+        std::fs::create_dir_all(&disc).unwrap();
+        crate::muxer::write_marker(
+            &disc,
+            &crate::muxer::RippedMarker {
+                schema_version: crate::muxer::RIPPED_MARKER_SCHEMA,
+                iso_path: "/x/Resumed_Title/Resumed_Title.iso".into(),
+                mapfile_path: "/x/Resumed_Title/Resumed_Title.iso.mapfile".into(),
+                display_name: "Resumed Title".into(),
+                disc_format: "uhd".into(),
+                mkv_filename: "Resumed_Title.mkv".into(),
+                tmdb_title: "Resumed Title".into(),
+                tmdb_year: 2024,
+                tmdb_poster: String::new(),
+                tmdb_overview: String::new(),
+                tmdb_media_type: "movie".into(),
+                max_retries: 5,
+                abort_on_lost_secs: 0,
+                rip_elapsed_secs: 0.0,
+                rip_errors: 0,
+                rip_lost_video_secs: 0.0,
+                rip_last_sector: 0,
+                origin_device: "sg0".into(),
+                sweep_errors: 0,
+                sweep_total_lost_ms: 0.0,
+                sweep_main_lost_ms: 0.0,
+                sweep_num_bad_ranges: 0,
+                sweep_largest_gap_ms: 0.0,
+                title_confident: true,
+            },
+        )
+        .unwrap();
+        std::fs::write(disc.join(staging::DONE_MARKER), b"{}").unwrap();
+        staging::write_completed_marker(&disc);
+
+        let mux = crate::muxer::pending_queue(tmp.path());
+        assert!(
+            mux.is_empty(),
+            "a completed resume must be Move-queue only even if .ripped lingers, got {mux:?}"
+        );
+        let snap = staging::snapshot_staging_disc(&disc).expect("snapshot");
+        assert_eq!(
+            crate::muxer::mux_dispatch_verdict(Some(&snap)),
+            crate::muxer::MuxVerdict::SkipTerminal,
+            "the mux worker must treat a completed dir as terminal, never re-dispatch"
+        );
+    }
+
+    /// A LOW-CONFIDENCE resume success writes `.review` (not `.done`) +
+    /// `.completed`. Same mutual-exclusion outcome: never in the Mux queue.
+    #[test]
+    fn resume_review_success_is_not_in_mux_queue() {
+        let tmp = TempDir::new().unwrap();
+        let disc = tmp.path().join("Held_Resume");
+        std::fs::create_dir_all(&disc).unwrap();
+        std::fs::write(disc.join(staging::REVIEW_MARKER), b"{}").unwrap();
+        staging::write_completed_marker(&disc);
+
+        let mux = crate::muxer::pending_queue(tmp.path());
+        assert!(
+            mux.is_empty(),
+            "a .review+.completed resume must not be (queued) for mux"
         );
     }
 }
