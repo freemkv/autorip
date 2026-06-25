@@ -2356,6 +2356,366 @@ mod web_tests {
         assert!(!both_contain(&mux, &mv));
     }
 
+    // ===================================================================
+    // COMPREHENSIVE rip→mux→move→done state-machine coverage.
+    // The three views (per-device tile status, Mux queue, Move queue) must
+    // stay mutually consistent across EVERY marker transition and with
+    // MULTIPLE discs in staging. These tests walk the full marker lifecycle
+    // and assert, at each step, exactly which queue(s) a disc is in.
+    // ===================================================================
+
+    /// Build a schema-valid `.ripped` marker for `display_name` whose
+    /// `origin_device` is `origin`. Keeps the lifecycle tests terse.
+    fn ripped_marker_for(display_name: &str, origin: &str) -> crate::muxer::RippedMarker {
+        let safe = display_name.replace(' ', "_");
+        crate::muxer::RippedMarker {
+            schema_version: crate::muxer::RIPPED_MARKER_SCHEMA,
+            iso_path: format!("/x/{safe}/{safe}.iso"),
+            mapfile_path: format!("/x/{safe}/{safe}.iso.mapfile"),
+            display_name: display_name.into(),
+            disc_format: "uhd".into(),
+            mkv_filename: format!("{safe}.mkv"),
+            tmdb_title: display_name.into(),
+            tmdb_year: 2024,
+            tmdb_poster: String::new(),
+            tmdb_overview: String::new(),
+            tmdb_media_type: "movie".into(),
+            max_retries: 5,
+            abort_on_lost_secs: 0,
+            rip_elapsed_secs: 0.0,
+            rip_errors: 0,
+            rip_lost_video_secs: 0.0,
+            rip_last_sector: 0,
+            origin_device: origin.into(),
+            sweep_errors: 0,
+            sweep_total_lost_ms: 0.0,
+            sweep_main_lost_ms: 0.0,
+            sweep_num_bad_ranges: 0,
+            sweep_largest_gap_ms: 0.0,
+            title_confident: true,
+        }
+    }
+
+    /// Does `name` appear in BOTH queues at once? (Strips the trailing
+    /// status suffixes so `"X (queued)"` and `"X (moving)"` compare equal.)
+    fn in_both_queues(mux: &[String], mv: &[String]) -> bool {
+        let strip = |s: &str| -> String {
+            s.replace(" (queued)", "")
+                .replace(" (malformed)", "")
+                .replace(" (moving)", "")
+        };
+        mux.iter().any(|m| mv.iter().any(|v| strip(m) == strip(v)))
+    }
+
+    /// FULL marker lifecycle with the device-status view folded in. At each
+    /// step assert (a) which queue(s) the disc is in and (b) the device
+    /// tile status. The disc is NEVER in two queues; the tile is correct at
+    /// every stage. Covers `.ripped → .muxing → .done → .completed`.
+    #[test]
+    fn full_lifecycle_queue_and_status_consistent() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let staging = tmp.path().to_string_lossy().to_string();
+        let disc = tmp.path().join("Mercy");
+        fs::create_dir_all(&disc).unwrap();
+        let device = "sg_lifecycle_dev";
+
+        // --- Stage 0: sweep in progress. `.sweeping` marker, tile=ripping.
+        crate::ripper::staging::write_sweeping_marker(&disc);
+        crate::ripper::update_state(
+            device,
+            crate::ripper::RipState {
+                device: device.to_string(),
+                status: "ripping".to_string(),
+                disc_name: "Mercy".to_string(),
+                ..Default::default()
+            },
+        );
+        let (mux, mv) = build_queue_views(&staging);
+        assert!(
+            mux.is_empty() && mv.is_empty(),
+            "during sweep: in neither queue"
+        );
+        assert_eq!(device_status(device), Some("ripping".into()));
+
+        // --- Stage 1: `.ripped` hand-off. The read is DONE: tile=done(100%),
+        // disc enters the Mux queue ONLY. (`write_marker` also clears
+        // `.sweeping`.)
+        crate::muxer::write_marker(&disc, &ripped_marker_for("Mercy", device)).unwrap();
+        crate::ripper::update_state(
+            device,
+            crate::ripper::RipState {
+                device: device.to_string(),
+                status: "done".to_string(),
+                progress_pct: 100,
+                disc_name: "Mercy".to_string(),
+                output_file: "Mercy.mkv".to_string(),
+                ..Default::default()
+            },
+        );
+        let (mux, mv) = build_queue_views(&staging);
+        assert_eq!(mux.len(), 1, ".ripped → Mux queue");
+        assert!(mv.is_empty(), "not in Move queue yet");
+        assert!(!in_both_queues(&mux, &mv));
+        assert_eq!(
+            device_status(device),
+            Some("done".into()),
+            "tile is 'done' the instant the read finishes, even though the mux is pending"
+        );
+
+        // --- Stage 2: mux in flight. `.muxing` lock; disc leaves the static
+        // Mux queue (it's the live `_mux` device now); tile stays done.
+        crate::ripper::staging::write_muxing_marker(&disc);
+        let (mux, mv) = build_queue_views(&staging);
+        assert!(
+            mux.is_empty(),
+            "actively-muxing dir leaves the (queued) list"
+        );
+        assert!(mv.is_empty());
+        assert!(!in_both_queues(&mux, &mv));
+        assert_eq!(device_status(device), Some("done".into()));
+        crate::ripper::staging::clear_muxing_marker(&disc);
+
+        // --- Stage 3: mux success. `.done` (mover hand-off) written BEFORE
+        // `.completed`; `.ripped` may linger. Disc moves to the Move queue
+        // ONLY — the double-listing bug window.
+        fs::write(disc.join(".done"), b"{}").unwrap();
+        let (mux, mv) = build_queue_views(&staging);
+        assert!(
+            mux.is_empty(),
+            "a .done dir must NOT still be (queued) in the Mux queue"
+        );
+        assert_eq!(mv.len(), 1, ".done → Move queue");
+        assert!(!in_both_queues(&mux, &mv), "BUG #3: never in both queues");
+        assert_eq!(device_status(device), Some("done".into()));
+
+        // --- Stage 4: `.completed` lands (terminal). Still Move-only.
+        crate::ripper::staging::write_completed_marker(&disc);
+        let (mux, mv) = build_queue_views(&staging);
+        assert!(mux.is_empty());
+        assert_eq!(
+            mv.len(),
+            1,
+            "still in the Move queue until the mover relocates it"
+        );
+        assert!(!in_both_queues(&mux, &mv));
+
+        crate::ripper::STATE.lock().unwrap().remove(device);
+    }
+
+    /// LOW-CONFIDENCE lifecycle: the mux writes `.review` (not `.done`) for
+    /// an operator hold. The disc must leave the Mux queue (it's the mover's
+    /// concern now) and NOT double-list. `.review` is a Move-queue concept
+    /// only via the operator review flow, so it appears in neither the
+    /// "(moving)" list nor the Mux "(queued)" list here — the key invariant
+    /// is it is never simultaneously in both.
+    #[test]
+    fn review_hold_leaves_mux_queue_no_double_listing() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let staging = tmp.path().to_string_lossy().to_string();
+        let disc = tmp.path().join("Held_Title");
+        fs::create_dir_all(&disc).unwrap();
+
+        crate::muxer::write_marker(&disc, &ripped_marker_for("Held Title", "sg0")).unwrap();
+        let (mux, _) = build_queue_views(&staging);
+        assert_eq!(mux.len(), 1, "fresh .ripped is queued for mux");
+
+        // Low-confidence mux success: `.review` instead of `.done`, then
+        // `.completed`.
+        fs::write(disc.join(".review"), b"{}").unwrap();
+        let (mux, mv) = build_queue_views(&staging);
+        assert!(mux.is_empty(), "a .review dir must leave the Mux queue");
+        assert!(
+            !in_both_queues(&mux, &mv),
+            "never in both queues on the review path"
+        );
+
+        crate::ripper::staging::write_completed_marker(&disc);
+        let (mux, mv) = build_queue_views(&staging);
+        assert!(mux.is_empty());
+        assert!(!in_both_queues(&mux, &mv));
+    }
+
+    /// ABORT path: a post-mux loss abort writes `.failed` (no `.done`/
+    /// `.completed`). The disc must leave BOTH queues, and the device tile
+    /// reflects "error".
+    #[test]
+    fn abort_failed_leaves_both_queues_and_marks_error() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let staging = tmp.path().to_string_lossy().to_string();
+        let disc = tmp.path().join("Lossy_Disc");
+        fs::create_dir_all(&disc).unwrap();
+        let device = "sg_abort_dev";
+
+        crate::muxer::write_marker(&disc, &ripped_marker_for("Lossy Disc", device)).unwrap();
+        let (mux, _) = build_queue_views(&staging);
+        assert_eq!(mux.len(), 1);
+
+        // Abort gate quarantines: `.failed`, tile=error.
+        crate::ripper::staging::write_failed_marker(&disc, "aborted: loss exceeds threshold");
+        crate::ripper::update_state(
+            device,
+            crate::ripper::RipState {
+                device: device.to_string(),
+                status: "error".to_string(),
+                disc_name: "Lossy Disc".to_string(),
+                last_error: "aborted: loss exceeds threshold".to_string(),
+                ..Default::default()
+            },
+        );
+        let (mux, mv) = build_queue_views(&staging);
+        assert!(mux.is_empty(), ".failed dir must leave the Mux queue");
+        assert!(
+            mv.is_empty(),
+            ".failed dir is NOT in the Move queue (no .done)"
+        );
+        assert_eq!(device_status(device), Some("error".into()));
+
+        crate::ripper::STATE.lock().unwrap().remove(device);
+    }
+
+    /// CONCURRENT devices: two drives, each with its own staged job at a
+    /// DIFFERENT lifecycle stage, must not cross-contaminate queue
+    /// membership or device status. Disc A is mid-mux-queue (`.ripped`);
+    /// disc B has finished (`.done` → Move queue).
+    #[test]
+    fn concurrent_devices_no_cross_contamination() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let staging = tmp.path().to_string_lossy().to_string();
+        let dev_a = "sg_concurrent_a";
+        let dev_b = "sg_concurrent_b";
+
+        // Disc A: freshly handed off → Mux queue, tile A = done.
+        let disc_a = tmp.path().join("Alpha");
+        fs::create_dir_all(&disc_a).unwrap();
+        crate::muxer::write_marker(&disc_a, &ripped_marker_for("Alpha", dev_a)).unwrap();
+        crate::ripper::update_state(
+            dev_a,
+            crate::ripper::RipState {
+                device: dev_a.to_string(),
+                status: "done".to_string(),
+                progress_pct: 100,
+                disc_name: "Alpha".to_string(),
+                ..Default::default()
+            },
+        );
+
+        // Disc B: mux finished → Move queue, tile B = done.
+        let disc_b = tmp.path().join("Beta");
+        fs::create_dir_all(&disc_b).unwrap();
+        crate::muxer::write_marker(&disc_b, &ripped_marker_for("Beta", dev_b)).unwrap();
+        fs::write(disc_b.join(".done"), b"{}").unwrap();
+        crate::ripper::staging::write_completed_marker(&disc_b);
+        crate::ripper::update_state(
+            dev_b,
+            crate::ripper::RipState {
+                device: dev_b.to_string(),
+                status: "done".to_string(),
+                progress_pct: 100,
+                disc_name: "Beta".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let (mux, mv) = build_queue_views(&staging);
+        // Alpha is in the Mux queue ONLY; Beta in the Move queue ONLY.
+        assert!(
+            mux.iter().any(|m| m.contains("Alpha")),
+            "Alpha must be in the Mux queue"
+        );
+        assert!(
+            !mux.iter().any(|m| m.contains("Beta")),
+            "Beta must NOT be in the Mux queue"
+        );
+        assert!(
+            mv.iter().any(|m| m.contains("Beta")),
+            "Beta must be in the Move queue"
+        );
+        assert!(
+            !mv.iter().any(|m| m.contains("Alpha")),
+            "Alpha must NOT be in the Move queue"
+        );
+        assert!(
+            !in_both_queues(&mux, &mv),
+            "neither disc may be in both queues"
+        );
+        // Each device tile is independent.
+        assert_eq!(device_status(dev_a), Some("done".into()));
+        assert_eq!(device_status(dev_b), Some("done".into()));
+
+        crate::ripper::STATE.lock().unwrap().remove(dev_a);
+        crate::ripper::STATE.lock().unwrap().remove(dev_b);
+    }
+
+    /// `get_state_json` END-TO-END: the serialized live payload (the source
+    /// for the SSE/dashboard) must never list a disc in BOTH `_mux_queue`
+    /// and `_move_queue`, across MULTIPLE discs at different stages. This is
+    /// the top-level guarantee fix C makes — all three views derive from one
+    /// snapshot.
+    #[test]
+    fn get_state_json_never_double_lists_across_discs() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let staging = tmp.path().to_string_lossy().to_string();
+
+        // Three discs spanning the lifecycle:
+        //   Queued      → .ripped only        (Mux queue)
+        //   Moving      → .done + .completed   (Move queue)
+        //   AlsoQueued  → .ripped only         (Mux queue)
+        for (name, finished) in [("Queued", false), ("Moving", true), ("AlsoQueued", false)] {
+            let d = tmp.path().join(name);
+            fs::create_dir_all(&d).unwrap();
+            crate::muxer::write_marker(&d, &ripped_marker_for(name, "sg0")).unwrap();
+            if finished {
+                fs::write(d.join(".done"), b"{}").unwrap();
+                crate::ripper::staging::write_completed_marker(&d);
+            }
+        }
+
+        let json = get_state_json(&staging);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("state json must parse");
+        let to_names = |key: &str| -> Vec<String> {
+            v.get(key)
+                .and_then(|q| q.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|s| {
+                            s.replace(" (queued)", "")
+                                .replace(" (malformed)", "")
+                                .replace(" (moving)", "")
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mux_names = to_names("_mux_queue");
+        let move_names = to_names("_move_queue");
+
+        assert!(mux_names.contains(&"Queued".to_string()));
+        assert!(mux_names.contains(&"AlsoQueued".to_string()));
+        assert!(move_names.contains(&"Moving".to_string()));
+        // The cross-queue invariant: no disc in both lists.
+        for name in &mux_names {
+            assert!(
+                !move_names.contains(name),
+                "BUG #3 (get_state_json): '{name}' is in BOTH _mux_queue and _move_queue"
+            );
+        }
+    }
+
+    /// Helper: current status string of a device in the global STATE map.
+    fn device_status(device: &str) -> Option<String> {
+        ripper::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .map(|s| s.status.clone())
+    }
+
     #[test]
     fn keydb_body_under_cap_is_accepted() {
         let body = vec![b'x'; 100];
