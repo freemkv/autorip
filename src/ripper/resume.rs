@@ -457,6 +457,109 @@ fn resolve_media_type(carried: &str) -> String {
     }
 }
 
+/// Handle a durability-gate (`fsync`) failure on the resume mux output.
+///
+/// Both the ISO-output and the MKV/M2TS-output success paths call
+/// `staging::fsync_output_file` before writing any success marker; a `false`
+/// return means the output is not provably durable and we must NOT hand it to
+/// the mover. The naive response — preserve staging, return — is correct on the
+/// startup-scan path (which bumps `.restart_count` via
+/// `resume_or_quarantine_staging` on the NEXT restart). But `resume_remux` is
+/// ALSO driven by the live `_mux` worker loop (`check_and_mux`), which leaves
+/// `.ripped` in place and re-dispatches the SAME dir on its next tick — so a
+/// deterministic fsync failure (e.g. a wedged NFS export) would re-mux + re-fsync
+/// the same possibly-corrupt output forever, never consulting any restart cap.
+///
+/// This caps that loop the same way `resume_or_quarantine_staging` caps its
+/// partial-state path: bump `.restart_count`, and once it reaches
+/// `RESTART_LIMIT`, promote the dir to terminal `.failed` (which the worker's
+/// `mux_dispatch_verdict` and `resumable_dir_blocked` both treat as terminal,
+/// stopping the re-dispatch) and drop the `.ripped` hand-off so it can't be
+/// re-queued. Below the limit it leaves staging intact for the next retry.
+///
+/// Returns `true` when the dir was promoted to `.failed` (terminal), `false`
+/// when staging was preserved for another attempt. The caller resets device
+/// status and returns either way.
+fn handle_resume_fsync_failure(device: &str, staging_dir: &Path, output_desc: &str) -> bool {
+    let count = staging::increment_restart_count(staging_dir).unwrap_or_else(|e| {
+        // A failed counter bump must not green-light an infinite loop, but it
+        // also can't know the true count — log and treat as below-limit so the
+        // next tick re-reads/re-bumps from disk rather than quarantining blindly.
+        tracing::warn!(
+            staging = %staging_dir.display(),
+            error = %e,
+            "resume: failed to bump .restart_count after fsync failure"
+        );
+        0
+    });
+    if count >= staging::RESTART_LIMIT {
+        let reason =
+            format!("{output_desc} fsync failed repeatedly ({count} attempts); giving up",);
+        crate::log::device_log(
+            device,
+            &format!("Auto-resume: {reason} — quarantining staging (.failed)."),
+        );
+        staging::write_failed_marker(staging_dir, &reason);
+        staging::clear_restart_count(staging_dir);
+        // Drop the `.ripped` hand-off so the mux worker can't re-queue this
+        // now-terminal dir (belt-and-suspenders with the `.failed` guard).
+        if let Err(e) = crate::muxer::delete_marker(staging_dir) {
+            tracing::warn!(
+                staging = %staging_dir.display(),
+                error = %e,
+                "resume: failed to delete .ripped after fsync-failure quarantine; .failed guard prevents re-mux"
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// RAII exclusion lock for the cold operator-resume mux path.
+///
+/// The `_mux` worker path (`muxer::check_and_mux`) already writes `.muxing`
+/// and holds its own `MuxingGuard` for the duration of the dispatch, so it
+/// must NOT have a second guard write/clear the same marker underneath it.
+/// Every OTHER caller of [`resume_remux`] — the cold operator-resume path
+/// (`ResumeMode::Require` → `find_resumable_for_disc` → `resume_remux`) — runs
+/// a multi-minute mux with only `<name>.iso` + `<name>.iso.mapfile` on disk and
+/// NO governing marker. Without `.muxing`, `disc_owned_by_worker` /
+/// `resumable_dir_blocked` return false, so a concurrent `ResumeMode::Wipe` of
+/// the same disc `remove_dir_all`s the staging dir and deletes the ISO out from
+/// under this in-flight mux (the exact data loss the Wipe guard at
+/// `mod.rs` was added to prevent), and a second cold resume double-muxes the
+/// same ISO. Writing `.muxing` here closes both holes; the terminal marker
+/// writers (`write_completed_marker` / `write_failed_marker`) already clear it,
+/// and this guard's `Drop` clears it on every early-return / panic path too.
+struct ResumeMuxingGuard<'a> {
+    dir: &'a Path,
+    /// True when the synthetic `_mux` worker device already owns the lock — we
+    /// then neither write nor clear it, leaving the worker's `MuxingGuard` in
+    /// sole charge.
+    worker_owned: bool,
+}
+
+impl<'a> ResumeMuxingGuard<'a> {
+    /// Write `.muxing` (unless the `_mux` worker already holds it) and return a
+    /// guard that clears it on drop.
+    fn acquire(device: &str, dir: &'a Path) -> Self {
+        let worker_owned = device == "_mux";
+        if !worker_owned {
+            staging::write_muxing_marker(dir);
+        }
+        Self { dir, worker_owned }
+    }
+}
+
+impl Drop for ResumeMuxingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.worker_owned {
+            staging::clear_muxing_marker(self.dir);
+        }
+    }
+}
+
 pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: ResumeClass) {
     let ResumeClass::Remux {
         iso_path,
@@ -508,6 +611,18 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
 
     // 1. Delete the partial MKV/m2ts if present.
     delete_partial_output(&staging_dir, &display_name);
+
+    // Acquire the `.muxing` exclusion lock for the duration of this mux. On the
+    // cold operator-resume path the staging dir otherwise carries only the ISO
+    // + mapfile and NO governing marker, so a concurrent `ResumeMode::Wipe` (or
+    // a second cold resume) of the same disc would delete/double-mux the ISO
+    // out from under this in-flight mux. With `.muxing` present,
+    // `disc_owned_by_worker` / `resumable_dir_blocked` correctly block both.
+    // Skips the `_mux` worker device, which already holds the lock via
+    // `check_and_mux`'s `MuxingGuard`. Cleared on every exit (incl. early
+    // return / panic) by Drop; the terminal `.completed` / `.failed` writers
+    // also clear it.
+    let _muxing_guard = ResumeMuxingGuard::acquire(device, &staging_dir);
 
     // 2. Open the ISO via FileSectorSource.
     let mut iso_reader = match libfreemkv::FileSectorSource::open(&iso_path) {
@@ -1012,10 +1127,17 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // validates + moves `.iso` and the prune below retains it for ISO output.
     if super::output_is_iso_image(&output_format) {
         if !staging::fsync_output_file(&iso_path) {
+            let quarantined = handle_resume_fsync_failure(device, &staging_dir, "ISO image output");
+            let detail = if quarantined {
+                "ISO image not durable (fsync failed repeatedly); quarantined (.failed)"
+            } else {
+                "ISO image not durable (fsync failed); preserved for retry"
+            };
             crate::log::device_log(
                 device,
-                "Auto-resume: durability gate failed (could not fsync ISO image); \
-                 preserving staging for next-restart retry.",
+                &format!(
+                    "Auto-resume: durability gate failed (could not fsync ISO image); {detail}."
+                ),
             );
             reset_status_after_ripping(
                 device,
@@ -1023,7 +1145,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 &display_name,
                 &disc_format,
                 &duration,
-                Some("ISO image not durable (fsync failed); preserved for retry".to_string()),
+                Some(detail.to_string()),
             );
             super::unregister_halt(device);
             return;
@@ -1288,10 +1410,15 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // rather than handing a possibly-truncated file to the mover.
     let is_network = output_format == "network" && !cfg_read.network_target.is_empty();
     if !is_network && !staging::fsync_output_file(std::path::Path::new(&output_path)) {
+        let quarantined = handle_resume_fsync_failure(device, &staging_dir, "mux output");
+        let detail = if quarantined {
+            "mux output not durable (fsync failed repeatedly); quarantined (.failed)"
+        } else {
+            "mux output not durable (fsync failed); preserved for retry"
+        };
         crate::log::device_log(
             device,
-            "Auto-resume: durability gate failed (could not fsync mux output); \
-             preserving staging for next-restart retry.",
+            &format!("Auto-resume: durability gate failed (could not fsync mux output); {detail}."),
         );
         reset_status_after_ripping(
             device,
@@ -1299,7 +1426,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             &display_name,
             &disc_format,
             &duration,
-            Some("mux output not durable (fsync failed); preserved for retry".to_string()),
+            Some(detail.to_string()),
         );
         return;
     }
@@ -2497,5 +2624,117 @@ mod sweep_damage_marker_tests {
         assert_eq!(outcome.main_lost_ms, 9000.0);
         // STATE entry is cleaned up so the origin update can't read it later.
         assert!(super::super::STATE.lock().unwrap().get(key).is_none());
+    }
+}
+
+// Convergence round 4 (H1 + M4): the cold operator-resume mux path acquires the
+// `.muxing` exclusion lock so a concurrent Wipe / second cold resume can't
+// delete or double-mux the in-flight ISO; and a repeated durability-gate
+// (fsync) failure is capped via `.restart_count` → `.failed` rather than
+// re-muxing the same possibly-corrupt output forever on the `_mux` worker loop.
+#[cfg(test)]
+mod resume_lock_and_fsync_tests {
+    use super::*;
+    use crate::ripper::staging;
+
+    fn tmpdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!(
+                "autorip-resume-lock-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+            ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// H1: a cold operator-resume (real device) must write `.muxing` for the
+    /// duration of the mux so `disc_owned_by_worker` / `resumable_dir_blocked`
+    /// see the dir as owned and a concurrent Wipe / second cold resume is
+    /// blocked. The guard clears the marker on drop.
+    #[test]
+    fn cold_resume_guard_writes_and_clears_muxing() {
+        let d = tmpdir();
+        assert!(!d.join(".muxing").exists());
+        {
+            let _g = ResumeMuxingGuard::acquire("sg0", &d);
+            assert!(
+                d.join(".muxing").exists(),
+                "cold-resume guard must write .muxing while the mux is in flight"
+            );
+            // While held, the snapshot the ownership/blocked checks consult
+            // reports the dir as owned.
+            let snap = staging::snapshot_staging_disc(&d).expect("snapshot");
+            assert!(snap.has_muxing);
+        }
+        assert!(
+            !d.join(".muxing").exists(),
+            ".muxing must be cleared on guard drop (covers early-return / panic)"
+        );
+    }
+
+    /// H1: the `_mux` worker already holds the lock via `check_and_mux`'s own
+    /// MuxingGuard, so `resume_remux`'s guard must NOT touch the marker — neither
+    /// write a redundant one nor clear the worker's on drop (a clear would
+    /// release the worker's exclusion mid-dispatch).
+    #[test]
+    fn worker_mux_device_does_not_double_manage_muxing() {
+        let d = tmpdir();
+        // Simulate the worker having written .muxing before dispatch.
+        staging::write_muxing_marker(&d);
+        assert!(d.join(".muxing").exists());
+        {
+            let _g = ResumeMuxingGuard::acquire("_mux", &d);
+            assert!(d.join(".muxing").exists(), "worker's lock stays put");
+        }
+        assert!(
+            d.join(".muxing").exists(),
+            "the `_mux` guard must leave the worker's .muxing intact on drop"
+        );
+    }
+
+    /// M4: below `RESTART_LIMIT`, a fsync failure bumps `.restart_count` and
+    /// preserves staging (no `.failed`) for the next retry.
+    #[test]
+    fn fsync_failure_below_limit_preserves_and_bumps() {
+        let d = tmpdir();
+        // Seed a `.ripped` so we can assert it survives below the limit.
+        std::fs::write(d.join(".ripped"), b"{}").unwrap();
+        let quarantined = handle_resume_fsync_failure("_mux", &d, "mux output");
+        assert!(!quarantined, "first failure must not quarantine");
+        assert_eq!(staging::restart_count(&d), 1);
+        assert!(!d.join(".failed").exists(), "no .failed below the limit");
+        assert!(d.join(".ripped").exists(), ".ripped preserved for retry");
+    }
+
+    /// M4: once `.restart_count` reaches `RESTART_LIMIT`, the repeated fsync
+    /// failure promotes the dir to terminal `.failed`, drops `.ripped` so the
+    /// worker can't re-queue it, and clears the counter.
+    #[test]
+    fn fsync_failure_at_limit_quarantines() {
+        let d = tmpdir();
+        std::fs::write(d.join(".ripped"), b"{}").unwrap();
+        // Pre-seed the count to one below the limit so the next bump trips it.
+        staging::write_marker_durable(
+            &d.join(".restart_count"),
+            format!("{}\n", staging::RESTART_LIMIT - 1).as_bytes(),
+        )
+        .unwrap();
+        let quarantined = handle_resume_fsync_failure("_mux", &d, "mux output");
+        assert!(quarantined, "reaching RESTART_LIMIT must quarantine");
+        assert!(d.join(".failed").exists(), ".failed written (terminal)");
+        assert!(
+            !d.join(".ripped").exists(),
+            ".ripped dropped so the worker can't re-queue the terminal dir"
+        );
+        assert_eq!(
+            staging::restart_count(&d),
+            0,
+            ".restart_count cleared after quarantine"
+        );
     }
 }
