@@ -565,16 +565,29 @@ fn classify_done_absence(err_kind: std::io::ErrorKind, dir: &Path) -> DoneAbsenc
         // stranded `Fault`. The `.sweeping` window was previously ungoverned:
         // the mover saw no marker every 10s tick and WARN-flooded (182 warns
         // for one healthy in-progress disc, see the comment in check_and_move).
-        let governed = [
-            ".sweeping",
-            ".muxing",
-            ".ripped",
-            ".completed",
-            ".failed",
-            ".review",
-        ]
-        .iter()
-        .any(|m| dir.join(m).exists());
+        //
+        // Probe the markers via `snapshot_staging_disc`, NOT bare
+        // `dir.join(m).exists()`. On a cold NFS attribute cache (typical right
+        // after a container restart) a single-shot `exists()` can return false
+        // for a marker that is durably on the server — that false-negative
+        // would classify a healthy in-progress sweep as a `Fault` and WARN
+        // every 10s tick for the whole multi-hour window, the exact 182-warn
+        // bug `.sweeping` was added to kill. The snapshot retries `read_dir`
+        // up to 3x with 500ms gaps (the same defense `disc_owned_by_worker`
+        // and the startup resume scan rely on). A `None` snapshot means the
+        // dir contents are unknown (read_dir errored every retry): treat that
+        // as ungoverned and fall through to `Fault` so a genuinely stranded /
+        // unreadable dir still surfaces a WARN.
+        let governed = crate::ripper::staging::snapshot_staging_disc(dir)
+            .map(|s| {
+                s.has_sweeping
+                    || s.has_muxing
+                    || s.has_ripped
+                    || s.completed
+                    || s.has_failed
+                    || s.has_review
+            })
+            .unwrap_or(false);
         if governed {
             return DoneAbsence::InProgress;
         }
@@ -2416,6 +2429,31 @@ mod tests {
                 "non-NotFound error is a fault even with {m} present"
             );
         }
+    }
+
+    /// Convergence round 4 (M3): the governed-marker probe must route through
+    /// `snapshot_staging_disc` (NFS-attribute-cache-resilient, 3x-retried
+    /// read_dir) rather than bare per-marker `exists()` calls, so a cold-cache
+    /// mount right after a container restart can't false-negative a durably
+    /// present `.sweeping` into a `Fault` and WARN-flood the multi-hour sweep
+    /// window (the original 182-warn bug). A dir whose ONLY entry is `.sweeping`
+    /// classifies InProgress — and the same snapshot the rest of the resume
+    /// machinery uses agrees it's owned.
+    #[test]
+    fn done_absence_sweeping_governed_via_snapshot() {
+        use std::io::ErrorKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("disc-sweeping");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::ripper::staging::write_sweeping_marker(&dir);
+        // The same snapshot the governed check now consults sees the marker.
+        let snap = crate::ripper::staging::snapshot_staging_disc(&dir).expect("snapshot");
+        assert!(snap.has_sweeping);
+        assert_eq!(
+            classify_done_absence(ErrorKind::NotFound, &dir),
+            DoneAbsence::InProgress,
+            "a durably-present .sweeping marker is the in-progress state → no WARN"
+        );
     }
 
     /// Regression: a staging dir that vanished between the `.done` read and the
