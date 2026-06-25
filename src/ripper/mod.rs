@@ -180,15 +180,18 @@ fn key_readiness(
     }
     let reason = match outcome {
         KeyOutcome::Unreachable => {
-            "key source unavailable (check Keyserver URL / network, or the keydb file)".to_string()
+            "no key source could be reached (check the Keyserver URL, the network, or \
+             the key database file)"
+                .to_string()
         }
-        KeyOutcome::NoKey => "no key available for this disc".to_string(),
-        KeyOutcome::MissingInputs => "could not read this disc's key files".to_string(),
+        KeyOutcome::NoKey => "no key source has a key for this disc".to_string(),
+        KeyOutcome::MissingInputs => "this disc's key files could not be read".to_string(),
         // A resolve that still left the disc keyless: defer to the libfreemkv
-        // AACS failure heading.
+        // AACS failure message, with the `Error: E<code> ` prefix stripped so
+        // the tile shows a concise reason.
         KeyOutcome::Resolved => {
             let msg = keyless_failure_message(disc);
-            msg.lines().next().unwrap_or("no keys").to_string()
+            strip_error_prefix(&msg).to_string()
         }
     };
     format!("Missing keys — {reason}")
@@ -4633,9 +4636,10 @@ fn incomplete_mux_status(
 /// UI tells the user *which* failure they're looking at instead of always
 /// printing the same generic "check KEYDB" line.
 ///
-/// Two-line format: heading + body. The heading names what's missing and
-/// the error code (one glanceable summary); the body names the stage that
-/// failed and the remediation, or notes there isn't one.
+/// Render format (locked rc.6 messaging standard): `Error: E<code> <message>`
+/// — the `Error:` level word, the language-neutral `E<code>` token, then a
+/// single plain-English sentence naming the failure and any remediation. One
+/// line; built via [`error_line`].
 ///
 /// Dispatch is **code-based** (`e.code()`) using named libfreemkv constants.
 /// Codes outside the named set fall through to the 7xxx catch-all rather
@@ -4670,13 +4674,13 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
 
     // CssKeyMissing is a CSS (DVD) crack failure, not an AACS resolution
     // failure — surface it with CSS-specific messaging before the AACS
-    // numeric dispatch so the operator isn't pointed at the KEYDB.
+    // numeric dispatch so the operator isn't pointed at a key source.
     if let Some(libfreemkv::Error::CssKeyMissing) = err {
-        return format!(
-            "Couldn't unscramble disc (E{})\n\
-             CSS-protected disc; no title key could be recovered. The disc may be \
-             damaged or use an unsupported protection variant.",
-            ec::E_CSS_KEY_MISSING
+        return error_line(
+            ec::E_CSS_KEY_MISSING,
+            "Could not unscramble the disc. This is a CSS-protected disc and no title \
+             key could be recovered. The disc may be damaged or use an unsupported \
+             protection variant.",
         );
     }
 
@@ -4687,24 +4691,24 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
     // The library populates `path` with either the real filesystem path
     // that failed to load or the sentinel `<no keydb in search paths>`.
     // The sentinel means "nothing configured" — point the operator at
-    // Settings. A real path means a *configured* keydb failed to load
-    // (wrong path, NFS not mounted, permissions): include it so the
+    // Settings. A real path means a *configured* key source failed to
+    // load (wrong path, NFS not mounted, permissions): include it so the
     // operator can diagnose the load failure instead of being told to
     // configure a source that already exists.
     if let Some(libfreemkv::Error::KeydbLoad { path }) = err {
         const KEYDB_SENTINEL: &str = "<no keydb in search paths>";
         if path == KEYDB_SENTINEL {
-            return format!(
-                "No keys available (E{})\n\
-                 Configure a key source in Settings.",
-                ec::E_KEYDB_LOAD
+            return error_line(
+                ec::E_KEYDB_LOAD,
+                "No keys are available. Configure a key source in Settings.",
             );
         }
-        return format!(
-            "Couldn't load key source (E{})\n\
-             Configured key source failed to load: {path}. Check that the path \
-             exists and is readable.",
-            ec::E_KEYDB_LOAD
+        return error_line(
+            ec::E_KEYDB_LOAD,
+            &format!(
+                "A configured key source failed to load: {path}. Check that the path \
+                 exists and is readable."
+            ),
         );
     }
 
@@ -4712,8 +4716,8 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
         // Defensive fallback. scan_with always sets aacs_error when
         // encrypted && aacs.is_none(); if we land here something is
         // structurally off (e.g. callers building Disc by hand).
-        return "Encrypted disc, no keys found\n\
-                Check the key source in Settings."
+        return "This disc is encrypted and no keys were found. Check the key source \
+                in Settings."
             .to_string();
     };
 
@@ -4725,102 +4729,134 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
     #[allow(clippy::match_overlapping_arm)]
     match code {
         // E7000 — generic "everything tried, nothing worked" catch-all.
-        ec::E_AACS_NO_KEYS => format!(
-            "No keys (E{code})\n\
-             Disc not resolvable and no DK/PK path worked."
+        ec::E_AACS_NO_KEYS => error_line(
+            code,
+            "No keys are available for this disc. It could not be resolved and no key \
+             derivation path worked.",
         ),
 
         // Host cert rejected by the drive's HRL. Surfaces from
         // `aacs/handshake.rs` as drive-side AGID/cert rejection (7003),
         // host-side verify failure on the drive's cert (7005), drive
         // rejected our processing key (7007), or the post-loop
-        // `AacsHostCertRejected` (7015) when every host cert in KEYDB
-        // was rejected. "Update KEYDB" intentionally NOT suggested —
-        // KEYDB has the cert, the drive HRL is blocking it; a fresh
-        // KEYDB doesn't change the cert content.
+        // `AacsHostCertRejected` (7015) when every host cert was
+        // rejected. "Update keys" intentionally NOT suggested — the
+        // key source has the cert, the drive HRL is blocking it; fresh
+        // keys do not change the cert content.
         ec::E_AACS_CERT_REJECTED
         | ec::E_AACS_CERT_VERIFY
         | ec::E_AACS_KEY_REJECTED
-        | ec::E_AACS_HOST_CERT_REJECTED => format!(
-            "Host cert rejected (E{code})\n\
-             Drive HRL rejected every available host cert. Needs firmware unrevoke or \
-             raw-read mode."
+        | ec::E_AACS_HOST_CERT_REJECTED => error_line(
+            code,
+            "The drive rejected every available host certificate. The drive needs a \
+             firmware unrevoke or raw-read mode to rip this disc.",
         ),
 
-        // Drive does not support raw-read mode AND keydb has no host
-        // certs available for cert auth. Distinct from cert-rejected
+        // Drive does not support raw-read mode AND no host certs are
+        // available for cert auth. Distinct from cert-rejected
         // because we never got far enough to attempt cert exchange.
-        ec::E_AACS_RAW_READ_UNSUPPORTED => format!(
-            "No usable cert (E{code})\n\
-             Drive does not support raw-read mode and no usable host cert. Can't rip on this drive."
+        ec::E_AACS_RAW_READ_UNSUPPORTED => error_line(
+            code,
+            "The drive does not support raw-read mode and no usable host certificate \
+             is available. This drive cannot rip this disc.",
         ),
 
         // VID retrieval failed. From cert path: VID read (7009) or VID
         // MAC verification (7010) went sideways. From raw-read path:
         // the alternate READ_DISC_STRUCTURE read failed (7017). Either
-        // way the disc isn't in KEYDB (otherwise Path 1 would have hit
-        // before we landed here).
-        ec::E_AACS_VID_READ | ec::E_AACS_VID_MAC | ec::E_AACS_VID_UNAVAILABLE => format!(
-            "No Volume ID (E{code})\n\
-             Drive didn't return VID during AACS auth. Can't derive keys; disc not \
-             resolvable."
+        // way the disc isn't in any key source (otherwise Path 1 would
+        // have hit before we landed here).
+        ec::E_AACS_VID_READ | ec::E_AACS_VID_MAC | ec::E_AACS_VID_UNAVAILABLE => error_line(
+            code,
+            "The drive did not return the disc Volume ID during AACS authentication, \
+             so keys could not be derived and the disc could not be resolved.",
         ),
 
-        // MK derivation failed. VID succeeded but no DK in keydb walks
-        // this disc's MKB (7011) and no further fallback is available
-        // (7018).
-        ec::E_AACS_DATA_KEY | ec::E_AACS_MK_UNAVAILABLE => format!(
-            "No usable DK (E{code})\n\
-             VID ok, but no DK walks this disc's MKB."
+        // MK derivation failed. VID succeeded but no media key in the key
+        // source walks this disc's MKB (7011) and no further fallback is
+        // available (7018).
+        ec::E_AACS_DATA_KEY | ec::E_AACS_MK_UNAVAILABLE => error_line(
+            code,
+            "The Volume ID was read, but no media key from any key source unlocks this \
+             disc's media key block.",
         ),
 
-        // Disc-hash lookup in keydb missed and no other path is
+        // Disc-hash lookup in a key source missed and no other path is
         // available. Typically downstream of VID being unavailable so
         // the derivation paths short-circuit.
-        ec::E_AACS_VUK_NOT_IN_KEYDB => format!(
-            "Disc not resolvable (E{code})\n\
-             Disc hash not found in available keys."
+        ec::E_AACS_VUK_NOT_IN_KEYDB => error_line(
+            code,
+            "This disc could not be resolved. Its disc hash was not found in any key \
+             source.",
         ),
 
         // No host cert available at all — the OEM auth route can't run
         // because there's nothing to authenticate with. Distinct from
         // cert-rejected (7003/7005/7007/7015): there a cert existed but
         // the drive HRL blocked it; here no cert was present.
-        ec::E_AACS_NO_HOST_CERT => format!(
-            "No host cert (E{code})\n\
-             No host cert available, so the OEM auth route can't run."
+        ec::E_AACS_NO_HOST_CERT => error_line(
+            code,
+            "No host certificate is available, so the OEM authentication route cannot \
+             run.",
         ),
 
         // Drive identity didn't match any bundled profile, so the
         // per-drive CDB templates needed for the OEM VID route aren't
         // available.
-        ec::E_DRIVE_PROFILE_MISSING => format!(
-            "Drive profile missing (E{code})\n\
-             This drive isn't in the profile database, so the OEM VID route can't run."
+        ec::E_DRIVE_PROFILE_MISSING => error_line(
+            code,
+            "This drive is not in the profile database, so the OEM Volume ID route \
+             cannot run.",
         ),
 
         // Drive profile is present but carries no VID-retrieval CDB
         // template (older profile blob, or a drive class without an OEM
         // VID path).
-        ec::E_VID_CDB_UNAVAILABLE => format!(
-            "No VID command (E{code})\n\
-             Drive profile lacks a VID-retrieval command (older profile); can't run the OEM VID route."
+        ec::E_VID_CDB_UNAVAILABLE => error_line(
+            code,
+            "This drive's profile has no Volume ID command (it is an older profile), \
+             so the OEM Volume ID route cannot run.",
         ),
 
         // Other 7xxx — known AACS category but unmapped. Use a
         // generic-but-honest message rather than `({e:?})` debug-dump.
-        7000..=7999 => format!(
-            "AACS unknown stage (E{code})\n\
-             Failed at an unmapped stage. Report at github.com/freemkv/freemkv/issues."
+        7000..=7999 => error_line(
+            code,
+            "AACS key resolution failed at an unrecognized stage. Please report this \
+             at github.com/freemkv/freemkv/issues.",
         ),
 
         // Non-AACS code on the aacs_error slot — structurally
         // unexpected. Preserve the code; drop the `{e:?}` debug dump.
-        _ => format!(
-            "Non-AACS failure (E{code})\n\
-             Check /api/debug."
+        _ => error_line(
+            code,
+            "An unexpected error occurred while resolving keys. Enable debug logging \
+             via /api/debug for details.",
         ),
     }
+}
+
+/// Render a user-facing error line in the locked rc.6 messaging format:
+/// `Error: E<code> <message>`. The `Error:` level word leads, the
+/// language-neutral `E<code>` token follows, then the plain-English message.
+/// One line, no trailing period added by the renderer — the message carries
+/// its own punctuation. Single source of the format so every operator-facing
+/// libfreemkv-error string in this module renders identically.
+fn error_line(code: u16, message: &str) -> String {
+    format!("Error: E{code} {message}")
+}
+
+/// Strip the leading `Error: E<code> ` prefix from an [`error_line`] string,
+/// returning just the plain-English message. Used where a concise reason is
+/// wanted (e.g. the key-readiness tile) without the level word and code. If
+/// the input doesn't carry the prefix, it is returned unchanged.
+fn strip_error_prefix(s: &str) -> &str {
+    let Some(rest) = s.strip_prefix("Error: E") else {
+        return s;
+    };
+    // Skip the numeric code, then the single separating space.
+    let after_code = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    after_code.strip_prefix(' ').unwrap_or(s)
 }
 
 /// Translate a libfreemkv read-error into a user-facing message for
@@ -5544,14 +5580,45 @@ mod tests {
 
     // ── aacs_failure_message dispatch ────────────────────────────────
     //
-    // Code-based dispatch must (1) lead each user-facing message with the
-    // missing-key tag, (2) include the numeric `E{code}` so support
-    // requests stay routable, and (3) never leak the `{e:?}` debug dump
-    // the pre-rewrite catch-all produced.
+    // Locked rc.6 messaging standard: every user-facing message renders as
+    // `Error: E<code> <message>` — (1) the `Error:` level word leads, (2) the
+    // language-neutral `E<code>` token follows so support requests stay
+    // routable, (3) a single plain-English sentence, and (4) never leak the
+    // `{e:?}` debug dump the pre-rewrite catch-all produced.
 
-    // Two-line format: heading + body. Tests assert on heading prefix
-    // and body content separately so wording tweaks to one half don't
-    // require touching every test.
+    #[test]
+    fn aacs_failure_messages_follow_level_code_format() {
+        // Format contract: every rendered message starts with `Error: E<code> `.
+        for e in [
+            Error::CssKeyMissing,
+            Error::KeydbLoad {
+                path: "<no keydb in search paths>".into(),
+            },
+            Error::KeydbLoad {
+                path: "/config/keys/keydb.cfg".into(),
+            },
+            Error::AacsNoKeys,
+            Error::AacsCertRejected,
+            Error::AacsRawReadUnsupported,
+            Error::AacsVidRead,
+            Error::AacsDataKey,
+            Error::AacsVukNotInKeydb,
+            Error::DriveProfileMissing,
+            Error::VidCdbUnavailable,
+            Error::AacsNoHostCert {
+                path: "<no host cert>".into(),
+            },
+            Error::AacsAgidAlloc,
+        ] {
+            let s = aacs_failure_message(Some(&e));
+            assert!(
+                s.starts_with(&format!("Error: E{} ", e.code())),
+                "{e:?} must render `Error: E<code> <msg>`, got: {s}"
+            );
+            // One line — no embedded newline in the rc.6 single-line format.
+            assert!(!s.contains('\n'), "{e:?} message must be one line: {s}");
+        }
+    }
 
     #[test]
     fn aacs_failure_keydb_load_missing_path() {
@@ -5559,7 +5626,8 @@ mod tests {
             path: "<no keydb in search paths>".into(),
         };
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No keys available"), "msg: {s}");
+        assert!(s.starts_with("Error: E8005 "), "msg: {s}");
+        assert!(s.contains("No keys are available"), "msg: {s}");
         assert!(!s.contains("KEYDB"), "msg must not name the source: {s}");
     }
 
@@ -5572,7 +5640,7 @@ mod tests {
         let path = "/config/keys/keydb.cfg";
         let e = Error::KeydbLoad { path: path.into() };
         let s = aacs_failure_message(Some(&e));
-        assert!(s.contains("E8005"), "msg: {s}");
+        assert!(s.starts_with("Error: E8005 "), "msg: {s}");
         assert!(s.contains(path), "msg must include the failing path: {s}");
         assert!(
             !s.contains("Configure a key source in Settings"),
@@ -5586,10 +5654,10 @@ mod tests {
         // E7003 — drive rejected our host cert (HRL).
         let e = Error::AacsCertRejected;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("Host cert rejected"), "msg: {s}");
-        assert!(s.contains("E7003"), "msg: {s}");
+        assert!(s.starts_with("Error: E7003 "), "msg: {s}");
+        assert!(s.contains("host certificate"), "msg: {s}");
         assert!(s.contains("raw-read mode"), "msg: {s}");
-        // No "Update KEYDB" — KEYDB has the cert; the HRL blocks it.
+        // No "Update keys/KEYDB" — the key source has the cert; the HRL blocks it.
         assert!(!s.contains("Update KEYDB"), "msg: {s}");
         // Must not leak the debug-dump form the old catch-all emitted.
         assert!(!s.contains("AacsCertRejected"), "msg: {s}");
@@ -5599,8 +5667,8 @@ mod tests {
     fn aacs_failure_cert_verify_collapses_to_host_cert() {
         let e = Error::AacsCertVerify;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("Host cert rejected"), "msg: {s}");
-        assert!(s.contains("E7005"), "msg: {s}");
+        assert!(s.starts_with("Error: E7005 "), "msg: {s}");
+        assert!(s.contains("host certificate"), "msg: {s}");
     }
 
     /// The disk-space preflight message is operator-facing (it lands in
@@ -5638,43 +5706,40 @@ mod tests {
         // remediation as cert rejection.
         let e = Error::AacsKeyRejected;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("Host cert rejected"), "msg: {s}");
-        assert!(s.contains("E7007"), "msg: {s}");
+        assert!(s.starts_with("Error: E7007 "), "msg: {s}");
+        assert!(s.contains("host certificate"), "msg: {s}");
     }
 
     #[test]
     fn aacs_failure_vid_read_says_vid_missing() {
         let e = Error::AacsVidRead;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No Volume ID"), "msg: {s}");
-        assert!(s.contains("E7009"), "msg: {s}");
-        assert!(s.contains("VID"), "msg: {s}");
+        assert!(s.starts_with("Error: E7009 "), "msg: {s}");
+        assert!(s.contains("Volume ID"), "msg: {s}");
     }
 
     #[test]
     fn aacs_failure_vid_mac_says_vid_missing() {
         let e = Error::AacsVidMac;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No Volume ID"), "msg: {s}");
-        assert!(s.contains("E7010"), "msg: {s}");
+        assert!(s.starts_with("Error: E7010 "), "msg: {s}");
+        assert!(s.contains("Volume ID"), "msg: {s}");
     }
 
     #[test]
     fn aacs_failure_data_key_says_mk_missing() {
         let e = Error::AacsDataKey;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No usable DK"), "msg: {s}");
-        assert!(s.contains("E7011"), "msg: {s}");
-        assert!(s.contains("MKB"), "msg: {s}");
+        assert!(s.starts_with("Error: E7011 "), "msg: {s}");
+        assert!(s.contains("media key"), "msg: {s}");
     }
 
     #[test]
     fn aacs_failure_no_keys_says_all_missing() {
         let e = Error::AacsNoKeys;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No keys"), "msg: {s}");
-        assert!(s.contains("E7000"), "msg: {s}");
-        assert!(s.contains("DK/PK"), "msg: {s}");
+        assert!(s.starts_with("Error: E7000 "), "msg: {s}");
+        assert!(s.contains("No keys are available"), "msg: {s}");
     }
 
     #[test]
@@ -5684,8 +5749,8 @@ mod tests {
         // and exercises that path.
         let e = Error::AacsAgidAlloc;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("AACS unknown stage"), "msg: {s}");
-        assert!(s.contains("E7002"), "msg: {s}");
+        assert!(s.starts_with("Error: E7002 "), "msg: {s}");
+        assert!(s.contains("unrecognized stage"), "msg: {s}");
         assert!(s.contains("github.com/freemkv/freemkv/issues"), "msg: {s}");
         // No debug-dump leak.
         assert!(!s.contains("AacsAgidAlloc"), "msg: {s}");
@@ -5694,7 +5759,7 @@ mod tests {
     #[test]
     fn aacs_failure_none_falls_back_defensively() {
         let s = aacs_failure_message(None);
-        assert!(s.contains("no keys found"), "msg: {s}");
+        assert!(s.contains("no keys were found"), "msg: {s}");
     }
 
     // ── variants landing with v0.25.11 ───────────────────────────────
@@ -5704,8 +5769,8 @@ mod tests {
         // E7015 — all host certs in keydb were rejected by the drive.
         let e = Error::AacsHostCertRejected;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("Host cert rejected"), "msg: {s}");
-        assert!(s.contains("E7015"), "msg: {s}");
+        assert!(s.starts_with("Error: E7015 "), "msg: {s}");
+        assert!(s.contains("host certificate"), "msg: {s}");
         assert!(!s.contains("AacsHostCertRejected"), "msg: {s}");
     }
 
@@ -5714,8 +5779,7 @@ mod tests {
         // E7016 — drive doesn't support raw-read mode AND no host certs.
         let e = Error::AacsRawReadUnsupported;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No usable cert"), "msg: {s}");
-        assert!(s.contains("E7016"), "msg: {s}");
+        assert!(s.starts_with("Error: E7016 "), "msg: {s}");
         assert!(s.contains("does not support raw-read mode"), "msg: {s}");
     }
 
@@ -5724,8 +5788,8 @@ mod tests {
         // E7017 — alternate VID read failed.
         let e = Error::AacsVidUnavailable;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No Volume ID"), "msg: {s}");
-        assert!(s.contains("E7017"), "msg: {s}");
+        assert!(s.starts_with("Error: E7017 "), "msg: {s}");
+        assert!(s.contains("Volume ID"), "msg: {s}");
     }
 
     #[test]
@@ -5733,9 +5797,8 @@ mod tests {
         // E7018 — VID ok, but no DK in keydb walks this MKB.
         let e = Error::AacsMkUnavailable;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No usable DK"), "msg: {s}");
-        assert!(s.contains("E7018"), "msg: {s}");
-        assert!(s.contains("MKB"), "msg: {s}");
+        assert!(s.starts_with("Error: E7018 "), "msg: {s}");
+        assert!(s.contains("media key"), "msg: {s}");
     }
 
     #[test]
@@ -5744,8 +5807,8 @@ mod tests {
         // was available.
         let e = Error::AacsVukNotInKeydb;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("Disc not resolvable"), "msg: {s}");
-        assert!(s.contains("E7019"), "msg: {s}");
+        assert!(s.starts_with("Error: E7019 "), "msg: {s}");
+        assert!(s.contains("could not be resolved"), "msg: {s}");
         assert!(!s.contains("KEYDB"), "msg must not name the source: {s}");
     }
 
@@ -5755,8 +5818,8 @@ mod tests {
         // generic "report at github.com" catch-all.
         let e = Error::DriveProfileMissing;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("Drive profile missing"), "msg: {s}");
-        assert!(s.contains("E7020"), "msg: {s}");
+        assert!(s.starts_with("Error: E7020 "), "msg: {s}");
+        assert!(s.contains("profile database"), "msg: {s}");
         assert!(
             !s.contains("github.com"),
             "msg must not say report a bug: {s}"
@@ -5768,8 +5831,8 @@ mod tests {
         // E7021 — profile present but no VID-retrieval CDB template.
         let e = Error::VidCdbUnavailable;
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No VID command"), "msg: {s}");
-        assert!(s.contains("E7021"), "msg: {s}");
+        assert!(s.starts_with("Error: E7021 "), "msg: {s}");
+        assert!(s.contains("Volume ID command"), "msg: {s}");
         assert!(
             !s.contains("github.com"),
             "msg must not say report a bug: {s}"
@@ -5783,8 +5846,8 @@ mod tests {
             path: "<no host cert>".into(),
         };
         let s = aacs_failure_message(Some(&e));
-        assert!(s.starts_with("No host cert"), "msg: {s}");
-        assert!(s.contains("E7024"), "msg: {s}");
+        assert!(s.starts_with("Error: E7024 "), "msg: {s}");
+        assert!(s.contains("host certificate"), "msg: {s}");
         assert!(
             !s.contains("github.com"),
             "msg must not say report a bug: {s}"
@@ -5792,10 +5855,9 @@ mod tests {
     }
 
     #[test]
-    fn aacs_failure_message_is_two_lines() {
-        // Format contract: heading on line 1, body on line 2. UI
-        // renderers can wrap on the newline to give the heading
-        // visual prominence.
+    fn aacs_failure_message_is_one_line() {
+        // Locked rc.6 format contract: one line, `Error: E<code> <message>`,
+        // no embedded newline. (Replaces the pre-rc.6 two-line heading/body.)
         for e in [
             Error::AacsNoKeys,
             Error::AacsCertRejected,
@@ -5811,10 +5873,11 @@ mod tests {
             },
         ] {
             let s = aacs_failure_message(Some(&e));
-            assert!(s.contains('\n'), "{e:?} message missing newline: {s}");
-            let (heading, body) = s.split_once('\n').unwrap();
-            assert!(!heading.is_empty(), "{e:?} empty heading");
-            assert!(!body.is_empty(), "{e:?} empty body");
+            assert!(!s.contains('\n'), "{e:?} message must be one line: {s}");
+            assert!(
+                s.starts_with(&format!("Error: E{} ", e.code())),
+                "{e:?} must lead with the level word and code: {s}"
+            );
         }
     }
 
@@ -5826,22 +5889,23 @@ mod tests {
         // AACS-oriented "check the key source" fallback that the bare
         // `aacs_failure_message(None)` path produced.
         let msg = aacs_failure_message(Some(&Error::CssKeyMissing));
-        let heading = msg.lines().next().unwrap();
         assert!(
-            heading.to_lowercase().contains("unscramble") || heading.to_lowercase().contains("css"),
-            "CSS failure heading should name the CSS problem, got: {heading}"
+            msg.to_lowercase().contains("unscramble") || msg.to_lowercase().contains("css"),
+            "CSS failure should name the CSS problem, got: {msg}"
         );
         assert!(
             !msg.to_lowercase().contains("key source in settings"),
             "CSS failure must not point the operator at the (AACS) key source: {msg}"
         );
+        // Locked rc.6 format: `Error: E<code> <message>`, one line.
         assert!(
-            msg.contains(&format!("E{}", libfreemkv::error::E_CSS_KEY_MISSING)),
-            "CSS failure should carry its E-code: {msg}"
+            msg.starts_with(&format!(
+                "Error: E{} ",
+                libfreemkv::error::E_CSS_KEY_MISSING
+            )),
+            "CSS failure should lead with the level word and E-code: {msg}"
         );
-        // Two-line contract (same as the AACS messages).
-        let (h, body) = msg.split_once('\n').unwrap();
-        assert!(!h.is_empty() && !body.is_empty());
+        assert!(!msg.contains('\n'), "CSS message must be one line: {msg}");
     }
 
     #[test]
@@ -5854,9 +5918,9 @@ mod tests {
             path: "<no keydb in search paths>".to_string(),
         };
         let msg = super::keyless_failure_message_for(Some(&css), Some(&aacs));
-        let heading = msg.lines().next().unwrap().to_lowercase();
+        let lower = msg.to_lowercase();
         assert!(
-            heading.contains("unscramble") || heading.contains("css"),
+            lower.contains("unscramble") || lower.contains("css"),
             "css_error must take priority over aacs_error: {msg}"
         );
         assert!(
