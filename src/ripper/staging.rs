@@ -39,6 +39,21 @@ pub const FAILED_MARKER: &str = ".failed";
 /// startup-scan vocabulary is self-contained; a `debug_assert` in the mux
 /// worker tests pins the two equal.
 pub const RIPPED_MARKER: &str = ".ripped";
+/// In-progress marker written by `rip_disc` at staging-dir creation (before
+/// Pass 1) and replaced by `.ripped` (or `.failed`) on exit. Its presence
+/// means a sweep+patch is actively running (or crashed mid-sweep) and the
+/// dir is OWNED by the ripper, not orphaned partial state. Carries a JSON
+/// heartbeat/started timestamp so a future stale-heartbeat policy can tell a
+/// live sweep from a dead one. Without it the multi-hour sweep window has no
+/// governing marker: the resume scan restart-counts a healthy long rip toward
+/// `.failed`, and the mover WARNs every 10s tick on the absent `.done`.
+pub const SWEEPING_MARKER: &str = ".sweeping";
+/// Exclusion lock written by the mux worker when it begins muxing a `.ripped`
+/// dir and removed on completion. Its presence means the dir is OWNED by the
+/// mux worker; the drive-resume paths (`disc_already_completed` auto-insert,
+/// `find_resumable_for_disc`) must not select it (they would truncate the ISO
+/// the mux worker is reading, or double-mux the same output).
+pub const MUXING_MARKER: &str = ".muxing";
 pub const RESTART_COUNT_FILE: &str = ".restart_count";
 
 /// Available bytes at the given path's filesystem, via `statvfs(3)`.
@@ -227,6 +242,9 @@ pub fn write_failed_marker(staging_disc_dir: &Path, reason: &str) {
     if let Err(e) = write_marker_durable(&p, serialized.as_bytes()) {
         tracing::warn!(path = %p.display(), error = %e, "failed to write .failed marker");
     }
+    // A `.failed` terminal supersedes any in-progress `.sweeping` marker; clear
+    // it so a quarantined dir isn't also mis-read as an active sweep.
+    clear_sweeping_marker(staging_disc_dir);
 }
 
 /// Read the `.failed` marker's reason string. Returns None if missing
@@ -238,6 +256,62 @@ pub fn read_failed_reason(staging_disc_dir: &Path) -> Option<String> {
     v.get("reason")?.as_str().map(|s| s.to_string())
 }
 
+/// Write the `.sweeping` in-progress marker durably. Called at staging-dir
+/// creation in `rip_disc`, before Pass 1. Carries a JSON `started` epoch-secs
+/// timestamp (the heartbeat) so a future stale-sweep policy can distinguish a
+/// live multi-hour sweep from a dead one. Best-effort — logs on failure; a
+/// missing `.sweeping` just degrades to the pre-fix markerless-window
+/// behaviour, it never corrupts state.
+pub fn write_sweeping_marker(staging_disc_dir: &Path) {
+    let p = staging_disc_dir.join(SWEEPING_MARKER);
+    let body = serde_json::json!({
+        "started": crate::util::epoch_secs(),
+        "heartbeat": crate::util::epoch_secs(),
+    });
+    let serialized = serde_json::to_string_pretty(&body)
+        .unwrap_or_else(|_| "{\"started\":0,\"heartbeat\":0}".to_string());
+    if let Err(e) = write_marker_durable(&p, serialized.as_bytes()) {
+        tracing::warn!(path = %p.display(), error = %e, "failed to write .sweeping marker");
+    }
+}
+
+/// Write the `.muxing` exclusion lock durably. Called by the mux worker when
+/// it begins muxing a `.ripped` dir; removed on completion (RAII guard).
+/// Carries a JSON `started` epoch-secs timestamp for observability. Best-effort
+/// — a missing `.muxing` only loses the exclusion, it never corrupts state.
+pub fn write_muxing_marker(staging_disc_dir: &Path) {
+    let p = staging_disc_dir.join(MUXING_MARKER);
+    let body = serde_json::json!({ "started": crate::util::epoch_secs() });
+    let serialized =
+        serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{\"started\":0}".to_string());
+    if let Err(e) = write_marker_durable(&p, serialized.as_bytes()) {
+        tracing::warn!(path = %p.display(), error = %e, "failed to write .muxing marker");
+    }
+}
+
+/// Best-effort delete of the `.muxing` exclusion lock. Called when the mux
+/// worker finishes (or aborts) a dir. Not finding the file is not an error.
+pub fn clear_muxing_marker(staging_disc_dir: &Path) {
+    let p = staging_disc_dir.join(MUXING_MARKER);
+    if let Err(e) = std::fs::remove_file(&p) {
+        if e.kind() != io::ErrorKind::NotFound {
+            tracing::warn!(path = %p.display(), error = %e, "failed to clear .muxing marker");
+        }
+    }
+}
+
+/// Best-effort delete of the `.sweeping` in-progress marker. Called by
+/// `rip_disc` right before it writes the terminal `.ripped` (or `.failed`)
+/// marker for this dir. Not finding the file is not an error.
+pub fn clear_sweeping_marker(staging_disc_dir: &Path) {
+    let p = staging_disc_dir.join(SWEEPING_MARKER);
+    if let Err(e) = std::fs::remove_file(&p) {
+        if e.kind() != io::ErrorKind::NotFound {
+            tracing::warn!(path = %p.display(), error = %e, "failed to clear .sweeping marker");
+        }
+    }
+}
+
 /// Write the `.completed` marker. Empty file — its existence is the
 /// signal. Best-effort; logs on failure.
 pub fn write_completed_marker(staging_disc_dir: &Path) {
@@ -245,6 +319,10 @@ pub fn write_completed_marker(staging_disc_dir: &Path) {
     if let Err(e) = write_marker_durable(&p, b"") {
         tracing::warn!(path = %p.display(), error = %e, "failed to write .completed marker");
     }
+    // `.completed` is terminal-clean; clear any leftover in-progress `.sweeping`
+    // marker (the inline-mux success path writes `.completed` directly without
+    // going through `.ripped`).
+    clear_sweeping_marker(staging_disc_dir);
 }
 
 /// Durably write a hand-off/review marker (`.done` / `.review`) containing
@@ -302,6 +380,12 @@ pub fn fsync_output_file(output_path: &Path) -> bool {
 pub struct StagingSnapshot {
     pub dir: PathBuf,
     pub completed: bool,
+    /// `.failed` terminal marker present. This is the authoritative terminal
+    /// signal — keyed on PRESENCE, not parse-success, so a `.failed` written
+    /// with a non-JSON body (e.g. review.rs's "cancelled by operator") is
+    /// still recognised as terminal. `failed_reason` carries the parsed
+    /// reason when the body is JSON (None otherwise).
+    pub has_failed: bool,
     pub failed_reason: Option<String>,
     /// `.done` hand-off marker present. A completed mux writes `.done`
     /// (for the mover) before `.completed` (the process-level marker)
@@ -327,6 +411,18 @@ pub struct StagingSnapshot {
     /// `.failed` — the mux-worker dispatch decider (`mux_dispatch_verdict`)
     /// relies on this consistency.
     pub has_ripped: bool,
+    /// `.sweeping` in-progress marker present (written by `rip_disc` at
+    /// staging-dir creation, before Pass 1; replaced by `.ripped`/`.failed`
+    /// on exit). Its presence means a sweep+patch is actively running (or
+    /// crashed mid-sweep) — the dir is OWNED by the ripper, not orphaned
+    /// partial state. The resume scan treats it as "owned, in progress":
+    /// skip without bumping `.restart_count`.
+    pub has_sweeping: bool,
+    /// `.muxing` exclusion lock present (written by the mux worker while it
+    /// muxes a `.ripped` dir, removed on completion). Its presence means the
+    /// dir is OWNED by the mux worker; the drive-resume paths must not select
+    /// it for a fresh sweep or a double-mux.
+    pub has_muxing: bool,
     pub has_iso: bool,
     pub has_mapfile: bool,
     pub has_mkv: bool,
@@ -358,6 +454,8 @@ struct ScanObservations {
     has_done: bool,
     has_review: bool,
     has_ripped: bool,
+    has_sweeping: bool,
+    has_muxing: bool,
     has_completed: bool,
     has_failed: bool,
     has_iso: bool,
@@ -378,6 +476,8 @@ impl ScanObservations {
         !self.has_done
             && !self.has_review
             && !self.has_ripped
+            && !self.has_sweeping
+            && !self.has_muxing
             && !self.has_completed
             && !self.has_failed
             && !self.has_iso
@@ -459,6 +559,10 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
                     obs.has_review = true;
                 } else if name == RIPPED_MARKER {
                     obs.has_ripped = true;
+                } else if name == SWEEPING_MARKER {
+                    obs.has_sweeping = true;
+                } else if name == MUXING_MARKER {
+                    obs.has_muxing = true;
                 } else if name == COMPLETED_MARKER {
                     obs.has_completed = true;
                 } else if name == FAILED_MARKER {
@@ -518,10 +622,13 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
     Some(StagingSnapshot {
         dir: dir.to_path_buf(),
         completed: obs.has_completed,
+        has_failed: obs.has_failed,
         failed_reason,
         has_done: obs.has_done,
         has_review: obs.has_review,
         has_ripped: obs.has_ripped,
+        has_sweeping: obs.has_sweeping,
+        has_muxing: obs.has_muxing,
         has_iso: obs.has_iso,
         has_mapfile: obs.has_mapfile,
         has_mkv: obs.has_mkv,
@@ -583,7 +690,18 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
             });
             continue;
         }
-        if let Some(reason) = snap.failed_reason.clone() {
+        // Terminal `.failed` — keyed on marker PRESENCE (`has_failed`), not on
+        // a parseable reason. A `.failed` written with a non-JSON body (e.g.
+        // review.rs's operator-cancel "cancelled by operator") has
+        // `failed_reason == None` but is still terminal; keying on
+        // `failed_reason.is_some()` here would let such a dir slip past into
+        // the partial-state restart-count path. Surface the reason when it
+        // parsed; otherwise fall back to a generic terminal reason string.
+        if snap.has_failed {
+            let reason = snap
+                .failed_reason
+                .clone()
+                .unwrap_or_else(|| "failed (no machine-readable reason recorded)".to_string());
             tracing::warn!(path = %path.display(), reason = %reason, "staging entry has .failed — leaving for operator");
             hints.push(StagingResumeHint {
                 dir: snap.dir,
@@ -628,6 +746,30 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
             hints.push(StagingResumeHint {
                 dir: snap.dir,
                 action: ResumeAction::AlreadyCompleted,
+            });
+            continue;
+        }
+        // `.sweeping` / `.muxing` carve-out — checked BEFORE the partial-state
+        // branch. `.sweeping` is written by `rip_disc` at staging-dir creation
+        // (before Pass 1) and replaced by `.ripped`/`.failed` on exit; `.muxing`
+        // is written by the mux worker while it owns a `.ripped` dir. Either
+        // marker means the dir is actively OWNED and in progress, NOT orphaned
+        // partial state to be restart-counted. Without this carve-out a crash
+        // mid-sweep would leave `.sweeping` + ISO/mapfile on disk, the scan
+        // would treat it as partial state, bump `.restart_count` every cold
+        // restart, and after RESTART_LIMIT silently quarantine a healthy
+        // long-running rip as `.failed`. Skip without bumping the counter; a
+        // future stale-heartbeat policy can promote a genuinely dead sweep.
+        if snap.has_sweeping || snap.has_muxing {
+            tracing::info!(
+                path = %path.display(),
+                has_sweeping = snap.has_sweeping,
+                has_muxing = snap.has_muxing,
+                "staging entry is owned/in-progress (.sweeping/.muxing) — leaving alone, not restart-counting"
+            );
+            hints.push(StagingResumeHint {
+                dir: snap.dir,
+                action: ResumeAction::InProgress,
             });
             continue;
         }
@@ -722,6 +864,9 @@ pub struct StagingResumeHint {
 #[allow(dead_code)]
 pub enum ResumeAction {
     AlreadyCompleted,
+    /// Dir is actively owned/in progress (`.sweeping` sweep+patch running, or
+    /// `.muxing` mux worker holds it). Left alone, NOT restart-counted.
+    InProgress,
     AlreadyFailed {
         reason: String,
     },
@@ -1218,11 +1363,16 @@ mod tests {
         Done,
         Review,
         Ripped,
+        Sweeping,
+        Muxing,
         Iso,
         Mapfile,
         Mkv,
         RestartAtLimit,
         RestartBelowLimit,
+        /// A non-JSON `.failed` body (e.g. review.rs's operator-cancel). Used
+        /// to pin that terminal-ness keys on marker PRESENCE, not parse.
+        FailedNonJson,
     }
 
     /// What `resume_or_quarantine_staging` must decide for one disc dir.
@@ -1232,6 +1382,9 @@ mod tests {
         Failed,
         RestartLoopFailed,
         ResumePreserved,
+        /// Dir is owned/in progress (`.sweeping`/`.muxing`) — left alone, not
+        /// restart-counted.
+        InProgress,
         Wiped,
     }
 
@@ -1246,6 +1399,12 @@ mod tests {
                 Mk::Done => fs::write(disc.join(DONE_MARKER), b"{}").unwrap(),
                 Mk::Review => fs::write(disc.join(REVIEW_MARKER), b"{}").unwrap(),
                 Mk::Ripped => fs::write(disc.join(RIPPED_MARKER), b"{}").unwrap(),
+                Mk::Sweeping => fs::write(disc.join(SWEEPING_MARKER), b"{}").unwrap(),
+                Mk::Muxing => fs::write(disc.join(MUXING_MARKER), b"{}").unwrap(),
+                Mk::FailedNonJson => {
+                    // Mimic the legacy review.rs body: a non-JSON `.failed`.
+                    fs::write(disc.join(FAILED_MARKER), b"cancelled by operator\n").unwrap()
+                }
                 Mk::Iso => fs::write(disc.join("Disc.iso"), b"x").unwrap(),
                 Mk::Mapfile => fs::write(disc.join("Disc.iso.mapfile"), b"x").unwrap(),
                 Mk::Mkv => fs::write(disc.join("Disc.mkv"), b"x").unwrap(),
@@ -1275,6 +1434,7 @@ mod tests {
             ResumeAction::AlreadyFailed { .. } => Verdict::Failed,
             ResumeAction::RestartLoopFailed { .. } => Verdict::RestartLoopFailed,
             ResumeAction::ResumePreserved { .. } => Verdict::ResumePreserved,
+            ResumeAction::InProgress => Verdict::InProgress,
         }
     }
 
@@ -1401,6 +1561,49 @@ mod tests {
                 Verdict::ResumePreserved,
                 ".ripped + artifacts → partial state preserved (mux worker handles the .ripped)",
             ),
+            // --- H2/M1: .sweeping in-progress marker. A crash mid-sweep leaves
+            //     .sweeping + ISO/mapfile. Must be InProgress (owned), NOT
+            //     restart-counted toward .failed. ---
+            (
+                &[Sweeping],
+                Verdict::InProgress,
+                ".sweeping alone → owned/in-progress, leave alone",
+            ),
+            (
+                &[Sweeping, Iso, Mapfile],
+                Verdict::InProgress,
+                "CRASH MID-SWEEP: .sweeping + artifacts → in-progress, not partial state",
+            ),
+            (
+                &[Sweeping, Iso, Mapfile, RestartAtLimit],
+                Verdict::InProgress,
+                ".sweeping wins even at restart limit — a healthy long rip must NOT be quarantined",
+            ),
+            // --- H1: .muxing exclusion lock. Owned by the mux worker; same
+            //     in-progress treatment as .sweeping. ---
+            (
+                &[Muxing, Iso, Mapfile],
+                Verdict::InProgress,
+                ".muxing + artifacts → mux worker owns it, in-progress",
+            ),
+            (
+                &[Muxing, Iso, Mapfile, RestartAtLimit],
+                Verdict::InProgress,
+                ".muxing wins even at restart limit",
+            ),
+            // --- M2: a non-JSON `.failed` body (review.rs operator-cancel)
+            //     must still be TERMINAL — keyed on marker presence, not
+            //     parse-success. ---
+            (
+                &[FailedNonJson],
+                Verdict::Failed,
+                "non-JSON .failed body is still terminal (presence-keyed)",
+            ),
+            (
+                &[FailedNonJson, Iso, Mapfile, RestartAtLimit],
+                Verdict::Failed,
+                "non-JSON .failed + artifacts at restart limit → terminal, not restart-counted",
+            ),
         ];
         for (markers, expected, why) in table {
             let got = resume_verdict(markers);
@@ -1437,6 +1640,113 @@ mod tests {
     #[test]
     fn resume_nothing_present_is_wiped() {
         assert_eq!(resume_verdict(&[]), Verdict::Wiped);
+    }
+
+    /// H2/M1 regression: a dir with `.sweeping` + ISO/mapfile (a crash
+    /// mid-sweep) must be classified InProgress and must NOT have its
+    /// `.restart_count` bumped — otherwise a healthy multi-hour rip walks
+    /// toward `.failed` over RESTART_LIMIT restarts.
+    #[test]
+    fn sweeping_marker_is_in_progress_and_not_restart_counted() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("MyDisc.iso"), b"x").unwrap();
+        fs::write(disc.join("MyDisc.iso.mapfile"), b"x").unwrap();
+        write_sweeping_marker(&disc);
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::InProgress),
+            "got {:?}",
+            hints[0].action
+        );
+        // The critical property: counter must be ZERO (never bumped).
+        assert_eq!(
+            restart_count(&disc),
+            0,
+            ".sweeping must NOT be restart-counted"
+        );
+        assert!(!disc.join(FAILED_MARKER).exists());
+        // Artifacts + marker preserved for the resuming rip.
+        assert!(disc.join("MyDisc.iso").exists());
+        assert!(disc.join(SWEEPING_MARKER).exists());
+    }
+
+    /// H1 regression: a `.muxing` lock dir is owned by the mux worker — the
+    /// resume scan must leave it alone (InProgress), not restart-count it.
+    #[test]
+    fn muxing_marker_is_in_progress_and_not_restart_counted() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("MyDisc.iso"), b"x").unwrap();
+        fs::write(disc.join("MyDisc.iso.mapfile"), b"x").unwrap();
+        write_muxing_marker(&disc);
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(matches!(hints[0].action, ResumeAction::InProgress));
+        assert_eq!(restart_count(&disc), 0);
+        assert!(!disc.join(FAILED_MARKER).exists());
+    }
+
+    /// H2/M1: the `.sweeping` marker is superseded by every terminal/hand-off
+    /// transition. `write_failed_marker`, `write_completed_marker`, and
+    /// `muxer::write_marker` (`.ripped`) all clear it so a finished/quarantined
+    /// dir isn't also mis-read as an active sweep.
+    #[test]
+    fn sweeping_marker_cleared_by_terminal_writes() {
+        let d = tmpdir();
+        write_sweeping_marker(&d);
+        assert!(d.join(SWEEPING_MARKER).exists());
+        write_completed_marker(&d);
+        assert!(
+            !d.join(SWEEPING_MARKER).exists(),
+            ".completed must clear .sweeping"
+        );
+
+        let d2 = tmpdir();
+        write_sweeping_marker(&d2);
+        write_failed_marker(&d2, "boom");
+        assert!(
+            !d2.join(SWEEPING_MARKER).exists(),
+            ".failed must clear .sweeping"
+        );
+
+        let d3 = tmpdir();
+        write_sweeping_marker(&d3);
+        clear_sweeping_marker(&d3);
+        assert!(!d3.join(SWEEPING_MARKER).exists());
+        // Idempotent: clearing an already-gone marker must not panic/error.
+        clear_sweeping_marker(&d3);
+    }
+
+    /// M2 regression: a `.failed`-only dir with a non-JSON body (review.rs's
+    /// legacy "cancelled by operator") is still terminal to the resume scan.
+    /// `read_failed_reason` returns None for it, but the scan keys on
+    /// `has_failed` (presence), not parse-success.
+    #[test]
+    fn non_json_failed_is_terminal() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join(FAILED_MARKER), b"cancelled by operator\n").unwrap();
+        // The parser can't read a reason out of it...
+        assert_eq!(read_failed_reason(&disc), None);
+        // ...but the scan still treats it as terminal.
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::AlreadyFailed { .. }),
+            "got {:?}",
+            hints[0].action
+        );
+        // And the snapshot exposes has_failed even with no parseable reason.
+        let snap = snapshot_staging_disc(&disc).unwrap();
+        assert!(snap.has_failed);
+        assert!(snap.failed_reason.is_none());
     }
 
     /// Same guarantee for `increment_restart_count`: a rename failure must not

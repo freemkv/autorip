@@ -124,6 +124,11 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
                 reason: reason.clone(),
             };
         }
+        // Dir is actively owned/in progress (`.sweeping` sweep running, or
+        // `.muxing` mux worker holds it). The startup resume classifier must
+        // not claim it — the live worker owns the transition. Treat as
+        // NotEligible so this path leaves it alone.
+        ResumeAction::InProgress => return ResumeClass::NotEligible,
         ResumeAction::ResumePreserved { .. } => {}
     }
     let ResumeAction::ResumePreserved {

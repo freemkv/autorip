@@ -1027,6 +1027,19 @@ pub fn handle_rip_request(
                 drop_session(device);
                 return;
             }
+            // Mutual exclusion with the mux worker. A `.ripped`/`.muxing`
+            // staging dir for this disc is OWNED by the mux worker (sweep+patch
+            // done, mux pending or in flight). Running a fresh sweep here would
+            // truncate the ISO the mux worker is reading. Skip the auto-rip and
+            // leave the worker to finish.
+            if disc_owned_by_worker(cfg, device) {
+                crate::log::device_log(
+                    device,
+                    "Disc rip already staged and owned by the mux worker (.ripped/.muxing) — skipping unattended re-sweep.",
+                );
+                drop_session(device);
+                return;
+            }
             rip_disc(cfg, device, device_path, false);
         }
     }
@@ -1148,9 +1161,24 @@ fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
     // `read_dir(...).flatten()`, which would silently drop the disc's own dir
     // on a cold-cache DirEntry error and wrongly re-rip a completed disc.
     let staging_root = std::path::Path::new(&cfg_read.staging_dir);
-    let basenames = match list_staging_basenames(staging_root) {
-        Some(b) => b,
-        None => return false,
+    staging_disc_completed(staging_root, &sanitized)
+}
+
+/// Pure core of `disc_already_completed`: does a staging dir whose basename
+/// exactly matches `sanitized` carry `.completed` AND not `.review`? Split out
+/// (no `STATE`/`Config` reads) so the M4 held-for-review gating is unit-testable.
+///
+/// `.completed` alone is NOT enough: the auto-resume mux writes `.completed`
+/// even for a rip HELD for operator review (it writes `.review` instead of
+/// `.done`, then `.completed`). Treating such a dir as "already ripped" would
+/// make the unattended insert path skip it as finished while it's actually
+/// awaiting operator confirmation. A held-for-review disc is therefore NOT
+/// "already completed": require `.completed` AND absence of `.review` (M4). The
+/// review UI's `list_held` keys on `.review` independently, so it still
+/// surfaces the dir.
+fn staging_disc_completed(staging_root: &std::path::Path, sanitized: &str) -> bool {
+    let Some(basenames) = list_staging_basenames(staging_root) else {
+        return false;
     };
     for basename in basenames {
         let path = staging_root.join(&basename);
@@ -1160,13 +1188,75 @@ fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
         // shorter title's name is a prefix of a longer one ("Cars" sanitizes
         // to "Cars", "Cars 2" to "Cars_2"; a word-boundary check still fails
         // since `_` is the space separator). Exact equality is collision-free.
-        if staging_dir_matches_disc(&basename, &sanitized)
+        if staging_dir_matches_disc(&basename, sanitized)
             && path.join(staging::COMPLETED_MARKER).exists()
+            && !path.join(staging::REVIEW_MARKER).exists()
         {
             return true;
         }
     }
     false
+}
+
+/// Does the currently-scanned disc have a staging dir that is OWNED by the mux
+/// worker (`.ripped` hand-off pending, or `.muxing` lock held)? Used by the
+/// unattended Default auto-insert path to refuse a fresh sweep on such a dir:
+/// a fresh sweep would truncate the ISO the mux worker is reading (or is about
+/// to read). Mirrors `disc_already_completed`'s lookup (exact-name match,
+/// NFS-resilient listing) but checks the owner markers instead of `.completed`.
+fn disc_owned_by_worker(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
+    let cfg_read = match cfg.read() {
+        Ok(c) => c.clone(),
+        Err(_) => return false,
+    };
+    let display_name = STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(device)
+        .map(|rs| rs.disc_name.clone())
+        .unwrap_or_default();
+    if display_name.is_empty() {
+        return false;
+    }
+    let sanitized = crate::util::sanitize_path_compact(&display_name);
+    let staging_root = std::path::Path::new(&cfg_read.staging_dir);
+    staging_disc_owned_by_worker(staging_root, &sanitized)
+}
+
+/// Pure core of `disc_owned_by_worker`: does a staging dir whose basename
+/// exactly matches `sanitized` carry `.ripped` or `.muxing`? Split out (no
+/// `STATE`/`Config` reads) so the H1 exclusion is unit-testable.
+fn staging_disc_owned_by_worker(staging_root: &std::path::Path, sanitized: &str) -> bool {
+    let Some(basenames) = list_staging_basenames(staging_root) else {
+        return false;
+    };
+    for basename in basenames {
+        let path = staging_root.join(&basename);
+        if staging_dir_matches_disc(&basename, sanitized)
+            && (path.join(staging::RIPPED_MARKER).exists()
+                || path.join(staging::MUXING_MARKER).exists())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is this staging dir blocked from drive-resume (Remux) by an owner, held, or
+/// terminal marker? Pure projection of the snapshot booleans so the H1/M3 skip
+/// rules are unit-testable without seeding `STATE`/`Config`.
+///
+/// - `.ripped` / `.muxing` — OWNED by the mux worker. Returning Remux would
+///   double-mux the same output (the worker is already on it) and, on
+///   `.muxing`, race the worker for the ISO it's reading (H1).
+/// - `.review` — HELD for operator review; the operator hasn't resolved the
+///   title match. Re-muxing would overwrite the held output before they decide (M3).
+/// - `.failed` — TERMINAL; a prior attempt gave up (the ISO may be
+///   partial/aborted). Don't silently re-mux past it; the operator must
+///   explicitly Wipe + re-rip. Keyed on PRESENCE (`has_failed`) so a non-JSON
+///   `.failed` body is still honoured (M3).
+fn resumable_dir_blocked(snap: &staging::StagingSnapshot) -> bool {
+    snap.has_ripped || snap.has_muxing || snap.has_review || snap.has_failed
 }
 
 /// Look at the staging dirs for a Remux-eligible entry whose
@@ -1207,15 +1297,21 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
         // "Cars_2" from "Cars 2"; "Dune" of "Dunkirk"), resuming onto a
         // different title's partial ISO + mapfile. Exact equality is safe.
         if staging_dir_matches_disc(&basename, &sanitized) {
-            // User-initiated resume bypasses any `.failed` or
-            // `.completed` markers — the user clicked Rip with
-            // resume=yes and that is the authoritative signal.
-            // `classify_resume` would refuse on those markers
-            // (designed for the auto-resume era); we go straight to
-            // the underlying check: ISO + mapfile present, mapfile
-            // parses, no bytes_pending in mapfile, lost_secs within
-            // the configured threshold.
+            // User-initiated resume goes straight to the underlying
+            // remux-eligibility check (ISO + mapfile present, mapfile
+            // parses, no bytes_pending, lost_secs within threshold).
+            // It still refuses dirs that are OWNED by the mux worker
+            // (`.ripped`/`.muxing`), HELD for review (`.review`), or
+            // TERMINAL (`.failed`) — see the per-marker skips below.
+            // A `.completed` dir naturally has bytes_pending == 0 and no
+            // owner/held/terminal marker, but its ISO was already pruned,
+            // so `has_iso` is false and it falls through the ISO guard.
             let snap = staging::snapshot_staging_disc(&path)?;
+            // Owned/held/terminal dirs are not drive-resumable — see
+            // `resumable_dir_blocked` for the per-marker reasoning (H1/M3).
+            if resumable_dir_blocked(&snap) {
+                continue;
+            }
             if !snap.has_iso || !snap.has_mapfile {
                 continue;
             }
@@ -1841,6 +1937,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         unregister_halt(device);
         return;
     }
+    // Write the `.sweeping` in-progress marker immediately after the staging
+    // dir exists, before Pass 1. This governs the whole multi-hour sweep+patch
+    // window: without it the dir has only ISO+mapfile until `.ripped`, so a
+    // crash mid-sweep leaves it ungoverned — the startup resume scan would
+    // restart-count a healthy long rip toward `.failed`, and the mover would
+    // WARN-flood every 10s tick on the absent `.done`. Replaced by `.ripped`
+    // (hand-off) or `.failed` (abort) on every exit path below.
+    staging::write_sweeping_marker(std::path::Path::new(&staging));
     let filename = format!(
         "{}.{}",
         crate::util::sanitize_path_compact(&display_name),
@@ -5111,8 +5215,9 @@ mod tests {
     use super::{
         HaltGuard, aacs_failure_message, disk_space_preflight_message, format_pass_error,
         header_phase_outcome_is_failure, incomplete_mux_status, is_safe_staging_segment,
-        list_staging_basenames, prune_intermediate_iso, register_halt, resumable_for_disc,
-        staging_dir_matches_disc, staging_free_bytes,
+        list_staging_basenames, prune_intermediate_iso, register_halt, resumable_dir_blocked,
+        resumable_for_disc, staging_dir_matches_disc, staging_disc_completed,
+        staging_disc_owned_by_worker, staging_free_bytes,
     };
     use crate::ripper::session::device_halt;
     use crate::ripper::state::Resumable;
@@ -6818,6 +6923,122 @@ mod tests {
         assert_eq!(
             resumable_for_disc(&cfg, display_name),
             Some(Resumable::Sweep),
+        );
+    }
+
+    /// Build `<root>/<sanitized>` and drop the named empty marker files in it.
+    fn staging_disc_with_markers(
+        root: &std::path::Path,
+        sanitized: &str,
+        markers: &[&str],
+    ) -> std::path::PathBuf {
+        let disc = root.join(sanitized);
+        std::fs::create_dir_all(&disc).unwrap();
+        for m in markers {
+            std::fs::write(disc.join(m), b"{}").unwrap();
+        }
+        disc
+    }
+
+    /// M4: a rip HELD for review writes BOTH `.review` and `.completed`. The
+    /// "already ripped" check must NOT treat it as completed — otherwise the
+    /// unattended insert path skips a disc that's actually awaiting operator
+    /// confirmation. Gating is `.completed` AND not `.review`.
+    #[test]
+    fn staging_disc_completed_excludes_held_for_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let san = "Held_Movie";
+        // .completed alone → already ripped.
+        staging_disc_with_markers(tmp.path(), san, &[".completed"]);
+        assert!(
+            staging_disc_completed(tmp.path(), san),
+            ".completed alone must count as already-ripped"
+        );
+        // Add .review (held) → NO longer "already ripped".
+        std::fs::write(tmp.path().join(san).join(".review"), b"{}").unwrap();
+        assert!(
+            !staging_disc_completed(tmp.path(), san),
+            ".completed + .review (held) must NOT count as already-ripped (M4)"
+        );
+    }
+
+    /// M4 sanity: the review UI's `list_held` still surfaces a held dir even
+    /// when `.completed` is also present (it keys on `.review` and absence of
+    /// `.done`, independent of `.completed`).
+    #[test]
+    fn list_held_still_sees_completed_review_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disc = tmp.path().join("Held_Movie");
+        std::fs::create_dir_all(&disc).unwrap();
+        std::fs::write(disc.join(".review"), r#"{"title":"Held Movie","year":0}"#).unwrap();
+        std::fs::write(disc.join(".completed"), b"").unwrap();
+        std::fs::write(disc.join("Held_Movie.mkv"), b"x").unwrap();
+
+        let held = crate::review::list_held(tmp.path().to_str().unwrap());
+        assert_eq!(held.len(), 1, "a .completed+.review dir is still held");
+        assert_eq!(held[0].dir, "Held_Movie");
+    }
+
+    /// H1: a `.ripped` or `.muxing` staging dir is OWNED by the mux worker.
+    /// The drive auto-insert path must recognise it so it doesn't run a fresh
+    /// sweep that truncates the ISO the worker is reading.
+    #[test]
+    fn staging_disc_owned_by_worker_detects_ripped_and_muxing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let san = "Owned";
+        // Nothing yet → not owned.
+        staging_disc_with_markers(tmp.path(), san, &["Owned.iso", "Owned.iso.mapfile"]);
+        assert!(!staging_disc_owned_by_worker(tmp.path(), san));
+        // .ripped → owned.
+        std::fs::write(tmp.path().join(san).join(".ripped"), b"{}").unwrap();
+        assert!(
+            staging_disc_owned_by_worker(tmp.path(), san),
+            ".ripped must mark the dir owned by the mux worker"
+        );
+        // Swap .ripped for .muxing → still owned.
+        std::fs::remove_file(tmp.path().join(san).join(".ripped")).unwrap();
+        std::fs::write(tmp.path().join(san).join(".muxing"), b"{}").unwrap();
+        assert!(
+            staging_disc_owned_by_worker(tmp.path(), san),
+            ".muxing must mark the dir owned by the mux worker"
+        );
+    }
+
+    /// H1 + M3: the drive-resume (Remux) selector must skip dirs that are
+    /// owned (`.ripped`/`.muxing`), held (`.review`), or terminal (`.failed`),
+    /// while still resuming a plain ISO+mapfile dir. Drives the pure
+    /// `resumable_dir_blocked` against real snapshots.
+    #[test]
+    fn resumable_dir_blocked_skips_owned_held_and_terminal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mk = |name: &str, markers: &[&str]| {
+            let d = staging_disc_with_markers(
+                tmp.path(),
+                name,
+                &[&format!("{name}.iso"), &format!("{name}.iso.mapfile")],
+            );
+            for m in markers {
+                std::fs::write(d.join(m), b"{}").unwrap();
+            }
+            crate::ripper::staging::snapshot_staging_disc(&d).unwrap()
+        };
+
+        // Plain ISO+mapfile, no governing marker → NOT blocked (resumable).
+        assert!(!resumable_dir_blocked(&mk("Plain", &[])));
+        // Owned by mux worker.
+        assert!(resumable_dir_blocked(&mk("Ripped", &[".ripped"])));
+        assert!(resumable_dir_blocked(&mk("Muxing", &[".muxing"])));
+        // Held for operator review.
+        assert!(resumable_dir_blocked(&mk("Held", &[".review"])));
+        // Terminal — including a non-JSON `.failed` body (presence-keyed, M3).
+        let failed =
+            staging_disc_with_markers(tmp.path(), "Failed", &["Failed.iso", "Failed.iso.mapfile"]);
+        std::fs::write(failed.join(".failed"), b"cancelled by operator\n").unwrap();
+        let snap = crate::ripper::staging::snapshot_staging_disc(&failed).unwrap();
+        assert!(snap.has_failed && snap.failed_reason.is_none());
+        assert!(
+            resumable_dir_blocked(&snap),
+            "non-JSON .failed must still block drive-resume (presence-keyed)"
         );
     }
 
