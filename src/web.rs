@@ -858,11 +858,17 @@ function renderMuxes(){
     if(pct>0)html+='<div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+pct+'%;transition:width 1s"></div></div>';
     html+='<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div></div>';
   }
-  if(window._muxQueue){
-    window._muxQueue.forEach(m=>{
-      /* Skip the .ripped marker that corresponds to the title currently
-         muxing (worker leaves the marker in place until success). */
-      if(muxActive&&m.replace(/ \(queued\)/,'').replace(/ /g,'_').includes(mx.disc_name.replace(/ /g,'_')))return;
+  /* Mux queue rides on the live state payload (_mux_queue), refreshed
+     every SSE tick — so a job that moves on (mux finishes → Move queue)
+     disappears here on the next tick instead of lingering until a hard
+     refresh. `pending_queue` already excludes the dir currently muxing
+     (it carries `.muxing`) and any dir that has entered the Move queue
+     (`.done`/`.review`), so no frontend de-dup band-aid is needed: a job
+     is in exactly one queue. Fall back to the older _muxQueue (from the
+     /api/system fetch) only if the live field is absent. */
+  const muxQ=(data._mux_queue!=null)?data._mux_queue:window._muxQueue;
+  if(muxQ){
+    muxQ.forEach(m=>{
       hasContent=true;
       html+='<div style="padding:4px 0;font-size:.8rem"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--yellow);margin-right:8px;vertical-align:middle"></span>'+esc(m)+'</div>';
     });
@@ -904,9 +910,13 @@ function renderMoves(){
     if(pct>0)html+='<div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+pct+'%;transition:width 1s"></div></div>';
     html+='<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div></div>';
   }
-  /* Pending queue items */
-  if(window._moveQueue){
-    window._moveQueue.forEach(m=>{
+  /* Pending queue items — from the live state payload (_move_queue),
+     refreshed every SSE tick (falls back to the /api/system _moveQueue
+     only if absent). The active move (_move) is rendered above with its
+     progress bar; skip its matching queue entry so it isn't listed twice. */
+  const moveQ=(data._move_queue!=null)?data._move_queue:window._moveQueue;
+  if(moveQ){
+    moveQ.forEach(m=>{
       if(mv&&mv.name&&m.replace(/ \(moving\)/,'').replace(/ /g,'_').includes(mv.name.replace(/ /g,'_')))return;
       hasContent=true;
       html+='<div style="padding:4px 0;font-size:.8rem"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--yellow);margin-right:8px;vertical-align:middle"></span>'+esc(m)+'</div>';
@@ -1361,7 +1371,11 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     if is_get && (url == "/" || url == "/index.html") {
         serve_html(request);
     } else if is_get && url == "/api/state" {
-        json_response(request, 200, &get_state_json());
+        let staging_dir = cfg
+            .read()
+            .map(|c| c.staging_dir.clone())
+            .unwrap_or_default();
+        json_response(request, 200, &get_state_json(&staging_dir));
     } else if is_get && url == "/api/version" {
         json_response(
             request,
@@ -1397,7 +1411,7 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     } else if is_get && (url == "/api/debug" || url.starts_with("/api/debug?")) {
         handle_debug_log(request, &url);
     } else if is_get && url == "/events" {
-        handle_sse(request);
+        handle_sse(request, cfg);
     } else if is_post && url.starts_with("/api/scan/") {
         let device = url.trim_start_matches("/api/scan/");
         let device = percent_decode(device);
@@ -2250,6 +2264,98 @@ impl Drop for ConnGuard {
 mod web_tests {
     use super::*;
 
+    // Regression (bug #3): the Mux queue and Move queue must be mutually
+    // exclusive within a single state snapshot — a disc can never appear in
+    // both at once. `build_queue_views` is the single source both
+    // /api/state (SSE) and /api/system derive the queues from, so testing
+    // it covers every UI view. We walk a staging dir through the post-mux
+    // marker sequence and assert no name is in both lists at any step.
+    #[test]
+    fn build_queue_views_mutually_exclusive() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let staging = tmp.path().to_string_lossy().to_string();
+        let disc = tmp.path().join("Border_Town");
+        fs::create_dir_all(&disc).unwrap();
+
+        let both_contain = |mux: &[String], mv: &[String]| -> bool {
+            mux.iter().any(|m| {
+                let name = m.replace(" (queued)", "").replace(" (malformed)", "");
+                mv.iter().any(|v| v.replace(" (moving)", "") == name)
+            })
+        };
+
+        // Step 1: fresh hand-off — `.ripped` only. In the Mux queue, not Move.
+        crate::muxer::write_marker(
+            &disc,
+            &crate::muxer::RippedMarker {
+                schema_version: crate::muxer::RIPPED_MARKER_SCHEMA,
+                iso_path: "/x/Border_Town/Border_Town.iso".into(),
+                mapfile_path: "/x/Border_Town/Border_Town.iso.mapfile".into(),
+                display_name: "Border Town".into(),
+                disc_format: "uhd".into(),
+                mkv_filename: "Border_Town.mkv".into(),
+                tmdb_title: "Border Town".into(),
+                tmdb_year: 2024,
+                tmdb_poster: String::new(),
+                tmdb_overview: String::new(),
+                tmdb_media_type: "movie".into(),
+                max_retries: 5,
+                abort_on_lost_secs: 0,
+                rip_elapsed_secs: 0.0,
+                rip_errors: 0,
+                rip_lost_video_secs: 0.0,
+                rip_last_sector: 0,
+                origin_device: "sg0".into(),
+                sweep_errors: 0,
+                sweep_total_lost_ms: 0.0,
+                sweep_main_lost_ms: 0.0,
+                sweep_num_bad_ranges: 0,
+                sweep_largest_gap_ms: 0.0,
+                title_confident: true,
+            },
+        )
+        .unwrap();
+        let (mux, mv) = build_queue_views(&staging);
+        assert_eq!(mux.len(), 1, "fresh .ripped must be in the Mux queue");
+        assert!(mv.is_empty(), "not yet in the Move queue");
+        assert!(!both_contain(&mux, &mv));
+
+        // Step 2: mux in flight — `.muxing` added. Out of the Mux queue
+        // (shown as the live `_mux` device), still not in Move.
+        crate::ripper::staging::write_muxing_marker(&disc);
+        let (mux, mv) = build_queue_views(&staging);
+        assert!(
+            mux.is_empty(),
+            "an actively-muxing dir leaves the queued list"
+        );
+        assert!(mv.is_empty());
+        assert!(!both_contain(&mux, &mv));
+        crate::ripper::staging::clear_muxing_marker(&disc);
+
+        // Step 3: mux done — `.done` written (mover hand-off), `.completed`
+        // not yet, `.ripped` may linger. THIS is the double-listing bug
+        // window: it must be in the Move queue ONLY.
+        fs::write(disc.join(".done"), b"{}").unwrap();
+        let (mux, mv) = build_queue_views(&staging);
+        assert!(
+            mux.is_empty(),
+            "a dir in the Move queue (.done) must not also be (queued) in the Mux queue, got {mux:?}"
+        );
+        assert_eq!(mv.len(), 1, "must be in the Move queue");
+        assert!(
+            !both_contain(&mux, &mv),
+            "BUG #3: a disc must never appear in both the mux and move queues"
+        );
+
+        // Step 4: terminal `.completed` lands — still Move-only, never both.
+        crate::ripper::staging::write_completed_marker(&disc);
+        let (mux, mv) = build_queue_views(&staging);
+        assert!(mux.is_empty());
+        assert_eq!(mv.len(), 1);
+        assert!(!both_contain(&mux, &mv));
+    }
+
     #[test]
     fn keydb_body_under_cap_is_accepted() {
         let body = vec![b'x'; 100];
@@ -2952,7 +3058,7 @@ fn text_response(request: tiny_http::Request, body: &str) {
     let _ = request.respond(response);
 }
 
-fn get_state_json() -> String {
+fn get_state_json(staging_dir: &str) -> String {
     let state = match ripper::STATE.lock() {
         Ok(s) => s,
         Err(_) => return "{}".to_string(),
@@ -2973,7 +3079,54 @@ fn get_state_json() -> String {
     if let Some(vs) = verify_state {
         obj["_verify"] = serde_json::to_value(&vs).unwrap_or_default();
     }
+    // SINGLE-SOURCE STAGE VIEW (fix C): the Mux queue and Move queue ride
+    // on the SAME state payload as the per-device tiles and the synthetic
+    // `_mux` live-progress device. The dashboard pushes this payload on
+    // every SSE tick (~1s), so all three views — the device tile, the Mux
+    // queue, the Move queue — are always derived from one consistent
+    // snapshot. Two consecutive polls can no longer disagree (e.g. a job
+    // showing in both queues), and the queues no longer go stale until a
+    // tab re-open / hard refresh the way the separate `/api/system` fetch
+    // did. `pending_queue` already enforces mutual exclusion (a `.done`/
+    // `.review`/`.muxing`/`.completed`/`.failed` dir is never "(queued)"),
+    // so within this one snapshot a disc appears in at most one queue.
+    let (mux_queue, move_queue) = build_queue_views(staging_dir);
+    obj["_mux_queue"] = serde_json::to_value(&mux_queue).unwrap_or_default();
+    obj["_move_queue"] = serde_json::to_value(&move_queue).unwrap_or_default();
     obj.to_string()
+}
+
+/// Build the Mux-queue and Move-queue display lists from the staging dir.
+/// Shared by `get_state_json` (the live SSE/`/api/state` payload) and
+/// `handle_system_info` (the `/api/system` panel) so both endpoints derive
+/// the two queues from one place and can never disagree on membership.
+///
+/// Mutual exclusion is guaranteed by the markers themselves: the Move
+/// queue scans for `.done`, and `crate::muxer::pending_queue` (the Mux
+/// queue) skips any dir carrying `.done`/`.review`/`.muxing`/`.completed`/
+/// `.failed`. So a given staging dir lands in at most one of the two lists.
+fn build_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>) {
+    const QUEUE_DISPLAY_CAP: usize = 100;
+    // Move queue: staging dirs with a `.done` marker (pending moves).
+    let mut move_queue: Vec<String> = std::fs::read_dir(staging_dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir() && e.path().join(".done").exists())
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().replace('_', " ");
+                    format!("{} (moving)", name)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    move_queue.truncate(QUEUE_DISPLAY_CAP);
+    // Mux queue: staging dirs with a `.ripped` hand-off and no terminal /
+    // move-queue / in-flight marker (see `pending_queue`).
+    let mut mux_queue = crate::muxer::pending_queue(std::path::Path::new(staging_dir));
+    mux_queue.truncate(QUEUE_DISPLAY_CAP);
+    (mux_queue, move_queue)
 }
 
 fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
@@ -2995,22 +3148,25 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // pathological number of subdirs can't produce an unbounded response.
     const QUEUE_DISPLAY_CAP: usize = 100;
 
-    // Move queue: scan staging for .done markers (pending moves)
-    let move_all: Vec<String> = std::fs::read_dir(&cfg.staging_dir)
+    // Pre-cap full counts so the UI can show "+N more" rather than silently
+    // hiding entries dropped by the display cap.
+    let move_full_count = std::fs::read_dir(&cfg.staging_dir)
         .ok()
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().is_dir() && e.path().join(".done").exists())
-                .map(|e| {
-                    let name = e.file_name().to_string_lossy().replace('_', " ");
-                    format!("{} (moving)", name)
-                })
-                .collect()
+                .count()
         })
-        .unwrap_or_default();
-    let move_full_count = move_all.len();
-    let move_queue: Vec<String> = move_all.into_iter().take(QUEUE_DISPLAY_CAP).collect();
+        .unwrap_or(0);
+    let mux_full_count = crate::muxer::pending_queue(std::path::Path::new(&cfg.staging_dir)).len();
+
+    // Move + Mux queue display lists come from the SAME shared builder the
+    // live /api/state + SSE payload uses (`build_queue_views`), so the
+    // System-page panels and the live dashboard can never disagree on queue
+    // membership. `build_queue_views` enforces mutual exclusion (a dir is in
+    // at most one of the two lists).
+    let (mux_queue, move_queue) = build_queue_views(&cfg.staging_dir);
 
     // Mover errors: stuck staging dirs the user needs to act on.
     let move_errors: Vec<crate::mover::MoverError> = crate::mover::MOVE_ERRORS
@@ -3018,15 +3174,6 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         .map(|m| m.values().cloned().collect())
         .unwrap_or_default();
 
-    // Mux queue (v0.25.3): staging dirs with a `.ripped` marker —
-    // sweep+patch done, awaiting the mux worker. Empty in v0.25.3
-    // until rip_disc starts writing the marker; the UI panel exists
-    // so the wiring is ready for the cut-over.
-    let mut mux_queue = crate::muxer::pending_queue(std::path::Path::new(&cfg.staging_dir));
-    let mux_full_count = mux_queue.len();
-    mux_queue.truncate(QUEUE_DISPLAY_CAP);
-    // Number of move/mux entries dropped from the response by the display cap,
-    // so the UI can show "+N more" rather than silently hiding them.
     let truncation_count = move_full_count.saturating_sub(QUEUE_DISPLAY_CAP)
         + mux_full_count.saturating_sub(QUEUE_DISPLAY_CAP);
     let mux_errors: Vec<crate::muxer::MuxerError> = crate::muxer::MUX_ERRORS
@@ -3724,7 +3871,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     }
 }
 
-fn handle_sse(request: tiny_http::Request) {
+fn handle_sse(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // /events holds its thread for the whole client session (1s poll
     // loop). Cap concurrent streams so N clients can't pin N threads and
     // DoS the box; over the cap return 503 and let the thread end.
@@ -3760,7 +3907,15 @@ fn handle_sse(request: tiny_http::Request) {
 
     let mut stream = request.upgrade("sse", response);
 
-    let initial = format!("data: {}\n\n", get_state_json());
+    // Re-read the staging dir each tick (cheap) so a Settings change to
+    // the staging path is reflected without restarting the SSE stream.
+    let staging_dir = || {
+        cfg.read()
+            .map(|c| c.staging_dir.clone())
+            .unwrap_or_default()
+    };
+
+    let initial = format!("data: {}\n\n", get_state_json(&staging_dir()));
     if stream.write_all(initial.as_bytes()).is_err() {
         return;
     }
@@ -3768,7 +3923,7 @@ fn handle_sse(request: tiny_http::Request) {
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let frame = format!("data: {}\n\n", get_state_json());
+        let frame = format!("data: {}\n\n", get_state_json(&staging_dir()));
         if stream.write_all(frame.as_bytes()).is_err() {
             break;
         }
