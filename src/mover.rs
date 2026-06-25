@@ -540,8 +540,24 @@ enum DoneAbsence {
 /// Classify a `.done` read error. NotFound + any governing marker present is
 /// the by-design in-progress state; everything else is a fault. Pulled out so
 /// the warn-vs-debug split is unit-testable without a tracing capture.
+///
+/// The governing-marker probe is advisory, not a lock: between the `.done` read
+/// and these `exists()` calls the ripper/mux worker can land a marker, or the
+/// whole staging dir can be removed (a finished move, or `/api/stop` cleanup).
+/// That TOCTOU is inherent to a best-effort classification on a hot staging
+/// path and is handled deliberately:
+///   - If the dir itself has vanished (NotFound) we treat it as InProgress, not
+///     Fault — a dir that disappeared out from under us is a normal lifecycle
+///     transition, not a stranded-dir condition worth a WARN. Probing the dir
+///     once (rather than each marker) also collapses the race window: we read
+///     the directory's existence a single time instead of four marker joins.
 fn classify_done_absence(err_kind: std::io::ErrorKind, dir: &Path) -> DoneAbsence {
     if err_kind == std::io::ErrorKind::NotFound {
+        // The staging dir was removed between the `.done` read and now (move
+        // finalised, or stop-cleanup): not a stranded dir, so don't WARN.
+        if !dir.exists() {
+            return DoneAbsence::InProgress;
+        }
         let governed = [".ripped", ".completed", ".failed", ".review"]
             .iter()
             .any(|m| dir.join(m).exists());
@@ -2375,6 +2391,32 @@ mod tests {
                 "non-NotFound error is a fault even with {m} present"
             );
         }
+    }
+
+    /// Regression: a staging dir that vanished between the `.done` read and the
+    /// governing-marker probe (a finished move, or `/api/stop` cleanup) must be
+    /// treated as InProgress, not a stranded-dir Fault — that transition is a
+    /// normal lifecycle event and must not emit a spurious WARN.
+    #[test]
+    fn done_absence_vanished_dir_is_in_progress_not_fault() {
+        use std::io::ErrorKind;
+        let tmp = tempfile::tempdir().unwrap();
+        // Path under the temp root that was never created (or already removed).
+        let gone = tmp.path().join("disc-removed");
+        assert!(!gone.exists());
+        assert_eq!(
+            classify_done_absence(ErrorKind::NotFound, &gone),
+            DoneAbsence::InProgress,
+            "a dir that disappeared out from under the mover is a lifecycle \
+             transition, not a stranded-dir fault → no WARN"
+        );
+        // A non-NotFound error on a missing dir is still surfaced (the read
+        // failure itself, not the absence, is what we report).
+        assert_eq!(
+            classify_done_absence(ErrorKind::PermissionDenied, &gone),
+            DoneAbsence::Fault,
+            "non-NotFound errors stay faults even when the dir is gone"
+        );
     }
 
     #[test]
