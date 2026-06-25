@@ -245,6 +245,12 @@ pub fn write_failed_marker(staging_disc_dir: &Path, reason: &str) {
     // A `.failed` terminal supersedes any in-progress `.sweeping` marker; clear
     // it so a quarantined dir isn't also mis-read as an active sweep.
     clear_sweeping_marker(staging_disc_dir);
+    // It supersedes the `.muxing` exclusion lock too — same reasoning as
+    // `write_completed_marker`. A terminal write must reliably release the
+    // in-progress lock regardless of which path (worker guard, cold operator
+    // resume, or startup quarantine) reaches it, so a stale `.muxing` can't keep
+    // `disc_owned_by_worker` true on a now-terminal dir.
+    clear_muxing_marker(staging_disc_dir);
 }
 
 /// Read the `.failed` marker's reason string. Returns None if missing
@@ -323,6 +329,14 @@ pub fn write_completed_marker(staging_disc_dir: &Path) {
     // marker (the inline-mux success path writes `.completed` directly without
     // going through `.ripped`).
     clear_sweeping_marker(staging_disc_dir);
+    // A terminal write supersedes the `.muxing` exclusion lock too. The worker's
+    // MuxingGuard normally clears it, but the cold operator-resume path
+    // (`resume::resume_remux`) writes `.completed` WITHOUT going through the
+    // guard. If a `.muxing` marker was left on the dir (e.g. a prior worker mux
+    // the hard-watchdog exit(1)'d without clearing), it would persist and make
+    // `disc_owned_by_worker` return true forever on a dir that is actually
+    // `.completed`, silently blocking the unattended re-insert path.
+    clear_muxing_marker(staging_disc_dir);
 }
 
 /// Durably write a hand-off/review marker (`.done` / `.review`) containing
@@ -760,17 +774,24 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
         // restart, and after RESTART_LIMIT silently quarantine a healthy
         // long-running rip as `.failed`.
         //
-        // BUT a deterministically-wedging sweep/mux that gets killed by the
-        // hard watchdog (mux.rs) re-acquires `.sweeping`/`.muxing` on every
-        // restart, so a pure "always skip" carve-out would defeat the
-        // watchdog's `.restart_count` guard and spin forever. The watchdog
-        // bumps `.restart_count` and exit(1)s WITHOUT clearing the marker (it
-        // kills the process, so no guard runs), so the count IS already on
-        // disk here. Honor it: a single benign restart of a healthy long sweep
-        // (count below the limit) is still skipped without re-rip-counting,
-        // but once the watchdog has crashed RESTART_LIMIT times we promote the
-        // dir to `.failed` rather than spin. This caps a deterministic wedge
-        // at RESTART_LIMIT crashes while preserving the healthy-long-sweep case.
+        // BUT a deterministically-wedging sweep/mux that gets killed mid-flight
+        // re-acquires `.sweeping`/`.muxing` on every restart, so a pure "always
+        // skip" carve-out would spin forever. Only the 20-minute hard-watchdog
+        // mux escalation (mux.rs) bumps `.restart_count` itself before exit(1);
+        // EVERY other hard kill — OOM-kill, `docker kill`/SIGKILL, panic=abort,
+        // host power loss, or a libfreemkv panic that aborts the sweep in under
+        // 20 min — leaves the marker on disk with the count UNbumped (nothing
+        // ran to bump it). If we only skipped here, such a deterministically-
+        // crashing sweep would loop restart → skip-as-InProgress → re-sweep →
+        // crash forever, count pinned at 0, never promoted to `.failed`.
+        //
+        // So bump `.restart_count` on the InProgress skip too (mirroring the
+        // partial-state branch below), and once it reaches RESTART_LIMIT promote
+        // the dir to `.failed` rather than spin. A healthy long sweep survives a
+        // small number of benign restarts (count below the limit is still
+        // skipped, state preserved); a deterministic wedge is capped at
+        // RESTART_LIMIT crashes regardless of whether the watchdog or a raw kill
+        // ended it.
         if snap.has_sweeping || snap.has_muxing {
             let rc = restart_count(&path);
             if rc >= RESTART_LIMIT {
@@ -804,12 +825,19 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
                     action: ResumeAction::RestartLoopFailed { reason },
                 });
             } else {
+                // Bump on every InProgress skip so a deterministically-crashing
+                // owned sweep/mux walks toward `.failed` over RESTART_LIMIT
+                // restarts even when no watchdog ran to bump it. Best-effort: a
+                // bump failure just leaves the count where it was (we still skip
+                // and preserve state), exactly like the partial-state branch.
+                let attempt = increment_restart_count(&path).unwrap_or(rc);
                 tracing::info!(
                     path = %path.display(),
                     has_sweeping = snap.has_sweeping,
                     has_muxing = snap.has_muxing,
-                    restart_count = rc,
-                    "staging entry is owned/in-progress (.sweeping/.muxing) — leaving alone"
+                    restart_count = attempt,
+                    limit = RESTART_LIMIT,
+                    "staging entry is owned/in-progress (.sweeping/.muxing) — leaving alone, restart-counted"
                 );
                 hints.push(StagingResumeHint {
                     dir: snap.dir,
@@ -1308,6 +1336,97 @@ mod tests {
         assert!(disc.join("foo.iso").exists());
     }
 
+    /// R3 finding 2 regression: a `.sweeping` dir from a NON-watchdog hard crash
+    /// (OOM-kill / SIGKILL / panic=abort) lands with `.restart_count == 0`
+    /// because nothing ran to bump it. The InProgress carve-out must STILL
+    /// restart-count it, so a deterministically-crashing owned sweep walks toward
+    /// `.failed` over RESTART_LIMIT restarts instead of looping forever. Before
+    /// the fix the carve-out skipped without counting and the count stayed pinned
+    /// at 0.
+    #[test]
+    fn sweeping_in_progress_is_restart_counted() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("foo.iso"), b"x").unwrap();
+        // `.sweeping` present, count at 0 (raw kill — no watchdog bump).
+        write_sweeping_marker(&disc);
+        assert_eq!(restart_count(&disc), 0);
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::InProgress),
+            "below the limit a .sweeping dir is left in progress, got {:?}",
+            hints[0].action
+        );
+        assert_eq!(
+            restart_count(&disc),
+            1,
+            ".sweeping InProgress skip must bump .restart_count (else a crash loop never escapes)"
+        );
+        assert!(disc.join("foo.iso").exists());
+        assert!(!disc.join(FAILED_MARKER).exists());
+    }
+
+    /// R3 finding 2 regression (terminal end): once a `.sweeping` dir's restart
+    /// count reaches RESTART_LIMIT the carve-out must promote it to `.failed` and
+    /// clear the in-progress marker, capping a deterministic wedge instead of
+    /// spinning forever.
+    #[test]
+    fn sweeping_in_progress_fails_after_limit() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("foo.iso"), b"x").unwrap();
+        write_sweeping_marker(&disc);
+        fs::write(
+            disc.join(RESTART_COUNT_FILE),
+            format!("{}\n", RESTART_LIMIT).as_bytes(),
+        )
+        .unwrap();
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::RestartLoopFailed { .. }),
+            "got {:?}",
+            hints[0].action
+        );
+        assert!(disc.join(FAILED_MARKER).exists());
+        // The in-progress marker is cleared on promotion.
+        assert!(!disc.join(SWEEPING_MARKER).exists());
+        assert_eq!(restart_count(&disc), 0);
+    }
+
+    /// R3 finding 3 regression: a terminal write must release the `.muxing`
+    /// exclusion lock. The cold operator-resume path (`resume::resume_remux`)
+    /// writes `.completed`/`.failed` WITHOUT going through the worker's
+    /// MuxingGuard; if a stale `.muxing` lingered, `disc_owned_by_worker` would
+    /// read true forever on a terminal dir and silently block the re-insert path.
+    #[test]
+    fn terminal_writers_clear_muxing_lock() {
+        // .completed clears .muxing.
+        let d1 = tmpdir();
+        write_muxing_marker(&d1);
+        assert!(d1.join(MUXING_MARKER).exists());
+        write_completed_marker(&d1);
+        assert!(
+            !d1.join(MUXING_MARKER).exists(),
+            ".completed must clear a leftover .muxing lock"
+        );
+
+        // .failed clears .muxing.
+        let d2 = tmpdir();
+        write_muxing_marker(&d2);
+        assert!(d2.join(MUXING_MARKER).exists());
+        write_failed_marker(&d2, "terminal");
+        assert!(
+            !d2.join(MUXING_MARKER).exists(),
+            ".failed must clear a leftover .muxing lock"
+        );
+    }
+
     /// Regression (HIGH audit #7): if the durable hand-off (`.done`) marker
     /// write FAILS, the caller must NOT proceed to write `.completed` or clear
     /// `.restart_count`. Otherwise the staging dir looks terminal-complete
@@ -1703,12 +1822,15 @@ mod tests {
         assert_eq!(resume_verdict(&[]), Verdict::Wiped);
     }
 
-    /// H2/M1 regression: a dir with `.sweeping` + ISO/mapfile (a crash
-    /// mid-sweep) must be classified InProgress and must NOT have its
-    /// `.restart_count` bumped — otherwise a healthy multi-hour rip walks
-    /// toward `.failed` over RESTART_LIMIT restarts.
+    /// H2/M1 + R3 finding 2 regression: a dir with `.sweeping` + ISO/mapfile (a
+    /// crash mid-sweep) is classified InProgress and left in place (artifacts +
+    /// marker preserved). As of R3 finding 2 it is ALSO restart-counted on each
+    /// InProgress skip, so a deterministically-crashing owned sweep (whose count
+    /// no watchdog bumped) walks toward `.failed` over RESTART_LIMIT restarts
+    /// instead of looping forever. Below the limit the dir is still preserved
+    /// and never promoted to `.failed`.
     #[test]
-    fn sweeping_marker_is_in_progress_and_not_restart_counted() {
+    fn sweeping_marker_is_in_progress_and_restart_counted() {
         let root = tmpdir();
         let disc = root.join("MyDisc");
         fs::create_dir_all(&disc).unwrap();
@@ -1723,11 +1845,11 @@ mod tests {
             "got {:?}",
             hints[0].action
         );
-        // The critical property: counter must be ZERO (never bumped).
+        // R3 finding 2: counter is bumped on the InProgress skip (was 0 before).
         assert_eq!(
             restart_count(&disc),
-            0,
-            ".sweeping must NOT be restart-counted"
+            1,
+            ".sweeping InProgress skip must bump .restart_count"
         );
         assert!(!disc.join(FAILED_MARKER).exists());
         // Artifacts + marker preserved for the resuming rip.
@@ -1772,10 +1894,13 @@ mod tests {
         );
     }
 
-    /// H1 regression: a `.muxing` lock dir is owned by the mux worker — the
-    /// resume scan must leave it alone (InProgress), not restart-count it.
+    /// H1 + R3 finding 2 regression: a `.muxing` lock dir is owned by the mux
+    /// worker — the resume scan leaves it in place (InProgress). As of R3
+    /// finding 2 it is restart-counted on the InProgress skip too, so a
+    /// non-watchdog hard kill mid-mux (which left the count un-bumped) still
+    /// walks toward `.failed` over RESTART_LIMIT restarts rather than looping.
     #[test]
-    fn muxing_marker_is_in_progress_and_not_restart_counted() {
+    fn muxing_marker_is_in_progress_and_restart_counted() {
         let root = tmpdir();
         let disc = root.join("MyDisc");
         fs::create_dir_all(&disc).unwrap();
@@ -1786,7 +1911,7 @@ mod tests {
         let hints = resume_or_quarantine_staging(root.to_str().unwrap());
         assert_eq!(hints.len(), 1);
         assert!(matches!(hints[0].action, ResumeAction::InProgress));
-        assert_eq!(restart_count(&disc), 0);
+        assert_eq!(restart_count(&disc), 1);
         assert!(!disc.join(FAILED_MARKER).exists());
     }
 
@@ -1856,10 +1981,13 @@ mod tests {
         assert_eq!(restart_count(&disc), 0);
     }
 
-    /// Convergence R2 finding 1 boundary: a single benign restart of a healthy
-    /// long sweep (count BELOW the limit) must still be left InProgress and
-    /// must NOT be restart-counted by the resume scan (the carve-out's original
-    /// intent). Only the watchdog bumps the counter; the scan must not.
+    /// Convergence R2 finding 1 boundary, updated for R3 finding 2: a restart of
+    /// an owned `.muxing` dir whose count is BELOW the limit (pre-bump
+    /// `rc < RESTART_LIMIT`) is still left InProgress and preserved — but the
+    /// scan now bumps the counter on the skip (R3 finding 2) so a non-watchdog
+    /// hard kill doesn't loop with the count pinned. Pre-bump RESTART_LIMIT-1 is
+    /// below the failure gate, so the dir stays InProgress; the count advances to
+    /// RESTART_LIMIT, failing on the NEXT restart.
     #[test]
     fn muxing_below_restart_limit_stays_in_progress() {
         let root = tmpdir();
@@ -1883,9 +2011,9 @@ mod tests {
         );
         assert!(!disc.join(FAILED_MARKER).exists());
         assert!(disc.join(MUXING_MARKER).exists());
-        // The scan must NOT bump the counter — it stays exactly where the
-        // watchdog left it.
-        assert_eq!(restart_count(&disc), RESTART_LIMIT - 1);
+        // R3 finding 2: the scan bumps the counter on the InProgress skip — the
+        // dir advances to the limit and fails on the next restart.
+        assert_eq!(restart_count(&disc), RESTART_LIMIT);
     }
 
     /// H2/M1: the `.sweeping` marker is superseded by every terminal/hand-off
