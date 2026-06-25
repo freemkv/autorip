@@ -179,11 +179,26 @@ pub fn resolve(staging_root: &str, dir: &str, action: Resolve) -> Result<(), Str
             // `.failed` marker at all — invisible to the mover, the UI, and
             // the re-rip guard — while still reporting success to the
             // operator.
-            crate::ripper::staging::write_handoff_marker(
-                &d.join(".failed"),
-                b"cancelled by operator\n",
-            )
-            .map_err(|e| e.to_string())?;
+            //
+            // Write `.failed` as structured JSON `{"reason":...}` rather than a
+            // raw non-JSON body. `read_failed_reason` only parses JSON, so the
+            // old plain "cancelled by operator\n" body returned None and any
+            // terminal-ness check keying on a parseable reason wouldn't fire
+            // (M2). We go through `write_handoff_marker` (the durable
+            // tmp+fsync+rename writer) rather than `write_failed_marker` because
+            // that helper is best-effort/non-propagating, and the contract here
+            // requires surfacing a write failure (and preserving `.review`) so a
+            // failed cancel isn't reported as success. The JSON shape matches
+            // `write_failed_marker`'s so `read_failed_reason` recovers the
+            // reason; presence-based checks recognise it regardless.
+            let failed_body = serde_json::json!({
+                "reason": "cancelled by operator",
+                "timestamp": crate::util::format_iso_datetime(),
+            });
+            let failed_str =
+                serde_json::to_string_pretty(&failed_body).map_err(|e| e.to_string())?;
+            crate::ripper::staging::write_handoff_marker(&d.join(".failed"), failed_str.as_bytes())
+                .map_err(|e| e.to_string())?;
             std::fs::remove_file(&review).map_err(|e| e.to_string())?;
         }
     }
@@ -336,6 +351,17 @@ mod tests {
         resolve(tmp.to_str().unwrap(), "Held", Resolve::Cancel).unwrap();
         assert!(held.join(".failed").exists());
         assert!(!held.join(".review").exists());
+
+        // M2: the `.failed` marker is valid JSON carrying a machine-readable
+        // reason, so `read_failed_reason` recovers it (the legacy non-JSON
+        // "cancelled by operator\n" body parsed to None and defeated the
+        // reason-keyed terminal checks).
+        let reason = crate::ripper::staging::read_failed_reason(&held);
+        assert_eq!(
+            reason.as_deref(),
+            Some("cancelled by operator"),
+            "cancel must write a JSON .failed whose reason round-trips"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

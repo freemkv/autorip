@@ -104,7 +104,14 @@ pub fn write_marker(staging_dir: &Path, marker: &RippedMarker) -> std::io::Resul
     // primitive the rest of autorip's markers use. A plain `fs::write` here
     // could leave a torn/empty `.ripped` on a crash mid-write, which the mux
     // worker would then fail to parse — losing the hand-off.
-    crate::ripper::staging::write_marker_durable(&path, json.as_bytes())
+    crate::ripper::staging::write_marker_durable(&path, json.as_bytes())?;
+    // The `.ripped` hand-off supersedes the in-progress `.sweeping` marker
+    // `rip_disc` wrote at staging-dir creation. Clear it only after `.ripped`
+    // is durably on disk, so a crash between the two never leaves the dir with
+    // neither marker (which the resume scan would treat as orphaned partial
+    // state and restart-count).
+    crate::ripper::staging::clear_sweeping_marker(staging_dir);
+    Ok(())
 }
 
 pub fn read_marker(staging_dir: &Path) -> std::io::Result<RippedMarker> {
@@ -252,13 +259,30 @@ pub(crate) fn mux_dispatch_verdict(
     let Some(snap) = snap else {
         return MuxVerdict::SkipUnknown;
     };
-    if snap.completed || snap.failed_reason.is_some() {
+    // Terminal on `.failed` PRESENCE (`has_failed`), not on a parseable
+    // reason. review.rs writes a non-JSON `.failed` ("cancelled by operator")
+    // whose `failed_reason` is None; keying on `failed_reason.is_some()` here
+    // would let the worker re-dispatch a `.ripped`+`.failed` dir forever.
+    if snap.completed || snap.has_failed {
         return MuxVerdict::SkipTerminal;
     }
     if !snap.has_ripped {
         return MuxVerdict::SkipNoMarker;
     }
     MuxVerdict::Dispatch
+}
+
+/// RAII cleanup for the `.muxing` exclusion lock. Removing the marker on drop
+/// guarantees it is cleared on every exit of one `check_and_mux` loop iteration
+/// — the success branch, the failure branch, or a panic in the mux pipeline —
+/// so a crashed/aborted mux never strands a stale `.muxing` lock that would
+/// permanently hide the dir from the drive-resume paths.
+struct MuxingGuard<'a>(&'a Path);
+
+impl Drop for MuxingGuard<'_> {
+    fn drop(&mut self) {
+        crate::ripper::staging::clear_muxing_marker(self.0);
+    }
 }
 
 /// Find all staging dirs with a `.ripped` marker and dispatch each
@@ -377,6 +401,15 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             "mux worker: dispatching .ripped marker"
         );
         crate::log::syslog(&format!("Muxing: {} (worker)", title));
+        // Register an exclusion lock for the duration of the mux. The drive
+        // paths (`disc_already_completed` auto-insert, `find_resumable_for_disc`)
+        // skip any dir carrying `.muxing`, so a disc re-insert can't run a fresh
+        // sweep that truncates the ISO this worker is reading, nor double-mux
+        // the same output. Cleared on every exit of this iteration (success or
+        // failure) via the `_guard` drop below — the dir is then governed by
+        // `.completed`/`.failed`/`.ripped` instead.
+        crate::ripper::staging::write_muxing_marker(&dir);
+        let _guard = MuxingGuard(&dir);
         let outcome = crate::ripper::resume::remux_from_ripped_marker(cfg_arc, &dir, &marker);
         if outcome.success {
             clear_error(&dir.to_string_lossy());
@@ -861,6 +894,10 @@ mod tests {
         Ripped,
         Completed,
         Failed,
+        /// A non-JSON `.failed` body (review.rs operator-cancel). Pins that the
+        /// dispatch verdict keys on marker PRESENCE (`has_failed`), not a
+        /// parseable `failed_reason` (M2).
+        FailedNonJson,
         Done,
         Review,
         Iso,
@@ -883,6 +920,9 @@ mod tests {
                 }
                 M::Completed => crate::ripper::staging::write_completed_marker(&dir),
                 M::Failed => crate::ripper::staging::write_failed_marker(&dir, "test failure"),
+                M::FailedNonJson => {
+                    std::fs::write(dir.join(".failed"), b"cancelled by operator\n").unwrap()
+                }
                 M::Done => std::fs::write(dir.join(".done"), b"{}").unwrap(),
                 M::Review => std::fs::write(dir.join(".review"), b"{}").unwrap(),
                 M::Iso => std::fs::write(dir.join("Disc.iso"), b"x").unwrap(),
@@ -954,6 +994,19 @@ mod tests {
                 &[Ripped, Iso, Mapfile, Failed],
                 MuxVerdict::SkipTerminal,
                 "aborted hand-off with artifacts still present — terminal",
+            ),
+            // --- M2: a non-JSON `.failed` body is still terminal. The verdict
+            //     keys on `has_failed` (presence), not `failed_reason`. A
+            //     .ripped + non-JSON .failed must NOT re-dispatch forever. ---
+            (
+                &[FailedNonJson],
+                MuxVerdict::SkipTerminal,
+                "non-JSON .failed alone: terminal by presence",
+            ),
+            (
+                &[Ripped, FailedNonJson],
+                MuxVerdict::SkipTerminal,
+                "M2: .ripped + non-JSON .failed (no parseable reason) — terminal, never re-dispatch",
             ),
             // --- conflict: .completed + .failed both present ---
             (
