@@ -153,9 +153,10 @@ fn main() {
     // Ensure KEYDB exists — download on first boot if URL is configured
     if online_keys {
         log::syslog("Online key source — skipping local KEYDB download");
-    } else if libfreemkv::keydb::default_path()
+    } else if cfg
+        .read()
         .ok()
-        .map(|p| p.exists())
+        .map(|c| keysource::keydb_exists(&c))
         .unwrap_or(false)
     {
         log::syslog("KEYDB found");
@@ -173,12 +174,22 @@ fn main() {
             match web::guarded_get(&url) {
                 Ok(resp) => {
                     match web::read_capped_keydb_body(resp.into_reader(), web::KEYDB_MAX_BYTES) {
-                        Ok(buf) => match libfreemkv::keydb::save(&buf) {
-                            Ok(r) => {
-                                log::syslog(&format!("KEYDB downloaded: {} entries", r.entries))
+                        Ok(buf) => {
+                            let saved = cfg
+                                .read()
+                                .map_err(|_| libfreemkv::Error::KeydbWrite {
+                                    path: "<config lock poisoned>".into(),
+                                })
+                                .and_then(|c| keysource::save_keydb(&c, &buf));
+                            match saved {
+                                Ok(r) => log::syslog(&format!(
+                                    "KEYDB downloaded: {} entries -> {}",
+                                    r.entries,
+                                    r.path.display()
+                                )),
+                                Err(e) => log::syslog(&format!("KEYDB save failed: {e}")),
                             }
-                            Err(e) => log::syslog(&format!("KEYDB save failed: {e}")),
-                        },
+                        }
                         Err(web::KeydbReadError::TooLarge) => {
                             log::syslog("KEYDB download failed: response exceeded size limit")
                         }
@@ -251,12 +262,22 @@ fn main() {
                     Ok(resp) => {
                         match web::read_capped_keydb_body(resp.into_reader(), web::KEYDB_MAX_BYTES)
                         {
-                            Ok(buf) => match libfreemkv::keydb::save(&buf) {
-                                Ok(r) => {
-                                    log::syslog(&format!("KEYDB updated: {} entries", r.entries))
+                            Ok(buf) => {
+                                let saved = cfg2
+                                    .read()
+                                    .map_err(|_| libfreemkv::Error::KeydbWrite {
+                                        path: "<config lock poisoned>".into(),
+                                    })
+                                    .and_then(|c| keysource::save_keydb(&c, &buf));
+                                match saved {
+                                    Ok(r) => log::syslog(&format!(
+                                        "KEYDB updated: {} entries -> {}",
+                                        r.entries,
+                                        r.path.display()
+                                    )),
+                                    Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
                                 }
-                                Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
-                            },
+                            }
                             Err(web::KeydbReadError::TooLarge) => {
                                 log::syslog("KEYDB daily update: response exceeded size limit")
                             }
