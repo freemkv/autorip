@@ -674,7 +674,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
         Ok(d) => d,
         Err(e) => {
-            let msg = format!("Cannot open drive: {}", e);
+            let msg = format_lib_error("Cannot open drive", &e);
             crate::log::device_log(device, &msg);
             update_state(
                 device,
@@ -705,13 +705,14 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let disc_id = match libfreemkv::Disc::identify(&mut drive) {
         Ok(id) => id,
         Err(e) => {
-            crate::log::device_log(device, &format!("Identify failed: {}", e));
+            let msg = format_lib_error("Could not read the disc", &e);
+            crate::log::device_log(device, &msg);
             update_state(
                 device,
                 RipState {
                     device: device.to_string(),
                     status: "error".to_string(),
-                    last_error: format!("Identify failed: {}", e),
+                    last_error: msg,
                     ..Default::default()
                 },
             );
@@ -764,13 +765,14 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
         Ok(d) => d,
         Err(e) => {
-            crate::log::device_log(device, &format!("Scan failed: {}", e));
+            let msg = format_lib_error("Disc scan", &e);
+            crate::log::device_log(device, &msg);
             update_state(
                 device,
                 RipState {
                     device: device.to_string(),
                     status: "error".to_string(),
-                    last_error: format!("Scan failed: {}", e),
+                    last_error: msg,
                     ..Default::default()
                 },
             );
@@ -1770,7 +1772,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
                 Ok(d) => d,
                 Err(e) => {
-                    let msg = format!("Cannot open drive: {}", e);
+                    let msg = format_lib_error("Cannot open drive", &e);
                     crate::log::device_log(device, &msg);
                     update_state(
                         device,
@@ -1806,7 +1808,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
                 Ok(d) => d,
                 Err(e) => {
-                    let msg = format!("Scan failed: {}", e);
+                    let msg = format_lib_error("Disc scan", &e);
                     crate::log::device_log(device, &msg);
                     update_state(
                         device,
@@ -3747,7 +3749,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     r
                 }
                 Err(e) => {
-                    crate::log::device_log(device, &format!("Open ISO failed: {e}"));
+                    let msg = format_lib_error("Open ISO", &e);
+                    crate::log::device_log(device, &msg);
                     // Cannot open the ISO for mux — if the sweep was
                     // interrupted before any ISO data flushed (and the
                     // `.ripped` hand-off also failed, which is the only way
@@ -3756,10 +3759,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     // so the restart scan classifies it terminal instead of
                     // leaving it stranded `InProgress`.
                     let staging_disc_path = std::path::Path::new(&staging);
-                    staging::write_failed_marker(
-                        staging_disc_path,
-                        &format!("cannot open ISO for mux: {e}"),
-                    );
+                    staging::write_failed_marker(staging_disc_path, &msg);
                     staging::clear_restart_count(staging_disc_path);
                     update_state(
                         device,
@@ -3767,8 +3767,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                             device: device.to_string(),
                             status: "failed".to_string(),
                             disc_present: true,
-                            last_error: format!("cannot open ISO for mux: {e}"),
-                            failure_reason: Some(format!("cannot open ISO for mux: {e}")),
+                            last_error: msg.clone(),
+                            failure_reason: Some(msg),
                             disc_name: display_name,
                             disc_format,
                             tmdb_title,
@@ -3935,7 +3935,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             Ok(s) => Box::new(s),
             Err(e) => {
                 tracing::error!(target: "mux", device=%device, "build_iso_pipeline failed: {e}");
-                crate::log::device_log(device, &format!("Mux pipeline build failed: {e}"));
+                let msg = format!(
+                    "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
+                );
+                crate::log::device_log(device, &msg);
                 // A pipeline BUILD failure (header resolution, codec
                 // negotiation, format error) is structural and permanent —
                 // retries won't fix it. Quarantine the dir with `.failed`
@@ -3943,15 +3946,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // restart scan classifies it terminal instead of leaving
                 // it stranded `InProgress`.
                 let staging_disc_path = std::path::Path::new(&staging);
-                staging::write_failed_marker(
-                    staging_disc_path,
-                    &format!("mux pipeline build failed: {e}"),
-                );
+                staging::write_failed_marker(staging_disc_path, &msg);
                 staging::clear_restart_count(staging_disc_path);
                 update_state_with(device, |s| {
                     s.status = "failed".to_string();
-                    s.last_error = format!("mux pipeline build failed: {e}");
-                    s.failure_reason = Some(format!("mux pipeline build failed: {e}"));
+                    s.last_error = msg.clone();
+                    s.failure_reason = Some(msg.clone());
                 });
                 unregister_halt(device);
                 return;
@@ -5332,6 +5332,145 @@ fn format_pass_error(pass_label: &str, e: &libfreemkv::Error) -> String {
     format!("{}{} failed: {} — {}", pass_label, location, cause, action)
 }
 
+/// Render a libfreemkv setup/scan/mux error into a plain-English,
+/// operator-facing line for `last_error` / `failure_reason` (the UI red
+/// banner) and the device log.
+///
+/// The library's `Display` is deliberately code-only (`E1002: /dev/sg0`,
+/// `E6009`) — language-neutral, but useless to a human and a direct rubric
+/// violation if surfaced verbatim. This helper maps the variants autorip
+/// reaches off the drive-open / identify / scan / open-ISO / mux-build paths
+/// into "what failed, why if known, what to do next" without leaking a raw
+/// `E####` code or an internal path.
+///
+/// `phase` is a short human label for where it failed ("Cannot open drive",
+/// "Disc scan", "Open ISO", "Mux setup") that leads the sentence.
+fn format_lib_error(phase: &str, e: &libfreemkv::Error) -> String {
+    use libfreemkv::Error;
+
+    // Drive read failures carry SCSI sense — reuse the sense decoder so the
+    // operator gets the same "media damage / power-cycle the drive" guidance
+    // the pass-error path produces, rather than a bare sector dump.
+    if e.scsi_sense().is_some() {
+        return format_pass_error(phase, e);
+    }
+
+    let detail = match e {
+        // ── Drive / device layer (1xxx) ───────────────────────────────
+        Error::DeviceNotFound { .. } => {
+            "the drive could not be found. It may have been unplugged or moved to a \
+             different device path — check the connection and rescan."
+        }
+        Error::DevicePermission { .. } => {
+            "autorip is not allowed to access the drive. The container needs \
+             `privileged: true` and `/dev:/dev` mounted — verify the compose file."
+        }
+        Error::DeviceNotReady { .. } => {
+            "the drive is not ready. Make sure a disc is loaded and seated, wait a few \
+             seconds, then retry."
+        }
+        Error::DeviceResetFailed { .. } | Error::DeviceLocked { .. } => {
+            "the drive is wedged and could not be reset. Eject the disc and \
+             power-cycle the drive, then retry."
+        }
+        Error::ScsiInterfaceUnavailable { .. } | Error::IoKitPluginFailed { .. } => {
+            "autorip could not open a command channel to the drive. The container \
+             needs `privileged: true` and `/dev:/dev` — verify the compose file, then \
+             restart the container."
+        }
+        Error::UnsupportedDrive { .. } | Error::ProfileParse => {
+            "this drive model is not supported for ripping."
+        }
+        Error::UnsupportedPlatform { .. } | Error::PlatformNotImplemented { .. } => {
+            "this operation is not supported on this platform."
+        }
+
+        // ── Unlock / signature (3xxx) ─────────────────────────────────
+        Error::UnlockFailed | Error::SignatureMismatch { .. } => {
+            "the drive could not be unlocked for raw reads. It may need a firmware \
+             flash or a supported drive to rip this disc."
+        }
+
+        // ── SCSI / IO without sense data ──────────────────────────────
+        Error::ScsiError { .. } | Error::InvalidCdbLength { .. } => {
+            "the drive returned a command error. Eject the disc and power-cycle the \
+             drive, then retry."
+        }
+        Error::IoError { source } => return format!("{phase} failed: {source}"),
+
+        // ── Disc structure / scan (6xxx) ──────────────────────────────
+        Error::DiscRead { .. } => {
+            "the disc could not be read. It may be dirty, scratched, or unreadable in \
+             this drive — clean the disc and retry, or try another drive."
+        }
+        Error::UdfNotFound { .. } => {
+            "no filesystem was found on the disc. It may be blank, unfinalized, or not \
+             a video disc."
+        }
+        Error::MplsParse | Error::ClpiParse | Error::IfoParse | Error::DiscTitleRange { .. } => {
+            "the disc's title structure could not be read. The disc may be damaged or \
+             use an unsupported layout."
+        }
+        Error::NoStreams => {
+            "no playable video was found on the disc. It may be damaged or not a \
+             standard video disc."
+        }
+        Error::MkvInvalid => "the muxed output is not a valid MKV file.",
+        Error::Halted => "the rip was stopped.",
+        Error::MapfileInvalid { .. } => {
+            "the recovery map for a previous attempt is corrupt. Start a fresh rip to \
+             rebuild it."
+        }
+
+        // ── Decryption (7xxx) — defer to the AACS/CSS humanizer ────────
+        Error::DecryptFailed
+        | Error::CssKeyMissing
+        | Error::CssAuthFailed
+        | Error::NoDiscKey { .. } => {
+            return format!(
+                "{phase} failed: {}",
+                strip_error_prefix(&aacs_failure_message(Some(e)))
+            );
+        }
+
+        // ── Mux / output (9xxx) ───────────────────────────────────────
+        Error::IsoTooLarge { .. } | Error::DiscCapacityOverflow | Error::DiscCapacityMalformed => {
+            "the drive reported an unusable disc capacity. Clean the disc and retry, or \
+             try another drive."
+        }
+        Error::NoMetadata => "the disc carries no usable metadata.",
+        Error::MuxEmpty => {
+            "the disc produced no output. It may be damaged or contain no playable \
+             video."
+        }
+        Error::HevcParamParse
+        | Error::PesInvalidMagic
+        | Error::PesFrameTooLarge { .. }
+        | Error::PesTrackTooLarge { .. }
+        | Error::MuxTrackRange { .. }
+        | Error::M2tsPacketMalformed => {
+            "the disc's video stream could not be parsed for muxing. The source may be \
+             damaged or use an unsupported encoding."
+        }
+        Error::DemuxThreadPanicked
+        | Error::PipelineJoinTimeout
+        | Error::PipelineConsumerPanicked
+        | Error::PipelineConsumerGone
+        | Error::SweepConsumerGone => {
+            "the mux pipeline failed unexpectedly. Retry the rip; if it persists, \
+             enable debug logging via /api/debug and report it."
+        }
+
+        // Any other variant: a generic, honest line with no leaked code.
+        _ => {
+            "an unexpected error occurred. Enable debug logging via /api/debug for \
+             details."
+        }
+    };
+
+    format!("{phase} failed: {detail}")
+}
+
 /// Open a drive during transport-failure recovery, retrying with
 /// exponential backoff because firmware may not be ready for several
 /// seconds after a USB-bridge crash re-enumerates the device (whether on
@@ -5447,10 +5586,11 @@ mod tests {
 
     use super::{
         HaltGuard, SweepingGuard, aacs_failure_message, disk_space_preflight_message,
-        format_pass_error, header_phase_outcome_is_failure, incomplete_mux_status,
-        is_safe_staging_segment, list_staging_basenames, prune_intermediate_iso, register_halt,
-        resumable_dir_blocked, resumable_for_disc, staging_dir_matches_disc,
-        staging_disc_completed, staging_disc_owned_by_worker, staging_free_bytes,
+        format_lib_error, format_pass_error, header_phase_outcome_is_failure,
+        incomplete_mux_status, is_safe_staging_segment, list_staging_basenames,
+        prune_intermediate_iso, register_halt, resumable_dir_blocked, resumable_for_disc,
+        staging_dir_matches_disc, staging_disc_completed, staging_disc_owned_by_worker,
+        staging_free_bytes,
     };
     use crate::ripper::session::device_halt;
     use crate::ripper::staging;
@@ -5974,6 +6114,119 @@ mod tests {
             s.to_lowercase().contains("mapfile invalid"),
             "msg must label the code: {s}"
         );
+    }
+
+    // ── format_lib_error: setup/scan/open/mux phase rendering ─────────
+    //
+    // The library Display is code-only (`E1002: /dev/sg0`). Every variant
+    // autorip reaches off the drive-open / identify / scan / open-ISO paths
+    // must render as plain English with NO raw `E####` code and NO leaked
+    // device path, leading with the phase label.
+
+    #[test]
+    fn format_lib_error_device_permission_says_privileged_not_code() {
+        let e = Error::DevicePermission {
+            path: "/dev/sg0".into(),
+        };
+        let s = format_lib_error("Cannot open drive", &e);
+        assert!(s.starts_with("Cannot open drive failed:"), "msg: {s}");
+        assert!(s.to_lowercase().contains("privileged"), "msg: {s}");
+        // No raw code, no leaked device path.
+        assert!(!s.contains("E1001"), "msg leaks code: {s}");
+        assert!(!s.contains("/dev/sg0"), "msg leaks path: {s}");
+    }
+
+    #[test]
+    fn format_lib_error_device_not_found_actionable() {
+        let e = Error::DeviceNotFound {
+            path: "/dev/sg9".into(),
+        };
+        let s = format_lib_error("Cannot open drive", &e);
+        assert!(s.to_lowercase().contains("unplugged"), "msg: {s}");
+        assert!(!s.contains("E1000"), "msg: {s}");
+        assert!(!s.contains("/dev/sg9"), "msg: {s}");
+    }
+
+    #[test]
+    fn format_lib_error_no_streams_plain_english() {
+        let s = format_lib_error("Disc scan", &Error::NoStreams);
+        assert!(s.starts_with("Disc scan failed:"), "msg: {s}");
+        assert!(s.to_lowercase().contains("no playable video"), "msg: {s}");
+        assert!(!s.contains("E6009"), "msg leaks code: {s}");
+    }
+
+    #[test]
+    fn format_lib_error_udf_not_found_blank_disc_hint() {
+        let e = Error::UdfNotFound {
+            path: "/some/internal/path".into(),
+        };
+        let s = format_lib_error("Disc scan", &e);
+        assert!(s.to_lowercase().contains("filesystem"), "msg: {s}");
+        assert!(!s.contains("E6003"), "msg: {s}");
+        assert!(!s.contains("/some/internal/path"), "msg leaks path: {s}");
+    }
+
+    #[test]
+    fn format_lib_error_disc_read_advises_clean_disc() {
+        // A DiscRead WITHOUT sense data (no SCSI triple) — must still render
+        // a plain-English clean-the-disc message, not a bare code or sector.
+        let e = Error::DiscRead {
+            sector: 12345,
+            status: None,
+            sense: None,
+        };
+        let s = format_lib_error("Disc scan", &e);
+        assert!(s.to_lowercase().contains("could not be read"), "msg: {s}");
+        assert!(!s.contains("E6000"), "msg leaks code: {s}");
+        assert!(!s.contains("12345"), "msg leaks sector: {s}");
+    }
+
+    #[test]
+    fn format_lib_error_disc_read_with_sense_uses_pass_decoder() {
+        // A DiscRead WITH sense data routes through format_pass_error, so the
+        // operator gets the media-damage cause + Pass-2 guidance.
+        let e = Error::DiscRead {
+            sector: 1_000_000,
+            status: Some(2),
+            sense: Some(ScsiSense {
+                sense_key: 3,
+                asc: 0x11,
+                ascq: 0,
+            }),
+        };
+        let s = format_lib_error("Disc scan", &e);
+        assert!(s.to_lowercase().contains("bad sector"), "msg: {s}");
+        assert!(!s.contains("E6000"), "msg leaks code: {s}");
+    }
+
+    #[test]
+    fn format_lib_error_io_error_surfaces_inner_message() {
+        // io::Error Display is already plain English — surface it directly,
+        // no synthetic phrasing, no code.
+        let e = Error::IoError {
+            source: std::io::Error::other("no space left on device"),
+        };
+        let s = format_lib_error("Open output file", &e);
+        assert!(s.starts_with("Open output file failed:"), "msg: {s}");
+        assert!(s.contains("no space left on device"), "msg: {s}");
+    }
+
+    #[test]
+    fn format_lib_error_decrypt_defers_to_aacs_humanizer() {
+        let s = format_lib_error("Disc scan", &Error::CssKeyMissing);
+        // Routed through aacs_failure_message → CSS-specific text, prefix stripped.
+        assert!(s.starts_with("Disc scan failed:"), "msg: {s}");
+        assert!(s.to_lowercase().contains("unscramble"), "msg: {s}");
+        // The stripped form must NOT carry the Error:/E#### prefix.
+        assert!(!s.contains("E7023"), "msg leaks code: {s}");
+    }
+
+    #[test]
+    fn format_lib_error_never_leaks_bare_code_for_unmapped_variant() {
+        // An unmapped variant must hit the generic arm, not dump a code.
+        let s = format_lib_error("Disc scan", &Error::ProfileParse);
+        assert!(s.starts_with("Disc scan failed:"), "msg: {s}");
+        assert!(!s.contains("E2002"), "msg leaks code: {s}");
     }
 
     // ── aacs_failure_message dispatch ────────────────────────────────
