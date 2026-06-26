@@ -30,13 +30,15 @@ use super::staging::{self, ResumeAction, StagingResumeHint};
 
 /// Fallback title bitrate (bytes/sec) used to convert bad-byte counts
 /// into estimated lost title-seconds when the real per-title bitrate is
-/// unknown (≈ 8.25 Mbps). Shared by `classify_resume`'s pre-flight
+/// unknown. 8.25 MB/s = 66 Mbit/s — a conservative mid-range average for a
+/// UHD Blu-ray main feature (UHD BD runs ~50–100+ Mbps). Shared by
+/// `classify_resume`'s pre-flight
 /// estimate and `resume_remux`'s post-`scan_image` re-validation so the
 /// two cannot silently diverge. The authoritative title-scoped re-check
 /// in `resume_remux` (real per-title bitrate + `bytes_bad_in_title`) is
 /// what ultimately gates the mux. Single source of truth so the value
 /// can't drift across call sites.
-pub(super) const FALLBACK_BITRATE_BYTES_PER_SEC: f64 = 8_250_000.0;
+pub(crate) const FALLBACK_BITRATE_BYTES_PER_SEC: f64 = 8_250_000.0;
 
 /// Sentinel device path passed to `detect_max_batch_sectors` from the
 /// resume-remux path. There is no live drive here — we mux from a staged
@@ -103,7 +105,7 @@ pub enum ResumeClass {
 /// - if the disc has a muxable title (UDF read via `Disc::scan_image`
 ///   is deferred to the actor for cost reasons; the classifier
 ///   approximates with the whole-disc `Unreadable` bytes), the bad
-///   bytes converted to title-seconds (via the 8.25 Mbps fallback
+///   bytes converted to title-seconds (via the 66 Mbps fallback
 ///   bitrate, same constant `rip_disc` uses) are within
 ///   `abort_on_lost_secs`.
 ///
@@ -793,10 +795,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             &title,
             &bad_ranges,
             title_bytes_per_sec,
-        ) / 1000.0;
+        ) / crate::util::MILLIS_PER_SEC;
         if super::should_abort_for_loss(
-            lost_secs * 1000.0,
-            (cfg_read.abort_on_lost_secs * 1000) as f64,
+            lost_secs * crate::util::MILLIS_PER_SEC,
+            cfg_read.abort_on_lost_secs as f64 * crate::util::MILLIS_PER_SEC,
         ) {
             // "disc loss" for raw ISO (whole-disc scope), "title loss" for a
             // muxed MKV/M2TS (in-title scope) — matching how `lost_secs` was
@@ -963,11 +965,11 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         let main_title_bad = map.ranges_with(&[SectorStatus::Unreadable]);
         let main_title_bad_bytes = libfreemkv::disc::bytes_bad_in_title(&title, &main_title_bad);
         let main_lost_ms = if title_bytes_per_sec > 0.0 {
-            main_title_bad_bytes as f64 * 1000.0 / title_bytes_per_sec
+            main_title_bad_bytes as f64 * crate::util::MILLIS_PER_SEC / title_bytes_per_sec
         } else {
             0.0
         };
-        let errors = (map.stats().bytes_unreadable / 2048) as u32;
+        let errors = (map.stats().bytes_unreadable / crate::util::SECTOR_BYTES) as u32;
         super::mux::SweepDamageSnapshot {
             errors,
             total_lost_ms,
@@ -1384,7 +1386,8 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // are disjoint (sweep = Unreadable sectors baked into the ISO; demux =
     // decrypt/codec skips at mux), so they add.
     let done_errors = done_sweep_damage.errors.saturating_add(mux_outcome.errors);
-    let done_lost_video_secs = done_sweep_damage.main_lost_ms / 1000.0 + demux_lost_secs;
+    let done_lost_video_secs =
+        done_sweep_damage.main_lost_ms / crate::util::MILLIS_PER_SEC + demux_lost_secs;
 
     // 5. Success — write .completed marker, drop the hand-off marker for
     // the mover, clear .restart_count. Same shape as the rip_disc
@@ -1550,8 +1553,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             // classifier rates the disc on the loss actually in the MKV.
             errors: done_errors,
             lost_video_secs: done_lost_video_secs,
-            total_lost_ms: done_sweep_damage.total_lost_ms + demux_lost_secs * 1000.0,
-            main_lost_ms: done_sweep_damage.main_lost_ms + demux_lost_secs * 1000.0,
+            total_lost_ms: done_sweep_damage.total_lost_ms
+                + demux_lost_secs * crate::util::MILLIS_PER_SEC,
+            main_lost_ms: done_sweep_damage.main_lost_ms
+                + demux_lost_secs * crate::util::MILLIS_PER_SEC,
             bad_ranges: done_sweep_damage.bad_ranges.clone(),
             num_bad_ranges: done_sweep_damage.num_bad_ranges,
             bad_ranges_truncated: done_sweep_damage.bad_ranges_truncated,
@@ -1578,7 +1583,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             poster_url: &tmdb_poster,
             duration: &duration,
             codecs: &done_codecs,
-            size_gb: mux_outcome.bytes_done as f64 / 1_073_741_824.0,
+            size_gb: mux_outcome.bytes_done as f64 / crate::util::BYTES_PER_GIB,
             speed_mbs: mux_outcome.speed_mbs,
             elapsed_secs: mux_outcome.elapsed_secs,
             output_path: &staging_str,
@@ -1963,7 +1968,8 @@ mod resume_abort_scope_tests {
         let title = title_lba(1000, 1000);
         let bad = vec![(0u64, 50 * 2048)];
         let lost_secs =
-            crate::ripper::abort_lost_ms(/* output_is_iso */ true, &title, &bad, bps) / 1000.0;
+            crate::ripper::abort_lost_ms(/* output_is_iso */ true, &title, &bad, bps)
+                / crate::util::MILLIS_PER_SEC;
         assert!(
             lost_secs > 0.0,
             "iso resume must count whole-disc (out-of-title) loss"
@@ -1978,7 +1984,8 @@ mod resume_abort_scope_tests {
         let title = title_lba(1000, 1000);
         let bad = vec![(0u64, 50 * 2048)];
         let lost_secs =
-            crate::ripper::abort_lost_ms(/* output_is_iso */ false, &title, &bad, bps) / 1000.0;
+            crate::ripper::abort_lost_ms(/* output_is_iso */ false, &title, &bad, bps)
+                / crate::util::MILLIS_PER_SEC;
         assert_eq!(
             lost_secs, 0.0,
             "mkv resume must ignore out-of-title loss (in-title scope)"
@@ -2404,7 +2411,9 @@ mod post_mux_loss_gate_tests {
             "accepted resume must add demux errors to sweep errors"
         );
         assert!(
-            region.contains("done_sweep_damage.main_lost_ms / 1000.0 + demux_lost_secs"),
+            region.contains(
+                "done_sweep_damage.main_lost_ms / crate::util::MILLIS_PER_SEC + demux_lost_secs"
+            ),
             "accepted resume must add demux lost seconds to sweep main loss"
         );
         // Both the done card and the webhook must consume the combined figures,
@@ -2419,7 +2428,9 @@ mod post_mux_loss_gate_tests {
         );
         // Guard against regressing to the sweep-only webhook figures.
         assert!(
-            !region.contains("lost_video_secs: done_sweep_damage.main_lost_ms / 1000.0"),
+            !region.contains(
+                "lost_video_secs: done_sweep_damage.main_lost_ms / crate::util::MILLIS_PER_SEC"
+            ),
             "webhook must not report sweep-only loss, hiding demux loss"
         );
     }

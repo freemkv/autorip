@@ -42,6 +42,7 @@ pub use state::{
 // here because we are the parent of `state` / `session` / `staging`.
 use libfreemkv::event::BatchSizeReason;
 
+use crate::util::{BYTES_PER_GIB, BYTES_PER_MIB, MILLIS_PER_SEC};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -2919,9 +2920,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             device,
             &format!(
                 "Pass 1 done: {:.2} GB good, {:.2} MB unreadable, {:.2} MB pending",
-                result.bytes_good as f64 / 1_073_741_824.0,
-                result.bytes_unreadable as f64 / 1_048_576.0,
-                result.bytes_pending as f64 / 1_048_576.0,
+                result.bytes_good as f64 / BYTES_PER_GIB,
+                result.bytes_unreadable as f64 / BYTES_PER_MIB,
+                result.bytes_pending as f64 / BYTES_PER_MIB,
             ),
         );
 
@@ -3188,8 +3189,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 device,
                 &format!(
                     "Pass {pass} done: recovered {:.2} MB; {:.2} MB still unreadable{exit_str}",
-                    recovered as f64 / 1_048_576.0,
-                    bytes_unreadable as f64 / 1_048_576.0,
+                    recovered as f64 / BYTES_PER_MIB,
+                    bytes_unreadable as f64 / BYTES_PER_MIB,
                 ),
             );
             // Drop this pass's watcher before next iteration.
@@ -3208,7 +3209,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     &format!(
                         "PASS {} STOPPED: strategy=patch_recovery exhausted — no progress (recovered={} MB) after all retry attempts",
                         pass,
-                        recovered as f64 / 1_048_576.0
+                        recovered as f64 / BYTES_PER_MIB
                     ),
                 );
 
@@ -3342,7 +3343,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         &promoted_main_title_bad,
                     );
                     let promoted_main_lost_ms = if bps_progress > 0.0 {
-                        promoted_main_bad_bytes as f64 * 1000.0 / bps_progress
+                        promoted_main_bad_bytes as f64 * MILLIS_PER_SEC / bps_progress
                     } else {
                         0.0
                     };
@@ -3365,7 +3366,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     device,
                     &format!(
                         "ABORT: strategy=abort_check triggered — {:.2}s lost in main movie (threshold: {}s)",
-                        main_lost_ms_for_history / 1000.0,
+                        main_lost_ms_for_history / MILLIS_PER_SEC,
                         cfg_read.abort_on_lost_secs
                     ),
                 );
@@ -3374,7 +3375,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     device,
                     &format!(
                         "STRATEGY_FAILURE: abort_check FAILED — data loss ({:.2}s) exceeds threshold ({}s)",
-                        main_lost_ms_for_history / 1000.0,
+                        main_lost_ms_for_history / MILLIS_PER_SEC,
                         cfg_read.abort_on_lost_secs
                     ),
                 );
@@ -3395,7 +3396,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     if s.last_error.is_empty() {
                         s.last_error = format!(
                             "aborted — {:.2}s lost in main movie (threshold: {}s)",
-                            main_lost_ms_for_history / 1000.0,
+                            main_lost_ms_for_history / MILLIS_PER_SEC,
                             cfg_read.abort_on_lost_secs
                         );
                     }
@@ -3410,7 +3411,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     staging_disc_path,
                     &format!(
                         "aborted: {:.2}s lost in main movie exceeds threshold {}s",
-                        main_lost_ms_for_history / 1000.0,
+                        main_lost_ms_for_history / MILLIS_PER_SEC,
                         cfg_read.abort_on_lost_secs
                     ),
                 );
@@ -3424,7 +3425,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     device,
                     &format!(
                         "Main movie loss after retries: {:.2}s (threshold: {}s)",
-                        main_lost_ms_for_history / 1000.0,
+                        main_lost_ms_for_history / MILLIS_PER_SEC,
                         cfg_read.abort_on_lost_secs
                     ),
                 );
@@ -3588,7 +3589,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             abort_on_lost_secs: cfg_read.abort_on_lost_secs as u32,
             rip_elapsed_secs: 0.0, // mux worker re-derives elapsed from its own start
             rip_errors: 0,
-            rip_lost_video_secs: main_lost_ms_for_history / 1000.0,
+            rip_lost_video_secs: main_lost_ms_for_history / MILLIS_PER_SEC,
             rip_last_sector: rip_last_lba.load(Ordering::Relaxed),
             origin_device: device.to_string(),
             sweep_errors: marker_damage.as_ref().map(|d| d.errors).unwrap_or(0),
@@ -4139,7 +4140,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // accepted the rip because in-title loss was within threshold, but the
             // final UI card would show a larger number from out-of-title damage.
             final_lost_secs = if main_lost_ms_for_history_outer > 0.0 {
-                main_lost_ms_for_history_outer / 1000.0
+                main_lost_ms_for_history_outer / MILLIS_PER_SEC
             } else {
                 // main_lost_ms_for_history_outer is 0 when either: no bad sectors
                 // exist (clean disc), or bytes_unreadable == 0. In those cases
@@ -4268,7 +4269,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             device,
             &format!(
                 "Mux complete: {:.1} GB in {}s ({:.1} MB/s avg)",
-                bytes_done as f64 / 1_073_741_824.0,
+                bytes_done as f64 / BYTES_PER_GIB,
                 elapsed.round() as u64,
                 speed
             ),
@@ -4429,7 +4430,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             &format!(
                 "{}: {:.1} GB in {:.0}s ({:.0} MB/s), {} skipped (~{:.3}s lost)",
                 log_prefix,
-                bytes_done as f64 / 1_073_741_824.0,
+                bytes_done as f64 / BYTES_PER_GIB,
                 elapsed,
                 speed,
                 final_errors,
@@ -4484,7 +4485,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         (
             final_errors.saturating_add(mux_outcome.errors),
             final_lost_secs + demux_lost_secs,
-            demux_lost_secs * 1000.0,
+            demux_lost_secs * MILLIS_PER_SEC,
         )
     };
 
@@ -4492,7 +4493,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         device,
         &format!(
             "Complete: {:.1} GB in {:.0}s ({:.0} MB/s), {} skipped (~{:.3}s lost)",
-            bytes_done as f64 / 1_073_741_824.0,
+            bytes_done as f64 / BYTES_PER_GIB,
             elapsed,
             speed,
             done_errors,
@@ -4535,7 +4536,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // keeps the snapshot's whole-disc value, which is genuinely
             // computed from the mapfile's per-range durations.
             total_lost_ms: if cfg_read.max_retries == 0 {
-                final_lost_secs * 1000.0
+                final_lost_secs * MILLIS_PER_SEC
             } else {
                 sweep_damage_snapshot.total_lost_ms + done_demux_extra_ms
             },
@@ -4547,7 +4548,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // the `total_lost_ms` branch above. Multipass keeps the snapshot's
             // value, which is derived from the mapfile's in-title bad ranges.
             main_lost_ms: if cfg_read.max_retries == 0 {
-                final_lost_secs * 1000.0
+                final_lost_secs * MILLIS_PER_SEC
             } else {
                 sweep_damage_snapshot.main_lost_ms + done_demux_extra_ms
             },
@@ -4585,7 +4586,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             poster_url: &tmdb_poster,
             duration: &duration,
             codecs: &codecs,
-            size_gb: bytes_done as f64 / 1_073_741_824.0,
+            size_gb: bytes_done as f64 / BYTES_PER_GIB,
             speed_mbs: speed,
             elapsed_secs: elapsed,
             output_path: &staging,
@@ -4750,7 +4751,7 @@ pub(super) fn abort_lost_ms(
     } else {
         libfreemkv::disc::bytes_bad_in_title(title, bad_ranges)
     };
-    lost_bytes as f64 / title_bytes_per_sec * 1000.0
+    lost_bytes as f64 / title_bytes_per_sec * MILLIS_PER_SEC
 }
 
 /// Whether the post-retry abort check should fire.
@@ -4802,7 +4803,7 @@ pub(crate) fn post_mux_loss_verdict(
         return PostMuxVerdict::Proceed;
     }
     let abort_threshold_ms = (abort_on_lost_secs * 1000) as f64;
-    if should_abort_for_loss(demux_lost_secs * 1000.0, abort_threshold_ms) {
+    if should_abort_for_loss(demux_lost_secs * MILLIS_PER_SEC, abort_threshold_ms) {
         PostMuxVerdict::Abort { demux_lost_secs }
     } else {
         PostMuxVerdict::Proceed
@@ -5208,9 +5209,9 @@ fn strip_error_prefix(s: &str) -> &str {
 fn disk_space_preflight_message(required: u64, staging: &str, avail: u64) -> String {
     format!(
         "Insufficient staging disk space — need ≥ {:.1} GB free at {} (2× disc capacity), have {:.1} GB. Free up space or point STAGING_DIR at a larger volume.",
-        required as f64 / 1_073_741_824.0,
+        required as f64 / BYTES_PER_GIB,
         staging,
-        avail as f64 / 1_073_741_824.0,
+        avail as f64 / BYTES_PER_GIB,
     )
 }
 
@@ -5590,6 +5591,7 @@ mod tests {
     use crate::ripper::session::device_halt;
     use crate::ripper::staging;
     use crate::ripper::state::Resumable;
+    use crate::util::MILLIS_PER_SEC;
     use libfreemkv::{Error, ScsiSense};
 
     /// Convergence H1 regression: `SweepingGuard` is the RAII cleanup for the
@@ -6840,7 +6842,7 @@ mod tests {
         // The done card should report in-title loss (0s), not whole-disc.
         // Replicate the selection logic from the fix:
         let final_lost_secs = if in_title_lost_ms > 0.0 {
-            in_title_lost_ms / 1000.0
+            in_title_lost_ms / MILLIS_PER_SEC
         } else {
             0.0 // clean-title fallback; would be mux_outcome.lost_video_secs in production
         };
@@ -6860,7 +6862,7 @@ mod tests {
         let bad = vec![(1500u64 * 2048, 10 * 2048)];
         let in_title_lost_ms = super::abort_lost_ms(false, &title, &bad, bps);
         assert!(in_title_lost_ms > 0.0, "in-title loss should be non-zero");
-        let final_lost_secs = in_title_lost_ms / 1000.0;
+        let final_lost_secs = in_title_lost_ms / MILLIS_PER_SEC;
         // 10 sectors * 2048 bytes / 8_250_000 bps ≈ 0.00248s
         assert!(
             final_lost_secs > 0.0 && final_lost_secs < 1.0,
@@ -6892,12 +6894,12 @@ mod tests {
         // Replicate the fix's branch selection for single-pass (max_retries == 0).
         let max_retries = 0u32;
         let main_lost_ms = if max_retries == 0 {
-            final_lost_secs * 1000.0
+            final_lost_secs * MILLIS_PER_SEC
         } else {
             snapshot.main_lost_ms
         };
         let total_lost_ms = if max_retries == 0 {
-            final_lost_secs * 1000.0
+            final_lost_secs * MILLIS_PER_SEC
         } else {
             snapshot.total_lost_ms
         };
@@ -6930,7 +6932,7 @@ mod tests {
         let done_demux_extra_ms = if max_retries == 0 {
             0.0
         } else {
-            demux_lost_secs * 1000.0
+            demux_lost_secs * MILLIS_PER_SEC
         };
         let main_lost_ms = if max_retries == 0 {
             0.0
@@ -6977,7 +6979,7 @@ mod tests {
                 (
                     final_errors.saturating_add(mux_errors),
                     final_lost_secs + demux_lost_secs,
-                    demux_lost_secs * 1000.0,
+                    demux_lost_secs * MILLIS_PER_SEC,
                 )
             }
         }
@@ -7048,7 +7050,7 @@ mod tests {
         let lost = single_pass_lost_secs(10, bps); // 10 skipped sectors
         assert!(lost > 0.0, "skipped sectors must produce positive loss");
         assert!(
-            super::should_abort_for_loss(lost * 1000.0, threshold_ms),
+            super::should_abort_for_loss(lost * MILLIS_PER_SEC, threshold_ms),
             "single-pass rip with skipped sectors must abort at threshold 0"
         );
     }
@@ -7062,7 +7064,7 @@ mod tests {
         let lost = single_pass_lost_secs(0, bps);
         assert_eq!(lost, 0.0);
         assert!(
-            !super::should_abort_for_loss(lost * 1000.0, threshold_ms),
+            !super::should_abort_for_loss(lost * MILLIS_PER_SEC, threshold_ms),
             "a clean single-pass rip must NOT abort at threshold 0"
         );
     }
@@ -7076,14 +7078,14 @@ mod tests {
         // ~1000 skipped sectors ≈ 0.248s lost — well under 30s.
         let small = single_pass_lost_secs(1000, bps);
         assert!(
-            !super::should_abort_for_loss(small * 1000.0, threshold_ms),
+            !super::should_abort_for_loss(small * MILLIS_PER_SEC, threshold_ms),
             "single-pass loss under threshold must NOT abort, got {small:.3}s"
         );
         // Enough skips to exceed 30s: 30 * bps / 2048 sectors + slack.
         let big_sectors = (31.0 * bps / 2048.0) as u64;
         let big = single_pass_lost_secs(big_sectors, bps);
         assert!(
-            super::should_abort_for_loss(big * 1000.0, threshold_ms),
+            super::should_abort_for_loss(big * MILLIS_PER_SEC, threshold_ms),
             "single-pass loss over threshold must abort, got {big:.3}s"
         );
     }
