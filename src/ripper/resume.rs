@@ -1771,14 +1771,13 @@ fn resolve_keys_from_iso(
     mapfile_path: &Path,
     disc: libfreemkv::Disc,
 ) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
-    // The mapfile cache is the resume fast-path: when the sweep persisted unit
-    // keys (the disc was keyed at scan), `MapfileSource` — first in the source
-    // list — hands them straight to `Disc::decrypt_with(Key::Unit(..))`, no
-    // keydb parse and no key-service call. Keys XOR VID, so a UK there is the
-    // final answer. If the mapfile holds no keys (disc never keyed), resolution
-    // falls through to the configured source (which reads the VID from the
-    // mapfile via `IsoAccess`); a genuinely-unkeyed disc returns NoKey.
-    let sources = crate::keysource::build_sources(cfg, Some(mapfile_path));
+    // On resume / deferred mux the keys are re-resolved from the configured
+    // source (keydb / online) rather than read back from the mapfile header —
+    // the mapfile key-source was removed in the AACS-trait reshape. `IsoAccess`
+    // still reads the VID and content samples from the staged ISO + mapfile, so
+    // a keyable disc re-resolves correctly (marginally slower); a genuinely-
+    // unkeyed disc returns NoKey.
+    let sources = crate::keysource::build_sources(cfg);
     let mut access = crate::keysource::IsoAccess::new(iso_path, mapfile_path);
     crate::keysource::resolve_keys(sources, &mut access, disc)
 }
@@ -2078,8 +2077,8 @@ mod resume_remux_webhook_tests {
     /// configured (Discord, Plex, etc.) silently received nothing on any
     /// rip that finished via resume or the mux worker.
     ///
-    /// A full behavioural test would need a real openable ISO + mapfile
-    /// + decrypt + mux pipeline plus a mock HTTP endpoint, which is out
+    /// A full behavioural test would need a real openable ISO + mapfile +
+    /// decrypt + mux pipeline plus a mock HTTP endpoint, which is out
     /// of proportion to a single call site. Instead this pins, at source
     /// level, that the success region of `resume_remux` (between the
     /// "Auto-resume complete" log line and the `auto_eject` honoring)
@@ -2189,6 +2188,7 @@ mod resume_handoff_contract_tests {
     //!   - queue membership: on success the resume path writes `.done`/
     //!     `.review` + `.completed` and deletes `.ripped`, so the dir ends
     //!     up in the Move queue ONLY — never lingering in the Mux queue.
+    //!
     //! These tests pin the marker-state outcomes that drive those views
     //! without standing up a real ISO + mux pipeline.
     use crate::ripper::staging;
