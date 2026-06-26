@@ -346,15 +346,12 @@ fn check_post_copy_mkv(dst: &Path) -> Result<(), MoveError> {
         return Err(MoveError::MkvBadHead);
     }
 
-    // Tail: read the last 64 KiB and confirm at least one well-formed
-    // EBML element close near the very end. The cheapest robust signal
-    // is "the file is well above its own length-bytes" — if the last 8
-    // bytes can be read at all, the file isn't truncated to zero and
-    // the kernel is willing to surface the tail. Stronger structural
-    // parsing would require dragging in the EBML reader; that's
-    // overkill for the move gate (the mux already validated the EBML
-    // stream when it wrote the file — we just need to confirm cp
-    // didn't truncate).
+    // Tail: confirm the last 8 bytes are readable (the file isn't
+    // truncated to zero and the kernel is willing to surface the tail).
+    // We do NOT structurally parse EBML here — the mux already validated
+    // the stream when it wrote the file; this gate only catches a cp that
+    // truncated the output. Stronger structural parsing would require
+    // dragging in the EBML reader, which is overkill for the move gate.
     let size = f
         .metadata()
         .map_err(|e| MoveError::Unreadable(e.to_string()))?
@@ -387,7 +384,7 @@ fn check_post_copy_m2ts(dst: &Path) -> Result<(), MoveError> {
     const PKT: u64 = 192;
     const SYNC_OFFSET: usize = 4;
     const SAMPLE_PACKETS: u64 = 8;
-    const THRESHOLD: usize = 6; // out of SAMPLE_PACKETS
+    const THRESHOLD: usize = 6; // out of 2 * SAMPLE_PACKETS (head + tail = 16 samples)
 
     let mut f = std::fs::File::open(dst).map_err(|e| MoveError::Unreadable(e.to_string()))?;
     let size = f
@@ -2611,6 +2608,69 @@ mod tests {
             err
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_post_copy_m2ts_threshold_is_out_of_sixteen_not_eight() {
+        // Regression for the line-390 doc bug: THRESHOLD=6 is counted across
+        // BOTH the head (8) and tail (8) sample windows — 6 out of 16, not
+        // 6 out of 8. Prove it behaviorally: a file with exactly 3 sync bytes
+        // in the head window and 3 in the tail window (6 total, but only 3 in
+        // any single window) must PASS. If the gate were truly "6 of 8 per
+        // window" this would be rejected. Calling the m2ts checker directly
+        // sidesteps check_post_copy's size cross-check so only the sync logic
+        // is under test.
+        const PKT: usize = 192;
+        const SYNC_OFFSET: usize = 4;
+        const PACKETS: usize = 24; // head=0..8, tail=16..24, disjoint middle gap
+        let dir = scratch_dir("m2ts-threshold-16");
+        let dst = dir.join("dst.m2ts");
+        let mut bytes = vec![0u8; PACKETS * PKT];
+        // 3 sync bytes in the head window (packets 0,1,2).
+        for i in [0, 1, 2] {
+            bytes[i * PKT + SYNC_OFFSET] = 0x47;
+        }
+        // 3 sync bytes in the tail window (last 8 packets: 16..24 → 21,22,23).
+        for i in [21, 22, 23] {
+            bytes[i * PKT + SYNC_OFFSET] = 0x47;
+        }
+        std::fs::write(&dst, &bytes).unwrap();
+        assert!(
+            check_post_copy_m2ts(&dst).is_ok(),
+            "3 head + 3 tail = 6 of 16 must clear THRESHOLD; the gate counts \
+             across both windows, not 6 of 8 in one"
+        );
+        // And confirm 5 total (3 head + 2 tail) is below THRESHOLD → rejected,
+        // so the gate isn't trivially passing everything.
+        bytes[23 * PKT + SYNC_OFFSET] = 0x00;
+        std::fs::write(&dst, &bytes).unwrap();
+        assert!(
+            matches!(check_post_copy_m2ts(&dst), Err(MoveError::M2tsBadSync)),
+            "5 of 16 must fall below THRESHOLD=6"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn check_post_copy_mkv_tail_comment_does_not_claim_64kib_ebml_scan() {
+        // Regression for the line-349 doc bug: the MKV tail comment used to
+        // claim it "read the last 64 KiB and confirm at least one well-formed
+        // EBML element close" — neither of which the code does (it reads 8
+        // tail bytes). Source-pin the corrected comment so the false claim
+        // can't creep back in.
+        let src = include_str!("mover.rs");
+        let start = src
+            .find("fn check_post_copy_mkv")
+            .expect("check_post_copy_mkv present");
+        let body = &src[start..start + 1200];
+        assert!(
+            !body.contains("64 KiB"),
+            "MKV tail comment must not claim a 64 KiB read the code never does"
+        );
+        assert!(
+            !body.contains("EBML element close"),
+            "MKV tail comment must not claim EBML-element-close detection"
+        );
     }
 
     #[test]
