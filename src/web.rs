@@ -2005,7 +2005,6 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 /// a short deadline; error on timeout. Shared by `validate_fetch_url` and
 /// `validate_network_target` so neither can re-introduce an unbounded lookup.
 pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
     const DNS_TIMEOUT: Duration = Duration::from_secs(4);
@@ -2017,10 +2016,16 @@ pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAd
     const MAX_INFLIGHT: usize = 8;
     static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-    if INFLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT {
-        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
-        return Err("DNS resolution timed out".to_string());
-    }
+    // RAII admission token: its Drop releases the slot on EVERY exit path.
+    // We move it into the resolver closure so the slot is held until the
+    // (possibly detached) worker actually returns — but if `thread::spawn`
+    // itself unwinds (the OS refusing a new thread is exactly the
+    // resource-exhaustion case this throttle bounds), the guard is dropped
+    // on the spawning thread instead, so the counter never leaks.
+    let guard = match ConnGuard::try_acquire(&INFLIGHT, MAX_INFLIGHT) {
+        Some(g) => g,
+        None => return Err("DNS resolution timed out".to_string()),
+    };
 
     let host = host.to_string();
     // Bounded channel of capacity 1: the resolver thread's single send never
@@ -2029,12 +2034,12 @@ pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAd
     // receiver has already timed out and gone away.
     let (tx, rx) = mpsc::sync_channel::<Result<Vec<SocketAddr>, std::io::Error>>(1);
     std::thread::spawn(move || {
+        let _g = guard;
         let res = (host.as_str(), port)
             .to_socket_addrs()
             .map(|it| it.collect::<Vec<SocketAddr>>());
         // Receiver may be gone after the timeout — ignore the send error.
         let _ = tx.send(res);
-        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
     });
     match rx.recv_timeout(DNS_TIMEOUT) {
         Ok(Ok(addrs)) => Ok(addrs),
@@ -3349,6 +3354,57 @@ mod web_tests {
     }
 
     // ── Connection cap ─────────────────────────────────────────────────
+
+    #[test]
+    fn conn_guard_releases_slot_when_holder_unwinds() {
+        // Regression (resolve_with_timeout INFLIGHT leak): the DNS throttle
+        // now owns its slot via a ConnGuard moved into the resolver closure,
+        // so the slot is released even when the code holding it unwinds
+        // instead of returning normally — which is exactly what happens when
+        // `thread::spawn` panics (OS refuses a new thread) before the worker
+        // body that used to own the decrement could ever run. Model that here
+        // by panicking while a guard is in scope and confirming Drop still
+        // ran the fetch_sub.
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let g0 = ConnGuard::try_acquire(&C, 4).expect("first slot");
+        assert_eq!(C.load(Ordering::SeqCst), 1);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = ConnGuard::try_acquire(&C, 4).expect("second slot");
+            assert_eq!(C.load(Ordering::SeqCst), 2);
+            panic!("simulate thread::spawn unwinding with the guard held");
+        }));
+        assert!(r.is_err(), "the inner closure must have panicked");
+        // The unwound guard's Drop must have released its slot; only g0 remains.
+        assert_eq!(
+            C.load(Ordering::SeqCst),
+            1,
+            "guard slot leaked across an unwind"
+        );
+        drop(g0);
+        assert_eq!(C.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn resolve_with_timeout_uses_raii_guard_not_closure_side_fetch_sub() {
+        // Source-pin for the INFLIGHT-leak fix: the decrement must NOT live as
+        // a bare `INFLIGHT.fetch_sub(...)` inside the resolver closure (the old
+        // shape that leaked when thread::spawn panicked). It must flow through
+        // a ConnGuard whose Drop releases the slot on every path.
+        let src = include_str!("web.rs");
+        let start = src
+            .find("pub(crate) fn resolve_with_timeout")
+            .expect("resolve_with_timeout present");
+        let body = &src[start..start + 1500];
+        assert!(
+            body.contains("ConnGuard::try_acquire(&INFLIGHT, MAX_INFLIGHT)"),
+            "resolve_with_timeout must acquire its slot via ConnGuard"
+        );
+        assert!(
+            !body.contains("INFLIGHT.fetch_sub"),
+            "resolve_with_timeout must not decrement INFLIGHT by hand; the \
+             ConnGuard Drop owns the release"
+        );
+    }
 
     #[test]
     fn conn_guard_enforces_cap_and_releases_on_drop() {
