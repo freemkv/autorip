@@ -2852,37 +2852,10 @@ mod web_tests {
         assert_eq!(json2["keydb_url"], "");
     }
 
-    #[test]
-    fn keyserver_url_sentinel_round_trip_preserves_stored_url() {
-        // A GET→POST round-trip must NOT clobber the stored token-bearing URL.
-        // When the POST carries the masked form (containing the sentinel), the
-        // write guard must skip the update and leave the stored value intact.
-        //
-        // Mirror the inline logic from handle_settings_post:
-        //   if !v.contains(SECRET_SENTINEL) { c.keyserver_url = v.to_string(); }
-        let stored = "https://keys.example.com/mysecrettoken/decode";
-        let masked = "https://keys.example.com/********"; // form returned by GET
-
-        // Sentinel present → do not overwrite.
-        let updated = if masked.contains(SECRET_SENTINEL) {
-            stored.to_string()
-        } else {
-            masked.to_string()
-        };
-        assert_eq!(updated, stored, "sentinel must preserve the stored URL");
-
-        // A genuinely new URL (no sentinel) must overwrite.
-        let new_url = "https://keys.example.com/newtoken/decode";
-        let updated2 = if new_url.contains(SECRET_SENTINEL) {
-            stored.to_string()
-        } else {
-            new_url.to_string()
-        };
-        assert_eq!(
-            updated2, new_url,
-            "a real new URL must replace the stored one"
-        );
-    }
+    // NOTE: the keyserver_url sentinel round-trip is now tested
+    // executing-style by `http::settings_post_masked_keyserver_url_preserves_stored`
+    // (it drives the real handle_settings_post via a live server + config::save,
+    // not an inline re-implementation of the guard).
 
     #[test]
     fn settings_get_masks_webhook_token_keeps_origin() {
@@ -3408,6 +3381,334 @@ mod web_tests {
         // A bare trailing '%' or incomplete '%X' stays literal (no panic).
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("50%2"), "50%2");
+    }
+
+    // ── Real HTTP integration: drive handle_request via a live server ──
+    //
+    // tiny_http::Request has no public constructor, so these tests bind a
+    // loopback Server on an ephemeral port, write a raw HTTP/1.1 request from
+    // a client thread, recv the Request on the server side, hand it to the
+    // PRODUCTION `handle_request`, and read the served response back. This is
+    // the only way to exercise route dispatch + method gating + the real
+    // handlers (all private fns) end-to-end. Every assertion here fails if the
+    // dispatch wiring or a handler regresses — none of it is string-matched.
+    mod http {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        /// One real request/response round-trip through `handle_request`.
+        ///
+        /// Binds an ephemeral loopback server, spawns a client that writes the
+        /// raw request and reads the full response, then on this thread accepts
+        /// the request and dispatches it through production code. Returns the
+        /// parsed (status_code, body).
+        fn roundtrip(
+            cfg: &Arc<RwLock<Config>>,
+            method: &str,
+            path: &str,
+            body: Option<&str>,
+            extra_headers: &[(&str, &str)],
+        ) -> (u16, String) {
+            let server = Server::http("127.0.0.1:0").expect("bind loopback server");
+            let addr = server.server_addr().to_ip().expect("ip addr");
+
+            let method = method.to_string();
+            let path = path.to_string();
+            let body = body.map(|b| b.to_string());
+            let extra: Vec<(String, String)> = extra_headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(addr).expect("connect");
+                let body = body.unwrap_or_default();
+                let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+                for (k, v) in &extra {
+                    req.push_str(&format!("{k}: {v}\r\n"));
+                }
+                req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+                req.push_str("Connection: close\r\n\r\n");
+                req.push_str(&body);
+                stream.write_all(req.as_bytes()).expect("write request");
+                stream.flush().ok();
+                let mut resp = Vec::new();
+                stream.read_to_end(&mut resp).expect("read response");
+                String::from_utf8_lossy(&resp).to_string()
+            });
+
+            // Accept exactly one request and dispatch it through production.
+            let request = server.recv().expect("recv request");
+            handle_request(request, cfg);
+
+            let raw = client.join().expect("client thread");
+            parse_response(&raw)
+        }
+
+        /// Extract the status code and body from a raw HTTP/1.1 response.
+        fn parse_response(raw: &str) -> (u16, String) {
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw, ""));
+            let status_line = head.lines().next().unwrap_or_default();
+            // "HTTP/1.1 200 OK"
+            let code = status_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|c| c.parse::<u16>().ok())
+                .unwrap_or(0);
+            (code, body.to_string())
+        }
+
+        /// A Config whose autorip_dir points at a writable tempdir so
+        /// `config::save` (invoked by handle_settings_post) succeeds and we can
+        /// read back the persisted settings.json.
+        fn cfg_in_tempdir(dir: &std::path::Path) -> Arc<RwLock<Config>> {
+            let c = Config {
+                autorip_dir: dir.to_string_lossy().to_string(),
+                staging_dir: dir.join("staging").to_string_lossy().to_string(),
+                output_dir: dir.join("output").to_string_lossy().to_string(),
+                ..Config::default()
+            };
+            Arc::new(RwLock::new(c))
+        }
+
+        // ── Route dispatch + method gating ──────────────────────────────
+
+        #[test]
+        fn get_version_dispatches_and_returns_running_version() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let (code, body) = roundtrip(&cfg, "GET", "/api/version", None, &[]);
+            assert_eq!(code, 200);
+            assert!(
+                body.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))),
+                "GET /api/version must serve the running version, got: {body}"
+            );
+        }
+
+        #[test]
+        fn unknown_route_returns_404() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let (code, body) = roundtrip(&cfg, "GET", "/api/nope", None, &[]);
+            assert_eq!(code, 404, "an unknown route must 404");
+            assert!(body.contains("not found"));
+        }
+
+        #[test]
+        fn settings_route_gates_on_method() {
+            // GET /api/settings serves redacted settings; a DELETE to the same
+            // path falls through to 404 (method-gated, not matched).
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let (get_code, _) = roundtrip(&cfg, "GET", "/api/settings", None, &[]);
+            assert_eq!(get_code, 200, "GET /api/settings must be served");
+            let (del_code, _) = roundtrip(&cfg, "DELETE", "/api/settings", None, &[]);
+            assert_eq!(del_code, 404, "DELETE /api/settings must not match");
+        }
+
+        #[test]
+        fn sse_route_is_served_at_events_not_api_sse() {
+            // Pin the ACTUAL served route. Production serves /events; /api/sse
+            // is NOT a route and must 404. (This replaces the end_to_end
+            // dispatcher that accepted both.) /events is a streaming handler;
+            // assert it does not 404 rather than reading the infinite stream.
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let (api_sse_code, _) = roundtrip(&cfg, "GET", "/api/sse", None, &[]);
+            assert_eq!(
+                api_sse_code, 404,
+                "/api/sse is not a real route — production serves /events"
+            );
+        }
+
+        // ── Device-name validation in dispatch ──────────────────────────
+
+        #[test]
+        fn rip_route_rejects_invalid_device_name() {
+            // A path-traversal device name must be rejected by the dispatch
+            // guard (is_valid_device_name) with 400 — never reaching handle_rip.
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let (code, body) = roundtrip(&cfg, "POST", "/api/rip/..%2F..%2Fetc", None, &[]);
+            assert_eq!(code, 400, "traversal device name must be rejected");
+            assert!(body.contains("invalid device name"));
+        }
+
+        #[test]
+        fn stop_route_rejects_invalid_device_name() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let (code, _) = roundtrip(&cfg, "POST", "/api/stop/x", None, &[]);
+            // "x" is too short (is_valid_device_name requires len 3..=64) -> 400.
+            assert_eq!(code, 400, "a 1-char device name must be rejected");
+        }
+
+        // ── CSRF gate on POST ───────────────────────────────────────────
+
+        #[test]
+        fn cross_origin_post_is_rejected_403() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let (code, body) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some("{}"),
+                &[("Origin", "http://evil.example.com")],
+            );
+            assert_eq!(code, 403, "a cross-origin POST must be rejected");
+            assert!(body.contains("cross-origin"));
+        }
+
+        // ── read_json_body size limit (via handle_settings_post) ────────
+
+        #[test]
+        fn oversize_request_body_is_rejected_413() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            // One byte over MAX_REQUEST_BODY (1 MiB).
+            let big = "x".repeat((MAX_REQUEST_BODY as usize) + 1);
+            let (code, _) = roundtrip(&cfg, "POST", "/api/settings", Some(&big), &[]);
+            assert_eq!(code, 413, "a body over MAX_REQUEST_BODY must be 413");
+        }
+
+        #[test]
+        fn malformed_json_body_is_rejected_400() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let (code, body) = roundtrip(&cfg, "POST", "/api/settings", Some("{not json"), &[]);
+            assert_eq!(code, 400);
+            assert!(body.contains("invalid json"));
+        }
+
+        // ── handle_settings_post: the real save + the sentinel guard ────
+
+        #[test]
+        fn settings_post_persists_a_field_to_disk() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let (code, body) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"abort_on_lost_secs": 30}"#),
+                &[],
+            );
+            assert_eq!(code, 200, "a valid settings POST must succeed, got: {body}");
+            assert!(body.contains("\"ok\":true"));
+            // The in-memory config was mutated...
+            assert_eq!(cfg.read().unwrap().abort_on_lost_secs, 30);
+            // ...and persisted to settings.json on disk.
+            let saved = std::fs::read_to_string(cfg.read().unwrap().settings_file())
+                .expect("settings.json must be written");
+            assert!(
+                saved.contains("\"abort_on_lost_secs\""),
+                "the persisted settings.json must carry the field"
+            );
+        }
+
+        #[test]
+        fn settings_post_masked_keyserver_url_preserves_stored() {
+            // The secret-sentinel guard, MASKED half: a POST carrying the
+            // masked keyserver_url (containing SECRET_SENTINEL — the form GET
+            // returns) must NOT clobber the stored token-bearing URL.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let stored = "https://8.8.8.8/mysecrettoken/decode";
+            cfg.write().unwrap().keyserver_url = stored.to_string();
+
+            let masked = format!("https://8.8.8.8/{SECRET_SENTINEL}");
+            let patch = format!(r#"{{"keyserver_url": "{masked}"}}"#);
+            let (code, _) = roundtrip(&cfg, "POST", "/api/settings", Some(&patch), &[]);
+            assert_eq!(code, 200);
+            assert_eq!(
+                cfg.read().unwrap().keyserver_url,
+                stored,
+                "a masked (sentinel) keyserver_url must leave the stored URL intact"
+            );
+        }
+
+        #[test]
+        fn settings_post_real_keyserver_url_replaces_stored() {
+            // The secret-sentinel guard, REAL-VALUE half: a POST with a genuine
+            // (sentinel-free, SSRF-valid) keyserver_url replaces the stored one.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            cfg.write().unwrap().keyserver_url = "https://8.8.8.8/old/decode".to_string();
+
+            // Public IP literal validates without DNS.
+            let patch = r#"{"keyserver_url": "https://1.1.1.1/newtoken/decode"}"#;
+            let (code, _) = roundtrip(&cfg, "POST", "/api/settings", Some(patch), &[]);
+            assert_eq!(code, 200);
+            assert_eq!(
+                cfg.read().unwrap().keyserver_url,
+                "https://1.1.1.1/newtoken/decode",
+                "a real new keyserver_url must replace the stored one"
+            );
+        }
+
+        #[test]
+        fn settings_post_empty_keyserver_url_clears_it() {
+            // The clear half: an empty (no-sentinel) keyserver_url writes
+            // through, clearing the stored value (disables the online source).
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            cfg.write().unwrap().keyserver_url = "https://8.8.8.8/token/decode".to_string();
+
+            let (code, _) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"keyserver_url": ""}"#),
+                &[],
+            );
+            assert_eq!(code, 200);
+            assert_eq!(
+                cfg.read().unwrap().keyserver_url,
+                "",
+                "an empty keyserver_url must clear the stored value"
+            );
+        }
+
+        #[test]
+        fn settings_post_ssrf_url_is_rejected_400_and_not_stored() {
+            // A non-sentinel keyserver_url pointing at an internal/loopback
+            // host must be rejected before the write guard — stored value
+            // untouched.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            cfg.write().unwrap().keyserver_url = "https://8.8.8.8/keep/decode".to_string();
+
+            let (code, _) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"keyserver_url": "http://127.0.0.1/admin"}"#),
+                &[],
+            );
+            assert_eq!(code, 400, "an SSRF keyserver_url must be rejected");
+            assert_eq!(
+                cfg.read().unwrap().keyserver_url,
+                "https://8.8.8.8/keep/decode",
+                "a rejected keyserver_url must not mutate the stored value"
+            );
+        }
+
+        // ── handle_stop / handle_scan / handle_rip reach their handlers ──
+
+        #[test]
+        fn stop_route_reaches_handle_stop_with_its_own_drive_not_found() {
+            // A well-formed device with no STATE entry must reach handle_stop,
+            // which answers with ITS OWN distinctive "drive not found" body
+            // (not the generic dispatch "not found"). This proves the POST
+            // route is wired to the handler, not merely validated then dropped.
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let (code, body) = roundtrip(&cfg, "POST", "/api/stop/sr0", None, &[]);
+            assert_eq!(code, 404);
+            assert!(
+                body.contains("drive not found"),
+                "must be handle_stop's response, not the dispatch 404; got: {body}"
+            );
+            // And the dispatch fallthrough body must NOT appear.
+            assert!(
+                !body.contains("\"error\":\"not found\""),
+                "a wired /api/stop/<dev> must not hit the dispatch 404"
+            );
+        }
     }
 }
 
