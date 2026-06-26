@@ -430,7 +430,9 @@ pub struct StagingSnapshot {
     /// on exit). Its presence means a sweep+patch is actively running (or
     /// crashed mid-sweep) — the dir is OWNED by the ripper, not orphaned
     /// partial state. The resume scan treats it as "owned, in progress":
-    /// skip without bumping `.restart_count`.
+    /// state is left intact, but `.restart_count` IS bumped on each restart so
+    /// a deterministically-crashing owned sweep still converges to `.failed`
+    /// within `RESTART_LIMIT`.
     pub has_sweeping: bool,
     /// `.muxing` exclusion lock present (written by the mux worker while it
     /// muxes a `.ripped` dir, removed on completion). Its presence means the
@@ -812,13 +814,10 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
                     has_muxing = snap.has_muxing,
                     "owned/in-progress staging entry exceeded restart limit — marking .failed"
                 );
+                // write_failed_marker already clears BOTH the .sweeping and
+                // .muxing markers unconditionally, so no explicit clear is
+                // needed here for the owned/in-progress dir.
                 write_failed_marker(&path, &reason);
-                if snap.has_muxing {
-                    clear_muxing_marker(&path);
-                }
-                if snap.has_sweeping {
-                    clear_sweeping_marker(&path);
-                }
                 clear_restart_count(&path);
                 hints.push(StagingResumeHint {
                     dir: snap.dir,
@@ -938,7 +937,10 @@ pub struct StagingResumeHint {
 pub enum ResumeAction {
     AlreadyCompleted,
     /// Dir is actively owned/in progress (`.sweeping` sweep+patch running, or
-    /// `.muxing` mux worker holds it). Left alone, NOT restart-counted.
+    /// `.muxing` mux worker holds it). State is left intact, but `.restart_count`
+    /// IS bumped on every such skip so a deterministically-crashing owned dir
+    /// still converges to `.failed` within `RESTART_LIMIT` (a healthy long rip
+    /// survives the few benign bumps below the limit).
     InProgress,
     AlreadyFailed {
         reason: String,
@@ -1726,8 +1728,9 @@ mod tests {
                 ".ripped + artifacts → partial state preserved (mux worker handles the .ripped)",
             ),
             // --- H2/M1: .sweeping in-progress marker. A crash mid-sweep leaves
-            //     .sweeping + ISO/mapfile. Must be InProgress (owned), NOT
-            //     restart-counted toward .failed. ---
+            //     .sweeping + ISO/mapfile. Verdict is InProgress (owned) — state
+            //     left intact but `.restart_count` IS bumped each skip, so a
+            //     deterministic wedge converges to .failed within RESTART_LIMIT. ---
             (
                 &[Sweeping],
                 Verdict::InProgress,
@@ -1739,7 +1742,8 @@ mod tests {
                 "CRASH MID-SWEEP: .sweeping + artifacts → in-progress, not partial state",
             ),
             // R2 finding 1: BELOW the limit a healthy long sweep is left
-            // InProgress (never restart-counted by the scan) — but a sweep
+            // InProgress (state untouched except for the per-restart
+            // `.restart_count` bump) — but a sweep
             // that has wedged the watchdog RESTART_LIMIT times (the watchdog
             // bumps the count and exit(1)s, leaving `.sweeping` on disk) MUST
             // be promoted to `.failed`, else the carve-out defeats the

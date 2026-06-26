@@ -1342,7 +1342,12 @@ fn validate_destination_root(root: &str) -> Result<(), String> {
         .open(&probe)
     {
         Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
+            // Writability is proven; clean up the probe. A failure here is
+            // near-impossible right after a successful create_new, but log it
+            // rather than leave a zero-byte marker in the user's media library.
+            if std::fs::remove_file(&probe).is_err() {
+                tracing::warn!(probe = %probe.display(), "writability probe left behind");
+            }
             Ok(())
         }
         Err(e) => Err(format!("destination root '{root}' is not writable: {e}")),

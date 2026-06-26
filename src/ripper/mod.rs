@@ -1527,6 +1527,16 @@ fn resumable_for_disc(cfg: &Config, display_name: &str) -> Option<Resumable> {
             if snap.has_failed || snap.has_review {
                 return None;
             }
+            // A dir the mux worker owns (.ripped sweep-complete handoff or an
+            // in-flight .muxing) must NOT be offered as resumable. Resuming it
+            // would re-enter the rip/sweep path on a disc the worker is mid-mux
+            // on — racing the mux's reads against a fresh sweep that overwrites
+            // the staged ISO. Mirror the sibling Wipe guard
+            // (`disc_owned_by_worker` / `staging_disc_owned_by_worker`): a dir
+            // owned by the worker is off-limits until the mux finishes.
+            if snap.has_ripped || snap.has_muxing {
+                return None;
+            }
         }
         let (_iso_path, mapfile_path) = match resume::find_iso_and_mapfile(&path) {
             Some(p) => p,
@@ -7568,6 +7578,47 @@ mod tests {
                 resumable_for_disc(&cfg, display_name),
                 None,
                 "{marker} must suppress the Resume affordance (operator must Wipe)"
+            );
+        }
+    }
+
+    /// Owner decision #2 regression: `resumable_for_disc` must return None when
+    /// the disc's staging dir is owned by the mux worker (`.ripped` sweep-done
+    /// handoff or in-flight `.muxing`). Resuming such a dir would re-enter the
+    /// sweep path on a disc the worker is mid-mux on — racing fresh sweep writes
+    /// against the mux's reads and overwriting the staged ISO. Mirrors the
+    /// sibling Wipe guard (`staging_disc_owned_by_worker`): a worker-owned dir is
+    /// off-limits until the mux finishes, even with a Sweep-worthy mapfile.
+    #[test]
+    fn resumable_for_disc_blocked_when_owned_by_mux_worker() {
+        let display_name = "Mid Mux Disc";
+        let sanitized = crate::util::sanitize_path_compact(display_name);
+
+        for marker in [".ripped", ".muxing"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = crate::config::Config {
+                staging_dir: tmp.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            };
+            // Partial sweep (bytes_pending > 0) that WOULD be Resumable::Sweep…
+            let disc_dir = tmp.path().join(&sanitized);
+            std::fs::create_dir(&disc_dir).unwrap();
+            let iso = disc_dir.join(format!("{sanitized}.iso"));
+            std::fs::write(&iso, b"x").unwrap();
+            let mapfile_path = disc_dir.join(format!("{sanitized}.iso.mapfile"));
+            libfreemkv::disc::mapfile::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
+            // Sanity: without the worker-owned marker it IS Sweep-resumable.
+            assert_eq!(
+                resumable_for_disc(&cfg, display_name),
+                Some(Resumable::Sweep),
+                "precondition: partial sweep is resumable before {marker}"
+            );
+            // …but a worker-owned marker blocks the Resume affordance entirely.
+            std::fs::write(disc_dir.join(marker), b"{}").unwrap();
+            assert_eq!(
+                resumable_for_disc(&cfg, display_name),
+                None,
+                "{marker} must suppress Resume (mux worker owns the dir)"
             );
         }
     }
