@@ -1,64 +1,43 @@
 //! Integration tests for the rip-progress reporting path.
 //!
-//! These tests don't need a real drive — they simulate the closures
-//! and throttle loop that ripper.rs uses, then assert that the
-//! observable contract (per-device state, smoothed speed) is what
-//! the UI expects. Several are TDD-red: they will fail until the
-//! corresponding bug fix lands in src/ripper.rs. Each red test has
-//! a comment pointing to the line range it mirrors and the change
-//! that flips it green.
+//! These drive the REAL production event handlers — the closures
+//! `rip_disc` installs on the live drive and on the mux/sweep stream —
+//! via the `make_drive_event_fn` / `make_stream_event_fn` factories the
+//! orchestrator now calls. Firing real `libfreemkv` events at them and
+//! reading back the shared atomics proves the BytesRead→`latest_bytes_read`
+//! wiring the `/api/state` speed meter depends on is actually connected.
+//!
+//! The previous version of this file tested a hand-written
+//! `production_shape_handler` replica and a locally re-implemented EMA
+//! speed loop — neither of which existed in production. Production has
+//! BytesRead arms (the replica's premise that it lacked them was false),
+//! stores into an `AtomicU64` (not a struct), and its speed meter is a
+//! sliding-window average in `ripper::state::PassProgressState::observe`
+//! (NOT an EMA, and its first sample returns 0.0, the opposite of the old
+//! "first frame non-zero" assertion). The real speed meter is unit-tested
+//! in `src/ripper/state.rs` (`pass_progress_*`); these tests own the
+//! event-wiring half that those cannot reach.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
-use libfreemkv::event::{Event, EventKind};
+use freemkv_autorip::ripper::{make_drive_event_fn, make_stream_event_fn};
+use libfreemkv::event::{BatchSizeReason, Event, EventKind};
 
-/// Stand-in for the per-device RipState fields the BytesRead handler
-/// is supposed to update. We don't take the global STATE lock here
-/// because integration tests share that singleton — keeping the
-/// fake local makes the test order-independent.
-#[derive(Default, Debug)]
-struct FakeState {
-    bytes_good: u64,
-    bytes_total_disc: u64,
-}
-
-/// Mirrors the on_event closure ripper.rs installs at line 1372.
-/// Today the production closure has match arms for ReadError /
-/// Retry / SectorRecovered / SpeedChange and a catch-all `_ => {}`.
-/// `BytesRead` falls into the catch-all and is dropped.
-///
-/// This helper builds a closure with the SAME arm set as production.
-/// When the bug is fixed (a BytesRead arm is added that writes into
-/// the per-device state), update this helper to match — and the
-/// assertion below will flip from red to green.
-fn production_shape_handler(state: Arc<std::sync::Mutex<FakeState>>) -> impl Fn(Event) {
-    move |event: Event| match event.kind {
-        EventKind::BytesRead { bytes, total } => {
-            if let Ok(mut s) = state.lock() {
-                s.bytes_good = bytes;
-                s.bytes_total_disc = total;
-            }
-        }
-        EventKind::ReadError { .. } => {}
-        EventKind::BatchSizeChanged { .. } => {}
-        EventKind::SectorSkipped { .. } => {}
-        _ => {}
-    }
-}
-
+/// The drive-level handler must forward `BytesRead.bytes` into the shared
+/// `latest_bytes_read` atomic the UI reads — and must reset the watchdog
+/// on every event so a working-but-slow drive isn't declared stalled.
 #[test]
-#[ignore = "TDD-red: pending ripper.rs on_event/speed-meter refactor into testable pure fns"]
-fn test_bytes_read_event_updates_state() {
-    // TDD-red: production ripper.rs::on_event closures (lines 1372,
-    // 1686) lack a BytesRead match arm. This test installs a closure
-    // with the same arm set and asserts that BytesRead events update
-    // per-device state. Today the assert fires; once ripper.rs grows
-    // a BytesRead arm AND the helper above mirrors it, the test
-    // passes.
-    let state = Arc::new(std::sync::Mutex::new(FakeState::default()));
-    let handler = production_shape_handler(state.clone());
+fn drive_event_fn_publishes_bytes_read_into_shared_atomic() {
+    let wdf = Arc::new(AtomicU64::new(0));
+    let latest_bytes_read = Arc::new(AtomicU64::new(0));
+    let handler = make_drive_event_fn("sr0".to_string(), wdf.clone(), latest_bytes_read.clone());
+
+    assert_eq!(
+        latest_bytes_read.load(Ordering::Relaxed),
+        0,
+        "precondition: no bytes read yet"
+    );
 
     for i in 1..=5u64 {
         handler(Event {
@@ -69,165 +48,134 @@ fn test_bytes_read_event_updates_state() {
         });
     }
 
-    let s = state.lock().unwrap();
-    assert!(
-        s.bytes_good > 0,
-        "BytesRead handler must update state.bytes_good — got {}. \
-         If this fails, ripper.rs's on_event closures (lines 1372, 1686) \
-         lack a BytesRead match arm.",
-        s.bytes_good
-    );
-    assert_eq!(s.bytes_good, 50_000_000);
-    assert_eq!(s.bytes_total_disc, 50_000_000);
-}
-
-/// Mirrors the throttle/seed block at ripper.rs ~1968-1991. The
-/// production code today contains:
-///
-/// ```ignore
-/// if now.duration_since(last_update).as_secs_f64() < 1.0 {
-///     continue;
-/// }
-/// ```
-///
-/// which suppresses the FIRST sample, leaving `/api/state` showing
-/// 0 KB/s during cold start. This test simulates the loop and
-/// asserts the first publish carries a non-zero speed.
-#[test]
-#[ignore = "TDD-red: pending ripper.rs on_event/speed-meter refactor into testable pure fns"]
-fn test_first_frame_publishes_immediately() {
-    // TDD-red: fails until the cold-start fix lands. Today the loop
-    // gates EVERY sample on `< 1s since last_update`, including the
-    // very first one — so the first publish never fires within the
-    // first second. The fix is to bypass the gate on the first
-    // sample (or seed last_update to start - 1s).
-    let start = Instant::now();
-    let mut last_update = start;
-    let mut last_speed_bytes: u64 = 0;
-    let mut last_speed_time = start;
-    let mut smooth_speed: f64 = 0.0;
-    let mut first_update = true;
-    let mut seeded_speed = false;
-    let mut publishes: Vec<(Duration, f64)> = Vec::new();
-
-    // Simulated frame arrivals: 10 frames, 50 ms apart, 1 MB each.
-    // Total elapsed: 500 ms — well under the 1 s gate.
-    let frames = (1..=10u64).map(|i| (i * 50, 1_048_576u64 * i));
-
-    // PRODUCTION SHAPE — copies the loop from ripper.rs ~1967, with
-    // the cold-start bypass: the first frame skips the 1 s gate so
-    // the UI gets immediate feedback.
-    for (elapsed_ms, bytes_done) in frames {
-        let now = start + Duration::from_millis(elapsed_ms);
-        if !first_update && now.duration_since(last_update).as_secs_f64() < 1.0 {
-            continue;
-        }
-        first_update = false;
-        last_update = now;
-
-        let speed_interval = now.duration_since(last_speed_time).as_secs_f64();
-        let instant_speed = if speed_interval > 0.0 {
-            (bytes_done - last_speed_bytes) as f64 / (1024.0 * 1024.0) / speed_interval
-        } else {
-            0.0
-        };
-        last_speed_bytes = bytes_done;
-        last_speed_time = now;
-        smooth_speed = if !seeded_speed {
-            seeded_speed = true;
-            instant_speed
-        } else {
-            0.95 * smooth_speed + 0.05 * instant_speed
-        };
-        publishes.push((now.duration_since(start), smooth_speed));
-    }
-
-    assert!(
-        !publishes.is_empty(),
-        "no frames published in the first 500 ms — cold start is silent. \
-         Fix: bypass the 1s gate on the first frame so the UI gets cold-start data."
-    );
-    let (first_time, first_speed) = publishes[0];
-    assert!(
-        first_time < Duration::from_secs(1),
-        "first publish came after the 1s gate — cold start suppressed: t={:?}",
-        first_time
+    assert_eq!(
+        latest_bytes_read.load(Ordering::Relaxed),
+        50_000_000,
+        "BytesRead must update latest_bytes_read — if 0, the production \
+         on_event closure dropped BytesRead and /api/state would show 0 KB/s"
     );
     assert!(
-        first_speed > 0.0,
-        "first publish carried 0 MB/s — UI would show stalled disc on cold start"
+        wdf.load(Ordering::Relaxed) > 0,
+        "every event must reset the watchdog frame so a working drive \
+         isn't flagged stalled"
     );
 }
 
-/// The smooth_speed EMA in ripper.rs (~line 1987) must converge to a
-/// non-zero value once real samples arrive, even after a few
-/// zero-delta priming samples. Otherwise the speed display sticks
-/// at 0 KB/s through the rip.
+/// A `ReadError` event must not clobber the byte counter (it only logs and
+/// pets the watchdog). This pins that the byte channel and the error
+/// channel are independent — a read error mid-rip must not zero the meter.
 #[test]
-#[ignore = "TDD-red: pending ripper.rs on_event/speed-meter refactor into testable pure fns"]
-fn test_speed_meter_smoothing_with_zeros() {
-    // Mirrors the alpha=0.05 EMA from ripper.rs ~1987-1991. Should
-    // pass today — guards against future regressions where the EMA
-    // gets stuck at zero (e.g. by accidentally hard-coding the seed
-    // branch).
-    let mut smooth: f64 = 0.0;
-    let bytes = AtomicU64::new(0);
-    let start = Instant::now();
-    let mut last_b: u64 = 0;
-    let mut last_t = start;
+fn drive_event_fn_read_error_does_not_disturb_byte_counter() {
+    let wdf = Arc::new(AtomicU64::new(0));
+    let latest_bytes_read = Arc::new(AtomicU64::new(0));
+    let handler = make_drive_event_fn("sr0".to_string(), wdf.clone(), latest_bytes_read.clone());
 
-    // Phase 1: three zero-delta samples (the "stuck at zero" risk).
-    for i in 1..=3u64 {
-        let now = start + Duration::from_millis(i * 1000);
-        let b = bytes.load(Ordering::Relaxed); // still 0
-        let dt = now.duration_since(last_t).as_secs_f64();
-        let instant = if dt > 0.0 {
-            (b - last_b) as f64 / (1024.0 * 1024.0) / dt
-        } else {
-            0.0
-        };
-        last_b = b;
-        last_t = now;
-        smooth = if smooth < 0.01 {
-            instant
-        } else {
-            0.95 * smooth + 0.05 * instant
-        };
+    handler(Event {
+        kind: EventKind::BytesRead {
+            bytes: 12_345,
+            total: 1_000_000,
+        },
+    });
+    handler(Event {
+        kind: EventKind::ReadError {
+            sector: 999,
+            error: libfreemkv::Error::DiscRead {
+                sector: 999,
+                status: Some(2),
+                sense: None,
+            },
+        },
+    });
+
+    assert_eq!(
+        latest_bytes_read.load(Ordering::Relaxed),
+        12_345,
+        "a ReadError must not reset latest_bytes_read"
+    );
+}
+
+/// The stream-level handler (shared by the multipass ISO highway and the
+/// single-pass inline path) must forward BytesRead into the same atomic,
+/// AND route BatchSizeChanged → current_batch and SectorSkipped → last_lba.
+/// These three signals drive distinct UI fields; the test proves each lands
+/// in its own atomic.
+#[test]
+fn stream_event_fn_routes_each_event_to_its_own_atomic() {
+    let wdf = Arc::new(AtomicU64::new(0));
+    let last_lba = Arc::new(AtomicU64::new(0));
+    let current_batch = Arc::new(AtomicU16::new(16));
+    let latest_bytes_read = Arc::new(AtomicU64::new(0));
+    let handler = make_stream_event_fn(
+        "sr0".to_string(),
+        wdf.clone(),
+        last_lba.clone(),
+        current_batch.clone(),
+        latest_bytes_read.clone(),
+    );
+
+    handler(Event {
+        kind: EventKind::BytesRead {
+            bytes: 7_000_000,
+            total: 9_000_000,
+        },
+    });
+    handler(Event {
+        kind: EventKind::BatchSizeChanged {
+            new_size: 4,
+            reason: BatchSizeReason::Shrunk,
+        },
+    });
+    handler(Event {
+        kind: EventKind::SectorSkipped { sector: 4242 },
+    });
+
+    assert_eq!(
+        latest_bytes_read.load(Ordering::Relaxed),
+        7_000_000,
+        "BytesRead must land in latest_bytes_read"
+    );
+    assert_eq!(
+        current_batch.load(Ordering::Relaxed),
+        4,
+        "BatchSizeChanged must update current_batch (the UI's batch field)"
+    );
+    assert_eq!(
+        last_lba.load(Ordering::Relaxed),
+        4242,
+        "SectorSkipped must record the skipped LBA in last_lba"
+    );
+}
+
+/// The monotonic-progress contract the speed meter relies on: BytesRead
+/// carries a cumulative byte count, so successive events must leave the
+/// atomic holding the LATEST value. (If the handler accidentally summed or
+/// reset, the windowed-rate computation in `PassProgressState::observe`
+/// would read a bogus denominator and the displayed speed would be wrong.)
+#[test]
+fn stream_event_fn_bytes_read_is_last_writer_wins_cumulative() {
+    let wdf = Arc::new(AtomicU64::new(0));
+    let last_lba = Arc::new(AtomicU64::new(0));
+    let current_batch = Arc::new(AtomicU16::new(16));
+    let latest_bytes_read = Arc::new(AtomicU64::new(0));
+    let handler = make_stream_event_fn(
+        "sr0".to_string(),
+        wdf,
+        last_lba,
+        current_batch,
+        latest_bytes_read.clone(),
+    );
+
+    for cumulative in [1_048_576u64, 2_097_152, 3_145_728, 10_485_760] {
+        handler(Event {
+            kind: EventKind::BytesRead {
+                bytes: cumulative,
+                total: 10_485_760,
+            },
+        });
+        assert_eq!(
+            latest_bytes_read.load(Ordering::Relaxed),
+            cumulative,
+            "latest_bytes_read must hold the most recent cumulative count"
+        );
     }
-    assert!(
-        smooth < 0.01,
-        "no real bytes yet, smooth must be ~0; got {}",
-        smooth
-    );
-
-    // Phase 2: real samples — 30 MB/s sustained, four samples.
-    for i in 1..=4u64 {
-        let now = start + Duration::from_millis(3000 + i * 1000);
-        bytes.fetch_add(30 * 1024 * 1024, Ordering::Relaxed);
-        let b = bytes.load(Ordering::Relaxed);
-        let dt = now.duration_since(last_t).as_secs_f64();
-        let instant = if dt > 0.0 {
-            (b - last_b) as f64 / (1024.0 * 1024.0) / dt
-        } else {
-            0.0
-        };
-        last_b = b;
-        last_t = now;
-        smooth = if smooth < 0.01 {
-            instant
-        } else {
-            0.95 * smooth + 0.05 * instant
-        };
-    }
-
-    assert!(
-        smooth > 1.0,
-        "smooth_speed stuck near zero after 4 real samples at 30 MB/s — got {} MB/s",
-        smooth
-    );
-    assert!(
-        smooth <= 30.0,
-        "smooth_speed exceeded the instantaneous rate — bug in EMA: got {} MB/s",
-        smooth
-    );
 }

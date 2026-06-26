@@ -1604,6 +1604,71 @@ impl Drop for SweepingGuard {
     }
 }
 
+/// Build the drive-level `on_event` handler installed on the live drive.
+///
+/// Every event resets the watchdog (`wdf`) so the "stalled" timer doesn't
+/// climb while the library is working through recovery. `BytesRead` updates
+/// the shared `latest_bytes_read` atomic the UI reads; `ReadError` logs. The
+/// closure is factored out of `rip_disc` so the BytesRead→atomic wiring (the
+/// progress contract the `/api/state` speed meter depends on) is testable in
+/// isolation rather than buried in a 2000-line orchestrator.
+pub fn make_drive_event_fn(
+    dev: String,
+    wdf: Arc<AtomicU64>,
+    latest_bytes_read: Arc<AtomicU64>,
+) -> impl Fn(libfreemkv::event::Event) + Send + 'static {
+    move |event| {
+        wdf.store(crate::util::epoch_secs(), Ordering::Relaxed);
+        match event.kind {
+            libfreemkv::event::EventKind::BytesRead { bytes, .. } => {
+                latest_bytes_read.store(bytes, Ordering::Relaxed);
+            }
+            libfreemkv::event::EventKind::ReadError { sector, .. } => {
+                crate::log::device_log(&dev, &format!("Read error at sector {}", sector));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Build the stream-level `on_event` handler shared by the multipass ISO
+/// pipeline and the single-pass inline `DiscStream` path.
+///
+/// Resets the watchdog (`wdf`); `BytesRead` updates `latest_bytes_read`;
+/// `BatchSizeChanged` stores the new batch size (`current_batch`) and logs;
+/// `SectorSkipped` records the skipped LBA (`last_lba`) and logs. Factored
+/// out of `rip_disc` for the same testability reason as
+/// [`make_drive_event_fn`].
+pub fn make_stream_event_fn(
+    dev: String,
+    wdf: Arc<AtomicU64>,
+    last_lba: Arc<AtomicU64>,
+    current_batch: Arc<AtomicU16>,
+    latest_bytes_read: Arc<AtomicU64>,
+) -> impl Fn(libfreemkv::event::Event) + Send + 'static {
+    move |event| {
+        wdf.store(crate::util::epoch_secs(), Ordering::Relaxed);
+        match event.kind {
+            libfreemkv::event::EventKind::BytesRead { bytes, .. } => {
+                latest_bytes_read.store(bytes, Ordering::Relaxed);
+            }
+            libfreemkv::event::EventKind::BatchSizeChanged { new_size, reason } => {
+                current_batch.store(new_size, Ordering::Relaxed);
+                let label = match reason {
+                    BatchSizeReason::Shrunk => "shrunk",
+                    BatchSizeReason::Probed => "probed up",
+                };
+                crate::log::device_log(&dev, &format!("Batch size → {} ({})", new_size, label));
+            }
+            libfreemkv::event::EventKind::SectorSkipped { sector } => {
+                last_lba.store(sector, Ordering::Relaxed);
+                crate::log::device_log(&dev, &format!("Sector {} skipped (zero-filled)", sector));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Rip a disc. Reuses the existing drive session from scan_disc.
 /// If no session exists, opens fresh (for on_insert=rip).
 ///
@@ -2243,27 +2308,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // from this via spawn_pass_watcher. Renamed locally for clarity.
     let user_halt = halt.clone();
 
-    let dev_for_events = device.to_string();
-    let wdf_drive = wd_last_frame.clone();
-    let lbr_drive = latest_bytes_read.clone();
-    session.drive.on_event(move |event| {
-        // Any drive-level event means something is happening — reset the
-        // watchdog so the "stalled" timer doesn't monotonically climb
-        // while the library is working through recovery.
-        wdf_drive.store(crate::util::epoch_secs(), Ordering::Relaxed);
-        match event.kind {
-            libfreemkv::event::EventKind::BytesRead { bytes, .. } => {
-                lbr_drive.store(bytes, Ordering::Relaxed);
-            }
-            libfreemkv::event::EventKind::ReadError { sector, .. } => {
-                crate::log::device_log(
-                    &dev_for_events,
-                    &format!("Read error at sector {}", sector),
-                );
-            }
-            _ => {}
-        }
-    });
+    // Drive-level events: any one means something is happening, so the
+    // handler resets the watchdog so the "stalled" timer doesn't monotonically
+    // climb while the library works through recovery. See
+    // [`make_drive_event_fn`].
+    session.drive.on_event(make_drive_event_fn(
+        device.to_string(),
+        wd_last_frame.clone(),
+        latest_bytes_read.clone(),
+    ));
     // Multi-pass vs direct flow.
     //
     // When max_retries > 0, we go through an ISO intermediate: Disc::copy writes
@@ -3844,38 +3897,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // single-pass inline path (BytesRead + BatchSizeChanged +
     // SectorSkipped from DiscStream::fill_extents). Either path
     // calls this same closure; the UI doesn't care which.
-    let dev_for_stream_events = device.to_string();
-    let wdf_stream = wd_last_frame.clone();
-    let llba_stream = rip_last_lba.clone();
-    let rbs_stream = rip_current_batch.clone();
-    let lbr_stream = latest_bytes_read.clone();
-    let stream_event_fn = move |event: libfreemkv::event::Event| {
-        wdf_stream.store(crate::util::epoch_secs(), Ordering::Relaxed);
-        match event.kind {
-            libfreemkv::event::EventKind::BytesRead { bytes, .. } => {
-                lbr_stream.store(bytes, Ordering::Relaxed);
-            }
-            libfreemkv::event::EventKind::BatchSizeChanged { new_size, reason } => {
-                rbs_stream.store(new_size, Ordering::Relaxed);
-                let label = match reason {
-                    BatchSizeReason::Shrunk => "shrunk",
-                    BatchSizeReason::Probed => "probed up",
-                };
-                crate::log::device_log(
-                    &dev_for_stream_events,
-                    &format!("Batch size → {} ({})", new_size, label),
-                );
-            }
-            libfreemkv::event::EventKind::SectorSkipped { sector } => {
-                llba_stream.store(sector, Ordering::Relaxed);
-                crate::log::device_log(
-                    &dev_for_stream_events,
-                    &format!("Sector {} skipped (zero-filled)", sector),
-                );
-            }
-            _ => {}
-        }
-    };
+    let stream_event_fn = make_stream_event_fn(
+        device.to_string(),
+        wd_last_frame.clone(),
+        rip_last_lba.clone(),
+        rip_current_batch.clone(),
+        latest_bytes_read.clone(),
+    );
 
     // Mux-phase progress denominator. The multipass/resume highway reads the
     // WHOLE disc-capacity ISO, so its `BytesRead` climbs to `disc.capacity_bytes`
