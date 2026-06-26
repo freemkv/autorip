@@ -21,6 +21,7 @@
 //! the dashboard's pass/total bars don't reset to a "fresh rip" view
 //! when the mux phase starts.
 
+use crate::util::{BYTES_PER_GIB, BYTES_PER_MIB, MILLIS_PER_SEC};
 use crossbeam_channel::{SendTimeoutError as CbSendTimeoutError, bounded as cb_bounded};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -440,7 +441,7 @@ impl MuxSink {
             eprintln!(
                 "[DEBUG] MuxSink::push_state: pct={}, bytes_done={:.2}GB, speed={}MB/s",
                 pct,
-                bytes_done as f64 / 1_073_741_824.0,
+                bytes_done as f64 / BYTES_PER_GIB,
                 speed
             );
         }
@@ -453,7 +454,7 @@ impl MuxSink {
                 disc_name: self.ui.display_name.clone(),
                 disc_format: self.ui.disc_format.clone(),
                 progress_pct: pct,
-                progress_gb: bytes_done as f64 / 1_073_741_824.0,
+                progress_gb: bytes_done as f64 / BYTES_PER_GIB,
                 speed_mbs: speed,
                 eta: eta.clone(),
                 // During the mux phase the demux error counter (`errors`) is
@@ -469,7 +470,7 @@ impl MuxSink {
                     errors
                 },
                 lost_video_secs: if self.ui.sweep_damage.total_lost_ms > 0.0 {
-                    self.ui.sweep_damage.total_lost_ms / 1000.0
+                    self.ui.sweep_damage.total_lost_ms / MILLIS_PER_SEC
                 } else {
                     lost_video_secs
                 },
@@ -582,9 +583,8 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
         let speed = display_speed;
         let speed_for_eta = self.progress.eta_speed_mbs(now, display_speed);
         let eta = if speed_for_eta > 0.0 && self.ui.total_bytes > bytes_done {
-            let secs = ((self.ui.total_bytes - bytes_done) as f64
-                / (1024.0 * 1024.0)
-                / speed_for_eta) as u32;
+            let secs =
+                ((self.ui.total_bytes - bytes_done) as f64 / BYTES_PER_MIB / speed_for_eta) as u32;
             if secs > 359999 {
                 // > 99 hours — ETA is meaningless
                 String::new()
@@ -604,7 +604,7 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
 
         if now.duration_since(self.last_log).as_secs() >= 60 {
             self.last_log = now;
-            let gb = bytes_done as f64 / 1_073_741_824.0;
+            let gb = bytes_done as f64 / BYTES_PER_GIB;
             let speed_str = if speed >= 1.0 {
                 format!("{:.1} MB/s", speed)
             } else {
@@ -616,7 +616,7 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
                 format!(" ETA {}", eta)
             };
             if self.ui.total_bytes > 0 {
-                let total_gb = self.ui.total_bytes as f64 / 1_073_741_824.0;
+                let total_gb = self.ui.total_bytes as f64 / BYTES_PER_GIB;
                 crate::log::device_log(
                     &self.ui.device,
                     &format!(
@@ -877,7 +877,7 @@ pub(crate) fn run_mux(
                     let msg = format!(
                         "hard watchdog escalating: stalled {}s at {:.2} GB; exiting process for container restart",
                         stall_secs,
-                        bytes_good as f64 / 1_073_741_824.0,
+                        bytes_good as f64 / BYTES_PER_GIB,
                     );
                     // CRITICAL: do NOT call `device_log` here. The log
                     // file lives on the same NFS-mounted `/config`
@@ -946,7 +946,7 @@ pub(crate) fn run_mux(
                     // both the log line and the UI update — a single
                     // `wbytes` read so the two can't disagree.
                     let bytes = wbytes.load(Ordering::Relaxed);
-                    let gb = bytes as f64 / 1_073_741_824.0;
+                    let gb = bytes as f64 / BYTES_PER_GIB;
                     let pct = if wd_total > 0 {
                         (bytes * 100 / wd_total).min(100) as u8
                     } else {
@@ -1577,7 +1577,7 @@ pub(crate) fn run_mux(
             } else {
                 tracing::debug!(
                     "Mux send: OK in {:.3}ms, frame={}",
-                    elapsed.as_secs_f64() * 1000.0,
+                    elapsed.as_secs_f64() * MILLIS_PER_SEC,
                     track
                 );
             }
@@ -1653,7 +1653,7 @@ pub(crate) fn run_mux(
     };
     let elapsed_secs = start.elapsed().as_secs_f64();
     let speed_mbs = if elapsed_secs > 0.0 {
-        bytes_done as f64 / (1024.0 * 1024.0) / elapsed_secs
+        bytes_done as f64 / BYTES_PER_MIB / elapsed_secs
     } else {
         0.0
     };
@@ -2141,7 +2141,7 @@ mod tests {
             live_errors
         };
         let final_lost_secs = if snapshot_total_lost_ms > 0.0 {
-            snapshot_total_lost_ms / 1000.0
+            snapshot_total_lost_ms / MILLIS_PER_SEC
         } else {
             live_lost_secs
         };
@@ -2171,7 +2171,7 @@ mod tests {
             live_errors
         };
         let final_lost_secs = if snapshot_total_lost_ms > 0.0 {
-            snapshot_total_lost_ms / 1000.0
+            snapshot_total_lost_ms / MILLIS_PER_SEC
         } else {
             live_lost_secs
         };

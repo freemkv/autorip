@@ -3,6 +3,7 @@
 //! Opens drive fresh (requires container restart for firmware unlock).
 //! Stoppable via STOP flag. Reports live progress with good/bad/slow counts.
 
+use crate::util::SECTOR_BYTES;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -337,11 +338,11 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
         );
         return;
     }
-    let total_bytes = total_sectors * 2048;
+    let total_bytes = total_sectors * SECTOR_BYTES;
     let bytes_per_sec = if title.duration_secs > 0.0 {
         total_bytes as f64 / title.duration_secs
     } else {
-        8_250_000.0
+        crate::ripper::resume::FALLBACK_BITRATE_BYTES_PER_SEC
     };
     let batch = libfreemkv::disc::detect_max_batch_sectors(device_path);
 
@@ -354,7 +355,7 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
         &format!(
             "Verify: {} ({:.1} GB, {} sectors)",
             disc_name,
-            total_bytes as f64 / 1_073_741_824.0,
+            total_bytes as f64 / crate::util::BYTES_PER_GIB,
             total_sectors
         ),
     );
@@ -382,7 +383,7 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
         Some(&|p: &libfreemkv::progress::PassProgress| {
             let elapsed = start.elapsed().as_secs_f64();
             let speed = if elapsed > 0.0 {
-                p.work_done as f64 * 2048.0 / (1024.0 * 1024.0) / elapsed
+                p.work_done as f64 * SECTOR_BYTES as f64 / crate::util::BYTES_PER_MIB / elapsed
             } else {
                 0.0
             };
@@ -421,8 +422,9 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
     for range in &result.ranges {
         // Clamp so a pathological range can't render past the bar (>100%) or
         // invisibly thin (<0.3%).
-        let offset_pct =
-            (range.byte_offset as f64 / (total_sectors as f64 * 2048.0) * 100.0).clamp(0.0, 100.0);
+        let offset_pct = (range.byte_offset as f64 / (total_sectors as f64 * SECTOR_BYTES as f64)
+            * 100.0)
+            .clamp(0.0, 100.0);
         let width_pct = (range.count as f64 / total_sectors as f64 * 100.0).clamp(0.3, 100.0);
         // Exhaustive match (no `_`) so a new SectorStatus variant forces a
         // deliberate decision here instead of being silently dropped.
@@ -438,7 +440,7 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
             status: status_str.into(),
         });
 
-        let gb = range.byte_offset as f64 / 1_073_741_824.0;
+        let gb = range.byte_offset as f64 / crate::util::BYTES_PER_GIB;
         let ch_str = libfreemkv::verify::VerifyResult::chapter_at_offset(
             &title_clone.chapters,
             range.byte_offset,
@@ -472,8 +474,8 @@ fn run_verify_inner(device: &str, device_path: &str, keydb_path: Option<&str>) {
         });
     }
 
-    let bad_bytes = result.bad * 2048;
-    let bad_mb = bad_bytes as f64 / 1_048_576.0;
+    let bad_bytes = result.bad * SECTOR_BYTES;
+    let bad_mb = bad_bytes as f64 / crate::util::BYTES_PER_MIB;
     let bad_secs = bad_bytes as f64 / bytes_per_sec;
 
     let status = if was_stopped { "stopped" } else { "done" };

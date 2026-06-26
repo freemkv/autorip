@@ -1,3 +1,21 @@
+/// Bytes per disc sector, `u64`-typed for autorip's sector↔byte arithmetic
+/// (predominantly `u64`) so call sites need no per-site cast. Re-exports
+/// libfreemkv's single source of truth — not a re-declared literal.
+pub const SECTOR_BYTES: u64 = libfreemkv::consts::SECTOR_BYTES_U64;
+
+/// Bytes per mebibyte (2^20), `f64` for human-readable MB/s and MB display
+/// math. Single source so the two prior spellings (`1_048_576.0` and
+/// `1024.0 * 1024.0`) can't drift.
+pub const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+
+/// Bytes per gibibyte (2^30), `f64` for human-readable GB display math.
+pub const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Milliseconds per second, `f64` for the lost-video time math that converts
+/// between the millisecond-resolution damage accounting and second-resolution
+/// display/threshold values.
+pub const MILLIS_PER_SEC: f64 = 1000.0;
+
 /// Current epoch seconds.
 pub fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
