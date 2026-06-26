@@ -4154,88 +4154,84 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // block is skipped, so `demux_lost_secs == final_lost_secs` and behaviour
     // is unchanged. Both quantities are in-title-scoped (the mux only reads
     // the muxed title's sectors), matching the threshold's semantics.
-    if completed {
-        let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
-        if should_abort_for_loss(demux_lost_secs * 1000.0, abort_threshold_ms) {
-            crate::log::device_log(
-                device,
-                &format!(
-                    "ABORT: strategy=abort_check triggered — {:.2}s lost at mux (demux/decrypt skips) exceeds threshold {}s",
-                    demux_lost_secs, cfg_read.abort_on_lost_secs
-                ),
-            );
-            crate::log::device_log(
-                device,
-                &format!(
-                    "STRATEGY_FAILURE: abort_check FAILED — data loss ({:.2}s) exceeds threshold ({}s)",
-                    demux_lost_secs, cfg_read.abort_on_lost_secs
-                ),
-            );
-            crate::log::device_log(
-                device,
-                &if cfg_read.abort_on_lost_secs == 0 {
-                    "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. This loss appeared at mux time (decrypt/codec skips), which retries cannot recover. RAISE abort_on_lost_secs to accept some loss, or check that the disc's decryption keys are current.".to_string()
+    if post_mux_loss_verdict(completed, demux_lost_secs, cfg_read.abort_on_lost_secs)
+        != PostMuxVerdict::Proceed
+    {
+        crate::log::device_log(
+            device,
+            &format!(
+                "ABORT: strategy=abort_check triggered — {:.2}s lost at mux (demux/decrypt skips) exceeds threshold {}s",
+                demux_lost_secs, cfg_read.abort_on_lost_secs
+            ),
+        );
+        crate::log::device_log(
+            device,
+            &format!(
+                "STRATEGY_FAILURE: abort_check FAILED — data loss ({:.2}s) exceeds threshold ({}s)",
+                demux_lost_secs, cfg_read.abort_on_lost_secs
+            ),
+        );
+        crate::log::device_log(
+            device,
+            &if cfg_read.abort_on_lost_secs == 0 {
+                "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. This loss appeared at mux time (decrypt/codec skips), which retries cannot recover. RAISE abort_on_lost_secs to accept some loss, or check that the disc's decryption keys are current.".to_string()
+            } else {
+                format!(
+                    "RECOVERY_GUIDANCE: abort_on_lost_secs={}s limit exceeded — raise abort_on_lost_secs further or accept the loss after disc recovery. This loss appeared at mux time (decrypt/codec skips), which retries cannot recover.",
+                    cfg_read.abort_on_lost_secs
+                )
+            },
+        );
+        // Quarantine the lossy MKV: write `.failed` so the mover never
+        // files it and the resume detector treats the dir as
+        // terminal-failed (mirrors the multi-pass abort + mux-finalize
+        // failure paths). No `.done`/`.completed` is written.
+        let staging_disc_path = std::path::Path::new(&staging);
+        apply_post_mux_abort(
+            staging_disc_path,
+            demux_lost_secs,
+            cfg_read.abort_on_lost_secs,
+        );
+        update_state(
+            device,
+            RipState {
+                device: device.to_string(),
+                status: "error".to_string(),
+                disc_present: true,
+                disc_name: display_name.clone(),
+                disc_format: disc_format.clone(),
+                errors: final_errors,
+                // Operator-facing total loss = accepted sweep loss (in
+                // `final_lost_secs` for multi-pass; 0 for single-pass) plus
+                // the demux loss that tripped this gate. In single-pass
+                // `final_lost_secs == demux_lost_secs`, so report the demux
+                // value alone to avoid double-counting.
+                lost_video_secs: if cfg_read.max_retries == 0 {
+                    demux_lost_secs
                 } else {
-                    format!(
-                        "RECOVERY_GUIDANCE: abort_on_lost_secs={}s limit exceeded — raise abort_on_lost_secs further or accept the loss after disc recovery. This loss appeared at mux time (decrypt/codec skips), which retries cannot recover.",
-                        cfg_read.abort_on_lost_secs
-                    )
+                    final_lost_secs + demux_lost_secs
                 },
-            );
-            // Quarantine the lossy MKV: write `.failed` so the mover never
-            // files it and the resume detector treats the dir as
-            // terminal-failed (mirrors the multi-pass abort + mux-finalize
-            // failure paths). No `.done`/`.completed` is written.
-            let staging_disc_path = std::path::Path::new(&staging);
-            staging::write_failed_marker(
-                staging_disc_path,
-                &format!(
+                last_sector: final_last_sector,
+                current_batch: final_current_batch,
+                preferred_batch: batch,
+                tmdb_title: tmdb_title.clone(),
+                tmdb_year,
+                tmdb_poster: tmdb_poster.clone(),
+                tmdb_overview: tmdb_overview.clone(),
+                duration: duration.clone(),
+                codecs: codecs.clone(),
+                last_error: format!(
+                    "aborted — {:.2}s lost at mux (threshold: {}s)",
+                    demux_lost_secs, cfg_read.abort_on_lost_secs
+                ),
+                failure_reason: Some(format!(
                     "aborted: {:.2}s lost at mux exceeds threshold {}s",
                     demux_lost_secs, cfg_read.abort_on_lost_secs
-                ),
-            );
-            staging::clear_restart_count(staging_disc_path);
-            update_state(
-                device,
-                RipState {
-                    device: device.to_string(),
-                    status: "error".to_string(),
-                    disc_present: true,
-                    disc_name: display_name.clone(),
-                    disc_format: disc_format.clone(),
-                    errors: final_errors,
-                    // Operator-facing total loss = accepted sweep loss (in
-                    // `final_lost_secs` for multi-pass; 0 for single-pass) plus
-                    // the demux loss that tripped this gate. In single-pass
-                    // `final_lost_secs == demux_lost_secs`, so report the demux
-                    // value alone to avoid double-counting.
-                    lost_video_secs: if cfg_read.max_retries == 0 {
-                        demux_lost_secs
-                    } else {
-                        final_lost_secs + demux_lost_secs
-                    },
-                    last_sector: final_last_sector,
-                    current_batch: final_current_batch,
-                    preferred_batch: batch,
-                    tmdb_title: tmdb_title.clone(),
-                    tmdb_year,
-                    tmdb_poster: tmdb_poster.clone(),
-                    tmdb_overview: tmdb_overview.clone(),
-                    duration: duration.clone(),
-                    codecs: codecs.clone(),
-                    last_error: format!(
-                        "aborted — {:.2}s lost at mux (threshold: {}s)",
-                        demux_lost_secs, cfg_read.abort_on_lost_secs
-                    ),
-                    failure_reason: Some(format!(
-                        "aborted: {:.2}s lost at mux exceeds threshold {}s",
-                        demux_lost_secs, cfg_read.abort_on_lost_secs
-                    )),
-                    ..Default::default()
-                },
-            );
-            return;
-        }
+                )),
+                ..Default::default()
+            },
+        );
+        return;
     }
 
     // Emit a final mux summary line so the history record's captured log
@@ -4749,6 +4745,65 @@ pub(super) fn abort_lost_ms(
 /// pass as a silent success.
 fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
     lost_ms.is_nan() || lost_ms > abort_threshold_ms
+}
+
+/// Outcome of the post-mux loss gate, decoupled from the side effects
+/// (markers, state updates, logging) so the decision can be unit-tested
+/// executing-style.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PostMuxVerdict {
+    /// Loss is within the threshold (or the mux never completed, so the
+    /// gate does not apply): proceed to the success/hand-off path.
+    Proceed,
+    /// In-title demux loss exceeds the threshold: quarantine the staging
+    /// dir with `.failed` and refuse to deliver. Carries the demux-loss
+    /// seconds that tripped the gate (for the failure marker/log).
+    Abort { demux_lost_secs: f64 },
+}
+
+/// The pure post-mux abort decision. Inputs are the exact triple in scope
+/// at the gate: whether the mux completed, the in-title demux-skip loss in
+/// seconds, and the configured `abort_on_lost_secs` threshold.
+///
+/// This is the single source of truth for the verdict; both the fresh-rip
+/// gate (`rip_disc`) and the resume gate (`resume_remux`) delegate to it so
+/// the two paths cannot diverge. The gate only applies when the mux
+/// `completed` — an incomplete mux is handled by a separate read-error path
+/// upstream.
+pub(crate) fn post_mux_loss_verdict(
+    completed: bool,
+    demux_lost_secs: f64,
+    abort_on_lost_secs: u64,
+) -> PostMuxVerdict {
+    if !completed {
+        return PostMuxVerdict::Proceed;
+    }
+    let abort_threshold_ms = (abort_on_lost_secs * 1000) as f64;
+    if should_abort_for_loss(demux_lost_secs * 1000.0, abort_threshold_ms) {
+        PostMuxVerdict::Abort { demux_lost_secs }
+    } else {
+        PostMuxVerdict::Proceed
+    }
+}
+
+/// Apply the staging-side effects of a post-mux abort: quarantine the disc
+/// dir with `.failed` (so the mover never files it and resume treats it as
+/// terminal) and clear the restart counter. No `.done`/`.completed` is
+/// written. Factored out so both gate call sites stay in lock-step and the
+/// effect is testable against a `TempDir`.
+pub(crate) fn apply_post_mux_abort(
+    staging_disc_path: &std::path::Path,
+    demux_lost_secs: f64,
+    abort_on_lost_secs: u64,
+) {
+    staging::write_failed_marker(
+        staging_disc_path,
+        &format!(
+            "aborted: {:.2}s lost at mux exceeds threshold {}s",
+            demux_lost_secs, abort_on_lost_secs
+        ),
+    );
+    staging::clear_restart_count(staging_disc_path);
 }
 
 /// Whether the rip's deliverable is the whole-disc ISO itself rather than a
@@ -7415,65 +7470,153 @@ mod tests {
     /// (a) is not re-narrowed to single-pass and (b) compares
     /// `demux_lost_secs` via `should_abort_for_loss`, quarantining with
     /// `write_failed_marker`.
-    #[test]
-    fn fresh_rip_post_mux_gate_covers_multipass() {
-        let src = include_str!("mod.rs");
-        let start = src
-            .find("Post-mux demux-skip abort gate (all fresh-rip paths)")
-            .expect("mod.rs should have the post-mux demux-skip gate");
-        // Bound to the gate block: up to the final mux summary line that
-        // follows it.
-        let end = src[start..]
-            .find("Emit a final mux summary line")
-            .map(|i| start + i)
-            .expect("mod.rs should have the final mux-summary section after the gate");
-        let region = &src[start..end];
+    // The post-mux abort gate's verdict + staging side effects, driven
+    // executing-style through the SAME `post_mux_loss_verdict` /
+    // `apply_post_mux_abort` functions the production `rip_disc` gate calls
+    // (mod.rs "Post-mux demux-skip abort gate"). These replace the prior
+    // include_str! source-inspection tests: they fail if the production
+    // decision or its staging effect regresses, not if a string moves.
 
-        // The gate's outer guard must be `if completed {` — NOT narrowed to
-        // single-pass with `max_retries == 0`, which would skip multi-pass.
-        assert!(
-            region.contains("if completed {"),
-            "post-mux gate must run for all completed fresh rips (single + multi-pass)"
+    #[test]
+    fn post_mux_verdict_aborts_above_threshold_and_proceeds_at_or_below() {
+        // threshold 30s: 45s loss aborts, 10s proceeds, exactly-30s proceeds
+        // (gate is strictly `>`).
+        assert_eq!(
+            super::post_mux_loss_verdict(true, 45.0, 30),
+            super::PostMuxVerdict::Abort {
+                demux_lost_secs: 45.0
+            },
+            "45s demux loss over a 30s threshold must abort"
         );
-        assert!(
-            !region.contains("cfg_read.max_retries == 0 {\n        let abort_threshold_ms"),
-            "post-mux gate must not be re-guarded to single-pass only"
+        assert_eq!(
+            super::post_mux_loss_verdict(true, 10.0, 30),
+            super::PostMuxVerdict::Proceed,
+            "10s demux loss under a 30s threshold must proceed"
         );
-        // It must gate on the demux-skip estimate (the only signal carrying
-        // mux-time loss), via the shared comparator.
-        assert!(
-            region.contains("should_abort_for_loss(demux_lost_secs * 1000.0, abort_threshold_ms)"),
-            "post-mux gate must compare demux_lost_secs via should_abort_for_loss"
-        );
-        // Over-threshold loss must quarantine `.failed` (no `.done`).
-        assert!(
-            region.contains("write_failed_marker"),
-            "post-mux gate must quarantine an over-threshold lossy mux with write_failed_marker"
+        assert_eq!(
+            super::post_mux_loss_verdict(true, 30.0, 30),
+            super::PostMuxVerdict::Proceed,
+            "exactly-at-threshold must proceed (strictly greater-than aborts)"
         );
     }
 
     #[test]
-    fn post_mux_gate_decision_function_aborts_above_threshold() {
-        // Behavioural companion to the source-inspection test above: exercise
-        // the actual decision the post-mux gate makes, using the exact
-        // expression from the gate (`demux_lost_secs * 1000.0` vs the ms
-        // threshold). A nonzero loss above threshold must abort; below or at
-        // threshold must not.
-        let abort_threshold_ms = 30_000.0; // abort_on_lost_secs = 30
-        let over_demux_lost_secs = 45.0;
-        let under_demux_lost_secs = 10.0;
+    fn post_mux_verdict_perfect_required_aborts_any_loss_but_accepts_zero() {
+        // abort_on_lost_secs = 0 means "require a perfect rip": ANY nonzero
+        // in-title demux loss aborts, exactly-zero proceeds.
+        assert_eq!(
+            super::post_mux_loss_verdict(true, 0.0, 0),
+            super::PostMuxVerdict::Proceed,
+            "zero loss under a perfect-required threshold must proceed"
+        );
+        assert_eq!(
+            super::post_mux_loss_verdict(true, 0.001, 0),
+            super::PostMuxVerdict::Abort {
+                demux_lost_secs: 0.001
+            },
+            "any nonzero loss must abort when abort_on_lost_secs = 0"
+        );
+    }
+
+    #[test]
+    fn post_mux_verdict_does_not_gate_an_incomplete_mux() {
+        // An incomplete mux is handled by the upstream read-error path, not
+        // this gate — so even huge loss reports Proceed here.
+        assert_eq!(
+            super::post_mux_loss_verdict(false, 9999.0, 0),
+            super::PostMuxVerdict::Proceed,
+            "the post-mux gate must not fire when the mux did not complete"
+        );
+    }
+
+    #[test]
+    fn post_mux_verdict_nan_loss_fails_safe_to_abort() {
+        // An unquantifiable loss (NaN) must abort, never silently pass.
+        match super::post_mux_loss_verdict(true, f64::NAN, 30) {
+            super::PostMuxVerdict::Abort { demux_lost_secs } => {
+                assert!(demux_lost_secs.is_nan())
+            }
+            super::PostMuxVerdict::Proceed => panic!("NaN loss must fail safe to abort"),
+        }
+    }
+
+    #[test]
+    fn apply_post_mux_abort_quarantines_with_failed_and_no_done_or_completed() {
+        // Drive the REAL staging side effect of an abort: a `.failed` marker
+        // appears (so the mover never files the dir and resume treats it as
+        // terminal), and crucially NO `.done`/`.completed` is written.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disc = tmp.path().join("DISC_TITLE");
+        std::fs::create_dir_all(&disc).unwrap();
+
+        super::apply_post_mux_abort(&disc, 45.0, 30);
+
+        let reason =
+            staging::read_failed_reason(&disc).expect(".failed marker must exist after abort");
         assert!(
-            super::should_abort_for_loss(over_demux_lost_secs * 1000.0, abort_threshold_ms),
-            "45s demux loss over a 30s threshold must abort"
+            reason.contains("45.00s lost at mux exceeds threshold 30s"),
+            "failed reason must carry the loss/threshold, got: {reason}"
         );
         assert!(
-            !super::should_abort_for_loss(under_demux_lost_secs * 1000.0, abort_threshold_ms),
-            "10s demux loss under a 30s threshold must not abort"
+            !disc.join(staging::COMPLETED_MARKER).exists(),
+            "an aborted rip must NOT write .completed"
         );
-        // Perfect-required (threshold 0): any nonzero loss aborts.
         assert!(
-            super::should_abort_for_loss(0.001 * 1000.0, 0.0),
-            "any demux loss must abort when abort_on_lost_secs = 0"
+            !disc.join(".done").exists(),
+            "an aborted rip must NOT write a .done hand-off marker"
+        );
+    }
+
+    #[test]
+    fn apply_post_mux_abort_clears_restart_count() {
+        // The restart counter must be cleared on abort so a benign restart
+        // doesn't re-attempt a deterministically-lossy mux.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disc = tmp.path().join("DISC_TITLE");
+        std::fs::create_dir_all(&disc).unwrap();
+        staging::increment_restart_count(&disc).unwrap();
+        staging::increment_restart_count(&disc).unwrap();
+        assert_eq!(
+            staging::restart_count(&disc),
+            2,
+            "precondition: restart count was bumped to 2"
+        );
+
+        super::apply_post_mux_abort(&disc, 45.0, 30);
+
+        assert_eq!(
+            staging::restart_count(&disc),
+            0,
+            "abort must clear the restart count"
+        );
+    }
+
+    #[test]
+    fn under_threshold_verdict_leaves_staging_unquarantined() {
+        // The success-side contract: when the verdict is Proceed, the gate
+        // does NOT call apply_post_mux_abort, so the staging dir keeps a
+        // bumped restart count and never gets a `.failed`. This pins that the
+        // Proceed branch has no quarantine side effect.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disc = tmp.path().join("DISC_TITLE");
+        std::fs::create_dir_all(&disc).unwrap();
+        staging::increment_restart_count(&disc).unwrap();
+
+        // 10s loss, 30s threshold -> Proceed; production would not call the
+        // applier.
+        assert_eq!(
+            super::post_mux_loss_verdict(true, 10.0, 30),
+            super::PostMuxVerdict::Proceed
+        );
+
+        assert!(
+            staging::read_failed_reason(&disc).is_none(),
+            "an under-threshold rip must not be quarantined"
+        );
+        assert_eq!(
+            staging::restart_count(&disc),
+            1,
+            "an under-threshold rip must not clear the restart count"
         );
     }
 }
