@@ -873,4 +873,152 @@ mod tests {
         assert_eq!(cfg.on_read_error, "stop");
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    /// Parse a CHECKED-IN, realistic settings.json fixture through the REAL
+    /// `load_saved` overlay and assert every field independently. This is not
+    /// a serialize→deserialize self-roundtrip (which would tautologically pass
+    /// whatever the struct serializes): the fixture is hand-authored JSON with
+    /// deployment-shaped values, so the test fails if `load_saved` ever stops
+    /// reading a field, mis-keys it, or drops a clamp/validation/migration.
+    #[test]
+    fn real_settings_json_fixture_parses_field_by_field() {
+        const FIXTURE: &str = include_str!("../tests/fixtures/settings.json");
+        let d = scratch("fixture");
+        let cfg = load_with(&d, FIXTURE);
+
+        assert_eq!(cfg.staging_dir, "/staging-local");
+        assert_eq!(cfg.output_dir, "/output");
+        assert_eq!(cfg.movie_dir, "movies");
+        assert_eq!(cfg.tv_dir, "tv");
+        assert_eq!(cfg.min_length_secs, 900);
+        assert!(!cfg.main_feature);
+        assert!(!cfg.auto_eject);
+        assert_eq!(cfg.on_insert, "rip");
+        assert_eq!(cfg.output_format, "mkv");
+        assert_eq!(cfg.network_target, "");
+        assert_eq!(cfg.on_read_error, "skip");
+        assert_eq!(cfg.max_retries, 3);
+        assert!(cfg.keep_iso);
+        assert_eq!(cfg.abort_on_lost_secs, 30);
+        assert!(cfg.capture_without_keys);
+        assert_eq!(cfg.max_rip_duration_secs, 28800);
+        assert_eq!(cfg.min_pass_budget_secs, 5400);
+        assert_eq!(cfg.transport_recovery_delay_secs, 5);
+        assert_eq!(cfg.tmdb_api_key, "deadbeefcafef00ddeadbeefcafef00d");
+        assert_eq!(
+            cfg.keydb_path.as_deref(),
+            Some("/root/.config/freemkv/keydb.cfg")
+        );
+        assert_eq!(
+            cfg.keydb_url,
+            "https://keydb.example.org/export/keydb_eng.zip"
+        );
+        assert_eq!(cfg.key_source, "online");
+        assert_eq!(cfg.keyserver_url, "https://keys.example.org/decode");
+        assert_eq!(cfg.keyserver_secret, "s3cr3t-token");
+        assert_eq!(cfg.decrypt_threads, 4);
+        assert_eq!(cfg.log_retention_days, 14);
+        // The empty webhook URL in the fixture array must be filtered out.
+        assert_eq!(
+            cfg.webhook_urls,
+            vec![
+                "https://discord.com/api/webhooks/1/abc".to_string(),
+                "https://jellyfin.example.org/hook".to_string()
+            ],
+            "empty webhook URLs must be dropped on load"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Malformed / wrong-typed values at the settings.json trust boundary must
+    /// each fall back to the field default WITHOUT wiping the rest of the file.
+    /// Drives the real per-field type-gating + enum validation in `load_saved`.
+    #[test]
+    fn malformed_values_fall_back_to_defaults_field_independently() {
+        let d = scratch("malformed");
+        // Every field has a wrong type or an invalid enum value, EXCEPT
+        // movie_dir which is well-formed — proving the bad fields don't wipe
+        // the good one (independent gating).
+        let json = r#"{
+            "max_retries": "three",
+            "abort_on_lost_secs": -5,
+            "main_feature": "yes",
+            "on_insert": "explode",
+            "output_format": "garbage",
+            "on_read_error": "panic",
+            "key_source": "telepathy",
+            "decrypt_threads": "lots",
+            "movie_dir": "Films"
+        }"#;
+        let cfg = load_with(&d, json);
+        let def = Config::default();
+
+        // Wrong-typed / out-of-range numerics keep defaults.
+        assert_eq!(
+            cfg.max_retries, def.max_retries,
+            "string max_retries → default"
+        );
+        assert_eq!(
+            cfg.abort_on_lost_secs, def.abort_on_lost_secs,
+            "negative abort_on_lost_secs (not as_u64) → default"
+        );
+        assert_eq!(cfg.main_feature, def.main_feature, "string bool → default");
+        assert_eq!(
+            cfg.decrypt_threads, def.decrypt_threads,
+            "string usize → default"
+        );
+        // Invalid enum strings keep defaults (validated against allowed sets).
+        assert_eq!(cfg.on_insert, def.on_insert, "unknown on_insert → default");
+        assert_eq!(
+            cfg.output_format, def.output_format,
+            "unknown output_format → default"
+        );
+        assert_eq!(
+            cfg.on_read_error, def.on_read_error,
+            "unknown on_read_error → default"
+        );
+        assert_eq!(
+            cfg.key_source, def.key_source,
+            "unknown key_source → default"
+        );
+        // The one well-formed field still loads — bad neighbours didn't wipe it.
+        assert_eq!(
+            cfg.movie_dir, "Films",
+            "a valid field survives bad neighbours"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A settings.json that fails to parse entirely (e.g. a partial write from
+    /// a SIGKILL mid-save) must revert ALL persisted fields to defaults rather
+    /// than panicking or loading garbage. Drives the real parse-failure branch.
+    #[test]
+    fn unparseable_settings_json_reverts_to_defaults() {
+        let d = scratch("unparseable");
+        let cfg = load_with(&d, "{ this is not valid json ");
+        let def = Config::default();
+        assert_eq!(cfg.max_retries, def.max_retries);
+        assert_eq!(cfg.staging_dir, def.staging_dir);
+        assert_eq!(cfg.output_format, def.output_format);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Numeric knobs above their trust-boundary ceiling are clamped on load.
+    /// (Complements `load_saved_clamps_pathological_durations` with the
+    /// retention + decrypt_threads ceilings exercised via a fixture-shaped
+    /// JSON rather than struct literals.)
+    #[test]
+    fn over_ceiling_numeric_knobs_are_clamped_on_load() {
+        let d = scratch("clamp_ceiling");
+        let json = r#"{
+            "log_retention_days": 999999,
+            "decrypt_threads": 100000,
+            "max_retries": 250
+        }"#;
+        let cfg = load_with(&d, json);
+        assert_eq!(cfg.log_retention_days, 3650, "retention clamps to 10y");
+        assert_eq!(cfg.decrypt_threads, 256, "decrypt_threads clamps to 256");
+        assert_eq!(cfg.max_retries, 10, "max_retries clamps to 10");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
