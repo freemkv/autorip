@@ -831,7 +831,7 @@ fn check_and_move(cfg: &Config) {
         // `create_dir_all` a fresh tree (which would resolve into the
         // container's writable overlay and silently swallow an 80 GB rip).
         let dest_root = destination_root(cfg, &tmdb_result);
-        if let Err(reason) = validate_destination_root(dest_root) {
+        if let Err(reason) = validate_destination_root(&dest_root) {
             record_error(
                 &dir_str,
                 &format!(
@@ -845,7 +845,7 @@ fn check_and_move(cfg: &Config) {
             );
             crate::log::syslog(&format!(
                 "Move BLOCKED — destination root {} unavailable: {} (output preserved in staging: {})",
-                absolute_for_log(dest_root),
+                absolute_for_log(&dest_root),
                 reason,
                 dir.display()
             ));
@@ -1167,7 +1167,15 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
                 } else {
                     String::new()
                 };
-                let dir = format!("{}/{}{}", cfg.movie_dir, safe_title, year_str);
+                // The movie root is `movie_dir` resolved UNDER `output_dir`
+                // (see `resolve_media_root`): a RELATIVE `movie_dir`
+                // ("movies") is joined onto output_dir → /mnt/.../movies; an
+                // ABSOLUTE `movie_dir` wins via Path::join (back-compat).
+                // Pre-fix this used `cfg.movie_dir` standalone, so a relative
+                // "movies" resolved against the container root `/` → `/movies`
+                // (the overlay), the 2026-06 "Mercy" incident.
+                let root = resolve_media_root(&cfg.output_dir, &cfg.movie_dir);
+                let dir = format!("{root}/{safe_title}{year_str}");
                 // Filename carries the year too, matching the folder and the
                 // Plex/Jellyfin `Title (Year)/Title (Year).ext` convention
                 // (pre-fix the file was bare `Title.ext` — folder had the year
@@ -1176,7 +1184,10 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
                 format!("{dir}/{name}")
             }
             "tv" if !cfg.tv_dir.is_empty() => {
-                let dir = format!("{}/{}/Season 1", cfg.tv_dir, safe_title);
+                // Same join fix as the movie branch: `tv_dir` resolved under
+                // `output_dir` (relative joins, absolute wins).
+                let root = resolve_media_root(&cfg.output_dir, &cfg.tv_dir);
+                let dir = format!("{root}/{safe_title}/Season 1");
                 // Sanitize the leaf too — the movie branch already derives
                 // its leaf from a sanitized title, but this branch used the
                 // RAW source filename, so a filename carrying a path
@@ -1206,27 +1217,61 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
     }
 }
 
+/// Resolve a media subdirectory (`movie_dir` / `tv_dir`) UNDER the base
+/// `output_dir` using `Path::join` semantics:
+///   - a RELATIVE `sub` ("movies") is joined onto `output_dir`
+///     ("/mnt/unraid-1/media/" + "movies" → "/mnt/unraid-1/media/movies").
+///   - an ABSOLUTE `sub` ("/srv/movies") REPLACES `output_dir` entirely
+///     (Path::join semantics) — preserving back-compat for operators who
+///     configured an absolute movie/tv dir.
+///   - an EMPTY `sub` yields `output_dir` unchanged (the empty-dir
+///     fall-through; callers only reach here with a non-empty `sub`).
+///
+/// This is the core of the 2026-06 "Mercy" fix: previously the movie/tv
+/// branches used `cfg.movie_dir` / `cfg.tv_dir` STANDALONE, so a relative
+/// "movies" resolved against the container root `/` → `/movies` (the
+/// ephemeral overlay) instead of under the NFS mount at output_dir.
+///
+/// Returns a clean, slash-joined string (no trailing slash from a
+/// trailing-slash `output_dir`, since Path::join normalizes that).
+fn resolve_media_root(output_dir: &str, sub: &str) -> String {
+    if sub.is_empty() {
+        return output_dir.to_string();
+    }
+    Path::new(output_dir)
+        .join(sub)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// The configured destination ROOT directory that governs a planned move,
 /// mirroring `build_destination`'s root selection exactly. This is the
-/// mount point the operator configured (e.g. `/mnt/unraid-1/media/movies`),
-/// NOT the per-title subdirectory under it. Returned so the mover can
-/// validate the root is present + writable BEFORE creating any subdir tree
-/// under it — the guard against silently writing an 80 GB rip into a
-/// container overlay when the NAS bind-mount has vanished.
+/// resolved mount-relative root (e.g. `/mnt/unraid-1/media/movies`), NOT
+/// the per-title subdirectory under it. Returned so the mover can validate
+/// the root is present + writable BEFORE creating any subdir tree under it
+/// — the guard against silently writing an 80 GB rip into a container
+/// overlay when the NAS bind-mount has vanished.
 ///
 /// Selection must stay in lock-step with `build_destination`:
-///   - movie with a non-empty `movie_dir` → `movie_dir`
-///   - tv with a non-empty `tv_dir` → `tv_dir`
+///   - movie with a non-empty `movie_dir` → `output_dir` ⨝ `movie_dir`
+///   - tv with a non-empty `tv_dir` → `output_dir` ⨝ `tv_dir`
 ///   - everything else (no tmdb, empty movie/tv dir) → `output_dir`
-fn destination_root<'a>(cfg: &'a Config, tmdb: &Option<tmdb::TmdbResult>) -> &'a str {
+///
+/// (The join is the "Mercy" fix — see `resolve_media_root`. Returns an
+/// owned String now that the root is computed, not a borrowed cfg field.)
+fn destination_root(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>) -> String {
     if let Some(result) = tmdb {
         match result.media_type.as_str() {
-            "movie" if !cfg.movie_dir.is_empty() => return &cfg.movie_dir,
-            "tv" if !cfg.tv_dir.is_empty() => return &cfg.tv_dir,
+            "movie" if !cfg.movie_dir.is_empty() => {
+                return resolve_media_root(&cfg.output_dir, &cfg.movie_dir);
+            }
+            "tv" if !cfg.tv_dir.is_empty() => {
+                return resolve_media_root(&cfg.output_dir, &cfg.tv_dir);
+            }
             _ => {}
         }
     }
-    &cfg.output_dir
+    cfg.output_dir.clone()
 }
 
 /// Fail-loud destination-root validation: the configured root must ALREADY
@@ -1319,21 +1364,37 @@ fn validate_destination_root(root: &str) -> Result<(), String> {
 /// preserves output in staging. This just surfaces the problem early.
 pub(crate) fn check_configured_destinations(cfg: &Config) -> Vec<(String, String)> {
     let mut problems = Vec::new();
-    // Deduplicate identical roots (movie_dir == output_dir is common) so the
-    // operator doesn't see the same warning twice.
-    let mut seen: Vec<&str> = Vec::new();
-    for root in [
-        cfg.movie_dir.as_str(),
-        cfg.tv_dir.as_str(),
-        cfg.output_dir.as_str(),
-    ] {
+    // Validate the RESOLVED roots — the same `output_dir`-joined paths the
+    // move actually uses (`resolve_media_root`), not the raw relative
+    // `movie_dir` / `tv_dir`. Without this the early check would flag a
+    // perfectly-valid relative "movies" as "not absolute" even though it
+    // resolves to a present /mnt/.../movies (and conversely would miss a
+    // join that lands somewhere missing).
+    let movie_root = if cfg.movie_dir.is_empty() {
+        None
+    } else {
+        Some(resolve_media_root(&cfg.output_dir, &cfg.movie_dir))
+    };
+    let tv_root = if cfg.tv_dir.is_empty() {
+        None
+    } else {
+        Some(resolve_media_root(&cfg.output_dir, &cfg.tv_dir))
+    };
+    // Deduplicate identical resolved roots (movie_dir resolving to the same
+    // path as output_dir is common) so the operator doesn't see the same
+    // warning twice.
+    let mut seen: Vec<String> = Vec::new();
+    for root in [movie_root, tv_root, Some(cfg.output_dir.clone())]
+        .into_iter()
+        .flatten()
+    {
         if root.is_empty() || seen.contains(&root) {
             continue;
         }
-        seen.push(root);
-        if let Err(reason) = validate_destination_root(root) {
-            problems.push((root.to_string(), reason));
+        if let Err(reason) = validate_destination_root(&root) {
+            problems.push((root.clone(), reason));
         }
+        seen.push(root);
     }
     problems
 }
@@ -1629,6 +1690,94 @@ mod tests {
             dest,
             "/out/Movies/Aurora Drift Two (2024)/Aurora Drift Two (2024).mkv"
         );
+    }
+
+    // ===================================================================
+    // Mercy incident ROOT CAUSE (2026-06): a RELATIVE `movie_dir` must be
+    // joined UNDER `output_dir`, not used standalone. The rig's exact
+    // config was output_dir="/mnt/unraid-1/media/", movie_dir="movies".
+    // Pre-fix, build_destination used `cfg.movie_dir` ("movies") directly,
+    // so the dest was "movies/Mercy (2024)/..." → resolved against the
+    // container root `/` → "/movies/..." (the ephemeral overlay), NOT the
+    // NFS mount. The fix joins movie_dir under output_dir.
+    // ===================================================================
+    #[test]
+    fn build_destination_relative_movie_dir_joins_under_output_dir() {
+        // The EXACT rig config that caused the Mercy incident.
+        let cfg = cfg_with_dirs("movies", "", "/mnt/unraid-1/media/");
+        let tmdb = Some(tmdb_movie("Mercy", 2023));
+        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv");
+        assert_eq!(
+            dest, "/mnt/unraid-1/media/movies/Mercy (2023)/Mercy (2023).mkv",
+            "a relative movie_dir must resolve UNDER output_dir on the NFS mount"
+        );
+        // The regression we're guarding against: it must NOT be the bare
+        // container-overlay path.
+        assert!(
+            !dest.starts_with("/movies/"),
+            "movie_dir must never be used standalone (Mercy bug: wrote to /movies on the overlay)"
+        );
+        // And destination_root must agree — it's what validate_destination_root
+        // checks, so a correct config validates the REAL mount root.
+        assert_eq!(
+            destination_root(&cfg, &tmdb),
+            "/mnt/unraid-1/media/movies",
+            "destination_root must be the joined mount-relative root, not bare 'movies'"
+        );
+    }
+
+    /// A relative `tv_dir` is likewise joined under `output_dir` (same bug
+    /// class as the movie branch).
+    #[test]
+    fn build_destination_relative_tv_dir_joins_under_output_dir() {
+        let cfg = cfg_with_dirs("", "tv", "/mnt/unraid-1/media/");
+        let tmdb = Some(tmdb::TmdbResult {
+            title: "Severance".into(),
+            year: 2022,
+            poster_url: String::new(),
+            overview: String::new(),
+            media_type: "tv".into(),
+        });
+        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv");
+        assert_eq!(
+            dest,
+            "/mnt/unraid-1/media/tv/Severance/Season 1/sev_s01e01.mkv"
+        );
+        assert!(!dest.starts_with("/tv/"));
+    }
+
+    /// Back-compat: an ABSOLUTE `movie_dir` still wins via Path::join
+    /// semantics (replaces output_dir entirely) — operators who configured
+    /// an absolute movie/tv dir keep their existing layout.
+    #[test]
+    fn build_destination_absolute_movie_dir_overrides_output_dir() {
+        let cfg = cfg_with_dirs("/srv/library/movies", "", "/mnt/unraid-1/media/");
+        let tmdb = Some(tmdb_movie("Mercy", 2023));
+        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv");
+        assert_eq!(
+            dest, "/srv/library/movies/Mercy (2023)/Mercy (2023).mkv",
+            "an absolute movie_dir must override output_dir (Path::join semantics)"
+        );
+        assert_eq!(destination_root(&cfg, &tmdb), "/srv/library/movies");
+    }
+
+    /// `resolve_media_root` unit semantics: relative joins, absolute wins,
+    /// trailing slashes normalize, empty sub → output_dir.
+    #[test]
+    fn resolve_media_root_semantics() {
+        assert_eq!(
+            resolve_media_root("/mnt/unraid-1/media/", "movies"),
+            "/mnt/unraid-1/media/movies"
+        );
+        assert_eq!(
+            resolve_media_root("/mnt/unraid-1/media", "movies"),
+            "/mnt/unraid-1/media/movies"
+        );
+        assert_eq!(
+            resolve_media_root("/mnt/media", "/srv/movies"),
+            "/srv/movies"
+        );
+        assert_eq!(resolve_media_root("/mnt/media", ""), "/mnt/media");
     }
 
     #[test]
