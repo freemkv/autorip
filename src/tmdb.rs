@@ -612,13 +612,6 @@ mod tests {
     /// a future edit to that arm will be caught here.
     #[test]
     fn fetch_multi_error_summary_no_api_key_leak() {
-        // Mirrors the match arm in fetch_multi's Err(e) branch.
-        fn error_kind_for(e: &ureq::Error) -> String {
-            match e {
-                ureq::Error::Transport(t) => t.kind().to_string(),
-                ureq::Error::Status(c, _) => format!("HTTP {c}"),
-            }
-        }
         // Verify the Status variant: just a code, no URL.
         // We can't construct a live ureq::Error::Status without a server, but
         // we can assert the format! template that fetch_multi emits.

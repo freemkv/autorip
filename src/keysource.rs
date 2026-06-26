@@ -1,25 +1,23 @@
 //! Where AACS keys come from.
 //!
-//! libfreemkv does no key lookup — it is handed a [`libfreemkv::Key`] and
-//! derives down the AACS chain to decrypt. autorip resolves that key from one
-//! or more *published key sources* (`freemkv_keysources`): the mapfile cache
-//! (the resume fast-path) is tried first, then the configured source — a local
-//! keydb (`local`) or a remote key service (`online`).
+//! libfreemkv does no key lookup — its `KeySource`s resolve a disc's terminal
+//! Unit Keys, driving the library's boil-down crypto. autorip resolves from the
+//! configured *published key source* (`freemkv_keysources`): a local keydb
+//! (`local`) or a remote key service (`online`).
 //!
 //! The flow is the same for a live drive and a staged ISO: scan the disc
 //! KEYLESS (structure + AACS inputs, no resolution), build [`DiscInputs`] from
-//! its key files (+ content samples when a source needs them), then try each
-//! source's candidate keys via [`libfreemkv::Disc::decrypt_with`] — the first
-//! that derives unit keys wins. The only drive-vs-ISO difference is the
-//! [`DiscKeyAccess`] impl.
+//! its key files (+ content samples for wrong-key validation), then resolve via
+//! [`resolve_and_apply_traced`] — the first source whose Unit Keys validate
+//! wins. The only drive-vs-ISO difference is the [`DiscKeyAccess`] impl.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use freemkv_keysources::{
-    DiscInputs, KeySource, KeydbSource, MapfileSource, MultiSource, OnlineSource,
-};
-use libfreemkv::{read_encrypted_units, resolve_and_apply};
+use freemkv_keysources::{DiscInputs, KeySource, KeydbSource, OnlineSource};
+use libfreemkv::aacs::ResolutionTrace;
+use libfreemkv::keysource::resolve_and_apply_traced;
+use libfreemkv::read_encrypted_units;
 
 use crate::config::Config;
 
@@ -143,10 +141,13 @@ pub enum KeyOutcome {
     Resolved,
     /// Couldn't read the disc's key files, or the disc reported no titles.
     MissingInputs,
-    /// No configured source produced a key that decrypts this disc.
+    /// No configured source produced a key that decrypts this disc. Since the
+    /// reshaped `KeySource` no longer reports a per-source `errored()` signal, a
+    /// source that *failed* (e.g. an unreachable key service) is no longer
+    /// distinguished from one that simply had no key — both land here. The
+    /// per-source [`ResolutionTrace`] (rendered to the device log) carries the
+    /// finer-grained walk for diagnosis.
     NoKey,
-    /// A source itself failed (e.g. key service unreachable / unreadable keydb).
-    Unreachable,
 }
 
 /// The configured keydb path, or the service's standard default location.
@@ -273,17 +274,17 @@ pub fn iso_scan_opts() -> libfreemkv::ScanOptions {
     libfreemkv::ScanOptions::default()
 }
 
-/// Build the ordered key-source list from config.
+/// Build the ordered key-source list from config: `online` → the remote key
+/// service, anything else → the local keydb (explicit path, else the standard
+/// location).
 ///
-/// The mapfile cache (when a rip mapfile exists) is tried first — it holds
-/// already-resolved unit keys, so a resume needs no keydb parse and no network.
-/// Then the configured source: `online` → the remote key service, anything
-/// else → the local keydb (explicit path, else the standard location).
-pub fn build_sources(cfg: &Config, mapfile: Option<&Path>) -> Vec<Box<dyn KeySource>> {
+/// The mapfile key-source was removed in the AACS-trait reshape: on resume /
+/// deferred mux, keys are re-resolved from the keydb / online source rather
+/// than read back from the `.map` header (correct, marginally slower). The
+/// `.map` recovery-state file itself is unaffected — autorip still loads it for
+/// sector status via `IsoAccess`.
+pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
     let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
-    if let Some(mf) = mapfile {
-        sources.push(Box::new(MapfileSource::new(mf)));
-    }
     match cfg.key_source.as_str() {
         "online" => match validate_keyserver_url(&cfg.keyserver_url) {
             Ok(()) => sources.push(Box::new(OnlineSource::new(
@@ -292,8 +293,8 @@ pub fn build_sources(cfg: &Config, mapfile: Option<&Path>) -> Vec<Box<dyn KeySou
             ))),
             // SSRF defense-in-depth: refuse to POST disc-key material to an
             // internal / metadata address. Drop the online source entirely
-            // (the mapfile cache, if present, still applies) rather than
-            // hand `OnlineSource` a URL we won't trust. The web store-side
+            // (leaving no source) rather than hand `OnlineSource` a URL we
+            // won't trust. The web store-side
             // guard normally rejects these at save time; this covers a
             // value that slipped past it or predates that guard.
             Err(e) => {
@@ -364,25 +365,23 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         [0u8; 16]
     });
 
-    // Read content samples only if some source needs ciphertext validation:
-    // an online key service, OR a keydb (it can hand out a per-disc terminal
-    // `Key::Unit` that `decrypt_with` applies as-is — a hash-matching but
-    // wrong UK is only disproved by descrambling real ciphertext). A mapfile
-    // alone keys on already-validated unit keys and needs no sample.
-    let need_samples = sources.iter().any(|s| s.needs_samples());
-    let samples = if need_samples {
-        match disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() {
-            Some(title) => access.sample_units(&title, SAMPLE_UNITS),
-            None => {
-                tracing::warn!(
-                    phase = "key_resolve",
-                    "no titles — cannot sample for key service"
-                );
-                Vec::new()
-            }
+    // Read content samples for ciphertext validation, UNCONDITIONALLY. The
+    // reshaped `KeySource` trait dropped `needs_samples()`, so we no longer gate
+    // the sample read on a source asking for it. Both remaining sources need
+    // samples anyway — the keydb can hand out a per-disc terminal unit key that
+    // `decrypt_with` applies as-is (a hash-matching but wrong UK is only
+    // disproved by descrambling real ciphertext), and the online service
+    // validates server-side — so this is conservative, not wasteful. Samples
+    // feed `decrypt_with`'s wrong-key rejection via `inputs.samples`; never skip.
+    let samples = match disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() {
+        Some(title) => access.sample_units(&title, SAMPLE_UNITS),
+        None => {
+            tracing::warn!(
+                phase = "key_resolve",
+                "no titles — cannot sample for key validation"
+            );
+            Vec::new()
         }
-    } else {
-        Vec::new()
     };
 
     let inputs = DiscInputs {
@@ -403,23 +402,84 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         },
     };
 
-    // One ordered driver, one shared loop: hand each source's candidates (one at
-    // a time) to `Disc::decrypt_with` — which validates and only keeps a key that
-    // decrypts — and stop at the first that takes.
-    let mut sources = MultiSource::new(sources);
-    if resolve_and_apply(&mut sources, &inputs, &mut disc) {
+    // One ordered driver: each source's `get_uk` is tried in turn and the first
+    // whose Unit Keys validate against the samples is committed. The `_traced`
+    // variant also hands back the structured per-source walk for rendering.
+    let (resolved, trace) = resolve_and_apply_traced(&sources, &inputs, &mut disc);
+
+    // Render the structured walk to the device log — ALWAYS, success or
+    // failure: the "error-walk pillar". English lives here (app layer); the
+    // library trace is typed enums only.
+    for line in render_resolution_trace(&trace) {
+        tracing::info!(phase = "key_resolve", "{line}");
+    }
+
+    if resolved {
         tracing::info!(phase = "key_resolve", "key resolved — disc now keyed");
         return (disc, KeyOutcome::Resolved);
     }
+    (disc, KeyOutcome::NoKey)
+}
 
-    // Every source exhausted with no key. A source that FAILED (an unreachable
-    // key service) is reported distinctly from a clean "no key for this disc".
-    let outcome = if sources.errored() {
-        KeyOutcome::Unreachable
-    } else {
-        KeyOutcome::NoKey
+/// Render a [`ResolutionTrace`] into human-readable `who > node > … > OUTCOME`
+/// lines — one per unlocker and per key source consulted. The library trace is
+/// English-free typed enums; ALL English mapping lives here in the app layer.
+/// Shown on both success and failure so the operator always sees the walk.
+pub fn render_resolution_trace(trace: &ResolutionTrace) -> Vec<String> {
+    use libfreemkv::aacs::trace::{KeyNode, KeyOutcome as KO, UnlockOutcome};
+
+    let mkb = |m: Option<u32>| match m {
+        Some(n) => format!(" (MKBv{n})"),
+        None => String::new(),
     };
-    (disc, outcome)
+    let mut lines = Vec::new();
+
+    for step in &trace.unlock {
+        // `who` is the unlocker's own name() — printed verbatim (no enum to map).
+        let outcome = match step.outcome {
+            UnlockOutcome::Unlocked => "UNLOCKED".to_string(),
+            UnlockOutcome::FirmwareNotUnlockable => "firmware not unlockable".to_string(),
+            UnlockOutcome::NoUsableHostCert { mkb: m } => {
+                format!("no usable host cert{}", mkb(m))
+            }
+            UnlockOutcome::CertRevoked { mkb: m } => format!("host cert revoked{}", mkb(m)),
+            UnlockOutcome::HandshakeRejected => "handshake rejected".to_string(),
+            UnlockOutcome::VidUnavailable => "Volume ID unavailable".to_string(),
+        };
+        lines.push(format!("unlock: {} > {outcome}", step.who));
+    }
+
+    for step in &trace.keys {
+        // `who` is the source's own label() — printed verbatim (no enum to map).
+        let nodes: Vec<&str> = step
+            .path
+            .iter()
+            .map(|n| match n {
+                KeyNode::MatchedDisc => "matched disc",
+                KeyNode::NoEntry => "no entry",
+                KeyNode::FoundUnitKeys => "found unit keys",
+                KeyNode::FoundVuk => "found VUK",
+                KeyNode::FoundMediaKey => "found media key",
+                KeyNode::NeedVid => "need VID",
+                KeyNode::VidFromUnlock => "VID from drive",
+                KeyNode::VidFromKeydb => "VID from keydb",
+                KeyNode::NoVid => "no VID",
+                KeyNode::DerivedVuk => "derived VUK",
+                KeyNode::DerivedUnitKeys => "derived unit keys",
+            })
+            .collect();
+        let outcome = match step.outcome {
+            KO::Resolved => "RESOLVED",
+            KO::MissingVid => "MISSING VID",
+            KO::NoKey => "NO KEY",
+        };
+        let mut parts = vec![step.who.clone()];
+        parts.extend(nodes.into_iter().map(str::to_string));
+        parts.push(outcome.to_string());
+        lines.push(format!("key: {}", parts.join(" > ")));
+    }
+
+    lines
 }
 
 /// [`DiscKeyAccess`] backed by a live optical drive. `vid` is the Volume ID
@@ -695,8 +755,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("keys").join("keydb.cfg");
 
-        let mut cfg = Config::default();
-        cfg.keydb_path = Some(dest.to_string_lossy().into_owned());
+        let cfg = Config {
+            keydb_path: Some(dest.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
 
         // The path the reads will resolve and the gate must check.
         assert_eq!(keydb_path(&cfg), dest);
@@ -790,8 +852,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let explicit = tmp.path().join("custom").join("mykeys.cfg");
 
-        let mut cfg = Config::default();
-        cfg.keydb_path = Some(explicit.to_string_lossy().into_owned());
+        let cfg = Config {
+            keydb_path: Some(explicit.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
 
         assert_eq!(
             keydb_path(&cfg),
@@ -822,8 +886,10 @@ mod tests {
             // No exe-local default resolvable in this environment — skip.
             return;
         };
-        let mut cfg = Config::default();
-        cfg.keydb_path = Some(exe_local.to_string_lossy().into_owned());
+        let cfg = Config {
+            keydb_path: Some(exe_local.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
         assert_eq!(keydb_path(&cfg), exe_local);
 
         let result = save_keydb(&cfg, b"0xBEEF\n").expect("save must succeed");
@@ -840,8 +906,8 @@ mod tests {
     // --- KeyOutcome reporting via resolve_keys (rc.6 WS3) --------------------
 
     /// A minimal keyless, encrypted `Disc` for driving `resolve_keys` outcome
-    /// classification. No real AACS state — the outcome (MissingInputs / NoKey /
-    /// Unreachable) is decided by the fixtures' behavior, not the disc.
+    /// classification. No real AACS state — the outcome (MissingInputs / NoKey)
+    /// is decided by the fixtures' behavior, not the disc.
     fn keyless_encrypted_disc() -> libfreemkv::Disc {
         libfreemkv::Disc {
             volume_id: "TEST_DISC".into(),
@@ -861,25 +927,29 @@ mod tests {
         }
     }
 
-    /// A `KeySource` fixture that hands out NO keys and never errors — models a
-    /// source that simply has no key for this disc (e.g. an empty keydb).
+    /// A `KeySource` fixture that resolves NO unit keys — models a source that
+    /// simply has no key for this disc (e.g. an empty keydb).
     struct NoKeySource;
     impl KeySource for NoKeySource {
-        fn next_key(&mut self, _inputs: &DiscInputs) -> Option<libfreemkv::Key> {
-            None
+        fn get_uk(
+            &self,
+            _ctx: &dyn freemkv_keysources::ResolveCtx,
+        ) -> Result<Vec<freemkv_keysources::UnitKey>, libfreemkv::Error> {
+            Ok(Vec::new())
         }
     }
 
-    /// A `KeySource` fixture that hands out no keys but reports `errored()` —
-    /// models a source that FAILED (e.g. key service unreachable / unreadable
-    /// keydb), the distinction `resolve_keys` maps to `Unreachable`.
+    /// A `KeySource` fixture whose `get_uk` FAILS (returns `Err`) — models a
+    /// source that errored (e.g. an unreachable key service). With the reshaped
+    /// trait there is no per-source `errored()` signal, so `resolve_and_apply`
+    /// treats this exactly like "no key here": it maps to `NoKey`.
     struct ErroringSource;
     impl KeySource for ErroringSource {
-        fn next_key(&mut self, _inputs: &DiscInputs) -> Option<libfreemkv::Key> {
-            None
-        }
-        fn errored(&self) -> bool {
-            true
+        fn get_uk(
+            &self,
+            _ctx: &dyn freemkv_keysources::ResolveCtx,
+        ) -> Result<Vec<freemkv_keysources::UnitKey>, libfreemkv::Error> {
+            Err(libfreemkv::Error::AacsKeyRejected)
         }
     }
 
@@ -927,36 +997,34 @@ mod tests {
         assert_eq!(outcome, KeyOutcome::NoKey);
     }
 
-    /// Key files present, a source FAILED (errored) and produced no key →
-    /// `Unreachable`. This is the distinction the dashboard tile renders as
-    /// "no key source could be reached" rather than "no key for this disc".
+    /// Key files present, a source that ERRORS (its `get_uk` returns `Err`) and
+    /// no other source has a key → `NoKey`. The reshaped `KeySource` trait
+    /// dropped the per-source `errored()` signal, so a failed source is no
+    /// longer distinguished from a clean miss — both map to `NoKey` (the
+    /// finer-grained per-source walk is in the rendered ResolutionTrace).
     #[test]
-    fn resolve_keys_reports_unreachable_when_a_source_errored() {
+    fn resolve_keys_reports_no_key_when_a_source_errors() {
         let mut access = FixtureAccess {
             key_files: Some((b"inf".to_vec(), b"mkb".to_vec())),
         };
-        // Mix a clean no-key source with a failed one — `errored()` is an
-        // any() across the MultiSource, so the failure must dominate.
         let sources: Vec<Box<dyn KeySource>> =
             vec![Box::new(NoKeySource), Box::new(ErroringSource)];
         let (_disc, outcome) = resolve_keys(sources, &mut access, keyless_encrypted_disc());
         assert_eq!(
             outcome,
-            KeyOutcome::Unreachable,
-            "a failed source must surface as Unreachable, not NoKey"
+            KeyOutcome::NoKey,
+            "an errored source is indistinguishable from a clean miss now → NoKey"
         );
     }
 
-    /// The four `KeyOutcome` variants are distinct — a regression guard so a
-    /// future refactor can't accidentally collapse e.g. Unreachable into NoKey
-    /// (which would erase the "check your keyserver/network" guidance).
+    /// The three `KeyOutcome` variants are distinct — a regression guard so a
+    /// future refactor can't accidentally collapse e.g. MissingInputs into NoKey.
     #[test]
     fn key_outcome_variants_are_distinct() {
         let all = [
             KeyOutcome::Resolved,
             KeyOutcome::MissingInputs,
             KeyOutcome::NoKey,
-            KeyOutcome::Unreachable,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -971,41 +1039,31 @@ mod tests {
 
     // --- build_sources ordering / SSRF / fallback (rc.6 WS3) -----------------
 
-    /// `build_sources` puts the mapfile source FIRST (the resume fast-path) when
-    /// a mapfile is supplied, ahead of the configured local keydb.
+    /// `build_sources` with a local `key_source` yields exactly the configured
+    /// keydb (the mapfile key-source was removed in the AACS-trait reshape).
     #[test]
-    fn build_sources_puts_mapfile_first_then_configured() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mf = tmp.path().join("disc.map");
-        let mut cfg = Config::default();
-        cfg.key_source = "local".into();
-        let sources = build_sources(&cfg, Some(&mf));
-        assert_eq!(sources.len(), 2, "mapfile + local keydb");
-        // The configured local keydb lands AFTER the mapfile (it labels itself
-        // "keydb"); index 0 is therefore the resume mapfile cache, which must be
-        // tried first. (MapfileSource keeps the default "source" label, so we
-        // pin the order via the keydb's distinguishing label at index 1.)
-        assert_eq!(
-            sources[1].label(),
-            "keydb",
-            "the configured local keydb must come after the resume mapfile cache"
-        );
-        // Sanity: with no mapfile, only the configured keydb is present.
-        let no_mf = build_sources(&cfg, None);
-        assert_eq!(no_mf.len(), 1);
-        assert_eq!(no_mf[0].label(), "keydb");
+    fn build_sources_local_yields_keydb() {
+        let cfg = Config {
+            key_source: "local".into(),
+            ..Config::default()
+        };
+        let sources = build_sources(&cfg);
+        assert_eq!(sources.len(), 1, "just the configured local keydb");
+        assert_eq!(sources[0].label(), "keydb");
     }
 
     /// An online `key_source` with an SSRF-blocked URL drops the online source
-    /// entirely (rather than handing OnlineSource a URL we won't trust). With no
-    /// mapfile that leaves ZERO sources — the rip then surfaces NoKey instead of
+    /// entirely (rather than handing OnlineSource a URL we won't trust). That
+    /// leaves ZERO sources — the rip then surfaces NoKey instead of
     /// exfiltrating disc-key material to an internal address.
     #[test]
     fn build_sources_drops_online_source_on_ssrf_blocked_url() {
-        let mut cfg = Config::default();
-        cfg.key_source = "online".into();
-        cfg.keyserver_url = "http://169.254.169.254/keys".into();
-        let sources = build_sources(&cfg, None);
+        let cfg = Config {
+            key_source: "online".into(),
+            keyserver_url: "http://169.254.169.254/keys".into(),
+            ..Config::default()
+        };
+        let sources = build_sources(&cfg);
         assert!(
             sources.is_empty(),
             "SSRF-blocked online URL must yield no usable source"
@@ -1016,9 +1074,11 @@ mod tests {
     /// the local keydb rather than silently producing no source.
     #[test]
     fn build_sources_unknown_key_source_falls_back_to_local_keydb() {
-        let mut cfg = Config::default();
-        cfg.key_source = "onlnie".into();
-        let sources = build_sources(&cfg, None);
+        let cfg = Config {
+            key_source: "onlnie".into(),
+            ..Config::default()
+        };
+        let sources = build_sources(&cfg);
         assert_eq!(sources.len(), 1, "fallback to a single local keydb source");
         assert!(!uses_online(&cfg), "a typo'd source is not 'online'");
     }
