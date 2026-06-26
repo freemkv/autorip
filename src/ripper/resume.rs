@@ -1328,9 +1328,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // `lost_video_secs` from `run_mux` is the live demux-skip estimate
     // (bytes skipped / title_bytes_per_sec), already in-title-scoped — the
     // same quantity and semantics the single-pass gate compares.
+    // Delegate the decision to the shared post-mux gate so resume and the
+    // fresh-rip path (mod.rs) cannot diverge on what counts as over-threshold.
     let demux_lost_secs = mux_outcome.lost_video_secs;
-    let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
-    if super::should_abort_for_loss(demux_lost_secs * 1000.0, abort_threshold_ms) {
+    if super::post_mux_loss_verdict(true, demux_lost_secs, cfg_read.abort_on_lost_secs)
+        != super::PostMuxVerdict::Proceed
+    {
         crate::log::device_log(
             device,
             &format!(
@@ -1343,14 +1346,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // treats the dir as terminal-failed — exactly as the single-pass
         // gate does. Clear the restart count so a benign restart doesn't
         // re-attempt a deterministically-lossy mux.
-        staging::write_failed_marker(
-            &staging_dir,
-            &format!(
-                "aborted: {:.2}s lost at mux exceeds threshold {}s",
-                demux_lost_secs, cfg_read.abort_on_lost_secs
-            ),
-        );
-        staging::clear_restart_count(&staging_dir);
+        super::apply_post_mux_abort(&staging_dir, demux_lost_secs, cfg_read.abort_on_lost_secs);
         // Remove the `.ripped` hand-off marker: this job is now terminal-failed,
         // so the mux worker must not re-dispatch it. The worker also treats
         // `.failed` as terminal (muxer.rs), but deleting `.ripped` here removes
@@ -2311,40 +2307,64 @@ mod post_mux_loss_gate_tests {
     /// whose identical loss the single-pass path quarantines (`.failed`)
     /// under `abort_on_lost_secs=0`.
     ///
-    /// A full behavioural test would need a real ISO that decodes into
-    /// demux skips plus a mux pipeline — out of proportion to one call
-    /// site (same rationale as `success_path_fires_completion_webhook`).
-    /// Instead this pins, at source level, that the region between the
-    /// mux-incomplete early-return and the `.completed` success marker
-    /// inspects `lost_video_secs`, compares it via `should_abort_for_loss`,
-    /// and quarantines with `write_failed_marker` on exceedance.
+    /// `resume_remux` and the fresh-rip `rip_disc` gate now delegate to the
+    /// SAME `super::post_mux_loss_verdict` / `super::apply_post_mux_abort`
+    /// functions (resume.rs "Post-mux loss abort gate" → mod.rs). Driving
+    /// those shared functions executing-style proves resume reaches the
+    /// identical verdict and quarantine the single-pass path does — without
+    /// needing a real lossy ISO + mux pipeline. (The remaining glue around
+    /// the gate — `.ripped` deletion, `reset_status_after_ripping` — is
+    /// exercised by the resume_handoff_contract_tests below; what THIS test
+    /// pins is the abort decision + staging effect that used to be verified
+    /// only by include_str! string-matching.)
     #[test]
     fn resume_enforces_post_mux_loss_gate() {
-        let src = include_str!("resume.rs");
-        // Bound to the post-mux success region: from the mux-incomplete
-        // early-return up to the success-marker section header.
-        let start = src
-            .find("Auto-resume mux did not complete")
-            .expect("resume.rs should have the mux-incomplete early-return");
-        let end = src[start..]
-            .find("5. Success — write .completed marker")
-            .map(|i| start + i)
-            .expect("resume.rs should have the success-marker section");
-        let region = &src[start..end];
+        use crate::ripper::staging;
+        use crate::ripper::{PostMuxVerdict, apply_post_mux_abort, post_mux_loss_verdict};
+
+        // Same verdict as single-pass: over abort_on_lost_secs=0 (perfect
+        // required), any demux loss aborts; exactly-zero proceeds.
+        assert_eq!(
+            post_mux_loss_verdict(true, 12.5, 0),
+            PostMuxVerdict::Abort {
+                demux_lost_secs: 12.5
+            },
+            "resume must abort a 12.5s demux loss under a perfect-required threshold"
+        );
+        assert_eq!(
+            post_mux_loss_verdict(true, 0.0, 0),
+            PostMuxVerdict::Proceed,
+            "resume must accept a zero-loss mux under a perfect-required threshold"
+        );
+
+        // The quarantine effect resume applies on abort: `.failed` written,
+        // no `.completed`/`.done`, restart count cleared — identical to the
+        // single-pass gate because it is the same function.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disc = tmp.path().join("DISC_TITLE");
+        std::fs::create_dir_all(&disc).unwrap();
+        staging::increment_restart_count(&disc).unwrap();
+
+        apply_post_mux_abort(&disc, 12.5, 0);
+
+        let reason = staging::read_failed_reason(&disc)
+            .expect("resume abort must write a .failed marker (no .done)");
         assert!(
-            region.contains("mux_outcome.lost_video_secs"),
-            "resume post-mux region must read mux_outcome.lost_video_secs \
-             (the only signal carrying demux-time loss)"
+            reason.contains("12.50s lost at mux exceeds threshold 0s"),
+            "resume failed reason must carry loss/threshold, got: {reason}"
         );
         assert!(
-            region.contains("should_abort_for_loss"),
-            "resume post-mux region must gate loss via should_abort_for_loss, \
-             matching the single-pass gate"
+            !disc.join(staging::COMPLETED_MARKER).exists(),
+            "resume abort must NOT write .completed"
         );
         assert!(
-            region.contains("write_failed_marker"),
-            "resume post-mux region must quarantine an over-threshold lossy \
-             mux with write_failed_marker (no .done), matching single-pass"
+            !disc.join(".done").exists(),
+            "resume abort must NOT write a .done hand-off marker"
+        );
+        assert_eq!(
+            staging::restart_count(&disc),
+            0,
+            "resume abort must clear the restart count"
         );
     }
 
