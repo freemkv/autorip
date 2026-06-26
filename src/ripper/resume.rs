@@ -656,7 +656,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         Err(e) => {
             crate::log::device_log(
                 device,
-                &format!("Auto-resume aborted: scan_image failed: {}", e),
+                &format!(
+                    "Auto-resume aborted: {}",
+                    super::format_lib_error("reading the saved disc image", &e)
+                ),
             );
             // The live-device dispatch (`handle_rip_request` → `scan_disc`)
             // already moved this device to status="scanning". Bailing here
@@ -759,20 +762,17 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             // between classify and act). We must NOT skip the per-title
             // loss guard and mux blind — abort the resume and let the
             // next pass re-classify against fresh state.
-            crate::log::device_log(
-                device,
-                &format!(
-                    "Auto-resume aborted: mapfile reload failed for loss re-validation: {}",
-                    e
-                ),
+            let msg = format!(
+                "Could not read this disc's saved recovery map, so remaining data loss cannot be re-checked — start a fresh rip to rebuild it ({e})."
             );
+            crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
             reset_status_after_ripping(
                 device,
                 "idle",
                 &display_name,
                 &disc_format,
                 &duration,
-                Some(format!("mapfile reload failed: {}", e)),
+                Some(msg),
             );
             return;
         }
@@ -930,10 +930,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let iso_reader_for_mux = match libfreemkv::FileSectorSource::open(&iso_path) {
         Ok(r) => r,
         Err(e) => {
-            crate::log::device_log(
-                device,
-                &format!("Auto-resume aborted: cannot re-open ISO for mux: {}", e),
+            let msg = format!(
+                "Could not re-open the saved disc image to finish muxing — the staging file may have been moved or the staging volume is unavailable ({e})."
             );
+            crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
             // Reset from "ripping" (set above) → "error" so the next
             // /api/rip isn't blocked by the "already ripping" gate.
             reset_status_after_ripping(
@@ -942,7 +942,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 &display_name,
                 &disc_format,
                 &duration,
-                Some(format!("ISO re-open failed: {}", e)),
+                Some(msg),
             );
             super::unregister_halt(device);
             return;
@@ -1031,10 +1031,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         Ok(s) => Box::new(s),
         Err(e) => {
             tracing::error!(target: "mux", device=%device, "build_iso_pipeline failed: {e}");
-            crate::log::device_log(
-                device,
-                &format!("Auto-resume aborted: mux pipeline build failed: {}", e),
+            let msg = format!(
+                "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
             );
+            crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
             // Reset from "ripping" (set above) → "error" so the next
             // /api/rip isn't blocked by the "already ripping" gate.
             reset_status_after_ripping(
@@ -1043,7 +1043,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 &display_name,
                 &disc_format,
                 &duration,
-                Some(format!("Mux pipeline build failed: {}", e)),
+                Some(msg),
             );
             super::unregister_halt(device);
             return;

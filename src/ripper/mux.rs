@@ -1139,7 +1139,9 @@ pub(crate) fn run_mux(
     let raw_output = match libfreemkv::output(&inputs.dest_url, &out_title) {
         Ok(s) => s,
         Err(e) => {
-            let msg = format!("Open output failed: {e}");
+            let msg = format!(
+                "Could not create the output file — check that the staging directory exists, is writable, and has free space ({e})."
+            );
             crate::log::device_log(inputs.device, &msg);
             update_state(
                 inputs.device,
