@@ -230,19 +230,9 @@ mod tests {
         // inline. If the logic in fire() changes, this test must change too —
         // that's the point: it pins the shape of the logged string.
         let url = "https://discord.com/api/webhooks/123456/SECRET_TOKEN";
-        // Construct a dummy ureq::Error::Status. ureq doesn't expose a public
-        // constructor, so we exercise the summary branch through a helper that
-        // mirrors the match arm.
-        fn summarise(e: &ureq::Error) -> String {
-            match e {
-                ureq::Error::Status(c, _) => format!("HTTP {c}"),
-                ureq::Error::Transport(t) => t.kind().to_string(),
-            }
-        }
-        // Build a minimal Status error via a local mock server response. Since
-        // we can't construct one without a live connection, we test the
-        // origin-stripping half (already well-tested above) and the summary
-        // format string that fire() would produce.
+        // We can't construct a `ureq::Error::Status` without a live connection, so
+        // we test the origin-stripping half (already well-tested above) and the
+        // summary format string that fire() would produce.
         let origin = webhook_url_origin(url);
         // The log line produced by fire() is: "Webhook failed {origin}: {summary}"
         // — neither contains the token path.

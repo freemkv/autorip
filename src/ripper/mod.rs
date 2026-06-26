@@ -148,7 +148,7 @@ fn resolve_keys_from_drive(
     drive: &mut libfreemkv::Drive,
     disc: libfreemkv::Disc,
 ) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
-    let sources = crate::keysource::build_sources(cfg, None);
+    let sources = crate::keysource::build_sources(cfg);
     let vid = disc.aacs.as_ref().map(|a| a.volume_id);
     let mut access = DriveAccess::new(drive, vid);
     crate::keysource::resolve_keys(sources, &mut access, disc)
@@ -179,11 +179,6 @@ fn key_readiness(
         return "Capture without keys — no decryption".to_string();
     }
     let reason = match outcome {
-        KeyOutcome::Unreachable => {
-            "no key source could be reached (check the Keyserver URL, the network, or \
-             the key database file)"
-                .to_string()
-        }
         KeyOutcome::NoKey => "no key source has a key for this disc".to_string(),
         KeyOutcome::MissingInputs => "this disc's key files could not be read".to_string(),
         // A resolve that still left the disc keyless: defer to the libfreemkv
