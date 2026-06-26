@@ -27,8 +27,8 @@ pub mod state;
 #[allow(unused_imports)]
 pub use session::{
     RegisterError, device_halt, join_all_rip_threads, join_rip_thread, register_halt,
-    register_rip_thread, rollback_failed_spawn, spawn_rip_thread, swap_halt_carrying_cancel,
-    take_rip_thread, unregister_halt,
+    register_rip_thread, rollback_failed_spawn, spawn_rip_thread, stop_and_drain,
+    swap_halt_carrying_cancel, take_rip_thread, unregister_halt,
 };
 #[allow(unused_imports)]
 pub use state::{

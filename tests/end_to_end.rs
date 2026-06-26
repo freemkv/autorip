@@ -1,10 +1,19 @@
-//! Host-free smoke tests for the web layer.
+//! Host-free smoke test for the web layer's state serialization.
 //!
-//! No tiny_http server, no real drives — just verify that:
-//!   - RipState round-trips through serde_json the way get_state_json
-//!     produces it, and the UI's expected fields all survive.
-//!   - The route dispatcher rejects path-traversal-shaped URLs and
-//!     accepts the documented endpoints.
+//! This verifies that `RipState` round-trips through serde_json the way
+//! `get_state_json` produces it, and the UI's expected fields all survive.
+//!
+//! Route dispatch + device-name validation are NOT tested here anymore: a
+//! prior version of this file shipped a hand-rolled `dispatch`/`Route`
+//! replica with its OWN copy of `is_valid_device_name` — which had drifted
+//! from production (the replica required `starts_with("sg")`, but production
+//! accepts any ASCII-alphanumeric device, so `/api/stop/sr0` is valid in
+//! production but the replica rejected it). The replica's SSE branch also
+//! accepted BOTH `/api/sse` and `/events`, passing regardless of which route
+//! production actually served. Those concerns are now driven against the REAL
+//! `handle_request` in the in-crate `web::web_tests::http` module (it pins
+//! `/events` as the served SSE route and exercises the real validator), so
+//! the drift-prone replica is deleted rather than maintained.
 
 use freemkv_autorip::ripper::{BadRange, RipState};
 
@@ -117,111 +126,6 @@ fn test_state_json_serialization_round_trip() {
     assert_eq!(v2["bad_ranges"][0]["lba"], 1000);
 }
 
-/// One enum variant per known endpoint, plus an explicit `Unknown`.
-/// Mirrors the if/else ladder in web.rs::handle_request.
-#[derive(Debug, PartialEq, Eq)]
-enum Route {
-    State,
-    System,
-    Sse,
-    Debug,
-    Scan(String),
-    Rip(String),
-    Stop(String),
-    Eject(String),
-    Unknown,
-}
-
-/// Inline copy of web.rs::is_valid_device_name (private — see
-/// the unit-test module in web.rs for the full coverage). Used here
-/// only so the dispatcher can reject malformed device IDs.
-fn is_valid_device_name(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() < 3 || !s.starts_with("sg") {
-        return false;
-    }
-    bytes[2..].iter().all(|b| b.is_ascii_digit())
-}
-
-/// Mirrors the dispatch logic in web.rs::handle_request, scoped to
-/// the endpoints listed in the task spec. POST/GET method matching
-/// is folded into the URL match for the test — the production code
-/// gates each branch on `is_get` / `is_post`, but here we're
-/// asserting URL → route, not method routing.
-fn dispatch(url: &str) -> Route {
-    if url == "/api/state" {
-        Route::State
-    } else if url == "/api/system" {
-        Route::System
-    } else if url == "/api/sse" || url == "/events" {
-        // The task spec mentions /api/sse; production currently
-        // serves /events. Both are accepted here so the test
-        // documents the intent, then notes the mismatch separately.
-        Route::Sse
-    } else if url == "/api/debug" || url.starts_with("/api/debug?") {
-        Route::Debug
-    } else if let Some(dev) = url.strip_prefix("/api/scan/") {
-        if is_valid_device_name(dev) {
-            Route::Scan(dev.to_string())
-        } else {
-            Route::Unknown
-        }
-    } else if let Some(dev) = url.strip_prefix("/api/rip/") {
-        if is_valid_device_name(dev) {
-            Route::Rip(dev.to_string())
-        } else {
-            Route::Unknown
-        }
-    } else if let Some(dev) = url.strip_prefix("/api/stop/") {
-        if is_valid_device_name(dev) {
-            Route::Stop(dev.to_string())
-        } else {
-            Route::Unknown
-        }
-    } else if let Some(dev) = url.strip_prefix("/api/eject/") {
-        if is_valid_device_name(dev) {
-            Route::Eject(dev.to_string())
-        } else {
-            Route::Unknown
-        }
-    } else {
-        Route::Unknown
-    }
-}
-
-#[test]
-fn test_route_dispatcher_recognizes_all_endpoints() {
-    assert_eq!(dispatch("/api/state"), Route::State);
-    assert_eq!(dispatch("/api/system"), Route::System);
-    assert_eq!(dispatch("/api/debug"), Route::Debug);
-    assert_eq!(dispatch("/api/debug?level=warn"), Route::Debug);
-    assert_eq!(dispatch("/api/scan/sg4"), Route::Scan("sg4".to_string()));
-    assert_eq!(dispatch("/api/rip/sg4"), Route::Rip("sg4".to_string()));
-    assert_eq!(dispatch("/api/stop/sg4"), Route::Stop("sg4".to_string()));
-    assert_eq!(dispatch("/api/eject/sg4"), Route::Eject("sg4".to_string()));
-
-    // Path-traversal / malformed device IDs must NOT match a route.
-    // These were the v0.11.x phantom-tab bugs.
-    assert_eq!(dispatch("/api/rip/sg4/../foo"), Route::Unknown);
-    assert_eq!(dispatch("/api/rip/sg4/stop"), Route::Unknown);
-    assert_eq!(dispatch("/api/rip/../etc/passwd"), Route::Unknown);
-    assert_eq!(dispatch("/api/eject/sda"), Route::Unknown);
-    assert_eq!(dispatch("/api/scan/sr0"), Route::Unknown);
-    assert_eq!(dispatch("/api/scan/sg4 "), Route::Unknown); // trailing space
-    assert_eq!(dispatch("/api/scan/"), Route::Unknown); // empty device
-
-    // Totally unknown URL.
-    assert_eq!(dispatch("/no/such/path"), Route::Unknown);
-    assert_eq!(dispatch("/"), Route::Unknown);
-}
-
-#[test]
-fn test_sse_route_is_routable() {
-    // The task spec lists /api/sse; production serves /events. Until
-    // those are unified, both URLs route to the SSE handler in this
-    // dispatcher. This test documents the intent — if the spec wins,
-    // /api/sse alone should be enough; if production wins, /events
-    // alone is. Today: both work.
-    assert_eq!(dispatch("/api/sse"), Route::Sse);
-    assert_eq!(dispatch("/events"), Route::Sse);
-}
+// Route dispatch, device-name validation, and the SSE route are now driven
+// against the REAL handle_request in src/web.rs (mod web_tests::http) — see
+// the module doc comment above. No replica dispatcher lives here.
