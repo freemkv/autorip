@@ -1491,7 +1491,7 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
 
     let dest_str = dest.to_string_lossy().to_string();
     let src_size = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let total_gb = src_size as f64 / 1_073_741_824.0;
+    let total_gb = src_size as f64 / crate::util::BYTES_PER_GIB;
 
     // v0.25.7: replaced the `cp` subprocess with an in-process copy on a
     // worker thread, polled here for live progress. Drops the cp package
@@ -1602,9 +1602,9 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 } else {
                     0
                 };
-                let gb = done as f64 / 1_073_741_824.0;
+                let gb = done as f64 / crate::util::BYTES_PER_GIB;
                 let speed_mbs = if elapsed > 0.0 {
-                    (done as f64 / elapsed) / (1024.0 * 1024.0)
+                    (done as f64 / elapsed) / crate::util::BYTES_PER_MIB
                 } else {
                     0.0
                 };

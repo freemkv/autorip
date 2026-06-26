@@ -57,7 +57,8 @@ pub fn send_rich(cfg: &Config, ev: &RipEvent) {
         "elapsed_secs": ev.elapsed_secs.round() as u64,
         "output_path": ev.output_path,
         "errors": ev.errors,
-        "lost_video_secs": (ev.lost_video_secs * 1000.0).round() / 1000.0,
+        "lost_video_secs": (ev.lost_video_secs * crate::util::MILLIS_PER_SEC).round()
+            / crate::util::MILLIS_PER_SEC,
     });
     fire(cfg, &payload);
 }

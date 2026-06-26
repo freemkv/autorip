@@ -5,6 +5,7 @@
 //! Lifted verbatim from the monolithic `ripper.rs` as part of the 0.18
 //! prep split — no semantic changes.
 
+use crate::util::{BYTES_PER_GIB, BYTES_PER_MIB, MILLIS_PER_SEC, SECTOR_BYTES};
 use std::sync::Mutex;
 
 /// One contiguous bad range as seen in the UI. Derived from the mapfile
@@ -493,9 +494,9 @@ pub(super) fn byte_offset_in_title(lba: u32, title: &libfreemkv::DiscTitle) -> O
     let mut cumulative = 0u64;
     for ext in &title.extents {
         if lba >= ext.start_lba && lba < ext.start_lba + ext.sector_count {
-            return Some(cumulative + (lba - ext.start_lba) as u64 * 2048);
+            return Some(cumulative + (lba - ext.start_lba) as u64 * SECTOR_BYTES);
         }
-        cumulative += ext.sector_count as u64 * 2048;
+        cumulative += ext.sector_count as u64 * SECTOR_BYTES;
     }
     None
 }
@@ -531,10 +532,10 @@ pub(crate) fn build_bad_ranges(
     let mut ranges: Vec<BadRange> = raw
         .iter()
         .map(|(pos, size)| {
-            let lba = pos / 2048;
-            let count = (size / 2048) as u32;
+            let lba = pos / SECTOR_BYTES;
+            let count = (size / SECTOR_BYTES) as u32;
             let duration_ms = if bps > 0.0 {
-                (*size as f64) / bps * 1000.0
+                (*size as f64) / bps * MILLIS_PER_SEC
             } else {
                 0.0
             };
@@ -736,7 +737,7 @@ impl PassProgressState {
             return 0.0;
         }
         let bytes = newest_b.saturating_sub(oldest_b);
-        let mbs = bytes as f64 / 1_048_576.0 / dt;
+        let mbs = bytes as f64 / BYTES_PER_MIB / dt;
         // Sanity cap. Real optical drives top out around 70–140 MB/s;
         // 1 GB/s would be a measurement artifact (clock jitter, mapfile
         // replay, monotonic-clock anomaly). Drop rather than display.
@@ -774,7 +775,7 @@ impl PassProgressState {
         if bytes == 0 {
             return display_speed;
         }
-        let mbs = bytes as f64 / 1_048_576.0 / elapsed;
+        let mbs = bytes as f64 / BYTES_PER_MIB / elapsed;
         mbs.min(1024.0)
     }
 }
@@ -811,7 +812,7 @@ pub(super) fn push_pass_state(
     let main_title_bad = map.ranges_with(&[libfreemkv::disc::mapfile::SectorStatus::Unreadable]);
     let main_title_bad_bytes = libfreemkv::disc::bytes_bad_in_title(title, &main_title_bad);
     let main_lost_ms = if bps > 0.0 {
-        main_title_bad_bytes as f64 * 1000.0 / bps
+        main_title_bad_bytes as f64 * MILLIS_PER_SEC / bps
     } else {
         0.0
     };
@@ -843,11 +844,11 @@ pub(super) fn push_pass_state(
     // `errors` is the user-visible skipped-sector count: terminal-bad
     // sectors only (`bytes_lost`). Pending bytes are not "errors" — they
     // may still recover.
-    let errors = (bytes_lost / 2048) as u32;
+    let errors = (bytes_lost / SECTOR_BYTES) as u32;
     // MAYBE-bucket time equivalent (yellow pill in the UI). Mirrors the
     // existing `total_lost_ms` (red pill) computed from per-range durations.
     let total_maybe_ms = if bps > 0.0 {
-        bytes_maybe as f64 * 1000.0 / bps
+        bytes_maybe as f64 * MILLIS_PER_SEC / bps
     } else {
         0.0
     };
@@ -937,13 +938,13 @@ pub(super) fn push_pass_state(
             }
         };
         let pass_eta = if eta_speed > 0.01 && last_work_total > last_pos {
-            let rem_mb = (last_work_total - last_pos) as f64 / 1_048_576.0;
+            let rem_mb = (last_work_total - last_pos) as f64 / BYTES_PER_MIB;
             format_secs((rem_mb / eta_speed) as u64)
         } else {
             String::new()
         };
         let total_eta = if eta_speed > 0.01 && total_work_estimated > total_done {
-            let rem_mb = (total_work_estimated - total_done) as f64 / 1_048_576.0;
+            let rem_mb = (total_work_estimated - total_done) as f64 / BYTES_PER_MIB;
             format_secs((rem_mb / eta_speed) as u64)
         } else {
             String::new()
@@ -962,17 +963,17 @@ pub(super) fn push_pass_state(
             disc_name: ctx.display_name.clone(),
             disc_format: ctx.disc_format.clone(),
             progress_pct: pct,
-            progress_gb: last_pos as f64 / 1_073_741_824.0,
+            progress_gb: last_pos as f64 / BYTES_PER_GIB,
             // Populate the documented last_sector (LBA) during sweep too,
-            // not just mux. `last_pos` is the swept byte offset; / 2048
-            // is the equivalent LBA the UI playhead expects. Previously
-            // left at Default (0), so the playhead never moved during the
-            // sweep phase despite the field being documented.
-            last_sector: last_pos / 2048,
+            // not just mux. `last_pos` is the swept byte offset; dividing by
+            // the sector size yields the equivalent LBA the UI playhead
+            // expects. Previously left at Default (0), so the playhead never
+            // moved during the sweep phase despite the field being documented.
+            last_sector: last_pos / SECTOR_BYTES,
             speed_mbs,
             eta,
             errors,
-            lost_video_secs: total_lost_ms / 1000.0,
+            lost_video_secs: total_lost_ms / MILLIS_PER_SEC,
             output_file: ctx.filename.clone(),
             tmdb_title: ctx.tmdb_title.clone(),
             tmdb_year: ctx.tmdb_year,
@@ -1013,9 +1014,9 @@ pub(super) fn push_pass_state(
         let mut s = state.borrow_mut();
         if s.last_log.elapsed().as_secs() >= 60 {
             s.last_log = std::time::Instant::now();
-            let pos_gb = last_pos as f64 / 1_073_741_824.0;
-            let good_gb = stats.bytes_good as f64 / 1_073_741_824.0;
-            let total_gb = ctx.bytes_total_disc as f64 / 1_073_741_824.0;
+            let pos_gb = last_pos as f64 / BYTES_PER_GIB;
+            let good_gb = stats.bytes_good as f64 / BYTES_PER_GIB;
+            let total_gb = ctx.bytes_total_disc as f64 / BYTES_PER_GIB;
             let speed_str = if speed_mbs >= 1.0 {
                 format!("{speed_mbs:.1} MB/s")
             } else {
@@ -1025,7 +1026,7 @@ pub(super) fn push_pass_state(
                 format!(
                     ", {} skipped ({:.2} MB)",
                     errors,
-                    bytes_lost as f64 / 1_048_576.0
+                    bytes_lost as f64 / BYTES_PER_MIB
                 )
             } else {
                 String::new()
@@ -1073,7 +1074,7 @@ pub(super) fn set_pass_progress(
         s.disc_name = ctx.display_name.clone();
         s.disc_format = ctx.disc_format.clone();
         s.progress_pct = pct;
-        s.progress_gb = bytes_good as f64 / 1_073_741_824.0;
+        s.progress_gb = bytes_good as f64 / BYTES_PER_GIB;
         s.output_file = ctx.filename.clone();
         s.tmdb_title = ctx.tmdb_title.clone();
         s.tmdb_year = ctx.tmdb_year;
@@ -1144,7 +1145,7 @@ mod tests {
 
         // Fixed behavior: feed the real loss -> Moderate.
         assert_eq!(
-            damage_severity_for(errors, lost_video_secs * 1000.0),
+            damage_severity_for(errors, lost_video_secs * MILLIS_PER_SEC),
             "moderate",
             "single-pass done card must derive total_lost_ms from lost_video_secs"
         );
@@ -1690,7 +1691,7 @@ mod tests {
         let main_title_bad = map.ranges_with(&[SectorStatus::Unreadable]);
         let main_bad_bytes = libfreemkv::disc::bytes_bad_in_title(&title, &main_title_bad);
         let main_lost_ms = if bps > 0.0 {
-            main_bad_bytes as f64 * 1000.0 / bps
+            main_bad_bytes as f64 * MILLIS_PER_SEC / bps
         } else {
             0.0
         };
