@@ -887,23 +887,23 @@ mod tests {
         let cfg = load_with(&d, FIXTURE);
 
         assert_eq!(cfg.staging_dir, "/staging-local");
-        assert_eq!(cfg.output_dir, "/output");
+        assert_eq!(cfg.output_dir, "/alt-output");
         assert_eq!(cfg.movie_dir, "movies");
         assert_eq!(cfg.tv_dir, "tv");
         assert_eq!(cfg.min_length_secs, 900);
         assert!(!cfg.main_feature);
         assert!(!cfg.auto_eject);
         assert_eq!(cfg.on_insert, "rip");
-        assert_eq!(cfg.output_format, "mkv");
-        assert_eq!(cfg.network_target, "");
+        assert_eq!(cfg.output_format, "iso");
+        assert_eq!(cfg.network_target, "nas.example.com:9000");
         assert_eq!(cfg.on_read_error, "skip");
         assert_eq!(cfg.max_retries, 3);
         assert!(cfg.keep_iso);
         assert_eq!(cfg.abort_on_lost_secs, 30);
         assert!(cfg.capture_without_keys);
-        assert_eq!(cfg.max_rip_duration_secs, 28800);
-        assert_eq!(cfg.min_pass_budget_secs, 5400);
-        assert_eq!(cfg.transport_recovery_delay_secs, 5);
+        assert_eq!(cfg.max_rip_duration_secs, 14400);
+        assert_eq!(cfg.min_pass_budget_secs, 1800);
+        assert_eq!(cfg.transport_recovery_delay_secs, 10);
         assert_eq!(cfg.tmdb_api_key, "deadbeefcafef00ddeadbeefcafef00d");
         assert_eq!(
             cfg.keydb_path.as_deref(),

@@ -320,7 +320,7 @@ pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
     sources
 }
 
-/// Whether the configured (non-mapfile) source talks to a remote key service —
+/// Whether the configured source talks to a remote key service —
 /// used by the UI to announce a potentially slow keyserver round-trip.
 pub fn uses_online(cfg: &Config) -> bool {
     cfg.key_source == "online"
@@ -372,15 +372,23 @@ pub fn resolve_keys<A: DiscKeyAccess>(
     // `decrypt_with` applies as-is (a hash-matching but wrong UK is only
     // disproved by descrambling real ciphertext), and the online service
     // validates server-side — so this is conservative, not wasteful. Samples
-    // feed `decrypt_with`'s wrong-key rejection via `inputs.samples`; never skip.
-    let samples = match disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() {
-        Some(title) => access.sample_units(&title, SAMPLE_UNITS),
-        None => {
-            tracing::warn!(
-                phase = "key_resolve",
-                "no titles — cannot sample for key validation"
-            );
-            Vec::new()
+    // feed `decrypt_with`'s wrong-key rejection via `inputs.samples`; never skip
+    // (except when there is no source at all — e.g. an SSRF-blocked online URL
+    // dropped the only source — in which case the read off the live drive / ISO
+    // is pure wasted I/O: `resolve_and_apply_traced` over zero sources is NoKey
+    // regardless of samples).
+    let samples = if sources.is_empty() {
+        Vec::new()
+    } else {
+        match disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() {
+            Some(title) => access.sample_units(&title, SAMPLE_UNITS),
+            None => {
+                tracing::warn!(
+                    phase = "key_resolve",
+                    "no titles — cannot sample for key validation"
+                );
+                Vec::new()
+            }
         }
     };
 
@@ -787,7 +795,7 @@ mod tests {
             );
             // The validated file was relocated off the exe-local path.
             assert!(
-                !exe_local.exists() || exe_local != dest,
+                !exe_local.exists(),
                 "the validated keydb must not be stranded at the exe-local path"
             );
         }

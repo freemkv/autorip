@@ -2321,7 +2321,7 @@ mod web_tests {
             },
         )
         .unwrap();
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert_eq!(mux.len(), 1, "fresh .ripped must be in the Mux queue");
         assert!(mv.is_empty(), "not yet in the Move queue");
         assert!(!both_contain(&mux, &mv));
@@ -2329,7 +2329,7 @@ mod web_tests {
         // Step 2: mux in flight — `.muxing` added. Out of the Mux queue
         // (shown as the live `_mux` device), still not in Move.
         crate::ripper::staging::write_muxing_marker(&disc);
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(
             mux.is_empty(),
             "an actively-muxing dir leaves the queued list"
@@ -2342,7 +2342,7 @@ mod web_tests {
         // not yet, `.ripped` may linger. THIS is the double-listing bug
         // window: it must be in the Move queue ONLY.
         fs::write(disc.join(".done"), b"{}").unwrap();
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(
             mux.is_empty(),
             "a dir in the Move queue (.done) must not also be (queued) in the Mux queue, got {mux:?}"
@@ -2355,7 +2355,7 @@ mod web_tests {
 
         // Step 4: terminal `.completed` lands — still Move-only, never both.
         crate::ripper::staging::write_completed_marker(&disc);
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(mux.is_empty());
         assert_eq!(mv.len(), 1);
         assert!(!both_contain(&mux, &mv));
@@ -2436,7 +2436,7 @@ mod web_tests {
                 ..Default::default()
             },
         );
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(
             mux.is_empty() && mv.is_empty(),
             "during sweep: in neither queue"
@@ -2458,7 +2458,7 @@ mod web_tests {
                 ..Default::default()
             },
         );
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert_eq!(mux.len(), 1, ".ripped → Mux queue");
         assert!(mv.is_empty(), "not in Move queue yet");
         assert!(!in_both_queues(&mux, &mv));
@@ -2471,7 +2471,7 @@ mod web_tests {
         // --- Stage 2: mux in flight. `.muxing` lock; disc leaves the static
         // Mux queue (it's the live `_mux` device now); tile stays done.
         crate::ripper::staging::write_muxing_marker(&disc);
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(
             mux.is_empty(),
             "actively-muxing dir leaves the (queued) list"
@@ -2485,7 +2485,7 @@ mod web_tests {
         // `.completed`; `.ripped` may linger. Disc moves to the Move queue
         // ONLY — the double-listing bug window.
         fs::write(disc.join(".done"), b"{}").unwrap();
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(
             mux.is_empty(),
             "a .done dir must NOT still be (queued) in the Mux queue"
@@ -2496,7 +2496,7 @@ mod web_tests {
 
         // --- Stage 4: `.completed` lands (terminal). Still Move-only.
         crate::ripper::staging::write_completed_marker(&disc);
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(mux.is_empty());
         assert_eq!(
             mv.len(),
@@ -2523,13 +2523,13 @@ mod web_tests {
         fs::create_dir_all(&disc).unwrap();
 
         crate::muxer::write_marker(&disc, &ripped_marker_for("Held Title", "sg0")).unwrap();
-        let (mux, _) = build_queue_views(&staging);
+        let (mux, _, _, _) = build_queue_views(&staging);
         assert_eq!(mux.len(), 1, "fresh .ripped is queued for mux");
 
         // Low-confidence mux success: `.review` instead of `.done`, then
         // `.completed`.
         fs::write(disc.join(".review"), b"{}").unwrap();
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(mux.is_empty(), "a .review dir must leave the Mux queue");
         assert!(
             !in_both_queues(&mux, &mv),
@@ -2537,7 +2537,7 @@ mod web_tests {
         );
 
         crate::ripper::staging::write_completed_marker(&disc);
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(mux.is_empty());
         assert!(!in_both_queues(&mux, &mv));
     }
@@ -2555,7 +2555,7 @@ mod web_tests {
         let device = "sg_abort_dev";
 
         crate::muxer::write_marker(&disc, &ripped_marker_for("Lossy Disc", device)).unwrap();
-        let (mux, _) = build_queue_views(&staging);
+        let (mux, _, _, _) = build_queue_views(&staging);
         assert_eq!(mux.len(), 1);
 
         // Abort gate quarantines: `.failed`, tile=error.
@@ -2570,7 +2570,7 @@ mod web_tests {
                 ..Default::default()
             },
         );
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(mux.is_empty(), ".failed dir must leave the Mux queue");
         assert!(
             mv.is_empty(),
@@ -2625,7 +2625,7 @@ mod web_tests {
             },
         );
 
-        let (mux, mv) = build_queue_views(&staging);
+        let (mux, mv, _, _) = build_queue_views(&staging);
         // Alpha is in the Mux queue ONLY; Beta in the Move queue ONLY.
         assert!(
             mux.iter().any(|m| m.contains("Alpha")),
@@ -3337,8 +3337,8 @@ mod web_tests {
         for _ in 0..40 {
             let addrs = resolve_with_timeout("9.9.9.9", 853).expect("literal resolves");
             assert!(addrs.iter().any(|a| a.port() == 853));
-            // Let the detached resolver thread run its fetch_sub before the
-            // next iteration so the slot is reliably released.
+            // Let the detached resolver thread finish (dropping its ConnGuard)
+            // before the next iteration so the slot is reliably released.
             std::thread::yield_now();
         }
     }
@@ -3796,6 +3796,11 @@ fn get_state_json(staging_dir: &str) -> String {
     if let Some(vs) = verify_state {
         obj["_verify"] = serde_json::to_value(&vs).unwrap_or_default();
     }
+    // Release the STATE lock before the staging-dir scan below. `build_queue_views`
+    // does filesystem I/O (read_dir + per-dir stat); holding STATE across it would
+    // serialize the ripper's once-per-tick progress writes against this
+    // once-per-second scan. `obj` already holds everything we needed from `state`.
+    drop(state);
     // SINGLE-SOURCE STAGE VIEW (fix C): the Mux queue and Move queue ride
     // on the SAME state payload as the per-device tiles and the synthetic
     // `_mux` live-progress device. The dashboard pushes this payload on
@@ -3807,23 +3812,35 @@ fn get_state_json(staging_dir: &str) -> String {
     // did. `pending_queue` already enforces mutual exclusion (a `.done`/
     // `.review`/`.muxing`/`.completed`/`.failed` dir is never "(queued)"),
     // so within this one snapshot a disc appears in at most one queue.
-    let (mux_queue, move_queue) = build_queue_views(staging_dir);
+    let (mux_queue, move_queue, _, _) = build_queue_views(staging_dir);
     obj["_mux_queue"] = serde_json::to_value(&mux_queue).unwrap_or_default();
     obj["_move_queue"] = serde_json::to_value(&move_queue).unwrap_or_default();
     obj.to_string()
 }
+
+/// Cap on how many queue entries we serialize so a staging dir holding a
+/// pathological number of subdirs can't produce an unbounded response. Shared
+/// by `build_queue_views` (the actual truncation) and `handle_system_info`
+/// (the "+N more" math) so the displayed list and its overflow count can never
+/// drift apart.
+const QUEUE_DISPLAY_CAP: usize = 100;
 
 /// Build the Mux-queue and Move-queue display lists from the staging dir.
 /// Shared by `get_state_json` (the live SSE/`/api/state` payload) and
 /// `handle_system_info` (the `/api/system` panel) so both endpoints derive
 /// the two queues from one place and can never disagree on membership.
 ///
+/// Returns `(mux_queue, move_queue, mux_full_count, move_full_count)`: the
+/// first two are capped at `QUEUE_DISPLAY_CAP` for display, the last two are
+/// the uncapped totals from the SAME scan so callers can compute a "+N more"
+/// overflow count that always matches the displayed lists (one snapshot, no
+/// TOCTOU between count and list).
+///
 /// Mutual exclusion is guaranteed by the markers themselves: the Move
 /// queue scans for `.done`, and `crate::muxer::pending_queue` (the Mux
 /// queue) skips any dir carrying `.done`/`.review`/`.muxing`/`.completed`/
 /// `.failed`. So a given staging dir lands in at most one of the two lists.
-fn build_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>) {
-    const QUEUE_DISPLAY_CAP: usize = 100;
+fn build_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usize) {
     // Move queue: staging dirs with a `.done` marker (pending moves).
     let mut move_queue: Vec<String> = std::fs::read_dir(staging_dir)
         .ok()
@@ -3838,12 +3855,16 @@ fn build_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>) {
                 .collect()
         })
         .unwrap_or_default();
-    move_queue.truncate(QUEUE_DISPLAY_CAP);
     // Mux queue: staging dirs with a `.ripped` hand-off and no terminal /
     // move-queue / in-flight marker (see `pending_queue`).
     let mut mux_queue = crate::muxer::pending_queue(std::path::Path::new(staging_dir));
+    // Uncapped totals captured before truncation so "+N more" math shares this
+    // one snapshot with the displayed lists.
+    let move_full_count = move_queue.len();
+    let mux_full_count = mux_queue.len();
+    move_queue.truncate(QUEUE_DISPLAY_CAP);
     mux_queue.truncate(QUEUE_DISPLAY_CAP);
-    (mux_queue, move_queue)
+    (mux_queue, move_queue, mux_full_count, move_full_count)
 }
 
 fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
@@ -3861,29 +3882,15 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         }
     };
 
-    // Cap on how many queue entries we serialize so a staging dir holding a
-    // pathological number of subdirs can't produce an unbounded response.
-    const QUEUE_DISPLAY_CAP: usize = 100;
-
-    // Pre-cap full counts so the UI can show "+N more" rather than silently
-    // hiding entries dropped by the display cap.
-    let move_full_count = std::fs::read_dir(&cfg.staging_dir)
-        .ok()
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir() && e.path().join(".done").exists())
-                .count()
-        })
-        .unwrap_or(0);
-    let mux_full_count = crate::muxer::pending_queue(std::path::Path::new(&cfg.staging_dir)).len();
-
     // Move + Mux queue display lists come from the SAME shared builder the
     // live /api/state + SSE payload uses (`build_queue_views`), so the
     // System-page panels and the live dashboard can never disagree on queue
     // membership. `build_queue_views` enforces mutual exclusion (a dir is in
-    // at most one of the two lists).
-    let (mux_queue, move_queue) = build_queue_views(&cfg.staging_dir);
+    // at most one of the two lists) and returns the uncapped totals from the
+    // same scan, so the "+N more" overflow math below shares one snapshot with
+    // the displayed lists (no count-vs-list TOCTOU).
+    let (mux_queue, move_queue, mux_full_count, move_full_count) =
+        build_queue_views(&cfg.staging_dir);
 
     // Mover errors: stuck staging dirs the user needs to act on.
     let move_errors: Vec<crate::mover::MoverError> = crate::mover::MOVE_ERRORS

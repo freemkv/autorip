@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.0-beta.1] — UNRELEASED
+
+Inherits libfreemkv 1.1.0-beta.1, including the **DVD movie-not-menu** fix.
+
+### Fixed
+
+- **Resume can no longer race an in-flight mux.** A staging directory owned by
+  the mux worker (sweep handed off, or mux in progress) is no longer offered for
+  sweep-resume, so a manually triggered resume can't overwrite the staged ISO
+  while the muxer is still reading it.
+
 ## [1.0.0-rc.5.1]
 
 ### Fixed
