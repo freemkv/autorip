@@ -5000,12 +5000,11 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     // under heavy ECC retry on the BU40N). A timeout is logged but not fatal
     // — the HTTP response still goes out 200 so the UI doesn't spin.
     let _ = cfg;
-    if let Some(halt) = ripper::device_halt(device) {
-        halt.cancel();
-    }
     crate::verify::request_stop(device);
 
-    if ripper::join_rip_thread(device, std::time::Duration::from_secs(60)).is_err() {
+    // Cancel the per-device halt and drain the rip thread (the core
+    // stop→drain contract; see ripper::stop_and_drain).
+    if !ripper::stop_and_drain(device, std::time::Duration::from_secs(60)) {
         tracing::warn!(
             device = %device,
             "rip thread did not drain within 60s of stop"

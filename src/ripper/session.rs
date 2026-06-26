@@ -281,6 +281,23 @@ pub fn device_halt(device: &str) -> Option<Halt> {
     halts.get(device).cloned()
 }
 
+/// Stop a device's rip thread and drain it: cancel the per-device [`Halt`]
+/// token (which every rip-phase clone polls), then block until the thread
+/// finishes or `timeout` elapses. Returns `true` if the thread drained
+/// (finished, or there was none) within the budget, `false` on timeout.
+///
+/// This is the core of the HTTP `/api/stop` handler — extracted so the
+/// stop→drain contract (handle_stop must not return while the rip thread is
+/// still mid-write, holding the SCSI session) is testable by driving the
+/// REAL function rather than a replica. `handle_stop` calls this, then layers
+/// on the verify-worker drain + STATE reset that are specific to the web path.
+pub fn stop_and_drain(device: &str, timeout: Duration) -> bool {
+    if let Some(halt) = device_halt(device) {
+        halt.cancel();
+    }
+    join_rip_thread(device, timeout).is_ok()
+}
+
 /// Atomically swap in a new [`Halt`] for `device`, carrying forward a Stop
 /// that landed on the outgoing token. Under a SINGLE acquisition of the
 /// `HALTS` lock this: reads the outgoing token's `is_cancelled()`, inserts

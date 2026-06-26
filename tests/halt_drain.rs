@@ -40,40 +40,21 @@ fn test_cancel_halt_propagates_to_rip_clones() {
     );
 }
 
-/// Mirrors what handle_stop now does in production (web.rs):
-///   - cancel the device's `Halt` token (the new replacement for
-///     the deleted `request_stop` helper).
-///   - join_rip_thread(device, timeout) — best-effort drain so the
-///     caller doesn't return while the rip thread is mid-write.
-fn handle_stop_today(device: &str) {
-    if let Some(halt) = ripper::device_halt(device) {
-        halt.cancel();
-    }
-    let _ = ripper::join_rip_thread(device, Duration::from_secs(35));
-}
-
 #[test]
-fn test_handle_stop_waits_for_thread_drain() {
-    // TDD-red: today ripper.rs:422 spawns the rip thread with
-    // `.spawn(...).ok()` and discards the JoinHandle, so handle_stop
-    // (web.rs:1489) has nothing to join on. After handle_stop
-    // returns, the rip thread may still be alive, holding the SCSI
-    // session.
+fn test_stop_and_drain_waits_for_thread_to_finish() {
+    // The stop→drain contract: stop must cancel the device's halt token AND
+    // block until the rip thread has actually finished — it must NOT return
+    // while the thread is still mid-write holding the SCSI session.
     //
-    // The fix is to stash the JoinHandle in a per-device map and
-    // have handle_stop join (with a timeout) before responding.
-    //
-    // This test asserts the post-condition: "after handle_stop
-    // returns, the rip thread has exited." Modeled here by:
-    //   - spawn a fake rip thread that drains slowly (100 ms),
-    //   - call handle_stop_today (which doesn't join),
-    //   - assert the thread is_finished() right after.
-    //
-    // Today: handle_stop_today returns instantly, the slow-draining
-    // thread is still running, the assert fires. RED.
-    //
-    // Once handle_stop is fixed to join: update handle_stop_today
-    // to also join (with a timeout) and the assert flips to GREEN.
+    // This drives the REAL production function `ripper::stop_and_drain` (the
+    // core handle_stop now delegates to), not a replica. A synthetic rip
+    // thread polls the halt token, then takes ~100 ms to "close its output"
+    // before exiting. The test asserts:
+    //   - stop_and_drain returned true (it observed the thread finish), and
+    //   - the thread's own exit flag is set by the time stop returned, and
+    //   - stop took at least the drain delay (it genuinely waited).
+    // If stop_and_drain ever regressed to fire-and-forget, `drained` would be
+    // false (timeout) and/or `exited` would still be false right after.
     let device = "sg_drain_test";
     let halt = Halt::new();
     ripper::register_halt(device, halt.clone());
@@ -84,9 +65,9 @@ fn test_handle_stop_waits_for_thread_drain() {
     let handle = std::thread::Builder::new()
         .name(format!("fake-rip-{device}"))
         .spawn(move || {
-            // Halt-aware loop with a realistic drain delay — simulates
-            // the rip thread finishing its current sector batch and
-            // closing the output file before exiting.
+            // Halt-aware loop with a realistic drain delay — simulates the rip
+            // thread finishing its current sector batch and closing the output
+            // file before exiting.
             while !halt_t.is_cancelled() {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -95,27 +76,32 @@ fn test_handle_stop_waits_for_thread_drain() {
         })
         .expect("spawn fake rip thread");
 
-    // Plug the synthetic thread into the same per-device JoinHandle
-    // table that production's spawn site uses, so handle_stop_today's
-    // `join_rip_thread` call can drain it.
+    // Plug the synthetic thread into the same per-device JoinHandle table the
+    // production spawn site uses, so stop_and_drain's internal join_rip_thread
+    // can find and reap it.
     ripper::register_rip_thread(device, handle).expect("no prior handle for this device");
 
-    // Give the thread a moment to start its loop so the halt-flag
-    // observation isn't racing with spawn() returning.
+    // Give the thread a moment to start its loop so the halt-flag observation
+    // isn't racing with spawn() returning.
     std::thread::sleep(Duration::from_millis(20));
 
     let stop_started = Instant::now();
-    handle_stop_today(device);
+    let drained = ripper::stop_and_drain(device, Duration::from_secs(35));
     let stop_elapsed = stop_started.elapsed();
 
-    // The contract: after handle_stop returns, the rip thread has
-    // exited. With the join in place, stop_elapsed reflects the
-    // drain time (~110 ms) and the thread reached its exit branch.
-    let _ = stop_elapsed;
+    assert!(
+        drained,
+        "stop_and_drain must report the rip thread drained within the budget"
+    );
     assert!(
         exited.load(Ordering::Relaxed),
-        "rip thread didn't reach its exit branch — Halt token not observed or \
-         handle_stop returned before join completed"
+        "rip thread had not reached its exit branch when stop_and_drain returned — \
+         stop did not actually wait for the thread to finish"
+    );
+    assert!(
+        stop_elapsed >= Duration::from_millis(90),
+        "stop returned faster than the ~100ms drain delay ({stop_elapsed:?}) — \
+         it can't have waited for the thread to finish closing its output"
     );
 }
 
