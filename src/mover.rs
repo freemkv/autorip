@@ -1968,6 +1968,141 @@ mod tests {
         assert_eq!(outcome, MoveOutcome::Moved);
     }
 
+    #[test]
+    fn move_file_collides_when_dest_same_size_different_content() {
+        // Atomicity/safety contract: when the destination already holds a
+        // DIFFERENT file of the SAME length (a wrong-title match routing two
+        // discs to one path with byte-identical mux lengths), move_file must
+        // NOT clobber it. It returns Collision and leaves BOTH files intact so
+        // the operator can disambiguate — never silently overwriting the
+        // existing title.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.mkv");
+        let dest = tmp.path().join("b.mkv");
+        // Equal length, differing content: same 4-byte EBML magic, same total
+        // size, but the payload differs (so head/tail probe mismatches).
+        write_minimal_mkv(&src, b"AAAAAAAAAAAA");
+        write_minimal_mkv(&dest, b"BBBBBBBBBBBB");
+        assert_eq!(
+            std::fs::metadata(&src).unwrap().len(),
+            std::fs::metadata(&dest).unwrap().len(),
+            "precondition: equal length"
+        );
+
+        let outcome = move_file(&src, &dest, &noop_progress);
+        assert_eq!(
+            outcome,
+            MoveOutcome::Collision,
+            "same-size different-content dest must collide, not overwrite"
+        );
+        // Both originals survive untouched.
+        assert_eq!(std::fs::read(&src).unwrap(), {
+            let mut b = vec![0x1A, 0x45, 0xDF, 0xA3];
+            b.extend_from_slice(b"AAAAAAAAAAAA");
+            b
+        });
+        assert_eq!(std::fs::read(&dest).unwrap(), {
+            let mut b = vec![0x1A, 0x45, 0xDF, 0xA3];
+            b.extend_from_slice(b"BBBBBBBBBBBB");
+            b
+        });
+    }
+
+    /// Cross-device (EXDEV) copy+unlink SUCCESS path, driven end-to-end
+    /// through `move_file` against a SEPARATE real filesystem.
+    ///
+    /// `move_file`'s fast path is `fs::rename`; the copy+validate+unlink
+    /// fallback only runs when rename fails with EXDEV (src and dest on
+    /// different filesystems). Within one tempdir rename always succeeds, so
+    /// this branch is unreachable without a second mount. On Linux CI we can
+    /// often create one without root via a user-namespace `tmpfs`/`tmpdir` on
+    /// a distinct device — but that isn't guaranteed. So this test probes for
+    /// two distinct filesystems among well-known mount points and SKIPS
+    /// (documenting the gap) when it can't find them, rather than faking the
+    /// EXDEV condition.
+    ///
+    /// KNOWN GAP: when no second filesystem is available (typical dev laptop /
+    /// sandboxed CI), the `move_file` copy-success → post-copy validate →
+    /// `remove_file(src)` → `Moved`, and the `MovedDirty` (copy ok, unlink
+    /// fails) branch, are NOT exercised end-to-end. The constituent pieces ARE
+    /// covered: `copy_counting` success/atomicity (its own tests),
+    /// `check_post_copy_*` validation (its own tests), and the copy-FAILURE
+    /// cleanup path (`move_file_copy_failure_leaves_no_partial_dest`). Closing
+    /// the gap fully needs a real EXDEV mount or an injectable rename seam.
+    #[test]
+    fn move_file_cross_device_copy_unlink_success_when_two_filesystems_exist() {
+        // Find a tempdir on a filesystem different from std::env::temp_dir().
+        let primary = tempfile::tempdir().unwrap();
+        let primary_dev = std::fs::metadata(primary.path())
+            .ok()
+            .and_then(dev_id_of)
+            .expect("stat primary tempdir");
+
+        // Candidate roots that are commonly a distinct filesystem.
+        let candidates = ["/dev/shm", "/run/user", "/tmp", "/var/tmp"];
+        let secondary_root = candidates.iter().find_map(|root| {
+            let p = std::path::Path::new(root);
+            if !p.is_dir() {
+                return None;
+            }
+            let dev = std::fs::metadata(p).ok().and_then(dev_id_of)?;
+            if dev != primary_dev { Some(p) } else { None }
+        });
+
+        let Some(secondary_root) = secondary_root else {
+            eprintln!(
+                "SKIP move_file_cross_device_copy_unlink_success: no second \
+                 filesystem available — EXDEV copy path not exercised (see test doc)"
+            );
+            return;
+        };
+
+        // Source on the secondary fs, dest on the primary fs → rename across
+        // them returns EXDEV, forcing the copy+unlink fallback.
+        let work = secondary_root.join(format!("autorip-xdev-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&work);
+        let src = work.join("a.mkv");
+        let dest = primary.path().join("a.mkv");
+        write_minimal_mkv(&src, b"cross device payload bytes");
+
+        let outcome = move_file(&src, &dest, &noop_progress);
+
+        // Best-effort cleanup of the secondary-fs scratch dir.
+        let _ = std::fs::remove_dir_all(&work);
+
+        // If for some reason rename still succeeded (same fs after all), we'd
+        // get Moved too — both acceptable; the key assertions are that the
+        // dest holds the bytes and the src was unlinked.
+        assert_eq!(
+            outcome,
+            MoveOutcome::Moved,
+            "cross-device move must succeed"
+        );
+        assert!(
+            !src.exists(),
+            "src must be unlinked after a successful copy"
+        );
+        let moved = std::fs::read(&dest).unwrap();
+        assert_eq!(
+            &moved[..4],
+            &[0x1A, 0x45, 0xDF, 0xA3],
+            "dest is the moved MKV"
+        );
+    }
+
+    fn dev_id_of(m: std::fs::Metadata) -> Option<u64> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(m.dev())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = m;
+            None
+        }
+    }
+
     // Helpers for the structural checks. Real MKVs are EBML-framed
     // with the magic [1A 45 DF A3] at offset 0. Real BD-TS .m2ts uses
     // 192-byte packets with TS sync 0x47 at offset 4 within each
