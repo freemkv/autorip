@@ -10,6 +10,8 @@ Inherits libfreemkv 1.1.0-beta.1, including the **DVD movie-not-menu** fix.
   the mux worker (sweep handed off, or mux in progress) is no longer offered for
   sweep-resume, so a manually triggered resume can't overwrite the staged ISO
   while the muxer is still reading it.
+- keydb save writes directly to the service path (removed the
+  validate-then-relocate workaround).
 
 ## [1.0.0-rc.5.1]
 

@@ -167,84 +167,38 @@ pub fn keydb_path(cfg: &Config) -> PathBuf {
 /// autorip's default keydb location: `$HOME/.config/freemkv/keydb.cfg`.
 ///
 /// The container bind-mounts the keydb to `/root/.config/freemkv`, so the
-/// service resolves it under the standard per-user config dir — NOT
-/// libfreemkv's `default_path()`, which is local to the executable (correct for
-/// the portable CLI, wrong for a containerized service whose binary and keydb
-/// live in different places).
+/// service resolves it under the standard per-user config dir — NOT the CLI's
+/// exe-local default, which is correct for the portable CLI but wrong for a
+/// containerized service whose binary and keydb live in different places.
 fn service_default_keydb() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/freemkv/keydb.cfg"))
 }
 
 /// Does autorip's keydb already exist at the service-canonical path?
 ///
-/// The startup gate (main.rs) MUST use this — not
-/// `libfreemkv::keydb::default_path()`, which points at the exe-local path the
-/// reads never consult. Using the same resolver as the reads means the
+/// The startup gate (main.rs) MUST use this — not an exe-local default — so the
 /// "already have a keydb, skip download" decision is made against the file the
-/// rip will actually load. (Bug f750a5e fixed the reads but left the startup
-/// gate and the writes on the exe-local path.)
+/// rip will actually load. Using the same resolver as the reads keeps the gate,
+/// the writes, and the reads on one path. (Bug f750a5e fixed the reads but left
+/// the startup gate and the writes on the exe-local path.)
 pub fn keydb_exists(cfg: &Config) -> bool {
     keydb_path(cfg).exists()
 }
 
 /// Validate and persist raw keydb bytes to autorip's service-canonical path.
 ///
-/// `libfreemkv::keydb::save` does the right *validation* (zip/gz/plain
-/// extraction, entry-count check, crash-safe atomic write) but writes to its
-/// own exe-local `default_path()` — the wrong target for a containerized
-/// service whose keydb is bind-mounted at `$HOME/.config/freemkv/keydb.cfg` and
-/// whose reads resolve through [`keydb_path`]. We reuse libfreemkv for the
-/// validation+decompression (no duplicated zip/gz logic, no extra deps), then
-/// relocate the validated file onto the service path with an atomic rename so
-/// the write target and the read target agree.
+/// `KeydbSource::save` does the validation (zip/gz/plain extraction, entry-count
+/// check) and the crash-safe atomic write (sibling-temp + fsync + rename)
+/// straight to the path the source owns — here the service path resolved by
+/// [`keydb_path`], where the reads also look. No relocation: the write target
+/// and read target are the same path by construction.
 ///
-/// Returns the libfreemkv `UpdateResult` with its `path` field rewritten to the
-/// service-canonical destination actually written.
+/// Returns the `UpdateResult` (from `freemkv-keysources`) describing the write.
 pub fn save_keydb(
     cfg: &Config,
     data: &[u8],
-) -> std::result::Result<libfreemkv::keydb::UpdateResult, libfreemkv::Error> {
-    // libfreemkv validates + decompresses + writes to its exe-local default.
-    let mut result = libfreemkv::keydb::save(data)?;
-    let src = result.path.clone();
-    let dest = keydb_path(cfg);
-
-    // Already the canonical target (e.g. an operator who set keydb_path to the
-    // exe-local path, or a single-binary deployment) — nothing to relocate.
-    if src == dest {
-        return Ok(result);
-    }
-
-    if let Some(dir) = dest.parent() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!(error = %e, dest = %dest.display(), "keydb: create dest dir failed");
-            let _ = std::fs::remove_file(&src);
-            return Err(libfreemkv::Error::KeydbWrite {
-                path: dest.display().to_string(),
-            });
-        }
-    }
-
-    // Prefer a same-filesystem atomic rename; fall back to copy+remove when the
-    // validated file and the bind-mounted dest live on different mounts (the
-    // common container case: exe on the image layer, keydb on a bind volume —
-    // rename across mounts returns EXDEV).
-    let relocated = std::fs::rename(&src, &dest).or_else(|_| {
-        std::fs::copy(&src, &dest).map(|_| ()).inspect(|_| {
-            let _ = std::fs::remove_file(&src);
-        })
-    });
-    if let Err(e) = relocated {
-        tracing::warn!(error = %e, src = %src.display(), dest = %dest.display(),
-            "keydb: relocate to service path failed; keydb may be at exe-local path");
-        let _ = std::fs::remove_file(&src);
-        return Err(libfreemkv::Error::KeydbWrite {
-            path: dest.display().to_string(),
-        });
-    }
-
-    result.path = dest;
-    Ok(result)
+) -> std::result::Result<freemkv_keysources::UpdateResult, libfreemkv::Error> {
+    KeydbSource::new(keydb_path(cfg)).save(data)
 }
 
 /// ScanOptions for a **live-drive** structure scan. Lookup-free (the library
@@ -584,14 +538,6 @@ impl DiscKeyAccess for IsoAccess<'_> {
 mod tests {
     use super::*;
 
-    /// Serializes tests that drive `save_keydb` → `libfreemkv::keydb::save`,
-    /// which writes to the single process-wide exe-local `default_path()`
-    /// (`<exe_dir>/keydb.cfg`) before `save_keydb` relocates it. Two such tests
-    /// running in parallel race on that shared file: one renames it out from
-    /// under the other, surfacing a spurious `KeydbWrite`. The lock makes the
-    /// write→relocate sequence atomic across the test binary.
-    static SAVE_KEYDB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn ssrf_guard_blocks_metadata_and_internal_hosts() {
         // Cloud metadata endpoint — the canonical SSRF target.
@@ -751,15 +697,12 @@ mod tests {
         assert!(!libfreemkv::aacs::is_aacs_scrambled(&clear));
     }
 
-    /// Regression for the rc.6 keydb path split: autorip's keydb *writes* and
-    /// the startup *existence check* must land on the same service-canonical
-    /// path the *reads* resolve through (keydb_path / keydb_exists), NOT
-    /// libfreemkv's exe-local default_path. Before the fix, save() wrote to the
-    /// exe dir while reads looked under $HOME/.config/freemkv, so a fresh
-    /// container "downloaded" a keydb every boot yet every AACS rip still failed.
+    /// autorip's keydb *writes* and the startup *existence check* must land on
+    /// the same service-canonical path the *reads* resolve through (keydb_path /
+    /// keydb_exists). `save_keydb` now writes STRAIGHT to `keydb_path(cfg)` via
+    /// `KeydbSource::save` — no validate-then-relocate dance.
     #[test]
     fn save_keydb_writes_to_service_path_and_existence_agrees() {
-        let _guard = SAVE_KEYDB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("keys").join("keydb.cfg");
 
@@ -772,12 +715,12 @@ mod tests {
         assert_eq!(keydb_path(&cfg), dest);
         assert!(!keydb_exists(&cfg), "no keydb written yet");
 
-        // A minimal valid keydb body (one `0x...` entry line) — libfreemkv's
-        // save() validation accepts `0x`-prefixed lines as entries.
+        // A minimal valid keydb body (one `0x...` entry line) — the save
+        // validation accepts `0x`-prefixed lines as entries.
         let body = b"0xDEADBEEFDEADBEEFDEADBEEFDEADBEEF\n";
         let result = save_keydb(&cfg, body).expect("save_keydb must succeed");
 
-        // It wrote to the service path, not the libfreemkv exe-local default.
+        // It wrote straight to the service path.
         assert_eq!(result.path, dest, "save must target the service path");
         assert!(dest.exists(), "keydb file must exist at the service path");
         assert!(
@@ -786,19 +729,14 @@ mod tests {
         );
         assert_eq!(result.entries, 1, "one 0x entry");
 
-        // And the libfreemkv exe-local default must NOT be where it ended up
-        // (the bug was the two paths diverging).
-        if let Ok(exe_local) = libfreemkv::keydb::default_path() {
-            assert_ne!(
-                exe_local, dest,
-                "test only meaningful when the exe-local default differs from the dest"
-            );
-            // The validated file was relocated off the exe-local path.
-            assert!(
-                !exe_local.exists(),
-                "the validated keydb must not be stranded at the exe-local path"
-            );
-        }
+        // No stray temp sibling left behind by the atomic write.
+        let leftovers: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
 
         // Content round-trips: the bytes at the service path are the keydb text.
         let written = std::fs::read_to_string(&dest).unwrap();
@@ -814,11 +752,11 @@ mod tests {
     /// SAME service default (`$HOME/.config/freemkv/keydb.cfg`): `keydb_path`,
     /// `service_default_keydb`, and the read path (`drive_scan_opts` builds its
     /// `KeydbSource` from `keydb_path`). The rc.6 bug was the reads going to
-    /// `$HOME/.config/freemkv` while the writes/gate went to libfreemkv's
-    /// exe-local default; this pins they resolve to one location.
+    /// `$HOME/.config/freemkv` while the writes/gate went to an exe-local
+    /// default; this pins they resolve to one location.
     ///
     /// Reads the ambient `$HOME` rather than mutating it — mutating the global
-    /// env races with `libfreemkv::keydb::default_path()` in sibling tests.
+    /// env would race with other tests that read it.
     #[test]
     fn keydb_resolvers_all_agree_on_service_default() {
         let Some(home) = std::env::var_os("HOME") else {
@@ -880,35 +818,25 @@ mod tests {
         );
     }
 
-    /// `save_keydb` is idempotent on the dest path: when the validated file is
-    /// already AT the service-canonical destination (operator pointed
-    /// `keydb_path` straight at the exe-local default, or a single-binary
-    /// deploy), the early-return src==dest branch leaves the file in place and
-    /// reports that path — no spurious relocate, no data loss.
+    /// A second `save_keydb` to the same service path replaces the prior keydb
+    /// in place (direct atomic write, no relocate) and reports that path.
     #[test]
-    fn save_keydb_is_idempotent_when_src_equals_dest() {
-        let _guard = SAVE_KEYDB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // Point keydb_path at exactly libfreemkv's exe-local default so
-        // save()'s own write target equals our dest → src==dest branch.
-        let Ok(exe_local) = libfreemkv::keydb::default_path() else {
-            // No exe-local default resolvable in this environment — skip.
-            return;
-        };
+    fn save_keydb_overwrites_existing_at_service_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("keys").join("keydb.cfg");
         let cfg = Config {
-            keydb_path: Some(exe_local.to_string_lossy().into_owned()),
+            keydb_path: Some(dest.to_string_lossy().into_owned()),
             ..Config::default()
         };
-        assert_eq!(keydb_path(&cfg), exe_local);
 
-        let result = save_keydb(&cfg, b"0xBEEF\n").expect("save must succeed");
-        assert_eq!(
-            result.path, exe_local,
-            "src==dest path must report the canonical (== exe-local here) target"
-        );
-        assert!(exe_local.exists(), "file must be present at the dest");
-        // Clean up the file we wrote to the shared exe-local default so we don't
-        // leak state into other tests / runs.
-        let _ = std::fs::remove_file(&exe_local);
+        save_keydb(&cfg, b"0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n").expect("first save");
+        let result =
+            save_keydb(&cfg, b"0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n").expect("second save");
+
+        assert_eq!(result.path, dest, "save always targets the service path");
+        let written = std::fs::read_to_string(&dest).unwrap();
+        assert!(written.contains("0xBBBB"), "newest keydb content must win");
+        assert!(!written.contains("0xAAAA"), "old content fully replaced");
     }
 
     // --- KeyOutcome reporting via resolve_keys (rc.6 WS3) --------------------
