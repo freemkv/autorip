@@ -808,9 +808,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             &bad_ranges,
             title_bytes_per_sec,
         ) / crate::util::MILLIS_PER_SEC;
+        // ISO output is whole-disc and must be byte-complete: the per-title
+        // tolerance is ignored (forced to 0), matching the fresh-rip gate.
+        let effective_abort =
+            super::effective_abort_secs(&cfg_read.output_format, cfg_read.abort_on_lost_secs);
         if super::should_abort_for_loss(
             lost_secs * crate::util::MILLIS_PER_SEC,
-            cfg_read.abort_on_lost_secs as f64 * crate::util::MILLIS_PER_SEC,
+            effective_abort as f64 * crate::util::MILLIS_PER_SEC,
         ) {
             // "disc loss" for raw ISO (whole-disc scope), "title loss" for a
             // muxed MKV/M2TS (in-title scope) — matching how `lost_secs` was
@@ -824,7 +828,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 device,
                 &format!(
                     "Auto-resume aborted: {scope} loss {:.2}s exceeds threshold {}s",
-                    lost_secs, cfg_read.abort_on_lost_secs
+                    lost_secs, effective_abort
                 ),
             );
             reset_status_after_ripping(
@@ -835,7 +839,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 &duration,
                 Some(format!(
                     "{scope} loss {:.2}s exceeds threshold {}s",
-                    lost_secs, cfg_read.abort_on_lost_secs
+                    lost_secs, effective_abort
                 )),
             );
             return;
