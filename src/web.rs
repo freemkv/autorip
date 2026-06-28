@@ -353,7 +353,6 @@ function renderSteps(steps,progress,eta,speed,s){
                             : b>=1048576    ? (b/1048576).toFixed(1)+' MB'
                             : b>=1024       ? (b/1024).toFixed(1)+' KB'
                             : b+' B';
-        const maybeMs = (s.total_maybe_ms!=null && s.total_maybe_ms>=0) ? s.total_maybe_ms : 0;
         const lostMs  = (s.total_lost_ms!=null  && s.total_lost_ms >=0) ? s.total_lost_ms  : 0;
         /* Fixed-width per pill type: each pill's content can grow as
            values change ("864 MB" \u2192 "12.5 GB", "~3s" \u2192 "~01:23:45"),
@@ -369,8 +368,22 @@ function renderSteps(steps,progress,eta,speed,s){
         if(bg>0){
           pills+=pill('Good','var(--green,#3aaa55)', fmtBytes(bg), 90);
         }
+        if(bm>0 || bl>0){
+          /* The GATE metric: loss within the MAIN FEATURE (the muxed title),
+             scoped via main_lost_ms. The Good/Maybe/Lost pills are WHOLE-DISC
+             byte counts; this is what abort_on_lost_secs actually checks. So a
+             990 MB disc-wide Maybe (an out-of-feature clip) sits beside
+             "Feature clean" (0:00 lost) \u2014 no more reading the disc-wide Maybe
+             time as main-movie loss. */
+          const mainLostMs = (s.main_lost_ms!=null && s.main_lost_ms>=0) ? s.main_lost_ms : 0;
+          pills+=pill('Feature', mainLostMs>0?'var(--red,#e34234)':'var(--green,#3aaa55)',
+                      mainLostMs>0?'~'+fmtMs(mainLostMs)+' lost':'clean', 110);
+        }
         if(bm>0){
-          pills+=pill('Maybe','var(--yellow,#f0c000)', fmtBytes(bm)+' \u00b7 ~'+fmtMs(maybeMs), 170);
+          /* Whole-disc bytes only \u2014 NOT a time. Converting the disc-wide Maybe
+             to "~M:SS" wrongly read as main-feature loss; the Feature pill above
+             carries the real main-movie figure. */
+          pills+=pill('Maybe','var(--yellow,#f0c000)', fmtBytes(bm), 110);
         }
         if(bl>0){
           /* damage_severity label only when terminal loss exists. */
@@ -1002,6 +1015,7 @@ function renderSettings(s){
       {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. nas.example.com:9000)',indent:true,placeholder:'nas.example.com:9000',showIf:{key:'output_format',value:'network'}},
       {key:'main_feature',label:'Main Feature Only',type:'bool',hint:'',indent:true,hideIf:{key:'output_format',value:'iso'}},
       {key:'min_length_secs',label:'Minimum Title Length (seconds)',type:'number',hint:'Shorter titles are skipped (600 = 10 min)',indent:true,hideIf:{key:'output_format',value:'iso'}},
+      {key:'abort_on_lost_secs',label:'Max Acceptable Main Movie Loss',type:'number',hint:'Seconds of missing data tolerated in the MAIN FEATURE (the muxed title) after all retries. 0 = ZERO: abort on ANY lost byte — unreadable OR undecryptable — not just ≥1s. Scoped to the main movie only (a scratched menu/extra outside the title never aborts). Applies to MUXED output only (MKV / M2TS / Network) — IGNORED for an ISO rip, which is kept whole as-is (for a byte-perfect full-disc image use the freemkv CLI). Multi-pass only.',indent:true,showIf:{key:'rip_mode',value:'multi'},hideIf:{key:'output_format',value:'iso'}},
     ]},
     {title:'Recovery',fields:[
       {key:'rip_mode',label:'Rip Mode',type:'radio',options:[{value:'single',label:'Single Pass'},{value:'multi',label:'Multi Pass'}],hint:'Single Pass: stream disc → MKV directly. Fastest, best for healthy discs. Multi Pass: rip an ISO, retry bad sectors with progressively smaller blocks, then mux to MKV. Use for discs with read errors.'},
@@ -1012,7 +1026,6 @@ function renderSettings(s){
          post-retry abort decision is governed by abort_on_lost_secs (time-based). */
       {key:'max_retries',label:'Retry Passes',type:'number',hint:'How many retry passes to run on bad sectors. Each pass uses smaller blocks (60→30→15→7→1 sectors) and alternates direction. Default 5 covers most recoverable damage.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
       {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Promote the disc ISO into the library alongside the muxed title. Off by default to reclaim disk.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
-      {key:'abort_on_lost_secs',label:'Max Acceptable Main Movie Loss',type:'number',hint:'Seconds of missing data I will tolerate in the main feature after all retries finish. 0 = perfect rip required (abort if any loss). Applies to multi-pass only.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
     ]},
     {title:'Output',fields:[
       {key:'staging_dir',label:'Staging Directory',type:'text',hint:'Where rips are written before being moved to the final destination. Use a fast local disk for performance; the finished MKV is moved to the output directory on completion.'},
@@ -1047,7 +1060,7 @@ function renderSettings(s){
       const hideShow=f.showIf&&s[f.showIf.key]!==f.showIf.value;
       const hideHide=f.hideIf&&s[f.hideIf.key]===f.hideIf.value;
       const hide=(hideShow||hideHide)?'display:none;':'';
-      const showAttr=f.showIf?' data-show-key="'+f.showIf.key+'" data-show-value="'+f.showIf.value+'"':(f.hideIf?' data-hide-key="'+f.hideIf.key+'" data-hide-value="'+f.hideIf.value+'"':'');
+      const showAttr=(f.showIf?' data-show-key="'+f.showIf.key+'" data-show-value="'+f.showIf.value+'"':'')+(f.hideIf?' data-hide-key="'+f.hideIf.key+'" data-hide-value="'+f.hideIf.value+'"':'');
       if(f.type==='action'){
         html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><div style="display:flex;align-items:center;gap:10px"><button type="button" class="btn" onclick="'+f.action+'">'+f.button+'</button><span id="'+f.status+'" style="font-size:.8rem"></span></div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }else if(f.type==='radio'){
@@ -1078,18 +1091,21 @@ function renderSettings(s){
   toggleConditional();
 }
 function toggleConditional(){
-  document.querySelectorAll('[data-show-key]').forEach(el=>{
-    const k=el.dataset.showKey,v=el.dataset.showValue;
-    const radio=document.querySelector('input[data-key="'+k+'"]:checked');
-    el.style.display=radio&&radio.value===v?'':'none';
-  });
-  // hideIf: hide when the referenced field has the given value
-  // (inverse of showIf). Used to gate title-filtering settings on
-  // output formats that actually have a mux step.
-  document.querySelectorAll('[data-hide-key]').forEach(el=>{
-    const k=el.dataset.hideKey,v=el.dataset.hideValue;
-    const radio=document.querySelector('input[data-key="'+k+'"]:checked');
-    el.style.display=radio&&radio.value===v?'none':'';
+  // A field may carry BOTH a showIf and a hideIf (e.g. abort_on_lost_secs:
+  // show only in multi-pass AND not for ISO output). Compute visibility per
+  // element from both: hidden if the showIf condition isn't met OR the hideIf
+  // condition IS met. Single-condition fields keep their prior behaviour.
+  document.querySelectorAll('[data-show-key],[data-hide-key]').forEach(el=>{
+    let visible=true;
+    if(el.dataset.showKey){
+      const r=document.querySelector('input[data-key="'+el.dataset.showKey+'"]:checked');
+      if(!(r&&r.value===el.dataset.showValue)) visible=false;
+    }
+    if(el.dataset.hideKey){
+      const r=document.querySelector('input[data-key="'+el.dataset.hideKey+'"]:checked');
+      if(r&&r.value===el.dataset.hideValue) visible=false;
+    }
+    el.style.display=visible?'':'none';
   });
 }
 
@@ -1143,8 +1159,12 @@ function saveSettings(){
   status.textContent='';
   status.style.color='var(--green)';
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)})
-    .then(r=>{
-      if(!r.ok)throw new Error('HTTP '+r.status);
+    .then(async r=>{
+      if(!r.ok){
+        let msg='HTTP '+r.status;
+        try{const j=await r.json();if(j&&j.error)msg=j.error;}catch(_){}
+        throw new Error(msg);
+      }
       btn.textContent='✓ Saved';
       btn.style.background='var(--green)';
       btn.style.color='#fff';
@@ -4276,22 +4296,43 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     // /mnt/unraid-1/media/movies, …) while rejecting relative / climbing paths.
     // Empty string is allowed: it means "unset / inherit default" for the
     // optional movie_dir / tv_dir overrides.
-    for field in ["output_dir", "staging_dir", "movie_dir", "tv_dir"] {
+    let has_parent_dir = |p: &std::path::Path| {
+        p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    };
+    // output_dir / staging_dir are MOUNT ROOTS: they must be absolute (a real
+    // mount point) and may not climb with `..`.
+    for field in ["output_dir", "staging_dir"] {
         if let Some(v) = patch.get(field).and_then(|v| v.as_str()) {
             if v.is_empty() {
                 continue;
             }
             let p = std::path::Path::new(v);
-            let bad = !p.is_absolute()
-                || p.components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir));
-            if bad {
+            if !p.is_absolute() || has_parent_dir(p) {
                 return json_response(
                     request,
                     400,
                     &format!(
                         r#"{{"ok":false,"error":"{field} must be an absolute path with no '..'"}}"#
                     ),
+                );
+            }
+        }
+    }
+    // movie_dir / tv_dir are SUB-DIRECTORY names placed UNDER output_dir (the
+    // defaults are the relative "movies" / "tv"). Relative is the norm; only
+    // reject `..` so they can't escape the output root. An absolute override is
+    // also permitted.
+    for field in ["movie_dir", "tv_dir"] {
+        if let Some(v) = patch.get(field).and_then(|v| v.as_str()) {
+            if v.is_empty() {
+                continue;
+            }
+            if has_parent_dir(std::path::Path::new(v)) {
+                return json_response(
+                    request,
+                    400,
+                    &format!(r#"{{"ok":false,"error":"{field} must not contain '..'"}}"#),
                 );
             }
         }
