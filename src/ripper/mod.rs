@@ -8128,7 +8128,10 @@ mod tests {
         std::fs::create_dir_all(&disc).unwrap();
 
         let terminal = super::apply_post_mux_abort(&disc, 45.0, 30);
-        assert!(!terminal, "a first abort-on-loss must be resumable, not terminal");
+        assert!(
+            !terminal,
+            "a first abort-on-loss must be resumable, not terminal"
+        );
 
         let (reason, attempt) = staging::read_aborted_loss(&disc)
             .expect(".aborted-loss marker must exist after a first abort");
