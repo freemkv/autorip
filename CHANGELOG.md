@@ -2,10 +2,46 @@
 
 ## [1.1.0-beta.1] — UNRELEASED
 
-Inherits libfreemkv 1.1.0-beta.1, including the **DVD movie-not-menu** fix.
+Inherits libfreemkv 1.1.0-beta.1, including the **post-read decrypt-verify gate**
+(undecryptable units are caught during the rip and re-read) and the
+**DVD movie-not-menu** fix.
+
+### Added
+
+- **ISO output now requires a 100% byte-complete image.** The per-title
+  "Max Acceptable Main Movie Loss" tolerance is a muxed-output (MKV / M2TS /
+  Network) setting and is now ignored for an ISO rip (forced to 0): a value left
+  over from a previous MKV rip can no longer silently let an ISO accept loss. The
+  Settings UI already hid the field for ISO; the abort logic now matches it.
+
+### Changed
+
+- **Rip progress is now two states — Good and Maybe, never a third.** The live
+  card no longer shows `Feature` / `Cosmetic` / `Moderate` / `Serious` /
+  `No chance` / `Lost` pills. **Good** = whole-disc bytes read *and* verify-clean;
+  **Maybe** = every byte not yet good (pending, NonTrimmed, currently-unreadable,
+  undecryptable — all folded together). Nothing is called "lost" mid-rip: a later
+  pass, or a freshly power-cycled drive, still recovers it, so there is no live
+  terminal bucket. "Bad" is a **verdict**, decided once after the final pass
+  (main-feature lost time vs `abort_on_lost_secs`), not a pill. The Maybe pill's
+  bytes are whole-disc but its **time is the main-feature lost time** at ms
+  precision — `Maybe 990 MB · 0:00` means 990 MB pending with zero movie impact
+  (passes), while `Maybe 12 KB · ~1 ms` is a few movie sectors (fails a 0
+  threshold). A handful of sectors reads as `~1 ms`, never `0`.
+- **Abort-on-loss is resumable, not terminal.** A rip that aborts because
+  main-movie loss exceeds the threshold now writes a bounded, *resumable* marker
+  (re-checked against the *current* threshold on the next attempt, up to a small
+  cap) instead of a terminal failure — a raised threshold, a fresh patch pass, or
+  a better drive state can finish it without re-ripping from scratch. Operator
+  cancel and durability/structural-mux failures stay terminal.
+- **"Max Acceptable Main Movie Loss"** moved under the MKV/muxed-output settings
+  and shown in seconds.
 
 ### Fixed
 
+- **Clearer abort message.** A sub-second main-movie loss now reads e.g. "1 ms"
+  instead of a confusing "0.00s", and a zero threshold reads "perfect rip
+  required" instead of "threshold 0s".
 - **Resume can no longer race an in-flight mux.** A staging directory owned by
   the mux worker (sweep handed off, or mux in progress) is no longer offered for
   sweep-resume, so a manually triggered resume can't overwrite the staged ISO

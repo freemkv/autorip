@@ -345,9 +345,8 @@ pub fn mark_aborted_on_loss(staging_disc_dir: &Path, reason: &str) -> bool {
     let attempt = prior.saturating_add(1);
     clear_restart_count(staging_disc_dir);
     if attempt >= MAX_LOSS_RESUME_ATTEMPTS {
-        let terminal_reason = format!(
-            "{reason}; exhausted {MAX_LOSS_RESUME_ATTEMPTS} abort-on-loss resume attempts"
-        );
+        let terminal_reason =
+            format!("{reason}; exhausted {MAX_LOSS_RESUME_ATTEMPTS} abort-on-loss resume attempts");
         // write_failed_marker clears .sweeping/.muxing; also drop the
         // now-superseded .aborted-loss so the two markers can't coexist.
         write_failed_marker(staging_disc_dir, &terminal_reason);
@@ -1552,8 +1551,14 @@ mod tests {
 
         // The MAX-th abort promotes to terminal .failed and removes .aborted-loss.
         let terminal = mark_aborted_on_loss(&disc, "loss exceeds threshold");
-        assert!(terminal, "the {MAX_LOSS_RESUME_ATTEMPTS}th abort must be terminal");
-        assert!(disc.join(FAILED_MARKER).exists(), "terminal .failed must be written");
+        assert!(
+            terminal,
+            "the {MAX_LOSS_RESUME_ATTEMPTS}th abort must be terminal"
+        );
+        assert!(
+            disc.join(FAILED_MARKER).exists(),
+            "terminal .failed must be written"
+        );
         assert!(
             !disc.join(ABORTED_LOSS_MARKER).exists(),
             ".aborted-loss must be removed when promoted to terminal"
@@ -1588,13 +1593,22 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*attempt, 1);
-                assert!(*has_iso && *has_mapfile, "ISO + mapfile must be reported intact");
+                assert!(
+                    *has_iso && *has_mapfile,
+                    "ISO + mapfile must be reported intact"
+                );
             }
             other => panic!("expected ResumeAbortedLoss, got {other:?}"),
         }
         assert!(disc.join("foo.iso").exists());
-        assert!(disc.join(ABORTED_LOSS_MARKER).exists(), "marker left intact for retry");
-        assert!(!disc.join(FAILED_MARKER).exists(), "below limit must NOT be terminal");
+        assert!(
+            disc.join(ABORTED_LOSS_MARKER).exists(),
+            "marker left intact for retry"
+        );
+        assert!(
+            !disc.join(FAILED_MARKER).exists(),
+            "below limit must NOT be terminal"
+        );
     }
 
     /// (b) A `.aborted-loss` marker AT/ABOVE the attempt limit is TERMINAL: the
@@ -1616,7 +1630,10 @@ mod tests {
             }
             other => panic!("expected AlreadyFailed, got {other:?}"),
         }
-        assert!(disc.join(FAILED_MARKER).exists(), "must be promoted to terminal .failed");
+        assert!(
+            disc.join(FAILED_MARKER).exists(),
+            "must be promoted to terminal .failed"
+        );
         assert!(
             !disc.join(ABORTED_LOSS_MARKER).exists(),
             ".aborted-loss must be cleared on terminal promotion"
@@ -1655,7 +1672,11 @@ mod tests {
         write_marker_durable(&d1.join(COMPLETED_MARKER), b"{}").unwrap();
         let h1 = resume_or_quarantine_staging(root1.to_str().unwrap());
         assert_eq!(h1.len(), 1);
-        assert!(matches!(h1[0].action, ResumeAction::AlreadyCompleted), "got {:?}", h1[0].action);
+        assert!(
+            matches!(h1[0].action, ResumeAction::AlreadyCompleted),
+            "got {:?}",
+            h1[0].action
+        );
 
         // .done (+ leftover ISO) → AlreadyCompleted (finished, awaiting mover).
         let root2 = tmpdir();
@@ -1665,7 +1686,11 @@ mod tests {
         write_marker_durable(&d2.join(DONE_MARKER), b"{}").unwrap();
         let h2 = resume_or_quarantine_staging(root2.to_str().unwrap());
         assert_eq!(h2.len(), 1);
-        assert!(matches!(h2[0].action, ResumeAction::AlreadyCompleted), "got {:?}", h2[0].action);
+        assert!(
+            matches!(h2[0].action, ResumeAction::AlreadyCompleted),
+            "got {:?}",
+            h2[0].action
+        );
     }
 
     /// R3 finding 2 regression: a `.sweeping` dir from a NON-watchdog hard crash

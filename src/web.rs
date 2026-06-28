@@ -337,28 +337,27 @@ function renderSteps(steps,progress,eta,speed,s){
       const totalEtaStr=col(s.total_eta?'ETA '+s.total_eta:'',95,'left');
       const totalSpdStr=col('',85,'left');
       const totalLine=[totalPctStr,totalEtaStr,totalSpdStr].join(SEP);
-      /* 0.13.23: three-bucket display.
-         GOOD  (green)  \u2014 Finished sectors. Always rendered when bytes_total_disc>0.
-         MAYBE (yellow) \u2014 Pending sectors (Pass 2-N may recover). Hidden when 0.
-         LOST  (red)    \u2014 Unreadable sectors (terminal). Hidden when 0.
-         Each pill carries the bucket's video time equivalent, so users can
-         see at a glance "X good \u00b7 2h05m, Y maybe \u00b7 2.4s, Z no chance \u00b7 0s".
-         The damage_severity label appears alongside (Cosmetic / Moderate /
-         Serious) only when there's actual loss. */
       let badLine='';
-      const bg=s.bytes_good||0, bm=s.bytes_maybe||0, bl=s.bytes_lost||0;
-      const haveAny = bg>0 || bm>0 || bl>0;
-      if(haveAny){
+      /* TWO pills, ever \u2014 Good and Maybe. Never a third.
+         GOOD  = whole-disc bytes that are read AND verify-clean (Finished).
+         MAYBE = whole-disc bytes not-yet-good: pending, NonTrimmed, and
+                 currently-unreadable/undecryptable all folded together.
+                 NOTHING is "lost"/"no chance" mid-rip \u2014 a later pass (or a
+                 freshly power-cycled drive) still recovers it, so there is no
+                 terminal bucket here. "Bad" is a VERDICT, decided once after
+                 the final pass (main-feature lost time vs abort_on_lost_secs),
+                 not a live pill.
+         The Maybe pill's BYTES are whole-disc, but its TIME is the MAIN-FEATURE
+         lost time (main_lost_ms) \u2014 that is what the abort gate judges. So
+         "Maybe 990 MB \u00b7 0:00" = 990 MB pending but zero movie time \u21d2 will pass;
+         "Maybe 12 KB \u00b7 ~1 ms" = a few sectors of movie \u21d2 fails a 0 threshold.
+         Time is rendered at ms precision (fmtMs): 6 sectors is 1 ms, never 0. */
+      const bg=s.bytes_good||0, bm=(s.bytes_maybe||0)+(s.bytes_lost||0);
+      if(bg>0 || bm>0){
         const fmtBytes = (b)=> b>=1073741824 ? (b/1073741824).toFixed(2)+' GB'
                             : b>=1048576    ? (b/1048576).toFixed(1)+' MB'
                             : b>=1024       ? (b/1024).toFixed(1)+' KB'
                             : b+' B';
-        const lostMs  = (s.total_lost_ms!=null  && s.total_lost_ms >=0) ? s.total_lost_ms  : 0;
-        /* Fixed-width per pill type: each pill's content can grow as
-           values change ("864 MB" \u2192 "12.5 GB", "~3s" \u2192 "~01:23:45"),
-           and an inline-block grows with content unless we pin it.
-           Per-type min-widths sized for each pill's worst case so the
-           Good chip doesn't waste space matching Maybe/Bad. */
         const pill = (label, color, body, minPx)=>
           '<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:'+color
           +';color:var(--pill-fg);font-size:.65rem;font-weight:600;margin-right:6px;'
@@ -368,35 +367,11 @@ function renderSteps(steps,progress,eta,speed,s){
         if(bg>0){
           pills+=pill('Good','var(--green,#3aaa55)', fmtBytes(bg), 90);
         }
-        if(bm>0 || bl>0){
-          /* The GATE metric: loss within the MAIN FEATURE (the muxed title),
-             scoped via main_lost_ms. The Good/Maybe/Lost pills are WHOLE-DISC
-             byte counts; this is what abort_on_lost_secs actually checks. So a
-             990 MB disc-wide Maybe (an out-of-feature clip) sits beside
-             "Feature clean" (0:00 lost) \u2014 no more reading the disc-wide Maybe
-             time as main-movie loss. */
-          const mainLostMs = (s.main_lost_ms!=null && s.main_lost_ms>=0) ? s.main_lost_ms : 0;
-          pills+=pill('Feature', mainLostMs>0?'var(--red,#e34234)':'var(--green,#3aaa55)',
-                      mainLostMs>0?'~'+fmtMs(mainLostMs)+' lost':'clean', 110);
-        }
         if(bm>0){
-          /* Whole-disc bytes only \u2014 NOT a time. Converting the disc-wide Maybe
-             to "~M:SS" wrongly read as main-feature loss; the Feature pill above
-             carries the real main-movie figure. */
-          pills+=pill('Maybe','var(--yellow,#f0c000)', fmtBytes(bm), 110);
+          const mainLostMs = (s.main_lost_ms!=null && s.main_lost_ms>=0) ? s.main_lost_ms : 0;
+          const t = mainLostMs>0 ? '~'+fmtMs(mainLostMs) : '0:00';
+          pills+=pill('Maybe','var(--yellow,#f0c000)', fmtBytes(bm)+' \u00b7 '+t, 160);
         }
-        if(bl>0){
-          /* damage_severity label only when terminal loss exists. */
-          const sev=s.damage_severity||'';
-          const sevLabel = sev==='serious' ? 'Serious'
-                         : sev==='moderate' ? 'Moderate'
-                         : sev==='cosmetic' ? 'Cosmetic'
-                         : 'No chance';
-          pills+=pill(sevLabel,'var(--red,#e34234)', fmtBytes(bl)+' \u00b7 ~'+fmtMs(lostMs), 195);
-        }
-        /* 0.13.24: bump margin-top from 6px to 14px so the pill row gets
-           the same visual breathing room as the gap between the per-pass
-           and total bars (matches the v0.13.19 polish on those bars). */
         if(pills) badLine='<div style="font-size:.7rem;margin-top:14px">'+pills+'</div>';
       }
       detail='<div style="margin-top:6px">'
@@ -1015,7 +990,7 @@ function renderSettings(s){
       {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. nas.example.com:9000)',indent:true,placeholder:'nas.example.com:9000',showIf:{key:'output_format',value:'network'}},
       {key:'main_feature',label:'Main Feature Only',type:'bool',hint:'',indent:true,hideIf:{key:'output_format',value:'iso'}},
       {key:'min_length_secs',label:'Minimum Title Length (seconds)',type:'number',hint:'Shorter titles are skipped (600 = 10 min)',indent:true,hideIf:{key:'output_format',value:'iso'}},
-      {key:'abort_on_lost_secs',label:'Max Acceptable Main Movie Loss',type:'number',hint:'Seconds of missing data tolerated in the MAIN FEATURE (the muxed title) after all retries. 0 = ZERO: abort on ANY lost byte — unreadable OR undecryptable — not just ≥1s. Scoped to the main movie only (a scratched menu/extra outside the title never aborts). Applies to MUXED output only (MKV / M2TS / Network) — IGNORED for an ISO rip, which is kept whole as-is (for a byte-perfect full-disc image use the freemkv CLI). Multi-pass only.',indent:true,showIf:{key:'rip_mode',value:'multi'},hideIf:{key:'output_format',value:'iso'}},
+      {key:'abort_on_lost_secs',label:'Max Acceptable Main Movie Loss',type:'number',hint:'Seconds of missing data tolerated in the MAIN FEATURE (the muxed title) after all retries. 0 = ZERO: abort on ANY lost byte — unreadable OR undecryptable — not just ≥1s. Scoped to the main movie only (a scratched menu/extra outside the title never aborts). Applies to title-selected output (MKV / M2TS / Network stream) — IGNORED for an ISO rip, which is kept whole as-is (for a byte-perfect full-disc image use the freemkv CLI). Multi-pass only.',indent:true,showIf:{key:'rip_mode',value:'multi'},hideIf:{key:'output_format',value:'iso'}},
     ]},
     {title:'Recovery',fields:[
       {key:'rip_mode',label:'Rip Mode',type:'radio',options:[{value:'single',label:'Single Pass'},{value:'multi',label:'Multi Pass'}],hint:'Single Pass: stream disc → MKV directly. Fastest, best for healthy discs. Multi Pass: rip an ISO, retry bad sectors with progressively smaller blocks, then mux to MKV. Use for discs with read errors.'},
