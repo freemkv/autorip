@@ -260,7 +260,10 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
         for hint in &hints {
             // Classify for the log only (resume itself is recomputed on
             // demand via find_resumable_for_disc); no map is retained.
-            let class = resume::classify_resume(hint, c.abort_on_lost_secs);
+            let class = resume::classify_resume(
+                hint,
+                effective_abort_secs(&c.output_format, c.abort_on_lost_secs),
+            );
             tracing::info!(
                 dir = %hint.dir.display(),
                 action = ?hint.action,
@@ -3413,17 +3416,21 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 }
             }
 
+            // ISO output is whole-disc and must be byte-complete: the per-title
+            // tolerance is ignored (forced to 0). MKV/M2TS use the configured value.
+            let effective_abort =
+                effective_abort_secs(&cfg_read.output_format, cfg_read.abort_on_lost_secs);
             if loss_aborts(
                 main_lost_bytes_for_history,
                 main_lost_ms_for_history,
-                cfg_read.abort_on_lost_secs,
+                effective_abort,
             ) {
                 crate::log::device_log(
                     device,
                     &format!(
                         "ABORT: strategy=abort_check triggered — {:.2}s lost in main movie (threshold: {}s)",
                         main_lost_ms_for_history / MILLIS_PER_SEC,
-                        cfg_read.abort_on_lost_secs
+                        effective_abort
                     ),
                 );
 
@@ -3432,18 +3439,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     &format!(
                         "STRATEGY_FAILURE: abort_check FAILED — data loss ({:.2}s) exceeds threshold ({}s)",
                         main_lost_ms_for_history / MILLIS_PER_SEC,
-                        cfg_read.abort_on_lost_secs
+                        effective_abort
                     ),
                 );
 
                 crate::log::device_log(
                     device,
-                    &if cfg_read.abort_on_lost_secs == 0 {
+                    &if output_is_iso_image(&cfg_read.output_format) {
+                        "RECOVERY_GUIDANCE: ISO output is a whole-disc image and requires 100% — abort_on_lost_secs does not apply (it is a MUXED-output setting, ignored for ISO). The loss is unrecoverable media: clean or replace the disc, or choose MKV output to tolerate non-title damage.".to_string()
+                    } else if effective_abort == 0 {
                         "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. To let a rip complete despite some loss, RAISE abort_on_lost_secs to the number of seconds of main-movie loss you can tolerate (e.g. 5 or 30).".to_string()
                     } else {
                         format!(
                             "RECOVERY_GUIDANCE: abort_on_lost_secs={}s limit exceeded — raise abort_on_lost_secs further or accept the loss after disc recovery.",
-                            cfg_read.abort_on_lost_secs
+                            effective_abort
                         )
                     },
                 );
@@ -3451,9 +3460,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     s.status = "error".to_string();
                     if s.last_error.is_empty() {
                         s.last_error = format!(
-                            "aborted — {:.2}s lost in main movie (threshold: {}s)",
-                            main_lost_ms_for_history / MILLIS_PER_SEC,
-                            cfg_read.abort_on_lost_secs
+                            "aborted — {} lost in main movie ({})",
+                            fmt_loss(main_lost_ms_for_history),
+                            fmt_threshold(effective_abort)
                         );
                     }
                 });
@@ -3470,9 +3479,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 let terminal = staging::mark_aborted_on_loss(
                     staging_disc_path,
                     &format!(
-                        "aborted: {:.2}s lost in main movie exceeds threshold {}s",
-                        main_lost_ms_for_history / MILLIS_PER_SEC,
-                        cfg_read.abort_on_lost_secs
+                        "aborted: {} lost in main movie ({})",
+                        fmt_loss(main_lost_ms_for_history),
+                        fmt_threshold(effective_abort)
                     ),
                 );
                 if terminal {
@@ -3491,7 +3500,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     &format!(
                         "Main movie loss after retries: {:.2}s (threshold: {}s)",
                         main_lost_ms_for_history / MILLIS_PER_SEC,
-                        cfg_read.abort_on_lost_secs
+                        effective_abort
                     ),
                 );
             } else {
@@ -4959,6 +4968,47 @@ pub(crate) fn apply_post_mux_abort(
 /// (`rip_disc`'s inline terminal and `resume::resume_remux`) can't diverge.
 fn output_is_iso_image(output_format: &str) -> bool {
     output_format == "iso"
+}
+
+/// Effective main-movie-loss tolerance for the abort gate.
+///
+/// ISO output is a whole-disc image and must be byte-complete, so the
+/// `abort_on_lost_secs` per-title tolerance is **ignored** — forced to 0
+/// ("require 100%"). This makes the behaviour match the UI, where the field is
+/// hidden for ISO (`hideIf output_format=iso`) and documented as "IGNORED for an
+/// ISO rip, which is kept whole as-is". Without this an `abort_on_lost_secs`
+/// value configured for a previous MKV rip would silently leak into an ISO rip
+/// and accept a lossy image. MUXED output (MKV / M2TS / Network) uses the
+/// configured value unchanged.
+fn effective_abort_secs(output_format: &str, configured: u64) -> u64 {
+    if output_is_iso_image(output_format) {
+        0
+    } else {
+        configured
+    }
+}
+
+/// Human-readable main-movie loss for UI / markers. Sub-second loss shows
+/// milliseconds (so a 12 KB / ~1 ms gap reads as "1 ms", not a confusing
+/// "0.00s"); a second or more shows seconds. NaN (unquantifiable) is spelled out.
+fn fmt_loss(lost_ms: f64) -> String {
+    if !lost_ms.is_finite() {
+        "an unknown amount".to_string()
+    } else if lost_ms < crate::util::MILLIS_PER_SEC {
+        format!("{:.0} ms", lost_ms.max(0.0))
+    } else {
+        format!("{:.2}s", lost_ms / crate::util::MILLIS_PER_SEC)
+    }
+}
+
+/// Human-readable abort threshold: 0 means "perfect rip required" (any loss
+/// aborts), otherwise the configured seconds.
+fn fmt_threshold(secs: u64) -> String {
+    if secs == 0 {
+        "perfect rip required".to_string()
+    } else {
+        format!("threshold {secs}s")
+    }
 }
 
 /// Whether the intermediate ISO must be retained as the deliverable rather than
@@ -7984,6 +8034,49 @@ mod tests {
             }
             super::PostMuxVerdict::Proceed => panic!("NaN loss must fail safe to abort"),
         }
+    }
+
+    #[test]
+    fn effective_abort_secs_forces_iso_to_zero() {
+        use super::effective_abort_secs;
+        // ISO output is whole-disc and must be byte-complete: the per-title
+        // tolerance is IGNORED (forced to 0 = require 100%), no matter what was
+        // configured (e.g. left over from a prior MKV rip).
+        assert_eq!(effective_abort_secs("iso", 0), 0);
+        assert_eq!(
+            effective_abort_secs("iso", 30),
+            0,
+            "iso must ignore a stored MKV tolerance"
+        );
+        assert_eq!(effective_abort_secs("iso", 999), 0);
+        // Muxed outputs pass the configured value through unchanged.
+        assert_eq!(effective_abort_secs("mkv", 30), 30);
+        assert_eq!(effective_abort_secs("m2ts", 5), 5);
+        assert_eq!(effective_abort_secs("network", 0), 0);
+    }
+
+    #[test]
+    fn iso_aborts_on_any_loss_despite_configured_tolerance() {
+        use super::{effective_abort_secs, loss_aborts};
+        // Bug scenario: a 30s tolerance configured for MKV, then output switched
+        // to ISO. The raw config would WRONGLY tolerate a small whole-disc loss…
+        let configured = 30u64;
+        let lost_bytes = 2048; // one unreadable sector
+        let lost_ms = 100.0; // trivial duration — would pass a 30s threshold
+        assert!(
+            !loss_aborts(lost_bytes, lost_ms, configured),
+            "raw stored 30s threshold would tolerate the loss — the cosmetic-only bug"
+        );
+        // …but the EFFECTIVE iso threshold (0) aborts on any lost byte:
+        assert!(
+            loss_aborts(lost_bytes, lost_ms, effective_abort_secs("iso", configured)),
+            "iso must abort on ANY whole-disc loss regardless of stored tolerance"
+        );
+        // …while MKV keeps tolerating within its configured threshold:
+        assert!(
+            !loss_aborts(lost_bytes, lost_ms, effective_abort_secs("mkv", configured)),
+            "mkv still tolerates loss within its configured threshold"
+        );
     }
 
     #[test]
