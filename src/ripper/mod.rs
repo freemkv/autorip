@@ -2504,6 +2504,38 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // strategy identifier to the operator.
         let mut last_sweep_err: Option<libfreemkv::Error> = None;
 
+        // On-decrypt-miss key fetch. Online/sample-driven sources resolve only the
+        // CPS units sampled up front; when a read hits an orphan unit no held key
+        // opens, this asks the SAME key sources with that unit's ciphertext, caches
+        // the returned key, and retries — recovering an orphan CPS unit (e.g. a
+        // bonus clip not reachable from any playlist) instead of hard-failing the
+        // read. `None` for non-AACS discs. Built once, shared (cloned Arc) into the
+        // sweep and patch read paths; the mux reads main-title (already-resolved)
+        // extents only, so it doesn't need it.
+        let key_fetch: Option<libfreemkv::sector::KeyFetch> = disc.inputs().map(|mut inputs| {
+            // The live scan reads the MKB for the up-front resolve but does NOT
+            // retain it on the disc state, so `disc.inputs()` carries an EMPTY
+            // MKB. An online key service NEEDS the MKB to derive an orphan unit's
+            // key (decode rejects `mkb=0` with 404). Read it once here so every
+            // refetch request carries the full inf+MKB, exactly like the up-front
+            // resolve did. One drive read at rip start; `inf` filled too if absent.
+            if inputs.mkb.is_empty() {
+                if let Ok((inf, mkb)) =
+                    libfreemkv::Disc::read_aacs_inputs_from_drive(&mut session.drive)
+                {
+                    if inputs.unit_key_ro.is_empty() {
+                        inputs.unit_key_ro = inf;
+                    }
+                    inputs.mkb = mkb;
+                }
+            }
+            let cfg = Arc::clone(cfg);
+            let make: std::sync::Arc<
+                dyn Fn() -> Vec<Box<dyn libfreemkv::keysource::KeySource>> + Send + Sync,
+            > = std::sync::Arc::new(move || crate::keysource::build_sources(&cfg.read().unwrap()));
+            libfreemkv::keysource::key_fetch(inputs, make)
+        });
+
         'pass1: loop {
             attempt += 1;
             if attempt > MAX_PASS1_ATTEMPTS {
@@ -2541,6 +2573,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     .as_ref()
                     .map(|a| a.unit_keys.clone())
                     .unwrap_or_default(),
+                key_fetch: key_fetch.clone(),
             };
 
             match disc.sweep(&mut session.drive, iso_path, &sweep_opts) {
@@ -3102,6 +3135,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 wedged_threshold: 50,
                 progress: Some(&patch_progress),
                 halt: Some(pass_halt.clone()),
+                key_fetch: key_fetch.clone(),
             };
             let cr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {
                 Ok(r) => r,
@@ -3259,6 +3293,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // causing the abort check to see zero Unreadable bytes even after
         // promotion — MED logic bug fixed here).
         let mut main_lost_ms_for_history = 0.0f64;
+        let mut main_lost_bytes_for_history = 0u64;
         if cfg_read.max_retries > 0 {
             let mapfile_path = std::path::Path::new(&mapfile_path_str);
             if let Ok(mut map) = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path) {
@@ -3325,6 +3360,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                             &bad_ranges,
                             title_bytes_per_sec,
                         );
+                        // Raw byte count under the SAME scope — the perfect-rip
+                        // (threshold 0) gate keys on this, not the bitrate-derived
+                        // ms, so a zero/low bitrate can't hide unreadable loss.
+                        main_lost_bytes_for_history = abort_lost_bytes(
+                            cfg_read.output_format == "iso",
+                            &title_for_progress,
+                            &bad_ranges,
+                        );
                         // Mirror into the outer binding so the final done/stopped
                         // state update (after run_mux) can use the same in-title
                         // value without re-reading the mapfile.
@@ -3370,8 +3413,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 }
             }
 
-            let abort_threshold_ms = (cfg_read.abort_on_lost_secs * 1000) as f64;
-            if should_abort_for_loss(main_lost_ms_for_history, abort_threshold_ms) {
+            if loss_aborts(
+                main_lost_bytes_for_history,
+                main_lost_ms_for_history,
+                cfg_read.abort_on_lost_secs,
+            ) {
                 crate::log::device_log(
                     device,
                     &format!(
@@ -3411,13 +3457,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         );
                     }
                 });
-                // Write the terminal `.failed` marker so restart logic sees an
-                // explicit failure for this disc instead of treating the
-                // abandoned staging as an in-progress rip and looping until
-                // RESTART_LIMIT ("restart loop detected"). Mirrors the
-                // mux-finalize-failure path's marker write.
+                // Record the abort as a RESUMABLE `.aborted-loss` (not a
+                // terminal `.failed`): the full ISO + mapfile are on disk, so a
+                // raised `abort_on_lost_secs`, a fresh patch pass, or a code
+                // change may bring the loss under threshold on a later attempt.
+                // `mark_aborted_on_loss` bounds the retries — once
+                // MAX_LOSS_RESUME_ATTEMPTS aborts have accrued it promotes the
+                // dir to terminal `.failed` for the operator. It also clears
+                // `.restart_count` so a deterministically-lossy rip doesn't ALSO
+                // walk the crash-restart loop.
                 let staging_disc_path = std::path::Path::new(&staging);
-                staging::write_failed_marker(
+                let terminal = staging::mark_aborted_on_loss(
                     staging_disc_path,
                     &format!(
                         "aborted: {:.2}s lost in main movie exceeds threshold {}s",
@@ -3425,7 +3475,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         cfg_read.abort_on_lost_secs
                     ),
                 );
-                staging::clear_restart_count(staging_disc_path);
+                if terminal {
+                    crate::log::device_log(
+                        device,
+                        "Abort-on-loss retry budget exhausted — quarantining (.failed).",
+                    );
+                }
                 unregister_halt(device);
                 return; // Skip mux entirely
             }
@@ -3937,6 +3992,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             format,
             Some(halt_token.clone()),
             Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
+            // Fresh-key-on-failure fetch: not yet wired for autorip. Wiring it
+            // needs the keyserver config (cfg.keyserver_url/secret) and the ISO's
+            // inf/MKB threaded to this mux site; build the factory exactly like
+            // `freemkv::pipe::build_iso_fetch_factory` and pass it here.
+            None,
         ) {
             Ok(s) => Box::new(s),
             Err(e) => {
@@ -4129,6 +4189,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // below replaces `final_lost_secs` with the sweep-mapfile loss for the UI
     // card, so the post-mux gate can still gate fresh multi-pass rips on it.
     let demux_lost_secs = mux_outcome.lost_video_secs;
+    // Raw lost bytes (read-error zero-fill + decrypt-loss) — the perfect-rip
+    // (threshold 0) post-mux gate keys on this so undecryptable units can't
+    // round to ~0 seconds and pass.
+    let demux_lost_bytes = mux_outcome.lost_video_bytes;
     // In multipass mode the `input.errors` counter above counts ISO→MKV demux
     // skips (usually zero — ISO reads don't fail). The real bad-sector count
     // lives in the mapfile sidecar. Prefer that when present.
@@ -4188,8 +4252,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // block is skipped, so `demux_lost_secs == final_lost_secs` and behaviour
     // is unchanged. Both quantities are in-title-scoped (the mux only reads
     // the muxed title's sectors), matching the threshold's semantics.
-    if post_mux_loss_verdict(completed, demux_lost_secs, cfg_read.abort_on_lost_secs)
-        != PostMuxVerdict::Proceed
+    if post_mux_loss_verdict(
+        completed,
+        demux_lost_secs,
+        demux_lost_bytes,
+        cfg_read.abort_on_lost_secs,
+    ) != PostMuxVerdict::Proceed
     {
         crate::log::device_log(
             device,
@@ -4747,6 +4815,23 @@ fn mux_progress_denominator(
     }
 }
 
+/// The unreadable byte count that the abort gate scopes to: whole-disc for an
+/// ISO deliverable, in-title only for an MKV (a scratched menu/trailer outside
+/// the muxed title does not count for an MKV mux). This is the RAW source of
+/// truth the `abort_on_lost_secs == 0` ("perfect") gate keys on — no bitrate, no
+/// float — so a zero-bitrate title can never hide unreadable loss.
+pub(super) fn abort_lost_bytes(
+    output_is_iso: bool,
+    title: &libfreemkv::DiscTitle,
+    bad_ranges: &[(u64, u64)],
+) -> u64 {
+    if output_is_iso {
+        bad_ranges.iter().map(|(_, sz)| *sz).sum::<u64>()
+    } else {
+        libfreemkv::disc::bytes_bad_in_title(title, bad_ranges)
+    }
+}
+
 pub(super) fn abort_lost_ms(
     output_is_iso: bool,
     title: &libfreemkv::DiscTitle,
@@ -4756,12 +4841,7 @@ pub(super) fn abort_lost_ms(
     if title_bytes_per_sec <= 0.0 {
         return 0.0;
     }
-    let lost_bytes = if output_is_iso {
-        bad_ranges.iter().map(|(_, sz)| *sz).sum::<u64>()
-    } else {
-        libfreemkv::disc::bytes_bad_in_title(title, bad_ranges)
-    };
-    lost_bytes as f64 / title_bytes_per_sec * MILLIS_PER_SEC
+    abort_lost_bytes(output_is_iso, title, bad_ranges) as f64 / title_bytes_per_sec * MILLIS_PER_SEC
 }
 
 /// Whether the post-retry abort check should fire.
@@ -4779,6 +4859,20 @@ pub(super) fn abort_lost_ms(
 /// pass as a silent success.
 fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
     lost_ms.is_nan() || lost_ms > abort_threshold_ms
+}
+
+/// The flawless-rip loss gate. `abort_on_lost_secs == 0` means ZERO — abort on
+/// ANY lost byte (unreadable OR undecryptable), keyed on the raw byte count so
+/// no bitrate/float rounding can let a sub-second or zero-bitrate loss slip
+/// through ("0 means ZERO, not <1s"). `> 0` keeps the time-based tolerance:
+/// abort only when the loss exceeds N seconds. A NaN `lost_ms` always aborts
+/// (fail-safe: an unquantifiable loss must never pass as success).
+fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
+    if abort_on_lost_secs == 0 {
+        lost_bytes > 0 || lost_ms.is_nan()
+    } else {
+        lost_ms.is_nan() || lost_ms > (abort_on_lost_secs as f64) * MILLIS_PER_SEC
+    }
 }
 
 /// Outcome of the post-mux loss gate, decoupled from the side effects
@@ -4807,37 +4901,48 @@ pub(crate) enum PostMuxVerdict {
 pub(crate) fn post_mux_loss_verdict(
     completed: bool,
     demux_lost_secs: f64,
+    demux_lost_bytes: u64,
     abort_on_lost_secs: u64,
 ) -> PostMuxVerdict {
     if !completed {
         return PostMuxVerdict::Proceed;
     }
-    let abort_threshold_ms = (abort_on_lost_secs * 1000) as f64;
-    if should_abort_for_loss(demux_lost_secs * MILLIS_PER_SEC, abort_threshold_ms) {
+    // `demux_lost_bytes` carries BOTH read-error zero-fill and decrypt-loss
+    // (DiscStream/PipelinedStream `lost_bytes()` sum the two). At threshold 0
+    // any nonzero byte aborts — this is what catches undecryptable units that
+    // the bitrate-derived seconds value could round to ~0.
+    if loss_aborts(
+        demux_lost_bytes,
+        demux_lost_secs * MILLIS_PER_SEC,
+        abort_on_lost_secs,
+    ) {
         PostMuxVerdict::Abort { demux_lost_secs }
     } else {
         PostMuxVerdict::Proceed
     }
 }
 
-/// Apply the staging-side effects of a post-mux abort: quarantine the disc
-/// dir with `.failed` (so the mover never files it and resume treats it as
-/// terminal) and clear the restart counter. No `.done`/`.completed` is
-/// written. Factored out so both gate call sites stay in lock-step and the
-/// effect is testable against a `TempDir`.
+/// Apply the staging-side effects of a post-mux abort-on-loss: record a
+/// RESUMABLE `.aborted-loss` for the disc dir (so the mover never files it and
+/// resume re-checks it against the current threshold) and clear the restart
+/// counter. No `.done`/`.completed` is written. Bounded by
+/// `MAX_LOSS_RESUME_ATTEMPTS`: once the abort budget is exhausted
+/// `mark_aborted_on_loss` promotes the dir to terminal `.failed`. Factored out
+/// so both post-mux gate call sites (fresh single-pass + resume) stay in
+/// lock-step and the effect is testable against a `TempDir`. Returns `true`
+/// when the dir was promoted to terminal `.failed`.
 pub(crate) fn apply_post_mux_abort(
     staging_disc_path: &std::path::Path,
     demux_lost_secs: f64,
     abort_on_lost_secs: u64,
-) {
-    staging::write_failed_marker(
+) -> bool {
+    staging::mark_aborted_on_loss(
         staging_disc_path,
         &format!(
             "aborted: {:.2}s lost at mux exceeds threshold {}s",
             demux_lost_secs, abort_on_lost_secs
         ),
-    );
-    staging::clear_restart_count(staging_disc_path);
+    )
 }
 
 /// Whether the rip's deliverable is the whole-disc ISO itself rather than a
@@ -7810,20 +7915,22 @@ mod tests {
     fn post_mux_verdict_aborts_above_threshold_and_proceeds_at_or_below() {
         // threshold 30s: 45s loss aborts, 10s proceeds, exactly-30s proceeds
         // (gate is strictly `>`).
+        // For a >0 (seconds) threshold the verdict is seconds-driven; the byte
+        // count is not consulted, so pass a representative nonzero value.
         assert_eq!(
-            super::post_mux_loss_verdict(true, 45.0, 30),
+            super::post_mux_loss_verdict(true, 45.0, 1_000_000, 30),
             super::PostMuxVerdict::Abort {
                 demux_lost_secs: 45.0
             },
             "45s demux loss over a 30s threshold must abort"
         );
         assert_eq!(
-            super::post_mux_loss_verdict(true, 10.0, 30),
+            super::post_mux_loss_verdict(true, 10.0, 1_000_000, 30),
             super::PostMuxVerdict::Proceed,
             "10s demux loss under a 30s threshold must proceed"
         );
         assert_eq!(
-            super::post_mux_loss_verdict(true, 30.0, 30),
+            super::post_mux_loss_verdict(true, 30.0, 1_000_000, 30),
             super::PostMuxVerdict::Proceed,
             "exactly-at-threshold must proceed (strictly greater-than aborts)"
         );
@@ -7831,19 +7938,29 @@ mod tests {
 
     #[test]
     fn post_mux_verdict_perfect_required_aborts_any_loss_but_accepts_zero() {
-        // abort_on_lost_secs = 0 means "require a perfect rip": ANY nonzero
-        // in-title demux loss aborts, exactly-zero proceeds.
+        // abort_on_lost_secs = 0 means ZERO: the gate is BYTE-driven (not the
+        // bitrate-derived seconds), so ANY nonzero lost byte aborts and exactly
+        // zero bytes proceeds — even a sub-second loss can't round to 0 and pass.
         assert_eq!(
-            super::post_mux_loss_verdict(true, 0.0, 0),
+            super::post_mux_loss_verdict(true, 0.0, 0, 0),
             super::PostMuxVerdict::Proceed,
-            "zero loss under a perfect-required threshold must proceed"
+            "zero bytes lost under a perfect-required threshold must proceed"
         );
         assert_eq!(
-            super::post_mux_loss_verdict(true, 0.001, 0),
+            super::post_mux_loss_verdict(true, 0.001, 2048, 0),
             super::PostMuxVerdict::Abort {
                 demux_lost_secs: 0.001
             },
-            "any nonzero loss must abort when abort_on_lost_secs = 0"
+            "any nonzero lost byte must abort when abort_on_lost_secs = 0"
+        );
+        // The granularity guarantee: even if the seconds estimate rounds to ~0
+        // (tiny/zero bitrate), a single lost byte still aborts at threshold 0.
+        assert_eq!(
+            super::post_mux_loss_verdict(true, 0.0, 1, 0),
+            super::PostMuxVerdict::Abort {
+                demux_lost_secs: 0.0
+            },
+            "one lost byte aborts at 0 even when the seconds estimate is 0"
         );
     }
 
@@ -7852,7 +7969,7 @@ mod tests {
         // An incomplete mux is handled by the upstream read-error path, not
         // this gate — so even huge loss reports Proceed here.
         assert_eq!(
-            super::post_mux_loss_verdict(false, 9999.0, 0),
+            super::post_mux_loss_verdict(false, 9999.0, 9_999_999, 0),
             super::PostMuxVerdict::Proceed,
             "the post-mux gate must not fire when the mux did not complete"
         );
@@ -7861,7 +7978,7 @@ mod tests {
     #[test]
     fn post_mux_verdict_nan_loss_fails_safe_to_abort() {
         // An unquantifiable loss (NaN) must abort, never silently pass.
-        match super::post_mux_loss_verdict(true, f64::NAN, 30) {
+        match super::post_mux_loss_verdict(true, f64::NAN, 0, 30) {
             super::PostMuxVerdict::Abort { demux_lost_secs } => {
                 assert!(demux_lost_secs.is_nan())
             }
@@ -7870,21 +7987,66 @@ mod tests {
     }
 
     #[test]
-    fn apply_post_mux_abort_quarantines_with_failed_and_no_done_or_completed() {
-        // Drive the REAL staging side effect of an abort: a `.failed` marker
-        // appears (so the mover never files the dir and resume treats it as
-        // terminal), and crucially NO `.done`/`.completed` is written.
+    fn loss_aborts_zero_threshold_is_byte_exact() {
+        use super::loss_aborts;
+        // abort_on_lost_secs == 0 → ZERO: any lost byte aborts, regardless of
+        // the (bitrate-derived) seconds estimate; exactly zero bytes proceeds.
+        assert!(
+            loss_aborts(1, 0.0, 0),
+            "1 lost byte must abort at threshold 0"
+        );
+        assert!(
+            !loss_aborts(0, 12_345.0, 0),
+            "0 lost bytes proceeds at threshold 0 even if the seconds estimate is nonzero"
+        );
+        assert!(
+            loss_aborts(0, f64::NAN, 0),
+            "NaN loss fails safe to abort even at threshold 0"
+        );
+        // abort_on_lost_secs > 0 → seconds threshold (lost_ms is MILLISECONDS,
+        // threshold is seconds*1000); bytes are not consulted on this path.
+        assert!(
+            !loss_aborts(9_999_999, 999.0, 1),
+            "999ms under a 1000ms (1s) threshold proceeds (bytes ignored on the seconds path)"
+        );
+        assert!(
+            loss_aborts(0, 1001.0, 1),
+            "1001ms over a 1000ms (1s) threshold aborts"
+        );
+        assert!(
+            !loss_aborts(0, 1000.0, 1),
+            "exactly 1000ms at a 1s threshold proceeds (strictly greater-than aborts)"
+        );
+        assert!(
+            loss_aborts(0, f64::NAN, 30),
+            "NaN loss fails safe to abort on the seconds path too"
+        );
+    }
+
+    #[test]
+    fn apply_post_mux_abort_quarantines_with_aborted_loss_and_no_done_or_completed() {
+        // Drive the REAL staging side effect of a FIRST abort: a RESUMABLE
+        // `.aborted-loss` marker appears (NOT the terminal `.failed`, since the
+        // ISO is intact and the loss may clear on a later attempt), and
+        // crucially NO `.done`/`.completed` is written. It must report
+        // non-terminal.
         let tmp = tempfile::TempDir::new().unwrap();
         let disc = tmp.path().join("DISC_TITLE");
         std::fs::create_dir_all(&disc).unwrap();
 
-        super::apply_post_mux_abort(&disc, 45.0, 30);
+        let terminal = super::apply_post_mux_abort(&disc, 45.0, 30);
+        assert!(!terminal, "a first abort-on-loss must be resumable, not terminal");
 
-        let reason =
-            staging::read_failed_reason(&disc).expect(".failed marker must exist after abort");
+        let (reason, attempt) = staging::read_aborted_loss(&disc)
+            .expect(".aborted-loss marker must exist after a first abort");
+        assert_eq!(attempt, 1, "first abort records attempt 1");
         assert!(
             reason.contains("45.00s lost at mux exceeds threshold 30s"),
-            "failed reason must carry the loss/threshold, got: {reason}"
+            "aborted-loss reason must carry the loss/threshold, got: {reason}"
+        );
+        assert!(
+            !disc.join(staging::FAILED_MARKER).exists(),
+            "a first abort-on-loss must NOT write the terminal .failed"
         );
         assert!(
             !disc.join(staging::COMPLETED_MARKER).exists(),
@@ -7934,7 +8096,7 @@ mod tests {
         // 10s loss, 30s threshold -> Proceed; production would not call the
         // applier.
         assert_eq!(
-            super::post_mux_loss_verdict(true, 10.0, 30),
+            super::post_mux_loss_verdict(true, 10.0, 1_000_000, 30),
             super::PostMuxVerdict::Proceed
         );
 

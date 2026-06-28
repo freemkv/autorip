@@ -648,7 +648,7 @@ mod tests {
     /// Cross-side agreement: autorip's sample selector (`read_encrypted_units`)
     /// hands the key service only units the service's own gate accepts —
     /// because both sides call the SAME predicate,
-    /// `libfreemkv::aacs::is_aacs_scrambled`.
+    /// `libfreemkv::aacs::ts_sync_destroyed`.
     #[test]
     fn sample_units_are_all_aacs_scrambled() {
         use std::io::Write;
@@ -682,7 +682,7 @@ mod tests {
         for u in &units {
             assert_eq!(u.len(), 6144);
             assert!(
-                libfreemkv::aacs::is_aacs_scrambled(u),
+                libfreemkv::aacs::ts_sync_destroyed(u),
                 "selector must only emit units the key service accepts"
             );
         }
@@ -694,7 +694,7 @@ mod tests {
             clear[off] = 0x47;
             off += 192;
         }
-        assert!(!libfreemkv::aacs::is_aacs_scrambled(&clear));
+        assert!(!libfreemkv::aacs::ts_sync_destroyed(&clear));
     }
 
     /// autorip's keydb *writes* and the startup *existence check* must land on
