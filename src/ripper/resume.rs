@@ -131,15 +131,27 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
         // not claim it — the live worker owns the transition. Treat as
         // NotEligible so this path leaves it alone.
         ResumeAction::InProgress => return ResumeClass::NotEligible,
-        ResumeAction::ResumePreserved { .. } => {}
+        // Both ResumePreserved and ResumeAbortedLoss carry an intact ISO +
+        // mapfile and must be re-checked for `Remux` eligibility against the
+        // CURRENT `abort_on_lost_secs`. A `.aborted-loss` dir whose threshold
+        // was since raised (or whose mapfile is now clean) becomes eligible and
+        // auto-completes WITHOUT needing the disc; one still over threshold
+        // falls through to NotEligible (the bounded retry counter, advanced at
+        // the abort write site, eventually promotes it to terminal `.failed`).
+        ResumeAction::ResumePreserved { .. } | ResumeAction::ResumeAbortedLoss { .. } => {}
     }
-    let ResumeAction::ResumePreserved {
-        has_iso,
-        has_mapfile,
-        ..
-    } = &hint.action
-    else {
-        return ResumeClass::NotEligible;
+    let (has_iso, has_mapfile) = match &hint.action {
+        ResumeAction::ResumePreserved {
+            has_iso,
+            has_mapfile,
+            ..
+        }
+        | ResumeAction::ResumeAbortedLoss {
+            has_iso,
+            has_mapfile,
+            ..
+        } => (*has_iso, *has_mapfile),
+        _ => return ResumeClass::NotEligible,
     };
     if !has_iso || !has_mapfile {
         return ResumeClass::NotEligible;
@@ -1029,6 +1041,11 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         format,
         Some(halt_token.clone()),
         Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
+        // Fresh-key-on-failure fetch: not yet wired for autorip resume (same
+        // follow-up as the multipass mux — thread the keyserver config + ISO
+        // inf/MKB here, building the factory like
+        // `freemkv::pipe::build_iso_fetch_factory`).
+        None,
     ) {
         Ok(s) => Box::new(s),
         Err(e) => {
@@ -1333,8 +1350,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // Delegate the decision to the shared post-mux gate so resume and the
     // fresh-rip path (mod.rs) cannot diverge on what counts as over-threshold.
     let demux_lost_secs = mux_outcome.lost_video_secs;
-    if super::post_mux_loss_verdict(true, demux_lost_secs, cfg_read.abort_on_lost_secs)
-        != super::PostMuxVerdict::Proceed
+    let demux_lost_bytes = mux_outcome.lost_video_bytes;
+    if super::post_mux_loss_verdict(
+        true,
+        demux_lost_secs,
+        demux_lost_bytes,
+        cfg_read.abort_on_lost_secs,
+    ) != super::PostMuxVerdict::Proceed
     {
         crate::log::device_log(
             device,
@@ -2332,33 +2354,40 @@ mod post_mux_loss_gate_tests {
         // Same verdict as single-pass: over abort_on_lost_secs=0 (perfect
         // required), any demux loss aborts; exactly-zero proceeds.
         assert_eq!(
-            post_mux_loss_verdict(true, 12.5, 0),
+            post_mux_loss_verdict(true, 12.5, 2048, 0),
             PostMuxVerdict::Abort {
                 demux_lost_secs: 12.5
             },
-            "resume must abort a 12.5s demux loss under a perfect-required threshold"
+            "resume must abort any lost byte under a perfect-required threshold"
         );
         assert_eq!(
-            post_mux_loss_verdict(true, 0.0, 0),
+            post_mux_loss_verdict(true, 0.0, 0, 0),
             PostMuxVerdict::Proceed,
             "resume must accept a zero-loss mux under a perfect-required threshold"
         );
 
-        // The quarantine effect resume applies on abort: `.failed` written,
-        // no `.completed`/`.done`, restart count cleared — identical to the
-        // single-pass gate because it is the same function.
+        // The quarantine effect resume applies on a FIRST abort: a RESUMABLE
+        // `.aborted-loss` written (NOT terminal `.failed`), no `.completed`/
+        // `.done`, restart count cleared — identical to the single-pass gate
+        // because it is the same function.
         let tmp = tempfile::TempDir::new().unwrap();
         let disc = tmp.path().join("DISC_TITLE");
         std::fs::create_dir_all(&disc).unwrap();
         staging::increment_restart_count(&disc).unwrap();
 
-        apply_post_mux_abort(&disc, 12.5, 0);
+        let terminal = apply_post_mux_abort(&disc, 12.5, 0);
+        assert!(!terminal, "a first resume abort-on-loss must be resumable");
 
-        let reason = staging::read_failed_reason(&disc)
-            .expect("resume abort must write a .failed marker (no .done)");
+        let (reason, attempt) = staging::read_aborted_loss(&disc)
+            .expect("resume abort must write a .aborted-loss marker (no .done)");
+        assert_eq!(attempt, 1, "first resume abort records attempt 1");
         assert!(
             reason.contains("12.50s lost at mux exceeds threshold 0s"),
-            "resume failed reason must carry loss/threshold, got: {reason}"
+            "resume aborted-loss reason must carry loss/threshold, got: {reason}"
+        );
+        assert!(
+            !disc.join(staging::FAILED_MARKER).exists(),
+            "a first resume abort must NOT write the terminal .failed"
         );
         assert!(
             !disc.join(staging::COMPLETED_MARKER).exists(),

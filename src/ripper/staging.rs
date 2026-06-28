@@ -34,6 +34,23 @@ pub const DONE_MARKER: &str = ".done";
 pub const REVIEW_MARKER: &str = ".review";
 pub const COMPLETED_MARKER: &str = ".completed";
 pub const FAILED_MARKER: &str = ".failed";
+/// Resumable-failure marker for an abort-on-loss outcome (main-movie /
+/// demux loss exceeded `abort_on_lost_secs` after retries). UNLIKE the
+/// terminal `.failed`, this dir is RECOVERABLE: the full ISO + mapfile are on
+/// disk, so a raised `abort_on_lost_secs`, a code change, or a fresh patch pass
+/// (drive reload) may bring the loss under threshold on a later attempt. The
+/// resume scan re-enters such a dir instead of quarantining it. Carries a JSON
+/// `{reason, attempt, timestamp}` body; `attempt` is the count of abort-on-loss
+/// outcomes so far. It is BOUNDED by [`MAX_LOSS_RESUME_ATTEMPTS`]: once the
+/// count reaches the limit and the rip is STILL over threshold, the dir is
+/// promoted to a terminal `.failed` for the operator so it can't retry forever.
+pub const ABORTED_LOSS_MARKER: &str = ".aborted-loss";
+/// Maximum number of abort-on-loss attempts before an [`ABORTED_LOSS_MARKER`]
+/// dir is promoted to a terminal `.failed`. Mirrors [`RESTART_LIMIT`]'s role for
+/// the crash-restart loop: a healthy disc that simply can't be read clean within
+/// the configured loss budget is retried a bounded number of times, then left
+/// for the operator instead of spinning.
+pub const MAX_LOSS_RESUME_ATTEMPTS: u64 = 3;
 /// Hand-off marker written by `rip_disc` and consumed by the mux worker.
 /// Kept here (duplicated from `crate::muxer::RIPPED_MARKER_NAME`) so the
 /// startup-scan vocabulary is self-contained; a `debug_assert` in the mux
@@ -262,6 +279,86 @@ pub fn read_failed_reason(staging_disc_dir: &Path) -> Option<String> {
     v.get("reason")?.as_str().map(|s| s.to_string())
 }
 
+/// Write (or rewrite) the `.aborted-loss` resumable-failure marker with a
+/// reason and the current attempt count. Like `write_failed_marker` this is
+/// the end-of-run state for this attempt, so it supersedes the in-progress
+/// `.sweeping`/`.muxing` markers (clear them). Best-effort.
+pub fn write_aborted_loss_marker(staging_disc_dir: &Path, reason: &str, attempt: u64) {
+    let p = staging_disc_dir.join(ABORTED_LOSS_MARKER);
+    let body = serde_json::json!({
+        "reason": reason,
+        "attempt": attempt,
+        "timestamp": crate::util::format_iso_datetime(),
+    });
+    let serialized =
+        serde_json::to_string_pretty(&body).expect("json! value is always serialisable");
+    if let Err(e) = write_marker_durable(&p, serialized.as_bytes()) {
+        tracing::warn!(path = %p.display(), error = %e, "failed to write .aborted-loss marker");
+    }
+    // The run that produced this loss has ended; release the in-progress
+    // ownership markers exactly as a terminal `.failed` would.
+    clear_sweeping_marker(staging_disc_dir);
+    clear_muxing_marker(staging_disc_dir);
+}
+
+/// Best-effort delete of the `.aborted-loss` marker. Used when the dir is
+/// promoted to a terminal `.failed` (attempts exhausted) so the two markers
+/// can't coexist.
+pub fn clear_aborted_loss_marker(staging_disc_dir: &Path) {
+    let p = staging_disc_dir.join(ABORTED_LOSS_MARKER);
+    let _ = std::fs::remove_file(&p);
+}
+
+/// Read the `.aborted-loss` marker's `(reason, attempt)`. Returns None if the
+/// marker is missing or unparseable; a present-but-attemptless body reads back
+/// as attempt 0 (the conservative "no prior attempts recorded" value).
+pub fn read_aborted_loss(staging_disc_dir: &Path) -> Option<(String, u64)> {
+    let p = staging_disc_dir.join(ABORTED_LOSS_MARKER);
+    let body = std::fs::read_to_string(&p).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let reason = v
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or("aborted on loss")
+        .to_string();
+    let attempt = v.get("attempt").and_then(|a| a.as_u64()).unwrap_or(0);
+    Some((reason, attempt))
+}
+
+/// Record an abort-on-loss outcome for `staging_disc_dir`, bounded by
+/// [`MAX_LOSS_RESUME_ATTEMPTS`]. Reads the prior attempt count from any existing
+/// `.aborted-loss` marker, increments it, and EITHER:
+///   * writes a fresh `.aborted-loss` (resumable) when still under the limit, OR
+///   * promotes the dir to a terminal `.failed` (and removes `.aborted-loss`)
+///     once the incremented count reaches the limit — the rip is STILL over
+///     threshold after the budgeted retries, so it's left for the operator.
+///
+/// Clears `.restart_count` either way (a deterministically-lossy rip must not
+/// ALSO accrue crash-restart counts). Returns `true` when the dir became
+/// terminal `.failed`, `false` when it stays resumable. This is the single
+/// helper every abort-on-loss site calls so they can't diverge on the
+/// resumable-vs-terminal decision.
+pub fn mark_aborted_on_loss(staging_disc_dir: &Path, reason: &str) -> bool {
+    let prior = read_aborted_loss(staging_disc_dir)
+        .map(|(_, a)| a)
+        .unwrap_or(0);
+    let attempt = prior.saturating_add(1);
+    clear_restart_count(staging_disc_dir);
+    if attempt >= MAX_LOSS_RESUME_ATTEMPTS {
+        let terminal_reason = format!(
+            "{reason}; exhausted {MAX_LOSS_RESUME_ATTEMPTS} abort-on-loss resume attempts"
+        );
+        // write_failed_marker clears .sweeping/.muxing; also drop the
+        // now-superseded .aborted-loss so the two markers can't coexist.
+        write_failed_marker(staging_disc_dir, &terminal_reason);
+        clear_aborted_loss_marker(staging_disc_dir);
+        true
+    } else {
+        write_aborted_loss_marker(staging_disc_dir, reason, attempt);
+        false
+    }
+}
+
 /// Write the `.sweeping` in-progress marker durably. Called at staging-dir
 /// creation in `rip_disc`, before Pass 1. Carries a JSON `started` epoch-secs
 /// timestamp (the heartbeat) so a future stale-sweep policy can distinguish a
@@ -401,6 +498,15 @@ pub struct StagingSnapshot {
     /// reason when the body is JSON (None otherwise).
     pub has_failed: bool,
     pub failed_reason: Option<String>,
+    /// `.aborted-loss` resumable-failure marker present — the rip aborted
+    /// because main-movie / demux loss exceeded `abort_on_lost_secs`, but the
+    /// ISO + mapfile are intact so it's RECOVERABLE (raised threshold, fresh
+    /// patch, code change). Distinct from terminal `.failed`: the resume scan
+    /// re-enters such a dir up to `MAX_LOSS_RESUME_ATTEMPTS` times. `attempt`
+    /// carries the abort count parsed from the marker (0 if unparseable).
+    pub has_aborted_loss: bool,
+    pub aborted_loss_reason: Option<String>,
+    pub aborted_loss_attempt: u64,
     /// `.done` hand-off marker present. A completed mux writes `.done`
     /// (for the mover) before `.completed` (the process-level marker)
     /// and before the ISO prune. A crash in that window leaves `.done`
@@ -474,6 +580,7 @@ struct ScanObservations {
     has_muxing: bool,
     has_completed: bool,
     has_failed: bool,
+    has_aborted_loss: bool,
     has_iso: bool,
     has_mapfile: bool,
     has_mkv: bool,
@@ -496,6 +603,7 @@ impl ScanObservations {
             && !self.has_muxing
             && !self.has_completed
             && !self.has_failed
+            && !self.has_aborted_loss
             && !self.has_iso
             && !self.has_mapfile
             && !self.has_mkv
@@ -583,6 +691,8 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
                     obs.has_completed = true;
                 } else if name == FAILED_MARKER {
                     obs.has_failed = true;
+                } else if name == ABORTED_LOSS_MARKER {
+                    obs.has_aborted_loss = true;
                 } else if name.ends_with(".iso") {
                     obs.has_iso = true;
                 } else if name.ends_with(".mapfile") {
@@ -634,12 +744,25 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
     } else {
         None
     };
+    // Same consistency rule as `.failed`: only read the marker body when the
+    // primed scan actually saw it.
+    let (aborted_loss_reason, aborted_loss_attempt) = if obs.has_aborted_loss {
+        match read_aborted_loss(dir) {
+            Some((reason, attempt)) => (Some(reason), attempt),
+            None => (None, 0),
+        }
+    } else {
+        (None, 0)
+    };
 
     Some(StagingSnapshot {
         dir: dir.to_path_buf(),
         completed: obs.has_completed,
         has_failed: obs.has_failed,
         failed_reason,
+        has_aborted_loss: obs.has_aborted_loss,
+        aborted_loss_reason,
+        aborted_loss_attempt,
         has_done: obs.has_done,
         has_review: obs.has_review,
         has_ripped: obs.has_ripped,
@@ -723,6 +846,59 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
                 dir: snap.dir,
                 action: ResumeAction::AlreadyFailed { reason },
             });
+            continue;
+        }
+        // `.aborted-loss` — a RESUMABLE failure (loss exceeded threshold) with
+        // the full ISO + mapfile intact. Checked AFTER terminal `.failed` (so a
+        // dir promoted to `.failed` stays terminal) and BEFORE the partial-state
+        // branch. Below the attempt limit it re-enters via `ResumeAbortedLoss`
+        // (the classifier re-checks loss against the CURRENT threshold); at or
+        // above the limit it is promoted to terminal `.failed` here as a
+        // belt-and-suspenders backstop to the write-site promotion in
+        // `mark_aborted_on_loss`, so a marker that somehow persists at the limit
+        // can't be retried forever.
+        if snap.has_aborted_loss {
+            let reason = snap
+                .aborted_loss_reason
+                .clone()
+                .unwrap_or_else(|| "aborted: loss exceeded threshold".to_string());
+            if snap.aborted_loss_attempt >= MAX_LOSS_RESUME_ATTEMPTS {
+                let terminal_reason = format!(
+                    "{reason}; exhausted {MAX_LOSS_RESUME_ATTEMPTS} abort-on-loss resume attempts"
+                );
+                tracing::error!(
+                    path = %path.display(),
+                    attempt = snap.aborted_loss_attempt,
+                    limit = MAX_LOSS_RESUME_ATTEMPTS,
+                    "staging entry exceeded abort-on-loss resume limit — promoting .aborted-loss to terminal .failed"
+                );
+                write_failed_marker(&path, &terminal_reason);
+                clear_aborted_loss_marker(&path);
+                hints.push(StagingResumeHint {
+                    dir: snap.dir,
+                    action: ResumeAction::AlreadyFailed {
+                        reason: terminal_reason,
+                    },
+                });
+            } else {
+                tracing::info!(
+                    path = %path.display(),
+                    attempt = snap.aborted_loss_attempt,
+                    limit = MAX_LOSS_RESUME_ATTEMPTS,
+                    reason = %reason,
+                    "staging entry has .aborted-loss under the attempt limit — resumable, re-checking against current threshold"
+                );
+                hints.push(StagingResumeHint {
+                    dir: snap.dir,
+                    action: ResumeAction::ResumeAbortedLoss {
+                        attempt: snap.aborted_loss_attempt,
+                        reason,
+                        has_iso: snap.has_iso,
+                        has_mapfile: snap.has_mapfile,
+                        has_mkv: snap.has_mkv,
+                    },
+                });
+            }
             continue;
         }
         // `.done` carve-out — checked BEFORE the partial-state branch.
@@ -950,6 +1126,20 @@ pub enum ResumeAction {
     },
     ResumePreserved {
         attempt: u64,
+        has_iso: bool,
+        has_mapfile: bool,
+        has_mkv: bool,
+    },
+    /// Dir carries a `.aborted-loss` marker (rip aborted because loss exceeded
+    /// `abort_on_lost_secs`) and is still under `MAX_LOSS_RESUME_ATTEMPTS`, so
+    /// it's RESUMABLE: re-check it against the CURRENT threshold (which may have
+    /// been raised) and/or re-attempt recovery. `attempt` is the abort count so
+    /// far; the classifier routes this through the same eligibility check as
+    /// `ResumePreserved`. Once the count reaches the limit the resume scan
+    /// promotes the dir to terminal `.failed` and emits `AlreadyFailed` instead.
+    ResumeAbortedLoss {
+        attempt: u64,
+        reason: String,
         has_iso: bool,
         has_mapfile: bool,
         has_mkv: bool,
@@ -1338,6 +1528,146 @@ mod tests {
         assert!(disc.join("foo.iso").exists());
     }
 
+    /// Abort-on-loss bounding (unit): `mark_aborted_on_loss` records resumable
+    /// `.aborted-loss` for the first `MAX_LOSS_RESUME_ATTEMPTS - 1` calls, then
+    /// promotes to terminal `.failed` once the count reaches the limit. The
+    /// counter is read back from the marker each call, so it survives across
+    /// process restarts (it lives on disk, not in memory).
+    #[test]
+    fn mark_aborted_on_loss_is_bounded_then_terminal() {
+        let disc = tmpdir();
+        fs::write(disc.join("foo.iso"), b"x").unwrap();
+
+        // Attempts 1..MAX are resumable: .aborted-loss present, no .failed.
+        for expected in 1..MAX_LOSS_RESUME_ATTEMPTS {
+            let terminal = mark_aborted_on_loss(&disc, "loss exceeds threshold");
+            assert!(
+                !terminal,
+                "attempt {expected} (< limit {MAX_LOSS_RESUME_ATTEMPTS}) must stay resumable"
+            );
+            let (_, attempt) = read_aborted_loss(&disc).expect(".aborted-loss must exist");
+            assert_eq!(attempt, expected, "attempt count must advance on disk");
+            assert!(!disc.join(FAILED_MARKER).exists());
+        }
+
+        // The MAX-th abort promotes to terminal .failed and removes .aborted-loss.
+        let terminal = mark_aborted_on_loss(&disc, "loss exceeds threshold");
+        assert!(terminal, "the {MAX_LOSS_RESUME_ATTEMPTS}th abort must be terminal");
+        assert!(disc.join(FAILED_MARKER).exists(), "terminal .failed must be written");
+        assert!(
+            !disc.join(ABORTED_LOSS_MARKER).exists(),
+            ".aborted-loss must be removed when promoted to terminal"
+        );
+        let reason = read_failed_reason(&disc).expect(".failed reason must parse");
+        assert!(
+            reason.contains("exhausted") && reason.contains("loss exceeds threshold"),
+            "terminal reason must carry both the original cause and the exhaustion note, got: {reason}"
+        );
+    }
+
+    /// (a) A `.aborted-loss` marker BELOW the attempt limit is RESUMABLE: the
+    /// scan emits `ResumeAbortedLoss` (not `AlreadyFailed`), leaves the ISO +
+    /// marker intact, and does NOT write `.failed`.
+    #[test]
+    fn aborted_loss_below_limit_is_resumable() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("foo.iso"), b"x").unwrap();
+        fs::write(disc.join("foo.iso.mapfile"), b"x").unwrap();
+        // First abort → attempt 1 (< MAX_LOSS_RESUME_ATTEMPTS).
+        write_aborted_loss_marker(&disc, "12.50s lost exceeds 0s", 1);
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        match &hints[0].action {
+            ResumeAction::ResumeAbortedLoss {
+                attempt,
+                has_iso,
+                has_mapfile,
+                ..
+            } => {
+                assert_eq!(*attempt, 1);
+                assert!(*has_iso && *has_mapfile, "ISO + mapfile must be reported intact");
+            }
+            other => panic!("expected ResumeAbortedLoss, got {other:?}"),
+        }
+        assert!(disc.join("foo.iso").exists());
+        assert!(disc.join(ABORTED_LOSS_MARKER).exists(), "marker left intact for retry");
+        assert!(!disc.join(FAILED_MARKER).exists(), "below limit must NOT be terminal");
+    }
+
+    /// (b) A `.aborted-loss` marker AT/ABOVE the attempt limit is TERMINAL: the
+    /// scan promotes it to `.failed`, removes `.aborted-loss`, and emits
+    /// `AlreadyFailed` (backstop to the write-site promotion).
+    #[test]
+    fn aborted_loss_at_limit_is_promoted_to_terminal() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("foo.iso"), b"x").unwrap();
+        write_aborted_loss_marker(&disc, "12.50s lost exceeds 0s", MAX_LOSS_RESUME_ATTEMPTS);
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        match &hints[0].action {
+            ResumeAction::AlreadyFailed { reason } => {
+                assert!(reason.contains("exhausted"), "got: {reason}");
+            }
+            other => panic!("expected AlreadyFailed, got {other:?}"),
+        }
+        assert!(disc.join(FAILED_MARKER).exists(), "must be promoted to terminal .failed");
+        assert!(
+            !disc.join(ABORTED_LOSS_MARKER).exists(),
+            ".aborted-loss must be cleared on terminal promotion"
+        );
+    }
+
+    /// (c) A real terminal `.failed` (operator cancel / durability failure)
+    /// stays terminal — unaffected by the abort-loss path. (Mirrors
+    /// `resume_preserves_failed_dirs` but pinned alongside the new variants so a
+    /// future change to the abort-loss branch can't silently reroute it.)
+    #[test]
+    fn real_failed_stays_terminal_alongside_abort_loss() {
+        let root = tmpdir();
+        let disc = root.join("MyDisc");
+        fs::create_dir_all(&disc).unwrap();
+        fs::write(disc.join("foo.iso"), b"x").unwrap();
+        write_failed_marker(&disc, "cancelled by operator");
+
+        let hints = resume_or_quarantine_staging(root.to_str().unwrap());
+        assert_eq!(hints.len(), 1);
+        assert!(
+            matches!(hints[0].action, ResumeAction::AlreadyFailed { .. }),
+            "a real .failed must stay terminal, got {:?}",
+            hints[0].action
+        );
+    }
+
+    /// (d) A finished rip (`.done`/`.completed`) is unaffected by the new
+    /// abort-loss branch — still classified `AlreadyCompleted`.
+    #[test]
+    fn done_and_completed_unaffected_by_abort_loss_branch() {
+        // .completed → AlreadyCompleted.
+        let root1 = tmpdir();
+        let d1 = root1.join("DiscA");
+        fs::create_dir_all(&d1).unwrap();
+        write_marker_durable(&d1.join(COMPLETED_MARKER), b"{}").unwrap();
+        let h1 = resume_or_quarantine_staging(root1.to_str().unwrap());
+        assert_eq!(h1.len(), 1);
+        assert!(matches!(h1[0].action, ResumeAction::AlreadyCompleted), "got {:?}", h1[0].action);
+
+        // .done (+ leftover ISO) → AlreadyCompleted (finished, awaiting mover).
+        let root2 = tmpdir();
+        let d2 = root2.join("DiscB");
+        fs::create_dir_all(&d2).unwrap();
+        fs::write(d2.join("foo.iso"), b"x").unwrap();
+        write_marker_durable(&d2.join(DONE_MARKER), b"{}").unwrap();
+        let h2 = resume_or_quarantine_staging(root2.to_str().unwrap());
+        assert_eq!(h2.len(), 1);
+        assert!(matches!(h2[0].action, ResumeAction::AlreadyCompleted), "got {:?}", h2[0].action);
+    }
+
     /// R3 finding 2 regression: a `.sweeping` dir from a NON-watchdog hard crash
     /// (OOM-kill / SIGKILL / panic=abort) lands with `.restart_count == 0`
     /// because nothing ran to bump it. The InProgress carve-out must STILL
@@ -1548,6 +1878,8 @@ mod tests {
         Failed,
         RestartLoopFailed,
         ResumePreserved,
+        /// Dir carries a resumable `.aborted-loss` below the attempt limit.
+        ResumeAbortedLoss,
         /// Dir is owned/in progress (`.sweeping`/`.muxing`) — left alone, not
         /// restart-counted.
         InProgress,
@@ -1600,6 +1932,7 @@ mod tests {
             ResumeAction::AlreadyFailed { .. } => Verdict::Failed,
             ResumeAction::RestartLoopFailed { .. } => Verdict::RestartLoopFailed,
             ResumeAction::ResumePreserved { .. } => Verdict::ResumePreserved,
+            ResumeAction::ResumeAbortedLoss { .. } => Verdict::ResumeAbortedLoss,
             ResumeAction::InProgress => Verdict::InProgress,
         }
     }
