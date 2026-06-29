@@ -12,6 +12,13 @@ mod verify;
 mod web;
 mod webhook;
 
+/// Full build label: package version + git short hash (e.g. `1.1.1 (g2014a41)`),
+/// the same shape libfreemkv stamps into every MKV. Surfaced in `--version`,
+/// the UI footer, `/api/version`, and the startup log so the running build is
+/// always identifiable — a hand-deployed test build no longer hides behind a
+/// bare package version. Built by `build.rs`.
+pub const VERSION_LABEL: &str = concat!(env!("AUTORIP_VERSION"), env!("GIT_SUFFIX"));
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[global_allocator]
@@ -31,7 +38,7 @@ fn main() {
             std::process::exit(run_healthcheck());
         }
         Some("--version") | Some("-V") => {
-            println!("autorip {}", env!("CARGO_PKG_VERSION"));
+            println!("autorip {}", VERSION_LABEL);
             std::process::exit(0);
         }
         Some("--help") | Some("-h") => {
@@ -43,7 +50,7 @@ fn main() {
                    autorip --bootstrap      Initialize container env (NFS mount), then run the daemon\n  \
                    autorip --healthcheck    Probe http://127.0.0.1:$PORT/api/state (exit 0/1)\n  \
                    autorip --version        Print version and exit",
-                env!("CARGO_PKG_VERSION")
+                VERSION_LABEL
             );
             std::process::exit(0);
         }
@@ -129,10 +136,10 @@ fn main() {
 
     log::syslog(&format!(
         "autorip starting (v{}, edition 2024)",
-        env!("CARGO_PKG_VERSION")
+        VERSION_LABEL
     ));
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = VERSION_LABEL,
         target = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         "autorip starting"

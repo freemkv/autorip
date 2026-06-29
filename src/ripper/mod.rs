@@ -3024,8 +3024,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         crate::log::device_log(
             device,
             &format!(
-                "PASS 2-{}: retry loop starting max_retries={} bytes_pending={} bytes_unreadable={}",
-                max_retries, max_retries, bytes_pending, bytes_unreadable
+                "PASS 2-{}: retry loop starting max_retries={} bytes_pending={}",
+                max_retries, max_retries, bytes_pending
             ),
         );
         let mut pass_2_settled = false;
@@ -3106,6 +3106,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
             let pass = retry_n + 1;
 
+            // Flip the UI to the new pass BEFORE the settle, so the tile shows
+            // "pass N · retrying · 0%" immediately instead of carrying the prior
+            // pass's stale 99% through the 30 s drive settle below.
+            set_pass_progress(
+                &pass_ctx,
+                pass,
+                total_passes,
+                bytes_good,
+                bytes_pending,    // MAYBE bucket — Pass 2-N may still recover
+                bytes_unreadable, // LOST bucket — terminal
+            );
+
             // Settle the drive between Pass 1 and Pass 2 only. The BU40N
             // (and other Initio-bridge drives) wedge after grinding on bad
             // sectors. Giving the drive 30 s of idle BEFORE we hammer it
@@ -3124,18 +3136,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             crate::log::device_log(
                 device,
                 &format!(
-                    "PASS {}/{total_passes}: retrying bad ranges (bpt=1) bytes_pending={} bytes_unreadable={}",
-                    pass, bytes_pending, bytes_unreadable
+                    "PASS {}/{total_passes}: retrying bad ranges (bpt=1) bytes_pending={}",
+                    pass, bytes_pending
                 ),
-            );
-
-            set_pass_progress(
-                &pass_ctx,
-                pass,
-                total_passes,
-                bytes_good,
-                bytes_pending,    // MAYBE bucket — Pass 2-N may still recover
-                bytes_unreadable, // LOST bucket — terminal
             );
 
             // Per-pass progress + watcher.

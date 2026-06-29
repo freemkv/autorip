@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.1.1] — UNRELEASED
+
+### Added
+
+- **Version now carries the build's git short hash** — `--version`, the UI
+  footer, `/api/version`, and the startup log report e.g. `1.1.1 (g2014a41)`
+  (the same shape libfreemkv stamps into MKVs), so a running build — including a
+  hand-deployed test build — is always identifiable instead of hiding behind a
+  bare package version.
+
+### Fixed
+
+- **A blocked mux now shows the real reason.** When the mux worker aborts (e.g.
+  main-movie loss exceeds the threshold), the System tab showed only "mux worker
+  dispatch did not complete (see _mux device log)". It now surfaces the actual
+  reason from the staging marker (e.g. "0.86s lost at mux exceeds threshold 0s")
+  so the operator doesn't have to read device logs — and can Accept the damage
+  to deliver as-is.
+
+- **The dashboard is no longer cached across releases.** The single-page UI
+  (HTML + inline JS) was served with no `Cache-Control`, so browsers kept
+  running the *old* page — old client-side validation, old error handling, old
+  everything — after a new autorip version deployed. It's now served `no-store`,
+  so a release takes effect on the next page load instead of requiring a manual
+  hard-refresh.
+- **Retry passes no longer show the previous pass's progress.** When pass 1
+  ended and a retry pass began, the per-pass bar stayed frozen at "pass 1/N ·
+  99% · ETA 0s" through the 30 s drive-settle (until the first retry read). The
+  new pass now flips to "pass N · retrying · 0%" immediately, before the settle.
+  The cumulative total bar is unaffected.
+- **Quieter retry-pass logs.** Dropped `bytes_unreadable=…` from the per-pass
+  log lines — it is always `0` until the final pass promotes pending sectors, so
+  it was pure noise mid-rip.
+
 ## [1.1.0]
 
 Inherits libfreemkv 1.1.0, including the **post-read decrypt-verify gate**

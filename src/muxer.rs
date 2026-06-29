@@ -492,10 +492,22 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             }
         } else {
             let path_str = dir.to_string_lossy().to_string();
+            // Surface the ACTUAL reason the mux was blocked (e.g. "0.86s lost at
+            // mux exceeds threshold 0s") from the staging marker the mux worker
+            // wrote, instead of a generic "see the device log" — the operator
+            // should not have to read device logs to learn why. A loss-abort
+            // also leaves a resumable `.aborted-loss`, so the UI can offer
+            // Accept-damage off that reason.
+            let reason = crate::ripper::staging::read_aborted_loss(&dir)
+                .map(|(r, _)| r)
+                .or_else(|| crate::ripper::staging::read_failed_reason(&dir))
+                .unwrap_or_else(|| {
+                    "mux worker dispatch did not complete (see _mux device log)".to_string()
+                });
             record_error(
                 &path_str,
-                "mux worker dispatch did not complete (see _mux device log)",
-                "check `/api/state` _mux device or the device log for the underlying error; staging is preserved for retry",
+                &reason,
+                "staging is preserved — raise the loss threshold or Accept the damage to deliver as-is",
             );
         }
     }
