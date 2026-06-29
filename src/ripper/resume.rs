@@ -1356,78 +1356,16 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         return;
     }
 
-    // Post-mux loss abort gate — mirror the fresh single-pass gate
-    // (mod.rs, "Single-pass abort gate"). The PRE-mux gate above
-    // (resume.rs §3) only sees mapfile `Unreadable` sectors. It cannot
-    // see demux-time loss: sectors that read into the ISO fine but fail
-    // AACS/CSS decrypt at mux time, or codec-level corruption that forces
-    // the demuxer to skip — both zero-fill and surface only as
-    // `mux_outcome.lost_video_secs`. Without this gate a resumed rip would
-    // auto-file (`.done`) a disc whose identical loss the fresh single-pass
-    // path quarantines (`.failed`) under `abort_on_lost_secs=0`. The two
-    // paths must reach the same verdict.
-    //
-    // `lost_video_secs` from `run_mux` is the live demux-skip estimate
-    // (bytes skipped / title_bytes_per_sec), already in-title-scoped — the
-    // same quantity and semantics the single-pass gate compares.
-    // Delegate the decision to the shared post-mux gate so resume and the
-    // fresh-rip path (mod.rs) cannot diverge on what counts as over-threshold.
+    // v1.2.0: the mux never aborts on mux-time (demux/decrypt) loss — it is
+    // concealed in the read path and dropped-to-keyframe at the codec layer,
+    // yielding a decode-clean file. `lost_video_secs` from `run_mux` (bytes
+    // skipped / title_bytes_per_sec, in-title-scoped) is still reported below
+    // for the operator, but it never quarantines the resumed disc; the
+    // abort_on_lost_secs knob governs the PRE-mux rip phase only (resume.rs §3).
     let demux_lost_secs = mux_outcome.lost_video_secs;
-    let demux_lost_bytes = mux_outcome.lost_video_bytes;
-    if super::post_mux_loss_verdict(
-        true,
-        demux_lost_secs,
-        demux_lost_bytes,
-        if accept_loss {
-            u64::MAX
-        } else {
-            cfg_read.abort_on_lost_secs
-        },
-    ) != super::PostMuxVerdict::Proceed
-    {
-        crate::log::device_log(
-            device,
-            &format!(
-                "Auto-resume aborted: {:.2}s lost at mux (demux/decrypt skips) exceeds threshold {}s",
-                demux_lost_secs, cfg_read.abort_on_lost_secs
-            ),
-        );
-        // Quarantine the lossy output: write `.failed` (no `.done`/
-        // `.completed`) so the mover never files it and the resume detector
-        // treats the dir as terminal-failed — exactly as the single-pass
-        // gate does. Clear the restart count so a benign restart doesn't
-        // re-attempt a deterministically-lossy mux.
-        super::apply_post_mux_abort(&staging_dir, demux_lost_secs, cfg_read.abort_on_lost_secs);
-        // Remove the `.ripped` hand-off marker: this job is now terminal-failed,
-        // so the mux worker must not re-dispatch it. The worker also treats
-        // `.failed` as terminal (muxer.rs), but deleting `.ripped` here removes
-        // the re-queue source outright — belt and suspenders against the
-        // re-mux-forever loop.
-        if let Err(e) = crate::muxer::delete_marker(&staging_dir) {
-            tracing::warn!(
-                staging = %staging_dir.display(),
-                error = %e,
-                "failed to delete .ripped marker after abort-on-lost-secs; .failed guard prevents re-mux"
-            );
-        }
-        reset_status_after_ripping(
-            device,
-            "error",
-            &display_name,
-            &disc_format,
-            &duration,
-            Some(format!(
-                "aborted: {:.2}s lost at mux exceeds threshold {}s",
-                demux_lost_secs, cfg_read.abort_on_lost_secs
-            )),
-        );
-        return;
-    }
 
-    // Operator-facing loss for an ACCEPTED resume = sweep loss + demux loss.
-    // The abort gate above only refuses a resume whose demux loss EXCEEDS the
-    // threshold; a resume accepted under a non-zero `abort_on_lost_secs` can
-    // still carry real demux-time loss (undecryptable sectors zero-filled,
+    // Operator-facing loss for a resume = sweep loss + demux loss. A resume can
+    // carry real demux-time loss (undecryptable sectors zero-filled,
     // codec-corruption demux skips) that the sweep mapfile never saw. Reporting
     // `done_sweep_damage` alone would file such a disc as clean/low-loss even
     // though the MKV is materially lossier — the same demux loss the fresh
@@ -2368,106 +2306,27 @@ mod resume_handoff_contract_tests {
 
 #[cfg(test)]
 mod post_mux_loss_gate_tests {
-    /// Regression: `resume_remux` must enforce the SAME post-mux loss
-    /// abort gate the fresh single-pass path does. The PRE-mux gate only
-    /// counts mapfile `Unreadable` sectors; demux-time loss (AACS/CSS
-    /// decrypt failures during ISO mux, codec-corruption demux skips) is
-    /// invisible there and surfaces only as `mux_outcome.lost_video_secs`.
-    /// Without a post-mux check, a resumed rip auto-files (`.done`) a disc
-    /// whose identical loss the single-pass path quarantines (`.failed`)
-    /// under `abort_on_lost_secs=0`.
-    ///
-    /// `resume_remux` and the fresh-rip `rip_disc` gate now delegate to the
-    /// SAME `super::post_mux_loss_verdict` / `super::apply_post_mux_abort`
-    /// functions (resume.rs "Post-mux loss abort gate" → mod.rs). Driving
-    /// those shared functions executing-style proves resume reaches the
-    /// identical verdict and quarantine the single-pass path does — without
-    /// needing a real lossy ISO + mux pipeline. (The remaining glue around
-    /// the gate — `.ripped` deletion, `reset_status_after_ripping` — is
-    /// exercised by the resume_handoff_contract_tests below; what THIS test
-    /// pins is the abort decision + staging effect that used to be verified
-    /// only by include_str! string-matching.)
-    #[test]
-    fn resume_enforces_post_mux_loss_gate() {
-        use crate::ripper::staging;
-        use crate::ripper::{PostMuxVerdict, apply_post_mux_abort, post_mux_loss_verdict};
-
-        // Same verdict as single-pass: over abort_on_lost_secs=0 (perfect
-        // required), any demux loss aborts; exactly-zero proceeds.
-        assert_eq!(
-            post_mux_loss_verdict(true, 12.5, 2048, 0),
-            PostMuxVerdict::Abort {
-                demux_lost_secs: 12.5
-            },
-            "resume must abort any lost byte under a perfect-required threshold"
-        );
-        assert_eq!(
-            post_mux_loss_verdict(true, 0.0, 0, 0),
-            PostMuxVerdict::Proceed,
-            "resume must accept a zero-loss mux under a perfect-required threshold"
-        );
-
-        // The quarantine effect resume applies on a FIRST abort: a RESUMABLE
-        // `.aborted-loss` written (NOT terminal `.failed`), no `.completed`/
-        // `.done`, restart count cleared — identical to the single-pass gate
-        // because it is the same function.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let disc = tmp.path().join("DISC_TITLE");
-        std::fs::create_dir_all(&disc).unwrap();
-        staging::increment_restart_count(&disc).unwrap();
-
-        let terminal = apply_post_mux_abort(&disc, 12.5, 0);
-        assert!(!terminal, "a first resume abort-on-loss must be resumable");
-
-        let (reason, attempt) = staging::read_aborted_loss(&disc)
-            .expect("resume abort must write a .aborted-loss marker (no .done)");
-        assert_eq!(attempt, 1, "first resume abort records attempt 1");
-        assert!(
-            reason.contains("12.50s lost at mux exceeds threshold 0s"),
-            "resume aborted-loss reason must carry loss/threshold, got: {reason}"
-        );
-        assert!(
-            !disc.join(staging::FAILED_MARKER).exists(),
-            "a first resume abort must NOT write the terminal .failed"
-        );
-        assert!(
-            !disc.join(staging::COMPLETED_MARKER).exists(),
-            "resume abort must NOT write .completed"
-        );
-        assert!(
-            !disc.join(".done").exists(),
-            "resume abort must NOT write a .done hand-off marker"
-        );
-        assert_eq!(
-            staging::restart_count(&disc),
-            0,
-            "resume abort must clear the restart count"
-        );
-    }
-
-    /// Regression: an ACCEPTED resume (demux loss within `abort_on_lost_secs`)
-    /// must report sweep loss + demux loss to the operator, not the sweep
-    /// mapfile alone. The abort gate only refuses resumes whose demux loss
-    /// EXCEEDS the threshold; loss within the threshold is real loss in the
-    /// delivered MKV that the fresh single-pass path surfaces (mod.rs
+    /// Regression: a resume must report sweep loss + demux loss to the
+    /// operator, not the sweep mapfile alone. Since v1.2.0 the mux never aborts
+    /// on mux-time loss; whatever demux loss the concealed MKV carries is real
+    /// loss the fresh single-pass path also surfaces (mod.rs
     /// `final_lost_secs = mux_outcome.lost_video_secs`). Previously the resume
     /// done card and `rip_complete` webhook sourced `errors` /
     /// `lost_video_secs` solely from `done_sweep_damage`, so any demux-time
     /// loss (undecryptable sectors, codec corruption) was invisible and the
     /// disc was filed as clean.
     ///
-    /// A behavioural test would need a real lossy ISO + mux pipeline (same
-    /// rationale as the gate test above); instead this pins, at source level,
-    /// that the accepted-success region folds the demux loss into the
-    /// reported figures.
+    /// A behavioural test would need a real lossy ISO + mux pipeline; instead
+    /// this pins, at source level, that the success region folds the demux loss
+    /// into the reported figures.
     #[test]
     fn resume_reports_demux_loss_on_accepted_rip() {
         let src = include_str!("resume.rs");
         // Bound to the accepted-success region: from the post-mux abort gate's
         // combined-loss computation up to the auto-eject tail.
         let start = src
-            .find("Operator-facing loss for an ACCEPTED resume")
-            .expect("resume.rs should compute combined accepted-resume loss");
+            .find("Operator-facing loss for a resume")
+            .expect("resume.rs should compute combined resume loss");
         let end = src[start..]
             .find("Honor auto_eject after a successful resume")
             .map(|i| start + i)
