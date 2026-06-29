@@ -283,12 +283,6 @@ pub(crate) struct MuxOutcome {
     /// Estimated lost video seconds derived from `errors`. Same
     /// override pattern as `errors` when a mapfile is available.
     pub(crate) lost_video_secs: f64,
-    /// RAW lost bytes at mux time — read-error zero-fill PLUS decrypt-loss
-    /// (the stream's `lost_bytes()` sums both). This is the bitrate-free
-    /// source of truth the `abort_on_lost_secs == 0` ("perfect") post-mux
-    /// gate keys on, so undecryptable units can't round to ~0 seconds and
-    /// slip through. 0 on the early-return paths (no mux ran).
-    pub(crate) lost_video_bytes: u64,
     /// True iff the output stream was successfully opened (i.e. we got
     /// past header buffering and `libfreemkv::output(...)` returned
     /// Ok). The orchestrator gates history-record writing on this:
@@ -1046,7 +1040,6 @@ pub(crate) fn run_mux(
                 speed_mbs: 0.0,
                 errors: u32::try_from(input.errors()).unwrap_or(u32::MAX),
                 lost_video_secs: 0.0,
-                lost_video_bytes: 0,
                 output_opened: false,
                 finalize_error: None,
                 read_error: None,
@@ -1082,7 +1075,6 @@ pub(crate) fn run_mux(
                         speed_mbs: 0.0,
                         errors: u32::try_from(input.errors()).unwrap_or(u32::MAX),
                         lost_video_secs: 0.0,
-                        lost_video_bytes: 0,
                         output_opened: false,
                         finalize_error: Some(msg),
                         read_error: None,
@@ -1116,7 +1108,6 @@ pub(crate) fn run_mux(
             speed_mbs: 0.0,
             errors: u32::try_from(input.errors()).unwrap_or(u32::MAX),
             lost_video_secs: 0.0,
-            lost_video_bytes: 0,
             output_opened: false,
             finalize_error: Some(msg),
             read_error: None,
@@ -1168,7 +1159,6 @@ pub(crate) fn run_mux(
                 speed_mbs: 0.0,
                 errors: u32::try_from(input.errors()).unwrap_or(u32::MAX),
                 lost_video_secs: 0.0,
-                lost_video_bytes: 0,
                 output_opened: false,
                 finalize_error: None,
                 read_error: None,
@@ -1239,7 +1229,6 @@ pub(crate) fn run_mux(
                 speed_mbs: 0.0,
                 errors: u32::try_from(input.errors()).unwrap_or(u32::MAX),
                 lost_video_secs: 0.0,
-                lost_video_bytes: 0,
                 // The output IS open at this point — the pre-split
                 // behaviour didn't have this branch (no pipeline) so
                 // we treat it like a write error: history record
@@ -1505,7 +1494,6 @@ pub(crate) fn run_mux(
                 speed_mbs: 0.0,
                 errors: atomics_in.input_errors.load(Ordering::Relaxed),
                 lost_video_secs: 0.0,
-                lost_video_bytes: 0,
                 output_opened: true,
                 finalize_error: None,
                 read_error: None,
@@ -1839,9 +1827,6 @@ pub(crate) fn run_mux(
         speed_mbs,
         errors,
         lost_video_secs,
-        // Raw lost bytes (read-error zero-fill + decrypt-loss) for the perfect-rip
-        // post-mux gate — see `MuxOutcome::lost_video_bytes`.
-        lost_video_bytes: lost_bytes,
         output_opened: true,
         finalize_error,
         read_error: read_error_cause,
