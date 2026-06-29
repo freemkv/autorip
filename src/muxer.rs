@@ -245,7 +245,7 @@ pub(crate) enum MuxVerdict {
 /// Order matters and mirrors `check_and_mux`'s former inline guards:
 /// 1. `None` snapshot ⇒ `SkipUnknown` (don't dispatch on a degraded listing).
 /// 2. `.completed` OR `.failed` ⇒ `SkipTerminal` — terminal regardless of
-///    whether `.ripped` still lingers (the post-mux-abort `.ripped`+`.failed`
+///    whether `.ripped` still lingers (the terminal-mux-failure `.ripped`+`.failed`
 ///    re-mux loop, da16f00, lives or dies on this arm).
 /// 3. `.ripped` absent ⇒ `SkipNoMarker`.
 /// 4. otherwise ⇒ `Dispatch`.
@@ -492,12 +492,13 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             }
         } else {
             let path_str = dir.to_string_lossy().to_string();
-            // Surface the ACTUAL reason the mux was blocked (e.g. "0.86s lost at
-            // mux exceeds threshold 0s") from the staging marker the mux worker
-            // wrote, instead of a generic "see the device log" — the operator
-            // should not have to read device logs to learn why. A loss-abort
-            // also leaves a resumable `.aborted-loss`, so the UI can offer
-            // Accept-damage off that reason.
+            // Surface the ACTUAL reason the dir didn't advance (e.g. a
+            // rip-phase loss abort "0.86s lost in main movie exceeds threshold
+            // 0s", or a structural finalize failure) from the staging marker the
+            // mux worker wrote, instead of a generic "see the device log" — the
+            // operator should not have to read device logs to learn why. A
+            // rip-phase loss abort leaves a resumable `.aborted-loss`, so the UI
+            // can offer Accept-damage off that reason.
             let reason = crate::ripper::staging::read_aborted_loss(&dir)
                 .map(|(r, _)| r)
                 .or_else(|| crate::ripper::staging::read_failed_reason(&dir))
@@ -554,8 +555,8 @@ pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
         // when delete_marker fails post-mux (NFS, see resume.rs). The
         // `.completed` marker is the authoritative "done" signal — skip
         // the dir so a finished title doesn't report "(queued)" forever.
-        // `.failed` is equally terminal (post-mux abort): skip it too so an
-        // aborted title doesn't report "(queued)" indefinitely.
+        // `.failed` is equally terminal (a terminal mux failure): skip it too
+        // so a failed title doesn't report "(queued)" indefinitely.
         //
         // MUTUAL EXCLUSION (a job is in exactly ONE queue at a time): a
         // mux's success path writes the mover hand-off marker (`.done` /
@@ -762,11 +763,12 @@ mod tests {
         );
     }
 
-    // Regression (re-mux-forever loop): a post-mux abort writes `.failed`
-    // WITHOUT `.completed`, and `.ripped` is only deleted on success — so a
-    // `.ripped` + `.failed` dir must be recognised as TERMINAL by both the
-    // check_and_mux guard (via `failed_reason`) and pending_queue, or the
-    // worker re-dispatches it every tick forever (re-mux → re-abort → repeat).
+    // Regression (re-mux-forever loop): a terminal mux failure (e.g. a
+    // structural finalize error) writes `.failed` WITHOUT `.completed`, and
+    // `.ripped` is only deleted on success — so a `.ripped` + `.failed` dir
+    // must be recognised as TERMINAL by both the check_and_mux guard (via
+    // `failed_reason`) and pending_queue, or the worker re-dispatches it every
+    // tick forever (re-mux → re-fail → repeat).
     #[test]
     fn completion_guard_sees_failed_via_snapshot() {
         let tmp = TempDir::new().unwrap();
@@ -775,7 +777,7 @@ mod tests {
         write_marker(&movie, &sample_marker()).unwrap();
         crate::ripper::staging::write_failed_marker(
             &movie,
-            "aborted: demux loss exceeds threshold",
+            "mux finalize failed (unseekable output)",
         );
 
         let snap = crate::ripper::staging::snapshot_staging_disc(&movie)
@@ -946,7 +948,7 @@ mod tests {
         write_marker(&movie, &sample_marker()).unwrap();
         crate::ripper::staging::write_failed_marker(
             &movie,
-            "aborted: demux loss exceeds threshold",
+            "mux finalize failed (unseekable output)",
         );
 
         let q = pending_queue(tmp.path());
@@ -1190,7 +1192,7 @@ mod tests {
             (
                 &[Ripped, Failed],
                 MuxVerdict::SkipTerminal,
-                "THE BUG: post-mux abort wrote .failed but .ripped lingered — must be terminal, not re-dispatched forever",
+                "THE BUG: a terminal mux failure wrote .failed but .ripped lingered — must be terminal, not re-dispatched forever",
             ),
             (
                 &[Failed],
@@ -1315,7 +1317,7 @@ mod tests {
     }
 
     /// TRANSITION: ripped → loss-abort → failed → not re-dispatched.
-    /// Mirrors the resume loss-abort branch, which writes `.failed` (and
+    /// Mirrors a terminal mux failure branch, which writes `.failed` (and
     /// deletes `.ripped`). Even if `.ripped` survives, the verdict must be
     /// terminal — the re-mux-forever loop is impossible.
     #[test]
@@ -1328,8 +1330,11 @@ mod tests {
         let s1 = crate::ripper::staging::snapshot_staging_disc(&dir);
         assert_eq!(mux_dispatch_verdict(s1.as_ref()), MuxVerdict::Dispatch);
 
-        // Loss-abort quarantines the dir.
-        crate::ripper::staging::write_failed_marker(&dir, "aborted: demux loss exceeds threshold");
+        // A terminal mux failure quarantines the dir.
+        crate::ripper::staging::write_failed_marker(
+            &dir,
+            "mux finalize failed (unseekable output)",
+        );
 
         let s2 = crate::ripper::staging::snapshot_staging_disc(&dir);
         assert_eq!(

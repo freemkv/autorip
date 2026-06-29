@@ -2087,11 +2087,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // multi-pass pre-mux gate and `abort_lost_ms`). Single-pass mode streams
     // only the selected title's sectors straight to the muxer — it never reads
     // (let alone recovers) out-of-title sectors and produces no whole-disc ISO.
-    // So single-pass cannot honour ISO semantics: its post-mux gate would scope
-    // loss IN-TITLE, accepting a disc that the multi-pass / resume paths would
-    // ABORT on (whole-disc scope) under `abort_on_lost_secs=0` with damage
-    // outside the title — the verdict would diverge by rip mode for identical
-    // input. Refuse the incoherent combination up front and point the operator
+    // So single-pass cannot honour ISO semantics at all: there is no whole-disc
+    // image to hand the operator, and its rip-phase loss accounting is in-title
+    // only, so out-of-title damage that the multi-pass / resume ISO paths would
+    // capture (and gate on, whole-disc, under `abort_on_lost_secs=0`) is never
+    // seen. Refuse the incoherent combination up front and point the operator
     // at multi-pass (the only path that captures a real whole-disc ISO and
     // applies whole-disc loss accounting), mirroring the single-pass no-keys
     // guidance below.
@@ -4236,10 +4236,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Demux-time loss (sectors that read into the ISO fine but fail AACS/CSS
     // decrypt at mux, or codec-corruption demux skips that zero-fill output).
     // This is the in-title-scoped demux-skip estimate from `run_mux`, the same
-    // quantity the single-pass (mod.rs) and resume (resume.rs) post-mux gates
-    // compare against the threshold. Captured BEFORE the multipass overwrite
+    // quantity the single-pass (mod.rs) and resume (resume.rs) success paths
+    // fold into their reported figures. Captured BEFORE the multipass overwrite
     // below replaces `final_lost_secs` with the sweep-mapfile loss for the UI
-    // card, so the post-mux gate can still gate fresh multi-pass rips on it.
+    // card, so a fresh multi-pass rip can still report this demux loss. The mux
+    // never aborts on it — it is concealed and tallied only.
     let demux_lost_secs = mux_outcome.lost_video_secs;
     // In multipass mode the `input.errors` counter above counts ISO→MKV demux
     // skips (usually zero — ISO reads don't fail). The real bad-sector count
@@ -4485,10 +4486,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         return;
     }
 
-    // Operator-facing ACCEPTED-done figures fold in demux-time loss the same
-    // way the single-pass path (above) and the resume path (resume.rs) do, so a
-    // fresh multi-pass rip and a resume of the IDENTICAL ISO reach the same
-    // verdict whenever demux loss is non-zero but within `abort_on_lost_secs`.
+    // Operator-facing done figures fold in demux-time loss the same way the
+    // single-pass path (above) and the resume path (resume.rs) do, so a fresh
+    // multi-pass rip and a resume of the IDENTICAL ISO report the same loss
+    // figures whenever demux loss is non-zero. (The mux always proceeds; this is
+    // reporting only — demux-time loss never aborts the disc.)
     //
     // Single-pass (max_retries == 0): the 3812 overwrite block was skipped, so
     // `final_lost_secs == demux_lost_secs` and `final_errors == mux_outcome.errors`
@@ -4889,12 +4891,13 @@ fn retain_intermediate_iso(keep_iso: bool, output_format: &str) -> bool {
 /// accounting counts every unreadable sector, including damage OUTSIDE any
 /// title's extents (see `abort_lost_ms` and the multi-pass / resume pre-mux
 /// gates). Single-pass streams only the selected title to the muxer — it never
-/// reads out-of-title sectors and captures no whole-disc ISO, so its post-mux
-/// gate scopes loss in-title. Allowing single-pass ISO would therefore let it
-/// ACCEPT a disc that the multi-pass / resume paths ABORT on (whole-disc scope)
-/// for identical input under `abort_on_lost_secs=0` — the verdict would diverge
-/// by rip mode. Only multi-pass captures a real ISO and applies whole-disc
-/// scope, so ISO output requires it.
+/// reads out-of-title sectors and captures no whole-disc ISO, so there is no
+/// whole-disc image to deliver and its rip-phase loss accounting is in-title
+/// only. Allowing single-pass ISO would therefore hand over an incomplete image
+/// and silently miss out-of-title damage that the multi-pass / resume ISO paths
+/// capture and gate on (whole-disc scope) under `abort_on_lost_secs=0`. Only
+/// multi-pass captures a real ISO and applies whole-disc scope, so ISO output
+/// requires it.
 fn iso_output_needs_multipass(output_format: &str, max_retries: u8) -> bool {
     output_format == "iso" && max_retries == 0
 }
@@ -7051,13 +7054,13 @@ mod tests {
         assert!((extra - 0.0).abs() < 0.001, "no demux loss adds no extra");
     }
 
-    // ── single-pass (max_retries == 0) abort gate ───────────────────
+    // ── loss-threshold decision (should_abort_for_loss) ─────────────
 
-    /// Regression: in single-pass mode the abort_on_lost_secs check runs
-    /// AFTER the mux, gating on the demux skip count rather than a
-    /// mapfile. This pins the loss-from-skip-count → abort-decision
-    /// chain the post-mux single-pass gate relies on, mirroring the
-    /// in-production derivation:
+    /// Pins the loss-from-skip-count → threshold-decision math used by the
+    /// loss gate, exercising `should_abort_for_loss` over a skip-count
+    /// derived loss. (The function names below retain their "single-pass"
+    /// wording; note the mux itself never aborts on loss — these tests pin
+    /// the pure threshold helper, not a post-mux gate.) Derivation:
     ///   lost_secs = skip_sectors * 2048 / title_bytes_per_sec
     ///   abort     = should_abort_for_loss(lost_secs * 1000, threshold_ms)
     fn single_pass_lost_secs(skip_sectors: u64, title_bytes_per_sec: f64) -> f64 {
@@ -7070,10 +7073,8 @@ mod tests {
 
     #[test]
     fn single_pass_any_loss_aborts_at_threshold_zero() {
-        // abort_on_lost_secs=0 ("require a perfect rip") must abort a
-        // single-pass rip that skipped ANY sectors — the divergence this
-        // fix closes (previously single-pass silently delivered a lossy
-        // MKV at threshold 0).
+        // abort_on_lost_secs=0 ("require a perfect rip"): the threshold
+        // helper must report "abort" for ANY positive skip-derived loss.
         let bps = 8_250_000.0;
         let threshold_ms = 0.0; // abort_on_lost_secs = 0
         let lost = single_pass_lost_secs(10, bps); // 10 skipped sectors

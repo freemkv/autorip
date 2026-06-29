@@ -1447,9 +1447,10 @@ pub(crate) fn run_mux(
                         tracing::trace!(target: "stream", "Producer: EOF reached, returning");
                         // FINAL FLUSH: store the complete decrypt/read loss before
                         // exiting. The per-frame stores above can miss units dropped
-                        // on the last frame(s); the post-mux gate reads this atomic
-                        // after the producer joins, so it must reflect ALL loss
-                        // (otherwise abort_on_lost_secs=0 can pass a lossy MKV).
+                        // on the last frame(s); the orchestrator reads this atomic
+                        // after the producer joins to tally and report ALL mux-time
+                        // loss, so it must reflect the full count (the mux never
+                        // aborts on this loss — it is concealed + reported only).
                         input_lost_bytes_for_thread
                             .store(local_input.lost_bytes(), Ordering::Relaxed);
                         return;
@@ -1469,7 +1470,7 @@ pub(crate) fn run_mux(
                 }
             }
             // FINAL FLUSH on the read-error (break) path too — same reason as the
-            // EOF path: the post-mux gate must see the complete loss tally.
+            // EOF path: the reported loss tally must be complete.
             input_lost_bytes_for_thread.store(local_input.lost_bytes(), Ordering::Relaxed);
         }) {
         Ok(h) => h,
@@ -1669,9 +1670,9 @@ pub(crate) fn run_mux(
     };
     // Scale by the bytes actually skipped, not the skip-event count: an
     // AACS skip event zero-fills a whole 6144-byte unit, so
-    // `errors * 2048` understates loss ~3x. This `lost_video_secs` feeds
-    // the single-pass abort gate (max_retries==0), which would otherwise
-    // accept a lossy rip that exceeded abort_on_lost_secs.
+    // `errors * 2048` understates loss ~3x. This `lost_video_secs` is
+    // tallied and reported (folded into the done-card figures) — the mux
+    // always proceeds; mux-time loss is concealed, never aborts the disc.
     let lost_bytes = input_lost_bytes.load(Ordering::Relaxed);
     let lost_video_secs = if inputs.title_bytes_per_sec > 0.0 {
         lost_bytes as f64 / inputs.title_bytes_per_sec

@@ -1011,7 +1011,7 @@ function renderSettings(s){
       {key:'network_target',label:'Network Target',type:'text',hint:'host:port for network output (e.g. nas.example.com:9000)',indent:true,placeholder:'nas.example.com:9000',showIf:{key:'output_format',value:'network'}},
       {key:'main_feature',label:'Main Feature Only',type:'bool',hint:'',indent:true,hideIf:{key:'output_format',value:'iso'}},
       {key:'min_length_secs',label:'Minimum Title Length (seconds)',type:'number',hint:'Shorter titles are skipped (600 = 10 min)',indent:true,hideIf:{key:'output_format',value:'iso'}},
-      {key:'abort_on_lost_secs',label:'Max Acceptable Main Movie Loss',type:'number',hint:'Seconds of missing data tolerated in the MAIN FEATURE (the muxed title) after all retries. 0 = ZERO: abort on ANY lost byte — unreadable OR undecryptable — not just ≥1s. Scoped to the main movie only (a scratched menu/extra outside the title never aborts). Applies to title-selected output (MKV / M2TS / Network stream) — IGNORED for an ISO rip, which is kept whole as-is (for a byte-perfect full-disc image use the freemkv CLI). Multi-pass only.',indent:true,showIf:{key:'rip_mode',value:'multi'},hideIf:{key:'output_format',value:'iso'}},
+      {key:'abort_on_lost_secs',label:'Max Acceptable Main Movie Loss',type:'number',hint:'Governs the RIP phase only: seconds of UNREADABLE main-movie data tolerated after all retry passes. If unreadable-sector loss in the MAIN FEATURE still exceeds this once retries are exhausted, the rip aborts (leaving a resumable staging dir). 0 = require a perfect rip — abort on ANY unreadable byte, not just ≥1s. Scoped to the main movie only (a scratched menu/extra outside the title never aborts). Applies to title-selected output (MKV / M2TS / Network stream) — IGNORED for an ISO rip, which is kept whole as-is (for a byte-perfect full-disc image use the freemkv CLI). The mux itself never aborts: any undecryptable/demux-time loss is concealed and tallied, never quarantined. Multi-pass only.',indent:true,showIf:{key:'rip_mode',value:'multi'},hideIf:{key:'output_format',value:'iso'}},
     ]},
     {title:'Recovery',fields:[
       {key:'rip_mode',label:'Rip Mode',type:'radio',options:[{value:'single',label:'Single Pass'},{value:'multi',label:'Multi Pass'}],hint:'Single Pass: stream disc → MKV directly. Fastest, best for healthy discs. Multi Pass: rip an ISO, retry bad sectors with progressively smaller blocks, then mux to MKV. Use for discs with read errors.'},
@@ -2575,7 +2575,7 @@ mod web_tests {
         assert!(!in_both_queues(&mux, &mv));
     }
 
-    /// ABORT path: a post-mux loss abort writes `.failed` (no `.done`/
+    /// FAILURE path: a terminal mux failure writes `.failed` (no `.done`/
     /// `.completed`). The disc must leave BOTH queues, and the device tile
     /// reflects "error".
     #[test]
@@ -2591,15 +2591,18 @@ mod web_tests {
         let (mux, _, _, _) = build_queue_views(&staging);
         assert_eq!(mux.len(), 1);
 
-        // Abort gate quarantines: `.failed`, tile=error.
-        crate::ripper::staging::write_failed_marker(&disc, "aborted: loss exceeds threshold");
+        // A terminal mux failure quarantines: `.failed`, tile=error.
+        crate::ripper::staging::write_failed_marker(
+            &disc,
+            "mux finalize failed (unseekable output)",
+        );
         crate::ripper::update_state(
             device,
             crate::ripper::RipState {
                 device: device.to_string(),
                 status: "error".to_string(),
                 disc_name: "Lossy Disc".to_string(),
-                last_error: "aborted: loss exceeds threshold".to_string(),
+                last_error: "mux finalize failed (unseekable output)".to_string(),
                 ..Default::default()
             },
         );
