@@ -18,6 +18,12 @@ use std::sync::atomic::AtomicBool;
 
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Full build label (package version + git short hash, e.g. `1.1.1 (g2014a41)`).
+/// Mirrors the `main.rs` const for the same reason `SHUTDOWN` is duplicated:
+/// modules reference `crate::VERSION_LABEL`, so both crate roots must define it.
+/// Built by `build.rs`.
+pub const VERSION_LABEL: &str = concat!(env!("AUTORIP_VERSION"), env!("GIT_SUFFIX"));
+
 pub mod config;
 pub mod keysource;
 pub mod log;
