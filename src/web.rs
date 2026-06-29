@@ -1396,7 +1396,7 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         json_response(
             request,
             200,
-            &format!("{{\"version\":\"{}\"}}", env!("CARGO_PKG_VERSION")),
+            &format!("{{\"version\":\"{}\"}}", crate::VERSION_LABEL),
         );
     } else if is_get && url == "/api/settings" {
         let c = match cfg.read() {
@@ -1681,8 +1681,19 @@ fn handle_tmdb_search(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, ur
 fn serve_html(request: tiny_http::Request) {
     let header =
         Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
-    let html = DASHBOARD_HTML.replace("{VERSION}", env!("CARGO_PKG_VERSION"));
-    let response = Response::from_string(html).with_header(header);
+    let html = DASHBOARD_HTML.replace("{VERSION}", crate::VERSION_LABEL);
+    // The dashboard is a single self-contained page (HTML + inline CSS/JS), so
+    // it IS the app shell. Serve it non-cacheable: without this, browsers cache
+    // it heuristically and keep running the OLD UI + old client-side validation
+    // after a deploy ("caching isn't invalidated on release"). no-store forces a
+    // fresh fetch on every load, so a new autorip version takes effect at once.
+    let response = Response::from_string(html).with_header(header).with_header(
+        Header::from_bytes(
+            &b"Cache-Control"[..],
+            &b"no-store, no-cache, must-revalidate"[..],
+        )
+        .unwrap(),
+    );
     let _ = request.respond(response);
 }
 
@@ -3558,7 +3569,7 @@ mod web_tests {
             let (code, body) = roundtrip(&cfg, "GET", "/api/version", None, &[]);
             assert_eq!(code, 200);
             assert!(
-                body.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))),
+                body.contains(&format!("\"version\":\"{}\"", crate::VERSION_LABEL)),
                 "GET /api/version must serve the running version, got: {body}"
             );
         }

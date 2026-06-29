@@ -1165,13 +1165,13 @@ pub(super) fn set_pass_progress(
         0
     };
     // Use update_state_with instead of a full RipState replacement so that
-    // the pass-independent fields (pass_progress_pct, total_progress_*,
-    // errors, total_lost_ms, bad_ranges, etc.) are preserved across the
-    // pass boundary. A full RipState with ..Default::default() would zero
-    // those fields, causing the UI progress bars to visibly drop to 0 at
-    // the start of each new pass. Only the fields that reflect the new
-    // pass's initial state are updated here; push_pass_state callbacks
-    // will update progress / ETA once the pass is running.
+    // the CUMULATIVE fields (total_progress_*, errors, total_lost_ms,
+    // bad_ranges, etc.) survive the pass boundary — a full RipState with
+    // ..Default::default() would zero them, dropping the *total* bar to 0 at
+    // every pass. The PER-PASS bar (pass_progress_pct) + ETA/speed, by
+    // contrast, ARE reset below: they belong to a single pass, so carrying
+    // pass 1's 99% made pass 2 read "pass 1/7 · 99%" through the settle.
+    // push_pass_state callbacks refill them once the new pass is reading.
     update_state_with(&ctx.device, |s| {
         s.status = "ripping".to_string();
         s.disc_present = true;
@@ -1195,6 +1195,15 @@ pub(super) fn set_pass_progress(
         s.bytes_total_disc = ctx.bytes_total_disc;
         s.preferred_batch = ctx.batch;
         s.current_batch = ctx.batch;
+        // Reset the PER-PASS bar + its ETA/speed at the pass boundary so a new
+        // pass starts visibly at 0% rather than inheriting the prior pass's
+        // 99% (which made pass 2 read "pass 1/7 · 99% · ETA 0s" through the
+        // 30 s settle). The cumulative `total_progress_pct` is intentionally
+        // left untouched. push_pass_state refills these on its first tick.
+        s.pass_progress_pct = 0;
+        s.pass_eta = String::new();
+        s.eta = String::new();
+        s.speed_mbs = 0.0;
     });
 }
 
