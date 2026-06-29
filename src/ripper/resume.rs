@@ -2322,8 +2322,8 @@ mod post_mux_loss_gate_tests {
     #[test]
     fn resume_reports_demux_loss_on_accepted_rip() {
         let src = include_str!("resume.rs");
-        // Bound to the accepted-success region: from the post-mux abort gate's
-        // combined-loss computation up to the auto-eject tail.
+        // Bound to the accepted-success region: from the combined-loss
+        // (sweep + demux) computation up to the auto-eject tail.
         let start = src
             .find("Operator-facing loss for a resume")
             .expect("resume.rs should compute combined resume loss");
