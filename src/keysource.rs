@@ -14,7 +14,7 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use freemkv_keysources::{DiscInputs, KeySource, KeydbSource, OnlineSource};
+use freemkv_keysources::{KeySource, KeydbSource, OnlineSource};
 use libfreemkv::aacs::ResolutionTrace;
 use libfreemkv::keysource::resolve_and_apply_traced;
 use libfreemkv::read_encrypted_units;
@@ -284,11 +284,11 @@ pub fn uses_online(cfg: &Config) -> bool {
 /// from WHERE the disc lives — a live drive or a staged ISO — so the resolution
 /// logic is written once. See [`DriveAccess`] and [`IsoAccess`].
 pub trait DiscKeyAccess {
-    /// The disc's `Unit_Key_RO.inf` + `MKB` bytes.
-    fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)>;
-    /// The 16-byte AACS Volume ID, if available.
-    fn volume_id(&self) -> Option<[u8; 16]>;
-    /// Up to `n` encrypted aligned units sampled from the disc's content.
+    /// Up to `n` encrypted aligned units sampled from the disc's content — the
+    /// ONLY thing `resolve_keys` can't get from `disc.inputs()` (the scan does
+    /// not retain the reader). The AACS inputs (inf, MKB, VID, disc_hash,
+    /// version) all come from `disc.inputs()`, so this trait is now purely a
+    /// sample-the-ciphertext seam over "where the disc lives" (drive vs ISO).
     fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>>;
 }
 
@@ -307,31 +307,31 @@ pub fn resolve_keys<A: DiscKeyAccess>(
     access: &mut A,
     mut disc: libfreemkv::Disc,
 ) -> (libfreemkv::Disc, KeyOutcome) {
-    let Some((inf, mkb)) = access.key_files() else {
-        tracing::warn!(phase = "key_resolve", "could not read disc key files");
+    // ALL AACS inputs (inf, MKB, VID, disc_hash, version, volume_label) come
+    // from the keyless scan via `disc.inputs()` — the single source of truth.
+    // `access` is used ONLY to sample ciphertext, which the scan does not
+    // retain. (Before the libfreemkv MKB-read fix, `disc.inputs()` shipped an
+    // empty MKB, which is why this used to re-read inf+MKB out-of-band via
+    // `access.key_files()`; that whole duplicate read path is gone.)
+    let Some(mut inputs) = disc.inputs() else {
+        tracing::warn!(phase = "key_resolve", "disc carries no AACS inputs");
         return (disc, KeyOutcome::MissingInputs);
     };
-    let vid = access.volume_id().unwrap_or_else(|| {
+    if inputs.volume_id == [0u8; 16] {
         tracing::warn!(
             phase = "key_resolve",
-            "no Volume ID available; using all-zero VID — key derivation may fail"
+            "no Volume ID available; using all-zero VID — VID-keyed derivation may fail"
         );
-        [0u8; 16]
-    });
+    }
 
-    // Read content samples for ciphertext validation, UNCONDITIONALLY. The
-    // reshaped `KeySource` trait dropped `needs_samples()`, so we no longer gate
-    // the sample read on a source asking for it. Both remaining sources need
-    // samples anyway — the keydb can hand out a per-disc terminal unit key that
-    // `decrypt_with` applies as-is (a hash-matching but wrong UK is only
-    // disproved by descrambling real ciphertext), and the online service
-    // validates server-side — so this is conservative, not wasteful. Samples
-    // feed `decrypt_with`'s wrong-key rejection via `inputs.samples`; never skip
-    // (except when there is no source at all — e.g. an SSRF-blocked online URL
-    // dropped the only source — in which case the read off the live drive / ISO
-    // is pure wasted I/O: `resolve_and_apply_traced` over zero sources is NoKey
-    // regardless of samples).
-    let samples = if sources.is_empty() {
+    // Read content samples for ciphertext validation, UNCONDITIONALLY. Both
+    // remaining sources need them — the keydb can hand out a per-disc terminal
+    // unit key that `decrypt_with` applies as-is (a hash-matching but wrong UK
+    // is only disproved by descrambling real ciphertext), and the online service
+    // validates server-side. Skipped only when there is NO source at all (e.g.
+    // an SSRF-blocked online URL dropped the only source) — then the disc read
+    // is pure wasted I/O and resolution is `NoKey` regardless of samples.
+    inputs.samples = if sources.is_empty() {
         Vec::new()
     } else {
         match disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() {
@@ -344,24 +344,6 @@ pub fn resolve_keys<A: DiscKeyAccess>(
                 Vec::new()
             }
         }
-    };
-
-    let inputs = DiscInputs {
-        disc_hash: libfreemkv::aacs::disc_hash_hex(&libfreemkv::aacs::disc_hash(&inf)),
-        volume_id: vid,
-        mkb,
-        unit_key_ro: inf,
-        samples,
-        // The disc's own title (UDF/ISO volume id, else BDMV name) so the key
-        // service can catalog hash→title from our ripped discs.
-        volume_label: {
-            let v = disc.volume_id.trim();
-            if v.is_empty() {
-                disc.meta_title.clone()
-            } else {
-                Some(v.to_string())
-            }
-        },
     };
 
     // One ordered driver: each source's `get_uk` is tried in turn and the first
@@ -448,73 +430,33 @@ pub fn render_resolution_trace(trace: &ResolutionTrace) -> Vec<String> {
 /// from the structure scan (the drive read it during AACS auth).
 pub struct DriveAccess<'a> {
     drive: &'a mut libfreemkv::Drive,
-    vid: Option<[u8; 16]>,
 }
 
 impl<'a> DriveAccess<'a> {
-    pub fn new(drive: &'a mut libfreemkv::Drive, vid: Option<[u8; 16]>) -> Self {
-        Self { drive, vid }
+    pub fn new(drive: &'a mut libfreemkv::Drive) -> Self {
+        Self { drive }
     }
 }
 
 impl DiscKeyAccess for DriveAccess<'_> {
-    fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        match libfreemkv::Disc::read_aacs_inputs_from_drive(self.drive) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!(
-                    phase = "key_resolve",
-                    error = %e,
-                    "read_aacs_inputs_from_drive failed"
-                );
-                None
-            }
-        }
-    }
-    fn volume_id(&self) -> Option<[u8; 16]> {
-        self.vid
-    }
     fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>> {
         read_encrypted_units(self.drive, title, n)
     }
 }
 
-/// [`DiscKeyAccess`] backed by a staged ISO + its mapfile (the resume path).
-/// The Volume ID is recovered from the mapfile (the ISO doesn't carry it).
+/// [`DiscKeyAccess`] backed by a staged ISO (the resume path). Samples
+/// ciphertext from the ISO; all AACS inputs come from `disc.inputs()`.
 pub struct IsoAccess<'a> {
     iso_path: &'a Path,
-    mapfile_path: &'a Path,
 }
 
 impl<'a> IsoAccess<'a> {
-    pub fn new(iso_path: &'a Path, mapfile_path: &'a Path) -> Self {
-        Self {
-            iso_path,
-            mapfile_path,
-        }
+    pub fn new(iso_path: &'a Path) -> Self {
+        Self { iso_path }
     }
 }
 
 impl DiscKeyAccess for IsoAccess<'_> {
-    fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        match libfreemkv::Disc::read_aacs_inputs(self.iso_path) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!(
-                    phase = "key_resolve",
-                    path = %self.iso_path.display(),
-                    error = %e,
-                    "read_aacs_inputs failed"
-                );
-                None
-            }
-        }
-    }
-    fn volume_id(&self) -> Option<[u8; 16]> {
-        libfreemkv::disc::mapfile::Mapfile::load(self.mapfile_path)
-            .ok()
-            .and_then(|m| m.vid())
-    }
     fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>> {
         match libfreemkv::FileSectorSource::open(self.iso_path) {
             Ok(mut r) => read_encrypted_units(&mut r, title, n),
@@ -892,44 +834,57 @@ mod tests {
     /// `DiscKeyAccess` fixture whose `key_files()` returns the given option;
     /// `volume_id` is a fixed all-zero VID; `sample_units` yields nothing (none
     /// of the outcome tests use a sample-needing source).
-    struct FixtureAccess {
-        key_files: Option<(Vec<u8>, Vec<u8>)>,
-    }
+    struct FixtureAccess;
     impl DiscKeyAccess for FixtureAccess {
-        fn key_files(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-            self.key_files.clone()
-        }
-        fn volume_id(&self) -> Option<[u8; 16]> {
-            Some([0u8; 16])
-        }
         fn sample_units(&mut self, _t: &libfreemkv::DiscTitle, _n: usize) -> Vec<Vec<u8>> {
             Vec::new()
         }
     }
 
-    /// `key_files()` returning None → `MissingInputs`, regardless of what sources
-    /// are configured (we never even reach key resolution).
+    /// Like [`keyless_encrypted_disc`] but WITH AACS state, so `disc.inputs()`
+    /// returns `Some` and `resolve_keys` proceeds to the key sources (rather than
+    /// short-circuiting on `MissingInputs`). Minimal state — the outcome tests use
+    /// only no-key / erroring sources, so the AACS bytes themselves don't matter.
+    fn keyless_encrypted_disc_with_aacs() -> libfreemkv::Disc {
+        let mut disc = keyless_encrypted_disc();
+        disc.aacs = Some(libfreemkv::disc::AacsState {
+            version: libfreemkv::aacs::AACS_MAJOR_UHD,
+            bus_encryption: false,
+            mkb_version: None,
+            disc_hash: "0xabc".into(),
+            key_source: libfreemkv::disc::KeyOrigin::KeyDb,
+            vuk: None,
+            unit_keys: Vec::new(),
+            read_data_key: None,
+            volume_id: [0u8; 16],
+            uk_ro: Vec::new(),
+            mkb: Vec::new(),
+        });
+        disc
+    }
+
+    /// A disc with NO AACS state → `disc.inputs()` is `None` → `MissingInputs`,
+    /// regardless of what sources are configured (we never reach key resolution).
     #[test]
-    fn resolve_keys_reports_missing_inputs_when_key_files_unreadable() {
-        let mut access = FixtureAccess { key_files: None };
+    fn resolve_keys_reports_missing_inputs_when_disc_has_no_aacs() {
+        let mut access = FixtureAccess;
         let sources: Vec<Box<dyn KeySource>> = vec![Box::new(NoKeySource)];
         let (_disc, outcome) = resolve_keys(sources, &mut access, keyless_encrypted_disc());
         assert_eq!(
             outcome,
             KeyOutcome::MissingInputs,
-            "unreadable key files must report MissingInputs, not NoKey"
+            "no AACS inputs must report MissingInputs, not NoKey"
         );
     }
 
-    /// Key files present, sources exhausted with NO key and NO error →
+    /// AACS inputs present, sources exhausted with NO key and NO error →
     /// `NoKey` (a clean "no source has a key for this disc").
     #[test]
     fn resolve_keys_reports_no_key_when_sources_exhausted_clean() {
-        let mut access = FixtureAccess {
-            key_files: Some((b"inf".to_vec(), b"mkb".to_vec())),
-        };
+        let mut access = FixtureAccess;
         let sources: Vec<Box<dyn KeySource>> = vec![Box::new(NoKeySource)];
-        let (_disc, outcome) = resolve_keys(sources, &mut access, keyless_encrypted_disc());
+        let (_disc, outcome) =
+            resolve_keys(sources, &mut access, keyless_encrypted_disc_with_aacs());
         assert_eq!(outcome, KeyOutcome::NoKey);
     }
 
@@ -940,12 +895,11 @@ mod tests {
     /// finer-grained per-source walk is in the rendered ResolutionTrace).
     #[test]
     fn resolve_keys_reports_no_key_when_a_source_errors() {
-        let mut access = FixtureAccess {
-            key_files: Some((b"inf".to_vec(), b"mkb".to_vec())),
-        };
+        let mut access = FixtureAccess;
         let sources: Vec<Box<dyn KeySource>> =
             vec![Box::new(NoKeySource), Box::new(ErroringSource)];
-        let (_disc, outcome) = resolve_keys(sources, &mut access, keyless_encrypted_disc());
+        let (_disc, outcome) =
+            resolve_keys(sources, &mut access, keyless_encrypted_disc_with_aacs());
         assert_eq!(
             outcome,
             KeyOutcome::NoKey,
