@@ -128,7 +128,6 @@ tr:hover { background:var(--chip); }
   <div id="actions"></div>
   <div id="steps" style="margin-bottom:16px"></div>
   <div id="err"></div>
-  <div id="bad-ranges"></div>
   <details style="margin-top:16px"><summary style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;cursor:pointer;user-select:none">Log</summary>
   <div id="log" class="log" style="flex:1;max-height:none;margin-top:8px"></div></details>
 </div>
@@ -205,10 +204,6 @@ function ml(v,m){if(!v)return'';for(const[k,l]of m)if(v.includes(k))return l;ret
 const ACTIVE_STATES=['ripping','scanning','detecting','verifying'];
 let _lastStatus={};
 let _activeTab=null;
-/* Persisted across the ~1s data re-renders so the bad-range details stays
-   open if the user opened it (upd() swaps innerHTML, which would otherwise
-   collapse the native <details> every tick). Updated via its ontoggle. */
-let _badRangesOpen=false;
 
 function renderBar(s,p){
   /* Two modes, one renderer:
@@ -427,23 +422,6 @@ function fmtChapterTime(secs){
   const h=Math.floor(secs/3600),m=Math.floor((secs%3600)/60),s=Math.floor(secs%60);
   return h>0?h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0'):m+':'+String(s).padStart(2,'0');
 }
-function renderBadRanges(s){
-  const ranges=s.bad_ranges||[];
-  if(!ranges.length)return'';
-  const n=s.num_bad_ranges||ranges.length;
-  const totMs=s.total_lost_ms||0;
-  const maxMs=s.largest_gap_ms||0;
-  const truncated=s.bad_ranges_truncated||0;
-  const summary=n+' bad range'+(n!==1?'s':'')+' \u00b7 '+fmtMs(totMs)+' total \u00b7 largest '+fmtMs(maxMs);
-  let rows='';
-  ranges.forEach(r=>{
-    const loc=r.chapter?'ch '+r.chapter+(r.time_offset_secs!=null?' @ '+fmtChapterTime(r.time_offset_secs):''):'\u2014';
-    rows+='<tr><td style="font-family:monospace;font-size:.75rem">'+r.lba.toLocaleString()+'</td><td style="font-size:.75rem">'+r.count+'</td><td style="font-size:.75rem">'+fmtMs(r.duration_ms)+'</td><td style="font-size:.75rem;color:var(--text3)">'+loc+'</td></tr>';
-  });
-  if(truncated>0)rows+='<tr><td colspan="4" style="font-size:.75rem;color:var(--text3);padding-top:6px">\u2026 +'+truncated+' smaller</td></tr>';
-  return '<div class="card"><details'+(_badRangesOpen?' open':'')+' ontoggle="_badRangesOpen=this.open"><summary style="cursor:pointer;font-size:.85rem"><strong>'+summary+'</strong></summary><table style="width:100%;margin-top:8px;border-collapse:collapse"><thead><tr style="color:var(--text3);font-size:.7rem;text-align:left;text-transform:uppercase"><th>LBA</th><th>Sectors</th><th>Duration</th><th>Location</th></tr></thead><tbody>'+rows+'</tbody></table></details></div>';
-}
-
 /* ---- Build steps from state ---- */
 function buildSteps(s){
   const steps=[];
@@ -479,7 +457,7 @@ function handleState(data){
   if(!devs.length){
     upd('dtabs','');
     upd('np','<div class="np"><div class="idle-msg">'+D+'<p>No drives detected</p></div></div>');
-    upd('actions','');upd('steps','');upd('err','');upd('bad-ranges','');
+    upd('actions','');upd('steps','');upd('err','');
     return;
   }
   const multi=devs.length>1;
@@ -639,7 +617,6 @@ function renderCurrent(){
   }
   /* (Pass/phase info lives inside the Ripping step \u2014 no separate banner.) */
   upd('err',errHtml);
-  upd('bad-ranges',renderBadRanges(s));
 
   /* Verify / Disc Health */
   const v=data._verify;
