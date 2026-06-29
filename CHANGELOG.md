@@ -1,23 +1,44 @@
 # Changelog
 
-## [1.1.1] — UNRELEASED
+## [1.2.0] — 2026-06-28
 
 ### Added
 
 - **Version now carries the build's git short hash** — `--version`, the UI
-  footer, `/api/version`, and the startup log report e.g. `1.1.1 (g2014a41)`
+  footer, `/api/version`, and the startup log report e.g. `1.2.0 (g2014a41)`
   (the same shape libfreemkv stamps into MKVs), so a running build — including a
   hand-deployed test build — is always identifiable instead of hiding behind a
   bare package version.
 
+### Changed
+
+- **The mux never aborts on mux-time loss.** A disc that swept and patched is
+  always handed to the muxer, and the muxer always delivers. Earlier versions
+  ran a *second* loss check after muxing and could quarantine an
+  already-finished file when demux/decrypt loss exceeded `abort_on_lost_secs` —
+  but with libfreemkv 1.2.0 that loss is concealed into a decode-clean file
+  (NULL-TS fill + drop-to-keyframe) and merely tallied, so failing the disc at
+  that point only stranded a good rip. `abort_on_lost_secs` now governs the
+  **rip** phase alone (unreadable sectors, before the mux); the mux is never
+  gated by it. (The drive/pipeline status split into explicit DeviceStage /
+  PipelineStage models is staged for a later 1.2.x — see the in-code
+  `TODO(1.2.0)`.)
+- **One key-resolution path.** autorip resolves AACS keys through
+  `Disc::inputs()` (libfreemkv) instead of its own duplicate `key_files()` /
+  `volume_id()` readers, so the service and the CLI capture a disc's inputs
+  identically. The stale mapfile-VID read was dropped in favour of the disc's
+  own Volume ID.
+
 ### Fixed
 
-- **A blocked mux now shows the real reason.** When the mux worker aborts (e.g.
-  main-movie loss exceeds the threshold), the System tab showed only "mux worker
-  dispatch did not complete (see _mux device log)". It now surfaces the actual
-  reason from the staging marker (e.g. "0.86s lost at mux exceeds threshold 0s")
-  so the operator doesn't have to read device logs — and can Accept the damage
-  to deliver as-is.
+- **Resume re-injects the mapfile VID for an uncatalogued-disc ISO.** Resuming a
+  mux from a swept ISO whose disc wasn't in the catalogue now reconstructs the
+  Volume ID from the mapfile so AACS resolution has the input it needs, instead
+  of failing the resume.
+- **A failed mux shows the real reason.** When the mux worker genuinely fails,
+  the System tab surfaces the actual reason from the staging marker instead of a
+  generic "mux worker dispatch did not complete (see _mux device log)", so the
+  operator doesn't have to read device logs.
 
 - **The dashboard is no longer cached across releases.** The single-page UI
   (HTML + inline JS) was served with no `Cache-Control`, so browsers kept
