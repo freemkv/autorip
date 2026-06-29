@@ -735,7 +735,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // Sample-based key source: read the disc's files + Volume ID (from the
     // mapfile) + on-disc samples (from the ISO), resolve a Unit Key, and re-scan
     // with it so decryption keys populate. No-op for a local source.
-    let (disc, _key_outcome) = resolve_keys_from_iso(&cfg_read, &iso_path, &mapfile_path, disc);
+    let (disc, _key_outcome) = resolve_keys_from_iso(&cfg_read, &iso_path, disc);
 
     // Real-bitrate re-validation: now that we have the actual title,
     // recompute bytes-bad-in-title (vs the classifier's whole-disc
@@ -1822,17 +1822,15 @@ pub(crate) fn remux_from_ripped_marker(
 fn resolve_keys_from_iso(
     cfg: &Config,
     iso_path: &Path,
-    mapfile_path: &Path,
     disc: libfreemkv::Disc,
 ) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
     // On resume / deferred mux the keys are re-resolved from the configured
-    // source (keydb / online) rather than read back from the mapfile header —
-    // the mapfile key-source was removed in the AACS-trait reshape. `IsoAccess`
-    // still reads the VID and content samples from the staged ISO + mapfile, so
-    // a keyable disc re-resolves correctly (marginally slower); a genuinely-
-    // unkeyed disc returns NoKey.
+    // source (keydb / online). All AACS inputs (inf/MKB/VID/version/hash) come
+    // from the keyless scan via `disc.inputs()`; `IsoAccess` only samples
+    // ciphertext from the staged ISO for wrong-key validation. A keyable disc
+    // re-resolves correctly; a genuinely-unkeyed disc returns NoKey.
     let sources = crate::keysource::build_sources(cfg);
-    let mut access = crate::keysource::IsoAccess::new(iso_path, mapfile_path);
+    let mut access = crate::keysource::IsoAccess::new(iso_path);
     crate::keysource::resolve_keys(sources, &mut access, disc)
 }
 

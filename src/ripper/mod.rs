@@ -150,8 +150,7 @@ fn resolve_keys_from_drive(
     disc: libfreemkv::Disc,
 ) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
     let sources = crate::keysource::build_sources(cfg);
-    let vid = disc.aacs.as_ref().map(|a| a.volume_id);
-    let mut access = DriveAccess::new(drive, vid);
+    let mut access = DriveAccess::new(drive);
     crate::keysource::resolve_keys(sources, &mut access, disc)
 }
 
@@ -2560,7 +2559,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // refetch request carries the full inf+MKB, exactly like the up-front
             // resolve did. One drive read at rip start; `inf` filled too if absent.
             if inputs.mkb.is_empty() {
-                if let Ok((inf, mkb)) =
+                if let Ok((inf, mkb, _version)) =
                     libfreemkv::Disc::read_aacs_inputs_from_drive(&mut session.drive)
                 {
                     if inputs.unit_key_ro.is_empty() {
