@@ -368,8 +368,13 @@ function renderSteps(steps,progress,eta,speed,s){
           pills+=pill('Good','var(--green,#3aaa55)', fmtBytes(bg), 90);
         }
         if(bm>0){
-          const mainLostMs = (s.main_lost_ms!=null && s.main_lost_ms>=0) ? s.main_lost_ms : 0;
-          const t = mainLostMs>0 ? '~'+fmtMs(mainLostMs) : '0:00';
+          /* Time = MAIN-FEATURE movie time at risk (main_at_risk_ms: pending +
+             lost \u2229 feature), NOT the terminal Unreadable-only main_lost_ms which
+             is structurally 0 until the final pass. So 0:00 honestly means "no
+             movie impact" even mid-rip, and a real ms figure means the movie is
+             affected. Melts toward 0 as retries recover pending sectors. */
+          const atRiskMs = (s.main_at_risk_ms!=null && s.main_at_risk_ms>=0) ? s.main_at_risk_ms : 0;
+          const t = atRiskMs>0 ? '~'+fmtMs(atRiskMs) : '0:00';
           pills+=pill('Maybe','var(--yellow,#f0c000)', fmtBytes(bm)+' \u00b7 '+t, 160);
         }
         if(pills) badLine='<div style="font-size:.7rem;margin-top:14px">'+pills+'</div>';
@@ -582,7 +587,23 @@ function renderCurrent(){
   }else if(discIn){
     btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan</button>';
   }
+  /* Operator override: a rip that aborted because main-movie loss exceeded the
+     threshold can be DELIVERED as-is. The existing ISO is re-muxed (no re-sweep)
+     with the abort gate bypassed. Shown whenever the last error is a loss abort
+     and nothing is actively running. */
+  const lossAborted=(s.last_error||'').indexOf('lost in main movie')>=0||(s.last_error||'').indexOf('lost at mux')>=0;
+  if(lossAborted&&!active){
+    btns='<button class="btn" style="background:var(--yellow);color:#000;border-color:var(--yellow)" onclick="if(confirm(\'Accept the lost data and deliver this movie as-is? The unreadable section will be missing, but the rest is intact.\')){fetch(\'/api/accept-loss/\'+dev,{method:\'POST\'})}">Accept damage &amp; deliver</button>'+btns;
+  }
   if(discIn&&!active)btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
+  /* Operator off-ramp for a loss-aborted rip: the complete ISO is staged on
+     disk, so instead of re-ripping you can ACCEPT the recorded main-movie
+     damage and deliver as-is (re-mux with the loss override). "Run another
+     pass" is the Resume button (continues Pass N from the mapfile, recovering
+     only the bad core). The accept is one-shot and confirmed. */
+  if(s.loss_aborted&&!active){
+    btns+='<button class="btn" style="background:var(--yellow,#f0c000);color:#000;border-color:var(--yellow,#f0c000)" onclick="if(confirm(\'Accept the recorded main-movie damage and deliver this rip as-is?\')){this.disabled=true;fetch(\'/api/accept-loss/\'+dev,{method:\'POST\'})}">Accept damage &amp; deliver</button>';
+  }
 
   const dot=active?'var(--green)':scanned?'var(--accent)':discIn?'var(--yellow)':'var(--text3)';
   const pulse=active?'animation:p 1.5s infinite;':'';
@@ -1426,6 +1447,12 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             return json_response(request, 400, r#"{"error":"invalid device name"}"#);
         }
         handle_rip(request, cfg, &device, query);
+    } else if is_post && url.starts_with("/api/accept-loss/") {
+        let device = percent_decode(url.trim_start_matches("/api/accept-loss/"));
+        if !is_valid_device_name(&device) {
+            return json_response(request, 400, r#"{"error":"invalid device name"}"#);
+        }
+        handle_accept_loss(request, cfg, &device);
     } else if is_post && url == "/api/update-keydb" {
         handle_update_keydb(request, cfg);
     } else if is_post && url.starts_with("/api/eject/") {
@@ -4798,6 +4825,53 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
     }
 
     json_response(request, 200, r#"{"ok":true}"#);
+}
+
+/// POST `/api/accept-loss/{device}` — operator override.
+///
+/// Accept the recorded over-threshold main-movie loss and deliver the existing
+/// rip instead of re-ripping. Writes the one-shot `.accept-loss` marker into the
+/// disc's staging dir, clears the terminal/abort markers so the dir is resumable
+/// again, then re-muxes the EXISTING ISO via the resume path (no re-sweep) — where
+/// `resume_remux` honors the marker and bypasses the abort gate. Fixes the
+/// exhaust → `.failed` → wasteful full-re-rip loop.
+fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
+    let Some(disc_name) = ripper::current_disc_name(device) else {
+        json_response(
+            request,
+            404,
+            r#"{"ok":false,"error":"no disc state for device"}"#,
+        );
+        return;
+    };
+    let staging = {
+        let c = match cfg.read() {
+            Ok(c) => c,
+            Err(e) => e.into_inner(),
+        };
+        c.staging_device_dir(&crate::util::sanitize_path_compact(&disc_name))
+    };
+    let dir = std::path::Path::new(&staging);
+    if !dir.exists() {
+        json_response(
+            request,
+            404,
+            r#"{"ok":false,"error":"no staging dir to accept"}"#,
+        );
+        return;
+    }
+    // Arm the one-shot override and clear the terminal/abort markers so the dir
+    // resumes (re-mux) instead of being refused as failed.
+    ripper::staging::write_accept_loss_marker(dir);
+    let _ = std::fs::remove_file(dir.join(ripper::staging::FAILED_MARKER));
+    ripper::staging::clear_aborted_loss_marker(dir);
+    ripper::staging::clear_restart_count(dir);
+    crate::log::device_log(
+        device,
+        "Accept-damage requested — re-muxing the existing ISO with the loss override.",
+    );
+    // Delegate to the resume path; resume_remux consumes `.accept-loss`.
+    handle_rip(request, cfg, device, "resume=yes");
 }
 
 /// Resume-mode chosen by the caller of `/api/rip`. The dispatch logic

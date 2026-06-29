@@ -615,6 +615,20 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from(&cfg_read.staging_dir));
 
+    // One-shot operator override: if `.accept-loss` is present the operator
+    // chose to deliver this rip despite over-threshold main-movie damage. The
+    // abort gates below then treat the threshold as unlimited, so the EXISTING
+    // ISO is re-muxed and delivered (no wasteful full re-sweep). Consumed here
+    // so a later resume doesn't silently re-accept.
+    let accept_loss = staging::accept_loss_requested(&staging_dir);
+    if accept_loss {
+        staging::clear_accept_loss_marker(&staging_dir);
+        crate::log::device_log(
+            device,
+            "Operator accepted the recorded loss — delivering the existing rip despite over-threshold damage.",
+        );
+    }
+
     crate::log::device_log(
         device,
         &format!(
@@ -810,8 +824,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         ) / crate::util::MILLIS_PER_SEC;
         // ISO output is whole-disc and must be byte-complete: the per-title
         // tolerance is ignored (forced to 0), matching the fresh-rip gate.
-        let effective_abort =
-            super::effective_abort_secs(&cfg_read.output_format, cfg_read.abort_on_lost_secs);
+        // `.accept-loss` raises the effective threshold to unlimited so the
+        // operator override delivers despite over-threshold damage.
+        let effective_abort = if accept_loss {
+            u64::MAX
+        } else {
+            super::effective_abort_secs(&cfg_read.output_format, cfg_read.abort_on_lost_secs)
+        };
         if super::should_abort_for_loss(
             lost_secs * crate::util::MILLIS_PER_SEC,
             effective_abort as f64 * crate::util::MILLIS_PER_SEC,
@@ -1359,7 +1378,11 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         true,
         demux_lost_secs,
         demux_lost_bytes,
-        cfg_read.abort_on_lost_secs,
+        if accept_loss {
+            u64::MAX
+        } else {
+            cfg_read.abort_on_lost_secs
+        },
     ) != super::PostMuxVerdict::Proceed
     {
         crate::log::device_log(

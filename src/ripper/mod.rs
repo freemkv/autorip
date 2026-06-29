@@ -32,9 +32,9 @@ pub use session::{
 };
 #[allow(unused_imports)]
 pub use state::{
-    BadRange, Resumable, RipState, STATE, current_claim_gen, device_known, is_busy,
-    set_stop_cooldown, set_title_override, take_title_override, try_claim_active, update_state,
-    update_state_with,
+    BadRange, Resumable, RipState, STATE, current_claim_gen, current_disc_name, device_known,
+    is_busy, set_stop_cooldown, set_title_override, take_title_override, try_claim_active,
+    update_state, update_state_with,
 };
 
 // Internal-use imports for the orchestrator code that lives in this
@@ -1065,6 +1065,20 @@ pub fn handle_rip_request(
                 drop_session(device);
                 return;
             }
+            // Anti-clobber: a `.aborted-loss` staging holds a complete (or
+            // partially-recovered) swept ISO that aborted only on the loss
+            // threshold. A fresh sweep here would overwrite that 50+ GB ISO and
+            // throw away the recovery progress (the bug that destroyed a swept
+            // Dunkirk ISO). Leave it for the operator to Accept (deliver) or
+            // resume (run another recovery pass) — never auto-clobber it.
+            if disc_loss_aborted(cfg, device) {
+                crate::log::device_log(
+                    device,
+                    "Disc has a loss-aborted staged ISO awaiting an operator decision — NOT re-ripping. Use 'Accept damage' to deliver it, or 'Resume' to run another recovery pass.",
+                );
+                drop_session(device);
+                return;
+            }
             rip_disc(cfg, device, device_path, false);
         }
     }
@@ -1163,6 +1177,29 @@ fn list_staging_basenames(staging_dir: &std::path::Path) -> Option<Vec<String>> 
         // like the old `read_dir(...).ok()?` (no listing → no match).
         None
     }
+}
+
+/// Does the currently-scanned disc have a resumable `.aborted-loss` staging dir
+/// (a swept ISO that aborted only on the main-movie loss threshold)? Used to
+/// stop the unattended Default path from re-sweeping over — and clobbering — an
+/// ISO that is waiting on an operator Accept / run-another-pass decision.
+fn disc_loss_aborted(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
+    let cfg_read = match cfg.read() {
+        Ok(c) => c.clone(),
+        Err(_) => return false,
+    };
+    let display_name = STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(device)
+        .map(|rs| rs.disc_name.clone())
+        .unwrap_or_default();
+    if display_name.is_empty() {
+        return false;
+    }
+    let sanitized = crate::util::sanitize_path_compact(&display_name);
+    let dir = std::path::Path::new(&cfg_read.staging_dir).join(&sanitized);
+    dir.join(staging::ABORTED_LOSS_MARKER).exists()
 }
 
 fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
@@ -3458,6 +3495,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 );
                 update_state_with(device, |s| {
                     s.status = "error".to_string();
+                    // Surface the Accept-damage off-ramp: the complete ISO is on
+                    // disk as a resumable `.aborted-loss`, so the operator can
+                    // deliver it as-is instead of re-ripping.
+                    s.loss_aborted = true;
                     if s.last_error.is_empty() {
                         s.last_error = format!(
                             "aborted — {} lost in main movie ({})",
@@ -8076,6 +8117,24 @@ mod tests {
         assert!(
             !loss_aborts(lost_bytes, lost_ms, effective_abort_secs("mkv", configured)),
             "mkv still tolerates loss within its configured threshold"
+        );
+    }
+
+    #[test]
+    fn accept_loss_override_threshold_proceeds_but_nan_still_aborts() {
+        use super::loss_aborts;
+        // The `.accept-loss` override raises the effective threshold to u64::MAX.
+        // A real, large in-title loss must then PROCEED (deliver despite damage)…
+        assert!(
+            !loss_aborts(1_000_000_000, 2_370.0, u64::MAX),
+            "operator override (u64::MAX threshold) must deliver despite 2.37s in-movie loss"
+        );
+        // …but an UNQUANTIFIABLE (NaN) loss must STILL fail safe to abort even
+        // under the override — accepting a known amount is the operator's call,
+        // a NaN amount is not a quantity anyone agreed to.
+        assert!(
+            loss_aborts(0, f64::NAN, u64::MAX),
+            "NaN loss must abort even under the accept-loss override"
         );
     }
 
