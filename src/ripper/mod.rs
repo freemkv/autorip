@@ -3513,11 +3513,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // terminal `.failed`): the full ISO + mapfile are on disk, so a
                 // raised `abort_on_lost_secs`, a fresh patch pass, or a code
                 // change may bring the loss under threshold on a later attempt.
-                // `mark_aborted_on_loss` bounds the retries — once
-                // MAX_LOSS_RESUME_ATTEMPTS aborts have accrued it promotes the
-                // dir to terminal `.failed` for the operator. It also clears
-                // `.restart_count` so a deterministically-lossy rip doesn't ALSO
-                // walk the crash-restart loop.
+                // `mark_aborted_on_loss` keeps the dir RESUMABLE indefinitely:
+                // a loss-abort is deterministic media damage a plain re-rip
+                // won't change, so it is NEVER promoted to terminal `.failed` by
+                // attempt count (the operator resolves it via Accept or another
+                // pass). It also clears `.restart_count` so a deterministically-
+                // lossy rip doesn't ALSO walk the crash-restart loop. The `bool`
+                // it returns is now always `false`; the `if terminal` log below
+                // is inert (retained so the call site compiles unchanged).
                 let staging_disc_path = std::path::Path::new(&staging);
                 let terminal = staging::mark_aborted_on_loss(
                     staging_disc_path,
@@ -4500,8 +4503,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // sweep-mapfile loss and `final_errors` with the mapfile bad-sector count;
     // both are disjoint from the demux skip count (sweep = Unreadable sectors
     // baked into the ISO; demux = decrypt/codec skips at mux), so add the demux
-    // loss / errors. This mirrors the ABORTED multipass branch above, which
-    // already reports `final_lost_secs + demux_lost_secs`.
+    // loss / errors. (The resume path in resume.rs folds the two the same way,
+    // so a fresh multi-pass rip and a resume of the identical ISO report
+    // matching figures.)
     let (done_errors, done_lost_secs, done_demux_extra_ms) = if cfg_read.max_retries == 0 {
         (final_errors, final_lost_secs, 0.0)
     } else {
