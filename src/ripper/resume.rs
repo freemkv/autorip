@@ -735,7 +735,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // Sample-based key source: read the disc's files + Volume ID (from the
     // mapfile) + on-disc samples (from the ISO), resolve a Unit Key, and re-scan
     // with it so decryption keys populate. No-op for a local source.
-    let (disc, _key_outcome) = resolve_keys_from_iso(&cfg_read, &iso_path, disc);
+    let (disc, _key_outcome) = resolve_keys_from_iso(&cfg_read, &iso_path, &mapfile_path, disc);
 
     // Real-bitrate re-validation: now that we have the actual title,
     // recompute bytes-bad-in-title (vs the classifier's whole-disc
@@ -1822,13 +1822,29 @@ pub(crate) fn remux_from_ripped_marker(
 fn resolve_keys_from_iso(
     cfg: &Config,
     iso_path: &Path,
-    disc: libfreemkv::Disc,
+    mapfile_path: &Path,
+    mut disc: libfreemkv::Disc,
 ) -> (libfreemkv::Disc, crate::keysource::KeyOutcome) {
     // On resume / deferred mux the keys are re-resolved from the configured
-    // source (keydb / online). All AACS inputs (inf/MKB/VID/version/hash) come
-    // from the keyless scan via `disc.inputs()`; `IsoAccess` only samples
-    // ciphertext from the staged ISO for wrong-key validation. A keyable disc
-    // re-resolves correctly; a genuinely-unkeyed disc returns NoKey.
+    // source (keydb / online). Most AACS inputs (inf/MKB/version/hash) come from
+    // the keyless ISO scan via `disc.inputs()`; `IsoAccess` only samples
+    // ciphertext for wrong-key validation. The ONE input the ISO scan can't
+    // recover is the Volume ID (no live-drive AACS handshake → all-zero
+    // sentinel). The rip persisted the real VID to the mapfile (`# freemkv-vid:`,
+    // via `Mapfile::set_vid`), so re-inject it here: a DK/PK→MK→VUK derivation
+    // (the uncatalogued-disc path) NEEDS the VID, and resolving it from
+    // `disc.inputs()` alone regressed that case. A keyable disc re-resolves
+    // correctly; a genuinely-unkeyed disc returns NoKey.
+    if let Some(a) = disc.aacs.as_mut() {
+        if a.volume_id == [0u8; 16] {
+            if let Some(vid) = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path)
+                .ok()
+                .and_then(|m| m.vid())
+            {
+                a.volume_id = vid;
+            }
+        }
+    }
     let sources = crate::keysource::build_sources(cfg);
     let mut access = crate::keysource::IsoAccess::new(iso_path);
     crate::keysource::resolve_keys(sources, &mut access, disc)
