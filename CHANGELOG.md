@@ -1,13 +1,23 @@
 # Changelog
 
-## [1.1.0-beta.1] — UNRELEASED
+## [1.1.0]
 
-Inherits libfreemkv 1.1.0-beta.1, including the **post-read decrypt-verify gate**
+Inherits libfreemkv 1.1.0, including the **post-read decrypt-verify gate**
 (undecryptable units are caught during the rip and re-read) and the
 **DVD movie-not-menu** fix.
 
 ### Added
 
+- **"Accept damage & deliver" — operator off-ramp on a loss-abort.** When a rip
+  aborts because main-movie loss exceeds the threshold, the card now offers a
+  one-click Accept: the *existing* swept ISO is re-muxed and delivered as-is (the
+  loss gate is bypassed for that one delivery), with **no re-rip**. "Run another
+  pass" is the Resume button (continues Pass N from the mapfile, recovering only
+  the bad core). Pairs with the resume fixes below.
+- **Live patch progress is no longer a black box.** During a retry pass the
+  bad-range drilldown now lists the *located* Maybe ranges (LBA + sectors +
+  chapter) being worked, instead of staying empty until a sector is terminally
+  given up on.
 - **ISO output now requires a 100% byte-complete image.** The per-title
   "Max Acceptable Main Movie Loss" tolerance is a muxed-output (MKV / M2TS /
   Network) setting and is now ignored for an ISO rip (forced to 0): a value left
@@ -28,17 +38,40 @@ Inherits libfreemkv 1.1.0-beta.1, including the **post-read decrypt-verify gate*
   precision — `Maybe 990 MB · 0:00` means 990 MB pending with zero movie impact
   (passes), while `Maybe 12 KB · ~1 ms` is a few movie sectors (fails a 0
   threshold). A handful of sectors reads as `~1 ms`, never `0`.
-- **Abort-on-loss is resumable, not terminal.** A rip that aborts because
-  main-movie loss exceeds the threshold now writes a bounded, *resumable* marker
-  (re-checked against the *current* threshold on the next attempt, up to a small
-  cap) instead of a terminal failure — a raised threshold, a fresh patch pass, or
-  a better drive state can finish it without re-ripping from scratch. Operator
-  cancel and durability/structural-mux failures stay terminal.
+- **Abort-on-loss is resumable, never terminal — and you can accept the loss.**
+  A rip that aborts because main-movie loss exceeds the threshold keeps its
+  complete swept ISO and stays *resumable indefinitely* (the old "exhaust N
+  attempts → terminal `.failed` → re-rip the whole disc from scratch" loop is
+  gone — a deterministic media defect won't fix itself, so re-sweeping 50 GB to
+  reach the same bad sector was pure waste). The abort card now offers
+  **Accept damage & deliver**: a one-shot operator override that re-muxes the
+  *existing* ISO and delivers the movie as-is, missing only the unreadable
+  section — for an imperceptible loss (a few frames / ~1 ms) that's the right
+  call, and it's yours to make. Operator cancel and durability/structural-mux
+  failures stay terminal.
+- **Live patch progress is no longer a black box.** During retry passes the
+  drilldown now lists the *located* ranges being worked (LBA, sectors, chapter),
+  so "pass 3, no movement" shows exactly which bad region the drive is grinding.
 - **"Max Acceptable Main Movie Loss"** moved under the MKV/muxed-output settings
   and shown in seconds.
 
 ### Fixed
 
+- **A loss-abort no longer destroys the swept ISO.** Previously a rip that
+  aborted on main-movie loss was retried a few times and then promoted to a
+  terminal `.failed`, which locked out resume — and the next trigger re-swept the
+  whole disc from scratch, **overwriting the complete 50+ GB ISO** and discarding
+  all recovery progress. A loss-abort is deterministic media damage, so it now
+  stays **resumable indefinitely** (never auto-promoted to `.failed` by attempt
+  count) and the unattended path **refuses to re-sweep over** a loss-aborted ISO.
+  The operator resolves it: **Accept** (deliver as-is) or **Resume** (run another
+  recovery pass on the bad core). The complete ISO is never thrown away.
+- **The live "Maybe" pill now shows honest main-movie time at risk.** It counts
+  in-feature *pending* sectors (not just terminally-unreadable ones), so a rip in
+  progress reads `Maybe N · ~Xms` when the movie is affected and `Maybe N · 0:00`
+  when the pending bytes are out-of-feature — instead of a premature `0:00` /
+  "Feature clean" while a bad range was still unresolved. The single-source
+  `RipProgress` computation replaces three drifting copies.
 - **Clearer abort message.** A sub-second main-movie loss now reads e.g. "1 ms"
   instead of a confusing "0.00s", and a zero threshold reads "perfect rip
   required" instead of "threshold 0s".

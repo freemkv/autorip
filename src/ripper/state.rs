@@ -95,14 +95,24 @@ pub struct RipState {
     /// scoped to the longest title only — enables the UI to render
     /// "(Xs in main movie)".
     pub main_lost_ms: f64,
-    /// Sum of `Pending` ranges' durations — the video time at risk
-    /// pending Pass 2-N retry. Companion to [`Self::bytes_maybe`]. UI's
-    /// yellow "maybe" pill renders this. Drops as retry passes promote
-    /// pending sectors to `Finished` (recovered) or `Unreadable` (final).
-    pub total_maybe_ms: f64,
+    /// **Main-feature time still AT RISK** — the honest live "Maybe" metric.
+    /// The duration of every not-yet-good range (`NonTrimmed` + `NonScraped` +
+    /// `Unreadable`) that falls within the main title's extents. Unlike
+    /// [`Self::main_lost_ms`] (terminal `Unreadable`-only — correct for the
+    /// abort verdict, but trivially 0 mid-rip), this counts pending in-feature
+    /// data as movie-at-risk, so the two-pill UI's `Maybe N · <time>` is honest
+    /// during the rip: `0:00` when the pending bytes are out-of-feature, a real
+    /// ms figure when they're in the movie. It melts toward `main_lost_ms` as
+    /// retry passes resolve pending sectors to `Finished` or `Unreadable`.
+    pub main_at_risk_ms: f64,
     /// Largest single contiguous bad range's duration. Tells the difference
     /// between 1000 × 1ms gaps (unnoticeable) vs 1 × 1s gap (noticeable glitch).
     pub largest_gap_ms: f64,
+    /// True when this rip aborted because main-movie loss exceeded the
+    /// threshold and a resumable `.aborted-loss` staging (the complete ISO) is
+    /// on disk. The UI shows the **Accept damage & deliver** off-ramp when set —
+    /// the operator can deliver the rip as-is instead of re-ripping.
+    pub loss_aborted: bool,
     pub last_error: String,
     pub output_file: String,
     pub tmdb_title: String,
@@ -208,8 +218,9 @@ impl Default for RipState {
             bad_ranges_truncated: 0,
             total_lost_ms: 0.0,
             main_lost_ms: 0.0,
-            total_maybe_ms: 0.0,
+            main_at_risk_ms: 0.0,
             largest_gap_ms: 0.0,
+            loss_aborted: false,
             last_error: String::new(),
             output_file: String::new(),
             tmdb_title: String::new(),
@@ -325,6 +336,20 @@ pub(super) fn forget_device_state(device: &str) {
 pub fn device_known(device: &str) -> bool {
     let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
     s.contains_key(device)
+}
+
+/// The disc display-name currently associated with `device` (from the live
+/// state), if any. Used by the `Accept damage` handler to locate the disc's
+/// staging dir without re-scanning.
+pub fn current_disc_name(device: &str) -> Option<String> {
+    let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    s.get(device).and_then(|r| {
+        if r.disc_name.is_empty() {
+            None
+        } else {
+            Some(r.disc_name.clone())
+        }
+    })
 }
 
 pub fn is_busy(device: &str) -> bool {
@@ -515,19 +540,36 @@ fn range_chapter(lba: u32, title: &libfreemkv::DiscTitle) -> (Option<u32>, Optio
     (None, None)
 }
 
-/// Build the UI's bad-range list from the mapfile. Caps at 50 entries by size
-/// (largest first); returns the truncation count so the UI can say "+X more".
+/// Build the **terminal** bad-range list (`Unreadable` only) — the done-card /
+/// abort snapshot, where "bad" means the drive has finally given up. Thin
+/// wrapper over [`located_ranges`].
 pub(crate) fn build_bad_ranges(
     map: &libfreemkv::disc::mapfile::Mapfile,
     title: &libfreemkv::DiscTitle,
     bps: f64,
 ) -> (Vec<BadRange>, u32, u32, f64, f64) {
-    use libfreemkv::disc::mapfile::SectorStatus;
-    // Only Unreadable ranges count as "bad" in the UI. NonTried = unread work,
-    // NonTrimmed / NonScraped = failed pass-1 but patch hasn't confirmed yet.
-    // Showing those as "bad" during pass 1 falsely implies the whole disc is
-    // damaged before the library has actually given up on anything.
-    let raw = map.ranges_with(&[SectorStatus::Unreadable]);
+    located_ranges(
+        map,
+        title,
+        bps,
+        &[libfreemkv::disc::mapfile::SectorStatus::Unreadable],
+    )
+}
+
+/// Build a located range list (LBA + sectors + duration + chapter) for the
+/// given mapfile `statuses`, capped at 50 by duration (largest first); the
+/// truncation count lets the UI say "+X more". The status set is the caller's:
+/// terminal `Unreadable` for the verdict snapshot ([`build_bad_ranges`]), or the
+/// full not-yet-good set (`NonTrimmed`/`NonScraped`/`Unreadable`) for the live
+/// **Maybe** drilldown — so a patch pass shows WHERE it is working instead of a
+/// black box. `NonTried` (unread, ahead of the head) is never included.
+pub(crate) fn located_ranges(
+    map: &libfreemkv::disc::mapfile::Mapfile,
+    title: &libfreemkv::DiscTitle,
+    bps: f64,
+    statuses: &[libfreemkv::disc::mapfile::SectorStatus],
+) -> (Vec<BadRange>, u32, u32, f64, f64) {
+    let raw = map.ranges_with(statuses);
     let total_count = raw.len() as u32;
     let mut ranges: Vec<BadRange> = raw
         .iter()
@@ -565,6 +607,68 @@ pub(crate) fn build_bad_ranges(
         total_lost_ms,
         largest_gap_ms,
     )
+}
+
+/// The single source of truth for the **live, two-state** rip display, computed
+/// once from a freshly-loaded mapfile + the main title. Replaces the ad-hoc
+/// per-callback field math that had drifted into showing terminal
+/// (`Unreadable`-only) numbers mid-rip.
+///
+/// Two buckets only — Good and Maybe — plus the honest movie-time at risk and a
+/// located Maybe drilldown. The terminal verdict fields (`main_lost_ms` /
+/// `total_lost_ms`, `Unreadable`-only) are deliberately NOT computed here; the
+/// caller keeps owning them for the abort gate and done card.
+pub(crate) struct RipProgress {
+    /// GOOD: whole-disc bytes read AND verify-clean (`Finished`).
+    pub good_bytes: u64,
+    /// Main-feature movie time still AT RISK: the duration of the not-yet-good
+    /// (`NonTrimmed`/`NonScraped`/`Unreadable`) ranges that fall inside the
+    /// title extents. `0` when every pending/lost byte is out-of-feature; a real
+    /// figure when the movie itself is affected. Melts toward the terminal
+    /// `main_lost_ms` as retries resolve pending sectors.
+    pub main_at_risk_ms: f64,
+    /// Located Maybe ranges for the drilldown (LBA + sectors + chapter), capped
+    /// at 50 by duration. During a patch pass this shows WHERE recovery is
+    /// working — no more black-box "flying blind".
+    pub ranges: Vec<BadRange>,
+    pub num_ranges: u32,
+    pub ranges_truncated: u32,
+    pub largest_gap_ms: f64,
+}
+
+impl RipProgress {
+    /// Compute the live two-state progress. `bps` is the title's bytes/sec used
+    /// to turn at-risk bytes into a movie-time estimate.
+    pub(crate) fn from_map(
+        map: &libfreemkv::disc::mapfile::Mapfile,
+        title: &libfreemkv::DiscTitle,
+        bps: f64,
+    ) -> Self {
+        use libfreemkv::disc::mapfile::SectorStatus::{NonScraped, NonTrimmed, Unreadable};
+        // MAYBE = everything not yet good: retry-pending PLUS terminal-unreadable.
+        // `NonTried` (ahead of the read head) is excluded — it's the progress
+        // remainder, not damage.
+        let maybe_statuses = [NonTrimmed, NonScraped, Unreadable];
+        // Honest at-risk movie time: intersect the Maybe ranges with the title
+        // extents. Out-of-feature pending → 0:00; in-feature pending → real ms.
+        let maybe_ranges = map.ranges_with(&maybe_statuses);
+        let at_risk_bytes = libfreemkv::disc::bytes_bad_in_title(title, &maybe_ranges);
+        let main_at_risk_ms = if bps > 0.0 {
+            at_risk_bytes as f64 * MILLIS_PER_SEC / bps
+        } else {
+            0.0
+        };
+        let (ranges, num_ranges, ranges_truncated, _total_ms, largest_gap_ms) =
+            located_ranges(map, title, bps, &maybe_statuses);
+        Self {
+            good_bytes: map.stats().bytes_good,
+            main_at_risk_ms,
+            ranges,
+            num_ranges,
+            ranges_truncated,
+            largest_gap_ms,
+        }
+    }
 }
 
 /// Per-pass speed tracker — sliding window of `(Instant, bytes_good)`
@@ -800,19 +904,24 @@ pub(super) fn push_pass_state(
         Err(_) => return,
     };
     let stats = map.stats();
-    let (ranges, total_count, truncated, total_lost_ms, largest_gap_ms) =
-        build_bad_ranges(&map, title, bps);
-    // Main-title-only lost time: intersect Unreadable ranges with the
-    // main feature's extents, then convert to ms using the same bps.
-    // Unreadable-only, to match this field's doc and `total_lost_ms` /
-    // `build_bad_ranges`. (Pre-fix this also folded in the MAYBE buckets
-    // NonTrimmed/NonScraped — still-retry-eligible bytes — so during a
-    // patch pass the "(Xs in main movie)" pill counted bytes that hadn't
-    // been given up on yet, and could exceed `total_lost_ms`.)
+    // Single source for the LIVE two-state display: Good/Maybe buckets, the
+    // honest at-risk movie time (counts in-feature PENDING, not just terminal
+    // loss), and the located Maybe drilldown (so a patch pass shows where it is
+    // working). See `RipProgress`.
+    let prog = RipProgress::from_map(&map, title, bps);
+    // Terminal verdict figures — `Unreadable`-only — kept for the done card and
+    // back-compat. These stay 0 until a sector is finally given up on, which is
+    // correct for the abort gate but is exactly why the live UI must NOT read
+    // them mid-rip; it reads `prog.main_at_risk_ms` instead.
     let main_title_bad = map.ranges_with(&[libfreemkv::disc::mapfile::SectorStatus::Unreadable]);
     let main_title_bad_bytes = libfreemkv::disc::bytes_bad_in_title(title, &main_title_bad);
     let main_lost_ms = if bps > 0.0 {
         main_title_bad_bytes as f64 * MILLIS_PER_SEC / bps
+    } else {
+        0.0
+    };
+    let total_lost_ms = if bps > 0.0 {
+        stats.bytes_unreadable as f64 * MILLIS_PER_SEC / bps
     } else {
         0.0
     };
@@ -845,13 +954,6 @@ pub(super) fn push_pass_state(
     // sectors only (`bytes_lost`). Pending bytes are not "errors" — they
     // may still recover.
     let errors = (bytes_lost / SECTOR_BYTES) as u32;
-    // MAYBE-bucket time equivalent (yellow pill in the UI). Mirrors the
-    // existing `total_lost_ms` (red pill) computed from per-range durations.
-    let total_maybe_ms = if bps > 0.0 {
-        bytes_maybe as f64 * MILLIS_PER_SEC / bps
-    } else {
-        0.0
-    };
     // v0.13.16: pass_progress_pct = work_done / work_total (per-pass).
     // The legacy progress_pct stays populated as a copy (back-compat for
     // any consumer reading the old field).
@@ -984,17 +1086,19 @@ pub(super) fn push_pass_state(
             codecs: ctx.codecs.clone(),
             pass,
             total_passes,
-            bytes_good: stats.bytes_good,
+            bytes_good: prog.good_bytes,
             bytes_maybe,
             bytes_lost,
             bytes_total_disc: ctx.bytes_total_disc,
-            bad_ranges: ranges,
-            num_bad_ranges: total_count,
-            bad_ranges_truncated: truncated,
+            // Live drilldown shows the located MAYBE ranges (pending + lost), so
+            // a patch pass is visible instead of a black box.
+            bad_ranges: prog.ranges,
+            num_bad_ranges: prog.num_ranges,
+            bad_ranges_truncated: prog.ranges_truncated,
             total_lost_ms,
             main_lost_ms,
-            total_maybe_ms,
-            largest_gap_ms,
+            main_at_risk_ms: prog.main_at_risk_ms,
+            largest_gap_ms: prog.largest_gap_ms,
             preferred_batch: ctx.batch,
             current_batch: ctx.batch,
             pass_progress_pct: pass_pct,
@@ -1166,6 +1270,91 @@ mod tests {
             content_format: libfreemkv::ContentFormat::BdTs,
             codec_privates: Vec::new(),
         }
+    }
+
+    /// A title whose feature occupies one extent of `sector_count` sectors
+    /// starting at `start_lba` — i.e. bytes `[start_lba*2048, (start_lba+count)*2048)`.
+    fn title_with_extent(start_lba: u32, sector_count: u32) -> libfreemkv::DiscTitle {
+        let mut t = minimal_title();
+        t.extents = vec![libfreemkv::Extent {
+            start_lba,
+            sector_count,
+        }];
+        t
+    }
+
+    #[test]
+    fn rip_progress_at_risk_counts_in_feature_pending() {
+        // The bug this fixes: a NonTrimmed (pending) range INSIDE the feature
+        // must register as movie-time at risk, even before it's Unreadable —
+        // so the live "Maybe" pill is honest mid-rip instead of a premature 0.
+        let (_p, mut mf) = tmp_map("rp_in_feat", 400_000);
+        // feature extent = sectors [10,110) → bytes [20480, 225280).
+        mf.record(40_960, 4096, SectorStatus::NonTrimmed).unwrap();
+        let title = title_with_extent(10, 100);
+        // bps = 4096 → 4096 bytes == 1000 ms.
+        let prog = RipProgress::from_map(&mf, &title, 4096.0);
+        assert!(
+            (prog.main_at_risk_ms - 1000.0).abs() < 1.0,
+            "in-feature pending must count as at-risk movie time, got {}",
+            prog.main_at_risk_ms
+        );
+        assert_eq!(prog.num_ranges, 1, "pending range must be located live");
+    }
+
+    #[test]
+    fn rip_progress_at_risk_zero_when_pending_out_of_feature() {
+        // The "Maybe 990 MB · 0:00" case: pending bytes OUTSIDE the movie →
+        // zero at-risk time, so the pill reads 0:00 and the rip will pass.
+        let (_p, mut mf) = tmp_map("rp_out_feat", 4_000_000);
+        mf.record(2_000_000, 100_000, SectorStatus::NonTrimmed)
+            .unwrap();
+        let title = title_with_extent(0, 10); // feature = bytes [0, 20480)
+        let prog = RipProgress::from_map(&mf, &title, 4096.0);
+        assert_eq!(
+            prog.main_at_risk_ms, 0.0,
+            "out-of-feature pending must NOT read as movie loss"
+        );
+        assert_eq!(
+            prog.num_ranges, 1,
+            "still a located Maybe range (whole-disc)"
+        );
+    }
+
+    #[test]
+    fn rip_progress_at_risk_counts_unreadable_too() {
+        // Terminal Unreadable in-feature is at risk as well (it IS lost).
+        let (_p, mut mf) = tmp_map("rp_unread", 400_000);
+        mf.record(40_960, 4096, SectorStatus::Unreadable).unwrap();
+        let title = title_with_extent(10, 100);
+        let prog = RipProgress::from_map(&mf, &title, 4096.0);
+        assert!(prog.main_at_risk_ms > 0.0);
+        assert_eq!(prog.num_ranges, 1);
+    }
+
+    #[test]
+    fn rip_progress_drilldown_shows_pending_unlike_terminal() {
+        // The live-vs-terminal difference that kills "flying blind": the Maybe
+        // drilldown shows pending ranges (so a patch pass is visible), while the
+        // terminal build_bad_ranges hides them until they're given up on.
+        let (_p, mut mf) = tmp_map("rp_drill", 400_000);
+        mf.record(20_480, 2048, SectorStatus::NonTrimmed).unwrap();
+        mf.record(30_720, 2048, SectorStatus::NonScraped).unwrap();
+        let title = title_with_extent(0, 200);
+        let prog = RipProgress::from_map(&mf, &title, 2048.0);
+        assert_eq!(prog.num_ranges, 2, "live drilldown shows pending ranges");
+        let (terminal, count, ..) = build_bad_ranges(&mf, &title, 2048.0);
+        assert!(terminal.is_empty(), "terminal drilldown hides pending");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn rip_progress_good_bytes_tracks_finished() {
+        let (_p, mut mf) = tmp_map("rp_good", 400_000);
+        mf.record(0, 8192, SectorStatus::Finished).unwrap();
+        let title = title_with_extent(0, 200);
+        let prog = RipProgress::from_map(&mf, &title, 2048.0);
+        assert_eq!(prog.good_bytes, 8192);
     }
 
     #[test]
