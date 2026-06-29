@@ -515,12 +515,14 @@ pub struct StagingSnapshot {
     /// reason when the body is JSON (None otherwise).
     pub has_failed: bool,
     pub failed_reason: Option<String>,
-    /// `.aborted-loss` resumable-failure marker present — the rip aborted
-    /// because main-movie / demux loss exceeded `abort_on_lost_secs`, but the
-    /// ISO + mapfile are intact so it's RECOVERABLE (raised threshold, fresh
-    /// patch, code change). Distinct from terminal `.failed`: the resume scan
-    /// re-enters such a dir up to `MAX_LOSS_RESUME_ATTEMPTS` times. `attempt`
-    /// carries the abort count parsed from the marker (0 if unparseable).
+    /// `.aborted-loss` resumable-failure marker present — the RIP PHASE aborted
+    /// because main-movie unreadable-sector loss exceeded `abort_on_lost_secs`
+    /// (the mux never aborts on loss), but the ISO + mapfile are intact so it's
+    /// RECOVERABLE (raised threshold, fresh patch, code change). Distinct from
+    /// terminal `.failed`: the resume scan re-enters such a dir indefinitely
+    /// (a loss-abort is deterministic, never promoted to terminal by attempt
+    /// count). `attempt` carries the abort count parsed from the marker (0 if
+    /// unparseable), kept solely to inform the UI.
     pub has_aborted_loss: bool,
     pub aborted_loss_reason: Option<String>,
     pub aborted_loss_attempt: u64,
@@ -865,15 +867,14 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
             });
             continue;
         }
-        // `.aborted-loss` — a RESUMABLE failure (loss exceeded threshold) with
-        // the full ISO + mapfile intact. Checked AFTER terminal `.failed` (so a
-        // dir promoted to `.failed` stays terminal) and BEFORE the partial-state
-        // branch. Below the attempt limit it re-enters via `ResumeAbortedLoss`
-        // (the classifier re-checks loss against the CURRENT threshold); at or
-        // above the limit it is promoted to terminal `.failed` here as a
-        // belt-and-suspenders backstop to the write-site promotion in
-        // `mark_aborted_on_loss`, so a marker that somehow persists at the limit
-        // can't be retried forever.
+        // `.aborted-loss` — a RESUMABLE failure (rip-phase loss exceeded
+        // threshold) with the full ISO + mapfile intact. Checked AFTER terminal
+        // `.failed` (so a dir already promoted to `.failed` stays terminal) and
+        // BEFORE the partial-state branch. It ALWAYS re-enters via
+        // `ResumeAbortedLoss` (the classifier re-checks loss against the CURRENT
+        // threshold) — a loss-abort is deterministic media damage, never
+        // promoted to terminal `.failed` by attempt count (see the write site,
+        // `mark_aborted_on_loss`).
         if snap.has_aborted_loss {
             let reason = snap
                 .aborted_loss_reason
@@ -1132,13 +1133,13 @@ pub enum ResumeAction {
         has_mapfile: bool,
         has_mkv: bool,
     },
-    /// Dir carries a `.aborted-loss` marker (rip aborted because loss exceeded
-    /// `abort_on_lost_secs`) and is still under `MAX_LOSS_RESUME_ATTEMPTS`, so
-    /// it's RESUMABLE: re-check it against the CURRENT threshold (which may have
-    /// been raised) and/or re-attempt recovery. `attempt` is the abort count so
-    /// far; the classifier routes this through the same eligibility check as
-    /// `ResumePreserved`. Once the count reaches the limit the resume scan
-    /// promotes the dir to terminal `.failed` and emits `AlreadyFailed` instead.
+    /// Dir carries a `.aborted-loss` marker (the rip phase aborted because
+    /// main-movie loss exceeded `abort_on_lost_secs`), so it's RESUMABLE:
+    /// re-check it against the CURRENT threshold (which may have been raised)
+    /// and/or re-attempt recovery. `attempt` is the abort count so far; the
+    /// classifier routes this through the same eligibility check as
+    /// `ResumePreserved`. A loss-abort is deterministic and stays RESUMABLE
+    /// indefinitely — never promoted to terminal `.failed` by attempt count.
     ResumeAbortedLoss {
         attempt: u64,
         reason: String,

@@ -492,13 +492,16 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             }
         } else {
             let path_str = dir.to_string_lossy().to_string();
-            // Surface the ACTUAL reason the dir didn't advance (e.g. a
-            // rip-phase loss abort "0.86s lost in main movie exceeds threshold
-            // 0s", or a structural finalize failure) from the staging marker the
-            // mux worker wrote, instead of a generic "see the device log" — the
-            // operator should not have to read device logs to learn why. A
-            // rip-phase loss abort leaves a resumable `.aborted-loss`, so the UI
-            // can offer Accept-damage off that reason.
+            // Surface the ACTUAL reason the dir didn't advance — a STRUCTURAL
+            // mux finalize/write failure (the mux no longer aborts a disc for
+            // loss: a completed mux always hands off, so a non-advancing dir
+            // here means the output failed to finalize/write, not a loss
+            // threshold) — from the staging marker the mux worker wrote, instead
+            // of a generic "see the device log", so the operator doesn't have to
+            // read device logs to learn why. The `read_aborted_loss` probe is
+            // defensive: a rip-phase loss abort writes `.aborted-loss` BEFORE
+            // muxing (it skips the mux), so it normally never reaches this
+            // worker, but if one is somehow present the UI can still surface it.
             let reason = crate::ripper::staging::read_aborted_loss(&dir)
                 .map(|(r, _)| r)
                 .or_else(|| crate::ripper::staging::read_failed_reason(&dir))
@@ -508,7 +511,7 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             record_error(
                 &path_str,
                 &reason,
-                "staging is preserved — raise the loss threshold or Accept the damage to deliver as-is",
+                "the mux failed to finalize/write the output — staging is preserved; check the _mux device log for the failure detail and re-run the mux",
             );
         }
     }

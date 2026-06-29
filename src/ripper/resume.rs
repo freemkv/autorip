@@ -2305,7 +2305,10 @@ mod resume_handoff_contract_tests {
 }
 
 #[cfg(test)]
-mod post_mux_loss_gate_tests {
+// Named for history: v1.2.0 REMOVED the post-mux loss-abort gate (a completed
+// mux now always proceeds to hand-off). These tests pin the resulting contract
+// — mux-time loss is REPORTED, never gated/quarantined — at source level.
+mod post_mux_loss_reporting_tests {
     /// Regression: a resume must report sweep loss + demux loss to the
     /// operator, not the sweep mapfile alone. Since v1.2.0 the mux never aborts
     /// on mux-time loss; whatever demux loss the concealed MKV carries is real
@@ -2381,14 +2384,18 @@ mod post_mux_loss_gate_tests {
     fn resume_incomplete_mux_surfaces_read_error_not_silent_idle() {
         let src = include_str!("resume.rs");
         // Bound to the mux-incomplete early-return: from the guard up to the
-        // post-mux loss-abort gate comment that follows it.
+        // v1.2.0 mux-never-aborts comment that immediately follows it (the old
+        // post-mux loss-abort gate was REMOVED in 1.2.0, so its text is gone —
+        // anchoring on that phrase used to self-match this test's own source via
+        // `include_str!` and span ~1000 lines). The new anchor brackets just the
+        // ~35-line guard block.
         let start = src
             .find("if !mux_outcome.output_opened || !mux_outcome.completed {")
             .expect("resume.rs should have the mux-incomplete guard");
         let end = src[start..]
-            .find("Post-mux loss abort gate")
+            .find("v1.2.0: the mux never aborts on mux-time")
             .map(|i| start + i)
-            .expect("resume.rs should have the post-mux loss gate after the guard");
+            .expect("resume.rs should have the v1.2.0 mux-never-aborts comment after the guard");
         let region = &src[start..end];
 
         assert!(
@@ -2415,6 +2422,62 @@ mod post_mux_loss_gate_tests {
             ),
             "resume mux-incomplete branch must not hardcode idle/None, hiding the \
              read-error cause and aliasing a failure to a clean stop"
+        );
+    }
+
+    /// v1.2.0 invariant: a COMPLETED mux that carries mux-time (demux/decrypt)
+    /// loss ALWAYS proceeds to a hand-off marker (`.done` if title-confident,
+    /// else `.review`) and NEVER quarantines the disc on that loss — no
+    /// `.failed`, no `.aborted-loss`. The post-mux loss-abort gate (which used
+    /// `should_abort_for_loss` to fail a lossy-but-complete mux) was removed; the
+    /// only remaining loss gate is the PRE-mux rip phase (resume.rs §3, which
+    /// runs and returns BEFORE this success region).
+    ///
+    /// A behavioural test would need a real lossy ISO + mux pipeline (same
+    /// rationale as the sibling gate tests); instead this pins, at source level,
+    /// that the success region (a) still reports the demux loss and (b) hands off
+    /// without ever consulting a loss threshold or writing a terminal-loss marker.
+    #[test]
+    fn completed_mux_with_loss_hands_off_and_never_fails_on_loss() {
+        let src = include_str!("resume.rs");
+        // The completed-mux success region: from the v1.2.0 mux-never-aborts
+        // note through the auto-eject tail (same bounds the loss-reporting test
+        // above pins, on the success side of the mux-incomplete guard).
+        let start = src
+            .find("v1.2.0: the mux never aborts on mux-time")
+            .expect("resume.rs should have the v1.2.0 mux-never-aborts comment");
+        let end = src[start..]
+            .find("Honor auto_eject after a successful resume")
+            .map(|i| start + i)
+            .expect("resume.rs should have the auto_eject tail after success");
+        let region = &src[start..end];
+
+        // (a) The loss is still REPORTED, never silently dropped.
+        assert!(
+            region.contains("demux_lost_secs"),
+            "completed-mux success region must still report demux-time loss"
+        );
+        // (b) It hands off via a `.done`/`.review` marker.
+        assert!(
+            region.contains("if title_confident { \".done\" } else { \".review\" }"),
+            "completed mux must hand off to .done (confident) or .review (not)"
+        );
+        assert!(
+            region.contains("write_handoff_marker"),
+            "completed mux must write a hand-off marker so the mover/operator picks it up"
+        );
+        // (c) It NEVER consults a loss threshold on the completed-mux path...
+        assert!(
+            !region.contains("should_abort_for_loss"),
+            "the post-mux loss-abort gate was removed in 1.2.0 — a completed mux \
+             must not gate hand-off on a loss threshold"
+        );
+        // ...and NEVER writes a terminal-loss marker for mux-time loss.
+        assert!(
+            !region.contains("mark_aborted_on_loss")
+                && !region.contains("write_aborted_loss_marker")
+                && !region.contains("ABORTED_LOSS_MARKER"),
+            "a completed mux carrying loss must NOT be quarantined with .aborted-loss"
         );
     }
 }
