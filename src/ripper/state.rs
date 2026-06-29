@@ -35,6 +35,14 @@ pub enum Resumable {
     Sweep,
 }
 
+// TODO(1.2.0): replace the stringly-typed `status` with two explicit enums —
+// DeviceStage (idle/scanning/sweeping/patching/done) for the drive on the
+// Ripper tab, and PipelineStage (queued/muxing/moving/delivered/blocked) for
+// the disc-in-pipeline on the System tab. Deferred this cycle: the web UI JS
+// hard-depends on these exact status strings (web.rs buildSteps:
+// `s.status==='scanning'` etc.), so the enum cutover must land together with
+// the frontend rework rather than half-wired. The post-mux abort removal
+// (mux never aborts) is the SAFE subset that shipped now.
 /// State broadcast for web UI.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RipState {
