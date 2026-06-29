@@ -426,8 +426,8 @@ pub fn render_resolution_trace(trace: &ResolutionTrace) -> Vec<String> {
     lines
 }
 
-/// [`DiscKeyAccess`] backed by a live optical drive. `vid` is the Volume ID
-/// from the structure scan (the drive read it during AACS auth).
+/// [`DiscKeyAccess`] backed by a live optical drive. Samples ciphertext
+/// directly from the drive for the AACS key derivation.
 pub struct DriveAccess<'a> {
     drive: &'a mut libfreemkv::Drive,
 }
