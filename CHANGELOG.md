@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.2.0] — 2026-06-28
+## [1.2.0] — 2026-06-29
 
 ### Added
 
@@ -12,8 +12,8 @@
 
 ### Changed
 
-- **The mux never aborts on mux-time loss.** A disc that swept and patched is
-  always handed to the muxer, and the muxer always delivers. Earlier versions
+- **The mux never aborts on mux-time loss.** A disc that was swept and patched
+  is always handed to the muxer, and the muxer always delivers. Earlier versions
   ran a *second* loss check after muxing and could quarantine an
   already-finished file when demux/decrypt loss exceeded `abort_on_lost_secs` —
   but with libfreemkv 1.2.0 that loss is concealed into a decode-clean file
@@ -39,6 +39,10 @@
   the System tab surfaces the actual reason from the staging marker instead of a
   generic "mux worker dispatch did not complete (see _mux device log)", so the
   operator doesn't have to read device logs.
+- **Removed the bad-ranges detail table from the rip card.** Its summary total
+  was computed in the wrong unit (showing "<1 ms total" while the ranges summed
+  to tens of seconds), and it duplicated the at-a-glance Good/Maybe pills. The
+  table is gone; the pills and the in-bar red bad-range overlay remain.
 
 - **The dashboard is no longer cached across releases.** The single-page UI
   (HTML + inline JS) was served with no `Cache-Control`, so browsers kept
