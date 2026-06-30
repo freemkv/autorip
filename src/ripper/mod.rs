@@ -2537,7 +2537,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             pass1_state.borrow_mut().last_work_done = p.work_done;
             pass1_state.borrow_mut().last_work_total = p.work_total;
             // Throttle: only re-read mapfile + push state every 1.5s.
-            if pass1_state.borrow().last_update.elapsed().as_millis() < 1500 {
+            // 250 ms UI push cadence (see the patch closure below for rationale).
+            if pass1_state.borrow().last_update.elapsed().as_millis() < 250 {
                 return true;
             }
             push_pass_state(
@@ -3144,6 +3145,28 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 bytes_unreadable, // LOST bucket — terminal
             );
 
+            // Per-pass progress state — created BEFORE the settle so the disc
+            // map can be painted immediately.
+            let patch_state = std::cell::RefCell::new(PassProgressState::new());
+            let patch_ctx = &pass_ctx;
+            let patch_title = &title_for_progress;
+            let patch_map = std::path::Path::new(&mapfile_path_str);
+
+            // Paint the map (red bad ranges + at-risk movie time) at pass start,
+            // BEFORE the 30 s settle. Otherwise the bar sits all-green with
+            // "Maybe … · 0:00" for 30 s until the patch loop's first emission —
+            // most visible on resume, where there's no prior sweep push to carry
+            // the ranges across the pass boundary.
+            push_pass_state(
+                patch_ctx,
+                patch_title,
+                bps_progress,
+                patch_map,
+                pass,
+                total_passes,
+                &patch_state,
+            );
+
             // Settle the drive between Pass 1 and Pass 2 only. The BU40N
             // (and other Initio-bridge drives) wedge after grinding on bad
             // sectors. Giving the drive 30 s of idle BEFORE we hammer it
@@ -3166,16 +3189,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     pass, bytes_pending
                 ),
             );
-
-            // Per-pass progress + watcher.
-            let patch_state = std::cell::RefCell::new(PassProgressState::new());
-            let patch_ctx = &pass_ctx;
-            let patch_title = &title_for_progress;
-            let patch_map = std::path::Path::new(&mapfile_path_str);
             let patch_progress = |p: &libfreemkv::progress::PassProgress| -> bool {
                 patch_state.borrow_mut().last_work_done = p.work_done;
                 patch_state.borrow_mut().last_work_total = p.work_total;
-                if patch_state.borrow().last_update.elapsed().as_millis() < 1500 {
+                // 250 ms UI push cadence (matches libfreemkv's snapshot
+                // republish). The speed/ETA window is time-based, so finer
+                // samples only smooth it; the per-push mapfile reload is cheap
+                // for the usual handful of ranges.
+                if patch_state.borrow().last_update.elapsed().as_millis() < 250 {
                     return true;
                 }
                 push_pass_state(
