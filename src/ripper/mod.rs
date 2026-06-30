@@ -3198,7 +3198,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // mirror what patch_internal was constructing internally.
             let patch_opts = libfreemkv::PatchOptions {
                 decrypt: false,
-                block_sectors: Some(1),
+                // Enter each bad range BATCHED (not single-sector). A bad
+                // range from Pass 1 is mostly the good skip-ahead overshoot
+                // with a small damaged core; reading it one sector at a time
+                // (the old Some(1)) paid a SCSI op + AACS-unit decrypt per
+                // sector even through the good part. With a batch, the good
+                // overshoot reads in bulk and a batch failure bisects
+                // (handle_read_failure halves) down to the actual bad sector
+                // — single-sector cost is confined to real damage. Matches
+                // the sweep's batch size.
+                block_sectors: Some(32),
                 full_recovery: true,
                 reverse: true,
                 wedged_threshold: 50,
