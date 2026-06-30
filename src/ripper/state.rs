@@ -672,6 +672,10 @@ pub(super) struct PassProgressState {
     /// Last `work_total` reported by libfreemkv's `Progress` trait — total
     /// bytes this pass will process. Drives `pass_progress_pct` denominator.
     pub(super) last_work_total: u64,
+    /// Hold the displayed-speed window at a fixed 10s (instead of growing to
+    /// 60s) for bursty PATCH passes, so the speed stays responsive. Set by
+    /// `push_pass_state` from the pass number; the steady sweep leaves it false.
+    pub(super) responsive: bool,
     /// `bytes_unreadable` snapshotted on this pass's first
     /// `push_pass_state` callback, frozen for the rest of the pass. The
     /// total-progress denominator (`max_retries × bytes_lost`) uses this
@@ -745,6 +749,7 @@ impl PassProgressState {
             last_log: now,
             last_work_done: 0,
             last_work_total: 0,
+            responsive: false,
             frozen_bytes_lost: None,
         }
     }
@@ -769,7 +774,16 @@ impl PassProgressState {
             .pass_start
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or(0.0);
-        let window_secs = display_window_secs(elapsed_pass);
+        // Patch passes are bursty (grind one sector, then zip the readable
+        // overshoot), so they hold a fixed 10s window — the displayed speed
+        // stays responsive and a fast-capture burst shows up fast instead of
+        // being diluted over a minute. The sweep is steady, so it keeps the
+        // growing 10s→60s window that smooths a transient stall.
+        let window_secs = if self.responsive {
+            STATIC_WINDOW_SECS
+        } else {
+            display_window_secs(elapsed_pass)
+        };
         let cutoff = now.checked_sub(std::time::Duration::from_secs_f64(window_secs));
         if let Some(cutoff) = cutoff {
             while let Some(&(t, _)) = self.samples.front() {
@@ -943,6 +957,9 @@ pub(super) fn push_pass_state(
     let (speed_mbs, pass_eta_str, total_eta_str) = {
         let mut s = state.borrow_mut();
         let now = std::time::Instant::now();
+        // Patch passes (pass > 1) hold a fixed 10s speed window — bursty
+        // recovery should read responsively, not be smoothed over a minute.
+        s.responsive = pass > 1;
         let display_speed = s.observe(now, last_pos);
         // ETA uses the long-running average (bytes ripped this pass /
         // elapsed-this-pass), NOT the displayed 10 s window. A transient
