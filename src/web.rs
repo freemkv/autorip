@@ -224,8 +224,8 @@ function renderBar(s,p){
   const ranges=s&&s.bad_ranges||[];
   const positional=!!(s&&s.pass>1);
   /* Same height in EVERY pass (pass 1 sweep + pass N defrag map) so the bar
-     doesn't resize between phases. 30px reads as a disc map, not a hairline. */
-  const barH=30;
+     doesn't resize between phases. 20px reads as a disc map, not a hairline. */
+  const barH=20;
   /* "You are here" caret ABOVE the bar — consistent in EVERY pass.
      pass 1 (sweep): at last_sector, the real sequential read head.
      pass N (patch): at the active section = the highest-LBA bad range still
@@ -409,14 +409,16 @@ function renderSteps(steps,progress,eta,speed,s){
          Time is rendered at ms precision (fmtMs): 6 sectors is 1 ms, never 0. */
       const bg=s.bytes_good||0, bm=(s.bytes_maybe||0)+(s.bytes_lost||0);
       if(bg>0 || bm>0){
-        const pill = (label, color, body, minPx)=>
-          '<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:'+color
+        /* FIXED width (not min-width) + border-box so the pills never grow or
+           shrink as the byte/time values change — the row stays rock-steady. */
+        const pill = (label, color, body, wPx)=>
+          '<span style="display:inline-block;box-sizing:border-box;padding:2px 8px;border-radius:10px;background:'+color
           +';color:var(--pill-fg);font-size:.65rem;font-weight:600;margin-right:6px;'
-          +'min-width:'+minPx+'px;text-align:center;font-variant-numeric:tabular-nums">'
+          +'width:'+wPx+'px;text-align:center;white-space:nowrap;overflow:hidden;font-variant-numeric:tabular-nums">'
           +label+' '+body+'</span>';
         let pills='';
         if(bg>0){
-          pills+=pill('Good','var(--green,#3aaa55)', fmtBytes(bg), 90);
+          pills+=pill('Good','var(--green,#3aaa55)', fmtBytes(bg), 150);
         }
         if(bm>0){
           /* Time = MAIN-FEATURE movie time at risk (main_at_risk_ms: pending +
@@ -426,7 +428,7 @@ function renderSteps(steps,progress,eta,speed,s){
              affected. Melts toward 0 as retries recover pending sectors. */
           const atRiskMs = (s.main_at_risk_ms!=null && s.main_at_risk_ms>=0) ? s.main_at_risk_ms : 0;
           const t = atRiskMs>0 ? '~'+fmtMs(atRiskMs) : '0:00';
-          pills+=pill('Maybe','var(--yellow,#f0c000)', fmtBytes(bm)+' \u00b7 '+t, 160);
+          pills+=pill('Maybe','var(--yellow,#f0c000)', fmtBytes(bm)+' \u00b7 '+t, 200);
         }
         if(pills) badLine='<div style="font-size:.7rem;margin-top:14px">'+pills+'</div>';
       }
@@ -583,14 +585,13 @@ function renderCurrent(){
   /* Actions bar */
   let btns='';
   if(active){
-    btns='<button class="btn btn-stop" onclick="if(confirm(\'Stop?\')){this.disabled=true;fetch(\'/api/stop/'+dev+'\',{method:\'POST\'})}">Stop</button>';
-    /* Elapsed-since-rip-started counter (v0.25.7). Ticks every 1s from
-       a single setInterval. font-variant-numeric:tabular-nums keeps
-       every digit the same pixel width so the second-flips don't
-       jitter; min-width reserves space for the widest expected value
-       ("1h 02m 34s" ≈ 70px) so growing past 10m or past 1h doesn't
-       shove anything else around. */
-    btns+='<span id="rip-elapsed-'+dev+'" data-started="'+(s.started_epoch_secs||0)+'" style="margin-left:10px;font-size:.78rem;color:var(--text2);align-self:center;font-variant-numeric:tabular-nums;min-width:80px;display:inline-block"></span>';
+    /* Elapsed counter goes BEFORE the Stop button: the action row is
+       right-anchored, so the counter's growth (1m → 1h 02m 34s) extends
+       LEFTWARD into empty space and never shoves the Stop button. tabular-nums
+       keeps digits a fixed pixel width (no per-second jitter); text-align:right
+       + a min-width wide enough for the "1h 02m 34s" form keeps it stable. */
+    btns='<span id="rip-elapsed-'+dev+'" data-started="'+(s.started_epoch_secs||0)+'" style="margin-right:10px;font-size:.78rem;color:var(--text2);align-self:center;font-variant-numeric:tabular-nums;min-width:95px;text-align:right;display:inline-block"></span>';
+    btns+='<button class="btn btn-stop" onclick="if(confirm(\'Stop?\')){this.disabled=true;fetch(\'/api/stop/'+dev+'\',{method:\'POST\'})}">Stop</button>';
   }else if(scanned){
     /* Keys resolved at scan time. If they're missing (and the operator
        hasn't opted into capture-without-keys), don't offer Rip at all —
