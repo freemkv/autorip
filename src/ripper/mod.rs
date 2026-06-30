@@ -2530,8 +2530,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // timestamp + bytes for speed/ETA calc.
         let pass1_state = std::cell::RefCell::new(PassProgressState::new());
         let pass1_ctx = &pass_ctx;
-        let pass1_title = &title_for_progress;
-        let pass1_map = std::path::Path::new(&mapfile_path_str);
         let pass1_progress = |p: &libfreemkv::progress::PassProgress| -> bool {
             // Stash work_done for push_pass_state to compute pass progress.
             pass1_state.borrow_mut().last_work_done = p.work_done;
@@ -2541,15 +2539,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             if pass1_state.borrow().last_update.elapsed().as_millis() < 250 {
                 return true;
             }
-            push_pass_state(
-                pass1_ctx,
-                pass1_title,
-                bps_progress,
-                pass1_map,
-                1,
-                total_passes,
-                &pass1_state,
-            );
+            push_pass_state(pass1_ctx, p, bps_progress, 1, total_passes, &pass1_state);
             true
         };
 
@@ -3156,16 +3146,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // BEFORE the 30 s settle. Otherwise the bar sits all-green with
             // "Maybe … · 0:00" for 30 s until the patch loop's first emission —
             // most visible on resume, where there's no prior sweep push to carry
-            // the ranges across the pass boundary.
-            push_pass_state(
-                patch_ctx,
-                patch_title,
-                bps_progress,
+            // the ranges across the pass boundary. The lib builds the snapshot
+            // from the mapfile (autorip never parses it); there's no live `p`
+            // yet at the boundary.
+            if let Some(snap) = libfreemkv::disc::progress_snapshot_from_mapfile(
                 patch_map,
-                pass,
-                total_passes,
-                &patch_state,
-            );
+                Some(patch_title),
+                libfreemkv::progress::PassKind::Trim { reverse: true },
+                patch_ctx.bytes_total_disc,
+            ) {
+                push_pass_state(
+                    patch_ctx,
+                    &snap,
+                    bps_progress,
+                    pass,
+                    total_passes,
+                    &patch_state,
+                );
+            }
 
             // Settle the drive between Pass 1 and Pass 2 only. The BU40N
             // (and other Initio-bridge drives) wedge after grinding on bad
@@ -3199,15 +3197,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 if patch_state.borrow().last_update.elapsed().as_millis() < 250 {
                     return true;
                 }
-                push_pass_state(
-                    patch_ctx,
-                    patch_title,
-                    bps_progress,
-                    patch_map,
-                    pass,
-                    total_passes,
-                    &patch_state,
-                );
+                push_pass_state(patch_ctx, p, bps_progress, pass, total_passes, &patch_state);
                 true
             };
             let pass_halt = Arc::new(AtomicBool::new(false));
@@ -3983,17 +3973,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         bytes_unreadable_at_mux = bytes_unreadable;
 
         // Entering mux phase — push final mapfile state so the UI keeps the
-        // bad-range list visible through mux and into the "done" view.
+        // bad-range list visible through mux and into the "done" view. The lib
+        // builds the snapshot from the mapfile (autorip never parses it).
         let mux_state = std::cell::RefCell::new(PassProgressState::new());
-        push_pass_state(
-            &pass_ctx,
-            &title_for_progress,
-            bps_progress,
+        if let Some(snap) = libfreemkv::disc::progress_snapshot_from_mapfile(
             std::path::Path::new(&mapfile_path_str),
-            total_passes,
-            total_passes,
-            &mux_state,
-        );
+            Some(&title_for_progress),
+            libfreemkv::progress::PassKind::Mux,
+            pass_ctx.bytes_total_disc,
+        ) {
+            push_pass_state(
+                &pass_ctx,
+                &snap,
+                bps_progress,
+                total_passes,
+                total_passes,
+                &mux_state,
+            );
+        }
         // Snapshot the damage fields just written to STATE so the mux phase
         // can carry them forward in every per-frame push_state call.
         // Without this snapshot, push_state's `..Default::default()` would
