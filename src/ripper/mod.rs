@@ -178,15 +178,32 @@ fn key_readiness(
     if capture_without_keys {
         return "Capture without keys — no decryption".to_string();
     }
-    let reason = match outcome {
-        KeyOutcome::NoKey => "no key source has a key for this disc".to_string(),
-        KeyOutcome::MissingInputs => "this disc's key files could not be read".to_string(),
-        // A resolve that still left the disc keyless: defer to the libfreemkv
-        // AACS failure message, with the `Error: E<code> ` prefix stripped so
-        // the tile shows a concise reason.
-        KeyOutcome::Resolved => {
-            let msg = keyless_failure_message(disc);
-            strip_error_prefix(&msg).to_string()
+    // Accurate reason, in the SAME vocabulary the CLI speaks: render the
+    // libfreemkv error CODE through the shared `freemkv_i18n` catalog (the very
+    // en.json the CLI renders). PREFER the disc's own AACS-resolution error —
+    // captured by the scan in `disc.aacs_error` — because it is the true cause
+    // (e.g. E7025 "bus key unavailable", E6000 "disc unreadable / dirty"), not
+    // autorip's coarse `KeyOutcome`. This is what turns a wedged bus-auth disc
+    // from the misleading "key files could not be read" into its real condition,
+    // identical to what `freemkv` would print for the same code.
+    let reason = if let Some(err) = disc.aacs_error.as_ref() {
+        freemkv_i18n::error_message(u32::from(err.code()))
+    } else {
+        match outcome {
+            KeyOutcome::NoKey => "no key source has a key for this disc".to_string(),
+            // `inputs()` was None yet no AACS error was recorded — not expected
+            // from a real scan, but keep a sane, actionable generic.
+            KeyOutcome::MissingInputs => {
+                "couldn't read this disc's key files — the disc may be dirty, or the drive \
+                 may need an eject + reload"
+                    .to_string()
+            }
+            // Resolve ran but left the disc keyless: defer to the libfreemkv
+            // AACS failure message, concise prefix stripped.
+            KeyOutcome::Resolved => {
+                let msg = keyless_failure_message(disc);
+                strip_error_prefix(&msg).to_string()
+            }
         }
     };
     format!("Missing keys — {reason}")
@@ -3334,6 +3351,25 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // `map` without flushing, then re-loaded the pre-promotion file,
         // causing the abort check to see zero Unreadable bytes even after
         // promotion — MED logic bug fixed here).
+        // A user STOP is NOT recovery-exhaustion. If the user halted (before or
+        // within the retry passes), skip the NonTrimmed→Unreadable promotion AND
+        // the abort-on-loss check below — those un-retried ranges are still
+        // recoverable. Preserve the partial sweep (ISO + mapfile, ranges left
+        // NonTrimmed, no terminal marker) and stop cleanly so a later Resume
+        // continues Pass 1 + Pass N from the mapfile. (Bug fixed here: this halt
+        // check previously lived only at the mux gate, AFTER this promote+abort
+        // block — so a stop before the retry passes promoted un-retried ranges to
+        // Unreadable and wrote a spurious `.aborted-loss`, mis-routing the disc to
+        // the accept-loss/remux resume path instead of continue-the-sweep.)
+        if user_halt.load(Ordering::Relaxed) {
+            crate::log::device_log(
+                device,
+                "Rip stopped by user — preserving partial sweep for resume (no Unreadable promotion, no loss-abort).",
+            );
+            unregister_halt(device);
+            return;
+        }
+
         let mut main_lost_ms_for_history = 0.0f64;
         let mut main_lost_bytes_for_history = 0u64;
         if cfg_read.max_retries > 0 {

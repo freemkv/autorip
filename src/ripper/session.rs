@@ -117,7 +117,22 @@ where
     F: FnOnce() + Send + 'static,
 {
     let name = format!("{}-{}", role, device);
-    let handle = std::thread::Builder::new().name(name).spawn(f)?;
+    // Enter a per-thread span carrying the build + device for the worker's whole
+    // life. tracing spans are thread-local, so events from THIS crate AND from
+    // libfreemkv (called synchronously on this thread — its read_error / wedge /
+    // bus_key_unavailable warns) inherit these fields. That stamps the running
+    // build onto every diagnostic line in autorip.log / autorip.jsonl — the lines
+    // that previously couldn't be attributed to a build across a redeploy.
+    let span_build = crate::VERSION_LABEL;
+    let span_device = device.to_string();
+    let span_role = role.to_string();
+    let wrapped = move || {
+        let _span =
+            tracing::info_span!("worker", build = span_build, device = %span_device, role = %span_role)
+                .entered();
+        f();
+    };
+    let handle = std::thread::Builder::new().name(name).spawn(wrapped)?;
     match register_rip_thread(device, handle) {
         Ok(()) => Ok(()),
         Err(RegisterError::PriorThreadRunning(new_handle)) => {
