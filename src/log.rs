@@ -62,17 +62,30 @@ fn device_log_path(device: &str) -> String {
 /// in-memory ring stores the same. ISO-8601 timestamps so rip log archives
 /// sort correctly and midnight isn't ambiguous.
 pub fn device_log(device: &str, msg: &str) {
-    let line = format!("[{}] {}", crate::util::format_iso_datetime(), msg);
+    let ts = crate::util::format_iso_datetime();
+    let line = format!("[{}] {}", ts, msg);
 
     // In-memory ring (last RING_CAP lines per device). VecDeque gives O(1)
     // eviction from the front instead of Vec::remove(0)'s O(n) shift.
-    if let Ok(mut logs) = LOGS.lock() {
+    // `new_session` = this is the first line for the device since the ring was
+    // empty (process start, or just after `archive_device_log`). We anchor each
+    // session's file with a build banner so any log slice is attributable to the
+    // build that produced it — without that, a Watchtower redeploy mid-session
+    // interleaves two builds' lines indistinguishably (the bug that turned
+    // "which build emitted this?" into archaeology). The banner goes to the FILE
+    // only — keeping the in-memory ring (the live UI view) byte-for-byte as
+    // before so its line accounting is unchanged.
+    let new_session = if let Ok(mut logs) = LOGS.lock() {
         let log = logs.entry(device.to_string()).or_default();
+        let was_empty = log.is_empty();
         log.push_back(line.clone());
         if log.len() > RING_CAP {
             log.pop_front();
         }
-    }
+        was_empty
+    } else {
+        false
+    };
 
     // File log — per-device, append-only between archive points. A disk-full
     // or NFS stale-handle condition here must not break a rip (logging is
@@ -85,6 +98,14 @@ pub fn device_log(device: &str, msg: &str) {
         .open(&path)
     {
         Ok(mut f) => {
+            if new_session {
+                let _ = writeln!(
+                    f,
+                    "[{}] ▸ autorip {} — log session start",
+                    ts,
+                    crate::VERSION_LABEL
+                );
+            }
             if let Err(e) = writeln!(f, "{}", line) {
                 tracing::warn!(device = %device, path = %path, error = %e, "device log write failed");
             }
@@ -94,11 +115,11 @@ pub fn device_log(device: &str, msg: &str) {
         }
     }
 
-    // Structured event into the central log stream. The `device` field is
-    // what makes `jq 'select(.fields.device == "sg4")' autorip.jsonl`
-    // possible — the per-device files don't carry that grouping in a single
-    // file the way the JSONL stream does.
-    tracing::info!(device = %device, "{}", msg);
+    // Structured event into the central log stream. `device` enables
+    // `jq 'select(.fields.device == "sg4")' autorip.jsonl`; `build` stamps the
+    // running binary on EVERY device event so the central log (autorip.log /
+    // autorip.jsonl) is self-identifying across redeploys.
+    tracing::info!(device = %device, build = %crate::VERSION_LABEL, "{}", msg);
 }
 
 /// Get the most recent `lines` log lines for a device, oldest-first.
@@ -265,6 +286,46 @@ mod tests {
         assert_eq!(bracket.len(), 20);
         assert!(bracket.ends_with('Z'));
         assert_eq!(bracket.as_bytes()[10], b'T');
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn new_session_writes_build_banner_to_file_not_ring() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tmpdir("build_banner");
+        unsafe {
+            std::env::set_var("AUTORIP_DIR", &d);
+        }
+        let dev = format!("test_banner_{}", std::process::id());
+        device_log(&dev, "first line");
+        device_log(&dev, "second line");
+
+        // File: a build banner precedes the first line (session anchor), and the
+        // build label is present so the slice is attributable.
+        let content = std::fs::read_to_string(device_log_path(&dev)).unwrap();
+        assert!(
+            content.contains("log session start") && content.contains(crate::VERSION_LABEL),
+            "file must carry a build banner: {content}"
+        );
+        assert_eq!(
+            content.matches("log session start").count(),
+            1,
+            "exactly one banner per session, not per line"
+        );
+        // The banner must come before the first real line.
+        let banner_at = content.find("log session start").unwrap();
+        let first_at = content.find("first line").unwrap();
+        assert!(banner_at < first_at, "banner must precede the first line");
+
+        // Ring (live UI view) is unchanged — banner is file-only, so line
+        // accounting stays exactly as before.
+        let ring = get_device_log(&dev, 100);
+        assert_eq!(
+            ring.len(),
+            2,
+            "ring holds only the two real lines, no banner"
+        );
+        assert!(ring.iter().all(|l| !l.contains("log session start")));
         let _ = std::fs::remove_dir_all(&d);
     }
 
