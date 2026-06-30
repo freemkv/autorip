@@ -110,13 +110,6 @@ fn main() {
     // captured post-mortem.
     observe::init();
 
-    // Plug in the LibreDrive firmware unlocker. libfreemkv ships only the
-    // pluggable `Unlocker` seam; this single line registers the firmware
-    // unlock implementation so matching drives are unlocked at drive-prep.
-    // Remove it (and the freemkv-unlock-ld dep) and autorip still builds —
-    // drives fall back to the host-cert AACS handshake.
-    libfreemkv::register_unlocker(Box::new(freemkv_unlock_ld::LibreDrive::new()));
-
     // Signal handler for graceful shutdown
     #[cfg(unix)]
     unsafe {
