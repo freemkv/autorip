@@ -354,7 +354,7 @@ function renderSteps(steps,progress,eta,speed,s){
         '<span style="'+TAB+'min-width:'+minPx+'px;text-align:'+align+'">'+body+'</span>';
       const passPctStr=col(passPct+'%',45,'right');
       const passEtaStr=col(s.pass_eta?'ETA '+s.pass_eta:'',95,'left');
-      const spdStr=col((speed&&speed!=='0 KB/s')?speed:'',85,'left');
+      const spdStr=col(speed||'',85,'left');
       /* v0.13.19: wider text-row separators (em-spaces around the middle dot)
          + more vertical breathing room between bars and their text rows so
          the dashboard doesn't feel cramped. */
@@ -647,7 +647,7 @@ function renderCurrent(){
   /* Steps */
   const steps=buildSteps(s);
   const progressStr=s.progress_pct>0?s.progress_pct+'%':(s.progress_gb>0?s.progress_gb.toFixed(1)+' GB':'');
-  const speedStr=s.speed_mbs>=1?s.speed_mbs.toFixed(1)+' MB/s':s.speed_mbs>0?(s.speed_mbs*1024).toFixed(0)+' KB/s':'0 KB/s';
+  const speedStr=fmtSpeed(s.speed_mbs);
   const etaStr=s.eta||'';
   upd('steps',renderSteps(steps,progressStr,etaStr,speedStr,s));
 
@@ -797,6 +797,16 @@ function connectSSE(){
   _es.onerror=function(){_es.close();_es=null;setTimeout(connectSSE,2000)};
 }
 
+/* Speed string from MB/s. Drops to KB/s, then B/s for sub-KB rates, so a slow
+   patch reads e.g. "512 B/s" ("it's doing something") instead of "0 KB/s", and
+   "0 B/s" when work is genuinely frozen (grinding one sector's ECC) — never a
+   blank gap. */
+function fmtSpeed(mbs){
+  mbs=+mbs||0;
+  if(mbs>=1) return mbs.toFixed(1)+' MB/s';
+  if(mbs*1024>=1) return (mbs*1024).toFixed(0)+' KB/s';
+  return Math.round(mbs*1048576)+' B/s';
+}
 /* Live rip-elapsed counter (seconds resolution). */
 function fmtElapsedSecs(s){if(!s||s<0)return'';s=+s;const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return h>0?h+'h '+String(m).padStart(2,'0')+'m '+String(sec).padStart(2,'0')+'s':m+'m '+String(sec).padStart(2,'0')+'s'}
 /* v0.25.7: tick the rip-elapsed counter every 1s. Reads each
