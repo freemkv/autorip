@@ -1,9 +1,24 @@
 # Changelog
 
-## [1.2.0] — 2026-06-29
+## [1.2.0] — 2026-06-30
 
 ### Added
 
+- **Live patch view rework.** The rip card now shows a tall disc "defrag" map
+  (green = recovered, red = still bad) with a "you are here" marker tracking the
+  section being patched, a smooth fractional sweep fill, and a textual
+  `N sections · X sectors (Y MB) remaining` line. The ETA is always shown (no
+  more blank gaps at low patch rates), the Good/Maybe pills are fixed width so
+  the row doesn't jitter, and the elapsed counter sits before the Stop button so
+  its growth never shoves the button.
+- **Mux is its own view, not a rip pass.** The rip tab shows `pass 2/6` (sweep +
+  retries), never counting the mux; the map paints immediately at pass start
+  (red ranges + at-risk time) instead of sitting blank through the 30 s settle.
+- **Live Debug Log box** in the device view (the patch walk + per-read timings),
+  shown when debug logging is enabled.
+- **Loss-abort off-ramp.** When a rip can't finish perfectly, the System tab
+  offers explicit "Run one more pass" / "Accept & deliver" actions instead of
+  stalling on a stuck "scanning".
 - **Version now carries the build's git short hash** — `--version`, the UI
   footer, `/api/version`, and the startup log report e.g. `1.2.0 (g2014a41)`
   (the same shape libfreemkv stamps into MKVs), so a running build — including a
@@ -11,6 +26,21 @@
   bare package version.
 
 ### Changed
+
+- **autorip never reads the mapfile.** The live rip view renders entirely from
+  libfreemkv's `PassProgress` (the rendered located drilldown + at-risk movie
+  time), and the per-UI-tick mapfile reload is gone — the disc map, section
+  count and at-risk time all come from the library. If the mapfile format ever
+  changes (e.g. to a mapdb), no client code changes. The one-time done-card
+  verdict is the only remaining mapfile read.
+- **250 ms UI refresh** (was 1.5 s) so the map, sectors-remaining and speed
+  update live; the speed/ETA window is time-based so finer samples only smooth
+  it. Disc errors now render via `freemkv-i18n`, and each session stamps its
+  build SHA into the log.
+- **Batch patch reads (32 sectors).** autorip's patch block size was realigned
+  to libfreemkv's canonical 32 (it had drifted to single-sector), so a bad range
+  reads its good skip-ahead overshoot in bulk and only the real damage pays the
+  single-sector cost.
 
 - **The mux never aborts on mux-time loss.** A disc that was swept and patched
   is always handed to the muxer, and the muxer always delivers. Earlier versions
@@ -31,6 +61,17 @@
 
 ### Fixed
 
+- **Resume no longer false-fails on operator actions.** A graceful shutdown — an
+  operator redeploy, a host reboot, a Watchtower auto-update, a `docker stop` —
+  is never counted as a crash. The interrupted rip used to leave a
+  `.sweeping`/`.muxing` marker that the startup classifier read as an
+  in-progress crash and counted toward the restart limit, so a few redeploys
+  *during* a rip walked a perfectly healthy resumable rip to a false `.failed`
+  (resume "vanished"). autorip now cancels active rips on `SIGTERM` (so their
+  guards clear the markers) and clears any in-progress markers up front, with a
+  generous `stop_grace_period` — so only a true ungraceful crash (panic=abort /
+  OOM / power-loss) can ever increment the count. A cleanly-stopped resumable dir
+  is likewise never counted.
 - **Resume re-injects the mapfile VID for an uncatalogued-disc ISO.** Resuming a
   mux from a swept ISO whose disc wasn't in the catalogue now reconstructs the
   Volume ID from the mapfile so AACS resolution has the input it needs, instead
