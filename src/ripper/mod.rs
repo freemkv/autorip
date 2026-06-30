@@ -1092,6 +1092,16 @@ pub fn handle_rip_request(
                     device,
                     "Disc has a loss-aborted staged ISO awaiting an operator decision — NOT re-ripping. Use 'Accept damage' to deliver it, or 'Resume' to run another recovery pass.",
                 );
+                // Surface the decision in the live state, else the scan-set
+                // "scanning" status sticks forever with no movement and no
+                // off-ramp (the operator sees a perpetual spinner). Leave the
+                // status NON-active and flag `loss_aborted`: the web UI renders
+                // the Accept-damage / Resume buttons on `loss_aborted && !active`.
+                update_state_with(device, |s| {
+                    s.status = "idle".to_string();
+                    s.disc_present = true;
+                    s.loss_aborted = true;
+                });
                 drop_session(device);
                 return;
             }
