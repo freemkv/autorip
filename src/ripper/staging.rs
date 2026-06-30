@@ -432,6 +432,31 @@ pub fn clear_sweeping_marker(staging_disc_dir: &Path) {
     }
 }
 
+/// Clear every `.sweeping` / `.muxing` in-progress marker under `staging_root`.
+/// Called on GRACEFUL shutdown (SIGTERM: operator redeploy, reboot, Watchtower
+/// update, `docker stop`). A clean stop is NOT a crash, so every interrupted dir
+/// must be left clean-resumable — otherwise the startup classifier reads the
+/// leftover marker as an in-progress crash and bumps `.restart_count` toward a
+/// false `.failed`. This is the belt-and-suspenders to the rip-thread cancel:
+/// even if a rip drain overruns docker's stop-grace and the process is SIGKILLed
+/// before the SweepingGuard/MuxingGuard `Drop` runs, the markers are already
+/// gone, so the restart never counts the stop. Only a TRUE ungraceful crash
+/// (panic=abort / OOM / power loss — none of which reach this path) can leave a
+/// marker behind to be counted.
+pub fn clear_inprogress_markers(staging_root: &Path) {
+    let entries = match std::fs::read_dir(staging_root) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if dir.is_dir() {
+            clear_sweeping_marker(&dir);
+            clear_muxing_marker(&dir);
+        }
+    }
+}
+
 /// Write the `.completed` marker. Empty file — its existence is the
 /// signal. Best-effort; logs on failure.
 pub fn write_completed_marker(staging_disc_dir: &Path) {
