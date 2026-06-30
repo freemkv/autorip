@@ -565,23 +565,24 @@ function renderCurrent(){
   }else if(discIn){
     btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan</button>';
   }
-  /* Operator override: a rip that aborted because main-movie loss exceeded the
-     threshold can be DELIVERED as-is. The existing ISO is re-muxed (no re-sweep)
-     with the abort gate bypassed. Shown whenever the last error is a loss abort
-     and nothing is actively running. */
-  const lossAborted=(s.last_error||'').indexOf('lost in main movie')>=0||(s.last_error||'').indexOf('lost at mux')>=0;
+  /* Loss-aborted off-ramp: the rip aborted because main-movie loss exceeded the
+     threshold, but the COMPLETE ISO is staged on disk. Offer exactly TWO clear
+     choices and REPLACE the generic Rip/Verify (so the operator isn't offered a
+     destructive start-over here):
+       • "Run one more pass" — Resume (resume=yes): another recovery pass over
+         the bad ranges (Pass N from the mapfile, recovering only the bad core).
+       • "Accept & deliver"  — accept the recorded loss and deliver as-is
+         (re-mux with the abort gate bypassed; one-shot, confirmed).
+     Detected by the loss_aborted flag OR a loss-abort last_error; shown ONCE.
+     (Previously two separate blocks each appended an "Accept damage & deliver",
+     so it rendered twice with no Resume; --yellow is a dark brown, so black
+     text on it was unreadable — Resume is accent/white, Accept is amber-outlined.) */
+  const lossAborted=s.loss_aborted||(s.last_error||'').indexOf('lost in main movie')>=0||(s.last_error||'').indexOf('lost at mux')>=0;
   if(lossAborted&&!active){
-    btns='<button class="btn" style="background:var(--yellow);color:#000;border-color:var(--yellow)" onclick="if(confirm(\'Accept the lost data and deliver this movie as-is? The unreadable section will be missing, but the rest is intact.\')){fetch(\'/api/accept-loss/\'+dev,{method:\'POST\'})}">Accept damage &amp; deliver</button>'+btns;
+    btns='<button class="btn" style="background:var(--accent);color:#fff;border-color:var(--accent)" onclick="fetch(\'/api/rip/'+dev+'?resume=yes\',{method:\'POST\'})">Run one more pass</button>';
+    btns+='<button class="btn" style="background:transparent;color:var(--yellow);border-color:var(--yellow);font-weight:500" onclick="if(confirm(\'Accept the recorded main-movie damage and deliver this rip as-is? The unreadable section will be missing, but the rest is intact.\')){this.disabled=true;fetch(\'/api/accept-loss/\'+dev,{method:\'POST\'})}">Accept &amp; deliver</button>';
   }
   if(discIn&&!active)btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
-  /* Operator off-ramp for a loss-aborted rip: the complete ISO is staged on
-     disk, so instead of re-ripping you can ACCEPT the recorded main-movie
-     damage and deliver as-is (re-mux with the loss override). "Run another
-     pass" is the Resume button (continues Pass N from the mapfile, recovering
-     only the bad core). The accept is one-shot and confirmed. */
-  if(s.loss_aborted&&!active){
-    btns+='<button class="btn" style="background:var(--yellow,#f0c000);color:#000;border-color:var(--yellow,#f0c000)" onclick="if(confirm(\'Accept the recorded main-movie damage and deliver this rip as-is?\')){this.disabled=true;fetch(\'/api/accept-loss/\'+dev,{method:\'POST\'})}">Accept damage &amp; deliver</button>';
-  }
 
   const dot=active?'var(--green)':scanned?'var(--accent)':discIn?'var(--yellow)':'var(--text3)';
   const pulse=active?'animation:p 1.5s infinite;':'';
