@@ -130,6 +130,8 @@ tr:hover { background:var(--chip); }
   <div id="err"></div>
   <details style="margin-top:16px"><summary style="font-size:.7rem;color:var(--text3);text-transform:uppercase;font-weight:600;letter-spacing:1px;cursor:pointer;user-select:none">Log</summary>
   <div id="log" class="log" style="flex:1;max-height:none;margin-top:8px"></div></details>
+  <details id="debugBox" open style="margin-top:12px;display:none"><summary style="font-size:.7rem;color:var(--accent);text-transform:uppercase;font-weight:600;letter-spacing:1px;cursor:pointer;user-select:none">Debug Log (live) — the patch walk + timings</summary>
+  <div id="debuglog" class="log" style="flex:1;max-height:none;margin-top:8px"></div></details>
 </div>
 
 <!-- System page -->
@@ -701,6 +703,19 @@ function utcToLocal(line){
 
 /* ---- Device log viewer ---- */
 let _logTimer=null;
+/* Render one autorip.jsonl line as a compact human line for the debug box:
+   "HH:MM:SS LEVEL message  k=v k=v" (the patch walk + timings). Falls back
+   to the raw line if it isn't JSON. */
+function fmtDebugLine(line){
+  try{
+    const o=JSON.parse(line);
+    const t=(o.timestamp||'').replace('T',' ').replace('Z','').replace(/\.[0-9]+/,'');
+    const f=o.fields||{};
+    const msg=f.message||'';
+    const extra=Object.keys(f).filter(k=>k!=='message'&&k!=='build').map(k=>k+'='+f[k]).join(' ');
+    return t+' '+(o.level||'')+' '+msg+(extra?'  '+extra:'');
+  }catch(e){return line;}
+}
 function loadDeviceLog(dev){
   clearTimeout(_logTimer);
   fetch('/api/logs/'+encodeURIComponent(dev)).then(r=>r.text()).then(text=>{
@@ -711,6 +726,17 @@ function loadDeviceLog(dev){
       e._last=reversed;
     }
   }).catch(()=>{});
+  /* Debug Log box: only shown + polled when debug logging is ON. Reuses the
+     existing /api/debug jsonl tailer, filtered to this device, newest-first. */
+  const db=document.getElementById('debugBox');
+  if(window._debugOn){
+    if(db)db.style.display='';
+    fetch('/api/debug?device='+encodeURIComponent(dev)+'&n=500').then(r=>r.text()).then(text=>{
+      const el=document.getElementById('debuglog');
+      const lines=text.split('\n').filter(l=>l).map(fmtDebugLine).reverse().join('\n');
+      if(el&&el._last!==lines){el.textContent=lines;el._last=lines;}
+    }).catch(()=>{});
+  }else if(db){db.style.display='none';}
   _logTimer=setTimeout(()=>loadDeviceLog(dev),3000);
 }
 
@@ -944,6 +970,8 @@ function loadSystem(){
     /* Debug-logging toggle reflects current runtime state */
     const dbg=document.getElementById('debugToggle');
     if(dbg)dbg.checked=!!data.debug_enabled;
+    /* Global flag so the device-page Debug Log box shows/polls only when on */
+    window._debugOn=!!data.debug_enabled;
     /* System log */
     const logEl=document.getElementById('syslog');
     if(data.syslog){
