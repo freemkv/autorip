@@ -223,7 +223,12 @@ function renderBar(s,p){
   const total=s&&s.bytes_total_disc||0;
   const ranges=s&&s.bad_ranges||[];
   const positional=!!(s&&s.pass>1);
-  let html='<div style="flex:1;background:var(--chip);border-radius:3px;height:6px;overflow:hidden;position:relative">';
+  /* Defrag map (positional, pass>1) is ~5x taller than the slim sweep
+     progress bar so green/red segments actually read as a disc map rather
+     than a hairline. The sweep bar stays slim — it's a genuine 0->100%
+     fill, not a map. */
+  const barH=positional?30:8;
+  let html='<div style="flex:1;background:var(--chip);border-radius:'+(positional?4:3)+'px;height:'+barH+'px;overflow:hidden;position:relative">';
   if(positional){
     /* Positional map: the entire bar is green (the whole disc, good), then
        red bad ranges are punched in at their real offsets. If total is
@@ -272,14 +277,19 @@ function passLabelFor(s){
    /* Resolve the current pass into a human-readable label for the Ripping
       step. During multipass we show pass number + phase; otherwise "Ripping". */
    if(s.pass>0&&s.total_passes>0){
-     /* Phase rendering is identical regardless of which orchestrator
-        produced the state. Operators read phase, not code path \u2014
-        consistency between fresh-rip and resume is load-bearing.
-        Resume sets total_passes to the same `max_retries + 2` value
-        the multipass orchestrator uses, so both reach the mux phase
-        showing the same `pass N/N \u00b7 muxing` label. */
-     const phase=s.pass===1?'copying':(s.pass===s.total_passes?'muxing':'retrying');
-     return 'pass '+s.pass+'/'+s.total_passes+' \u00b7 '+phase;
+     /* This is the RIP tab: mux is a 100% separate process and view, so it
+        is NOT a rip pass and is excluded from the count. The backend's
+        total_passes still includes the trailing mux pass (max_retries + 2);
+        subtract it here so the operator sees "pass 2/6" (sweep + 5 retries),
+        never "2/7". */
+     const ripTotal=Math.max(s.total_passes-1,1); // drop the mux pass
+     if(s.pass>=s.total_passes){
+       /* Mux phase \u2014 from the rip tab's view, recovery is finished;
+          muxing lives in its own view. */
+       return 'recovery complete';
+     }
+     const phase=s.pass===1?'copying':'retrying';
+     return 'pass '+s.pass+'/'+ripTotal+' \u00b7 '+phase;
    }
    /* If pass=1 and no total_passes set, this is a clean disc — skip to mux. */
    if(s.pass===1&&s.total_passes===0){
@@ -326,14 +336,27 @@ function renderSteps(steps,progress,eta,speed,s){
          makes the bar's identity obvious), and drop "Recovered X / Y GB"
          entirely — the green Good pill carries the same information
          without duplicating it. */
-      /* Identical column structure to passLine — the "Total " prefix is
-         gone now that a "Total Progress:" label sits above the bar (just
-         like "Rip · pass N/M" sits above the per-pass bar). Third column
-         is reserved with an empty body so the layout doesn't reflow. */
-      const totalPctStr=col(totalPct+'%',45,'right');
-      const totalEtaStr=col(s.total_eta?'ETA '+s.total_eta:'',95,'left');
-      const totalSpdStr=col('',85,'left');
-      const totalLine=[totalPctStr,totalEtaStr,totalSpdStr].join(SEP);
+      /* No second "total" bar — mux is a separate view, and a bytes-recovered
+         bar just sits at ~99% through the whole patch (the sweep already
+         recovered nearly everything; the slow grind is the last <1%). The
+         live patch signal is TEXTUAL instead: how many disc sections are
+         still bad and how many sectors remain. */
+      const fmtBytes = (b)=> b>=1073741824 ? (b/1073741824).toFixed(2)+' GB'
+                          : b>=1048576    ? (b/1048576).toFixed(1)+' MB'
+                          : b>=1024       ? (b/1024).toFixed(1)+' KB'
+                          : b+' B';
+      let sectorsLine='';
+      if(s.pass>1){
+        const nSec=(typeof s.num_bad_ranges==='number'&&s.num_bad_ranges>0)
+                    ?s.num_bad_ranges:((s.bad_ranges&&s.bad_ranges.length)||0);
+        const remBytes=(s.bytes_maybe||0)+(s.bytes_lost||0);
+        const remSect=Math.round(remBytes/2048);
+        if(nSec>0||remSect>0){
+          const secWord=nSec===1?'section':'sections';
+          sectorsLine='<div style="font-size:.75rem;color:var(--text2);margin-top:7px;font-variant-numeric:tabular-nums">'
+            +nSec+' '+secWord+' · '+remSect.toLocaleString()+' sectors ('+fmtBytes(remBytes)+') remaining</div>';
+        }
+      }
       let badLine='';
       /* TWO pills, ever \u2014 Good and Maybe. Never a third.
          GOOD  = whole-disc bytes that are read AND verify-clean (Finished).
@@ -351,10 +374,6 @@ function renderSteps(steps,progress,eta,speed,s){
          Time is rendered at ms precision (fmtMs): 6 sectors is 1 ms, never 0. */
       const bg=s.bytes_good||0, bm=(s.bytes_maybe||0)+(s.bytes_lost||0);
       if(bg>0 || bm>0){
-        const fmtBytes = (b)=> b>=1073741824 ? (b/1073741824).toFixed(2)+' GB'
-                            : b>=1048576    ? (b/1048576).toFixed(1)+' MB'
-                            : b>=1024       ? (b/1024).toFixed(1)+' KB'
-                            : b+' B';
         const pill = (label, color, body, minPx)=>
           '<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:'+color
           +';color:var(--pill-fg);font-size:.65rem;font-weight:600;margin-right:6px;'
@@ -379,14 +398,7 @@ function renderSteps(steps,progress,eta,speed,s){
       detail='<div style="margin-top:6px">'
         +renderBar(s,passPct)
         +'<div style="font-size:.75rem;color:var(--text2);margin-top:7px">'+passLine+'</div>'
-        /* "Total Progress:" label mirrors the "Rip · pass N/M" header
-           that's rendered above the per-pass bar (outside this `detail`
-           string) — both bars now have a small caption above them so a
-           glance at the dashboard tells you which is which. The 18px
-           top-margin gives breathing room from the per-pass speed line. */
-        +'<div style="font-size:.7rem;color:var(--text3);margin-top:18px">Total Progress:</div>'
-        +'<div style="margin-top:6px">'+renderTotalBar(totalPct)+'</div>'
-        +'<div style="font-size:.75rem;color:var(--text2);margin-top:7px">'+totalLine+'</div>'
+        +sectorsLine
         +badLine+'</div>';
       /* Fold pass info into the step name so it's obvious at a glance. */
       if(passLbl){
