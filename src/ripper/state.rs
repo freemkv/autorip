@@ -1044,16 +1044,23 @@ pub(super) fn push_pass_state(
             } else if secs < 360_000 {
                 format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
             } else {
-                String::new()
+                // Very long ETA (>100 h, e.g. a 489 MB bad set grinding at
+                // ~12 KB/s). Show days+hours so the field is never blank —
+                // the operator still wants "≈ 8d" over an empty gap.
+                format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
             }
         };
-        let pass_eta = if eta_speed > 0.01 && last_work_total > last_pos {
+        // ETA floor is 0.1 KB/s (0.0001 MB/s), not the old 10 KB/s (0.01
+        // MB/s). That floor blanked the ETA right at the patch rate (~12
+        // KB/s hovers on the threshold) — exactly when the operator most
+        // wants a number. Any forward motion now yields an ETA.
+        let pass_eta = if eta_speed > 0.0001 && last_work_total > last_pos {
             let rem_mb = (last_work_total - last_pos) as f64 / BYTES_PER_MIB;
             format_secs((rem_mb / eta_speed) as u64)
         } else {
             String::new()
         };
-        let total_eta = if eta_speed > 0.01 && total_work_estimated > total_done {
+        let total_eta = if eta_speed > 0.0001 && total_work_estimated > total_done {
             let rem_mb = (total_work_estimated - total_done) as f64 / BYTES_PER_MIB;
             format_secs((rem_mb / eta_speed) as u64)
         } else {
