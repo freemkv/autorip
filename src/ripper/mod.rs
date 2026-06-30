@@ -3225,14 +3225,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 progress: Some(&patch_progress),
                 halt: Some(pass_halt.clone()),
                 key_fetch: key_fetch.clone(),
-                // First retry pass = breadth-first fast capture: read every bad
-                // range once and leave each failed block NonTrimmed, so the
-                // readable blocks (the sweep's good skip-ahead overshoot) of ALL
-                // sections are recovered FIRST, before any single section's slow
-                // per-sector grind. Later passes (retry_n >= 1) do the granular
-                // bisect/retry on what's left. No data is dropped — a failed
-                // block stays NonTrimmed until a granular pass resolves it.
-                fast_capture: retry_n == 0,
+                // First retry pass (pass 2 = retry_n 1, since the loop is
+                // `for retry_n in 1..=max_retries`) = breadth-first fast capture:
+                // read every bad range once and leave each failed block
+                // NonTrimmed, so the readable blocks (the sweep's good skip-ahead
+                // overshoot) of ALL sections are recovered FIRST, before any
+                // single section's slow per-sector grind. Later passes
+                // (retry_n >= 2) do the granular bisect/retry on what's left. No
+                // data is dropped — a failed block stays NonTrimmed until a
+                // granular pass resolves it.
+                fast_capture: retry_n == 1,
             };
             let cr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {
                 Ok(r) => r,
