@@ -551,13 +551,15 @@ function renderCurrent(){
     if(notReady){
       btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan again</button>';
     }else if(s.resumable){
-      /* A resumable partial exists for this disc. Resume (accent) continues
-         where the last rip left off — for "sweep" it reads only the missing
-         ranges off the disc, for "remux" it just re-muxes the staged ISO.
-         Rip (green) means START OVER: it wipes the partial first, so confirm. */
+      /* A resumable partial exists. Design: the PRIMARY action (Resume —
+         continue where it left off) is the filled accent button and comes
+         first; "Start over" is the DESTRUCTIVE alternative (wipes the partial
+         and re-sweeps from scratch), so it is de-emphasized as a red OUTLINE
+         (not a green fill that competed with the primary) and confirmed. For
+         "remux" Resume just re-muxes the staged ISO. */
       const rl=s.resumable==='remux'?'Resume (re-mux)':'Resume';
       btns='<button class="btn" style="background:var(--accent);color:#fff;border-color:var(--accent)" onclick="fetch(\'/api/rip/'+dev+'?resume=yes\',{method:\'POST\'})">'+rl+'</button>';
-      btns+='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="if(confirm(\'Start over from scratch? This discards the resumable partial for this disc.\')){fetch(\'/api/rip/'+dev+'?resume=no\',{method:\'POST\'})}">Rip</button>';
+      btns+='<button class="btn" style="background:transparent;color:var(--red);border-color:var(--red)" onclick="if(confirm(\'Start over from scratch? This discards the resumable partial for this disc and re-rips the whole disc.\')){fetch(\'/api/rip/'+dev+'?resume=no\',{method:\'POST\'})}">Start over</button>';
     }else{
       btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="fetch(\'/api/rip/'+dev+'?resume=no\',{method:\'POST\'})">Rip</button>';
     }
