@@ -223,12 +223,47 @@ function renderBar(s,p){
   const total=s&&s.bytes_total_disc||0;
   const ranges=s&&s.bad_ranges||[];
   const positional=!!(s&&s.pass>1);
-  /* Defrag map (positional, pass>1) is ~5x taller than the slim sweep
-     progress bar so green/red segments actually read as a disc map rather
-     than a hairline. The sweep bar stays slim — it's a genuine 0->100%
-     fill, not a map. */
-  const barH=positional?30:8;
-  let html='<div style="flex:1;background:var(--chip);border-radius:'+(positional?4:3)+'px;height:'+barH+'px;overflow:hidden;position:relative">';
+  /* Same height in EVERY pass (pass 1 sweep + pass N defrag map) so the bar
+     doesn't resize between phases. 30px reads as a disc map, not a hairline. */
+  const barH=30;
+  /* "You are here" caret ABOVE the bar — consistent in EVERY pass.
+     pass 1 (sweep): at last_sector, the real sequential read head.
+     pass N (patch): at the active section = the highest-LBA bad range still
+     present (autorip patches in reverse, so it steps left as ranges recover).
+     Derived from published state — in patch, last_sector is work-done (not a
+     disc LBA), so the active-section position is used instead. */
+  let caretPct=null;
+  if(total>0&&s&&s.status==='ripping'){
+    if(positional&&ranges.length){
+      /* Reverse patch works the highest-LBA range first, from its END (high
+         edge) toward its start, and the red heals from the right — so the live
+         read position is the active range's RIGHT edge (lba+count). It crawls
+         left as the block recovers; when the range clears, the next-highest
+         becomes active and the arrow jumps left. */
+      let act=ranges[0];
+      ranges.forEach(r=>{ if(r.lba>act.lba) act=r; });
+      /* Align to the red block's RENDERED right edge — same offset + min-width
+         0.5% clamp the overlay uses below — so the arrow sits exactly on the
+         end of the red even for tiny ranges (where the true lba+count would
+         fall short of the clamped-wider block). */
+      let offPct=(act.lba*2048)/total*100;
+      if(offPct<0)offPct=0; if(offPct>100)offPct=100;
+      let wPct=Math.max((act.count*2048)/total*100,0.5);
+      if(offPct+wPct>100)wPct=100-offPct;
+      caretPct=offPct+wPct;
+    }else if(!positional&&s.last_sector>0){
+      caretPct=(s.last_sector*2048)/total*100;
+    }
+  }
+  let caret='';
+  if(caretPct!=null){
+    if(caretPct<0)caretPct=0; if(caretPct>100)caretPct=100;
+    caret='<div style="position:relative;height:14px">'
+      +'<div style="position:absolute;left:'+caretPct+'%;bottom:0;transform:translateX(-50%);'
+      +'font-size:.8rem;color:var(--blue);line-height:1;animation:ph 1.2s infinite">'
+      +'▼</div></div>';
+  }
+  let html='<div style="background:var(--chip);border-radius:4px;height:'+barH+'px;overflow:hidden;position:relative">';
   if(positional){
     /* Positional map: the entire bar is green (the whole disc, good), then
        red bad ranges are punched in at their real offsets. If total is
@@ -236,8 +271,13 @@ function renderBar(s,p){
        neutral green fill so we never divide by zero. */
     html+='<div style="position:absolute;left:0;top:0;width:100%;height:100%;background:var(--green)"></div>';
   }else{
-    /* Sequential sweep: green grows with pass_progress_pct. */
-    html+='<div style="background:var(--green);height:100%;width:'+p+'%;transition:width 1s"></div>';
+    /* Sequential sweep: green grows with the swept position. Use the
+       FRACTIONAL position (last_sector advances every 250 ms) rather than the
+       integer pass_progress_pct, otherwise the fill jumps a whole 1% at a time
+       (~50 s per step on a UHD) and reads as "nothing, boom chunk". */
+    let fillPct=(total>0&&s&&s.last_sector>0)?(s.last_sector*2048)/total*100:p;
+    if(fillPct<0)fillPct=0; if(fillPct>100)fillPct=100;
+    html+='<div style="background:var(--green);height:100%;width:'+fillPct+'%;transition:width 1s"></div>';
   }
   /* Red bad-range overlay (both modes). Drawn at each range's real LBA
      position. min-width 0.5% keeps single-sector ranges visible on a 72GB
@@ -251,17 +291,8 @@ function renderBar(s,p){
       html+='<div style="position:absolute;left:'+offPct+'%;top:0;width:'+wPct+'%;height:100%;background:var(--red);opacity:0.9;transition:left 1s,width 1s"></div>';
     });
   }
-  /* Playhead: current read position = last_sector / total-sectors. Only during
-     an active rip with a known position and a known total. Thin (2px), full
-     height, accent/blue, pulsing — answers "where are we trying right now". It
-     hops around the bad ranges as the patch works. */
-  if(total>0&&s&&s.status==='ripping'&&s.last_sector>0){
-    let phPct=(s.last_sector*2048)/total*100;
-    if(phPct<0)phPct=0; if(phPct>100)phPct=100;
-    html+='<div style="position:absolute;left:'+phPct+'%;top:0;width:2px;height:100%;margin-left:-1px;background:var(--blue);box-shadow:0 0 3px var(--blue);animation:ph 1.2s infinite;transition:left 1s"></div>';
-  }
   html+='</div>';
-  return html;
+  return caret+html;
 }
 function renderTotalBar(p){
   /* v0.13.19: matches the pass bar's geometry (same height, same border-radius)
@@ -346,15 +377,19 @@ function renderSteps(steps,progress,eta,speed,s){
                           : b>=1024       ? (b/1024).toFixed(1)+' KB'
                           : b+' B';
       let sectorsLine='';
-      if(s.pass>1){
+      {
+        /* Same line in EVERY pass (consistency): bytes_maybe is the bad/not-yet-
+           good set (NonTrimmed+NonScraped), so this reads as "damage left to
+           recover" in both the sweep and the patch passes. The "N sections ·"
+           prefix only appears once bad ranges exist. */
         const nSec=(typeof s.num_bad_ranges==='number'&&s.num_bad_ranges>0)
                     ?s.num_bad_ranges:((s.bad_ranges&&s.bad_ranges.length)||0);
         const remBytes=(s.bytes_maybe||0)+(s.bytes_lost||0);
         const remSect=Math.round(remBytes/2048);
-        if(nSec>0||remSect>0){
-          const secWord=nSec===1?'section':'sections';
+        if(remSect>0){
+          const secPrefix = nSec>0 ? (nSec+' '+(nSec===1?'section':'sections')+' · ') : '';
           sectorsLine='<div style="font-size:.75rem;color:var(--text2);margin-top:7px;font-variant-numeric:tabular-nums">'
-            +nSec+' '+secWord+' · '+remSect.toLocaleString()+' sectors ('+fmtBytes(remBytes)+') remaining</div>';
+            +secPrefix+remSect.toLocaleString()+' sectors ('+fmtBytes(remBytes)+') remaining</div>';
         }
       }
       let badLine='';
