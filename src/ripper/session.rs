@@ -254,6 +254,22 @@ pub fn join_all_rip_threads(timeout: Duration) {
         .keys()
         .cloned()
         .collect();
+    // Cancel every active rip's halt FIRST, then join. Cancelling makes the rip
+    // break out of its sweep/patch loop and RETURN, which runs the
+    // SweepingGuard / MuxingGuard `Drop` impls that clear the `.sweeping` /
+    // `.muxing` markers — leaving a CLEAN resumable dir (same end-state as
+    // `/api/stop`). Without this the rip ignores SHUTDOWN, the join below times
+    // out, the process exits, and the thread is killed WITHOUT unwinding, so
+    // Drop never runs and a stale `.sweeping` survives. The startup classifier
+    // then reads that as an in-progress crash and bumps `.restart_count` — so a
+    // few operator redeploys / reboots / Watchtower updates DURING a rip walk a
+    // perfectly healthy resumable rip to a false `.failed`. A graceful shutdown
+    // is NOT a failure and must never increment. (Bitten 2026-06-30.)
+    for device in &devices {
+        if let Some(h) = device_halt(device) {
+            h.cancel();
+        }
+    }
     let deadline = std::time::Instant::now() + timeout;
     for device in devices {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());

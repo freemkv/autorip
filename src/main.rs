@@ -354,6 +354,16 @@ fn main() {
     // Main loop: poll drives (checks SHUTDOWN flag internally)
     ripper::drive_poll_loop(&cfg);
 
+    // Graceful shutdown is NOT a failure. Clear every in-progress marker up
+    // front so the next start resumes cleanly instead of counting this stop as a
+    // crash. This is robust even if a rip drain below overruns docker's
+    // stop-grace and the process is SIGKILLed mid-drain — by then the markers
+    // are already gone. (Only a TRUE ungraceful crash, which never reaches this
+    // path, can leave a marker to be counted.)
+    if let Ok(c) = cfg.read() {
+        ripper::staging::clear_inprogress_markers(std::path::Path::new(&c.staging_dir));
+    }
+
     // Drain any rip threads that are still mid-flight so we don't
     // exit the process while libfreemkv is holding a SCSI session
     // and writing into staging. Bounded so a stuck drive can't
