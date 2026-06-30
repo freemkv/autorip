@@ -1051,48 +1051,37 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
                 action: ResumeAction::RestartLoopFailed { reason },
             });
         } else {
-            match increment_restart_count(&path) {
-                Ok(new_rc) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        attempt = new_rc,
-                        limit = RESTART_LIMIT,
-                        // The failure gate above checks pre-bump
-                        // `rc >= RESTART_LIMIT`, so this dir is promoted to
-                        // `.failed` only once its count reaches
-                        // RESTART_LIMIT — i.e. on a restart where the
-                        // pre-bump count is already RESTART_LIMIT. Surface
-                        // that threshold so attempt=RESTART_LIMIT here
-                        // doesn't read as "should already have failed".
-                        fails_after = RESTART_LIMIT,
-                        has_iso = snap.has_iso,
-                        has_mapfile = snap.has_mapfile,
-                        has_mkv = snap.has_mkv,
-                        "partial staging state preserved across restart (fails on next restart once attempt reaches the limit)"
-                    );
-                    hints.push(StagingResumeHint {
-                        dir: snap.dir,
-                        action: ResumeAction::ResumePreserved {
-                            attempt: new_rc,
-                            has_iso: snap.has_iso,
-                            has_mapfile: snap.has_mapfile,
-                            has_mkv: snap.has_mkv,
-                        },
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "could not bump .restart_count; leaving partial state in place");
-                    hints.push(StagingResumeHint {
-                        dir: snap.dir,
-                        action: ResumeAction::ResumePreserved {
-                            attempt: rc,
-                            has_iso: snap.has_iso,
-                            has_mapfile: snap.has_mapfile,
-                            has_mkv: snap.has_mkv,
-                        },
-                    });
-                }
-            }
+            // A cleanly-stopped resumable dir — ISO + mapfile present, but NO
+            // `.sweeping`/`.muxing` (the InProgress branch above owns those).
+            // This is NOT a crash loop: the user stopped the rip, a pass
+            // finished, or the container was redeployed/rebooted between rips.
+            // Do NOT bump `.restart_count` here. Bumping on every container
+            // startup (operator redeploy, Watchtower auto-update, host reboot,
+            // a /api/stop then restart) falsely walked a HEALTHY resumable rip
+            // to `.failed` after RESTART_LIMIT restarts — the bug that made
+            // resume "randomly" stop working. Restart-count accrual belongs
+            // ONLY to genuinely-failing attempts: a crash mid-rip leaves
+            // `.sweeping`/`.muxing` → counted by the InProgress branch above; a
+            // repeatedly-fsync-failing mux is counted at its own site
+            // (`handle_resume_fsync_failure`). Here we just preserve + surface
+            // the dir as resumable, un-counted.
+            tracing::info!(
+                path = %path.display(),
+                restart_count = rc,
+                has_iso = snap.has_iso,
+                has_mapfile = snap.has_mapfile,
+                has_mkv = snap.has_mkv,
+                "partial staging state preserved (cleanly-stopped, resumable — not restart-counted)"
+            );
+            hints.push(StagingResumeHint {
+                dir: snap.dir,
+                action: ResumeAction::ResumePreserved {
+                    attempt: rc,
+                    has_iso: snap.has_iso,
+                    has_mapfile: snap.has_mapfile,
+                    has_mkv: snap.has_mkv,
+                },
+            });
         }
     }
     hints
@@ -1333,7 +1322,15 @@ mod tests {
     }
 
     #[test]
-    fn resume_bumps_counter_below_limit() {
+    fn resume_cleanly_stopped_resumable_not_counted() {
+        // A bare resumable dir (ISO present, no `.sweeping`/`.muxing` crash
+        // marker) is a clean stop / redeploy / reboot, NOT a crash loop. It
+        // must be preserved as resumable WITHOUT bumping `.restart_count` —
+        // otherwise operator redeploys, Watchtower auto-updates and host
+        // reboots would walk a HEALTHY resumable rip to `.failed` after
+        // RESTART_LIMIT restarts. Restart-count accrual belongs only to
+        // genuine crashes (the `.sweeping`/`.muxing` InProgress branch, see
+        // `sweeping_in_progress_is_restart_counted`) and fsync-failing mux.
         let root = tmpdir();
         let disc = root.join("MyDisc");
         fs::create_dir_all(&disc).unwrap();
@@ -1342,10 +1339,14 @@ mod tests {
         let hints = resume_or_quarantine_staging(root.to_str().unwrap());
         assert_eq!(hints.len(), 1);
         match &hints[0].action {
-            ResumeAction::ResumePreserved { attempt, .. } => assert_eq!(*attempt, 1),
+            ResumeAction::ResumePreserved { attempt, .. } => assert_eq!(*attempt, 0),
             other => panic!("unexpected action: {:?}", other),
         }
-        assert_eq!(restart_count(&disc), 1);
+        assert_eq!(
+            restart_count(&disc),
+            0,
+            "a clean stop must not bump restart_count"
+        );
         assert!(!disc.join(FAILED_MARKER).exists());
     }
 
