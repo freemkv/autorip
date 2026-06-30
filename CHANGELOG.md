@@ -41,6 +41,18 @@
   to libfreemkv's canonical 32 (it had drifted to single-sector), so a bad range
   reads its good skip-ahead overshoot in bulk and only the real damage pays the
   single-sector cost.
+- **Breadth-first recovery — fast-capture pass first.** The first retry pass now
+  runs libfreemkv's `fast_capture`: it reads every bad section once and grabs the
+  readable blocks (the sweep's good skip-ahead overshoot) across the WHOLE disc
+  before any single section's slow per-sector grind — instead of grinding section
+  1 to exhaustion before even touching section 2. Later passes do the granular
+  retry on what's left. No data is dropped: a failed block stays `NonTrimmed` for
+  a granular pass (covered by a libfreemkv fixture test).
+- **Speed always reads, down to bytes/sec.** A crawling patch now shows e.g.
+  `512 B/s` instead of a blank `0 KB/s`, and `0 B/s` when work is genuinely frozen
+  grinding one sector's ECC. The patch speed holds a fixed 10s window
+  (responsive) instead of growing to 60s, so a fast-capture burst shows
+  immediately; the steady sweep keeps its growing window.
 
 - **The mux never aborts on mux-time loss.** A disc that was swept and patched
   is always handed to the muxer, and the muxer always delivers. Earlier versions
