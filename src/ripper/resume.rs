@@ -1092,27 +1092,48 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         }
     };
 
-    // Pick up the TMDB metadata + codecs string that scan_disc
-    // populated in STATE before this path was entered. Without this,
-    // the mux's per-frame `update_state` would overwrite them with
-    // empty strings and the dashboard would lose the poster / title /
-    // year / codec badge for the entire mux phase.
-    let (tmdb_title, tmdb_year, tmdb_poster, tmdb_overview, tmdb_media_type, state_codecs) =
-        super::STATE
-            .lock()
-            .ok()
-            .and_then(|s| s.get(device).cloned())
+    // TMDB metadata source of truth: the DURABLE on-disk `.ripped` marker, NOT
+    // in-memory STATE. STATE is populated by the fresh-rip scan and is EMPTY on a
+    // cold auto-resume (a `.ripped`/resumable dir picked up by the mux worker or
+    // at startup, in a process that never ran the scan) — reading it there gave
+    // tmdb_year=0, so the mover filed the disc into a bare `Title/` folder with a
+    // bare `Title.mkv`, dropping the year even though the poster + marker carried
+    // it. The marker was written at scan time with the resolved TMDB result and
+    // survives every hop, so it is the authoritative source; fall back to STATE
+    // (then default) only when the marker is absent/unreadable. `codecs` is a
+    // live-mux display detail that isn't in the marker, so it still comes from
+    // STATE. (This is the state-machine fix: the year is a property of the durable
+    // artifact, not a value relayed through ephemeral in-memory state.)
+    let state_tmdb = super::STATE
+        .lock()
+        .ok()
+        .and_then(|s| s.get(device).cloned());
+    let marker_tmdb = crate::muxer::read_marker(&staging_dir).ok();
+    let state_codecs = state_tmdb
+        .as_ref()
+        .map(|rs| rs.codecs.clone())
+        .unwrap_or_default();
+    let (tmdb_title, tmdb_year, tmdb_poster, tmdb_overview, tmdb_media_type) = match &marker_tmdb {
+        Some(m) => (
+            m.tmdb_title.clone(),
+            m.tmdb_year,
+            m.tmdb_poster.clone(),
+            m.tmdb_overview.clone(),
+            m.tmdb_media_type.clone(),
+        ),
+        None => state_tmdb
+            .as_ref()
             .map(|rs| {
                 (
-                    rs.tmdb_title,
+                    rs.tmdb_title.clone(),
                     rs.tmdb_year,
-                    rs.tmdb_poster,
-                    rs.tmdb_overview,
-                    rs.tmdb_media_type,
-                    rs.codecs,
+                    rs.tmdb_poster.clone(),
+                    rs.tmdb_overview.clone(),
+                    rs.tmdb_media_type.clone(),
                 )
             })
-            .unwrap_or_default();
+            .unwrap_or_default(),
+    };
     // The mover routes by `media_type` (movie_dir vs tv_dir) and defaults a
     // missing/empty value to "movie". Resolve the same default here so a cold
     // auto-resume (empty STATE, no carried media_type) is explicit in the
