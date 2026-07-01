@@ -176,7 +176,10 @@ pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
         same_reason
     };
     if !same_reason {
-        crate::log::syslog(&format!("Mux blocked: {} — {}", path, reason));
+        crate::log::syslog(&freemkv_i18n::fmt(
+            "autorip.mux.blocked",
+            &[("path", path), ("reason", reason)],
+        ));
     }
 }
 
@@ -400,7 +403,10 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             title = %title,
             "mux worker: dispatching .ripped marker"
         );
-        crate::log::syslog(&format!("Muxing: {} (worker)", title));
+        crate::log::syslog(&freemkv_i18n::fmt(
+            "autorip.mux.muxing_worker",
+            &[("title", &title)],
+        ));
         // Register an exclusion lock for the duration of the mux. The drive
         // paths (`disc_already_completed` auto-insert, `find_resumable_for_disc`)
         // skip any dir carrying `.muxing`, so a disc re-insert can't run a fresh
@@ -414,7 +420,7 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         if outcome.success {
             clear_error(&dir.to_string_lossy());
             tracing::info!(staging = %dir.display(), title = %title, "mux worker: completed");
-            crate::log::syslog(&format!("Muxed: {}", title));
+            crate::log::syslog(&freemkv_i18n::fmt("autorip.mux.muxed", &[("title", &title)]));
             // Defensive: drive the origin device to "done" if (and ONLY
             // if) it is somehow still "ripping". The normal `.ripped`
             // hand-off in `rip_disc` now sets the real device to "done"
