@@ -872,14 +872,38 @@ fn check_and_move(cfg: &Config) {
             continue;
         }
 
-        // Move files
+        // Move files. Progress is reported as ONE aggregate bar across ALL files
+        // in this move (MKV + companion ISO when keep_iso), not per-file — so a
+        // 2-file move shows a single 0→100% (the MKV filling e.g. 0→45%, the ISO
+        // 45→100% by byte share), never two separate 0→100% runs. `total_all_gb`
+        // is the byte sum of every planned source; `moved_base_gb` accumulates the
+        // fully-moved prior files so each file's per-file progress is offset onto
+        // the aggregate.
+        let total_all_gb: f64 = planned_moves
+            .iter()
+            .map(|(src, _)| {
+                fresh_metadata(src).map(|m| m.len()).unwrap_or(0) as f64
+                    / crate::util::BYTES_PER_GIB
+            })
+            .sum();
+        let mut moved_base_gb: f64 = 0.0;
         let mut outcomes: Vec<MoveOutcome> = Vec::new();
         let mut announced_moving = false;
         for (src, dest) in &planned_moves {
             let name_for_progress = display_name.clone();
-            let on_progress = move |pct: u8, gb: f64, total_gb: f64, speed: f64| {
-                let eta = if speed > 1.0 && total_gb > gb {
-                    let secs = ((total_gb - gb) * 1024.0 / speed) as u32;
+            let src_size_gb = fresh_metadata(src).map(|m| m.len()).unwrap_or(0) as f64
+                / crate::util::BYTES_PER_GIB;
+            let base_gb = moved_base_gb;
+            let on_progress = move |_pct: u8, gb: f64, _total_gb: f64, speed: f64| {
+                // Fold the per-file (gb / total_gb) into the whole-move aggregate.
+                let agg_gb = base_gb + gb;
+                let agg_pct = if total_all_gb > 0.0 {
+                    ((agg_gb / total_all_gb) * 100.0).clamp(0.0, 100.0) as u8
+                } else {
+                    _pct
+                };
+                let eta = if speed > 1.0 && total_all_gb > agg_gb {
+                    let secs = ((total_all_gb - agg_gb) * 1024.0 / speed) as u32;
                     let m = secs / 60;
                     let s = secs % 60;
                     format!("{}:{:02}", m, s)
@@ -889,9 +913,9 @@ fn check_and_move(cfg: &Config) {
                 if let Ok(mut ms) = MOVE_STATE.lock() {
                     *ms = Some(MoveState {
                         name: name_for_progress.clone(),
-                        progress_pct: pct,
-                        progress_gb: gb,
-                        total_gb,
+                        progress_pct: agg_pct,
+                        progress_gb: agg_gb,
+                        total_gb: total_all_gb,
                         speed_mbs: speed,
                         eta,
                     });
@@ -982,6 +1006,9 @@ fn check_and_move(cfg: &Config) {
             }
             let outcome = move_file(src, Path::new(dest), &on_progress);
             outcomes.push(outcome);
+            // Advance the aggregate base so the NEXT file's progress continues
+            // from where this one ended (one bar across all files, not a reset).
+            moved_base_gb += src_size_gb;
             match outcome {
                 MoveOutcome::Collision => {}
                 MoveOutcome::Skipped => {
