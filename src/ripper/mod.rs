@@ -3349,12 +3349,25 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             bytes_pending = cr.bytes_pending;
             // PatchOutcome renames recovered_this_pass → bytes_recovered_this_pass.
             let recovered = cr.bytes_recovered_this_pass;
-            let exit_str = if cr.halted { " (halt)" } else { "" };
+            let exit_str = if cr.halted {
+                " (halt)"
+            } else if cr.wedged_exit {
+                " (DRIVE WEDGED: fast-fail sense — retries aborted, needs spin-cycle/power-cycle)"
+            } else {
+                ""
+            };
+            // Report the three buckets that actually tell success from failure:
+            // recovered THIS pass, how much is still bad (pending — retryable next
+            // pass), and how much has been given up (unreadable). The old line
+            // showed only `unreadable`, which is 0 until the post-loop promotion —
+            // so a pass that recovered nothing read as "0 recovered; 0 unreadable"
+            // and told you nothing.
             crate::log::device_log(
                 device,
                 &format!(
-                    "Pass {pass} done: recovered {:.2} MB; {:.2} MB still unreadable{exit_str}",
+                    "Pass {pass} done: recovered {:.2} MB this pass; {:.2} MB still bad, {:.2} MB unreadable{exit_str}",
                     recovered as f64 / BYTES_PER_MIB,
+                    bytes_pending as f64 / BYTES_PER_MIB,
                     bytes_unreadable as f64 / BYTES_PER_MIB,
                 ),
             );
