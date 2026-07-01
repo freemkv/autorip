@@ -1222,9 +1222,9 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
             // leaving the process alive with no UI and Docker none the wiser.
             // Now we signal SHUTDOWN so main exits non-zero and the container
             // restart policy recovers us.
-            crate::log::syslog(&format!(
-                "FATAL: web server bind failed on {}: {} — signalling shutdown",
-                addr, e
+            crate::log::syslog(&freemkv_i18n::fmt(
+                "autorip.web.bind_failed",
+                &[("addr", &addr.to_string()), ("error", &e.to_string())],
             ));
             tracing::error!(
                 address = %addr,
@@ -1235,7 +1235,10 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
             return;
         }
     };
-    crate::log::syslog(&format!("Web server listening on {}", addr));
+    crate::log::syslog(&freemkv_i18n::fmt(
+        "autorip.web.listening",
+        &[("addr", &addr.to_string())],
+    ));
     tracing::info!(address = %addr, "web server listening");
 
     for request in server.incoming_requests() {
@@ -4612,9 +4615,9 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     // succeeds (a mount can be transiently down at save time), but the
     // warning is loud on the System log.
     for (root, reason) in crate::mover::check_configured_destinations(&snapshot) {
-        crate::log::syslog(&format!(
-            "WARNING: configured destination '{root}' is not usable: {reason}. \
-             Rips will be PRESERVED in staging (not moved) until this is fixed."
+        crate::log::syslog(&freemkv_i18n::fmt(
+            "autorip.web.dest_unusable",
+            &[("root", &root), ("reason", &reason)],
         ));
     }
 
@@ -4826,7 +4829,7 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
         }))
         .is_err()
         {
-            crate::log::device_log(&dev, "Rip thread panicked");
+            crate::log::device_log(&dev, &freemkv_i18n::get("autorip.web.rip_thread_panicked"));
             ripper::update_state(
                 &dev,
                 ripper::RipState {
@@ -4895,10 +4898,7 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
     let _ = std::fs::remove_file(dir.join(ripper::staging::FAILED_MARKER));
     ripper::staging::clear_aborted_loss_marker(dir);
     ripper::staging::clear_restart_count(dir);
-    crate::log::device_log(
-        device,
-        "Accept-damage requested — re-muxing the existing ISO with the loss override.",
-    );
+    crate::log::device_log(device, &freemkv_i18n::get("autorip.web.accept_damage"));
     // Delegate to the resume path; resume_remux consumes `.accept-loss`.
     handle_rip(request, cfg, device, "resume=yes");
 }
