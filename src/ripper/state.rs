@@ -738,6 +738,11 @@ pub(super) fn display_window_secs(elapsed_pass_secs: f64) -> f64 {
 /// 1.5 s throttle, enough to settle.
 pub(super) const ETA_WARMUP_SECS: f64 = 10.0;
 
+/// Above this, the displayed ETA is shown as a steady ">Nh" rather than a
+/// precise-looking huge number. On a dead-media residue `remaining / rate`
+/// explodes and whipsaws; clamping it keeps the display honest and stable.
+pub(super) const ETA_CAP_SECS: u64 = 6 * 3600;
+
 impl PassProgressState {
     pub(super) fn new() -> Self {
         let now = std::time::Instant::now();
@@ -989,15 +994,28 @@ pub(super) fn push_pass_state(
         // MB/s). That floor blanked the ETA right at the patch rate (~12
         // KB/s hovers on the threshold) — exactly when the operator most
         // wants a number. Any forward motion now yields an ETA.
+        // Cap the displayed ETA. On a dead-media residue the recovery rate is
+        // near zero, so `remaining / rate` explodes to tens of hours and
+        // whipsaws (50 h → 12 h → …) as the rate twitches — a precise-looking
+        // number that is really "unknown / effectively never". Above the cap we
+        // show a steady ">Nh" instead; a real ETA reappears the moment the rate
+        // is high enough to put it back under the cap (i.e. on readable data).
+        let eta_str = |secs: u64| -> String {
+            if secs > ETA_CAP_SECS {
+                format!(">{}h", ETA_CAP_SECS / 3600)
+            } else {
+                format_secs(secs)
+            }
+        };
         let pass_eta = if eta_speed > 0.0001 && last_work_total > last_pos {
             let rem_mb = (last_work_total - last_pos) as f64 / BYTES_PER_MIB;
-            format_secs((rem_mb / eta_speed) as u64)
+            eta_str((rem_mb / eta_speed) as u64)
         } else {
             String::new()
         };
         let total_eta = if eta_speed > 0.0001 && total_work_estimated > total_done {
             let rem_mb = (total_work_estimated - total_done) as f64 / BYTES_PER_MIB;
-            format_secs((rem_mb / eta_speed) as u64)
+            eta_str((rem_mb / eta_speed) as u64)
         } else {
             String::new()
         };
