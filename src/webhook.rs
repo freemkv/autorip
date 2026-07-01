@@ -109,7 +109,7 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
         })
         .is_err()
     {
-        crate::log::syslog("Webhook dropped: too many concurrent deliveries in flight");
+        crate::log::syslog(&freemkv_i18n::get("autorip.webhook.dropped_inflight"));
         return;
     }
     // Decrement the in-flight counter however the thread exits.
@@ -133,10 +133,9 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
                 Ok(addrs) => addrs,
                 Err(e) => {
                     // Log only the origin — the path may contain a secret token.
-                    crate::log::syslog(&format!(
-                        "Webhook blocked {}: {}",
-                        webhook_url_origin(url),
-                        e
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.webhook.blocked",
+                        &[("url", &webhook_url_origin(url)), ("error", &e.to_string())],
                     ));
                     continue;
                 }
@@ -149,7 +148,10 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
             {
                 Ok(_) => {
                     // Log only the origin — the path may contain a secret token.
-                    crate::log::syslog(&format!("Webhook sent to {}", webhook_url_origin(url)));
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.webhook.sent",
+                        &[("url", &webhook_url_origin(url))],
+                    ));
                 }
                 Err(e) => {
                     // Summarise the error WITHOUT embedding `e` directly —
@@ -161,10 +163,9 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
                         ureq::Error::Status(c, _) => format!("HTTP {c}"),
                         ureq::Error::Transport(t) => t.kind().to_string(),
                     };
-                    crate::log::syslog(&format!(
-                        "Webhook failed {}: {}",
-                        webhook_url_origin(url),
-                        summary
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.webhook.failed",
+                        &[("url", &webhook_url_origin(url)), ("error", &summary)],
                     ));
                 }
             }
