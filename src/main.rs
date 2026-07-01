@@ -100,7 +100,10 @@ fn main() {
         // Both: structured event for the JSONL stream (greppable post-mortem)
         // AND the legacy syslog line so the per-device file + UI keep working.
         tracing::error!(thread = %thread, location = %loc, message = %msg, "panic");
-        log::syslog(&format!("PANIC in thread '{thread}' at {loc}: {msg}"));
+        log::syslog(&freemkv_i18n::fmt(
+            "autorip.panic",
+            &[("thread", &thread), ("loc", &loc), ("msg", msg)],
+        ));
     }));
 
     // Tracing — sets up stderr + autorip.log + autorip.jsonl sinks. Filter
@@ -126,9 +129,9 @@ fn main() {
     // it has no per-rip archive boundary, so this is its only bound.
     log::rotate_system_log_if_large();
 
-    log::syslog(&format!(
-        "autorip starting (v{}, edition 2024)",
-        VERSION_LABEL
+    log::syslog(&freemkv_i18n::fmt(
+        "autorip.lifecycle.starting",
+        &[("version", VERSION_LABEL)],
     ));
     tracing::info!(
         version = VERSION_LABEL,
@@ -149,10 +152,9 @@ fn main() {
     // operator sees the problem at startup instead of after a multi-hour rip.
     if let Ok(c) = cfg.read() {
         for (root, reason) in mover::check_configured_destinations(&c) {
-            log::syslog(&format!(
-                "WARNING: configured destination '{root}' is not usable at startup: {reason}. \
-                 Finished rips will be PRESERVED in staging (not moved) until this is fixed \
-                 (check the directory exists and its bind-mount/NAS share is present and writable)."
+            log::syslog(&freemkv_i18n::fmt(
+                "autorip.dest.unusable",
+                &[("root", &root), ("reason", &reason)],
             ));
         }
     }
@@ -168,14 +170,14 @@ fn main() {
 
     // Ensure KEYDB exists — download on first boot if URL is configured
     if online_keys {
-        log::syslog("Online key source — skipping local KEYDB download");
+        log::syslog(&freemkv_i18n::get("autorip.keydb.online_skip"));
     } else if cfg
         .read()
         .ok()
         .map(|c| keysource::keydb_exists(&c))
         .unwrap_or(false)
     {
-        log::syslog("KEYDB found");
+        log::syslog(&freemkv_i18n::get("autorip.keydb.found"));
     } else {
         let url = cfg
             .read()
@@ -183,7 +185,7 @@ fn main() {
             .map(|c| c.keydb_url.clone())
             .unwrap_or_default();
         if !url.is_empty() {
-            log::syslog("KEYDB not found, downloading...");
+            log::syslog(&freemkv_i18n::get("autorip.keydb.not_found_downloading"));
             // Route through the SSRF guard (validate_fetch_url + pinned
             // resolver) — a bare ureq::get here would let an operator-set
             // keydb_url reach loopback / RFC1918 / cloud-metadata.
@@ -198,23 +200,33 @@ fn main() {
                                 })
                                 .and_then(|c| keysource::save_keydb(&c, &buf));
                             match saved {
-                                Ok(r) => log::syslog(&format!(
-                                    "KEYDB downloaded: {} entries -> {}",
-                                    r.entries,
-                                    r.path.display()
+                                Ok(r) => log::syslog(&freemkv_i18n::fmt(
+                                    "autorip.keydb.downloaded",
+                                    &[
+                                        ("entries", &r.entries.to_string()),
+                                        ("path", &r.path.display().to_string()),
+                                    ],
                                 )),
-                                Err(e) => log::syslog(&format!("KEYDB save failed: {e}")),
+                                Err(e) => log::syslog(&freemkv_i18n::fmt(
+                                    "autorip.keydb.save_failed",
+                                    &[("error", &e.to_string())],
+                                )),
                             }
                         }
                         Err(web::KeydbReadError::TooLarge) => {
-                            log::syslog("KEYDB download failed: response exceeded size limit")
+                            log::syslog(&freemkv_i18n::get("autorip.keydb.download_too_large"))
                         }
-                        Err(web::KeydbReadError::Io) => log::syslog("KEYDB download read failed"),
+                        Err(web::KeydbReadError::Io) => {
+                            log::syslog(&freemkv_i18n::get("autorip.keydb.download_read_failed"))
+                        }
                     }
                 }
-                Err(e) => log::syslog(&format!(
-                    "KEYDB download failed for {}: {e}",
-                    crate::webhook::webhook_url_origin(&url)
+                Err(e) => log::syslog(&freemkv_i18n::fmt(
+                    "autorip.keydb.download_failed_for",
+                    &[
+                        ("url", &crate::webhook::webhook_url_origin(&url)),
+                        ("error", &e.to_string()),
+                    ],
                 )),
             }
         }
@@ -286,25 +298,33 @@ fn main() {
                                     })
                                     .and_then(|c| keysource::save_keydb(&c, &buf));
                                 match saved {
-                                    Ok(r) => log::syslog(&format!(
-                                        "KEYDB updated: {} entries -> {}",
-                                        r.entries,
-                                        r.path.display()
+                                    Ok(r) => log::syslog(&freemkv_i18n::fmt(
+                                        "autorip.keydb.updated",
+                                        &[
+                                            ("entries", &r.entries.to_string()),
+                                            ("path", &r.path.display().to_string()),
+                                        ],
                                     )),
-                                    Err(e) => log::syslog(&format!("KEYDB update failed: {e}")),
+                                    Err(e) => log::syslog(&freemkv_i18n::fmt(
+                                        "autorip.keydb.update_failed",
+                                        &[("error", &e.to_string())],
+                                    )),
                                 }
                             }
                             Err(web::KeydbReadError::TooLarge) => {
-                                log::syslog("KEYDB daily update: response exceeded size limit")
+                                log::syslog(&freemkv_i18n::get("autorip.keydb.update_too_large"))
                             }
                             Err(web::KeydbReadError::Io) => {
-                                log::syslog("KEYDB daily update: response read failed")
+                                log::syslog(&freemkv_i18n::get("autorip.keydb.update_read_failed"))
                             }
                         }
                     }
-                    Err(e) => log::syslog(&format!(
-                        "KEYDB update failed for {}: {e}",
-                        crate::webhook::webhook_url_origin(&url)
+                    Err(e) => log::syslog(&freemkv_i18n::fmt(
+                        "autorip.keydb.update_failed_for",
+                        &[
+                            ("url", &crate::webhook::webhook_url_origin(&url)),
+                            ("error", &e.to_string()),
+                        ],
                     )),
                 }
             }
@@ -379,7 +399,7 @@ fn main() {
     join_bounded(mover_handle, "mover", std::time::Duration::from_secs(120));
     join_bounded(muxer_handle, "muxer", std::time::Duration::from_secs(120));
 
-    log::syslog("autorip stopped");
+    log::syslog(&freemkv_i18n::get("autorip.lifecycle.stopped"));
 }
 
 /// Join `handle`, but give up after `timeout` so a wedged worker can't
@@ -828,8 +848,13 @@ fn prune_old_logs(log_dir: &str, retention_days: u64) {
     // pruned too, not just the top-level live logs.
     let pruned = prune_dir_recursive(std::path::Path::new(log_dir), cutoff);
     if pruned > 0 {
-        log::syslog(&format!(
-            "log prune: removed {pruned} files older than {retention_days}d from {log_dir}"
+        log::syslog(&freemkv_i18n::fmt(
+            "autorip.log_prune.removed",
+            &[
+                ("count", &pruned.to_string()),
+                ("days", &retention_days.to_string()),
+                ("dir", log_dir),
+            ],
         ));
     }
 }
