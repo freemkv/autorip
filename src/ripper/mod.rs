@@ -853,11 +853,12 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         ),
     );
 
-    // User-facing unlocker matrix — which registered unlockers apply to THIS
-    // drive+disc, shown for every disc so an operator can see (and question) a
-    // missing one (e.g. "LibreDrive: no" on a supported drive = the drive isn't
-    // recognised). Registry-driven: names come from libfreemkv's unlocker
-    // registry, never hardcoded, so this stays current as unlockers change. Kept
+    // User-facing unlocker matrix — which registered unlockers actually RAN this
+    // rip (did work, not merely "matched the disc kind"), shown for every disc so
+    // an operator can see (and question) a missing one (e.g. "LibreDrive: no" on a
+    // supported drive = the firmware unlock didn't take; "AACS: yes" only when the
+    // host-cert route did the bus removal because LibreDrive didn't). Registry-
+    // driven: names from libfreemkv's unlocker registry, never hardcoded. Kept
     // byte-identical to the CLI's rendering for consistency across the two apps.
     {
         let matrix = disc
@@ -866,7 +867,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             .map(|(name, ok)| format!("{name}: {}", if ok { "yes" } else { "no" }))
             .collect::<Vec<_>>()
             .join(", ");
-        crate::log::device_log(device, &format!("Unlockers — {matrix}"));
+        crate::log::device_log(
+            device,
+            &format!("Unlockers (yes = ran this rip) — {matrix}"),
+        );
     }
 
     // Extract title info before storing session
