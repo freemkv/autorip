@@ -1786,9 +1786,19 @@ fn serve_html(request: tiny_http::Request) {
 
 fn json_response(request: tiny_http::Request, status: u16, body: &str) {
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    // This is a local control app, not a website: NOTHING is cacheable. The API
+    // responses (state/version/etc.) are polled live, so a cached body would show
+    // stale rip state. Match the HTML shell's no-store.
     let response = Response::from_string(body)
         .with_status_code(StatusCode(status))
-        .with_header(header);
+        .with_header(header)
+        .with_header(
+            Header::from_bytes(
+                &b"Cache-Control"[..],
+                &b"no-store, no-cache, must-revalidate"[..],
+            )
+            .unwrap(),
+        );
     let _ = request.respond(response);
 }
 
@@ -3894,7 +3904,13 @@ mod web_tests {
 fn text_response(request: tiny_http::Request, body: &str) {
     let header =
         Header::from_bytes(&b"Content-Type"[..], &b"text/plain; charset=utf-8"[..]).unwrap();
-    let response = Response::from_string(body).with_header(header);
+    let response = Response::from_string(body).with_header(header).with_header(
+        Header::from_bytes(
+            &b"Cache-Control"[..],
+            &b"no-store, no-cache, must-revalidate"[..],
+        )
+        .unwrap(),
+    );
     let _ = request.respond(response);
 }
 
