@@ -853,6 +853,22 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         ),
     );
 
+    // User-facing unlocker matrix — which registered unlockers apply to THIS
+    // drive+disc, shown for every disc so an operator can see (and question) a
+    // missing one (e.g. "LibreDrive: no" on a supported drive = the drive isn't
+    // recognised). Registry-driven: names come from libfreemkv's unlocker
+    // registry, never hardcoded, so this stays current as unlockers change. Kept
+    // byte-identical to the CLI's rendering for consistency across the two apps.
+    {
+        let matrix = disc
+            .unlocker_matrix(&drive)
+            .into_iter()
+            .map(|(name, ok)| format!("{name}: {}", if ok { "yes" } else { "no" }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        crate::log::device_log(device, &format!("Unlockers — {matrix}"));
+    }
+
     // Extract title info before storing session
     let duration = disc
         .titles
