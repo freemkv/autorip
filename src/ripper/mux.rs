@@ -526,7 +526,10 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
 
     fn apply(&mut self, frame: libfreemkv::pes::PesFrame) -> Result<Flow, libfreemkv::Error> {
         if let Err(e) = self.output.write(&frame) {
-            crate::log::device_log(&self.ui.device, &format!("Write error: {e}"));
+            crate::log::device_log(
+                &self.ui.device,
+                &freemkv_i18n::fmt("autorip.mux.write_error", &[("error", &e.to_string())]),
+            );
             // Record the failure so `run_mux` reports `completed=false`.
             // We still return `Flow::Stop` (not `Err`) so the pipeline
             // drains cleanly and `close()` surfaces partial bytes for the
@@ -606,26 +609,41 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
             self.last_log = now;
             let gb = bytes_done as f64 / BYTES_PER_GIB;
             let speed_str = if speed >= 1.0 {
-                format!("{:.1} MB/s", speed)
+                freemkv_i18n::fmt("common.speed_mbs", &[("speed", &format!("{speed:.1}"))])
             } else {
-                format!("{:.0} KB/s", speed * 1024.0)
+                freemkv_i18n::fmt(
+                    "common.speed_kbs",
+                    &[("speed", &format!("{:.0}", speed * 1024.0))],
+                )
             };
             let eta_str = if eta.is_empty() {
                 String::new()
             } else {
-                format!(" ETA {}", eta)
+                freemkv_i18n::fmt("autorip.mux.eta_suffix", &[("eta", &eta)])
             };
             if self.ui.total_bytes > 0 {
                 let total_gb = self.ui.total_bytes as f64 / BYTES_PER_GIB;
                 crate::log::device_log(
                     &self.ui.device,
-                    &format!(
-                        "{:.1} GB / {:.1} GB ({}%) {}{}",
-                        gb, total_gb, pct, speed_str, eta_str
+                    &freemkv_i18n::fmt(
+                        "autorip.mux.progress",
+                        &[
+                            ("gb", &format!("{gb:.1}")),
+                            ("total_gb", &format!("{total_gb:.1}")),
+                            ("pct", &pct.to_string()),
+                            ("speed", &speed_str),
+                            ("eta", &eta_str),
+                        ],
                     ),
                 );
             } else {
-                crate::log::device_log(&self.ui.device, &format!("{:.1} GB {}", gb, speed_str));
+                crate::log::device_log(
+                    &self.ui.device,
+                    &freemkv_i18n::fmt(
+                        "autorip.mux.progress_nototal",
+                        &[("gb", &format!("{gb:.1}")), ("speed", &speed_str)],
+                    ),
+                );
             }
         }
 
@@ -663,7 +681,13 @@ impl Sink<libfreemkv::pes::PesFrame> for MuxSink {
         // it back to the caller. `Error::IoError` is the dedicated
         // pass-through for std `io::Error`s.
         if let Err(e) = self.output.finish() {
-            crate::log::device_log(&self.ui.device, &format!("Output finish error: {e}"));
+            crate::log::device_log(
+                &self.ui.device,
+                &freemkv_i18n::fmt(
+                    "autorip.mux.output_finish_error",
+                    &[("error", &e.to_string())],
+                ),
+            );
             return Err(libfreemkv::Error::IoError { source: e });
         }
         Ok(self.output.bytes_written())
@@ -966,9 +990,13 @@ pub(crate) fn run_mux(
                         last_log_secs = stall_secs;
                         crate::log::device_log(
                             &wd_device,
-                            &format!(
-                                "Drive stalled at {:.1} GB ({}%) — waiting for read ({})",
-                                gb, pct, stall_str
+                            &freemkv_i18n::fmt(
+                                "autorip.mux.drive_stalled",
+                                &[
+                                    ("gb", &format!("{gb:.1}")),
+                                    ("pct", &pct.to_string()),
+                                    ("stall", &stall_str),
+                                ],
                             ),
                         );
                     }
@@ -1013,7 +1041,10 @@ pub(crate) fn run_mux(
                     });
                     was_stalled = true;
                 } else if was_stalled {
-                    crate::log::device_log(&wd_device, "Drive recovered — reads resumed");
+                    crate::log::device_log(
+                        &wd_device,
+                        &freemkv_i18n::get("autorip.mux.drive_recovered"),
+                    );
                     was_stalled = false;
                     last_log_secs = 0;
                 }
@@ -1032,7 +1063,10 @@ pub(crate) fn run_mux(
     let mut header_reads = 0u32;
     while !input.headers_ready() {
         if halt_requested(inputs.device) {
-            crate::log::device_log(inputs.device, "Stop requested during header read");
+            crate::log::device_log(
+                inputs.device,
+                &freemkv_i18n::get("autorip.mux.stop_header_read"),
+            );
             return MuxOutcome {
                 completed: false,
                 bytes_done: 0,
@@ -1051,21 +1085,25 @@ pub(crate) fn run_mux(
                 if header_reads <= 3 || header_reads % 100 == 0 {
                     crate::log::device_log(
                         inputs.device,
-                        &format!(
-                            "Header frame {} track={} len={}",
-                            header_reads,
-                            frame.track,
-                            frame.data.len()
+                        &freemkv_i18n::fmt(
+                            "autorip.mux.header_frame",
+                            &[
+                                ("n", &header_reads.to_string()),
+                                ("track", &frame.track.to_string()),
+                                ("len", &frame.data.len().to_string()),
+                            ],
                         ),
                     );
                 }
                 buffered_bytes = buffered_bytes.saturating_add(frame.data.len());
                 buffered.push(frame);
                 if header_buffer_over_cap(buffered_bytes) {
-                    let msg = format!(
-                        "Header buffer exceeded {} MiB ({} frames) before codec_privates resolved; refusing to buffer an unbounded stream",
-                        HEADER_BUFFER_CAP_BYTES / (1024 * 1024),
-                        buffered.len(),
+                    let msg = freemkv_i18n::fmt(
+                        "autorip.mux.header_buffer_exceeded",
+                        &[
+                            ("mib", &(HEADER_BUFFER_CAP_BYTES / (1024 * 1024)).to_string()),
+                            ("frames", &buffered.len().to_string()),
+                        ],
                     );
                     crate::log::device_log(inputs.device, &msg);
                     return MuxOutcome {
@@ -1082,11 +1120,17 @@ pub(crate) fn run_mux(
                 }
             }
             Ok(None) => {
-                crate::log::device_log(inputs.device, "EOF during header read");
+                crate::log::device_log(
+                    inputs.device,
+                    &freemkv_i18n::get("autorip.mux.eof_header_read"),
+                );
                 break;
             }
             Err(e) => {
-                crate::log::device_log(inputs.device, &format!("Header error: {e}"));
+                crate::log::device_log(
+                    inputs.device,
+                    &freemkv_i18n::fmt("autorip.mux.header_error", &[("error", &e.to_string())]),
+                );
                 break;
             }
         }
@@ -1099,7 +1143,7 @@ pub(crate) fn run_mux(
     // gate) would wrongly become true. Treat unresolved headers as a
     // hard failure instead.
     if !input.headers_ready() {
-        let msg = "Header resolution incomplete (EOF or read error before codec_privates resolved); refusing to mux a truncated MKV".to_string();
+        let msg = freemkv_i18n::get("autorip.mux.header_incomplete");
         crate::log::device_log(inputs.device, &msg);
         return MuxOutcome {
             completed: false,
@@ -1115,7 +1159,10 @@ pub(crate) fn run_mux(
     }
     crate::log::device_log(
         inputs.device,
-        &format!("Headers ready, {} frames buffered", buffered.len()),
+        &freemkv_i18n::fmt(
+            "autorip.mux.headers_ready",
+            &[("frames", &buffered.len().to_string())],
+        ),
     );
 
     // Build the output title with codec_privates resolved and the
@@ -1134,13 +1181,14 @@ pub(crate) fn run_mux(
 
     crate::log::device_log(
         inputs.device,
-        &format!("Opening output: {}", inputs.dest_url),
+        &freemkv_i18n::fmt("autorip.mux.opening_output", &[("url", &inputs.dest_url)]),
     );
     let raw_output = match libfreemkv::output(&inputs.dest_url, &out_title) {
         Ok(s) => s,
         Err(e) => {
-            let msg = format!(
-                "Could not create the output file — check that the staging directory exists, is writable, and has free space ({e})."
+            let msg = freemkv_i18n::fmt(
+                "autorip.mux.output_create_failed",
+                &[("error", &e.to_string())],
             );
             crate::log::device_log(inputs.device, &msg);
             update_state(
@@ -1221,7 +1269,13 @@ pub(crate) fn run_mux(
     let pipe = match Pipeline::spawn_named("freemkv-mux-consumer", WRITE_PIPELINE_DEPTH, sink) {
         Ok(p) => p,
         Err(e) => {
-            crate::log::device_log(&device_str_for_sink, &format!("Pipeline spawn failed: {e}"));
+            crate::log::device_log(
+                &device_str_for_sink,
+                &freemkv_i18n::fmt(
+                    "autorip.mux.pipeline_spawn_failed",
+                    &[("error", &e.to_string())],
+                ),
+            );
             return MuxOutcome {
                 completed: false,
                 bytes_done: 0,
@@ -1352,7 +1406,10 @@ pub(crate) fn run_mux(
             let mut local_input = input;
             for frame in buffered {
                 if halt_token_producer.is_cancelled() {
-                    crate::log::device_log(&device_str, "Producer: Stop during buffered drain");
+                    crate::log::device_log(
+                        &device_str,
+                        &freemkv_i18n::get("autorip.mux.producer_stop_buffered_drain"),
+                    );
                     return;
                 }
                 match send_with_halt_raw(
@@ -1365,7 +1422,7 @@ pub(crate) fn run_mux(
                     SendOutcome::Halted => {
                         crate::log::device_log(
                             &device_str,
-                            "Producer: buffered drain halted (operator stop)",
+                            &freemkv_i18n::get("autorip.mux.producer_buffered_halted"),
                         );
                         return;
                     }
@@ -1374,7 +1431,7 @@ pub(crate) fn run_mux(
                         // flag it so the truncated output isn't marked done.
                         crate::log::device_log(
                             &device_str,
-                            "Producer: buffered drain aborted (send deadline or channel closed)",
+                            &freemkv_i18n::get("autorip.mux.producer_buffered_aborted"),
                         );
                         producer_read_failed_for_thread.store(true, Ordering::Relaxed);
                         return;
@@ -1386,7 +1443,10 @@ pub(crate) fn run_mux(
 
             loop {
                 if halt_token_producer.is_cancelled() {
-                    crate::log::device_log(&device_str, "Producer: Stop requested");
+                    crate::log::device_log(
+                        &device_str,
+                        &freemkv_i18n::get("autorip.mux.producer_stop_requested"),
+                    );
                     break;
                 }
                 match local_input.read() {
@@ -1418,7 +1478,7 @@ pub(crate) fn run_mux(
                             SendOutcome::Halted => {
                                 crate::log::device_log(
                                     &device_str,
-                                    "Producer: halted mid-send (operator stop)",
+                                    &freemkv_i18n::get("autorip.mux.producer_halted_midsend"),
                                 );
                                 break;
                             }
@@ -1431,7 +1491,7 @@ pub(crate) fn run_mux(
                                 // goes false and the MKV isn't marked done.
                                 crate::log::device_log(
                                     &device_str,
-                                    "Producer: send deadline elapsed or channel closed (consumer aborted)",
+                                    &freemkv_i18n::get("autorip.mux.producer_send_deadline"),
                                 );
                                 if let Ok(mut slot) = producer_read_cause_for_thread.lock() {
                                     slot.get_or_insert_with(|| {
@@ -1460,7 +1520,13 @@ pub(crate) fn run_mux(
                         // terminal reason can name a coded `E####` instead of a
                         // fixed generic truncation string.
                         let cause = producer_read_error_cause(&e);
-                        crate::log::device_log(&device_str, &format!("Producer read error: {e}"));
+                        crate::log::device_log(
+                            &device_str,
+                            &freemkv_i18n::fmt(
+                                "autorip.mux.producer_read_error",
+                                &[("error", &e.to_string())],
+                            ),
+                        );
                         if let Ok(mut slot) = producer_read_cause_for_thread.lock() {
                             slot.get_or_insert(cause);
                         }
@@ -1477,7 +1543,10 @@ pub(crate) fn run_mux(
         Err(e) => {
             crate::log::device_log(
                 &device_str_for_loop,
-                &format!("Failed to spawn ISO reader thread: {e}"),
+                &freemkv_i18n::fmt(
+                    "autorip.mux.iso_thread_spawn_failed",
+                    &[("error", &e.to_string())],
+                ),
             );
             // Finalize the pipeline so its consumer thread (which holds the
             // output file handle) is joined rather than detached/leaked.
@@ -1485,7 +1554,10 @@ pub(crate) fn run_mux(
             if let Err(fe) = pipe.finish_with_halt(Some(&halt_token)) {
                 crate::log::device_log(
                     &device_str_for_sink,
-                    &format!("Pipeline finalize after producer-spawn failure: {fe}"),
+                    &freemkv_i18n::fmt(
+                        "autorip.mux.pipeline_finalize_after_spawn_fail",
+                        &[("error", &fe.to_string())],
+                    ),
                 );
             }
             return MuxOutcome {
@@ -1564,7 +1636,7 @@ pub(crate) fn run_mux(
             {
                 crate::log::device_log(
                     &device_str_for_loop,
-                    "Mux consumer aborted (pipeline closed or halted)",
+                    &freemkv_i18n::get("autorip.mux.consumer_aborted"),
                 );
                 loop_drained_naturally = false;
                 break;
@@ -1580,9 +1652,9 @@ pub(crate) fn run_mux(
 
                 crate::log::device_log(
                     &device_str_for_loop,
-                    &format!(
-                        "Mux SEND STALLED {:.1}s (channel full)",
-                        elapsed.as_secs_f64()
+                    &freemkv_i18n::fmt(
+                        "autorip.mux.send_stalled",
+                        &[("secs", &format!("{:.1}", elapsed.as_secs_f64()))],
                     ),
                 );
             } else {
@@ -1651,7 +1723,10 @@ pub(crate) fn run_mux(
         Ok(b) => (b, None, true),
         Err(e) => {
             let msg = format!("{e}");
-            crate::log::device_log(&device_str_for_sink, &format!("Mux pipeline failed: {msg}"));
+            crate::log::device_log(
+                &device_str_for_sink,
+                &freemkv_i18n::fmt("autorip.mux.pipeline_failed", &[("msg", &msg)]),
+            );
             let finalize = if is_mux_wedge(&e) { None } else { Some(msg) };
             // On wedge/halt we still have the consumer's running
             // good-bytes estimate; report it rather than 0 so the
@@ -1712,7 +1787,10 @@ pub(crate) fn run_mux(
             .unwrap_or_else(|| "read error or send deadline".to_string());
         crate::log::device_log(
             &device_str_for_sink,
-            &format!("Mux incomplete: producer aborted mid-stream — {cause} (MKV truncated)"),
+            &freemkv_i18n::fmt(
+                "autorip.mux.incomplete_producer_aborted",
+                &[("cause", &cause)],
+            ),
         );
         read_error_cause = Some(cause);
     }
@@ -1742,7 +1820,7 @@ pub(crate) fn run_mux(
     if loop_drained_naturally && pipe_ok && finalize_error.is_none() && !write_failed && !produced {
         crate::log::device_log(
             &device_str_for_sink,
-            "Mux produced no frames/bytes — refusing to mark complete (empty/undecryptable output)",
+            &freemkv_i18n::get("autorip.mux.no_frames"),
         );
     }
     let completed = mux_completed(
@@ -1801,7 +1879,7 @@ pub(crate) fn run_mux(
         } else {
             crate::log::device_log(
                 &device_str_for_sink,
-                "Mux producer thread did not finish within 7.5 s after bridge drained — detaching",
+                &freemkv_i18n::get("autorip.mux.producer_no_finish"),
             );
             // Intentionally detached — by design, not a resource leak.
             //
