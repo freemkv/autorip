@@ -203,7 +203,7 @@ const RV={'3840x2160':'4K','1920x1080':'1080p','1280x720':'720p','720x480':'480p
 function ml(v,m){if(!v)return'';for(const[k,l]of m)if(v.includes(k))return l;return''}
 
 /* ---- Step-by-step progress ---- */
-const ACTIVE_STATES=['ripping','scanning','detecting','verifying'];
+const ACTIVE_STATES=['ripping','scanning','detecting'];
 let _lastStatus={};
 let _activeTab=null;
 
@@ -571,8 +571,7 @@ function renderCurrent(){
   if(!s)return;
 
   /* Derived state */
-  const verifying=data._verify&&data._verify.status==='running';
-  const active=ACTIVE_STATES.includes(s.status)||verifying;
+  const active=ACTIVE_STATES.includes(s.status);
   const title=s.tmdb_title||s.disc_name;
   const scanned=!!title;
   const discIn=s.disc_present||scanned||active;
@@ -634,7 +633,6 @@ function renderCurrent(){
     }else{
       btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="fetch(\'/api/rip/'+dev+'?resume=no\',{method:\'POST\'})">Rip</button>';
     }
-    btns+='<button class="btn" onclick="fetch(\'/api/verify/'+dev+'\',{method:\'POST\'})">Verify</button>';
   }else if(discIn){
     btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan</button>';
   }
@@ -692,70 +690,7 @@ function renderCurrent(){
   /* (Pass/phase info lives inside the Ripping step \u2014 no separate banner.) */
   upd('err',errHtml);
 
-  /* Verify / Disc Health */
-  const v=data._verify;
-  let vhtml='';
-  if(v&&(v.status==='running'||v.status==='done')){
-    vhtml+='<div class="card" style="margin-top:12px"><h2>Disc Health</h2>';
-    /* Sector map bar */
-    vhtml+='<div style="position:relative;height:12px;background:var(--chip);border-radius:3px;overflow:hidden;margin-bottom:8px">';
-    if(v.status==='running'){
-      const pct=v.progress_pct||0;
-      vhtml+='<div style="position:absolute;left:0;top:0;height:100%;width:'+pct+'%;background:var(--green);transition:width 1s"></div>';
-    }else{
-      /* Full green background for completed */
-      vhtml+='<div style="position:absolute;left:0;top:0;height:100%;width:100%;background:var(--green)"></div>';
-    }
-    /* Overlay bad/slow sectors */
-    if(v.sector_map){
-      v.sector_map.forEach(s=>{
-        const color=s.status==='bad'?'var(--red)':s.status==='recovered'?'var(--yellow)':'var(--yellow)';
-        vhtml+='<div style="position:absolute;left:'+s.offset_pct+'%;top:0;height:100%;width:'+Math.max(s.width_pct,0.3)+'%;background:'+color+'"></div>';
-      });
-    }
-    vhtml+='</div>';
-    /* Stats line */
-    if(v.status==='running'){
-      const spd=v.speed_mbs?v.speed_mbs.toFixed(1)+' MB/s':'';
-      const done=v.sectors_done||0;
-      const total=v.sectors_total||1;
-      const pct=(done/total*100).toFixed(1);
-      const goodCount=done-(v.bad||0)-(v.slow||0)-(v.recovered||0);
-      const badMb=((v.bad||0)*2048/1048576).toFixed(1);
-      const badSecs=((v.bad||0)*2048/8250000).toFixed(1);
-      vhtml+='<div style="font-size:.8rem;color:var(--text)">Verifying... <strong>'+pct+'%</strong> \u00b7 '+spd+'</div>';
-      let stats='<span style="color:var(--green)">'+goodCount.toLocaleString()+' good</span>';
-      if(v.bad)stats+=' \u00b7 <span style="color:var(--red)">'+v.bad.toLocaleString()+' bad ('+badMb+' MB, ~'+badSecs+'s)</span>';
-      if(v.slow)stats+=' \u00b7 <span style="color:var(--yellow)">'+v.slow.toLocaleString()+' slow</span>';
-      if(v.recovered)stats+=' \u00b7 <span style="color:var(--accent)">'+v.recovered.toLocaleString()+' recovered</span>';
-      stats+=' \u00b7 <span style="color:var(--text3)">'+total.toLocaleString()+' total</span>';
-      vhtml+='<div style="font-size:.75rem;margin-top:4px">'+stats+'</div>';
-    }else{
-      const total=v.sectors_total||1;
-      const pct=(((total-(v.bad||0))/total)*100).toFixed(v.bad>0?4:0);
-      const elapsed=v.elapsed_secs||0;
-      const m=Math.floor(elapsed/60);
-      const s=Math.floor(elapsed%60);
-      vhtml+='<div style="font-size:.8rem;color:var(--text);margin-bottom:4px"><strong>'+pct+'%</strong> readable in '+m+':'+String(s).padStart(2,'0')+'</div>';
-      vhtml+='<div style="font-size:.75rem;color:var(--text2)">';
-      vhtml+='Good: '+(v.good||0).toLocaleString();
-      if(v.slow)vhtml+=' \u00b7 Slow: '+v.slow.toLocaleString();
-      if(v.recovered)vhtml+=' \u00b7 Recovered: '+v.recovered.toLocaleString();
-      if(v.bad)vhtml+=' \u00b7 <span style="color:var(--red)">Bad: '+v.bad.toLocaleString()+'</span>';
-      vhtml+='</div>';
-      /* Bad ranges */
-      if(v.bad_ranges&&v.bad_ranges.length){
-        v.bad_ranges.filter(r=>r.status==='bad').forEach(r=>{
-          vhtml+='<div style="font-size:.75rem;color:var(--red);margin-top:4px">\u26a0 '+r.count+' bad sectors at '+r.gb_offset.toFixed(1)+' GB';
-          if(r.chapter)vhtml+=' ('+esc(r.chapter)+')';
-          vhtml+='</div>';
-        });
-      }
-      if(!v.bad&&!v.slow)vhtml+='<div style="font-size:.8rem;color:var(--green);margin-top:4px">\u2713 Disc is perfect</div>';
-    }
-    vhtml+='</div>';
-  }
-  upd('err',errHtml+vhtml);
+  upd('err',errHtml);
 
   /* Device log */
   loadDeviceLog(dev);
@@ -1556,25 +1491,6 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             return json_response(request, 400, r#"{"error":"invalid device name"}"#);
         }
         handle_stop(request, cfg, &device);
-    } else if is_post && url.starts_with("/api/verify/") {
-        let device = url.trim_start_matches("/api/verify/");
-        let device = percent_decode(device);
-        if !is_valid_device_name(&device) {
-            return json_response(request, 400, r#"{"error":"invalid device name"}"#);
-        }
-        let dev_path = format!("/dev/{}", device);
-        // Gate on the unified per-device claim, not a verify-local "already
-        // running" check: a rip/scan/eject in progress must also reject a
-        // verify (and vice-versa). try_claim_active is the single source of
-        // truth; reject early here so the caller gets a 409, then let
-        // run_verify perform the actual atomic claim it will hold.
-        if ripper::is_busy(&device) || crate::verify::is_running(&device) {
-            json_response(request, 409, r#"{"error":"device busy"}"#);
-        } else {
-            let keydb = cfg.read().ok().and_then(|c| c.keydb_path.clone());
-            crate::verify::run_verify(&device, &dev_path, keydb);
-            json_response(request, 200, r#"{"ok":true}"#);
-        }
     } else if is_get && url == "/api/review" {
         let staging = cfg
             .read()
@@ -3927,13 +3843,9 @@ fn get_state_json(staging_dir: &str) -> String {
     // RipState seeded by the mux worker — see the dashboard JS at the
     // `_mux` field), serialized below as part of `state`. There is no
     // separate live MuxState struct.
-    let verify_state = crate::verify::dashboard_state();
     let mut obj = serde_json::to_value(&*state).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(ms) = move_state {
         obj["_move"] = serde_json::to_value(&ms).unwrap_or_default();
-    }
-    if let Some(vs) = verify_state {
-        obj["_verify"] = serde_json::to_value(&vs).unwrap_or_default();
     }
     // Release the STATE lock before the staging-dir scan below. `build_queue_views`
     // does filesystem I/O (read_dir + per-dir stat); holding STATE across it would
@@ -5270,7 +5182,6 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     // under heavy ECC retry on the BU40N). A timeout is logged but not fatal
     // — the HTTP response still goes out 200 so the UI doesn't spin.
     let _ = cfg;
-    crate::verify::request_stop(device);
 
     // Cancel the per-device halt and drain the rip thread (the core
     // stop→drain contract; see ripper::stop_and_drain).
@@ -5279,30 +5190,6 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
             device = %device,
             "rip thread did not drain within 60s of stop"
         );
-    }
-
-    // Drain the detached verify worker before resetting STATE. The verify
-    // thread is NOT in RIP_THREADS, so join_rip_thread above returns
-    // immediately for it; without this bounded wait we'd reset STATE to idle
-    // while run_verify_inner still holds an open Drive, and a concurrent
-    // /api/rip could claim+open the same drive (double-open). request_stop
-    // already cancelled the drive halt, so the in-flight read bails within a
-    // poll interval; poll is_running until it clears, up to the same 60 s drain
-    // budget the rip thread gets. A timeout is logged, not fatal — the worker's
-    // own release_claim is generation-checked, so a late finish can't clobber a
-    // newer owner even if we proceed.
-    {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while crate::verify::is_running(device) {
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    device = %device,
-                    "verify worker did not drain within 60s of stop"
-                );
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
     }
 
     let existed = ripper::STATE
