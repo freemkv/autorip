@@ -477,15 +477,6 @@ pub fn try_claim_active(device: &str) -> bool {
     true
 }
 
-/// The device's current claim generation (0 if the device is unknown). A
-/// detached worker reads this immediately after its own [`try_claim_active`]
-/// and again before releasing the claim: if it changed, a newer owner has the
-/// device and the worker must not reset it to idle.
-pub fn current_claim_gen(device: &str) -> u64 {
-    let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    s.get(device).map(|r| r.claim_gen).unwrap_or(0)
-}
-
 /// Shared context for the progress callbacks of a multi-pass rip. Built once
 /// before pass 1, cheaply Arc-cloned per pass so each closure captures the
 /// same immutable values without reallocating every callback.
@@ -535,7 +526,7 @@ pub(super) fn byte_offset_in_title(lba: u32, title: &libfreemkv::DiscTitle) -> O
 
 fn range_chapter(lba: u32, title: &libfreemkv::DiscTitle) -> (Option<u32>, Option<f64>) {
     if let Some(byte_offset) = byte_offset_in_title(lba, title) {
-        if let Some((ch, t)) = libfreemkv::verify::VerifyResult::chapter_at_offset(
+        if let Some((ch, t)) = libfreemkv::disc::chapter_at_offset(
             &title.chapters,
             byte_offset,
             title.duration_secs,
