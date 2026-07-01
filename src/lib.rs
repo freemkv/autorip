@@ -34,6 +34,5 @@ pub mod review;
 pub mod ripper;
 pub mod tmdb;
 pub mod util;
-pub mod verify;
 pub mod web;
 pub mod webhook;

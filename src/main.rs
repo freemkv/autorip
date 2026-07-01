@@ -8,7 +8,6 @@ mod review;
 mod ripper;
 mod tmdb;
 mod util;
-mod verify;
 mod web;
 mod webhook;
 
