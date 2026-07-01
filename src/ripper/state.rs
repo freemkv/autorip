@@ -1092,24 +1092,38 @@ pub(super) fn push_pass_state(
             let good_gb = bytes_good as f64 / BYTES_PER_GIB;
             let total_gb = ctx.bytes_total_disc as f64 / BYTES_PER_GIB;
             let speed_str = if speed_mbs >= 1.0 {
-                format!("{speed_mbs:.1} MB/s")
+                freemkv_i18n::fmt("common.speed_mbs", &[("speed", &format!("{speed_mbs:.1}"))])
             } else {
-                format!("{:.0} KB/s", speed_mbs * 1024.0)
+                freemkv_i18n::fmt(
+                    "common.speed_kbs",
+                    &[("speed", &format!("{:.0}", speed_mbs * 1024.0))],
+                )
             };
             let bad_str = if bytes_lost > 0 {
-                format!(
-                    ", {} skipped ({:.2} MB)",
-                    errors,
-                    bytes_lost as f64 / BYTES_PER_MIB
+                freemkv_i18n::fmt(
+                    "autorip.rip.swept_skipped",
+                    &[
+                        ("errors", &errors.to_string()),
+                        ("mb", &format!("{:.2}", bytes_lost as f64 / BYTES_PER_MIB)),
+                    ],
                 )
             } else {
                 String::new()
             };
             crate::log::device_log(
                 &ctx.device,
-                &format!(
-                    "Pass {pass}/{total_passes}: swept {:.1} GB / {:.1} GB ({}%), good {:.1} GB, {}{}",
-                    pos_gb, total_gb, pct, good_gb, speed_str, bad_str
+                &freemkv_i18n::fmt(
+                    "autorip.rip.pass_swept",
+                    &[
+                        ("pass", &pass.to_string()),
+                        ("total", &total_passes.to_string()),
+                        ("pos", &format!("{pos_gb:.1}")),
+                        ("total_gb", &format!("{total_gb:.1}")),
+                        ("pct", &pct.to_string()),
+                        ("good", &format!("{good_gb:.1}")),
+                        ("speed", &speed_str),
+                        ("bad", &bad_str),
+                    ],
                 ),
             );
         }
