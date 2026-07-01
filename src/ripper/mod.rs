@@ -3455,7 +3455,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         if user_halt.load(Ordering::Relaxed) {
             crate::log::device_log(
                 device,
-                "Rip stopped by user — preserving partial sweep for resume (no Unreadable promotion, no loss-abort).",
+                "Rip stopped by user — preserving partial sweep for resume.",
             );
             unregister_halt(device);
             return;
