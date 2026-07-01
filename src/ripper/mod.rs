@@ -109,9 +109,12 @@ impl ScanWatchdog {
                     );
                     crate::log::device_log(
                         &device,
-                        &format!(
-                            "Still scanning ({}s elapsed, phase={})...",
-                            elapsed, last_phase
+                        &freemkv_i18n::fmt(
+                            "autorip.rip.still_scanning",
+                            &[
+                                ("elapsed", &elapsed.to_string()),
+                                ("phase", &last_phase.to_string()),
+                            ],
                         ),
                     );
                     warned = true;
@@ -585,7 +588,10 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                                 device = %device_for_thread,
                                 "scan/rip thread panicked"
                             );
-                            crate::log::device_log(&device_for_thread, "Thread panicked");
+                            crate::log::device_log(
+                &device_for_thread,
+                &freemkv_i18n::get("autorip.rip.thread_panicked"),
+            );
                             drop_session(&device_for_thread);
                             unregister_halt(&device_for_thread);
                             update_state(
@@ -646,7 +652,10 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
 /// the failure visible and self-explanatory, matching the other early-exit
 /// paths in those functions. `op` is the user-facing verb ("Scan" / "Rip").
 fn mark_config_lock_poisoned(device: &str, op: &str) {
-    crate::log::device_log(device, &format!("{op} aborted: config lock poisoned"));
+    crate::log::device_log(
+        device,
+        &freemkv_i18n::fmt("autorip.rip.aborted_config_poisoned", &[("op", op)]),
+    );
     update_state(
         device,
         RipState {
@@ -684,7 +693,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     );
 
     crate::log::archive_device_log(device);
-    crate::log::device_log(device, "Opening drive...");
+    crate::log::device_log(device, &freemkv_i18n::get("common.opening_drive"));
 
     let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
         Ok(d) => d,
@@ -706,7 +715,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     if let Err(e) = drive.wait_ready() {
         tracing::warn!(device = %device, error = %e, "drive wait_ready failed (continuing)");
     }
-    crate::log::device_log(device, "Initializing...");
+    crate::log::device_log(device, &freemkv_i18n::get("common.initializing"));
     if let Err(e) = drive.init() {
         tracing::warn!(device = %device, error = %e, "drive init failed (continuing — scan may degrade)");
     }
@@ -716,7 +725,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     }
 
     // Fast identify — disc name only, no playlists
-    crate::log::device_log(device, "Identifying disc...");
+    crate::log::device_log(device, &freemkv_i18n::get("common.identifying_disc"));
     let disc_id = match libfreemkv::Disc::identify(&mut drive) {
         Ok(id) => id,
         Err(e) => {
@@ -737,7 +746,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     let id_name = disc_id.name().to_string();
 
-    crate::log::device_log(device, &format!("Disc: {}", id_name));
+    crate::log::device_log(
+        device,
+        &freemkv_i18n::fmt("common.disc_label", &[("name", &id_name)]),
+    );
 
     // TMDB lookup — fast, user sees poster while full scan runs
     let tmdb = crate::tmdb::lookup(&crate::tmdb::clean_title(&id_name), &cfg_read.tmdb_api_key);
@@ -770,7 +782,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     );
 
     // Full scan — titles, streams, AACS keys
-    crate::log::device_log(device, "Scanning titles...");
+    crate::log::device_log(device, &freemkv_i18n::get("common.scanning_titles"));
     let scan_opts = scan_opts_for(&cfg_read);
     // Arm the scan-phase watchdog: WARNs every 15s while scan/resolve runs,
     // torn down by the drop-guard when this block returns.
@@ -812,7 +824,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         (disc, crate::keysource::KeyOutcome::Resolved)
     } else {
         if crate::keysource::uses_online(&cfg_read) {
-            crate::log::device_log(device, "Communicating with online keyserver...");
+            crate::log::device_log(
+                device,
+                &freemkv_i18n::get("autorip.rip.contacting_keyserver"),
+            );
             update_state_with(device, |s| {
                 s.key_status = "Communicating with online keyserver…".to_string();
             });
@@ -845,11 +860,13 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     crate::log::device_log(
         device,
-        &format!(
-            "Scanned: {} ({}, {} titles)",
-            disc_name,
-            disc_format,
-            disc.titles.len()
+        &freemkv_i18n::fmt(
+            "autorip.rip.scanned",
+            &[
+                ("name", &disc_name),
+                ("format", &disc_format),
+                ("count", &disc.titles.len().to_string()),
+            ],
         ),
     );
 
@@ -864,12 +881,17 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let matrix = disc
             .unlocker_matrix(&drive)
             .into_iter()
-            .map(|(name, ok)| format!("{name}: {}", if ok { "yes" } else { "no" }))
+            .map(|(name, ok)| {
+                format!(
+                    "{name}: {}",
+                    freemkv_i18n::get(if ok { "common.yes" } else { "common.no" })
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         crate::log::device_log(
             device,
-            &format!("Unlockers (yes = ran this rip) — {matrix}"),
+            &freemkv_i18n::fmt("autorip.rip.unlockers", &[("matrix", &matrix)]),
         );
     }
 
@@ -969,7 +991,7 @@ pub fn handle_rip_request(
     } else {
         crate::log::device_log(
             device,
-            "Skipping redundant scan — disc already identified since insertion.",
+            &freemkv_i18n::get("autorip.rip.skip_redundant_scan"),
         );
     }
     let cancelled = device_halt(device)
@@ -988,19 +1010,22 @@ pub fn handle_rip_request(
                 // the recovery budget; nothing is ever abandoned as "dead".
                 crate::log::device_log(
                     device,
-                    "Resume requested: continuing partial sweep from mapfile",
+                    &freemkv_i18n::get("autorip.rip.resume_continue_sweep"),
                 );
                 rip_disc(cfg, device, device_path, true);
             } else if let Some(class) = find_resumable_for_disc(cfg, device) {
                 // Mapfile is 100% recovered — just re-mux the staged ISO, no
                 // disc reads.
-                crate::log::device_log(device, "Resume requested: re-muxing existing ISO");
+                crate::log::device_log(
+                    device,
+                    &freemkv_i18n::get("autorip.rip.resume_remux_iso"),
+                );
                 resume::resume_remux(cfg, device, class);
                 drop_session(device);
             } else {
                 crate::log::device_log(
                     device,
-                    "Resume requested but no resumable staging state found for this disc",
+                    &freemkv_i18n::get("autorip.rip.resume_none"),
                 );
                 update_state(
                     device,
@@ -1030,7 +1055,7 @@ pub fn handle_rip_request(
             if disc_owned_by_worker(cfg, device) {
                 crate::log::device_log(
                     device,
-                    "Refusing to wipe staging: the mux worker is reading this disc's staged ISO (.ripped/.muxing). Wait for the mux to finish, then retry.",
+                    &freemkv_i18n::get("autorip.rip.wipe_refused_worker"),
                 );
                 update_state_with(device, |s| {
                     s.status = "error".to_string();
@@ -1056,7 +1081,7 @@ pub fn handle_rip_request(
             if disc_already_completed(cfg, device) {
                 crate::log::device_log(
                     device,
-                    "Disc already ripped (.completed marker present) — skipping unattended re-rip. Click Rip to force a fresh rip.",
+                    &freemkv_i18n::get("autorip.rip.already_ripped"),
                 );
                 let prev = STATE.lock().ok().and_then(|s| s.get(device).cloned());
                 update_state(
@@ -1096,7 +1121,7 @@ pub fn handle_rip_request(
             if disc_owned_by_worker(cfg, device) {
                 crate::log::device_log(
                     device,
-                    "Disc rip already staged and owned by the mux worker (.ripped/.muxing) — skipping unattended re-sweep.",
+                    &freemkv_i18n::get("autorip.rip.owned_by_worker"),
                 );
                 drop_session(device);
                 return;
@@ -1110,7 +1135,7 @@ pub fn handle_rip_request(
             if disc_loss_aborted(cfg, device) {
                 crate::log::device_log(
                     device,
-                    "Disc has a loss-aborted staged ISO awaiting an operator decision — NOT re-ripping. Use 'Accept damage' to deliver it, or 'Resume' to run another recovery pass.",
+                    &freemkv_i18n::get("autorip.rip.loss_aborted_await"),
                 );
                 // Surface the decision in the live state, else the scan-set
                 // "scanning" status sticks forever with no movement and no
@@ -1540,7 +1565,10 @@ fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
     if !is_safe_staging_segment(&sanitized) {
         crate::log::device_log(
             device,
-            &format!("Refusing to wipe staging: unsafe sanitized dir name {sanitized:?}"),
+            &freemkv_i18n::fmt(
+                "autorip.rip.wipe_unsafe_name",
+                &[("name", &format!("{sanitized:?}"))],
+            ),
         );
         return;
     }
@@ -1551,10 +1579,12 @@ fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
     if path.parent() != Some(staging_root) {
         crate::log::device_log(
             device,
-            &format!(
-                "Refusing to wipe staging: {} is not a direct child of {}",
-                path.display(),
-                staging_root.display()
+            &freemkv_i18n::fmt(
+                "autorip.rip.wipe_not_child",
+                &[
+                    ("path", &path.display().to_string()),
+                    ("root", &staging_root.display().to_string()),
+                ],
             ),
         );
         return;
@@ -1563,11 +1593,20 @@ fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
         match std::fs::remove_dir_all(&path) {
             Ok(_) => crate::log::device_log(
                 device,
-                &format!("Wiped staging dir for fresh rip: {}", path.display()),
+                &freemkv_i18n::fmt(
+                    "autorip.rip.wiped",
+                    &[("path", &path.display().to_string())],
+                ),
             ),
             Err(e) => crate::log::device_log(
                 device,
-                &format!("Failed to wipe staging dir {}: {}", path.display(), e),
+                &freemkv_i18n::fmt(
+                    "autorip.rip.wipe_failed",
+                    &[
+                        ("path", &path.display().to_string()),
+                        ("error", &e.to_string()),
+                    ],
+                ),
             ),
         }
     }
@@ -1718,7 +1757,13 @@ pub fn make_drive_event_fn(
                 latest_bytes_read.store(bytes, Ordering::Relaxed);
             }
             libfreemkv::event::EventKind::ReadError { sector, .. } => {
-                crate::log::device_log(&dev, &format!("Read error at sector {}", sector));
+                crate::log::device_log(
+                    &dev,
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.read_error_sector",
+                        &[("sector", &sector.to_string())],
+                    ),
+                );
             }
             _ => {}
         }
@@ -1749,14 +1794,26 @@ pub fn make_stream_event_fn(
             libfreemkv::event::EventKind::BatchSizeChanged { new_size, reason } => {
                 current_batch.store(new_size, Ordering::Relaxed);
                 let label = match reason {
-                    BatchSizeReason::Shrunk => "shrunk",
-                    BatchSizeReason::Probed => "probed up",
+                    BatchSizeReason::Shrunk => freemkv_i18n::get("autorip.rip.batch_shrunk"),
+                    BatchSizeReason::Probed => freemkv_i18n::get("autorip.rip.batch_probed"),
                 };
-                crate::log::device_log(&dev, &format!("Batch size → {} ({})", new_size, label));
+                crate::log::device_log(
+                    &dev,
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.batch_size",
+                        &[("size", &new_size.to_string()), ("label", &label)],
+                    ),
+                );
             }
             libfreemkv::event::EventKind::SectorSkipped { sector } => {
                 last_lba.store(sector, Ordering::Relaxed);
-                crate::log::device_log(&dev, &format!("Sector {} skipped (zero-filled)", sector));
+                crate::log::device_log(
+                    &dev,
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.sector_skipped",
+                        &[("sector", &sector.to_string())],
+                    ),
+                );
             }
             _ => {}
         }
@@ -1851,7 +1908,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Take the existing session, or open fresh
     let mut session = match take_session(device) {
         Some(s) if s.scanned => {
-            crate::log::device_log(device, "Reusing drive session");
+            crate::log::device_log(device, &freemkv_i18n::get("autorip.rip.reusing_session"));
             s
         }
         existing => {
@@ -1859,7 +1916,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             if existing.is_some() {
                 drop_session(device);
             }
-            crate::log::device_log(device, "Opening drive...");
+            crate::log::device_log(device, &freemkv_i18n::get("common.opening_drive"));
             let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1880,7 +1937,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             if let Err(e) = drive.wait_ready() {
                 tracing::warn!(device = %device, error = %e, "drive wait_ready failed (continuing)");
             }
-            crate::log::device_log(device, "Initializing...");
+            crate::log::device_log(device, &freemkv_i18n::get("common.initializing"));
             if let Err(e) = drive.init() {
                 tracing::warn!(device = %device, error = %e, "drive init failed (continuing)");
             }
@@ -1890,7 +1947,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             }
 
             let scan_opts = scan_opts_for(&cfg_read);
-            crate::log::device_log(device, "Scanning titles...");
+            crate::log::device_log(device, &freemkv_i18n::get("common.scanning_titles"));
             // Scan-phase watchdog (same as scan_disc): WARNs every 15s while
             // scan/resolve runs, torn down by the drop-guard.
             let scan_wd = ScanWatchdog::arm(device);
@@ -1955,7 +2012,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 device = %device,
                 "DriveSession had no disc — every code path that builds a session must set Some(disc); reaching this branch is a logic bug"
             );
-            crate::log::device_log(device, "Internal error: session has no disc");
+            crate::log::device_log(device, &freemkv_i18n::get("autorip.rip.no_disc"));
             update_state(
                 device,
                 RipState {
@@ -2045,16 +2102,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
     crate::log::device_log(
         device,
-        &format!(
-            "Disc: {} ({}, {} titles)",
-            disc_name,
-            disc_format,
-            disc.titles.len()
+        &freemkv_i18n::fmt(
+            "autorip.rip.disc_summary",
+            &[
+                ("name", &disc_name),
+                ("format", &disc_format),
+                ("count", &disc.titles.len().to_string()),
+            ],
         ),
     );
 
     if disc.titles.is_empty() {
-        crate::log::device_log(device, "No titles found");
+        crate::log::device_log(device, &freemkv_i18n::get("disc.no_titles"));
         update_state(
             device,
             RipState {
@@ -2084,16 +2143,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         if cfg_read.capture_without_keys {
             crate::log::device_log(
                 device,
-                &format!(
-                    "{msg}\nNo keys yet — capturing to ISO; mux deferred until keys are available."
-                ),
+                &freemkv_i18n::fmt("autorip.rip.no_keys_capturing", &[("msg", &msg)]),
             );
         } else {
             crate::log::device_log(
                 device,
-                &format!(
-                    "{msg}\nNo keys — not ripping. Enable \"capture without keys\" to save an ISO for later."
-                ),
+                &freemkv_i18n::fmt("autorip.rip.no_keys_not_ripping", &[("msg", &msg)]),
             );
             update_state_with(device, |s| {
                 s.status = "error".to_string();
@@ -2106,7 +2161,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
     // Probe for speed — only needed for rip, not scan
     if !session.probed {
-        crate::log::device_log(device, "Probing disc speed...");
+        crate::log::device_log(device, &freemkv_i18n::get("autorip.rip.probing_speed"));
         let _ = session.drive.probe_disc();
         session.probed = true;
     }
@@ -2144,9 +2199,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     if iso_output_needs_multipass(&output_format, cfg_read.max_retries) {
         crate::log::device_log(
             device,
-            "ISO output requires multi-pass mode — single-pass streams only the \
-             selected title and cannot capture a whole-disc image. Enable multi-pass \
-             mode (Retry Passes > 0) to rip an ISO.",
+            &freemkv_i18n::get("autorip.rip.iso_needs_multipass"),
         );
         update_state_with(device, |s| {
             s.status = "error".to_string();
@@ -2169,7 +2222,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // Bail loudly instead of pressing on: a missing staging dir
         // makes the free-space preflight skip its check and the sweep
         // later dies with a confusing ENOENT/EACCES far from the cause.
-        crate::log::device_log(device, &format!("Cannot create staging dir {staging}: {e}"));
+        crate::log::device_log(
+            device,
+            &freemkv_i18n::fmt(
+                "autorip.rip.staging_create_failed",
+                &[("dir", &staging), ("error", &e.to_string())],
+            ),
+        );
         update_state_with(device, |s| {
             s.status = "error".to_string();
             if s.last_error.is_empty() {
@@ -2214,7 +2273,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         format!("{}://{}", ext, output_path)
     };
 
-    crate::log::device_log(device, &format!("Ripping {} to {}", display_name, filename));
+    crate::log::device_log(
+        device,
+        &freemkv_i18n::fmt(
+            "autorip.rip.ripping_to",
+            &[("name", &display_name), ("file", &filename)],
+        ),
+    );
 
     update_state(
         device,
@@ -2473,8 +2538,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // eventual mid-stream ENOSPC isn't a surprise.
             crate::log::device_log(
                 device,
-                "disk-space preflight skipped: drive reported unknown capacity (read_capacity=0); \
-                 a too-small staging volume will ENOSPC mid-rip",
+                &freemkv_i18n::get("autorip.rip.diskcheck_unknown_capacity"),
             );
         }
         if bytes_total_disc > 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
@@ -2501,11 +2565,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // isn't a surprise. Mirrors the unknown-capacity branch.
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "disk-space preflight skipped: could not read free space at {} \
-                         (path missing or volume not mounted?); a too-small or unmounted \
-                         staging volume will ENOSPC mid-rip",
-                        &staging,
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.diskcheck_no_free",
+                        &[("path", &staging)],
                     ),
                 );
             }
@@ -2532,7 +2594,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         let bps_progress = title_bytes_per_sec;
 
         // Pass 1: disc → ISO (fast sweep, skip-forward on failure).
-        let pass_label = format!("Pass 1/{total_passes}: disc → ISO");
+        let pass_label = freemkv_i18n::fmt(
+            "autorip.rip.pass1_label",
+            &[("total", &total_passes.to_string())],
+        );
         crate::log::device_log(device, &pass_label);
         set_pass_progress(
             &pass_ctx,
@@ -2615,7 +2680,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         'pass1: loop {
             attempt += 1;
             if attempt > MAX_PASS1_ATTEMPTS {
-                crate::log::device_log(device, "Pass 1: max attempts reached");
+                crate::log::device_log(device, &freemkv_i18n::get("autorip.rip.pass1_max_attempts"));
                 break;
             }
 
@@ -2659,7 +2724,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 }
                 Err(e) => {
                     if halt.load(Ordering::Relaxed) {
-                        crate::log::device_log(device, &format!("Pass 1 cancelled (halt): {e}"));
+                        crate::log::device_log(
+                            device,
+                            &freemkv_i18n::fmt(
+                                "autorip.rip.pass1_cancelled",
+                                &[("error", &e.to_string())],
+                            ),
+                        );
                         // `_halt_guard` unregisters this device's Halt token on
                         // drop (i.e. on this `return`); no explicit call needed.
                         return;
@@ -2668,7 +2739,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     let is_transport = e.is_scsi_transport_failure();
 
                     if !is_transport {
-                        crate::log::device_log(device, &format!("Pass 1 failed: {e}"));
+                        crate::log::device_log(
+                            device,
+                            &freemkv_i18n::fmt("autorip.rip.pass1_failed", &[("error", &e.to_string())]),
+                        );
                         let user_msg = format_pass_error("Pass 1", &e);
                         update_state(
                             device,
@@ -2704,8 +2778,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     // on new path.
                     crate::log::device_log(
                         device,
-                        &format!(
-                            "Pass 1 attempt {attempt}: transport failure (bridge crash), waiting for USB re-enumeration"
+                        &freemkv_i18n::fmt(
+                            "autorip.rip.pass1_transport_failure",
+                            &[("attempt", &attempt.to_string())],
                         ),
                     );
                     drop_session(device);
@@ -2725,9 +2800,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         (Some(p), _) if p != device_path => {
                             crate::log::device_log(
                                 device,
-                                &format!(
-                                    "Pass 1 attempt {attempt}: drive rediscovered at {p} (original={}), attempting re-open",
-                                    device_path
+                                &freemkv_i18n::fmt(
+                                    "autorip.rip.pass1_rediscovered",
+                                    &[
+                                        ("attempt", &attempt.to_string()),
+                                        ("path", p),
+                                        ("orig", device_path),
+                                    ],
                                 ),
                             );
 
@@ -2745,10 +2824,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                             if let Err(e) = drive.wait_ready() {
                                 crate::log::device_log(
                                     device,
-                                    &format!(
-                                        "Pass 1 attempt {attempt}: Drive::wait_ready({}) failed strategy=transport_failure_recovery error={} — recovery path exhausted",
-                                        p,
-                                        e.code()
+                                    &freemkv_i18n::fmt(
+                                        "autorip.rip.pass1_wait_ready_failed",
+                                        &[
+                                            ("attempt", &attempt.to_string()),
+                                            ("path", p),
+                                            ("code", &e.code().to_string()),
+                                        ],
                                     ),
                                 );
 
@@ -2760,10 +2842,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
                                 crate::log::device_log(
                                     device,
-                                    &format!(
-                                        "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::wait_ready category={} error_code={}",
-                                        failure_category,
-                                        e.code()
+                                    &freemkv_i18n::fmt(
+                                        "autorip.rip.strategy_fail_wait_ready",
+                                        &[
+                                            ("category", failure_category),
+                                            ("code", &e.code().to_string()),
+                                        ],
                                     ),
                                 );
 
@@ -2773,12 +2857,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                             if let Err(e) = drive.init() {
                                 crate::log::device_log(
                                     device,
-                                    &format!(
-                                        "Pass 1 attempt {attempt}: Drive::init({}) failed strategy=transport_failure_recovery error={} sense_key={:?} ASC={:?} — recovery path exhausted",
-                                        p,
-                                        e.code(),
-                                        e.scsi_sense().map(|s| s.sense_key),
-                                        e.scsi_sense().map(|s| s.asc)
+                                    &freemkv_i18n::fmt(
+                                        "autorip.rip.pass1_init_failed",
+                                        &[
+                                            ("attempt", &attempt.to_string()),
+                                            ("path", p),
+                                            ("code", &e.code().to_string()),
+                                            ("sense_key", &format!("{:?}", e.scsi_sense().map(|s| s.sense_key))),
+                                            ("asc", &format!("{:?}", e.scsi_sense().map(|s| s.asc))),
+                                        ],
                                     ),
                                 );
 
@@ -2801,10 +2888,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
                             crate::log::device_log(
                                 device,
-                                &format!(
-                                    "PASS 1/{}: transport_failure_recovery SUCCESS — resuming from mapfile at {}",
-                                    attempt + 1,
-                                    p
+                                &freemkv_i18n::fmt(
+                                    "autorip.rip.pass1_recovery_success",
+                                    &[("n", &(attempt + 1).to_string()), ("path", p)],
                                 ),
                             );
                         }
@@ -2812,9 +2898,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         (Some(p), _) if p == device_path => {
                             crate::log::device_log(
                                 device,
-                                &format!(
-                                    "Pass 1 attempt {attempt}: drive still at original path {}, attempting re-open",
-                                    p
+                                &freemkv_i18n::fmt(
+                                    "autorip.rip.pass1_same_path",
+                                    &[("attempt", &attempt.to_string()), ("path", p)],
                                 ),
                             );
 
@@ -2834,10 +2920,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                             if let Err(e) = drive.wait_ready() {
                                 crate::log::device_log(
                                     device,
-                                    &format!(
-                                        "Pass 1 attempt {attempt}: Drive::wait_ready({}) failed strategy=transport_failure_recovery error={} — recovery path exhausted",
-                                        p,
-                                        e.code()
+                                    &freemkv_i18n::fmt(
+                                        "autorip.rip.pass1_wait_ready_failed",
+                                        &[
+                                            ("attempt", &attempt.to_string()),
+                                            ("path", p),
+                                            ("code", &e.code().to_string()),
+                                        ],
                                     ),
                                 );
 
@@ -2849,10 +2938,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
                                 crate::log::device_log(
                                     device,
-                                    &format!(
-                                        "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::wait_ready category={} error_code={}",
-                                        failure_category,
-                                        e.code()
+                                    &freemkv_i18n::fmt(
+                                        "autorip.rip.strategy_fail_wait_ready",
+                                        &[
+                                            ("category", failure_category),
+                                            ("code", &e.code().to_string()),
+                                        ],
                                     ),
                                 );
 
@@ -2862,12 +2953,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                             if let Err(e) = drive.init() {
                                 crate::log::device_log(
                                     device,
-                                    &format!(
-                                        "Pass 1 attempt {attempt}: Drive::init({}) failed strategy=transport_failure_recovery error={} sense_key={:?} ASC={:?} — recovery path exhausted",
-                                        p,
-                                        e.code(),
-                                        e.scsi_sense().map(|s| s.sense_key),
-                                        e.scsi_sense().map(|s| s.asc)
+                                    &freemkv_i18n::fmt(
+                                        "autorip.rip.pass1_init_failed",
+                                        &[
+                                            ("attempt", &attempt.to_string()),
+                                            ("path", p),
+                                            ("code", &e.code().to_string()),
+                                            ("sense_key", &format!("{:?}", e.scsi_sense().map(|s| s.sense_key))),
+                                            ("asc", &format!("{:?}", e.scsi_sense().map(|s| s.asc))),
+                                        ],
                                     ),
                                 );
 
@@ -2894,10 +2988,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
                             crate::log::device_log(
                                 device,
-                                &format!(
-                                    "PASS 1/{}: transport_failure_recovery SUCCESS — resuming from mapfile at {}",
-                                    attempt + 1,
-                                    p
+                                &freemkv_i18n::fmt(
+                                    "autorip.rip.pass1_recovery_success",
+                                    &[("n", &(attempt + 1).to_string()), ("path", p)],
                                 ),
                             );
                         }
@@ -2905,7 +2998,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         (None, _) => {
                             crate::log::device_log(
                                 device,
-                                "Pass 1: could not re-discover drive after transport failure strategy=usb_re_enumeration FAILED",
+                                &freemkv_i18n::get("autorip.rip.pass1_no_rediscover"),
                             );
 
                             // Log detailed breakdown of what was tried
@@ -2919,21 +3012,23 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
                             crate::log::device_log(
                                 device,
-                                &format!(
-                                    "usb_re_enumeration strategy tried probe paths: sg{} (original), sg{}, sg{}, sg{}, sg{}, sg{}, sg{}",
-                                    sg_num,
-                                    sg_num - 1,
-                                    sg_num + 1,
-                                    sg_num - 2,
-                                    sg_num + 2,
-                                    sg_num - 3,
-                                    sg_num + 3
+                                &freemkv_i18n::fmt(
+                                    "autorip.rip.usb_probe_paths",
+                                    &[
+                                        ("orig", &sg_num.to_string()),
+                                        ("a", &(sg_num - 1).to_string()),
+                                        ("b", &(sg_num + 1).to_string()),
+                                        ("c", &(sg_num - 2).to_string()),
+                                        ("d", &(sg_num + 2).to_string()),
+                                        ("e", &(sg_num - 3).to_string()),
+                                        ("f", &(sg_num + 3).to_string()),
+                                    ],
                                 ),
                             );
 
                             crate::log::device_log(
                                 device,
-                                "STRATEGY_FAILURE: usb_re_enumeration FAILED — no valid drive path found after USB re-enumeration",
+                                &freemkv_i18n::get("autorip.rip.strategy_fail_usb"),
                             );
 
                             break 'pass1;
@@ -2943,7 +3038,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         _ => {
                             crate::log::device_log(
                                 device,
-                                "STRATEGY_FAILURE: usb_re_enumeration FAILED — unexpected match state",
+                                &freemkv_i18n::get("autorip.rip.strategy_fail_usb_unexpected"),
                             );
 
                             break 'pass1;
@@ -2967,14 +3062,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "Pass 1: recovery failed at attempt {}/{}, strategy={}",
-                        // `attempt` is already 1-based (incremented at the top
-                        // of the loop), so print it directly — `attempt + 1`
-                        // overcounted, yielding e.g. "12/10" at exhaustion.
-                        attempt.min(MAX_PASS1_ATTEMPTS),
-                        MAX_PASS1_ATTEMPTS,
-                        failure_reason
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.pass1_recovery_failed",
+                        &[
+                            // `attempt` is already 1-based (incremented at the top
+                            // of the loop), so print it directly — `attempt + 1`
+                            // overcounted, yielding e.g. "12/10" at exhaustion.
+                            ("attempt", &attempt.min(MAX_PASS1_ATTEMPTS).to_string()),
+                            ("max", &MAX_PASS1_ATTEMPTS.to_string()),
+                            ("strategy", &failure_reason),
+                        ],
                     ),
                 );
 
@@ -3010,22 +3107,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 if failure_reason == "transport_failure_recovery_exhausted" {
                     crate::log::device_log(
                         device,
-                        &format!(
-                            "RECOVERY_GUIDANCE: Transport failure recovery exhausted after {} attempts. Check logs for specific error category (SCSI_ERROR, DEVICE_ERROR). If ILLEGAL REQUEST errors present, drive firmware wedged — eject disc and power-cycle USB drive before retrying.",
-                            MAX_PASS1_ATTEMPTS
+                        &freemkv_i18n::fmt(
+                            "autorip.rip.guidance_transport_exhausted",
+                            &[("attempts", &MAX_PASS1_ATTEMPTS.to_string())],
                         ),
                     );
 
                     crate::log::device_log(
                         device,
-                        &format!(
-                            "NEXT_STEPS: 1) Check /api/logs/{device} for STRATEGY_FAILURE entries. 2) Identify which phase failed (Drive::open/wait_ready/init). 3) If firmware wedged, power-cycle the drive and retry.",
-                        ),
+                        &freemkv_i18n::fmt("autorip.rip.next_steps", &[("device", device)]),
                     );
                 } else {
                     crate::log::device_log(
                         device,
-                        "RECOVERY_GUIDANCE: Unrecoverable error occurred before transport failure recovery could complete. Check logs for first ERROR entry to identify root cause.",
+                        &freemkv_i18n::get("autorip.rip.guidance_unrecoverable"),
                     );
                 }
 
@@ -3037,11 +3132,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         drop(_pass1_guard);
         crate::log::device_log(
             device,
-            &format!(
-                "Pass 1 done: {:.2} GB good, {:.2} MB unreadable, {:.2} MB pending",
-                result.bytes_good as f64 / BYTES_PER_GIB,
-                result.bytes_unreadable as f64 / BYTES_PER_MIB,
-                result.bytes_pending as f64 / BYTES_PER_MIB,
+            &freemkv_i18n::fmt(
+                "autorip.rip.pass1_done",
+                &[
+                    ("good", &format!("{:.2}", result.bytes_good as f64 / BYTES_PER_GIB)),
+                    (
+                        "unreadable",
+                        &format!("{:.2}", result.bytes_unreadable as f64 / BYTES_PER_MIB),
+                    ),
+                    (
+                        "pending",
+                        &format!("{:.2}", result.bytes_pending as f64 / BYTES_PER_MIB),
+                    ),
+                ],
             ),
         );
 
@@ -3059,9 +3162,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
         crate::log::device_log(
             device,
-            &format!(
-                "PASS 2-{}: retry loop starting max_retries={} bytes_pending={}",
-                max_retries, max_retries, bytes_pending
+            &freemkv_i18n::fmt(
+                "autorip.rip.retry_loop_start",
+                &[
+                    ("max", &max_retries.to_string()),
+                    ("max_retries", &max_retries.to_string()),
+                    ("pending", &bytes_pending.to_string()),
+                ],
             ),
         );
         for retry_n in 1..=max_retries {
@@ -3069,7 +3176,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             if user_halt.load(Ordering::Relaxed) {
                 crate::log::device_log(
                     device,
-                    &format!("PASS {} STOPPED: user halt before retry pass", retry_n + 1),
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.pass_stopped_user",
+                        &[("n", &(retry_n + 1).to_string())],
+                    ),
                 );
                 break;
             }
@@ -3124,16 +3234,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             };
             if mux_scope_bad == 0 {
                 let scope_label = if cfg_read.output_format == "iso" {
-                    "whole disc"
+                    freemkv_i18n::get("autorip.rip.scope_whole_disc")
                 } else {
-                    "muxed title"
+                    freemkv_i18n::get("autorip.rip.scope_muxed_title")
                 };
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "PASS {} SKIPPED: {} is 100% recovered in mapfile — proceeding to mux",
-                        retry_n + 1,
-                        scope_label
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.pass_skipped_recovered",
+                        &[("n", &(retry_n + 1).to_string()), ("scope", &scope_label)],
                     ),
                 );
                 break;
@@ -3185,9 +3294,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
             crate::log::device_log(
                 device,
-                &format!(
-                    "PASS {}/{total_passes}: retrying bad ranges (bpt=1) bytes_pending={}",
-                    pass, bytes_pending
+                &freemkv_i18n::fmt(
+                    "autorip.rip.pass_retrying",
+                    &[
+                        ("n", &pass.to_string()),
+                        ("total", &total_passes.to_string()),
+                        ("pending", &bytes_pending.to_string()),
+                    ],
                 ),
             );
             let patch_progress = |p: &libfreemkv::progress::PassProgress| -> bool {
@@ -3257,8 +3370,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // self-recovers in ~15 s of idle).
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "drive spin-cycle before pass {pass} failed ({e}); settling 15 s instead"
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.spin_cycle_failed",
+                        &[("pass", &pass.to_string()), ("error", &e.to_string())],
                     ),
                 );
                 // Short idle in 1 s slices so a user halt stays responsive.
@@ -3271,7 +3385,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             } else {
                 crate::log::device_log(
                     device,
-                    &format!("drive spin-cycled (soft un-wedge, no eject) before pass {pass}"),
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.spin_cycled",
+                        &[("pass", &pass.to_string())],
+                    ),
                 );
             }
             let cr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {
@@ -3298,11 +3415,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     if user_halt.load(Ordering::Relaxed) {
                         crate::log::device_log(
                             device,
-                            &format!(
-                                "PASS {} CANCELLED: user halt category={} error_code={}",
-                                pass,
-                                error_category,
-                                e.code()
+                            &freemkv_i18n::fmt(
+                                "autorip.rip.pass_cancelled",
+                                &[
+                                    ("n", &pass.to_string()),
+                                    ("category", error_category),
+                                    ("code", &e.code().to_string()),
+                                ],
                             ),
                         );
 
@@ -3312,23 +3431,27 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     } else {
                         crate::log::device_log(
                             device,
-                            &format!(
-                                "PASS {} FAILED: strategy=patch_recovery category={} error_code={} {}",
-                                pass,
-                                error_category,
-                                e.code(),
-                                sense_info.unwrap_or_default()
+                            &freemkv_i18n::fmt(
+                                "autorip.rip.pass_failed",
+                                &[
+                                    ("n", &pass.to_string()),
+                                    ("category", error_category),
+                                    ("code", &e.code().to_string()),
+                                    ("sense", &sense_info.unwrap_or_default()),
+                                ],
                             ),
                         );
 
                         // Log which recovery phase failed
                         crate::log::device_log(
                             device,
-                            &format!(
-                                "STRATEGY_FAILURE: patch_recovery FAILED at disc.patch() with category={} (sense_key={:?}, ASC={:?})",
-                                error_category,
-                                e.scsi_sense().map(|s| s.sense_key),
-                                e.scsi_sense().map(|s| s.asc)
+                            &freemkv_i18n::fmt(
+                                "autorip.rip.strategy_fail_patch",
+                                &[
+                                    ("category", error_category),
+                                    ("sense_key", &format!("{:?}", e.scsi_sense().map(|s| s.sense_key))),
+                                    ("asc", &format!("{:?}", e.scsi_sense().map(|s| s.asc))),
+                                ],
                             ),
                         );
 
@@ -3336,7 +3459,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         if e.code() == 4000 && e.is_scsi_transport_failure() {
                             crate::log::device_log(
                                 device,
-                                "ACTION_REQUIRED: Transport failure detected — USB bridge crashed. Eject disc and power-cycle drive before retrying.",
+                                &freemkv_i18n::get("autorip.rip.action_transport"),
                             );
                         } else if e.code() >= 6000
                             && e.scsi_sense()
@@ -3345,14 +3468,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         {
                             crate::log::device_log(
                                 device,
-                                "ACTION_REQUIRED: Drive hardware error detected — drive may be failing. Consider replacing optical drive.",
+                                &freemkv_i18n::get("autorip.rip.action_hardware"),
                             );
                         } else if e.code() == 4000
                             && e.scsi_sense().map(|s| s.asc == 0x20).unwrap_or(false)
                         {
                             crate::log::device_log(
                                 device,
-                                "ACTION_REQUIRED: ILLEGAL REQUEST (ASC=0x20) — drive firmware wedged. Power-cycle USB drive to clear state.",
+                                &freemkv_i18n::get("autorip.rip.action_illegal"),
                             );
                         }
                     }
@@ -3366,11 +3489,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // PatchOutcome renames recovered_this_pass → bytes_recovered_this_pass.
             let recovered = cr.bytes_recovered_this_pass;
             let exit_str = if cr.halted {
-                " (halt)"
+                freemkv_i18n::get("autorip.rip.exit_halt")
             } else if cr.wedged_exit {
-                " (DRIVE WEDGED: fast-fail sense — retries aborted, needs spin-cycle/power-cycle)"
+                freemkv_i18n::get("autorip.rip.exit_wedged")
             } else {
-                ""
+                String::new()
             };
             // Report the three buckets that actually tell success from failure:
             // recovered THIS pass, how much is still bad (pending — retryable next
@@ -3380,11 +3503,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // and told you nothing.
             crate::log::device_log(
                 device,
-                &format!(
-                    "Pass {pass} done: recovered {:.2} MB this pass; {:.2} MB still bad, {:.2} MB unreadable{exit_str}",
-                    recovered as f64 / BYTES_PER_MIB,
-                    bytes_pending as f64 / BYTES_PER_MIB,
-                    bytes_unreadable as f64 / BYTES_PER_MIB,
+                &freemkv_i18n::fmt(
+                    "autorip.rip.pass_done",
+                    &[
+                        ("pass", &pass.to_string()),
+                        ("recovered", &format!("{:.2}", recovered as f64 / BYTES_PER_MIB)),
+                        ("pending", &format!("{:.2}", bytes_pending as f64 / BYTES_PER_MIB)),
+                        (
+                            "unreadable",
+                            &format!("{:.2}", bytes_unreadable as f64 / BYTES_PER_MIB),
+                        ),
+                        ("exit", &exit_str),
+                    ],
                 ),
             );
             // Drop this pass's watcher before next iteration.
@@ -3400,21 +3530,23 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             if recovered == 0 {
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "PASS {} STOPPED: strategy=patch_recovery exhausted — no progress (recovered={} MB) after all retry attempts",
-                        pass,
-                        recovered as f64 / BYTES_PER_MIB
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.pass_no_progress",
+                        &[
+                            ("n", &pass.to_string()),
+                            ("recovered", &format!("{}", recovered as f64 / BYTES_PER_MIB)),
+                        ],
                     ),
                 );
 
                 crate::log::device_log(
                     device,
-                    "STRATEGY_FAILURE: patch_recovery exhausted — drive cannot recover more data from bad sectors with current settings",
+                    &freemkv_i18n::get("autorip.rip.strategy_fail_patch_exhausted"),
                 );
 
                 crate::log::device_log(
                     device,
-                    "RECOVERY_GUIDANCE: Consider increasing max_retries or abort_on_lost_secs if tolerating some data loss is acceptable.",
+                    &freemkv_i18n::get("autorip.rip.guidance_increase_retries"),
                 );
 
                 break;
@@ -3455,7 +3587,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         if user_halt.load(Ordering::Relaxed) {
             crate::log::device_log(
                 device,
-                "Rip stopped by user — preserving partial sweep for resume.",
+                &freemkv_i18n::get("autorip.rip.stopped_preserve"),
             );
             unregister_halt(device);
             return;
@@ -3593,32 +3725,36 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             ) {
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "ABORT: strategy=abort_check triggered — {:.2}s lost in main movie (threshold: {}s)",
-                        main_lost_ms_for_history / MILLIS_PER_SEC,
-                        effective_abort
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.abort_check",
+                        &[
+                            ("secs", &format!("{:.2}", main_lost_ms_for_history / MILLIS_PER_SEC)),
+                            ("threshold", &effective_abort.to_string()),
+                        ],
                     ),
                 );
 
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "STRATEGY_FAILURE: abort_check FAILED — data loss ({:.2}s) exceeds threshold ({}s)",
-                        main_lost_ms_for_history / MILLIS_PER_SEC,
-                        effective_abort
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.strategy_fail_abort",
+                        &[
+                            ("secs", &format!("{:.2}", main_lost_ms_for_history / MILLIS_PER_SEC)),
+                            ("threshold", &effective_abort.to_string()),
+                        ],
                     ),
                 );
 
                 crate::log::device_log(
                     device,
                     &if output_is_iso_image(&cfg_read.output_format) {
-                        "RECOVERY_GUIDANCE: ISO output is a whole-disc image and requires 100% — abort_on_lost_secs does not apply (it is a MUXED-output setting, ignored for ISO). The loss is unrecoverable media: clean or replace the disc, or choose MKV output to tolerate non-title damage.".to_string()
+                        freemkv_i18n::get("autorip.rip.guidance_iso")
                     } else if effective_abort == 0 {
-                        "RECOVERY_GUIDANCE: abort_on_lost_secs=0 requires a perfect rip — ANY unrecoverable loss in the main movie aborts here. To let a rip complete despite some loss, RAISE abort_on_lost_secs to the number of seconds of main-movie loss you can tolerate (e.g. 5 or 30).".to_string()
+                        freemkv_i18n::get("autorip.rip.guidance_perfect")
                     } else {
-                        format!(
-                            "RECOVERY_GUIDANCE: abort_on_lost_secs={}s limit exceeded — raise abort_on_lost_secs further or accept the loss after disc recovery.",
-                            effective_abort
+                        freemkv_i18n::fmt(
+                            "autorip.rip.guidance_limit",
+                            &[("threshold", &effective_abort.to_string())],
                         )
                     },
                 );
@@ -3660,7 +3796,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 if terminal {
                     crate::log::device_log(
                         device,
-                        "Abort-on-loss retry budget exhausted — quarantining (.failed).",
+                        &freemkv_i18n::get("autorip.rip.abort_budget_exhausted"),
                     );
                 }
                 unregister_halt(device);
@@ -3670,20 +3806,22 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             if main_lost_ms_for_history > 0.0 {
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "Main movie loss after retries: {:.2}s (threshold: {}s)",
-                        main_lost_ms_for_history / MILLIS_PER_SEC,
-                        effective_abort
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.main_loss_after_retries",
+                        &[
+                            ("secs", &format!("{:.2}", main_lost_ms_for_history / MILLIS_PER_SEC)),
+                            ("threshold", &effective_abort.to_string()),
+                        ],
                     ),
                 );
             } else {
-                crate::log::device_log(device, "All data recovered — proceeding with mux.");
+                crate::log::device_log(device, &freemkv_i18n::get("autorip.rip.all_recovered"));
             }
         }
 
         // Mux gating: skip mux + return cleanly if user pressed stop.
         if user_halt.load(Ordering::Relaxed) {
-            crate::log::device_log(device, "Rip cancelled — skipping mux.");
+            crate::log::device_log(device, &freemkv_i18n::get("autorip.rip.cancelled_skip_mux"));
             unregister_halt(device);
             return;
         }
@@ -3712,8 +3850,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             if !staging::fsync_output_file(iso_path) {
                 crate::log::device_log(
                     device,
-                    "Durability gate failed: could not fsync ISO image to stable storage; \
-                     withholding .done/.completed and preserving staging for retry",
+                    &freemkv_i18n::get("autorip.rip.durability_iso"),
                 );
                 update_state_with(device, |s| {
                     if s.last_error.is_empty() {
@@ -3753,8 +3890,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             ) {
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "{marker_name} marker write failed ({e}); ISO is staged but the mover cannot pick it up"
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.iso_marker_failed",
+                        &[("marker", marker_name), ("error", &e.to_string())],
                     ),
                 );
                 update_state_with(device, |s| {
@@ -3769,7 +3907,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             staging::clear_restart_count(staging_path);
             crate::log::device_log(
                 device,
-                &format!("ISO output complete — disc image staged as {iso_filename}"),
+                &freemkv_i18n::fmt(
+                    "autorip.rip.iso_complete",
+                    &[("name", &iso_filename)],
+                ),
             );
             update_state_with(device, |s| {
                 s.status = "done".to_string();
@@ -3869,13 +4010,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // so the cause is on the device log.
             crate::log::device_log(
                 device,
-                &format!(".ripped marker write failed ({e}); falling back to inline mux"),
+                &freemkv_i18n::fmt(
+                    "autorip.rip.ripped_marker_failed",
+                    &[("error", &e.to_string())],
+                ),
             );
         } else {
-            crate::log::device_log(
-                device,
-                "Sweep + patch complete; handed off to mux worker via .ripped marker.",
-            );
+            crate::log::device_log(device, &freemkv_i18n::get("autorip.rip.handed_off"));
             // Status: "done" — the DISC READ is complete. Sweep + patch
             // captured the whole-disc ISO; the drive is no longer needed
             // and (with auto_eject) is ejected just below. The mux is a
@@ -3977,7 +4118,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
         // Fallback inline-mux path (only reached if the marker write
         // above failed). Closes drive, opens ISO, runs mux as before.
-        crate::log::device_log(device, "Drive released; muxing ISO → MKV.");
+        crate::log::device_log(device, &freemkv_i18n::get("autorip.rip.drive_released_mux"));
         drop(session);
 
         // Open the ISO for the mux pipeline.
@@ -3987,7 +4128,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     use libfreemkv::sector::SectorSource;
                     crate::log::device_log(
                         device,
-                        &format!("ISO opened successfully: {} sectors", r.capacity_sectors()),
+                        &freemkv_i18n::fmt(
+                            "autorip.rip.iso_opened",
+                            &[("sectors", &r.capacity_sectors().to_string())],
+                        ),
                     );
                     r
                 }
@@ -4095,9 +4239,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         if cfg_read.max_retries > 0 {
             crate::log::device_log(
                 device,
-                &format!(
-                    "Ripped to ISO — no keys, mux deferred. ISO + mapfile preserved in staging \
-                     ({staging}); auto-resume will mux once keys are available. {msg}"
+                &freemkv_i18n::fmt(
+                    "autorip.rip.iso_no_keys_multipass",
+                    &[("staging", &staging), ("msg", &msg)],
                 ),
             );
             update_state_with(device, |s| {
@@ -4107,10 +4251,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         } else {
             crate::log::device_log(
                 device,
-                &format!(
-                    "Single-pass rip with no keys — cannot mux (no ISO captured). \
-                     Enable multi-pass mode to capture a deferred-mux ISO. {msg}"
-                ),
+                &freemkv_i18n::fmt("autorip.rip.singlepass_no_keys", &[("msg", &msg)]),
             );
             update_state_with(device, |s| {
                 s.status = "error".to_string();
@@ -4310,7 +4451,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 .finalize_error
                 .as_ref()
                 .expect("finalize_error is Some when header_phase_outcome_is_failure() is true");
-            crate::log::device_log(device, &format!("Mux failed: {reason}"));
+            crate::log::device_log(
+                device,
+                &freemkv_i18n::fmt("autorip.rip.mux_failed", &[("reason", reason)]),
+            );
             let staging_disc_path = std::path::Path::new(&staging);
             staging::write_failed_marker(
                 staging_disc_path,
@@ -4428,15 +4572,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     if completed {
         crate::log::device_log(
             device,
-            &format!(
-                "Mux complete: {:.1} GB in {}s ({:.1} MB/s avg)",
-                bytes_done as f64 / BYTES_PER_GIB,
-                elapsed.round() as u64,
-                speed
+            &freemkv_i18n::fmt(
+                "autorip.rip.mux_complete",
+                &[
+                    ("gb", &format!("{:.1}", bytes_done as f64 / BYTES_PER_GIB)),
+                    ("secs", &(elapsed.round() as u64).to_string()),
+                    ("speed", &format!("{speed:.1}")),
+                ],
             ),
         );
     } else if let Some(reason) = finalize_error.as_ref() {
-        crate::log::device_log(device, &format!("Mux failed: {reason}"));
+        crate::log::device_log(
+            device,
+            &freemkv_i18n::fmt("autorip.rip.mux_failed", &[("reason", reason)]),
+        );
     }
 
     // ── Mux-time loss gate (a loss is a loss) ───────────────────────────────
@@ -4460,9 +4609,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         if over && demux_lost_secs > 0.0 {
             crate::log::device_log(
                 device,
-                &format!(
-                    "ABORT: mux-time loss — {:.2}s missing in main movie (decrypt/codec) exceeds threshold ({}s). A loss is a loss.",
-                    total_lost_secs, effective_abort
+                &freemkv_i18n::fmt(
+                    "autorip.rip.abort_mux_loss",
+                    &[
+                        ("secs", &format!("{total_lost_secs:.2}")),
+                        ("threshold", &effective_abort.to_string()),
+                    ],
                 ),
             );
             update_state_with(device, |s| {
@@ -4522,8 +4674,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             if !is_network && !staging::fsync_output_file(std::path::Path::new(&output_path)) {
                 crate::log::device_log(
                     device,
-                    "Durability gate failed: could not fsync mux output to stable storage; \
-                     withholding .done/.completed and preserving staging for retry",
+                    &freemkv_i18n::get("autorip.rip.durability_mux"),
                 );
                 update_state_with(device, |s| {
                     if s.last_error.is_empty() {
@@ -4566,8 +4717,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // than silently lost.
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "{marker_name} marker write failed ({e}); MKV is staged but the mover cannot pick it up"
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.mkv_marker_failed",
+                        &[("marker", marker_name), ("error", &e.to_string())],
                     ),
                 );
                 update_state_with(device, |s| {
@@ -4587,9 +4739,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             if !title_confident {
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "Held for review: uncertain title match for \"{}\" — confirm/correct in the UI",
-                        display_name
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.held_review",
+                        &[("name", &display_name)],
                     ),
                 );
             }
@@ -4638,14 +4790,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             incomplete_mux_status(finalize_error.as_deref(), read_error.as_deref());
         crate::log::device_log(
             device,
-            &format!(
-                "{}: {:.1} GB in {:.0}s ({:.0} MB/s), {} skipped (~{:.3}s lost)",
-                log_prefix,
-                bytes_done as f64 / BYTES_PER_GIB,
-                elapsed,
-                speed,
-                final_errors,
-                final_lost_secs,
+            &freemkv_i18n::fmt(
+                "autorip.rip.incomplete_summary",
+                &[
+                    ("prefix", &log_prefix),
+                    ("gb", &format!("{:.1}", bytes_done as f64 / BYTES_PER_GIB)),
+                    ("secs", &format!("{elapsed:.0}")),
+                    ("speed", &format!("{speed:.0}")),
+                    ("errors", &final_errors.to_string()),
+                    ("lost", &format!("{final_lost_secs:.3}")),
+                ],
             ),
         );
         update_state(
@@ -4704,13 +4858,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
     crate::log::device_log(
         device,
-        &format!(
-            "Complete: {:.1} GB in {:.0}s ({:.0} MB/s), {} skipped (~{:.3}s lost)",
-            bytes_done as f64 / BYTES_PER_GIB,
-            elapsed,
-            speed,
-            done_errors,
-            done_lost_secs,
+        &freemkv_i18n::fmt(
+            "autorip.rip.complete_summary",
+            &[
+                ("gb", &format!("{:.1}", bytes_done as f64 / BYTES_PER_GIB)),
+                ("secs", &format!("{elapsed:.0}")),
+                ("speed", &format!("{speed:.0}")),
+                ("errors", &done_errors.to_string()),
+                ("lost", &format!("{done_lost_secs:.3}")),
+            ],
         ),
     );
 
@@ -4788,7 +4944,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         retain_intermediate_iso(cfg_read.keep_iso, &cfg_read.output_format),
     );
 
-    crate::log::device_log(device, "Rip complete");
+    crate::log::device_log(device, &freemkv_i18n::get("common.rip_complete"));
     crate::webhook::send_rich(
         &cfg_read,
         &crate::webhook::RipEvent {
@@ -4850,12 +5006,18 @@ pub fn eject_drive(device_path: &str) {
     match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
         Ok(mut session) => {
             if let Err(e) = session.eject() {
-                crate::log::device_log(dev, &format!("eject failed: {e}"));
+                crate::log::device_log(
+                    dev,
+                    &freemkv_i18n::fmt("autorip.rip.eject_failed", &[("error", &e.to_string())]),
+                );
                 tracing::warn!(device = %dev, error = %e, "eject command failed");
             }
         }
         Err(e) => {
-            crate::log::device_log(dev, &format!("eject skipped — drive open failed: {e}"));
+            crate::log::device_log(
+                dev,
+                &freemkv_i18n::fmt("autorip.rip.eject_skipped", &[("error", &e.to_string())]),
+            );
             tracing::warn!(device = %dev, error = %e, "eject skipped — drive open failed");
         }
     }
@@ -5117,9 +5279,12 @@ fn prune_intermediate_iso(
         return;
     }
     match std::fs::remove_file(iso_path) {
-        Ok(_) => crate::log::device_log(device, "Pruned intermediate ISO"),
+        Ok(_) => crate::log::device_log(device, &freemkv_i18n::get("autorip.rip.iso_pruned")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => crate::log::device_log(device, &format!("ISO prune warning: {e}")),
+        Err(e) => crate::log::device_log(
+            device,
+            &freemkv_i18n::fmt("autorip.rip.iso_prune_warning", &[("error", &e.to_string())]),
+        ),
     }
     // Mirror the ISO arm: a lingering mapfile in staging could be misread as a
     // partial rip by the resume classifier on next startup, so surface any
@@ -5127,7 +5292,10 @@ fn prune_intermediate_iso(
     match std::fs::remove_file(mapfile_path) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => crate::log::device_log(device, &format!("mapfile prune warning: {e}")),
+        Err(e) => crate::log::device_log(
+            device,
+            &freemkv_i18n::fmt("autorip.rip.mapfile_prune_warning", &[("error", &e.to_string())]),
+        ),
     }
 }
 
@@ -5711,13 +5879,16 @@ fn open_drive_with_backoff(
                 let backoff_secs = transport_recovery_delay_secs * (1u64 << retry);
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "Pass 1 attempt {attempt}: Drive::open({}) failed, retrying in {}s: error={} sense_key={:?} ASC={:?}",
-                        path,
-                        backoff_secs,
-                        e.code(),
-                        e.scsi_sense().map(|s| s.sense_key),
-                        e.scsi_sense().map(|s| s.asc)
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.open_retry",
+                        &[
+                            ("attempt", &attempt.to_string()),
+                            ("path", path),
+                            ("secs", &backoff_secs.to_string()),
+                            ("code", &e.code().to_string()),
+                            ("sense_key", &format!("{:?}", e.scsi_sense().map(|s| s.sense_key))),
+                            ("asc", &format!("{:?}", e.scsi_sense().map(|s| s.asc))),
+                        ],
                     ),
                 );
                 std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
@@ -5725,12 +5896,15 @@ fn open_drive_with_backoff(
             Err(e) => {
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "Pass 1 attempt {attempt}: Drive::open({}) failed strategy=transport_failure_recovery error={} sense_key={:?} ASC={:?} — recovery path exhausted",
-                        path,
-                        e.code(),
-                        e.scsi_sense().map(|s| s.sense_key),
-                        e.scsi_sense().map(|s| s.asc)
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.open_exhausted",
+                        &[
+                            ("attempt", &attempt.to_string()),
+                            ("path", path),
+                            ("code", &e.code().to_string()),
+                            ("sense_key", &format!("{:?}", e.scsi_sense().map(|s| s.sense_key))),
+                            ("asc", &format!("{:?}", e.scsi_sense().map(|s| s.asc))),
+                        ],
                     ),
                 );
 
@@ -5744,10 +5918,12 @@ fn open_drive_with_backoff(
 
                 crate::log::device_log(
                     device,
-                    &format!(
-                        "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::open category={} error_code={}",
-                        failure_category,
-                        e.code()
+                    &freemkv_i18n::fmt(
+                        "autorip.rip.strategy_fail_open",
+                        &[
+                            ("category", failure_category),
+                            ("code", &e.code().to_string()),
+                        ],
                     ),
                 );
 
@@ -5773,11 +5949,11 @@ fn log_init_recovery_failure(device: &str, e: &libfreemkv::Error) {
     if is_wedged_firmware {
         crate::log::device_log(
             device,
-            "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::init with ILLEGAL_REQUEST (ASC=0x20) — drive firmware wedged",
+            &freemkv_i18n::get("autorip.rip.strategy_fail_init_illegal"),
         );
         crate::log::device_log(
             device,
-            "USER_ACTION_REQUIRED: Eject disc and physically power-cycle USB optical drive to clear firmware state before retrying",
+            &freemkv_i18n::get("autorip.rip.user_action_powercycle"),
         );
     } else {
         let failure_category = if e.code() == 4000 {
@@ -5788,10 +5964,12 @@ fn log_init_recovery_failure(device: &str, e: &libfreemkv::Error) {
 
         crate::log::device_log(
             device,
-            &format!(
-                "STRATEGY_FAILURE: transport_failure_recovery FAILED at Drive::init category={} error_code={}",
-                failure_category,
-                e.code()
+            &freemkv_i18n::fmt(
+                "autorip.rip.strategy_fail_init",
+                &[
+                    ("category", &failure_category),
+                    ("code", &e.code().to_string()),
+                ],
             ),
         );
     }
