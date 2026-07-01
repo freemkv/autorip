@@ -114,7 +114,7 @@ fn warn_bad_key_throttled() {
             "tmdb: API key rejected (HTTP 401) — check the TMDB_API_KEY in Settings; \
              titles will fall through to the needs-review queue until it is fixed"
         );
-        crate::log::syslog("TMDB API key rejected (HTTP 401) — check TMDB_API_KEY in Settings");
+        crate::log::syslog(&freemkv_i18n::get("autorip.tmdb.key_rejected"));
     }
 }
 
