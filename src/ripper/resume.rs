@@ -511,7 +511,7 @@ fn handle_resume_fsync_failure(device: &str, staging_dir: &Path, output_desc: &s
             format!("{output_desc} fsync failed repeatedly ({count} attempts); giving up",);
         crate::log::device_log(
             device,
-            &format!("Auto-resume: {reason} — quarantining staging (.failed)."),
+            &freemkv_i18n::fmt("autorip.resume.quarantining", &[("reason", &reason)]),
         );
         staging::write_failed_marker(staging_dir, &reason);
         staging::clear_restart_count(staging_dir);
@@ -605,7 +605,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             // status="ripping" is not set yet here so there is no stuck
             // gate, but leave a trace so the silently-vanished resume is
             // diagnosable instead of disappearing with zero explanation.
-            crate::log::device_log(device, "Auto-resume aborted: config lock poisoned");
+            crate::log::device_log(
+                device,
+                &freemkv_i18n::get("autorip.resume.aborted_config_poisoned"),
+            );
             return;
         }
     };
@@ -625,15 +628,15 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         staging::clear_accept_loss_marker(&staging_dir);
         crate::log::device_log(
             device,
-            "Operator accepted the recorded loss — delivering the existing rip despite over-threshold damage.",
+            &freemkv_i18n::get("autorip.resume.operator_accepted_loss"),
         );
     }
 
     crate::log::device_log(
         device,
-        &format!(
-            "Auto-resume: re-muxing ISO from staging ({})",
-            staging_dir.display()
+        &freemkv_i18n::fmt(
+            "autorip.resume.remuxing_iso",
+            &[("dir", &staging_dir.display().to_string())],
         ),
     );
 
@@ -658,10 +661,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         Err(e) => {
             crate::log::device_log(
                 device,
-                &format!(
-                    "Auto-resume aborted: cannot open ISO {}: {}",
-                    iso_path.display(),
-                    e
+                &freemkv_i18n::fmt(
+                    "autorip.resume.aborted_open_iso",
+                    &[
+                        ("path", &iso_path.display().to_string()),
+                        ("error", &e.to_string()),
+                    ],
                 ),
             );
             // Don't clear counter — fall through to next-restart's
@@ -684,9 +689,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         Err(e) => {
             crate::log::device_log(
                 device,
-                &format!(
-                    "Auto-resume aborted: {}",
-                    super::format_lib_error("reading the saved disc image", &e)
+                &freemkv_i18n::fmt(
+                    "autorip.resume.aborted",
+                    &[(
+                        "msg",
+                        &super::format_lib_error("reading the saved disc image", &e),
+                    )],
                 ),
             );
             // The live-device dispatch (`handle_rip_request` → `scan_disc`)
@@ -717,7 +725,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     if !title_ok {
         crate::log::device_log(
             device,
-            "Auto-resume aborted: scan_image produced no usable title",
+            &freemkv_i18n::get("autorip.resume.aborted_no_title_scan"),
         );
         // Same wedge as the scan_image failure above: reset scanning → idle
         // so the "already ripping" gate doesn't reject every later /api/rip.
@@ -750,7 +758,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let title = match disc.titles.first() {
         Some(t) => t.clone(),
         None => {
-            crate::log::device_log(device, "Auto-resume aborted: no title after key resolution");
+            crate::log::device_log(
+                device,
+                &freemkv_i18n::get("autorip.resume.aborted_no_title_keys"),
+            );
             reset_status_after_ripping(
                 device,
                 "idle",
@@ -793,7 +804,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             let msg = format!(
                 "Could not read this disc's saved recovery map, so remaining data loss cannot be re-checked — start a fresh rip to rebuild it ({e})."
             );
-            crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
+            crate::log::device_log(
+                device,
+                &freemkv_i18n::fmt("autorip.resume.aborted", &[("msg", &msg)]),
+            );
             reset_status_after_ripping(
                 device,
                 "idle",
@@ -845,9 +859,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             };
             crate::log::device_log(
                 device,
-                &format!(
-                    "Auto-resume aborted: {scope} loss {:.2}s exceeds threshold {}s",
-                    lost_secs, effective_abort
+                &freemkv_i18n::fmt(
+                    "autorip.resume.aborted_loss",
+                    &[
+                        ("scope", scope),
+                        ("secs", &format!("{lost_secs:.2}")),
+                        ("threshold", &effective_abort.to_string()),
+                    ],
                 ),
             );
             reset_status_after_ripping(
@@ -887,10 +905,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         let msg = super::keyless_failure_message(&disc);
         crate::log::device_log(
             device,
-            &format!(
-                "{msg}\nRipped to ISO — no keys, mux deferred. \
-                 Staging preserved; will mux automatically once keys are available."
-            ),
+            &freemkv_i18n::fmt("autorip.resume.mux_deferred", &[("msg", &msg)]),
         );
         // We have not set status="ripping" yet (that happens via the
         // update_state call further below). reset_status_after_ripping
@@ -941,7 +956,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             // the degraded stop guarantee is at least visible in the log.
             crate::log::device_log(
                 device,
-                "Warning: halt registry unavailable (poisoned); this resume mux will not be stoppable via /api/stop",
+                &freemkv_i18n::get("autorip.resume.halt_unavailable"),
             );
             libfreemkv::Halt::new()
         }
@@ -970,7 +985,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             let msg = format!(
                 "Could not re-open the saved disc image to finish muxing — the staging file may have been moved or the staging volume is unavailable ({e})."
             );
-            crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
+            crate::log::device_log(
+                device,
+                &freemkv_i18n::fmt("autorip.resume.aborted", &[("msg", &msg)]),
+            );
             // Reset from "ripping" (set above) → "error" so the next
             // /api/rip isn't blocked by the "already ripping" gate.
             reset_status_after_ripping(
@@ -1076,7 +1094,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             let msg = format!(
                 "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
             );
-            crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
+            crate::log::device_log(
+                device,
+                &freemkv_i18n::fmt("autorip.resume.aborted", &[("msg", &msg)]),
+            );
             // Reset from "ripping" (set above) → "error" so the next
             // /api/rip isn't blocked by the "already ripping" gate.
             reset_status_after_ripping(
@@ -1198,9 +1219,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             };
             crate::log::device_log(
                 device,
-                &format!(
-                    "Auto-resume: durability gate failed (could not fsync ISO image); {detail}."
-                ),
+                &freemkv_i18n::fmt("autorip.resume.durability_iso", &[("detail", detail)]),
             );
             reset_status_after_ripping(
                 device,
@@ -1242,9 +1261,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         {
             crate::log::device_log(
                 device,
-                &format!(
-                    "Auto-resume: {} marker write failed ({}). Preserving staging for retry.",
-                    marker_name, e
+                &freemkv_i18n::fmt(
+                    "autorip.resume.marker_write_failed_iso",
+                    &[("marker", marker_name), ("error", &e.to_string())],
                 ),
             );
             reset_status_after_ripping(
@@ -1266,7 +1285,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             .unwrap_or_default();
         crate::log::device_log(
             device,
-            &format!("Auto-resume: ISO output complete — disc image staged as {iso_name}"),
+            &freemkv_i18n::fmt(
+                "autorip.resume.iso_output_complete",
+                &[("name", &iso_name)],
+            ),
         );
         super::update_state_with(device, |s| {
             s.status = "done".to_string();
@@ -1359,9 +1381,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         );
         crate::log::device_log(
             device,
-            &format!(
-                "Auto-resume mux did not complete ({log_prefix}) — preserving partial state for next restart",
-            ),
+            &freemkv_i18n::fmt("autorip.resume.mux_incomplete", &[("reason", &log_prefix)]),
         );
         // Reset from "ripping" → the verdict status so the next /api/rip isn't
         // blocked by the "already ripping" gate. Staging is preserved either
@@ -1414,9 +1434,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         if over {
             crate::log::device_log(
                 device,
-                &format!(
-                    "Auto-resume ABORT: mux-time loss — {:.2}s missing in main movie (decrypt/codec) exceeds threshold ({}s). A loss is a loss.",
-                    done_lost_video_secs, effective_abort
+                &freemkv_i18n::fmt(
+                    "autorip.resume.abort_mux_loss",
+                    &[
+                        ("secs", &format!("{done_lost_video_secs:.2}")),
+                        ("threshold", &effective_abort.to_string()),
+                    ],
                 ),
             );
             let _ = staging::mark_aborted_on_loss(
@@ -1469,7 +1492,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         };
         crate::log::device_log(
             device,
-            &format!("Auto-resume: durability gate failed (could not fsync mux output); {detail}."),
+            &freemkv_i18n::fmt("autorip.resume.durability_mux", &[("detail", detail)]),
         );
         reset_status_after_ripping(
             device,
@@ -1519,12 +1542,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // never sees.
         crate::log::device_log(
             device,
-            &format!(
-                "Auto-resume: {} marker write failed ({}): {}. \
-                 Preserving staging for next-restart retry.",
-                marker_name,
-                done_path.display(),
-                e
+            &freemkv_i18n::fmt(
+                "autorip.resume.marker_write_failed",
+                &[
+                    ("marker", marker_name),
+                    ("path", &done_path.display().to_string()),
+                    ("error", &e.to_string()),
+                ],
             ),
         );
         reset_status_after_ripping(
@@ -1540,10 +1564,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     staging::write_completed_marker(&staging_dir);
     staging::clear_restart_count(&staging_dir);
     if !title_confident {
-        crate::log::device_log(
-            device,
-            "Auto-resume: title match not confident — held for operator review (.review)",
-        );
+        crate::log::device_log(device, &freemkv_i18n::get("autorip.resume.held_review"));
     }
 
     // Prune the disc-sized intermediate ISO + its mapfile unless keep_iso is
@@ -1616,7 +1637,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             ..Default::default()
         },
     );
-    crate::log::device_log(device, "Auto-resume complete");
+    crate::log::device_log(device, &freemkv_i18n::get("autorip.resume.complete"));
 
     // Fire the completion webhook, mirroring rip_disc's terminal
     // branch. Both the cold auto-resume (`?resume=yes`) path and the
