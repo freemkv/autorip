@@ -540,10 +540,11 @@ pub struct StagingSnapshot {
     /// reason when the body is JSON (None otherwise).
     pub has_failed: bool,
     pub failed_reason: Option<String>,
-    /// `.aborted-loss` resumable-failure marker present — the RIP PHASE aborted
-    /// because main-movie unreadable-sector loss exceeded `abort_on_lost_secs`
-    /// (the mux never aborts on loss), but the ISO + mapfile are intact so it's
-    /// RECOVERABLE (raised threshold, fresh patch, code change). Distinct from
+    /// `.aborted-loss` resumable-failure marker present — a rip aborted because
+    /// main-movie loss exceeded `abort_on_lost_secs`, either read-time
+    /// (unreadable sectors, pre-mux gate) or mux-time (decrypt/codec loss,
+    /// post-mux gate), but the ISO + mapfile are intact so it's RECOVERABLE
+    /// (raised threshold, fresh patch, keydb refresh, code change). Distinct from
     /// terminal `.failed`: the resume scan re-enters such a dir indefinitely
     /// (a loss-abort is deterministic, never promoted to terminal by attempt
     /// count). `attempt` carries the abort count parsed from the marker (0 if

@@ -1356,12 +1356,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         return;
     }
 
-    // v1.2.0: the mux never aborts on mux-time (demux/decrypt) loss — it is
-    // concealed in the read path and dropped-to-keyframe at the codec layer,
-    // yielding a decode-clean file. `lost_video_secs` from `run_mux` (bytes
-    // skipped / title_bytes_per_sec, in-title-scoped) is still reported below
-    // for the operator, but it never quarantines the resumed disc; the
-    // abort_on_lost_secs knob governs the PRE-mux rip phase only (resume.rs §3).
+    // A loss is a loss. Mux-time (decrypt/codec) loss is missing in-title data
+    // just like a read error — concealed for playability (NULL-TS fill +
+    // drop-to-keyframe) but still gone. `lost_video_secs` from `run_mux`
+    // (bytes skipped / title_bytes_per_sec, in-title-scoped) is gated against
+    // `abort_on_lost_secs` below, mirroring the fresh-rip path (mod.rs); the
+    // sweep §3 gate can only see mapfile-Unreadable loss, not decrypt/codec loss.
     let demux_lost_secs = mux_outcome.lost_video_secs;
 
     // Operator-facing loss for a resume = sweep loss + demux loss. A resume can
@@ -1375,6 +1375,50 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let done_errors = done_sweep_damage.errors.saturating_add(mux_outcome.errors);
     let done_lost_video_secs =
         done_sweep_damage.main_lost_ms / crate::util::MILLIS_PER_SEC + demux_lost_secs;
+
+    // Mux-time loss gate (a loss is a loss). Gate the total in-title loss
+    // (sweep + mux-time decrypt/codec) against abort_on_lost_secs before filing
+    // `.done`, same as the fresh-rip path (mod.rs). Fires only when the MUX
+    // contributed loss the sweep §3 gate couldn't see. Over threshold →
+    // quarantine to a RESUMABLE `.aborted-loss` (a keydb refresh + re-mux can
+    // complete it). ISO output is exempt (whole-disc, gated by 100% elsewhere).
+    if demux_lost_secs > 0.0 && !super::output_is_iso_image(&output_format) {
+        let effective_abort =
+            super::effective_abort_secs(&output_format, cfg_read.abort_on_lost_secs);
+        let over = if effective_abort == 0 {
+            done_lost_video_secs > 0.0
+        } else {
+            done_lost_video_secs > effective_abort as f64
+        };
+        if over {
+            crate::log::device_log(
+                device,
+                &format!(
+                    "Auto-resume ABORT: mux-time loss — {:.2}s missing in main movie (decrypt/codec) exceeds threshold ({}s). A loss is a loss.",
+                    done_lost_video_secs, effective_abort
+                ),
+            );
+            let _ = staging::mark_aborted_on_loss(
+                &staging_dir,
+                &format!(
+                    "aborted: {:.2}s lost at mux, decrypt/codec (threshold {}s)",
+                    done_lost_video_secs, effective_abort
+                ),
+            );
+            reset_status_after_ripping(
+                device,
+                "error",
+                &display_name,
+                &disc_format,
+                &duration,
+                Some(format!(
+                    "aborted — {:.2}s lost at mux, decrypt/codec (threshold {}s)",
+                    done_lost_video_secs, effective_abort
+                )),
+            );
+            return;
+        }
+    }
 
     // 5. Success — write .completed marker, drop the hand-off marker for
     // the mover, clear .restart_count. Same shape as the rip_disc
@@ -2310,9 +2354,8 @@ mod resume_handoff_contract_tests {
 // — mux-time loss is REPORTED, never gated/quarantined — at source level.
 mod post_mux_loss_reporting_tests {
     /// Regression: a resume must report sweep loss + demux loss to the
-    /// operator, not the sweep mapfile alone. Since v1.2.0 the mux never aborts
-    /// on mux-time loss; whatever demux loss the concealed MKV carries is real
-    /// loss the fresh single-pass path also surfaces (mod.rs
+    /// operator, not the sweep mapfile alone. Mux-time (demux/decrypt) loss is
+    /// real loss the fresh single-pass path also surfaces (mod.rs
     /// `final_lost_secs = mux_outcome.lost_video_secs`). Previously the resume
     /// done card and `rip_complete` webhook sourced `errors` /
     /// `lost_video_secs` solely from `done_sweep_damage`, so any demux-time
@@ -2384,18 +2427,15 @@ mod post_mux_loss_reporting_tests {
     fn resume_incomplete_mux_surfaces_read_error_not_silent_idle() {
         let src = include_str!("resume.rs");
         // Bound to the mux-incomplete early-return: from the guard up to the
-        // v1.2.0 mux-never-aborts comment that immediately follows it (the old
-        // post-mux loss-abort gate was REMOVED in 1.2.0, so its text is gone —
-        // anchoring on that phrase used to self-match this test's own source via
-        // `include_str!` and span ~1000 lines). The new anchor brackets just the
-        // ~35-line guard block.
+        // "A loss is a loss" mux-time-loss note that immediately follows it. The
+        // new anchor brackets just the ~35-line guard block.
         let start = src
             .find("if !mux_outcome.output_opened || !mux_outcome.completed {")
             .expect("resume.rs should have the mux-incomplete guard");
         let end = src[start..]
-            .find("v1.2.0: the mux never aborts on mux-time")
+            .find("A loss is a loss. Mux-time")
             .map(|i| start + i)
-            .expect("resume.rs should have the v1.2.0 mux-never-aborts comment after the guard");
+            .expect("resume.rs should have the mux-time-loss note after the guard");
         let region = &src[start..end];
 
         assert!(
@@ -2425,27 +2465,26 @@ mod post_mux_loss_reporting_tests {
         );
     }
 
-    /// v1.2.0 invariant: a COMPLETED mux that carries mux-time (demux/decrypt)
-    /// loss ALWAYS proceeds to a hand-off marker (`.done` if title-confident,
-    /// else `.review`) and NEVER quarantines the disc on that loss — no
-    /// `.failed`, no `.aborted-loss`. The post-mux loss-abort gate (which used
-    /// `should_abort_for_loss` to fail a lossy-but-complete mux) was removed; the
-    /// only remaining loss gate is the PRE-mux rip phase (resume.rs §3, which
-    /// runs and returns BEFORE this success region).
+    /// v1.2.0 invariant (restored 2026-07-01, "a loss is a loss"): a COMPLETED
+    /// mux carrying mux-time (demux/decrypt) loss is gated on `abort_on_lost_secs`
+    /// just like read-time loss — missing data is missing data. Over threshold →
+    /// quarantine to a RESUMABLE `.aborted-loss` (a keydb refresh + re-mux can
+    /// complete it); within threshold → hand off (`.done` if title-confident,
+    /// else `.review`). The loss is always reported, never silently dropped.
     ///
     /// A behavioural test would need a real lossy ISO + mux pipeline (same
     /// rationale as the sibling gate tests); instead this pins, at source level,
-    /// that the success region (a) still reports the demux loss and (b) hands off
-    /// without ever consulting a loss threshold or writing a terminal-loss marker.
+    /// that the success region (a) reports the demux loss, (b) hands off via a
+    /// marker within threshold, and (c) gates mux-time loss over
+    /// `abort_on_lost_secs` to a resumable `.aborted-loss`.
     #[test]
-    fn completed_mux_with_loss_hands_off_and_never_fails_on_loss() {
+    fn completed_mux_with_loss_gated_by_abort_on_lost_secs() {
         let src = include_str!("resume.rs");
-        // The completed-mux success region: from the v1.2.0 mux-never-aborts
-        // note through the auto-eject tail (same bounds the loss-reporting test
-        // above pins, on the success side of the mux-incomplete guard).
+        // The completed-mux success region: from the "A loss is a loss" mux-time-
+        // loss note through the auto-eject tail.
         let start = src
-            .find("v1.2.0: the mux never aborts on mux-time")
-            .expect("resume.rs should have the v1.2.0 mux-never-aborts comment");
+            .find("A loss is a loss. Mux-time")
+            .expect("resume.rs should have the mux-time-loss note");
         let end = src[start..]
             .find("Honor auto_eject after a successful resume")
             .map(|i| start + i)
@@ -2455,9 +2494,9 @@ mod post_mux_loss_reporting_tests {
         // (a) The loss is still REPORTED, never silently dropped.
         assert!(
             region.contains("demux_lost_secs"),
-            "completed-mux success region must still report demux-time loss"
+            "completed-mux success region must report demux-time loss"
         );
-        // (b) It hands off via a `.done`/`.review` marker.
+        // (b) Within threshold it hands off via a `.done`/`.review` marker.
         assert!(
             region.contains("if title_confident { \".done\" } else { \".review\" }"),
             "completed mux must hand off to .done (confident) or .review (not)"
@@ -2466,18 +2505,15 @@ mod post_mux_loss_reporting_tests {
             region.contains("write_handoff_marker"),
             "completed mux must write a hand-off marker so the mover/operator picks it up"
         );
-        // (c) It NEVER consults a loss threshold on the completed-mux path...
+        // (c) A loss is a loss: mux-time loss OVER abort_on_lost_secs quarantines
+        //     to a RESUMABLE .aborted-loss, gated on the threshold.
         assert!(
-            !region.contains("should_abort_for_loss"),
-            "the post-mux loss-abort gate was removed in 1.2.0 — a completed mux \
-             must not gate hand-off on a loss threshold"
+            region.contains("mark_aborted_on_loss"),
+            "mux-time loss over threshold must quarantine to a resumable .aborted-loss"
         );
-        // ...and NEVER writes a terminal-loss marker for mux-time loss.
         assert!(
-            !region.contains("mark_aborted_on_loss")
-                && !region.contains("write_aborted_loss_marker")
-                && !region.contains("ABORTED_LOSS_MARKER"),
-            "a completed mux carrying loss must NOT be quarantined with .aborted-loss"
+            region.contains("abort_on_lost_secs") || region.contains("effective_abort"),
+            "the mux-time loss gate must consult the abort_on_lost_secs threshold"
         );
     }
 }
