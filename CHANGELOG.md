@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.2.0] — 2026-06-30
+## [1.2.0] — 2026-07-01
 
 ### Added
 
@@ -24,6 +24,11 @@
   (the same shape libfreemkv stamps into MKVs), so a running build — including a
   hand-deployed test build — is always identifiable instead of hiding behind a
   bare package version.
+- **Unlocker matrix in the device log.** After each disc scan, the device log shows
+  a one-line summary of which unlockers actually ran:
+  e.g. `Unlockers (yes = ran this rip) — LibreDrive: yes, AACS: no, CSS: no`.
+  Operator-visible confirmation that the right authentication paths fired, without
+  reading structured logs. Driven by `Disc::unlocker_matrix()` in libfreemkv 1.2.0.
 
 ### Changed
 
@@ -70,6 +75,29 @@
   `volume_id()` readers, so the service and the CLI capture a disc's inputs
   identically. The stale mapfile-VID read was dropped in favour of the disc's
   own Volume ID.
+- **Pass-1 progress bar leaves the un-read region blank.** During the sweep,
+  sectors that had not yet been attempted were rendered red — visually identical to
+  known-bad sectors. Unread means unknown, not bad; the bar now leaves that region
+  empty until sectors are actually assessed.
+- **Device log clears at scan, not rip.** The per-device log previously cleared
+  when a rip started, discarding the scan context — disc identity, unlocker matrix,
+  key-resolution outcome — before it was visible during the rip. The log now clears
+  at the start of a scan, so the full scan context carries through into the live
+  rip view.
+- **Pass-done log shows recovery buckets and wedge state.** Each completed pass
+  logs recovered / still-bad / unreadable sector counts alongside a wedge flag — a
+  compact per-pass verdict instead of a bare sector total.
+- **ETA capped at ">6h" on near-zero recovery rate.** A stalled drive previously
+  produced multi-day or astronomically large displayed ETAs. The ETA is now capped
+  at ">6h" when the recovery rate is near zero; the wedge indicator flags the
+  fast-fail state separately.
+- **Defrag-map caret tracks the largest bad range.** The "you are here" marker in
+  the disc map now follows the largest bad range being worked, matching the
+  largest-first dispatch order of the libfreemkv 1.2.0 Pass-N handler chain.
+- **`Cache-Control: no-store` extended to JSON and plain-text responses.** JSON API
+  responses (`/api/state`, `/api/version`, etc.) and plain-text endpoints now carry
+  `no-store` alongside the HTML dashboard, which already did. autorip is a local
+  control app; none of its responses are appropriate to cache.
 
 ### Fixed
 
