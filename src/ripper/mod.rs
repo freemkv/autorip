@@ -1789,12 +1789,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         device: device.to_string(),
     };
 
-    // Archive the previous rip's per-device log so the live log only
-    // shows events from the current attempt. Mirrors what scan_disc
-    // does; previously rip_disc was missing this so a stop -> rip
-    // cycle left "Stop requested..." / "Pass 1 cancelled" lines from
-    // the prior run mixed into the new one.
-    crate::log::archive_device_log(device);
+    // NOTE: the per-device log is archived/cleared at SCAN start
+    // (`scan_disc`), NOT here. A rip always follows a scan for this attempt, so
+    // clearing again on rip start would wipe the scan context (disc identity,
+    // the unlocker matrix, key resolution) the operator wants to see carry into
+    // the rip. One clear per attempt, at scan.
 
     // Snapshot the Config struct (it's Clone) and drop the read guard
     // immediately. Holding the guard across the rip body would block
