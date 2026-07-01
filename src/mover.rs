@@ -49,7 +49,10 @@ fn record_error(path: &str, reason: &str, hint: &str) {
         },
     );
     if !same_reason {
-        crate::log::syslog(&format!("Move blocked: {} — {}", path, reason));
+        crate::log::syslog(&freemkv_i18n::fmt(
+            "autorip.mover.blocked",
+            &[("path", path), ("reason", reason)],
+        ));
     }
 }
 
@@ -840,11 +843,13 @@ fn check_and_move(cfg: &Config) {
                  mover will NOT auto-create the root — fix the mount, then it \
                  retries on the next tick.",
             );
-            crate::log::syslog(&format!(
-                "Move BLOCKED — destination root {} unavailable: {} (output preserved in staging: {})",
-                absolute_for_log(&dest_root),
-                reason,
-                dir.display()
+            crate::log::syslog(&freemkv_i18n::fmt(
+                "autorip.mover.root_unavailable",
+                &[
+                    ("root", &absolute_for_log(&dest_root)),
+                    ("reason", &reason),
+                    ("dir", &dir.display().to_string()),
+                ],
             ));
             continue;
         }
@@ -960,9 +965,9 @@ fn check_and_move(cfg: &Config) {
                 Ok(d) => Some(d),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => {
-                    crate::log::syslog(&format!(
-                        "Move deferred (could not stat destination {}): {} — will retry next tick",
-                        dest, e
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.mover.deferred_stat_dest",
+                        &[("dest", dest), ("error", &e.to_string())],
                     ));
                     outcomes.push(MoveOutcome::Failed);
                     continue;
@@ -975,9 +980,13 @@ fn check_and_move(cfg: &Config) {
                 let s = match fresh_metadata(src) {
                     Ok(s) => s,
                     Err(e) => {
-                        crate::log::syslog(&format!(
-                            "Move deferred (destination {} exists but could not stat source {:?}): {} — will retry next tick",
-                            dest, src, e
+                        crate::log::syslog(&freemkv_i18n::fmt(
+                            "autorip.mover.deferred_stat_src",
+                            &[
+                                ("dest", dest),
+                                ("src", &format!("{src:?}")),
+                                ("error", &e.to_string()),
+                            ],
                         ));
                         outcomes.push(MoveOutcome::Failed);
                         continue;
@@ -992,12 +1001,14 @@ fn check_and_move(cfg: &Config) {
                         !same_head_and_tail(src, Path::new(dest))
                     };
                     if collision {
-                        crate::log::syslog(&format!(
-                            "Move blocked (destination exists, different file): {} ({} B) vs existing {} ({} B)",
-                            src.display(),
-                            s.len(),
-                            dest,
-                            d.len()
+                        crate::log::syslog(&freemkv_i18n::fmt(
+                            "autorip.mover.collision_diff_file",
+                            &[
+                                ("src", &src.display().to_string()),
+                                ("srcsize", &s.len().to_string()),
+                                ("dest", dest),
+                                ("destsize", &d.len().to_string()),
+                            ],
                         ));
                         outcomes.push(MoveOutcome::Collision);
                         continue;
@@ -1016,10 +1027,12 @@ fn check_and_move(cfg: &Config) {
                 }
                 MoveOutcome::Moved => {
                     if !announced_moving {
-                        crate::log::syslog(&format!(
-                            "Moving: {} ({} files)",
-                            display_name,
-                            ripped_files.len()
+                        crate::log::syslog(&freemkv_i18n::fmt(
+                            "autorip.mover.moving",
+                            &[
+                                ("name", &display_name),
+                                ("count", &ripped_files.len().to_string()),
+                            ],
                         ));
                         announced_moving = true;
                     }
@@ -1027,44 +1040,58 @@ fn check_and_move(cfg: &Config) {
                     // the operator can always see exactly where the bytes
                     // landed — never a cwd-relative "movies/Mercy/..." that
                     // could hide a wrong-filesystem write (Mercy incident).
-                    crate::log::syslog(&format!(
-                        "Moved {} → {}",
-                        src.file_name().unwrap_or_default().to_string_lossy(),
-                        absolute_for_log(dest)
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.mover.moved",
+                        &[
+                            (
+                                "file",
+                                &src.file_name().unwrap_or_default().to_string_lossy(),
+                            ),
+                            ("dest", &absolute_for_log(dest)),
+                        ],
                     ));
                 }
                 MoveOutcome::MovedDirty => {
                     if !announced_moving {
-                        crate::log::syslog(&format!(
-                            "Moving: {} ({} files)",
-                            display_name,
-                            ripped_files.len()
+                        crate::log::syslog(&freemkv_i18n::fmt(
+                            "autorip.mover.moving",
+                            &[
+                                ("name", &display_name),
+                                ("count", &ripped_files.len().to_string()),
+                            ],
                         ));
                         announced_moving = true;
                     }
-                    crate::log::syslog(&format!(
-                        "Moved {} → {} but source could not be removed",
-                        src.file_name().unwrap_or_default().to_string_lossy(),
-                        absolute_for_log(dest)
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.mover.moved_dirty",
+                        &[
+                            (
+                                "file",
+                                &src.file_name().unwrap_or_default().to_string_lossy(),
+                            ),
+                            ("dest", &absolute_for_log(dest)),
+                        ],
                     ));
                 }
                 MoveOutcome::Failed => {
-                    crate::log::syslog(&format!(
-                        "Failed to move {} → {}",
-                        src.display(),
-                        absolute_for_log(dest)
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.mover.failed",
+                        &[
+                            ("src", &src.display().to_string()),
+                            ("dest", &absolute_for_log(dest)),
+                        ],
                     ));
                 }
                 MoveOutcome::SizeMismatch => {
-                    crate::log::syslog(&format!(
-                        "Move blocked (post-cp size mismatch): {:?} -> {}",
-                        src, dest
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.mover.size_mismatch",
+                        &[("src", &format!("{src:?}")), ("dest", dest)],
                     ));
                 }
                 MoveOutcome::PostCopyInvalid => {
-                    crate::log::syslog(&format!(
-                        "Move blocked (post-cp validation failed — structural/unreadable): {:?} -> {}",
-                        src, dest
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.mover.postcopy_invalid",
+                        &[("src", &format!("{src:?}")), ("dest", dest)],
                     ));
                 }
             }
@@ -1139,7 +1166,10 @@ fn check_and_move(cfg: &Config) {
 
         if cleanup_err.is_none() {
             clear_error(&dir_str);
-            crate::log::syslog(&format!("Move complete: {}", display_name));
+            crate::log::syslog(&freemkv_i18n::fmt(
+                "autorip.mover.complete",
+                &[("name", &display_name)],
+            ));
         } else if any_dirty {
             record_error(
                 &dir_str,
@@ -1496,15 +1526,15 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 if check_post_copy(src, dest).is_ok() {
                     return MoveOutcome::Skipped;
                 }
-                crate::log::syslog(&format!(
-                    "Pre-existing destination failed post-copy validation; re-copying: {:?}",
-                    dest
+                crate::log::syslog(&freemkv_i18n::fmt(
+                    "autorip.mover.preexisting_revalidate",
+                    &[("dest", &format!("{dest:?}"))],
                 ));
                 // Fall through to the copy path below.
             } else {
-                crate::log::syslog(&format!(
-                    "Move blocked (destination same size but different content): {:?} vs {:?}",
-                    src, dest
+                crate::log::syslog(&freemkv_i18n::fmt(
+                    "autorip.mover.collision_diff_content",
+                    &[("src", &format!("{src:?}")), ("dest", &format!("{dest:?}"))],
                 ));
                 return MoveOutcome::Collision;
             }
@@ -1562,9 +1592,9 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 // fail it. Runs BEFORE the unlink so src bytes stay
                 // intact on any mismatch — the operator can retry.
                 if let Err(e) = check_post_copy(src, Path::new(&dest_str)) {
-                    crate::log::syslog(&format!(
-                        "Post-cp validation failed for {}: {}",
-                        dest_str, e
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.mover.postcopy_failed",
+                        &[("dest", &dest_str), ("error", &e.to_string())],
                     ));
                     // Map the failure KIND to the outcome so the operator
                     // gets an accurate hint. Only a true length disagreement
@@ -1600,13 +1630,19 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                         ),
                     );
                 }
-                crate::log::syslog(&format!("fs::copy failed for {}: {}", dest_str, e));
+                crate::log::syslog(&freemkv_i18n::fmt(
+                    "autorip.mover.copy_failed",
+                    &[("dest", &dest_str), ("error", &e.to_string())],
+                ));
                 return MoveOutcome::Failed;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 // Sender dropped without sending — worker panicked.
                 let _ = std::fs::remove_file(&dest_str);
-                crate::log::syslog(&format!("fs::copy thread panicked for {}", dest_str));
+                crate::log::syslog(&freemkv_i18n::fmt(
+                    "autorip.mover.copy_thread_panicked",
+                    &[("dest", &dest_str)],
+                ));
                 return MoveOutcome::Failed;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -1621,7 +1657,10 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                     // restart's first tick doesn't wedge on a size-mismatch
                     // Collision against this interrupted copy.
                     let _ = std::fs::remove_file(&dest_str);
-                    crate::log::syslog(&format!("Move aborted (shutdown) mid-copy: {}", dest_str));
+                    crate::log::syslog(&freemkv_i18n::fmt(
+                        "autorip.mover.aborted_shutdown",
+                        &[("dest", &dest_str)],
+                    ));
                     return MoveOutcome::Failed;
                 }
                 // Progress straight from the bytes we've written — no NFS stat,
