@@ -3064,7 +3064,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 max_retries, max_retries, bytes_pending
             ),
         );
-        let mut pass_2_settled = false;
         for retry_n in 1..=max_retries {
             // If user hit stop, bail.
             if user_halt.load(Ordering::Relaxed) {
@@ -3184,23 +3183,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 );
             }
 
-            // Settle the drive between Pass 1 and Pass 2 only, and ONLY when a
-            // fresh Pass-1 sweep just ground the disc. The BU40N (and other
-            // Initio-bridge drives) wedge after grinding on bad sectors, so 30 s
-            // of idle before the retry reads lets the drive recover — but on a
-            // RESUME there was no Pass-1 sweep just before (we jumped straight to
-            // the patch), the drive's been idle, and the settle is pure wasted
-            // time on every resume. `resume_sweep` is that signal.
-            if !pass_2_settled && !resume_sweep {
-                crate::log::device_log(device, "Settling drive for 30 s before retry pass");
-                std::thread::sleep(std::time::Duration::from_secs(30));
-                pass_2_settled = true;
-                if user_halt.load(Ordering::Relaxed) {
-                    crate::log::device_log(device, "PASS 2 STOPPED: user halt during drive settle");
-                    break;
-                }
-            }
-
             crate::log::device_log(
                 device,
                 &format!(
@@ -3263,14 +3245,29 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // power-cycle. spin_cycle() is exactly that WITHOUT ejecting (the
             // drive is slot-loading — a human eject is a product failure for an
             // unattended service). Validated live: took the drive from
-            // failing-every-read back to reading at MB/s. Best-effort — a
-            // spin-cycle failure (e.g. file-backed resume with no real drive)
-            // just proceeds to the read, which will report the real error.
+            // failing-every-read back to reading at MB/s. This ACTIVE reset
+            // supersedes the old 30 s passive settle (which used to also run
+            // before pass 2 — the two stacked to 45 s of redundant delay on a
+            // fresh rip); a power-cycle recovers a wedged drive better than idle.
             if let Err(e) = session.drive.spin_cycle() {
+                // spin_cycle's SCSI command itself failed (dead bus / file-backed
+                // resume with no real drive). Fall back to a short passive idle so
+                // a drive that just ground a sweep still gets SOME recovery time
+                // before the retry reads — never zero (a bridge transport fault
+                // self-recovers in ~15 s of idle).
                 crate::log::device_log(
                     device,
-                    &format!("drive spin-cycle before pass {pass} failed (continuing): {e}"),
+                    &format!(
+                        "drive spin-cycle before pass {pass} failed ({e}); settling 15 s instead"
+                    ),
                 );
+                // Short idle in 1 s slices so a user halt stays responsive.
+                for _ in 0..15 {
+                    if user_halt.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
             } else {
                 crate::log::device_log(
                     device,
