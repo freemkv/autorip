@@ -3238,6 +3238,26 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // granular pass resolves it.
                 fast_capture: retry_n == 1,
             };
+            // Un-wedge the drive in SOFTWARE before each retry pass. Grinding a
+            // bad cluster leaves the BU40N in a HARDWARE_ERROR fast-fail wedge
+            // where it fails even readable sectors; our notes say that needs a
+            // power-cycle. spin_cycle() is exactly that WITHOUT ejecting (the
+            // drive is slot-loading — a human eject is a product failure for an
+            // unattended service). Validated live: took the drive from
+            // failing-every-read back to reading at MB/s. Best-effort — a
+            // spin-cycle failure (e.g. file-backed resume with no real drive)
+            // just proceeds to the read, which will report the real error.
+            if let Err(e) = session.drive.spin_cycle() {
+                crate::log::device_log(
+                    device,
+                    &format!("drive spin-cycle before pass {pass} failed (continuing): {e}"),
+                );
+            } else {
+                crate::log::device_log(
+                    device,
+                    &format!("drive spin-cycled (soft un-wedge, no eject) before pass {pass}"),
+                );
+            }
             let cr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {
                 Ok(r) => r,
                 Err(e) => {
