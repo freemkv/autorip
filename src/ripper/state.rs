@@ -41,8 +41,7 @@ pub enum Resumable {
 // the disc-in-pipeline on the System tab. Deferred this cycle: the web UI JS
 // hard-depends on these exact status strings (web.rs buildSteps:
 // `s.status==='scanning'` etc.), so the enum cutover must land together with
-// the frontend rework rather than half-wired. The post-mux abort removal
-// (mux never aborts) is the SAFE subset that shipped now.
+// the frontend rework rather than half-wired.
 /// State broadcast for web UI.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RipState {

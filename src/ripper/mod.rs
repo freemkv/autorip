@@ -4414,11 +4414,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         }
     }
 
-    // v1.2.0: the mux never aborts on mux-time (demux/decrypt) loss. Such
-    // loss is concealed in the read path (NULL-TS fill) and dropped-to-keyframe
-    // at the codec layer, producing a decode-clean file; it is tallied and
-    // logged (lost_video_secs below) but never quarantines the disc. The
-    // abort_on_lost_secs knob governs the PRE-mux rip phase only.
+    // A loss is a loss. Mux-time (decrypt/codec) loss is missing in-title data
+    // just like a read error — it's concealed for playability (NULL-TS fill +
+    // drop-to-keyframe, so the file decodes clean) but the data is still gone.
+    // So it is gated against `abort_on_lost_secs` below, right before the `.done`
+    // marker, exactly as read-time loss is. The PRE-mux gate can't catch it (it
+    // reads only the mapfile Unreadable set — decrypt/codec skips never appear
+    // there), so this is the sole enforcement point for mux-time loss.
 
     // Emit a final mux summary line so the history record's captured log
     // ends with a clean terminal event instead of whatever the last 60s
@@ -4438,6 +4440,56 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         );
     } else if let Some(reason) = finalize_error.as_ref() {
         crate::log::device_log(device, &format!("Mux failed: {reason}"));
+    }
+
+    // ── Mux-time loss gate (a loss is a loss) ───────────────────────────────
+    // Read-time loss was already gated PRE-mux (it reads the mapfile Unreadable
+    // set); this catches the mux-time (decrypt/codec) loss the pre-mux gate can't
+    // see, before filing `.done`. Over `abort_on_lost_secs` → quarantine to a
+    // RESUMABLE `.aborted-loss` (a keydb refresh + re-mux can complete it),
+    // exactly as the pre-mux abort does. ISO output is exempt (whole-disc, gated
+    // by 100% elsewhere). Only fires when the MUX itself contributed loss —
+    // read-time loss alone already passed the pre-mux gate.
+    if completed && !output_is_iso_image(&cfg_read.output_format) {
+        let effective_abort =
+            effective_abort_secs(&cfg_read.output_format, cfg_read.abort_on_lost_secs);
+        let read_lost_secs = main_lost_ms_for_history_outer / MILLIS_PER_SEC;
+        let total_lost_secs = read_lost_secs + demux_lost_secs;
+        let over = if effective_abort == 0 {
+            total_lost_secs > 0.0
+        } else {
+            total_lost_secs > effective_abort as f64
+        };
+        if over && demux_lost_secs > 0.0 {
+            crate::log::device_log(
+                device,
+                &format!(
+                    "ABORT: mux-time loss — {:.2}s missing in main movie (decrypt/codec) exceeds threshold ({}s). A loss is a loss.",
+                    total_lost_secs, effective_abort
+                ),
+            );
+            update_state_with(device, |s| {
+                s.status = "error".to_string();
+                s.loss_aborted = true;
+                if s.last_error.is_empty() {
+                    s.last_error = format!(
+                        "aborted — {} lost at mux, decrypt/codec ({})",
+                        fmt_loss(total_lost_secs * MILLIS_PER_SEC),
+                        fmt_threshold(effective_abort)
+                    );
+                }
+            });
+            let _ = staging::mark_aborted_on_loss(
+                std::path::Path::new(&staging),
+                &format!(
+                    "aborted: {:.2}s lost at mux, decrypt/codec ({})",
+                    total_lost_secs,
+                    fmt_threshold(effective_abort)
+                ),
+            );
+            unregister_halt(device);
+            return;
+        }
     }
 
     // Write the staging markers (.done / .completed / .failed) the mover and the
