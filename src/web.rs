@@ -235,13 +235,14 @@ function renderBar(s,p){
   let caretPct=null;
   if(total>0&&s&&s.status==='ripping'){
     if(positional&&ranges.length){
-      /* Reverse patch works the highest-LBA range first, from its END (high
-         edge) toward its start, and the red heals from the right — so the live
-         read position is the active range's RIGHT edge (lba+count). It crawls
-         left as the block recovers; when the range clears, the next-highest
-         becomes active and the arrow jumps left. */
+      /* The handler-chain engine works the LARGEST bad range first
+         (largest-first ordering), so the live position sits on the largest
+         remaining range, not the highest-LBA one. Track that — otherwise the
+         caret parks on a small high-LBA block while recovery is really chewing
+         a big block elsewhere. When the largest range shrinks below another,
+         the arrow jumps to the new largest. */
       let act=ranges[0];
-      ranges.forEach(r=>{ if(r.lba>act.lba) act=r; });
+      ranges.forEach(r=>{ if(r.count>act.count) act=r; });
       /* Align to the red block's RENDERED right edge — same offset + min-width
          0.5% clamp the overlay uses below — so the arrow sits exactly on the
          end of the red even for tiny ranges (where the true lba+count would
