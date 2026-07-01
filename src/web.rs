@@ -210,9 +210,10 @@ let _activeTab=null;
 function renderBar(s,p){
   /* Two modes, one renderer:
      - Pass 1 (sequential sweep, s.pass<=1): a genuine left-to-right progress
-       fill. x-axis = work done. Green grows to pass_progress_pct. Bad-range
-       ticks still overlay at their real LBA position so the operator sees
-       damage accumulating during the sweep.
+       fill. x-axis = work done. Green grows to the read head. Only damage the
+       sweep has ALREADY passed over shows red; the unread region ahead of the
+       head stays blank (NonTried is unknown, not bad — see the overlay clip
+       below).
      - Pass 2-N (retry/patch, s.pass>1): a POSITIONAL disc map ("the disc,
        coloured by status"). x-axis = DISC POSITION (0..bytes_total_disc), NOT
        work done. The whole bar is the disc: GREEN everywhere it's good, RED
@@ -280,15 +281,34 @@ function renderBar(s,p){
     if(fillPct<0)fillPct=0; if(fillPct>100)fillPct=100;
     html+='<div style="background:var(--green);height:100%;width:'+fillPct+'%;transition:width 1s"></div>';
   }
-  /* Red bad-range overlay (both modes). Drawn at each range's real LBA
-     position. min-width 0.5% keeps single-sector ranges visible on a 72GB
-     UHD; clamp left+width so a range near the tail never overflows the bar. */
+  /* Red bad-range overlay. Drawn at each range's real LBA position. min-width
+     0.5% keeps single-sector ranges visible on a 72GB UHD; clamp left+width so
+     a range near the tail never overflows the bar.
+
+     Pass 1 (sweep): the region AHEAD of the read head is UNREAD — NonTried, not
+     bad. We don't know if it's good or bad until it's read, so it stays BLANK
+     (same reason the "maybe" bucket shows no red pill: nothing is a verdict
+     until it's been read). The live bad_ranges during a sweep is dominated by
+     one giant NonTried range covering the whole un-swept tail; painting it red
+     makes a pristine disc look 100% damaged. So CLIP the red to the swept
+     portion [0, last_sector]: only damage the sweep has actually passed over
+     shows red; the unread remainder is neutral track.
+     Pass N (positional): every bad_range IS determined-bad, so draw it in full. */
   if(total>0&&ranges.length){
+    const sweptPct=positional?100
+      :((s&&s.last_sector>0)?(s.last_sector*2048)/total*100:0);
     ranges.forEach(r=>{
       let offPct=(r.lba*2048)/total*100;
       if(offPct<0)offPct=0; if(offPct>100)offPct=100;
       let wPct=Math.max((r.count*2048)/total*100,0.5);
       if(offPct+wPct>100)wPct=100-offPct;
+      if(!positional){
+        /* Blank until read: skip ranges entirely ahead of the head, trim the
+           unread tail off one that straddles it. */
+        if(offPct>=sweptPct)return;
+        if(offPct+wPct>sweptPct)wPct=sweptPct-offPct;
+        if(wPct<=0)return;
+      }
       html+='<div style="position:absolute;left:'+offPct+'%;top:0;width:'+wPct+'%;height:100%;background:var(--red);opacity:0.9;transition:left 1s,width 1s"></div>';
     });
   }
