@@ -3165,12 +3165,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 );
             }
 
-            // Settle the drive between Pass 1 and Pass 2 only. The BU40N
-            // (and other Initio-bridge drives) wedge after grinding on bad
-            // sectors. Giving the drive 30 s of idle BEFORE we hammer it
-            // again with retry reads lets its internal state recover.
-            // Cheap insurance.
-            if !pass_2_settled {
+            // Settle the drive between Pass 1 and Pass 2 only, and ONLY when a
+            // fresh Pass-1 sweep just ground the disc. The BU40N (and other
+            // Initio-bridge drives) wedge after grinding on bad sectors, so 30 s
+            // of idle before the retry reads lets the drive recover — but on a
+            // RESUME there was no Pass-1 sweep just before (we jumped straight to
+            // the patch), the drive's been idle, and the settle is pure wasted
+            // time on every resume. `resume_sweep` is that signal.
+            if !pass_2_settled && !resume_sweep {
                 crate::log::device_log(device, "Settling drive for 30 s before retry pass");
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 pass_2_settled = true;
