@@ -869,7 +869,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             .join(", ");
         crate::log::device_log(
             device,
-            &format!("Unlockers (yes = ran this rip) — {matrix}"),
+            &format!("Unlockers — {matrix}"),
         );
     }
 
