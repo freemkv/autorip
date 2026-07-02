@@ -867,10 +867,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             .map(|(name, ok)| format!("{name}: {}", if ok { "yes" } else { "no" }))
             .collect::<Vec<_>>()
             .join(", ");
-        crate::log::device_log(
-            device,
-            &format!("Unlockers — {matrix}"),
-        );
+        crate::log::device_log(device, &format!("Unlockers — {matrix}"));
     }
 
     // Extract title info before storing session
