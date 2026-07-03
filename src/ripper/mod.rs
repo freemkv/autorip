@@ -209,6 +209,120 @@ fn key_readiness(
     format!("Missing keys — {reason}")
 }
 
+// ─── Online key service: DOWN vs genuine no-key ─────────────────────────────
+//
+// The online keysource swallows every failure (transport error, 502, timeout)
+// into an empty result, so autorip used to report a transient service outage as
+// a permanent "no keys found". These helpers classify the service's
+// reachability when it yields no key, and bounded-retry a transient outage
+// rather than permanently failing the disc.
+
+/// How many times online key resolution is re-attempted when the first attempt
+/// yields no key AND the key service classifies as DOWN / rate-limited. Small
+/// and bounded — a transient 502 usually clears within a minute; we never
+/// hammer the service or the drive.
+const KEY_SERVICE_RETRY_ATTEMPTS: u32 = 3;
+
+/// `key_status` / `last_error` text for a DOWN key service (transient outage).
+const KEY_SERVICE_DOWN_STATUS: &str = "Key service unavailable — the online key \
+    service is not responding. This is a temporary outage, not a missing key; \
+    will retry.";
+
+/// `key_status` / `last_error` text for a rate-limited (quota) key service.
+const KEY_SERVICE_QUOTA_STATUS: &str = "Key service rate-limited (quota) — will retry later.";
+
+/// Backoff before the Nth (1-based) online-key retry: 8s, 16s, 32s (capped).
+fn key_service_backoff(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(3);
+    std::time::Duration::from_secs(8u64.saturating_mul(1u64 << shift))
+}
+
+/// Map a transient reachability verdict to its operator-facing status line.
+/// `None` for a reachable service (`Up`) — the caller keeps its no-key text.
+fn key_service_transient_status(
+    reach: crate::keysource::ServiceReachability,
+) -> Option<&'static str> {
+    use crate::keysource::ServiceReachability;
+    match reach {
+        ServiceReachability::Down => Some(KEY_SERVICE_DOWN_STATUS),
+        ServiceReachability::RateLimited => Some(KEY_SERVICE_QUOTA_STATUS),
+        ServiceReachability::Up => None,
+    }
+}
+
+/// Given an online key resolution that produced NO key for an encrypted disc,
+/// classify the key service and — on a transient outage — bounded-retry the
+/// resolution. Returns the (possibly re-resolved) disc, its final `KeyOutcome`,
+/// and the reachability verdict when the disc is STILL keyless: `None` if the
+/// service was reachable (a genuine no-key — the caller keeps its existing
+/// behaviour), or `Some(transient)` when the service never recovered within the
+/// retries (the caller surfaces a retryable state instead of a permanent "no
+/// keys" error).
+///
+/// Precondition: the caller has already resolved once and got `NoKey` on an
+/// encrypted, still-keyless disc with `key_source == "online"`.
+fn retry_online_keys_on_outage(
+    device: &str,
+    cfg: &Config,
+    drive: &mut libfreemkv::Drive,
+    mut disc: libfreemkv::Disc,
+) -> (
+    libfreemkv::Disc,
+    crate::keysource::KeyOutcome,
+    Option<crate::keysource::ServiceReachability>,
+) {
+    use crate::keysource::KeyOutcome;
+    // ONE probe to classify. Reachable → genuine no-key; stop immediately and
+    // preserve the pre-fix behaviour.
+    let reach = crate::keysource::probe_online_reachability(cfg);
+    if !reach.is_transient() {
+        return (disc, KeyOutcome::NoKey, None);
+    }
+    crate::log::device_log(
+        device,
+        "Online key service appears DOWN (not a missing key) — retrying key resolution.",
+    );
+    let mut last_reach = reach;
+    for attempt in 1..=KEY_SERVICE_RETRY_ATTEMPTS {
+        if crate::SHUTDOWN.load(Ordering::Relaxed) {
+            break;
+        }
+        let backoff = key_service_backoff(attempt);
+        crate::log::device_log(
+            device,
+            &format!(
+                "Key-service retry {attempt}/{KEY_SERVICE_RETRY_ATTEMPTS} in {}s...",
+                backoff.as_secs()
+            ),
+        );
+        std::thread::sleep(backoff);
+        // Re-attempt the full resolution — the real retry against the service
+        // (also re-samples the disc). A recovered service resolves here.
+        let (d, outcome) = resolve_keys_from_drive(cfg, drive, disc);
+        disc = d;
+        if outcome == KeyOutcome::Resolved {
+            crate::log::device_log(device, "Key service recovered — keys resolved on retry.");
+            return (disc, KeyOutcome::Resolved, None);
+        }
+        // Still no key — re-classify: is the service back (genuine no-key now)
+        // or still down (keep the transient, retryable state)?
+        last_reach = crate::keysource::probe_online_reachability(cfg);
+        if !last_reach.is_transient() {
+            crate::log::device_log(
+                device,
+                "Key service reachable but returned no key — genuine missing key for this disc.",
+            );
+            return (disc, KeyOutcome::NoKey, None);
+        }
+    }
+    crate::log::device_log(
+        device,
+        "Key service still unavailable after retries — leaving disc in a retryable state \
+         (a later insert / rescan will pick it up). Not ejecting.",
+    );
+    (disc, KeyOutcome::NoKey, Some(last_reach))
+}
+
 use session::{
     DriveSession, drop_session, rediscover_drive, session_is_scanned, store_session, take_session,
 };
@@ -807,9 +921,9 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // key-resolution path (MKB / Unit_Key_RO.inf / sample units / keyserver)
     // does not apply to a DVD; running it reads the disc as if it were AACS/UHD
     // and is pure waste (and was where DVD scans stalled). Skip it for DVD.
-    let (disc, key_outcome) = if matches!(disc.format, libfreemkv::DiscFormat::Dvd) {
+    let (disc, key_outcome, key_reach) = if matches!(disc.format, libfreemkv::DiscFormat::Dvd) {
         tracing::info!(device = %device, "resolve_keys: skipped (DVD/CSS — no AACS)");
-        (disc, crate::keysource::KeyOutcome::Resolved)
+        (disc, crate::keysource::KeyOutcome::Resolved, None)
     } else {
         if crate::keysource::uses_online(&cfg_read) {
             crate::log::device_log(device, "Communicating with online keyserver...");
@@ -820,14 +934,33 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         scan_wd.enter_resolve();
         let resolve_t0 = std::time::Instant::now();
         tracing::info!(device = %device, "resolve_keys: begin");
-        let r = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
+        let (disc, outcome) = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
         tracing::info!(device = %device, elapsed_ms = resolve_t0.elapsed().as_millis() as u64, "resolve_keys: end");
-        r
+        // Down-vs-no-key: if the ONLINE service yielded no key for an encrypted,
+        // still-keyless disc, classify the service's reachability and bounded-
+        // retry on a transient outage rather than reporting a permanent
+        // "no keys found". `key_reach` is `Some(transient)` only when the
+        // service never recovered — that drives the retryable status below.
+        let no_keys =
+            disc.encrypted && matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None);
+        if crate::keysource::uses_online(&cfg_read)
+            && outcome == crate::keysource::KeyOutcome::NoKey
+            && no_keys
+        {
+            retry_online_keys_on_outage(device, &cfg_read, &mut drive, disc)
+        } else {
+            (disc, outcome, None)
+        }
     };
     // Scan + resolve are done; stand the watchdog down explicitly (drop also
     // covers any early return above).
     drop(scan_wd);
-    let key_status = key_readiness(&disc, key_outcome, cfg_read.capture_without_keys);
+    // A transient key-service outage gets its own distinct tile text (temporary,
+    // will-retry) instead of the permanent "Missing keys — no key" message.
+    let key_status = match key_reach.and_then(key_service_transient_status) {
+        Some(msg) => msg.to_string(),
+        None => key_readiness(&disc, key_outcome, cfg_read.capture_without_keys),
+    };
 
     // Update format from full scan (UHD vs BD now known)
     let disc_name = disc
@@ -1945,7 +2078,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         }
     };
 
-    let disc = match session.disc.take() {
+    let mut disc = match session.disc.take() {
         Some(d) => d,
         None => {
             tracing::error!(
@@ -2067,6 +2200,27 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let duration = crate::util::format_duration_hm(disc.titles[0].duration_secs);
     let codecs = format_codecs(&disc.titles[0]);
     let title = disc.titles[0].clone();
+
+    // Down-vs-no-key (rip path): if the ONLINE key service left this encrypted
+    // disc keyless, that may be a transient service outage (502 / timeout), not
+    // a genuinely missing key. Classify the service's reachability and bounded-
+    // retry resolution before we permanently fail the rip. A recovered service
+    // resolves keys here and the rip proceeds; a persistent outage yields
+    // `Some(reach)` and is parked below in a retryable/pending state instead of
+    // the old permanent "no keys found" error. No-op unless online + keyless;
+    // capture-without-keys keeps its ISO-now path untouched.
+    let mut key_outage: Option<crate::keysource::ServiceReachability> = None;
+    if crate::keysource::uses_online(&cfg_read)
+        && !cfg_read.capture_without_keys
+        && disc.encrypted
+        && matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None)
+    {
+        let (rdisc, _outcome, reach) =
+            retry_online_keys_on_outage(device, &cfg_read, &mut session.drive, disc);
+        disc = rdisc;
+        key_outage = reach;
+    }
+
     let keys = disc.decrypt_keys();
 
     // No-keys decision. An encrypted disc with no usable keys can still be swept
@@ -2077,6 +2231,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     //   * disabled → don't rip; surface the explicit reason and stop here.
     let keys_missing = disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None);
     if keys_missing {
+        // A persistent online-key-service outage is NOT a missing key: park the
+        // disc in a retryable/pending state (status idle, distinct message) so a
+        // later insert / rescan retries — do not permanently fail, do not eject.
+        if let Some(reach) = key_outage {
+            let status_msg = key_service_transient_status(reach).unwrap_or(KEY_SERVICE_DOWN_STATUS);
+            crate::log::device_log(device, &format!("Not ripping now — {status_msg}"));
+            update_state_with(device, |s| {
+                s.status = "idle".to_string();
+                s.key_status = status_msg.to_string();
+                s.last_error = status_msg.to_string();
+            });
+            unregister_halt(device);
+            return;
+        }
         let msg = keyless_failure_message(&disc);
         if cfg_read.capture_without_keys {
             crate::log::device_log(
@@ -6773,6 +6941,47 @@ mod tests {
             "CSS failure should lead with the level word and E-code: {msg}"
         );
         assert!(!msg.contains('\n'), "CSS message must be one line: {msg}");
+    }
+
+    /// The reachability verdict → operator status-line mapping (the state side
+    /// of the down-vs-no-key fix). A transient verdict (Down / RateLimited) maps
+    /// to a distinct, retryable message; a reachable service (Up) maps to `None`
+    /// so the caller keeps the existing "no keys found" behaviour. Paired with
+    /// `keysource::classify_reachability` (502/timeout→Down, 429→RateLimited,
+    /// 404/422→Up), this closes the full outcome→state chain.
+    #[test]
+    fn key_service_transient_status_mapping() {
+        use crate::keysource::ServiceReachability;
+        // DOWN (502 / timeout classified upstream) → transient outage message.
+        let down = super::key_service_transient_status(ServiceReachability::Down)
+            .expect("Down is transient");
+        assert!(
+            down.contains("temporary outage") && down.contains("not a missing key"),
+            "Down status must read as a transient outage, not a missing key: {down}"
+        );
+        // 429 quota → rate-limited message.
+        let quota = super::key_service_transient_status(ServiceReachability::RateLimited)
+            .expect("RateLimited is transient");
+        assert!(
+            quota.to_lowercase().contains("rate-limited"),
+            "RateLimited status must mention rate-limiting: {quota}"
+        );
+        // UP (404/422 — service reachable) → no override; keep no-key behaviour.
+        assert!(
+            super::key_service_transient_status(ServiceReachability::Up).is_none(),
+            "a reachable service is a genuine no-key, not an outage"
+        );
+    }
+
+    /// Retry backoff is bounded and monotonic (8s, 16s, 32s, capped) — a small,
+    /// non-hammering schedule.
+    #[test]
+    fn key_service_backoff_is_bounded() {
+        assert_eq!(super::key_service_backoff(1).as_secs(), 8);
+        assert_eq!(super::key_service_backoff(2).as_secs(), 16);
+        assert_eq!(super::key_service_backoff(3).as_secs(), 32);
+        // Capped — never grows without bound even if called with a high attempt.
+        assert_eq!(super::key_service_backoff(9).as_secs(), 64);
     }
 
     #[test]

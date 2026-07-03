@@ -280,6 +280,112 @@ pub fn uses_online(cfg: &Config) -> bool {
     cfg.key_source == "online"
 }
 
+/// Reachability verdict for the online key service, used to distinguish a
+/// *transient outage* (the service is down / throttled — a later attempt may
+/// succeed) from a *genuine no-key* (the service is up and simply has no key /
+/// rejected the request for this disc).
+///
+/// This is the crux of the "down vs no-key" fix: when the online source
+/// resolves NO key, autorip alone can't tell whether the service HAD the key
+/// but was unreachable (a 502 outage, connect-refused, timeout) or genuinely
+/// has none. A single bounded probe against the configured `keyserver_url`
+/// answers that — and only the [`Up`](Self::Up) verdict keeps the pre-fix
+/// "no keys found" behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceReachability {
+    /// The service answered with an HTTP status (any 2xx / 3xx / non-429 4xx).
+    /// It is UP — so a no-key result is a genuine missing key / auth rejection
+    /// for *this* disc, not an outage. Keep the existing behaviour.
+    Up,
+    /// Transport failure (connect refused / timeout / DNS / TLS) OR an HTTP
+    /// 5xx (502 / 503 / 504). The service is DOWN — a transient outage, NOT a
+    /// missing key. Retryable.
+    Down,
+    /// HTTP 429 — the service is up but rate-limiting us (quota). Transient;
+    /// a later attempt after backoff may succeed. Retryable.
+    RateLimited,
+}
+
+impl ServiceReachability {
+    /// True for the retryable verdicts ([`Down`](Self::Down) /
+    /// [`RateLimited`](Self::RateLimited)) — the ones that must NOT be reported
+    /// as a permanent missing key.
+    pub fn is_transient(self) -> bool {
+        matches!(
+            self,
+            ServiceReachability::Down | ServiceReachability::RateLimited
+        )
+    }
+}
+
+/// The observable result of a single reachability probe, decoupled from the
+/// HTTP client so the [`classify_reachability`] mapping can be unit-tested
+/// against mocked outcomes (502/timeout → down, 429 → quota, 404/422 → no-key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The server returned an HTTP response with this status code.
+    Status(u16),
+    /// No HTTP response at all — connection refused, timed out, DNS/TLS error.
+    Transport,
+}
+
+/// Map a probe outcome to a [`ServiceReachability`] verdict. Pure — the single
+/// source of truth for the down-vs-no-key decision, exercised directly by the
+/// unit tests.
+///
+/// * transport error, or HTTP 5xx (500-599)          → [`ServiceReachability::Down`]
+/// * HTTP 429                                         → [`ServiceReachability::RateLimited`]
+/// * any other HTTP status (2xx/3xx, and 4xx like 404/422) → [`ServiceReachability::Up`]
+///   — the service is reachable, so a no-key really is a missing key / auth wall.
+pub fn classify_reachability(outcome: ProbeOutcome) -> ServiceReachability {
+    match outcome {
+        ProbeOutcome::Transport => ServiceReachability::Down,
+        ProbeOutcome::Status(429) => ServiceReachability::RateLimited,
+        ProbeOutcome::Status(code) if (500..=599).contains(&code) => ServiceReachability::Down,
+        ProbeOutcome::Status(_) => ServiceReachability::Up,
+    }
+}
+
+/// Read timeout for the reachability probe. Short and bounded — we only need to
+/// learn *whether* the service answers, not to complete a key exchange.
+const PROBE_TIMEOUT_SECS: u64 = 8;
+
+/// Perform ONE bounded reachability probe against the configured
+/// `keyserver_url` and classify the result. Never hammers: a single cheap
+/// `GET` with short connect/read timeouts, zero redirects, and the same
+/// SSRF-pinning (`validate_fetch_url`) the rest of autorip's outbound HTTP
+/// uses. A `GET` on the (POST) key endpoint typically 404/405s — that's fine,
+/// *any* HTTP answer proves the service is UP; only transport failures / 5xx /
+/// 429 are transient.
+///
+/// If the URL is empty or SSRF-blocked we can't probe, so we report
+/// [`ServiceReachability::Up`] — that preserves the pre-fix behaviour (the
+/// online source was already dropped for such a URL, so the no-key is treated
+/// as genuine rather than a spurious "outage").
+pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
+    let url = cfg.keyserver_url.trim();
+    if url.is_empty() {
+        return ServiceReachability::Up;
+    }
+    let pinned = match crate::web::validate_fetch_url(url) {
+        Ok(addrs) => addrs,
+        // Can't safely reach it (bad scheme / blocked IP) — not an "outage".
+        Err(_) => return ServiceReachability::Up,
+    };
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(std::time::Duration::from_secs(4))
+        .timeout_read(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS))
+        .resolver(move |_netloc: &str| Ok(pinned.clone()))
+        .build();
+    let outcome = match agent.get(url).call() {
+        Ok(resp) => ProbeOutcome::Status(resp.status()),
+        Err(ureq::Error::Status(code, _)) => ProbeOutcome::Status(code),
+        Err(ureq::Error::Transport(_)) => ProbeOutcome::Transport,
+    };
+    classify_reachability(outcome)
+}
+
 /// How a disc's key-resolution inputs are obtained. Decouples [`resolve_keys`]
 /// from WHERE the disc lives — a live drive or a staged ISO — so the resolution
 /// logic is written once. See [`DriveAccess`] and [`IsoAccess`].
@@ -971,5 +1077,56 @@ mod tests {
         let sources = build_sources(&cfg);
         assert_eq!(sources.len(), 1, "fallback to a single local keydb source");
         assert!(!uses_online(&cfg), "a typo'd source is not 'online'");
+    }
+
+    // --- reachability classification: down vs no-key (v1.3.0) ----------------
+
+    /// The core down-vs-no-key mapping. An HTTP 5xx (502/503/504) OR a
+    /// transport failure (timeout / connect-refused) means the service is DOWN
+    /// (transient); 429 means rate-limited (transient); any other HTTP answer
+    /// — including 404 (auth wall) and 422 (no-key) — means the service is UP,
+    /// so a no-key is genuine.
+    #[test]
+    fn classify_reachability_down_vs_no_key() {
+        use ProbeOutcome::{Status, Transport};
+        // 5xx outage → DOWN
+        assert_eq!(
+            classify_reachability(Status(502)),
+            ServiceReachability::Down
+        );
+        assert_eq!(
+            classify_reachability(Status(503)),
+            ServiceReachability::Down
+        );
+        assert_eq!(
+            classify_reachability(Status(504)),
+            ServiceReachability::Down
+        );
+        assert_eq!(
+            classify_reachability(Status(500)),
+            ServiceReachability::Down
+        );
+        // transport failure (timeout / connect refused) → DOWN
+        assert_eq!(classify_reachability(Transport), ServiceReachability::Down);
+        // quota → RATE-LIMITED
+        assert_eq!(
+            classify_reachability(Status(429)),
+            ServiceReachability::RateLimited
+        );
+        // service reachable but rejects THIS disc → UP (genuine no-key)
+        assert_eq!(classify_reachability(Status(404)), ServiceReachability::Up);
+        assert_eq!(classify_reachability(Status(422)), ServiceReachability::Up);
+        assert_eq!(classify_reachability(Status(200)), ServiceReachability::Up);
+        assert_eq!(classify_reachability(Status(405)), ServiceReachability::Up);
+    }
+
+    /// Only `Down` and `RateLimited` are transient/retryable; `Up` is terminal
+    /// (a genuine no-key). Regression guard so a refactor can't flip a genuine
+    /// no-key into an infinite retry (or vice-versa).
+    #[test]
+    fn reachability_transient_partition() {
+        assert!(ServiceReachability::Down.is_transient());
+        assert!(ServiceReachability::RateLimited.is_transient());
+        assert!(!ServiceReachability::Up.is_transient());
     }
 }
