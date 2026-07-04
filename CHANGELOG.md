@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.2.2] — 2026-07-04
+
+### Fixed
+
+- **A down online key service is no longer reported as a missing key.** When
+  `key_source = "online"` resolves no key for an encrypted disc, autorip now runs
+  one bounded reachability probe against the keyserver (SSRF-pinned GET, ~8 s
+  timeout, zero redirects) and classifies the result: a transport error or
+  502/503/504 is a transient **outage**, a 429 is **rate-limited**, and any other
+  HTTP answer (2xx/3xx/non-429 4xx, including a 404 auth wall) means the service
+  is **up** and the key genuinely does not exist. On a transient verdict autorip
+  bounded-retries key resolution (3 attempts, 8/16/32 s backoff) instead of
+  permanently failing the disc, and if the service never recovers it parks the
+  disc in a distinct retryable state ("Key service unavailable — temporary
+  outage, not a missing key; will retry." / "Key service rate-limited (quota) —
+  will retry later.") rather than the permanent "no keys found" error. Wired into
+  both the scan-time key-readiness tile and the live rip path's keys-missing
+  gate; never hammers the drive or the service, never ejects.
+
+### Added
+
+- **Clear stuck move errors from the System tab.** Each move-queue error now
+  carries a ✕ to dismiss it, plus **Clear all** and **Refresh** in the errors
+  header. Clearing removes the entry from the in-memory error map; the mover
+  re-records any move that is still genuinely failing on its next tick, so a
+  resolved or stale error stays gone while a persistent one reappears — no
+  container restart needed to clear the display.
+
 ## [1.2.0] — 2026-07-01
 
 ### Added
