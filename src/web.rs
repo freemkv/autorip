@@ -955,11 +955,23 @@ function renderMoves(){
   /* Stuck-move errors that need user action (orphaned staging dirs etc.) */
   if(window._moveErrors&&window._moveErrors.length){
     html+='<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--chip)">';
+    /* Header: re-check (refresh) + clear-all. A cleared error the mover still
+       considers blocked reappears on its next tick, so refresh confirms which
+       are actually solved. */
+    html+='<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">'
+      +'<span style="font-size:.75rem;color:var(--text3);text-transform:uppercase;letter-spacing:.4px">Needs action</span>'
+      +'<span style="flex:1"></span>'
+      +'<a href="#" onclick="event.preventDefault();loadSystem()" style="font-size:.75rem;color:var(--text2);text-decoration:none">↻ Refresh</a>'
+      +'<a href="#" onclick="event.preventDefault();clearAllMoveErr()" style="font-size:.75rem;color:var(--text2);text-decoration:none">Clear all</a>'
+      +'</div>';
     window._moveErrors.forEach(e=>{
+      var p=e.path||'';
       html+='<div style="padding:6px 0;font-size:.8rem">'
         +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">'
         +'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);flex-shrink:0"></span>'
-        +'<span style="font-weight:500;color:var(--red)">'+esc(e.path||'')+'</span>'
+        +'<span style="font-weight:500;color:var(--red);flex:1;min-width:0;word-break:break-all">'+esc(p)+'</span>'
+        +'<span onclick="clearMoveErr('+JSON.stringify(p)+')" title="Clear this error" '
+          +'style="flex-shrink:0;cursor:pointer;color:var(--text3);font-size:1rem;line-height:1;padding:0 2px">&times;</span>'
         +'</div>'
         +'<div style="margin-left:16px;color:var(--text2)">'+esc(e.reason||'')+'</div>'
         +(e.hint?'<div style="margin-left:16px;color:var(--text3);font-size:.75rem;margin-top:2px">'+esc(e.hint)+'</div>':'')
@@ -968,6 +980,17 @@ function renderMoves(){
     html+='</div>';
   }
   upd('moves',html);
+}
+
+/* Clear a single stuck move error (the ✕), then re-pull so a still-blocked
+   one reappears and a solved one stays gone. */
+function clearMoveErr(path){
+  fetch('/api/move-errors/clear?path='+encodeURIComponent(path),{method:'POST'})
+    .then(()=>loadSystem()).catch(()=>loadSystem());
+}
+function clearAllMoveErr(){
+  fetch('/api/move-errors/clear-all',{method:'POST'})
+    .then(()=>loadSystem()).catch(()=>loadSystem());
 }
 
 /* ---- System page ---- */
@@ -1437,6 +1460,23 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
         handle_settings_post(request, cfg);
     } else if is_get && url == "/api/system" {
         handle_system_info(request, cfg);
+    } else if is_post && url == "/api/move-errors/clear-all" {
+        crate::mover::clear_all_move_errors();
+        json_response(request, 200, r#"{"ok":true}"#);
+    } else if is_post && url.starts_with("/api/move-errors/clear?") {
+        // Clear ONE move error by path. The path carries slashes/spaces, so it
+        // arrives percent-encoded in the `path=` query param.
+        let query = url.splitn(2, '?').nth(1).unwrap_or("");
+        let target = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("path="))
+            .map(percent_decode)
+            .unwrap_or_default();
+        if target.is_empty() {
+            return json_response(request, 400, r#"{"ok":false,"error":"missing path"}"#);
+        }
+        crate::mover::clear_move_error(&target);
+        json_response(request, 200, r#"{"ok":true}"#);
     } else if is_get && url.starts_with("/api/logs/") {
         let device = url.trim_start_matches("/api/logs/");
         let device = percent_decode(device);
