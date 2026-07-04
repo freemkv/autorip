@@ -59,6 +59,22 @@ fn clear_error(path: &str) {
     }
 }
 
+/// Operator-initiated clear of a single move error (the System-tab ✕). Removes
+/// it from the in-memory map; if the underlying block is still real, the next
+/// mover tick re-records it, so dismissing a genuinely-solved error makes it
+/// stay gone while a still-stuck one reappears within a tick.
+pub fn clear_move_error(path: &str) {
+    clear_error(path);
+}
+
+/// Operator-initiated clear of ALL move errors (the System-tab "Clear all").
+/// Same self-healing semantics: still-real blocks re-record on the next tick.
+pub fn clear_all_move_errors() {
+    if let Ok(mut m) = MOVE_ERRORS.lock() {
+        m.clear();
+    }
+}
+
 /// Outcome of moving a single file. Distinguishes between an active move
 /// (Moved / MovedDirty) and a no-op re-check (Skipped) so the caller can
 /// suppress webhook spam and log noise on subsequent loop ticks.
