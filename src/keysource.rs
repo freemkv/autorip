@@ -15,7 +15,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use freemkv_keysources::{KeySource, KeydbSource, OnlineSource};
-use libfreemkv::aacs::ResolutionTrace;
+use libfreemkv::aacs::trace::ResolutionTrace;
 use libfreemkv::keysource::resolve_and_apply_traced;
 use libfreemkv::read_encrypted_units;
 
@@ -696,7 +696,7 @@ mod tests {
     /// Cross-side agreement: autorip's sample selector (`read_encrypted_units`)
     /// hands the key service only units the service's own gate accepts —
     /// because both sides call the SAME predicate,
-    /// `libfreemkv::aacs::ts_sync_destroyed`.
+    /// `libfreemkv::aacs::content::ts_sync_destroyed`.
     #[test]
     fn sample_units_are_all_aacs_scrambled() {
         use std::io::Write;
@@ -730,7 +730,7 @@ mod tests {
         for u in &units {
             assert_eq!(u.len(), 6144);
             assert!(
-                libfreemkv::aacs::ts_sync_destroyed(u),
+                libfreemkv::aacs::content::ts_sync_destroyed(u),
                 "selector must only emit units the key service accepts"
             );
         }
@@ -742,7 +742,7 @@ mod tests {
             clear[off] = 0x47;
             off += 192;
         }
-        assert!(!libfreemkv::aacs::ts_sync_destroyed(&clear));
+        assert!(!libfreemkv::aacs::content::ts_sync_destroyed(&clear));
     }
 
     /// autorip's keydb *writes* and the startup *existence check* must land on
@@ -954,7 +954,7 @@ mod tests {
     fn keyless_encrypted_disc_with_aacs() -> libfreemkv::Disc {
         let mut disc = keyless_encrypted_disc();
         disc.aacs = Some(libfreemkv::disc::AacsState {
-            version: libfreemkv::aacs::AACS_MAJOR_UHD,
+            version: libfreemkv::aacs::mkb::AACS_MAJOR_UHD,
             bus_encryption: false,
             mkb_version: None,
             disc_hash: "0xabc".into(),
