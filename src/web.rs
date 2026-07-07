@@ -1466,7 +1466,7 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     } else if is_post && url.starts_with("/api/move-errors/clear?") {
         // Clear ONE move error by path. The path carries slashes/spaces, so it
         // arrives percent-encoded in the `path=` query param.
-        let query = url.splitn(2, '?').nth(1).unwrap_or("");
+        let query = url.split_once('?').map(|x| x.1).unwrap_or("");
         let target = query
             .split('&')
             .find_map(|kv| kv.strip_prefix("path="))
