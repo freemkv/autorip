@@ -763,9 +763,10 @@ mod tests {
         assert_eq!(keydb_path(&cfg), dest);
         assert!(!keydb_exists(&cfg), "no keydb written yet");
 
-        // A minimal valid keydb body (one `0x...` entry line) — the save
-        // validation accepts `0x`-prefixed lines as entries.
-        let body = b"0xDEADBEEFDEADBEEFDEADBEEFDEADBEEF\n";
+        // A minimal valid keydb body: one disc-entry line (`0x<hash> = <title>`),
+        // matching the parser's real rule that a `0x` line is an entry only if it
+        // also contains ` = `.
+        let body = b"0xDEADBEEFDEADBEEFDEADBEEFDEADBEEF = Test\n";
         let result = save_keydb(&cfg, body).expect("save_keydb must succeed");
 
         // It wrote straight to the service path.
@@ -877,9 +878,9 @@ mod tests {
             ..Config::default()
         };
 
-        save_keydb(&cfg, b"0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n").expect("first save");
+        save_keydb(&cfg, b"0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA = Test\n").expect("first save");
         let result =
-            save_keydb(&cfg, b"0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n").expect("second save");
+            save_keydb(&cfg, b"0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB = Test\n").expect("second save");
 
         assert_eq!(result.path, dest, "save always targets the service path");
         let written = std::fs::read_to_string(&dest).unwrap();

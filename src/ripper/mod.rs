@@ -2777,7 +2777,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let cfg = Arc::clone(cfg);
             let make: std::sync::Arc<
                 dyn Fn() -> Vec<Box<dyn libfreemkv::keysource::KeySource>> + Send + Sync,
-            > = std::sync::Arc::new(move || crate::keysource::build_sources(&cfg.read().unwrap()));
+            > = std::sync::Arc::new(move || {
+                // Recover the guard if the config lock was poisoned by a panicking
+                // settings writer, rather than panicking this rip thread — matches
+                // the file's graceful-degradation convention.
+                crate::keysource::build_sources(&cfg.read().unwrap_or_else(|e| e.into_inner()))
+            });
             libfreemkv::keysource::key_fetch(inputs, make)
         });
 
