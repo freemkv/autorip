@@ -970,7 +970,9 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         .to_string();
     let disc_format = match disc.format {
         libfreemkv::DiscFormat::Uhd => "uhd",
+        libfreemkv::DiscFormat::Fmts => "fmts",
         libfreemkv::DiscFormat::BluRay => "bluray",
+        libfreemkv::DiscFormat::HdDvd => "hddvd",
         libfreemkv::DiscFormat::Dvd => "dvd",
         libfreemkv::DiscFormat::Unknown => "unknown",
     }
@@ -2107,7 +2109,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         .to_string();
     let disc_format = match disc.format {
         libfreemkv::DiscFormat::Uhd => "uhd",
+        libfreemkv::DiscFormat::Fmts => "fmts",
         libfreemkv::DiscFormat::BluRay => "bluray",
+        libfreemkv::DiscFormat::HdDvd => "hddvd",
         libfreemkv::DiscFormat::Dvd => "dvd",
         libfreemkv::DiscFormat::Unknown => "unknown",
     }
