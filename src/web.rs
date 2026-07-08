@@ -197,11 +197,6 @@ function notify(title,body,icon){
 const D='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>';
 
 /* ---- Codec/Resolution maps ---- */
-const VM=[['HEVC Main10','4K HDR'],['HEVC Main','4K'],['HEVC','4K HDR'],['AVC High','HD'],['AVC','HD'],['MPEG2','SD']];
-const AM=[['TRUEHD','TrueHD 7.1'],['DTSHD','DTS-HD MA'],['A_DTS','DTS-HD MA'],['AC3','Dolby Digital'],['AAC','AAC'],['LPCM','PCM'],['FLAC','FLAC']];
-const RV={'3840x2160':'4K','1920x1080':'1080p','1280x720':'720p','720x480':'480p','720x576':'576p'};
-function ml(v,m){if(!v)return'';for(const[k,l]of m)if(v.includes(k))return l;return''}
-
 /* ---- Step-by-step progress ---- */
 const ACTIVE_STATES=['ripping','scanning','detecting'];
 let _lastStatus={};
@@ -314,16 +309,6 @@ function renderBar(s,p){
   }
   html+='</div>';
   return caret+html;
-}
-function renderTotalBar(p){
-  /* v0.13.19: matches the pass bar's geometry (same height, same border-radius)
-     so the two read as a pair instead of two unrelated components. The accent
-     colour + lower opacity still signal "secondary / aggregate" without making
-     the bar look stylistically different. No bad-range overlay — bad ranges
-     are a per-disc concept and live on the pass bar. */
-  return '<div style="flex:1;background:var(--chip);border-radius:3px;height:6px;overflow:hidden;position:relative;opacity:0.7">'
-    +'<div style="background:var(--accent);height:100%;width:'+p+'%;transition:width 1s"></div>'
-    +'</div>';
 }
 function passLabelFor(s){
    /* Resolve the current pass into a human-readable label for the Ripping
@@ -488,11 +473,6 @@ function fmtMs(ms){
   return h>0
     ? h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')
     : m+':'+String(s).padStart(2,'0');
-}
-function fmtChapterTime(secs){
-  if(secs==null||!isFinite(secs))return'';
-  const h=Math.floor(secs/3600),m=Math.floor((secs%3600)/60),s=Math.floor(secs%60);
-  return h>0?h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0'):m+':'+String(s).padStart(2,'0');
 }
 /* ---- Build steps from state ---- */
 function buildSteps(s){
@@ -688,8 +668,6 @@ function renderCurrent(){
     errHtml+='<div style="background:var(--blue);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u21ba Recovering \u00b7 batch '+s.current_batch+' / '+s.preferred_batch+lbaStr+'</div>';
   }
   /* (Pass/phase info lives inside the Ripping step \u2014 no separate banner.) */
-  upd('err',errHtml);
-
   upd('err',errHtml);
 
   /* Device log */

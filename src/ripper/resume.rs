@@ -1317,7 +1317,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             // `total_passes = 2` (sweep + mux) so the label still has
             // non-zero values to render. Multi-pass uses `+ 2` (sweep
             // + retries + mux); we match.
-            total_passes: cfg_read.max_retries.saturating_add(2).max(2),
+            total_passes: cfg_read.max_retries.saturating_add(2),
             bytes_total_disc: disc.capacity_bytes,
             // Pass the real max_retries and bytes_unreadable so that
             // total_pct_byte_weight accounts for the already-completed sweep.
@@ -2372,9 +2372,11 @@ mod resume_handoff_contract_tests {
 }
 
 #[cfg(test)]
-// Named for history: v1.2.0 REMOVED the post-mux loss-abort gate (a completed
-// mux now always proceeds to hand-off). These tests pin the resulting contract
-// — mux-time loss is REPORTED, never gated/quarantined — at source level.
+// These tests pin the post-mux loss REPORTING contract at source level: a
+// resume folds mux-time (demux/decrypt) loss into the operator-facing figures,
+// so an accepted rip with mux-time loss is never filed as clean. (The post-mux
+// loss gate itself is still live in `resume_remux`; accept-loss bypasses only
+// the PRE-mux threshold.)
 mod post_mux_loss_reporting_tests {
     /// Regression: a resume must report sweep loss + demux loss to the
     /// operator, not the sweep mapfile alone. Mux-time (demux/decrypt) loss is
