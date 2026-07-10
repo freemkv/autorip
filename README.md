@@ -1,4 +1,4 @@
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/freemkv/autorip/actions/workflows/ci.yml/badge.svg)](https://github.com/freemkv/autorip/actions/workflows/ci.yml)
 
 # freemkv-autorip
@@ -181,4 +181,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-AGPL-3.0 -- see [LICENSE](LICENSE).
+MIT -- see [LICENSE](LICENSE).
