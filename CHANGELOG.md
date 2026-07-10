@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.3.0] — 2026-07-08
+
+### Added
+
+- **Recognizes AACS 2.1 (FMTS) and HD-DVD discs.** The rip loop now labels and
+  handles the FMTS and HD-DVD disc formats as first-class rather than falling
+  through as an unknown format.
+
+### Changed
+
+- Inherits **libfreemkv 1.3.0** (AACS 2.1 / FMTS as a first-class format,
+  partial HD-DVD support with VC-1 muxing, and display-order timestamps for
+  program-stream H.264 / VC-1 / HEVC) and **freemkv-keysources 1.3.0**.
+- Trimmed dead settings-UI JavaScript (unused codec / resolution maps,
+  `renderTotalBar`, `fmtChapterTime`, and a duplicate error update).
+
+### Fixed
+
+- **The rip thread survives a poisoned config lock.** The key-fetch factory now
+  recovers the lock instead of panicking the rip thread, matching the service's
+  graceful-degradation convention.
+- **Corrected the resume total-pass count** — dropped a redundant `.max(2)` on
+  `total_passes` (`max_retries + 2` is already ≥ 2).
+
 ## [1.2.2] — 2026-07-04
 
 ### Fixed
