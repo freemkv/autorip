@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.3.2] — 2026-07-10
+
+Version sync with the workspace; inherits libfreemkv 1.3.2.
+
 ## [1.3.1] — 2026-07-10
 
 ### Licensing
