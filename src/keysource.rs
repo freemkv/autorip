@@ -274,6 +274,49 @@ pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
     sources
 }
 
+/// Build the fresh-key-on-decrypt-failure closure ([`libfreemkv::sector::KeyFetch`])
+/// for an ISO mux.
+///
+/// The library owns the recovery loop: when the mux highway hits an AACS unit
+/// that NO held key decrypts, it hands that ciphertext to this closure, which
+/// forwards the failing units (as content samples) to the configured key
+/// source(s); any Unit Keys the service derives are added to the pool and the
+/// unit is re-decrypted and TS-sync-validated. This is the seam that lets a
+/// **multi-CPS-unit disc recover its 2nd/Nth CPS-unit key mid-mux**: the
+/// upfront resolve validates only ONE unit key (the key service returns the one
+/// UK that opens the sample it was sent), so a disc whose feature spans a
+/// second CPS unit would otherwise drop that unit's content as decrypt loss —
+/// the exact 0.44s-in-the-main-movie failure. Wiring this closure sends the
+/// server the failing unit's data and gets that unit's key, on demand.
+///
+/// Mirrors `freemkv::pipe::build_iso_key_fetch`: read the ISO's AACS inputs
+/// (inf + MKB + version) ONCE, then reuse them per fetch with the failing units
+/// swapped in as `samples`. `None` for a non-AACS ISO (nothing to fetch) or
+/// when the inputs can't be read — the mux then behaves exactly as before. The
+/// VID is all-zero (an ISO carries no live-drive AACS handshake); the key
+/// service resolves the disc from its own catalog. `make_sources` is invoked
+/// per fetch (the cold path, ~once per CPS unit), rebuilding the SAME sources
+/// the upfront resolve used, so `online`/`local` config is honored identically.
+pub fn build_iso_key_fetch(cfg: &Config, iso_path: &Path) -> Option<libfreemkv::sector::KeyFetch> {
+    let (inf, mkb, version) = libfreemkv::Disc::read_aacs_inputs(iso_path).ok()?;
+    if inf.is_empty() {
+        return None;
+    }
+    let inputs = libfreemkv::DiscInputs {
+        disc_hash: String::new(),
+        volume_id: [0u8; 16],
+        version,
+        mkb,
+        unit_key_ro: inf,
+        samples: Vec::new(),
+        volume_label: None,
+    };
+    let cfg = cfg.clone();
+    let make_sources: std::sync::Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync> =
+        std::sync::Arc::new(move || build_sources(&cfg));
+    Some(libfreemkv::keysource::key_fetch(inputs, make_sources))
+}
+
 /// Whether the configured source talks to a remote key service —
 /// used by the UI to announce a potentially slow keyserver round-trip.
 pub fn uses_online(cfg: &Config) -> bool {

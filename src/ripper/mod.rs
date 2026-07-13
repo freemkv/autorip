@@ -4355,11 +4355,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             format,
             Some(halt_token.clone()),
             Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
-            // Fresh-key-on-failure fetch: not yet wired for autorip. Wiring it
-            // needs the keyserver config (cfg.keyserver_url/secret) and the ISO's
-            // inf/MKB threaded to this mux site; build the factory exactly like
-            // `freemkv::pipe::build_iso_fetch_factory` and pass it here.
-            None,
+            // Fresh-key-on-failure fetch: recover a 2nd/Nth CPS-unit key MID-MUX
+            // by handing the failing unit's ciphertext to the configured key
+            // source, instead of dropping it as decrypt loss (the upfront resolve
+            // validates only ONE unit key). See `crate::keysource::build_iso_key_fetch`.
+            crate::keysource::build_iso_key_fetch(&cfg_read, std::path::Path::new(&iso_path_str)),
         ) {
             Ok(s) => Box::new(s),
             Err(e) => {
@@ -5386,6 +5386,26 @@ fn incomplete_mux_status(
 /// fallback and mislead the operator into checking their KEYDB.
 fn keyless_failure_message(disc: &libfreemkv::Disc) -> String {
     keyless_failure_message_for(disc.css_error.as_ref(), disc.aacs_error.as_ref())
+}
+
+/// Keyless-deferral message for the resume / deferred-mux path (a raw ISO
+/// was staged but the mux found no usable keys). Mirrors the fresh-rip
+/// outage classifier ([`retry_online_keys_on_outage`]): when the configured
+/// source is the online key service and that service is unreachable or
+/// rate-limited, report THAT — a transient outage that will retry — instead
+/// of a permanent "no keys were found; check the key source in Settings".
+/// A keyserver that is merely DOWN otherwise sends the operator hunting
+/// through Settings for a key source that is actually fine (the exact
+/// confusion seen when cdxhp.com returned 502s during a deferred mux).
+pub(crate) fn deferred_keyless_message(cfg: &Config, disc: &libfreemkv::Disc) -> String {
+    if cfg.key_source == "online" {
+        if let Some(status) =
+            key_service_transient_status(crate::keysource::probe_online_reachability(cfg))
+        {
+            return status.to_string();
+        }
+    }
+    keyless_failure_message(disc)
 }
 
 /// CSS-over-AACS priority dispatch, split out from [`keyless_failure_message`]
