@@ -124,6 +124,7 @@ tr:hover { background:var(--chip); }
 <!-- Ripper page -->
 <div id="ripper" class="section active">
   <div id="dtabs"></div>
+  <div id="muxbanner"></div>
   <div id="np"></div>
   <div id="actions"></div>
   <div id="steps" style="margin-bottom:16px"></div>
@@ -504,6 +505,7 @@ function handleState(data){
      drive list is empty (idle / state briefly cleared), so the
      no-devices early return below must not gate Move Queue updates. */
   window._stateData=data;
+  renderMuxBanner(data);
   if(document.getElementById('system').classList.contains('active')){renderMuxes();renderMoves();}
   const devs=Object.keys(data).filter(k=>!k.startsWith('_'));
   if(!devs.length){
@@ -543,6 +545,36 @@ function handleState(data){
   renderCurrent();
 }
 
+/* Ripper-page banner: muxing/moving of PREVIOUS rips runs in the background
+   on the System tab. When the drive is idle (No disc / done card) new users
+   have no idea that work is still happening off-screen — so surface a hint
+   between the header and the disc card whenever a mux or move is in flight or
+   queued. It clears itself the moment both queues drain. */
+function renderMuxBanner(data){
+  const el=document.getElementById('muxbanner');
+  if(!el)return;
+  data=data||window._stateData||{};
+  const mx=data._mux;
+  const muxActive=!!(mx&&mx.status==='ripping'&&mx.disc_name);
+  const muxQ=!!(data._mux_queue&&data._mux_queue.length);
+  const mv=data._move;
+  const moveActive=!!(mv&&mv.name);
+  const moveQ=!!(data._move_queue&&data._move_queue.length);
+  const muxing=muxActive||muxQ, moving=moveActive||moveQ;
+  if(!muxing&&!moving){el.innerHTML='';return;}
+  let what;
+  if(muxing&&moving)what='Muxing &amp; moving of previous rips';
+  else if(moving)what='Moving of previous rips';
+  else what='Muxing of previous rips';
+  el.innerHTML='<div onclick="goSystemTab()" '
+    +'style="margin:0 0 16px;padding:10px 14px;background:var(--chip);border:1px solid var(--border);'
+    +'border-radius:8px;font-size:.85rem;color:var(--text2);cursor:pointer;display:flex;align-items:center;gap:8px">'
+    +'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);animation:p 1.5s infinite;flex-shrink:0"></span>'
+    +'<span>'+what+' still in progress — see the <b>System</b> tab.</span></div>';
+}
+/* Programmatically activate the System tab (reuses the nav click handler, so
+   loadSystem() fires). Used by the Ripper-page mux/move banner. */
+function goSystemTab(){var b=document.querySelector('.nav[data-tab="system"]');if(b)b.click();}
 function renderCurrent(){
   const data=window._stateData;
   if(!data)return;
@@ -883,11 +915,23 @@ function renderMuxes(){
   if(!hasContent)html='<div style="color:var(--text3);font-size:.8rem">No pending muxes</div>';
   if(window._muxErrors&&window._muxErrors.length){
     html+='<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--chip)">';
+    /* Header: re-check (refresh) + clear-all, matching the Move queue. A
+       cleared error the worker still considers blocked reappears on its next
+       tick UNLESS dismissed (loss-aborts stay cleared). */
+    html+='<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">'
+      +'<span style="font-size:.75rem;color:var(--text3);text-transform:uppercase;letter-spacing:.4px">Needs action</span>'
+      +'<span style="flex:1"></span>'
+      +'<a href="#" onclick="event.preventDefault();loadSystem()" style="font-size:.75rem;color:var(--text2);text-decoration:none">↻ Refresh</a>'
+      +'<a href="#" onclick="event.preventDefault();clearAllMuxErr()" style="font-size:.75rem;color:var(--text2);text-decoration:none">Clear all</a>'
+      +'</div>';
     window._muxErrors.forEach(e=>{
+      var p=e.path||'';
       html+='<div style="padding:6px 0;font-size:.8rem">'
         +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">'
         +'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);flex-shrink:0"></span>'
-        +'<span style="font-weight:500;color:var(--red)">'+esc(e.path||'')+'</span>'
+        +'<span style="font-weight:500;color:var(--red);flex:1;min-width:0;word-break:break-all">'+esc(p)+'</span>'
+        +'<span onclick="clearMuxErr('+JSON.stringify(p)+')" title="Clear this error" '
+          +'style="flex-shrink:0;cursor:pointer;color:var(--text3);font-size:1rem;line-height:1;padding:0 2px">&times;</span>'
         +'</div>'
         +'<div style="margin-left:16px;color:var(--text2)">'+esc(e.reason||'')+'</div>'
         +(e.hint?'<div style="margin-left:16px;color:var(--text3);font-size:.75rem;margin-top:2px">'+esc(e.hint)+'</div>':'')
@@ -896,6 +940,16 @@ function renderMuxes(){
     html+='</div>';
   }
   upd('muxes',html);
+}
+
+/* Clear a single stuck mux error (the ✕), then re-pull. */
+function clearMuxErr(path){
+  fetch('/api/mux-errors/clear?path='+encodeURIComponent(path),{method:'POST'})
+    .then(()=>loadSystem()).catch(()=>loadSystem());
+}
+function clearAllMuxErr(){
+  fetch('/api/mux-errors/clear-all',{method:'POST'})
+    .then(()=>loadSystem()).catch(()=>loadSystem());
 }
 /* ---- Move queue with live progress ---- */
 function renderMoves(){
@@ -1454,6 +1508,22 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             return json_response(request, 400, r#"{"ok":false,"error":"missing path"}"#);
         }
         crate::mover::clear_move_error(&target);
+        json_response(request, 200, r#"{"ok":true}"#);
+    } else if is_post && url == "/api/mux-errors/clear-all" {
+        crate::muxer::clear_all_mux_errors();
+        json_response(request, 200, r#"{"ok":true}"#);
+    } else if is_post && url.starts_with("/api/mux-errors/clear?") {
+        // Clear ONE mux error by path (percent-encoded `path=` query param).
+        let query = url.split_once('?').map(|x| x.1).unwrap_or("");
+        let target = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("path="))
+            .map(percent_decode)
+            .unwrap_or_default();
+        if target.is_empty() {
+            return json_response(request, 400, r#"{"ok":false,"error":"missing path"}"#);
+        }
+        crate::muxer::clear_mux_error(&target);
         json_response(request, 200, r#"{"ok":true}"#);
     } else if is_get && url.starts_with("/api/logs/") {
         let device = url.trim_start_matches("/api/logs/");

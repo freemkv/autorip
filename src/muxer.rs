@@ -154,7 +154,34 @@ pub struct MuxerError {
 pub static MUX_ERRORS: once_cell::sync::Lazy<Mutex<BTreeMap<String, MuxerError>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(BTreeMap::new()));
 
+/// Paths the operator has dismissed (the System-tab ✕ / Clear-all). A dismissed
+/// path is suppressed from re-recording, so a persistently-erroring dir — e.g. a
+/// loss-aborted disc the worker re-scans every tick (`SkipAbortedLoss`) — STAYS
+/// cleared instead of reappearing on the next tick. The dismissal is lifted when
+/// the dir is freshly DISPATCHED (a new mux attempt may produce a new error
+/// worth showing) or when the dir is pruned (gone from staging). Without this,
+/// the move-errors' "reappears if still blocked" model would make an old
+/// loss-abort card un-dismissable — the exact "old errors hanging around"
+/// complaint.
+pub static MUX_DISMISSED: once_cell::sync::Lazy<Mutex<std::collections::BTreeSet<String>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(std::collections::BTreeSet::new()));
+
+/// Operator hint for a loss-abort error card. A loss-abort is deterministic
+/// media damage that will NOT clear on its own (an identical re-mux reproduces
+/// the exact same loss), so the card must point at the two real resolutions
+/// instead of implying a retry will help.
+pub(crate) const ABORTED_LOSS_HINT: &str = "the delivered title lost more data than 'abort_on_lost_secs' allows, so this rip will NOT auto-retry (an identical re-mux reproduces the same loss). Re-insert the disc to Accept & deliver it as-is or run another recovery pass — or raise 'abort_on_lost_secs' in Settings first, then re-insert to deliver it automatically.";
+
 pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
+    // Operator dismissed this path — honor it (don't re-surface a card the
+    // operator cleared). Lifted on a fresh dispatch / prune (see MUX_DISMISSED).
+    if MUX_DISMISSED
+        .lock()
+        .map(|d| d.contains(path))
+        .unwrap_or(false)
+    {
+        return;
+    }
     // Mutate the map and capture whether this is a new reason under the
     // lock, then DROP the guard before the syslog write. syslog does
     // blocking log-file I/O (NFS-backed staging on the testbed); holding
@@ -183,6 +210,61 @@ pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
 pub(crate) fn clear_error(path: &str) {
     if let Ok(mut m) = MUX_ERRORS.lock() {
         m.remove(path);
+    }
+}
+
+/// Operator-initiated clear of a single mux error (the System-tab ✕). Removes
+/// the card AND marks the path dismissed so a persistently-erroring dir doesn't
+/// re-surface it on the next tick; the dismissal is lifted on the dir's next
+/// fresh dispatch (or when it's pruned from staging).
+pub fn clear_mux_error(path: &str) {
+    clear_error(path);
+    if let Ok(mut d) = MUX_DISMISSED.lock() {
+        d.insert(path.to_string());
+    }
+}
+
+/// Operator-initiated clear of ALL mux errors (the System-tab "Clear all").
+pub fn clear_all_mux_errors() {
+    if let Ok(mut m) = MUX_ERRORS.lock() {
+        if let Ok(mut d) = MUX_DISMISSED.lock() {
+            for k in m.keys() {
+                d.insert(k.clone());
+            }
+        }
+        m.clear();
+    }
+}
+
+/// Lift any dismissal for `path` — called when the dir is freshly dispatched so
+/// a NEW mux attempt's error (if any) can surface again.
+fn undismiss(path: &str) {
+    if let Ok(mut d) = MUX_DISMISSED.lock() {
+        d.remove(path);
+    }
+}
+
+/// Drop error cards (and dismissals) whose staging dir no longer exists — an
+/// "old error hanging around" for a disc that has been delivered, deleted, or
+/// moved out of staging. Keeps the System page showing only live jobs.
+fn prune_stale_errors() {
+    let stale: Vec<String> = {
+        let Ok(m) = MUX_ERRORS.lock() else { return };
+        m.keys()
+            .filter(|p| !Path::new(p).exists())
+            .cloned()
+            .collect()
+    };
+    if stale.is_empty() {
+        return;
+    }
+    if let Ok(mut m) = MUX_ERRORS.lock() {
+        for p in &stale {
+            m.remove(p);
+        }
+    }
+    if let Ok(mut d) = MUX_DISMISSED.lock() {
+        d.retain(|p| Path::new(p).exists());
     }
 }
 
@@ -231,6 +313,16 @@ pub(crate) enum MuxVerdict {
     Dispatch,
     /// `.completed` or `.failed` present — finished or quarantined, never re-mux.
     SkipTerminal,
+    /// `.aborted-loss` present — the mux ran to completion but the delivered
+    /// title carried more decrypt/codec loss than `abort_on_lost_secs` allows.
+    /// That loss is DETERMINISTIC media damage: re-muxing the same ISO with the
+    /// same keys reproduces the exact same loss, so auto-retrying every tick
+    /// just re-muxes 60 GB forever. This is a RESUMABLE, operator-resolved
+    /// state (Accept & deliver, run another recovery pass, or raise the
+    /// threshold) — exactly how the drive-side resume classifier already treats
+    /// `.aborted-loss` (see `staging.rs`). The worker surfaces the reason and
+    /// stops re-dispatching.
+    SkipAbortedLoss,
     /// No `.ripped` hand-off marker — nothing for the worker to do here.
     SkipNoMarker,
     /// Snapshot is `None` — the dir's contents are UNKNOWN (read_dir / DirEntry
@@ -247,8 +339,15 @@ pub(crate) enum MuxVerdict {
 /// 2. `.completed` OR `.failed` ⇒ `SkipTerminal` — terminal regardless of
 ///    whether `.ripped` still lingers (the terminal-mux-failure `.ripped`+`.failed`
 ///    re-mux loop, da16f00, lives or dies on this arm).
-/// 3. `.ripped` absent ⇒ `SkipNoMarker`.
-/// 4. otherwise ⇒ `Dispatch`.
+/// 3. `.aborted-loss` ⇒ `SkipAbortedLoss` — a completed mux whose delivered
+///    loss exceeded `abort_on_lost_secs`. Checked AFTER `.failed`/`.completed`
+///    (so a promoted-to-terminal dir stays terminal) and BEFORE the `.ripped`
+///    dispatch, because the loss-abort leaves `.ripped` in place: without this
+///    arm the worker re-muxes the whole ISO every tick to reproduce the exact
+///    same deterministic loss. Mirrors the drive-side classifier's ordering in
+///    `staging.rs` (`.failed` before `.aborted-loss`).
+/// 4. `.ripped` absent ⇒ `SkipNoMarker`.
+/// 5. otherwise ⇒ `Dispatch`.
 ///
 /// `has_ripped` is read from the same primed `read_dir` view as the snapshot
 /// so a cold-cache NFS miss can't race `.ripped` to "absent" while the
@@ -265,6 +364,13 @@ pub(crate) fn mux_dispatch_verdict(
     // would let the worker re-dispatch a `.ripped`+`.failed` dir forever.
     if snap.completed || snap.has_failed {
         return MuxVerdict::SkipTerminal;
+    }
+    // A loss-abort is deterministic media damage — auto-retrying it re-muxes
+    // the whole ISO on every tick to reach the identical over-threshold loss.
+    // Stop, surface the reason, and leave it for the operator (Accept, another
+    // pass, or a raised threshold), matching `staging.rs`'s resumable handling.
+    if snap.has_aborted_loss {
+        return MuxVerdict::SkipAbortedLoss;
     }
     if !snap.has_ripped {
         return MuxVerdict::SkipNoMarker;
@@ -300,6 +406,9 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         .unwrap_or_else(|e| e.into_inner())
         .staging_dir
         .clone();
+    // Clear out error cards for staging dirs that have since been delivered,
+    // deleted, or moved away — otherwise they linger on the System page.
+    prune_stale_errors();
     let entries = match std::fs::read_dir(&staging_root) {
         Ok(e) => e,
         Err(e) => {
@@ -371,6 +480,20 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         let snap = crate::ripper::staging::snapshot_staging_disc(&dir);
         match mux_dispatch_verdict(snap.as_ref()) {
             MuxVerdict::Dispatch => {}
+            MuxVerdict::SkipAbortedLoss => {
+                // The mux completed but the delivered title exceeded the loss
+                // threshold. DON'T re-mux (the loss is deterministic — it would
+                // reproduce identically). Surface the accurate reason + an
+                // actionable hint ONCE so the operator can resolve it, then
+                // leave the dir untouched. `record_error` de-dupes by reason, so
+                // this is idempotent across ticks (no log spam).
+                let reason = snap
+                    .as_ref()
+                    .and_then(|s| s.aborted_loss_reason.clone())
+                    .unwrap_or_else(|| "aborted: loss exceeded threshold".to_string());
+                record_error(&dir.to_string_lossy(), &reason, ABORTED_LOSS_HINT);
+                continue;
+            }
             MuxVerdict::SkipTerminal | MuxVerdict::SkipNoMarker | MuxVerdict::SkipUnknown => {
                 continue;
             }
@@ -410,6 +533,16 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         // `.completed`/`.failed`/`.ripped` instead.
         crate::ripper::staging::write_muxing_marker(&dir);
         let _guard = MuxingGuard(&dir);
+        // Clear any error card from a PRIOR attempt the instant this new
+        // dispatch begins — otherwise a stale red card (e.g. "no keys" from
+        // the last tick, or a leftover "aborted 0.44s") lingers on the System
+        // page while a fresh mux is actively running, and only cleared on
+        // success. If THIS attempt fails, the failure branch below re-records
+        // the current, accurate reason; if it succeeds, the card stays gone.
+        clear_error(&dir.to_string_lossy());
+        // A fresh dispatch may produce a new/different error — lift any prior
+        // operator dismissal so a genuinely new failure can surface again.
+        undismiss(&dir.to_string_lossy());
         let outcome = crate::ripper::resume::remux_from_ripped_marker(cfg_arc, &dir, &marker);
         if outcome.success {
             clear_error(&dir.to_string_lossy());
@@ -492,27 +625,53 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             }
         } else {
             let path_str = dir.to_string_lossy().to_string();
-            // Surface the ACTUAL reason the dir didn't advance — a STRUCTURAL
-            // mux finalize/write failure (the mux no longer aborts a disc for
-            // loss: a completed mux always hands off, so a non-advancing dir
-            // here means the output failed to finalize/write, not a loss
-            // threshold) — from the staging marker the mux worker wrote, instead
-            // of a generic "see the device log", so the operator doesn't have to
-            // read device logs to learn why. The `read_aborted_loss` probe is
-            // defensive: a rip-phase loss abort writes `.aborted-loss` BEFORE
-            // muxing (it skips the mux), so it normally never reaches this
-            // worker, but if one is somehow present the UI can still surface it.
-            let reason = crate::ripper::staging::read_aborted_loss(&dir)
-                .map(|(r, _)| r)
-                .or_else(|| crate::ripper::staging::read_failed_reason(&dir))
-                .unwrap_or_else(|| {
-                    "mux worker dispatch did not complete (see _mux device log)".to_string()
-                });
-            record_error(
-                &path_str,
-                &reason,
-                "the mux failed to finalize/write the output — staging is preserved; check the _mux device log for the failure detail and re-run the mux",
-            );
+            // Surface the ACTUAL reason the dir didn't advance. PREFER the
+            // reason the mux worker learned from the `_mux` device state
+            // (`outcome.failure_reason`): "no keys / key service down" for a
+            // keyless deferral, or the finalize/write error for a hard
+            // failure. This is the message the operator actually needs — the
+            // old code dropped it on the floor and fell back to a STALE
+            // `.aborted-loss` marker (left by an earlier loss-abort) glued to
+            // a generic "finalize/write" hint, so a keyserver outage rendered
+            // as "aborted: 0.44s lost at mux" + "mux failed to finalize/write"
+            // — pointing the operator at entirely the wrong thing.
+            // A mux that ran to completion but aborted on over-threshold loss
+            // just wrote `.aborted-loss`. Detect it FIRST (before the
+            // keys/finalize dispatch) so the card carries the loss reason + the
+            // loss hint, not a misleading "re-run the mux" — and so it matches
+            // the SkipAbortedLoss card every subsequent tick shows.
+            let (reason, hint) = if let Some((r, _)) =
+                crate::ripper::staging::read_aborted_loss(&dir)
+            {
+                (r, ABORTED_LOSS_HINT.to_string())
+            } else if let Some(r) = outcome.failure_reason.clone() {
+                let hint = if outcome.failure_retryable {
+                    // Keyless deferral: retryable, no operator action needed
+                    // unless it persists (the ISO stays staged and re-muxes
+                    // automatically once keys land / the key service recovers).
+                    "no decryption keys yet — the disc stays staged and will mux automatically once keys are available; if this persists, check the key source in Settings"
+                } else {
+                    "the mux failed to finalize/write the output — staging is preserved; check the _mux device log for the failure detail and re-run the mux"
+                };
+                (r, hint.to_string())
+            } else {
+                // Defensive fallback (no reason came back from the worker):
+                // read the staging markers as before. `read_aborted_loss` is
+                // itself defensive — a rip-phase loss abort writes
+                // `.aborted-loss` BEFORE muxing (it skips the mux), so it
+                // normally never reaches this worker.
+                let reason = crate::ripper::staging::read_aborted_loss(&dir)
+                    .map(|(r, _)| r)
+                    .or_else(|| crate::ripper::staging::read_failed_reason(&dir))
+                    .unwrap_or_else(|| {
+                        "mux worker dispatch did not complete (see _mux device log)".to_string()
+                    });
+                (
+                    reason,
+                    "the mux failed to finalize/write the output — staging is preserved; check the _mux device log for the failure detail and re-run the mux".to_string(),
+                )
+            };
+            record_error(&path_str, &reason, &hint);
         }
     }
 }
@@ -575,11 +734,19 @@ pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
         // Likewise skip the dir currently being muxed (`.muxing`): it is
         // surfaced as the live, in-flight mux via the synthetic `_mux`
         // device, so listing it again as "(queued)" here would double it.
+        //
+        // A `.aborted-loss` dir is NOT queued either: the worker
+        // (`mux_dispatch_verdict` → `SkipAbortedLoss`) will never dispatch it —
+        // it's a resumable, operator-resolved state surfaced via its own error
+        // card. Listing it as "(queued)" would promise a mux that never comes.
         if dir.join(crate::ripper::staging::COMPLETED_MARKER).exists()
             || dir.join(crate::ripper::staging::FAILED_MARKER).exists()
             || dir.join(crate::ripper::staging::DONE_MARKER).exists()
             || dir.join(crate::ripper::staging::REVIEW_MARKER).exists()
             || dir.join(crate::ripper::staging::MUXING_MARKER).exists()
+            || dir
+                .join(crate::ripper::staging::ABORTED_LOSS_MARKER)
+                .exists()
         {
             continue;
         }
@@ -1115,6 +1282,10 @@ mod tests {
         Iso,
         Mapfile,
         Mkv,
+        /// A `.aborted-loss` marker (mux completed but delivered loss exceeded
+        /// the threshold). Deterministic media damage — the worker must STOP
+        /// re-dispatching, not re-mux the ISO forever.
+        AbortedLoss,
     }
 
     /// Build a populated per-disc staging dir for the given markers, run the
@@ -1140,6 +1311,11 @@ mod tests {
                 M::Iso => std::fs::write(dir.join("Disc.iso"), b"x").unwrap(),
                 M::Mapfile => std::fs::write(dir.join("Disc.iso.mapfile"), b"x").unwrap(),
                 M::Mkv => std::fs::write(dir.join("Disc.mkv"), b"x").unwrap(),
+                M::AbortedLoss => crate::ripper::staging::write_aborted_loss_marker(
+                    &dir,
+                    "aborted: 0.44s lost at mux, decrypt/codec (threshold 0s)",
+                    1,
+                ),
             }
         }
         let snap = crate::ripper::staging::snapshot_staging_disc(&dir);
@@ -1247,6 +1423,27 @@ mod tests {
                 &[Ripped, Review],
                 MuxVerdict::Dispatch,
                 ".review without .completed likewise does not gate the mux worker",
+            ),
+            // --- .aborted-loss STOPS the re-mux loop (the 60GB/tick bug) ---
+            (
+                &[Ripped, Iso, Mapfile, AbortedLoss],
+                MuxVerdict::SkipAbortedLoss,
+                ".ripped lingers but the mux already loss-aborted: must NOT re-mux (deterministic loss)",
+            ),
+            (
+                &[AbortedLoss],
+                MuxVerdict::SkipAbortedLoss,
+                ".aborted-loss alone: resumable, operator-resolved — never auto-dispatch",
+            ),
+            (
+                &[Ripped, Completed, AbortedLoss],
+                MuxVerdict::SkipTerminal,
+                ".completed wins over .aborted-loss: a finished dir stays terminal",
+            ),
+            (
+                &[Ripped, Failed, AbortedLoss],
+                MuxVerdict::SkipTerminal,
+                ".failed wins over .aborted-loss: a quarantined dir stays terminal",
             ),
         ];
         for (markers, expected, why) in table {

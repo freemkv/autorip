@@ -886,7 +886,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         && matches!(keys, libfreemkv::decrypt::DecryptKeys::None)
         && !super::output_is_iso_image(&cfg_read.output_format)
     {
-        let msg = super::keyless_failure_message(&disc);
+        let msg = super::deferred_keyless_message(&cfg_read, &disc);
         crate::log::device_log(
             device,
             &format!(
@@ -1066,11 +1066,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         format,
         Some(halt_token.clone()),
         Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
-        // Fresh-key-on-failure fetch: not yet wired for autorip resume (same
-        // follow-up as the multipass mux — thread the keyserver config + ISO
-        // inf/MKB here, building the factory like
-        // `freemkv::pipe::build_iso_fetch_factory`).
-        None,
+        // Fresh-key-on-failure fetch: recover a 2nd/Nth CPS-unit key MID-MUX by
+        // handing the failing unit's ciphertext to the configured key source.
+        // Without this, a multi-CPS-unit disc (e.g. a feature spanning a second
+        // CPS unit) drops that unit's content as decrypt loss because the
+        // upfront resolve only validated ONE unit key. See
+        // `crate::keysource::build_iso_key_fetch`.
+        crate::keysource::build_iso_key_fetch(&cfg_read, &iso_path),
     ) {
         Ok(s) => Box::new(s),
         Err(e) => {
@@ -1713,6 +1715,17 @@ pub(crate) struct MuxHandoffOutcome {
     pub errors: u32,
     pub total_lost_ms: f64,
     pub main_lost_ms: f64,
+    /// On a NON-success mux, the real reason the dir didn't advance — read
+    /// off the `_mux` device state (`no keys` / `key service down` /
+    /// finalize-write failure) so the mux worker's error card surfaces the
+    /// actual cause instead of falling back to a stale `.aborted-loss`
+    /// marker + a generic "finalize/write" hint. Empty on success.
+    pub failure_reason: Option<String>,
+    /// True when the non-success was a keyless DEFERRAL (the synthetic `_mux`
+    /// device was left "idle" — a clean, retryable state: the ISO stays
+    /// staged and will mux automatically once keys land) rather than a hard
+    /// finalize/write failure. Drives which hint the error card shows.
+    pub failure_retryable: bool,
 }
 
 pub(crate) fn remux_from_ripped_marker(
@@ -1784,14 +1797,20 @@ pub(crate) fn remux_from_ripped_marker(
                 "failed to delete .ripped marker after successful mux; .completed guard prevents re-mux"
             );
         }
-        // Capture the mux-derived display fields the `_mux` done-state
-        // wrote (codecs filled by the frame loop, duration + output_file
-        // from the resumed-rip terminal state) BEFORE removing the entry
-        // below — the caller carries them into the origin device's
-        // secondary done-state so its tile shows the codec badge and
-        // duration, matching the inline fresh-rip done card.
-        if let Ok(mut s) = super::STATE.lock() {
-            if let Some(rs) = s.get(mux_device) {
+    }
+    // Read the synthetic `_mux` state BEFORE removing the entry. On success
+    // we carry the mux-derived display fields (codecs filled by the frame
+    // loop, duration + output_file from the resumed-rip terminal state) into
+    // the origin device's secondary done-state so its tile shows the codec
+    // badge and duration, matching the inline fresh-rip done card. On FAILURE
+    // we carry the real reason the dir didn't advance (no keys / key service
+    // down / finalize-write failure) so the mux worker's error card surfaces
+    // the actual cause instead of a stale `.aborted-loss` marker + generic
+    // hint. A keyless deferral leaves the device "idle" (retryable); a hard
+    // failure leaves it "error"/"failed".
+    if let Ok(mut s) = super::STATE.lock() {
+        if let Some(rs) = s.get(mux_device) {
+            if success {
                 outcome.codecs = rs.codecs.clone();
                 outcome.duration = rs.duration.clone();
                 outcome.output_file = rs.output_file.clone();
@@ -1811,12 +1830,15 @@ pub(crate) fn remux_from_ripped_marker(
                 outcome.errors = rs.errors;
                 outcome.total_lost_ms = rs.total_lost_ms;
                 outcome.main_lost_ms = rs.main_lost_ms;
+            } else if !rs.last_error.is_empty() {
+                outcome.failure_reason = Some(rs.last_error.clone());
+                outcome.failure_retryable = rs.status == "idle";
             }
-            // Clean up the synthetic STATE entry so the device tile grid
-            // (which already filters underscore keys, but still — be tidy)
-            // doesn't accumulate per-mux ghosts.
-            s.remove(mux_device);
         }
+        // Clean up the synthetic STATE entry so the device tile grid
+        // (which already filters underscore keys, but still — be tidy)
+        // doesn't accumulate per-mux ghosts.
+        s.remove(mux_device);
     }
     outcome
 }
