@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4.0] — 2026-07-13
+
+### Added
+
+- **3D discs rip to a single MVC-track MKV** automatically — the mux worker
+  reads the SSIF for a 3D clip and preserves both eyes, via libfreemkv 1.4.0.
+  No new configuration; 2D/UHD rips are unchanged.
+
 ## [1.3.2] — 2026-07-10
 
 Version sync with the workspace; inherits libfreemkv 1.3.2.
