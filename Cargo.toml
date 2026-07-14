@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-autorip"
-version = "1.3.2"
+version = "1.4.0"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT"
@@ -15,9 +15,9 @@ name = "autorip"
 path = "src/main.rs"
 
 [dependencies]
-libfreemkv = "1.3"
-freemkv-keysources = "1.3"
-freemkv-i18n = "1.3"
+libfreemkv = "1.4"
+freemkv-keysources = "1.4"
+freemkv-i18n = "1.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -66,6 +66,6 @@ codegen-units = 1
 # to the new version before regenerating Cargo.lock. Local dev overrides this
 # patch with a path patch via the gitignored .cargo/config.toml.
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.3.2" }
-freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.3.2" }
-freemkv-i18n = { git = "https://github.com/freemkv/freemkv-i18n", tag = "v1.3.2" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.4.0" }
+freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.4.0" }
+freemkv-i18n = { git = "https://github.com/freemkv/freemkv-i18n", tag = "v1.4.0" }
