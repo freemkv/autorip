@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.4.1] — 2026-07-14
+
+### Added
+
+- **3D rips get a `.mk3d` extension** (Matroska stereoscopic video, RFC 9559
+  §27.18.3) — byte-identical Matroska, only the extension differs, so media
+  servers and players surface the rip as stereoscopic 3D. 2D / UHD rips are
+  unchanged (`.mkv`), and the `m2ts` passthrough is unchanged (`.m2ts`). Applied
+  on both the fresh-rip and resume-remux paths.
+
+### Fixed
+
+- Inherits **libfreemkv 1.4.1**: the mux no longer conceals decryptable video as
+  loss when a disc carries the occasional authored-bad (non-conforming) TS packet
+  — the fix for the false "corruption" seen on some UHD titles.
+
 ## [1.4.0] — 2026-07-13
 
 ### Added
