@@ -911,10 +911,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     }
 
     let output_format = cfg_read.output_format.clone();
-    let ext = match output_format.as_str() {
-        "m2ts" => "m2ts",
-        _ => "mkv",
-    };
+    let ext = super::output_extension_for(&output_format, &disc);
     let filename = format!("{}.{}", display_name, ext);
     let staging_str = staging_dir.to_string_lossy().into_owned();
     let output_path = format!("{}/{}", staging_str, filename);
