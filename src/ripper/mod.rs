@@ -140,6 +140,29 @@ impl Drop for ScanWatchdog {
     }
 }
 
+/// Whether the disc's main feature (first title) carries an MVC dependent
+/// (right-eye) view — i.e. a Blu-ray 3D rip. Drives the `.mk3d` output
+/// extension so media servers/players recognise the file as stereoscopic 3D.
+pub(crate) fn disc_is_3d(disc: &libfreemkv::Disc) -> bool {
+    disc.titles.first().is_some_and(|t| {
+        t.streams
+            .iter()
+            .any(|s| matches!(s, libfreemkv::Stream::Video(v) if v.is_mvc_dependent()))
+    })
+}
+
+/// The output file extension for a rip of `disc`: `mk3d` for a 3D main feature
+/// (Matroska stereoscopic video — RFC 9559 §27.18.3), `m2ts` for the TS
+/// passthrough, else `mkv`. `.mk3d` is byte-identical Matroska; only the
+/// extension differs, so media servers/players surface the rip as 3D.
+pub(crate) fn output_extension_for(output_format: &str, disc: &libfreemkv::Disc) -> &'static str {
+    match output_format {
+        "m2ts" => "m2ts",
+        _ if disc_is_3d(disc) => "mk3d",
+        _ => "mkv",
+    }
+}
+
 /// Resolve keys for a freshly-scanned live disc via the configured sources. A
 /// thin live-drive binding over [`crate::keysource::resolve_keys`]; returns the
 /// disc with keys applied (`Resolved`) or unchanged on a miss. No mapfile yet
@@ -2328,10 +2351,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         return;
     }
 
-    let ext = match output_format.as_str() {
-        "m2ts" => "m2ts",
-        _ => "mkv",
-    };
+    let ext = output_extension_for(&output_format, &disc);
 
     let staging = cfg_read.staging_device_dir(&crate::util::sanitize_path_compact(&display_name));
     if let Err(e) = std::fs::create_dir_all(&staging) {
