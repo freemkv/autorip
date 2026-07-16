@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
+/// `output_format` value that means "deliver the whole-disc ISO image" rather
+/// than a muxed title. The one place this literal lives — compare through it
+/// (or [`crate::ripper::output_is_iso_image`]), never a bare `== "iso"`.
+pub(crate) const OUTPUT_FORMAT_ISO: &str = "iso";
+
 /// Runtime config. Single source of truth is `settings.json` on disk;
 /// the UI POSTs updates to it via `/api/settings`.
 ///

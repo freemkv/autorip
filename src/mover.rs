@@ -91,12 +91,10 @@ enum MoveOutcome {
     MovedDirty,
     /// Copy itself failed. Caller can retry on the next tick.
     Failed,
-    /// 0.20.8 validation-audit fix #3: `cp` reported success but the
-    /// post-copy size check found dst != src. Surfaces as a distinct
-    /// error reason on the System page so a half-copied destination
-    /// (e.g. NFS server ran out of space mid-cp without returning an
-    /// error to the cp process) isn't silently treated as a successful
-    /// move + source unlink. Caller leaves the staging dir alone — the
+    /// Post-copy size check found dst != src even though the copy returned
+    /// success. Surfaces distinctly so a half-copied destination (e.g. NFS
+    /// server ran out of space mid-copy without surfacing an error) isn't
+    /// treated as a successful move. Caller leaves the staging dir alone —
     /// dst is the broken copy, src is the source of truth.
     SizeMismatch,
     /// Post-copy validation failed for a NON-size reason: a structural
@@ -115,12 +113,10 @@ enum MoveOutcome {
     Collision,
 }
 
-/// 0.20.8 validation-audit fix #3 (revised v0.25.3): errors from the
-/// post-copy validation step inside `move_file`. Kept distinct from
-/// `MoveOutcome` because the outcome is the move-loop's view (Skipped /
-/// Moved / Failed / SizeMismatch), whereas `MoveError` is the
-/// validation-helper's view of *why* the cp result was rejected. The
-/// helper is unit-testable in isolation (see `check_post_copy`).
+/// Errors from the post-copy validation step inside `move_file`. Distinct
+/// from `MoveOutcome` (which is the move-loop's view) — `MoveError` is the
+/// validation helper's view of *why* the copy was rejected, and the helper
+/// is unit-testable in isolation (see `check_post_copy`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MoveError {
     /// The post-copy `stat()` of src and dst disagreed on length. `cp`
@@ -756,7 +752,7 @@ fn check_and_move(cfg: &Config) {
         // `output_format == "iso"` also moves the ISO: there the disc image
         // IS the deliverable (the ripper skipped the title mux), so the
         // staging dir holds no `.mkv` — only the `.iso` to promote.
-        let move_iso = cfg.keep_iso || cfg.output_format == "iso";
+        let move_iso = cfg.keep_iso || crate::ripper::output_is_iso_image(&cfg.output_format);
         let ripped_files: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
             Ok(entries) => {
                 // Don't `.filter_map(|e| e.ok())` away per-entry errors: on a
@@ -1101,14 +1097,10 @@ fn check_and_move(cfg: &Config) {
             .iter()
             .any(|o| matches!(o, MoveOutcome::Moved | MoveOutcome::MovedDirty));
 
-        // 0.20.8 validation-audit fix #3: surface size-mismatch through
-        // the same `record_error` UI path the other failures use, but
-        // with a distinct reason so the operator knows the destination
-        // is the short / broken side (src is intact, dst should be
-        // discarded). Checked BEFORE `any_failed` so a mixed batch
-        // (one Failed, one SizeMismatch) still surfaces the more
-        // diagnostic message — both lead to "leave dir alone, retry
-        // next tick", so ordering only affects the surfaced reason.
+        // Surface size-mismatch distinctly from other failures so the operator
+        // knows the destination is the broken side (src is intact). Checked
+        // before `any_failed` so a mixed batch surfaces the more diagnostic
+        // reason; both lead to "leave dir alone, retry next tick".
         if any_collision {
             record_error(
                 &dir_str,
@@ -1260,7 +1252,7 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
 /// Resolve a media subdirectory (`movie_dir` / `tv_dir`) UNDER the base
 /// `output_dir` using `Path::join` semantics:
 ///   - a RELATIVE `sub` ("movies") is joined onto `output_dir`
-///     ("/mnt/unraid-1/media/" + "movies" → "/mnt/unraid-1/media/movies").
+///     ("/mnt/media/" + "movies" → "/mnt/media/movies").
 ///   - an ABSOLUTE `sub` ("/srv/movies") REPLACES `output_dir` entirely
 ///     (Path::join semantics) — preserving back-compat for operators who
 ///     configured an absolute movie/tv dir.
@@ -1286,7 +1278,7 @@ fn resolve_media_root(output_dir: &str, sub: &str) -> String {
 
 /// The configured destination ROOT directory that governs a planned move,
 /// mirroring `build_destination`'s root selection exactly. This is the
-/// resolved mount-relative root (e.g. `/mnt/unraid-1/media/movies`), NOT
+/// resolved mount-relative root (e.g. `/mnt/media/movies`), NOT
 /// the per-title subdirectory under it. Returned so the mover can validate
 /// the root is present + writable BEFORE creating any subdir tree under it
 /// — the guard against silently writing an 80 GB rip into a container
@@ -1320,9 +1312,9 @@ fn destination_root(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>) -> String {
 /// rather than `create_dir_all`-ing a fresh (wrong) tree.
 ///
 /// This is the code hardening for the 2026-06 "Mercy" incident: the
-/// docker-compose lost its `/mnt/unraid-1/media/movies` bind-mount, so
-/// `/movies` resolved to the container's writable overlay. The mover
-/// silently `create_dir_all`'d `/movies/Mercy (2024)/` there and wrote
+/// docker-compose lost its NAS bind-mount, so `/movies` resolved to the
+/// container's writable overlay. The mover silently `create_dir_all`'d
+/// `/movies/Mercy (2024)/` there and wrote
 /// ~80 GB into the ephemeral layer, logging a relative-path "success".
 /// Requiring the root to pre-exist makes a missing mount a hard, loud
 /// error — a mount point is provisioned out-of-band (the bind target),
@@ -1348,7 +1340,7 @@ fn validate_destination_root(root: &str) -> Result<(), String> {
         return Err(format!(
             "destination root '{root}' is not an absolute path; \
              a destination mount must be configured as an absolute path \
-             (e.g. /mnt/unraid-1/media/movies) so it can never resolve \
+             (e.g. /mnt/media/movies) so it can never resolve \
              relative to the container's working directory"
         ));
     }
@@ -1541,24 +1533,14 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
     let src_size = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let total_gb = src_size as f64 / crate::util::BYTES_PER_GIB;
 
-    // v0.25.7: replaced the `cp` subprocess with an in-process copy on a
-    // worker thread, polled here for live progress. Drops the cp package
-    // dependency (the image-slim work doesn't ship a busybox cp by
-    // default). The copy itself is `copy_counting`, a plain buffered
-    // read/write loop — not `std::fs::copy` — so we can count bytes as we
-    // write them for progress; the kernel fast paths
-    // (copy_file_range/sendfile) wouldn't apply here anyway since this
-    // branch only runs for cross-filesystem moves (see `copy_counting`).
-    // Behaviour unchanged: progress ticks every 1 s, post-copy validation
-    // runs before unlink, src stays intact on any failure path.
+    // In-process copy on a worker thread: plain buffered read/write loop
+    // (`copy_counting`) counting bytes as written, for live progress. Kernel
+    // fast paths (copy_file_range/sendfile) don't apply here (cross-filesystem).
+    // Progress comes from the byte counter, not NFS stat() — stat on NFS
+    // lags and would pin the bar at 0 % for the whole copy. Post-copy
+    // validation runs before unlink; src stays intact on any failure.
     let src_owned = src.to_path_buf();
     let dest_owned = dest.to_path_buf();
-    // Copy on a worker thread, counting bytes as we write them. Progress is
-    // derived from THIS counter (see `copy_counting`), not from stat()-ing the
-    // NFS destination — that stat was the pre-0.26.x bug that pinned the move
-    // bar at 0 % for the whole copy. Reads come from local staging (fast); only
-    // the writes touch NFS, and they stay on this worker thread so a write
-    // stall can never block the poll loop below.
     let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let written_w = std::sync::Arc::clone(&written);
     let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<u64>>();
@@ -1739,21 +1721,20 @@ mod tests {
 
     // ===================================================================
     // Mercy incident ROOT CAUSE (2026-06): a RELATIVE `movie_dir` must be
-    // joined UNDER `output_dir`, not used standalone. The rig's exact
-    // config was output_dir="/mnt/unraid-1/media/", movie_dir="movies".
-    // Pre-fix, build_destination used `cfg.movie_dir` ("movies") directly,
+    // joined UNDER `output_dir`, not used standalone. Pre-fix,
+    // build_destination used `cfg.movie_dir` ("movies") directly,
     // so the dest was "movies/Mercy (2024)/..." → resolved against the
     // container root `/` → "/movies/..." (the ephemeral overlay), NOT the
     // NFS mount. The fix joins movie_dir under output_dir.
     // ===================================================================
     #[test]
     fn build_destination_relative_movie_dir_joins_under_output_dir() {
-        // The EXACT rig config that caused the Mercy incident.
-        let cfg = cfg_with_dirs("movies", "", "/mnt/unraid-1/media/");
+        // Reproduces the Mercy incident config (relative movie_dir, NFS output_dir).
+        let cfg = cfg_with_dirs("movies", "", "/mnt/media/");
         let tmdb = Some(tmdb_movie("Mercy", 2023));
         let dest = build_destination(&cfg, &tmdb, "Mercy.mkv");
         assert_eq!(
-            dest, "/mnt/unraid-1/media/movies/Mercy (2023)/Mercy (2023).mkv",
+            dest, "/mnt/media/movies/Mercy (2023)/Mercy (2023).mkv",
             "a relative movie_dir must resolve UNDER output_dir on the NFS mount"
         );
         // The regression we're guarding against: it must NOT be the bare
@@ -1766,7 +1747,7 @@ mod tests {
         // checks, so a correct config validates the REAL mount root.
         assert_eq!(
             destination_root(&cfg, &tmdb),
-            "/mnt/unraid-1/media/movies",
+            "/mnt/media/movies",
             "destination_root must be the joined mount-relative root, not bare 'movies'"
         );
     }
@@ -1775,7 +1756,7 @@ mod tests {
     /// class as the movie branch).
     #[test]
     fn build_destination_relative_tv_dir_joins_under_output_dir() {
-        let cfg = cfg_with_dirs("", "tv", "/mnt/unraid-1/media/");
+        let cfg = cfg_with_dirs("", "tv", "/mnt/media/");
         let tmdb = Some(tmdb::TmdbResult {
             title: "Severance".into(),
             year: 2022,
@@ -1784,10 +1765,7 @@ mod tests {
             media_type: "tv".into(),
         });
         let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv");
-        assert_eq!(
-            dest,
-            "/mnt/unraid-1/media/tv/Severance/Season 1/sev_s01e01.mkv"
-        );
+        assert_eq!(dest, "/mnt/media/tv/Severance/Season 1/sev_s01e01.mkv");
         assert!(!dest.starts_with("/tv/"));
     }
 
@@ -1796,7 +1774,7 @@ mod tests {
     /// an absolute movie/tv dir keep their existing layout.
     #[test]
     fn build_destination_absolute_movie_dir_overrides_output_dir() {
-        let cfg = cfg_with_dirs("/srv/library/movies", "", "/mnt/unraid-1/media/");
+        let cfg = cfg_with_dirs("/srv/library/movies", "", "/mnt/media/");
         let tmdb = Some(tmdb_movie("Mercy", 2023));
         let dest = build_destination(&cfg, &tmdb, "Mercy.mkv");
         assert_eq!(
@@ -1811,12 +1789,12 @@ mod tests {
     #[test]
     fn resolve_media_root_semantics() {
         assert_eq!(
-            resolve_media_root("/mnt/unraid-1/media/", "movies"),
-            "/mnt/unraid-1/media/movies"
+            resolve_media_root("/mnt/media/", "movies"),
+            "/mnt/media/movies"
         );
         assert_eq!(
-            resolve_media_root("/mnt/unraid-1/media", "movies"),
-            "/mnt/unraid-1/media/movies"
+            resolve_media_root("/mnt/media", "movies"),
+            "/mnt/media/movies"
         );
         assert_eq!(
             resolve_media_root("/mnt/media", "/srv/movies"),
@@ -3289,8 +3267,8 @@ mod tests {
     #[test]
     fn absolute_for_log_is_always_absolute() {
         assert_eq!(
-            absolute_for_log("/mnt/unraid-1/media/movies/Mercy (2024)/Mercy (2024).mkv"),
-            "/mnt/unraid-1/media/movies/Mercy (2024)/Mercy (2024).mkv"
+            absolute_for_log("/mnt/media/movies/Mercy (2024)/Mercy (2024).mkv"),
+            "/mnt/media/movies/Mercy (2024)/Mercy (2024).mkv"
         );
         let rel = absolute_for_log("movies/Mercy/Mercy.mkv");
         assert!(

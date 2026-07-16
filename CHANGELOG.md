@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.4.2] — 2026-07-15
+
+### Added
+
+- **Blu-ray 3D output.** A rip whose main feature carries an MVC dependent
+  (right-eye) view is written with a `.mk3d` extension (byte-identical Matroska)
+  so media servers/players surface it as stereoscopic 3D. Applies to fresh rips
+  and resumed re-muxes alike.
+
+### Fixed
+
+- **A recovery mapfile that can't be loaded at the abort-decision point now
+  forces an abort**, instead of silently reporting zero loss and delivering a
+  possibly-lossy rip as perfect. An unreadable damage record is treated as
+  unquantifiable loss (fail-safe).
+- **Resume and fresh-rip abort gates converged.** The resume re-mux path now
+  uses the same byte-aware loss gate as a fresh rip, so a zero-bitrate title with
+  real unreadable bytes can no longer slip through on resume when a fresh rip of
+  the same disc + config would abort.
+- **Device logs strip terminal control/escape bytes** from disc-supplied strings
+  (UDF volume-id, Blu-ray title) across every sink, closing an ANSI-escape
+  injection into `docker logs` / the on-disk log.
+- **The stop path recovers a poisoned rip-thread lock** rather than dropping the
+  `JoinHandle`, so a panicked rip worker is still drained before staging is
+  wiped (no regression of the stop-without-drain bug).
+
+### Changed
+
+- Inherits **libfreemkv 1.4.2** (mux no longer nulls decryptable video or storms
+  the key server on a bad-encoded region; decrypt / TS-structure separated).
+
 ## [1.4.1] — 2026-07-14
 
 ### Added
