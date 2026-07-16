@@ -100,7 +100,16 @@ pub fn register_rip_thread(device: &str, handle: JoinHandle<()>) -> Result<(), R
 }
 
 pub fn take_rip_thread(device: &str) -> Option<JoinHandle<()>> {
-    RIP_THREADS.lock().ok()?.remove(device)
+    // Recover from a poisoned lock (`into_inner`) rather than swallowing it with
+    // `.ok()?`: a poisoned RIP_THREADS means a rip worker panicked, which is
+    // exactly when `handle_stop` must still recover the JoinHandle to drain the
+    // thread before wiping staging. Returning `None` here would lose the handle
+    // and reintroduce the v0.13.6 stop-without-drain bug. Matches the
+    // poison-recovering convention used everywhere else in this module.
+    RIP_THREADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(device)
 }
 
 /// Spawn a rip-related worker thread and register its `JoinHandle`

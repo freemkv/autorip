@@ -377,32 +377,13 @@ fn device_key(path: &str) -> String {
 /// autorip just iterates the snapshot, tracks logical state
 /// (idle/scanning/ripping/cooldown), and spawns rip threads.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
-    // v0.13.17: re-enumerate drives every RESCAN_INTERVAL_SECS so an unplug
-    // + replug at the kernel level (drive moves from /dev/sg4 to /dev/sg5
-    // after USB re-enumeration) is picked up without a container restart.
-    // Pre-0.13.17 enumeration was one-shot at startup — the user had to
-    // restart the autorip container after every replug.
+    // Re-enumerate drives every RESCAN_INTERVAL_SECS so a USB unplug+replug
+    // (which may rename the device node) is detected without a container restart.
     const RESCAN_INTERVAL_SECS: u64 = 30;
-    // Startup safety net (0.20.7): walk staging and decide per-disc
-    // what to do — preserve partial rips for restart-loop accounting,
-    // wipe genuinely-empty stragglers, leave `.completed` / `.failed`
-    // markers in place. Pre-0.20.7 unconditionally wiped on startup,
-    // which threw away every in-flight ISO / mapfile when the
-    // container restarted mid-rip (Watchtower deploy, OOM, hard
-    // watchdog escalation — any of which now should resume, not lose
-    // half a UHD rip). See `staging::resume_or_quarantine_staging`.
-    // 0.20.8: classify each preserved hint once at startup. Keyed on
-    // the staging dir's `file_name()` (== sanitized display_name).
-    // The disc-insertion branch consults this map after `scan_disc`
-    // produces its own display_name and either routes into the
-    // auto-resume re-mux path or falls through to `rip_disc` as
-    // before. Map is `BTreeMap` for deterministic logging order;
-    // size is bounded by the number of staging subdirs (small).
-    // Startup staging scan. This runs `resume_or_quarantine_staging`
-    // for its side-effect (quarantine of terminally-failed dirs) and
-    // logging. We no longer build a `resume_map` from it: resume is
-    // user-gated and recomputed on demand via `find_resumable_for_disc`,
-    // so the prior per-disc classification BTreeMap was dead work.
+    // Startup staging scan: quarantine terminally-failed dirs and preserve
+    // resumable ones. Resume is user-gated and recomputed on demand via
+    // `find_resumable_for_disc`; we don't build a classification map here.
+    // See `staging::resume_or_quarantine_staging`.
     if let Ok(c) = cfg.read() {
         let hints = staging::resume_or_quarantine_staging(&c.staging_dir);
         tracing::info!(
@@ -459,11 +440,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     );
 
     while !crate::SHUTDOWN.load(Ordering::Relaxed) {
-        // v0.13.17 hot-plug: every RESCAN_INTERVAL_SECS, re-enumerate drives
-        // and reconcile against the cached path list. New devices get logged
-        // and start being polled. Devices that disappeared get their state
-        // cleared (drop_session + remove from STATE) so the UI doesn't show
-        // a phantom drive.
+        // Periodic hot-plug reconcile: re-enumerate drives and diff against
+        // the cached path list. New devices start being polled; removed devices
+        // have their session cleared so the UI doesn't show a phantom drive.
         if last_rescan.elapsed().as_secs() >= RESCAN_INTERVAL_SECS {
             last_rescan = std::time::Instant::now();
             let fresh = libfreemkv::list_drives();
@@ -1111,14 +1090,10 @@ pub fn handle_rip_request(
     device_path: &str,
     mode: crate::web::ResumeMode,
 ) {
-    // v0.25.7: skip the scan when the disc has already been scanned
-    // since insertion. Pre-0.25.7 this was unconditional, which meant
-    // every /api/rip click ran a second full scan + TMDB lookup —
-    // wiped the poster + title in the UI for ~10-30 s and burned the
-    // wallclock for no benefit since rip_disc would have reused the
-    // session anyway via take_session(). On disc eject + re-insert
-    // the poll loop calls drop_session, so a stale session can't
-    // survive a media change.
+    // Skip the scan when the disc has already been scanned since insertion —
+    // a redundant scan clears the UI poster + title for ~10-30 s and re-runs
+    // TMDB for no benefit. On disc eject + re-insert the poll loop calls
+    // drop_session, so a stale session can't survive a media change.
     if !session_is_scanned(device) {
         scan_disc(cfg, device, device_path);
     } else {
@@ -3303,7 +3278,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         SectorStatus::NonScraped,
                         SectorStatus::Unreadable,
                     ]);
-                    if cfg_read.output_format == "iso" {
+                    if output_is_iso_image(&cfg_read.output_format) {
                         bad.iter().map(|(_, sz)| *sz).sum::<u64>()
                     } else {
                         libfreemkv::disc::bytes_bad_in_title(&title_for_progress, &bad)
@@ -3317,7 +3292,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 }
             };
             if mux_scope_bad == 0 {
-                let scope_label = if cfg_read.output_format == "iso" {
+                let scope_label = if output_is_iso_image(&cfg_read.output_format) {
                     "whole disc"
                 } else {
                     "muxed title"
@@ -3422,16 +3397,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 progress: Some(&patch_progress),
                 halt: Some(pass_halt.clone()),
                 key_fetch: key_fetch.clone(),
-                // First retry pass (pass 2 = retry_n 1, since the loop is
-                // `for retry_n in 1..=max_retries`) = breadth-first fast capture:
-                // read every bad range once and leave each failed block
-                // NonTrimmed, so the readable blocks (the sweep's good skip-ahead
-                // overshoot) of ALL sections are recovered FIRST, before any
-                // single section's slow per-sector grind. Later passes
-                // (retry_n >= 2) do the granular bisect/retry on what's left. No
-                // data is dropped — a failed block stays NonTrimmed until a
-                // granular pass resolves it.
-                fast_capture: retry_n == 1,
             };
             // Un-wedge the drive in SOFTWARE before each retry pass. Grinding a
             // bad cluster leaves the BU40N in a HARDWARE_ERROR fast-fail wedge
@@ -3718,7 +3683,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         // is no title to scope to, so the whole disc is the
                         // unit of loss.
                         main_lost_ms_for_history = abort_lost_ms(
-                            cfg_read.output_format == "iso",
+                            output_is_iso_image(&cfg_read.output_format),
                             &title_for_progress,
                             &bad_ranges,
                             title_bytes_per_sec,
@@ -3727,7 +3692,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         // (threshold 0) gate keys on this, not the bitrate-derived
                         // ms, so a zero/low bitrate can't hide unreadable loss.
                         main_lost_bytes_for_history = abort_lost_bytes(
-                            cfg_read.output_format == "iso",
+                            output_is_iso_image(&cfg_read.output_format),
                             &title_for_progress,
                             &bad_ranges,
                         );
@@ -3774,6 +3739,27 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         s.largest_gap_ms = promoted_largest_gap_ms;
                     });
                 }
+            } else {
+                // Fail-safe: the mapfile could not be loaded, so we cannot
+                // promote residual NonTrimmed bytes to Unreadable nor measure
+                // in-title loss. Leaving `main_lost_*_for_history` at their 0
+                // initializers would let the abort gate below conclude "no
+                // loss" and deliver a possibly-lossy rip as perfect. Instead,
+                // mark loss unquantifiable (NaN ms) so `loss_aborts` fires
+                // regardless of threshold — a mapfile we cannot read at the
+                // abort-decision point means the rip's damage record is gone,
+                // and the safe verdict is abort/quarantine, never silent
+                // delivery.
+                crate::log::device_log(
+                    device,
+                    "Recovery mapfile could not be loaded to verify loss — forcing abort (cannot confirm a clean rip)",
+                );
+                tracing::error!(
+                    device = %device,
+                    mapfile = %mapfile_path_str,
+                    "end_of_recovery_promote: mapfile load failed at abort-decision point; forcing abort (loss unquantifiable)"
+                );
+                main_lost_ms_for_history = f64::NAN;
             }
 
             // ISO output is whole-disc and must be byte-complete: the per-title
@@ -3992,16 +3978,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // ripper::resume::remux_from_ripped_marker`.
         //
         // Snapshot sweep damage from STATE before building the marker.
-        // The update_state_with call inside the promotion+flush block
-        // (above) has already re-derived errors / total_lost_ms /
-        // main_lost_ms / bad_ranges / largest_gap_ms from the
-        // just-promoted in-memory map and written them to STATE, so
-        // this snapshot reflects the final post-promotion damage
-        // (NonTrimmed bytes promoted to Unreadable are included).
-        // We carry them into the marker so that remux_from_ripped_marker
-        // can populate SweepDamageSnapshot for a resumed mux without
-        // re-reading the mapfile (though mapfile-based re-derivation
-        // also works and is available as a fallback — see resume.rs).
+        // Snapshot the final post-promotion damage from STATE (already updated
+        // above, including promoted NonTrimmed→Unreadable bytes) and carry it
+        // into the marker so remux_from_ripped_marker can restore
+        // SweepDamageSnapshot on resume without re-reading the mapfile.
         let marker_damage = {
             let s = state::STATE.lock().unwrap_or_else(|e| e.into_inner());
             s.get(device).map(|rs| mux::SweepDamageSnapshot {
@@ -5055,9 +5035,7 @@ pub fn eject_drive(device_path: &str) {
     }
 }
 
-// `sanitize_filename` and `format_duration` moved to `util` in 0.13.0.
-// Callers below now use `crate::util::sanitize_path_compact` and
-// `crate::util::format_duration_hm` directly.
+// `sanitize_filename` / `format_duration` live in `util`.
 
 pub(crate) fn format_codecs(title: &libfreemkv::DiscTitle) -> String {
     let mut parts = Vec::new();
@@ -5200,7 +5178,8 @@ fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
     if abort_on_lost_secs == 0 {
         lost_bytes > 0 || lost_ms.is_nan()
     } else {
-        lost_ms.is_nan() || lost_ms > (abort_on_lost_secs as f64) * MILLIS_PER_SEC
+        // The `> 0` tolerance branch is exactly the ms-only gate.
+        should_abort_for_loss(lost_ms, (abort_on_lost_secs as f64) * MILLIS_PER_SEC)
     }
 }
 
@@ -5216,8 +5195,8 @@ fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
 /// validates + moves `.iso` files. This is the single predicate every
 /// deliverable/prune/mux-skip decision keys off so the two completion routes
 /// (`rip_disc`'s inline terminal and `resume::resume_remux`) can't diverge.
-fn output_is_iso_image(output_format: &str) -> bool {
-    output_format == "iso"
+pub(crate) fn output_is_iso_image(output_format: &str) -> bool {
+    output_format == crate::config::OUTPUT_FORMAT_ISO
 }
 
 /// Effective main-movie-loss tolerance for the abort gate.
@@ -5283,7 +5262,7 @@ fn retain_intermediate_iso(keep_iso: bool, output_format: &str) -> bool {
 /// multi-pass captures a real ISO and applies whole-disc scope, so ISO output
 /// requires it.
 fn iso_output_needs_multipass(output_format: &str, max_retries: u8) -> bool {
-    output_format == "iso" && max_retries == 0
+    output_is_iso_image(output_format) && max_retries == 0
 }
 
 /// Prune the disc-sized intermediate ISO and its mapfile sidecar on a

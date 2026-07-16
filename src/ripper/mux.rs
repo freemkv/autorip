@@ -489,13 +489,9 @@ impl MuxSink {
                 // view when mux starts. pass == total_passes is the
                 // established convention for "we're on the mux pass".
                 //
-                // Total progress is computed by `total_pct_byte_weight`
-                // (see its doc) — the same byte-weighted formula
-                // `state.rs` uses for sweep and patch, so the bar
-                // progresses smoothly across the sweep→mux handoff
-                // instead of jumping. (A prior pass-equal-weight formula
-                // lived here; it was replaced by the byte-weighted call
-                // below.)
+                // Total progress uses `total_pct_byte_weight` — the same
+                // byte-weighted formula as sweep/patch, so the bar
+                // progresses smoothly across the sweep→mux handoff.
                 pass: self.ui.total_passes,
                 total_passes: self.ui.total_passes,
                 pass_progress_pct: pct,

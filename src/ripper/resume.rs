@@ -818,12 +818,11 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // `output_format=iso` + `abort_on_lost_secs=0` and unreadable sectors
         // OUTSIDE the title, while a fresh rip of the same disc + config would
         // ABORT — the two paths must reach the same verdict.
-        let lost_secs = super::abort_lost_ms(
-            cfg_read.output_format == "iso",
-            &title,
-            &bad_ranges,
-            title_bytes_per_sec,
-        ) / crate::util::MILLIS_PER_SEC;
+        let output_is_iso = super::output_is_iso_image(&cfg_read.output_format);
+        let lost_bytes = super::abort_lost_bytes(output_is_iso, &title, &bad_ranges);
+        let lost_secs =
+            super::abort_lost_ms(output_is_iso, &title, &bad_ranges, title_bytes_per_sec)
+                / crate::util::MILLIS_PER_SEC;
         // ISO output is whole-disc and must be byte-complete: the per-title
         // tolerance is ignored (forced to 0), matching the fresh-rip gate.
         // `.accept-loss` raises the effective threshold to unlimited so the
@@ -833,14 +832,20 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         } else {
             super::effective_abort_secs(&cfg_read.output_format, cfg_read.abort_on_lost_secs)
         };
-        if super::should_abort_for_loss(
+        // BYTE-AWARE gate, identical to the fresh-rip path (`loss_aborts` in
+        // mod.rs): with `abort_on_lost_secs == 0`, "0 means ZERO" is byte-exact, so
+        // a zero-bitrate title (whose `lost_ms` rounds to 0) that still has real
+        // unreadable bytes ABORTS. The old `should_abort_for_loss` (ms-only) would
+        // silently deliver it — the two completion routes must not diverge.
+        if super::loss_aborts(
+            lost_bytes,
             lost_secs * crate::util::MILLIS_PER_SEC,
-            effective_abort as f64 * crate::util::MILLIS_PER_SEC,
+            effective_abort,
         ) {
             // "disc loss" for raw ISO (whole-disc scope), "title loss" for a
             // muxed MKV/M2TS (in-title scope) — matching how `lost_secs` was
             // computed just above.
-            let scope = if cfg_read.output_format == "iso" {
+            let scope = if super::output_is_iso_image(&cfg_read.output_format) {
                 "disc"
             } else {
                 "title"

@@ -61,7 +61,22 @@ fn device_log_path(device: &str) -> String {
 /// Line format in the per-device file: `[YYYY-MM-DDTHH:MM:SSZ] msg`. The
 /// in-memory ring stores the same. ISO-8601 timestamps so rip log archives
 /// sort correctly and midnight isn't ambiguous.
+/// Strip terminal control/escape bytes from log content. A crafted disc string
+/// (UDF volume-id, Blu-ray `bdmt` title) logged verbatim could otherwise inject
+/// ANSI escape sequences into an operator's terminal (`docker logs` / `tail`) or
+/// the on-disk `.log`. Replaces any control character (C0 / DEL / C1, ESC
+/// included) with `?`; ordinary text is untouched.
+fn sanitize_log_msg(msg: &str) -> String {
+    msg.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 pub fn device_log(device: &str, msg: &str) {
+    // Sanitize ONCE, up front, so EVERY sink (ring, file, and the structured
+    // tracing event below) gets the escape-free text — not just the file line.
+    let msg = sanitize_log_msg(msg);
+    let msg = msg.as_str();
     let ts = crate::util::format_iso_datetime();
     let line = format!("[{}] {}", ts, msg);
 

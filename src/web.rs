@@ -401,7 +401,7 @@ function renderSteps(steps,progress,eta,speed,s){
       }
       let badLine='';
       /* TWO pills, ever \u2014 Good and Maybe. Never a third.
-         GOOD  = whole-disc bytes that are read AND verify-clean (Finished).
+         GOOD  = whole-disc bytes successfully read off the disc (Finished).
          MAYBE = whole-disc bytes not-yet-good: pending, NonTrimmed, and
                  currently-unreadable/undecryptable all folded together.
                  NOTHING is "lost"/"no chance" mid-rip \u2014 a later pass (or a
@@ -650,8 +650,8 @@ function renderCurrent(){
   }
   /* Loss-aborted off-ramp: the rip aborted because main-movie loss exceeded the
      threshold, but the COMPLETE ISO is staged on disk. Offer exactly TWO clear
-     choices and REPLACE the generic Rip/Verify (so the operator isn't offered a
-     destructive start-over here):
+     choices and REPLACE the generic start-over (so the operator isn't offered a
+     destructive fresh rip here):
        • "Run one more pass" — Resume (resume=yes): another recovery pass over
          the bad ranges (Pass N from the mapfile, recovering only the bad core).
        • "Accept & deliver"  — accept the recorded loss and deliver as-is
@@ -4412,7 +4412,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     // point them at an arbitrary location for directory enumeration. Require an
     // absolute path with no `..` traversal component — that confines them to
     // real mount points (the legitimate configs are all absolute: /staging-local,
-    // /mnt/unraid-1/media/movies, …) while rejecting relative / climbing paths.
+    // /mnt/media/movies, …) while rejecting relative / climbing paths.
     // Empty string is allowed: it means "unset / inherit default" for the
     // optional movie_dir / tv_dir overrides.
     let has_parent_dir = |p: &std::path::Path| {
