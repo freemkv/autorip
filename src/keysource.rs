@@ -773,7 +773,7 @@ mod tests {
         for u in &units {
             assert_eq!(u.len(), 6144);
             assert!(
-                libfreemkv::aacs::content::ts_sync_destroyed(u),
+                !libfreemkv::aacs::content::is_clean(u, libfreemkv::disc::ContentFormat::BdTs),
                 "selector must only emit units the key service accepts"
             );
         }
@@ -785,7 +785,10 @@ mod tests {
             clear[off] = 0x47;
             off += 192;
         }
-        assert!(!libfreemkv::aacs::content::ts_sync_destroyed(&clear));
+        assert!(libfreemkv::aacs::content::is_clean(
+            &clear,
+            libfreemkv::disc::ContentFormat::BdTs
+        ));
     }
 
     /// autorip's keydb *writes* and the startup *existence check* must land on
