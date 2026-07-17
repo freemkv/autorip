@@ -131,7 +131,19 @@ fn validate_keyserver_url(raw: &str) -> Result<(), String> {
 }
 
 /// How many 6144-byte aligned encrypted units a sample-needing source is given.
-pub const SAMPLE_UNITS: usize = 4;
+///
+/// MUST be >= the online keyservice minimum: a request carrying fewer units is
+/// SILENTLY SKIPPED by the online source (see [`libfreemkv::keysource::MIN_SAMPLE_UNITS`]),
+/// which the ripper reads as "key service down" and fails the rip. Defined AS the
+/// floor so it tracks it and can never regress below — and the compile-time
+/// assertion below turns any regression into a BUILD error, not a silent runtime
+/// skip. (This bug shipped once as `= 4`; the assertion makes it un-shippable.)
+pub const SAMPLE_UNITS: usize = libfreemkv::keysource::MIN_SAMPLE_UNITS;
+const _: () = assert!(
+    SAMPLE_UNITS >= libfreemkv::keysource::MIN_SAMPLE_UNITS,
+    "autorip SAMPLE_UNITS must be >= the online keyservice's MIN_SAMPLE_UNITS \
+     or every online key request is silently skipped",
+);
 
 /// What happened when resolving keys for a disc — carried back so the UI can
 /// tell the user *why*, instead of a generic "missing keys".
