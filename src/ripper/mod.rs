@@ -2641,6 +2641,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // 0.0 in single-pass mode or when no unreadable sectors exist.
     let mut main_lost_ms_for_history_outer = 0.0f64;
 
+    // Retained FMTS forensic key map — set by the pre-rip gate (inside the sweep
+    // block below) and read by the live single-pass mux (after that block), so it
+    // must be declared here at the function-body level to bridge the two scopes.
+    // `None` for every non-FMTS disc, leaving the single-pass read walk unchanged.
+    let mut fmts_key_map: Option<std::sync::Arc<libfreemkv::decrypt::AacsKeyMap>> = None;
     let reader: Box<dyn libfreemkv::SectorSource> = if cfg_read.max_retries > 0 {
         let iso_path = std::path::Path::new(&iso_path_str);
         let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
@@ -2820,18 +2825,22 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // into the pool. Fail fast unless the operator opted into capture-without-
         // keys (then sweep the raw ISO to decode later). Non-FMTS discs are
         // unaffected (their base gate already ran).
+        //
+        // The resolved map is retained (`fmts_key_map`, declared at the function
+        // body level) so the LIVE single-pass mux reads only our-phase units —
+        // without it, single-pass FMTS would pass the alternate device-group half
+        // to the demux (the pre-fix bug).
         if disc.format == libfreemkv::DiscFormat::Fmts {
             let gate_title = disc.titles[0].clone();
             let mut gate_keys = disc.decrypt_keys();
-            let resolved = libfreemkv::resolve_mux_key_map(
+            let resolved_map = libfreemkv::resolve_mux_key_map(
                 &mut session.drive,
                 &gate_title,
                 &mut gate_keys,
                 key_fetch.as_ref(),
                 disc.content_format,
-            )
-            .is_ok();
-            match fmts_gate_decision(resolved, cfg_read.capture_without_keys) {
+            );
+            match fmts_gate_decision(resolved_map.is_ok(), cfg_read.capture_without_keys) {
                 FmtsGate::Proceed => {
                     // Bank the resolved forensic keys onto the disc so the sweep's
                     // key persist + the mux reuse them.
@@ -2840,6 +2849,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                             a.unit_keys = unit_keys.clone();
                         }
                     }
+                    // Retain the resolved map so the LIVE single-pass mux (inline
+                    // DiscStream) reads ONLY our-phase units — the same fix the
+                    // file-backed highway applies. The banked keys above align with
+                    // the map's slots (both derive from `gate_keys`). Multi-pass
+                    // ignores this: it sweeps a full ISO, then the highway re-resolves
+                    // its own map at resume-mux.
+                    fmts_key_map = resolved_map.ok().map(std::sync::Arc::new);
                     crate::log::device_log(
                         device,
                         "FMTS: complete forensic key map resolved pre-rip.",
@@ -4482,6 +4498,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // the highway path so the UI gets one event stream.
         let mut s = libfreemkv::DiscStream::new(reader, title, keys, batch, format)
             .with_halt(halt_token.clone());
+        // FMTS live single-pass: read only our-phase units (the retained pre-rip
+        // map decides which), so the alternate device-group half never reaches the
+        // demux — the same fix the file-backed highway applies. `None` for every
+        // non-FMTS disc, leaving the read walk unchanged.
+        if let Some(map) = fmts_key_map.clone() {
+            s = s.with_key_map(map);
+        }
         if cfg_read.on_read_error == "skip" {
             s.skip_errors = true;
         }
