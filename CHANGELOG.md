@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.4.5] — 2026-07-18
+
+### Fixed
+
+- **FMTS (AACS 2.1) rips are clean end to end.** Inherits libfreemkv 1.4.5's
+  read-only-our-variant FMTS mux, wired into **both** autorip mux paths: the resume
+  / multi-pass highway and the live single-pass `DiscStream`. The pre-rip forensic
+  key gate now retains the resolved map and hands it to the single-pass mux, so a
+  `rip_mode = "single"` FMTS rip no longer leaks the alternate device-group half
+  into the demuxer.
+
+### Changed
+
+- **All forensic keys are resolved before the sweep** (fail-fast), honoring the
+  **Capture Discs Without Keys** setting — a base-keyed but forensic-missing FMTS
+  disc no longer sweeps for an hour and then fails at mux.
+
+## [1.4.4] — 2026-07-17
+
+### Fixed
+
+- **The online key request now carries enough samples.** autorip sampled only 4
+  content units, below the online source's `MIN_SAMPLE_UNITS` (8) floor, so every
+  online lookup was skipped and surfaced as "key service down." The sample count is
+  now tied to `MIN_SAMPLE_UNITS` with a compile-time floor.
+
+## [1.4.3] — 2026-07-17
+
+Version sync with the workspace; inherits libfreemkv 1.4.3 (AACS 2.1
+forensic-variant online lookups).
+
 ## [1.4.2] — 2026-07-15
 
 ### Added
