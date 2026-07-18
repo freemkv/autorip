@@ -232,6 +232,36 @@ fn key_readiness(
     format!("Missing keys — {reason}")
 }
 
+/// What the pre-rip FMTS forensic-key gate should do, given whether the complete
+/// (base + per-index-phase) map resolved and the operator's capture setting.
+///
+/// The forensic index keys are online-only and were historically not resolved
+/// until mux — so a base-keyed-but-forensic-missing FMTS disc used to sweep for
+/// ~an hour, THEN fail at mux. Resolving the full map up front lets us decide
+/// before the sweep, honouring `capture_without_keys` exactly like the base gate.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum FmtsGate {
+    /// Full map resolved — rip normally (forensic keys are proven + banked).
+    Proceed,
+    /// Map incomplete but the operator opted into capture-without-keys — sweep the
+    /// raw ISO now, defer the forensic mux until the keys are available.
+    CaptureOnly,
+    /// Map incomplete and capture-without-keys is off — do not rip (skip the disc).
+    Skip,
+}
+
+/// Pure decision for the FMTS pre-rip gate (crypto/drive resolution is done by
+/// libfreemkv's `resolve_mux_key_map`, tested there; this is just the policy).
+fn fmts_gate_decision(map_resolved: bool, capture_without_keys: bool) -> FmtsGate {
+    if map_resolved {
+        FmtsGate::Proceed
+    } else if capture_without_keys {
+        FmtsGate::CaptureOnly
+    } else {
+        FmtsGate::Skip
+    }
+}
+
 // ─── Online key service: DOWN vs genuine no-key ─────────────────────────────
 //
 // The online keysource swallows every failure (transport error, 502, timeout)
@@ -2780,6 +2810,63 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             });
             libfreemkv::keysource::key_fetch(inputs, make)
         });
+
+        // ── FMTS: resolve the COMPLETE forensic key map BEFORE the sweep ──
+        // Base keys already passed the gate above; the forensic index keys are
+        // online-only and used to be resolved only at mux, so a base-keyed-but-
+        // forensic-missing FMTS disc swept for ~an hour and THEN failed. Prove the
+        // full (base + per-index-phase) map up front off the live drive — the
+        // `resolve_mux_key_map` seam does base + FMTS and folds the forensic keys
+        // into the pool. Fail fast unless the operator opted into capture-without-
+        // keys (then sweep the raw ISO to decode later). Non-FMTS discs are
+        // unaffected (their base gate already ran).
+        if disc.format == libfreemkv::DiscFormat::Fmts {
+            let gate_title = disc.titles[0].clone();
+            let mut gate_keys = disc.decrypt_keys();
+            let resolved = libfreemkv::resolve_mux_key_map(
+                &mut session.drive,
+                &gate_title,
+                &mut gate_keys,
+                key_fetch.as_ref(),
+                disc.content_format,
+            )
+            .is_ok();
+            match fmts_gate_decision(resolved, cfg_read.capture_without_keys) {
+                FmtsGate::Proceed => {
+                    // Bank the resolved forensic keys onto the disc so the sweep's
+                    // key persist + the mux reuse them.
+                    if let libfreemkv::decrypt::DecryptKeys::Aacs { unit_keys, .. } = &gate_keys {
+                        if let Some(a) = disc.aacs.as_mut() {
+                            a.unit_keys = unit_keys.clone();
+                        }
+                    }
+                    crate::log::device_log(
+                        device,
+                        "FMTS: complete forensic key map resolved pre-rip.",
+                    );
+                }
+                FmtsGate::CaptureOnly => {
+                    crate::log::device_log(
+                        device,
+                        "FMTS: forensic keys unavailable — capturing raw ISO now \
+                         (Capture Discs Without Keys is on); decode deferred until keys arrive.",
+                    );
+                }
+                FmtsGate::Skip => {
+                    crate::log::device_log(
+                        device,
+                        "FMTS: forensic keys missing — not ripping. Enable \
+                         \"capture without keys\" to save an ISO for later.",
+                    );
+                    update_state_with(device, |s| {
+                        s.status = "error".to_string();
+                        s.last_error = "FMTS forensic keys missing — not ripping.".to_string();
+                    });
+                    unregister_halt(device);
+                    return;
+                }
+            }
+        }
 
         'pass1: loop {
             attempt += 1;
@@ -5996,8 +6083,8 @@ mod tests {
     //! State-only helpers and their tests live in `state.rs`.
 
     use super::{
-        HaltGuard, SweepingGuard, aacs_failure_message, disk_space_preflight_message,
-        format_lib_error, format_pass_error, header_phase_outcome_is_failure,
+        FmtsGate, HaltGuard, SweepingGuard, aacs_failure_message, disk_space_preflight_message,
+        fmts_gate_decision, format_lib_error, format_pass_error, header_phase_outcome_is_failure,
         incomplete_mux_status, is_safe_staging_segment, list_staging_basenames,
         prune_intermediate_iso, register_halt, resumable_dir_blocked, resumable_for_disc,
         staging_dir_matches_disc, staging_disc_completed, staging_disc_owned_by_worker,
@@ -6008,6 +6095,19 @@ mod tests {
     use crate::ripper::state::Resumable;
     use crate::util::MILLIS_PER_SEC;
     use libfreemkv::{Error, ScsiSense};
+
+    /// The pre-rip FMTS gate honours `capture_without_keys` exactly like the base
+    /// no-keys gate: a resolved map always rips; an unresolved one captures the raw
+    /// ISO when the operator opted in, else skips the disc.
+    #[test]
+    fn fmts_gate_decision_honors_capture_without_keys() {
+        // Complete map → rip normally, regardless of the capture toggle.
+        assert_eq!(fmts_gate_decision(true, false), FmtsGate::Proceed);
+        assert_eq!(fmts_gate_decision(true, true), FmtsGate::Proceed);
+        // Incomplete map: capture-without-keys ON → capture ISO; OFF → skip.
+        assert_eq!(fmts_gate_decision(false, true), FmtsGate::CaptureOnly);
+        assert_eq!(fmts_gate_decision(false, false), FmtsGate::Skip);
+    }
 
     /// Convergence H1 regression: `SweepingGuard` is the RAII cleanup for the
     /// `.sweeping` in-progress marker. Many `rip_disc` early-return error
