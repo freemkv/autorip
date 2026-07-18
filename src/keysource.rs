@@ -974,7 +974,7 @@ mod tests {
     /// simply has no key for this disc (e.g. an empty keydb).
     struct NoKeySource;
     impl KeySource for NoKeySource {
-        fn get_uk(
+        fn get_unit_keys(
             &self,
             _ctx: &dyn freemkv_keysources::ResolveCtx,
         ) -> Result<Vec<freemkv_keysources::UnitKey>, libfreemkv::Error> {
@@ -988,7 +988,7 @@ mod tests {
     /// treats this exactly like "no key here": it maps to `NoKey`.
     struct ErroringSource;
     impl KeySource for ErroringSource {
-        fn get_uk(
+        fn get_unit_keys(
             &self,
             _ctx: &dyn freemkv_keysources::ResolveCtx,
         ) -> Result<Vec<freemkv_keysources::UnitKey>, libfreemkv::Error> {
