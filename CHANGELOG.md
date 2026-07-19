@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.5.0] — UNRELEASED
+
+Version sync with the workspace; inherits libfreemkv 1.5.0. No functional change to
+the service — the new extraction sinks (`audio://`, `sub://`, `chapters://`,
+`json://`) are library/CLI features and are not part of autorip's rip path.
+
 ## [1.4.5] — 2026-07-18
 
 ### Fixed
