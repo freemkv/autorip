@@ -4,17 +4,13 @@
 
 ### Fixed
 
-- **A rip with no TMDB match is now filed under the movie library, not dumped
-  at the share root.** A disc that rips cleanly but gets no TMDB match writes
-  `media_type: ""` into its `.done` marker. The mover routed that empty string
-  through neither the movie nor the TV branch, falling through to the
-  `output_dir` root — so the MKV (and, with `keep_iso`, the ISO) landed at the
-  bare library root with no per-title folder (observed: a 53 GB
-  `Drive (2011) - 4K Ultra HD.mkv` written to `/mnt/media//…`). The mover now
-  coalesces an empty `media_type` to the `"movie"` default (matching the
-  existing absent-media_type handling), so an unmatched-but-titled disc files
-  as `movies/Title (Year)/Title (Year).ext`. Nothing was ever lost — the output
-  was intact, just mis-placed.
+- A rip with no TMDB match now files under the movie library instead of the
+  share root. An empty `media_type` matched neither the movie nor TV branch and
+  fell through to `output_dir`; it now coalesces to `movie`, so the disc files as
+  `movies/Title (Year)/…`.
+- TMDB lookups no longer fail on a label with a parenthesized year (`Drive
+  (2011) - 4K Ultra HD` queried TMDB as `Drive (2011)` → 0 results). `clean_title`
+  strips a parenthesized 4-digit year; a bare year (`Blade Runner 2049`) is kept.
 
 ## [1.5.0] — UNRELEASED
 
