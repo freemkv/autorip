@@ -284,10 +284,40 @@ fn parse_result(v: &serde_json::Value) -> Option<(TmdbResult, f64)> {
     ))
 }
 
+/// Remove a parenthesized 4-digit release year from a label, e.g.
+/// "Drive (2011) - 4K Ultra HD" -> "Drive  - 4K Ultra HD". Retail meta-titles
+/// annotate the release year in parentheses; TMDB's text search returns ZERO
+/// hits when that annotation is left in the query (`Drive (2011)` matches
+/// nothing, `Drive` matches). A 4-digit year in parentheses is virtually never
+/// part of a real movie title, so removing it is safe. A BARE (unparenthesized)
+/// year is left untouched so titles like "Blade Runner 2049" and "1917" are
+/// unaffected. Char-based (not byte-based) so a multibyte label never panics.
+fn strip_paren_year(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        // Match "(dddd)" exactly: '(' then 4 ASCII digits then ')'.
+        if chars[i] == '('
+            && i + 5 < chars.len()
+            && chars[i + 5] == ')'
+            && chars[i + 1..i + 5].iter().all(|c| c.is_ascii_digit())
+        {
+            i += 6; // skip the whole "(dddd)" group
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Clean a disc label for TMDB search: "AURORA_DRIFT_TWO" -> "Aurora Drift Two"
-/// Strips common disc suffixes like "4K Ultra HD", "Blu-ray", "DVD", etc.
+/// Strips common disc suffixes like "4K Ultra HD", "Blu-ray", "DVD", etc., and
+/// a parenthesized release year (see [`strip_paren_year`]).
 pub fn clean_title(label: &str) -> String {
     let s = label.replace(['_', '-'], " ");
+    let s = strip_paren_year(&s);
 
     // Strip common disc format suffixes (case-insensitive)
     let suffixes = [
@@ -402,6 +432,45 @@ mod tests {
     #[test]
     fn clean_title_handles_hyphens() {
         assert_eq!(clean_title("SPIDER-MAN"), "Spider Man");
+    }
+
+    #[test]
+    fn clean_title_strips_parenthesized_year() {
+        // Retail meta-titles annotate the release year in parens; leaving it in
+        // the query makes TMDB return 0 hits ("Drive (2011)" matches nothing).
+        assert_eq!(clean_title("Drive (2011) - 4K Ultra HD"), "Drive");
+        assert_eq!(clean_title("Zombieland (2009)"), "Zombieland");
+        assert_eq!(clean_title("The Matrix (1999) BLURAY"), "The Matrix");
+    }
+
+    #[test]
+    fn clean_title_keeps_bare_year_in_title() {
+        // A BARE (unparenthesized) year is part of the title — never stripped.
+        assert_eq!(clean_title("BLADE_RUNNER_2049"), "Blade Runner 2049");
+        assert_eq!(clean_title("1917"), "1917");
+    }
+
+    #[test]
+    fn strip_paren_year_boundaries() {
+        // Exactly "(dddd)" is removed.
+        assert_eq!(strip_paren_year("Drive (2011)"), "Drive ");
+        assert_eq!(strip_paren_year("(2011)"), "");
+        // Near-miss digit counts are NOT a year group → kept verbatim.
+        assert_eq!(strip_paren_year("(201)"), "(201)");
+        assert_eq!(strip_paren_year("(20111)"), "(20111)");
+        assert_eq!(strip_paren_year("(20)"), "(20)");
+        // Non-digit contents kept.
+        assert_eq!(strip_paren_year("(abcd)"), "(abcd)");
+        assert_eq!(strip_paren_year("(20a1)"), "(20a1)");
+        // Malformed / unbalanced parens kept (no crash, no partial strip).
+        assert_eq!(strip_paren_year("(2011"), "(2011");
+        assert_eq!(strip_paren_year("2011)"), "2011)");
+        // Multiple year groups all removed.
+        assert_eq!(strip_paren_year("(2001) x (2002)"), " x ");
+        // Multibyte input must not panic and must strip correctly.
+        assert_eq!(strip_paren_year("Amélie (2001)"), "Amélie ");
+        // A 4-digit group adjacent to the end.
+        assert_eq!(strip_paren_year("Se7en (1995)"), "Se7en ");
     }
 
     #[test]
