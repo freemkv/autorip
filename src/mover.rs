@@ -1176,6 +1176,34 @@ fn check_and_move(cfg: &Config) {
     }
 }
 
+/// The media type used to ROUTE a planned move, coalescing an empty
+/// `media_type` to the `"movie"` default.
+///
+/// A disc that rips cleanly but gets no TMDB match writes `media_type: ""`
+/// into its `.done` marker (the muxer hand-off's serde default — see
+/// `muxer::marker_without_media_type_defaults_empty`). That empty string is
+/// `Some("")` at the marker parse, so it slips past the `unwrap_or("movie")`
+/// there and reaches `build_destination` / `destination_root` as `""`, which
+/// matches neither the `"movie"` nor `"tv"` arm and falls through to the
+/// `output_dir` ROOT — dumping the file at the bare library root with no
+/// per-title folder (e.g. `/mnt/media//Drive 2011 - 4K Ultra HD.mkv`, the
+/// Drive 4K UHD mis-file, 2026-07-22).
+///
+/// An ABSENT media_type already defaults to `"movie"` (both at the marker
+/// parse and in `review.rs`); an EMPTY one must too, so an
+/// unmatched-but-titled disc files as a movie under `movies/Title (Year)/`.
+/// A non-empty but non-movie/tv value (e.g. `"collection"`) still falls
+/// through to the fallback — only the empty case is coalesced. Sharing this
+/// one helper keeps `build_destination` and `destination_root` in lock-step
+/// (guarded by `destination_root_matches_build_destination_root`).
+fn routing_media_type(result: &tmdb::TmdbResult) -> &str {
+    if result.media_type.is_empty() {
+        "movie"
+    } else {
+        result.media_type.as_str()
+    }
+}
+
 fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
     // Source extension wins. Pre-0.25.7 this hardcoded ".mkv" for the
     // movie branch, which collided when keep_iso=true left both the
@@ -1192,7 +1220,7 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
         .unwrap_or("mkv");
     if let Some(result) = tmdb {
         let safe_title = crate::util::sanitize_path_display(&result.title);
-        match result.media_type.as_str() {
+        match routing_media_type(result) {
             "movie" if !cfg.movie_dir.is_empty() => {
                 let year_str = if result.year > 0 {
                     format!(" ({})", result.year)
@@ -1293,7 +1321,7 @@ fn resolve_media_root(output_dir: &str, sub: &str) -> String {
 /// owned String now that the root is computed, not a borrowed cfg field.)
 fn destination_root(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>) -> String {
     if let Some(result) = tmdb {
-        match result.media_type.as_str() {
+        match routing_media_type(result) {
             "movie" if !cfg.movie_dir.is_empty() => {
                 return resolve_media_root(&cfg.output_dir, &cfg.movie_dir);
             }
@@ -1716,6 +1744,47 @@ mod tests {
         assert_eq!(
             dest,
             "/out/Movies/Aurora Drift Two (2024)/Aurora Drift Two (2024).mkv"
+        );
+    }
+
+    // ===================================================================
+    // Drive 4K UHD mis-file (2026-07-22): a disc that rips but gets NO TMDB
+    // match writes `media_type: ""` into its .done marker. That empty string
+    // must route as a movie (the documented absent-default), filing under
+    // movies/Title (Year)/ — NOT fall through to the output_dir ROOT, which
+    // dumped the 53 GB MKV at the bare library root as
+    // `/mnt/media//Drive 2011 - 4K Ultra HD.mkv` (no per-title folder).
+    // ===================================================================
+    #[test]
+    fn build_destination_empty_media_type_files_as_movie() {
+        let cfg = cfg_with_dirs("movies", "tv", "/mnt/media/");
+        // A no-TMDB-match rip: title from the disc label, year 0, media_type "".
+        let tmdb = Some(tmdb::TmdbResult {
+            title: "Drive (2011) - 4K Ultra HD".into(),
+            year: 0,
+            poster_url: String::new(),
+            overview: String::new(),
+            media_type: String::new(),
+        });
+        let dest = build_destination(&cfg, &tmdb, "Drive (2011) - 4K Ultra HD.mkv");
+        // Files under the movie library in a per-title folder. (sanitize_path_display
+        // strips the parens from the disc-label title — same reason the mis-filed
+        // name lacked them — so the leaf is "Drive 2011 - 4K Ultra HD".)
+        assert_eq!(
+            dest, "/mnt/media/movies/Drive 2011 - 4K Ultra HD/Drive 2011 - 4K Ultra HD.mkv",
+            "an empty media_type must route as a movie, not dump at the output root"
+        );
+        // ...and specifically NOT the bare library root (the actual bug).
+        assert!(
+            !dest.starts_with("/mnt/media//"),
+            "empty media_type must not fall through to the output_dir root dump"
+        );
+        // destination_root must agree (it's what validate_destination_root
+        // checks) — the movie library root, not the bare share root.
+        assert_eq!(
+            destination_root(&cfg, &tmdb),
+            "/mnt/media/movies",
+            "destination_root must coalesce empty media_type to the movie root, in lock-step"
         );
     }
 
