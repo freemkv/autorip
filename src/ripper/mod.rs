@@ -2268,7 +2268,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         key_outage = reach;
     }
 
-    let keys = disc.decrypt_keys();
+    // Base decode keys. `mut` because the shared FMTS pre-decode step below may
+    // re-derive them after banking forensic index keys onto the disc, so BOTH
+    // rip paths (single-pass feeds `keys` straight into the inline reader) see
+    // the complete key pool.
+    let mut keys = disc.decrypt_keys();
 
     // No-keys decision. An encrypted disc with no usable keys can still be swept
     // to a raw ISO (the sweep uses `decrypt: false`); only the MUX needs keys.
@@ -2656,11 +2660,124 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // 0.0 in single-pass mode or when no unreadable sectors exist.
     let mut main_lost_ms_for_history_outer = 0.0f64;
 
-    // Retained FMTS forensic key map — set by the pre-rip gate (inside the sweep
-    // block below) and read by the live single-pass mux (after that block), so it
-    // must be declared here at the function-body level to bridge the two scopes.
-    // `None` for every non-FMTS disc, leaving the single-pass read walk unchanged.
+    // Retained FMTS forensic key map — set by the shared pre-decode gate BELOW
+    // (which runs for BOTH rip paths, before the workflow split) and read by the
+    // live single-pass inline reader after the split. Declared here to bridge
+    // those scopes. `None` for every non-FMTS disc.
     let mut fmts_key_map: Option<std::sync::Arc<libfreemkv::decrypt::AacsKeyMap>> = None;
+    // On-decrypt-miss key fetch. Online/sample-driven sources resolve only the
+    // CPS units sampled up front; when a read hits an orphan unit no held key
+    // opens, this asks the SAME key sources with that unit's ciphertext, caches
+    // the returned key, and retries — recovering an orphan CPS unit (e.g. a
+    // bonus clip not reachable from any playlist) instead of hard-failing the
+    // read. `None` for non-AACS discs. Built once, shared (cloned Arc) into the
+    // sweep and patch read paths; the mux reads main-title (already-resolved)
+    // extents only, so it doesn't need it. Only its consumers are the FMTS gate
+    // below and the multipass sweep/patch, so skip building it (and its live-drive
+    // MKB read) for a single-pass non-FMTS disc, where nothing reads it.
+    let key_fetch: Option<libfreemkv::sector::KeyFetch> = disc
+        .inputs()
+        .filter(|_| disc.format == libfreemkv::DiscFormat::Fmts || cfg_read.max_retries > 0)
+        .map(|mut inputs| {
+            // The live scan reads the MKB for the up-front resolve but does NOT
+            // retain it on the disc state, so `disc.inputs()` carries an EMPTY
+            // MKB. An online key service NEEDS the MKB to derive an orphan unit's
+            // key (decode rejects `mkb=0` with 404). Read it once here so every
+            // refetch request carries the full inf+MKB, exactly like the up-front
+            // resolve did. One drive read at rip start; `inf` filled too if absent.
+            if inputs.mkb.is_empty() {
+                if let Ok((inf, mkb, _version)) =
+                    libfreemkv::Disc::read_aacs_inputs_from_drive(&mut session.drive)
+                {
+                    if inputs.unit_key_ro.is_empty() {
+                        inputs.unit_key_ro = inf;
+                    }
+                    inputs.mkb = mkb;
+                }
+            }
+            let cfg = Arc::clone(cfg);
+            let make: std::sync::Arc<
+                dyn Fn() -> Vec<Box<dyn libfreemkv::keysource::KeySource>> + Send + Sync,
+            > = std::sync::Arc::new(move || {
+                // Recover the guard if the config lock was poisoned by a panicking
+                // settings writer, rather than panicking this rip thread — matches
+                // the file's graceful-degradation convention.
+                crate::keysource::build_sources(&cfg.read().unwrap_or_else(|e| e.into_inner()))
+            });
+            libfreemkv::keysource::key_fetch(inputs, make)
+        });
+
+    // ── Shared pre-decode: FMTS forensic key resolution (BOTH rip paths) ──
+    // Key resolution is a DECODE concern, so it runs here — before the single-
+    // pass/multipass workflow split — and both paths consume the result the same
+    // way. It used to be nested in the multipass-only reader block, so single-
+    // pass FMTS got neither the gate nor the read plan (its inline reader muxed
+    // the alternate device-group half as garbage). Base keys already passed the
+    // gate above; the forensic index keys are online-only and used to be resolved
+    // only at mux, so a base-keyed-but-forensic-missing FMTS disc swept for ~an
+    // hour and THEN failed. Prove the full (base + per-index-phase) map up front
+    // off the live drive — the `resolve_mux_key_map` seam does base + FMTS and
+    // folds the forensic keys into the pool. Fail fast unless the operator opted
+    // into capture-without-keys. Non-FMTS discs are unaffected (base gate already
+    // ran; `key_fetch` is `None` for CSS and for single-pass non-FMTS).
+    //
+    // The resolved map is retained (`fmts_key_map`, declared at the function
+    // body level) so the LIVE single-pass mux reads only our-phase units —
+    // without it, single-pass FMTS would pass the alternate device-group half
+    // to the demux (the pre-fix bug).
+    if disc.format == libfreemkv::DiscFormat::Fmts {
+        let gate_title = disc.titles[0].clone();
+        let mut gate_keys = disc.decrypt_keys();
+        let resolved_map = libfreemkv::resolve_mux_key_map(
+            &mut session.drive,
+            &gate_title,
+            &mut gate_keys,
+            key_fetch.as_ref(),
+            disc.content_format,
+        );
+        match fmts_gate_decision(resolved_map.is_ok(), cfg_read.capture_without_keys) {
+            FmtsGate::Proceed => {
+                // Bank the resolved forensic keys onto the disc so the sweep's
+                // key persist + the mux reuse them.
+                if let libfreemkv::decrypt::DecryptKeys::Aacs { unit_keys, .. } = &gate_keys {
+                    if let Some(a) = disc.aacs.as_mut() {
+                        a.unit_keys = unit_keys.clone();
+                    }
+                }
+                // Re-derive the shared decode keys so BOTH paths see the forensic
+                // index keys just banked. This is essential for SINGLE-PASS, whose
+                // inline reader is handed `keys` directly (a stale base-only pool
+                // would miss the `fmts_key_map` forensic slots → DecryptFailed).
+                // Multi-pass re-resolves its own map from the ISO at resume-mux, so
+                // for it this is harmless; the `fmts_key_map` below is consumed only
+                // by the single-pass inline reader (via `with_key_map`).
+                keys = disc.decrypt_keys();
+                fmts_key_map = resolved_map.ok().map(std::sync::Arc::new);
+                crate::log::device_log(device, "FMTS: complete forensic key map resolved pre-rip.");
+            }
+            FmtsGate::CaptureOnly => {
+                crate::log::device_log(
+                    device,
+                    "FMTS: forensic keys unavailable — capturing raw ISO now \
+                         (Capture Discs Without Keys is on); decode deferred until keys arrive.",
+                );
+            }
+            FmtsGate::Skip => {
+                crate::log::device_log(
+                    device,
+                    "FMTS: forensic keys missing — not ripping. Enable \
+                         \"capture without keys\" to save an ISO for later.",
+                );
+                update_state_with(device, |s| {
+                    s.status = "error".to_string();
+                    s.last_error = "FMTS forensic keys missing — not ripping.".to_string();
+                });
+                unregister_halt(device);
+                return;
+            }
+        }
+    }
+
     let reader: Box<dyn libfreemkv::SectorSource> = if cfg_read.max_retries > 0 {
         let iso_path = std::path::Path::new(&iso_path_str);
         let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
@@ -2793,111 +2910,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // `format_pass_error` rather than surfacing a bare internal
         // strategy identifier to the operator.
         let mut last_sweep_err: Option<libfreemkv::Error> = None;
-
-        // On-decrypt-miss key fetch. Online/sample-driven sources resolve only the
-        // CPS units sampled up front; when a read hits an orphan unit no held key
-        // opens, this asks the SAME key sources with that unit's ciphertext, caches
-        // the returned key, and retries — recovering an orphan CPS unit (e.g. a
-        // bonus clip not reachable from any playlist) instead of hard-failing the
-        // read. `None` for non-AACS discs. Built once, shared (cloned Arc) into the
-        // sweep and patch read paths; the mux reads main-title (already-resolved)
-        // extents only, so it doesn't need it.
-        let key_fetch: Option<libfreemkv::sector::KeyFetch> = disc.inputs().map(|mut inputs| {
-            // The live scan reads the MKB for the up-front resolve but does NOT
-            // retain it on the disc state, so `disc.inputs()` carries an EMPTY
-            // MKB. An online key service NEEDS the MKB to derive an orphan unit's
-            // key (decode rejects `mkb=0` with 404). Read it once here so every
-            // refetch request carries the full inf+MKB, exactly like the up-front
-            // resolve did. One drive read at rip start; `inf` filled too if absent.
-            if inputs.mkb.is_empty() {
-                if let Ok((inf, mkb, _version)) =
-                    libfreemkv::Disc::read_aacs_inputs_from_drive(&mut session.drive)
-                {
-                    if inputs.unit_key_ro.is_empty() {
-                        inputs.unit_key_ro = inf;
-                    }
-                    inputs.mkb = mkb;
-                }
-            }
-            let cfg = Arc::clone(cfg);
-            let make: std::sync::Arc<
-                dyn Fn() -> Vec<Box<dyn libfreemkv::keysource::KeySource>> + Send + Sync,
-            > = std::sync::Arc::new(move || {
-                // Recover the guard if the config lock was poisoned by a panicking
-                // settings writer, rather than panicking this rip thread — matches
-                // the file's graceful-degradation convention.
-                crate::keysource::build_sources(&cfg.read().unwrap_or_else(|e| e.into_inner()))
-            });
-            libfreemkv::keysource::key_fetch(inputs, make)
-        });
-
-        // ── FMTS: resolve the COMPLETE forensic key map BEFORE the sweep ──
-        // Base keys already passed the gate above; the forensic index keys are
-        // online-only and used to be resolved only at mux, so a base-keyed-but-
-        // forensic-missing FMTS disc swept for ~an hour and THEN failed. Prove the
-        // full (base + per-index-phase) map up front off the live drive — the
-        // `resolve_mux_key_map` seam does base + FMTS and folds the forensic keys
-        // into the pool. Fail fast unless the operator opted into capture-without-
-        // keys (then sweep the raw ISO to decode later). Non-FMTS discs are
-        // unaffected (their base gate already ran).
-        //
-        // The resolved map is retained (`fmts_key_map`, declared at the function
-        // body level) so the LIVE single-pass mux reads only our-phase units —
-        // without it, single-pass FMTS would pass the alternate device-group half
-        // to the demux (the pre-fix bug).
-        if disc.format == libfreemkv::DiscFormat::Fmts {
-            let gate_title = disc.titles[0].clone();
-            let mut gate_keys = disc.decrypt_keys();
-            let resolved_map = libfreemkv::resolve_mux_key_map(
-                &mut session.drive,
-                &gate_title,
-                &mut gate_keys,
-                key_fetch.as_ref(),
-                disc.content_format,
-            );
-            match fmts_gate_decision(resolved_map.is_ok(), cfg_read.capture_without_keys) {
-                FmtsGate::Proceed => {
-                    // Bank the resolved forensic keys onto the disc so the sweep's
-                    // key persist + the mux reuse them.
-                    if let libfreemkv::decrypt::DecryptKeys::Aacs { unit_keys, .. } = &gate_keys {
-                        if let Some(a) = disc.aacs.as_mut() {
-                            a.unit_keys = unit_keys.clone();
-                        }
-                    }
-                    // Retain the resolved map so the LIVE single-pass mux (inline
-                    // DiscStream) reads ONLY our-phase units — the same fix the
-                    // file-backed highway applies. The banked keys above align with
-                    // the map's slots (both derive from `gate_keys`). Multi-pass
-                    // ignores this: it sweeps a full ISO, then the highway re-resolves
-                    // its own map at resume-mux.
-                    fmts_key_map = resolved_map.ok().map(std::sync::Arc::new);
-                    crate::log::device_log(
-                        device,
-                        "FMTS: complete forensic key map resolved pre-rip.",
-                    );
-                }
-                FmtsGate::CaptureOnly => {
-                    crate::log::device_log(
-                        device,
-                        "FMTS: forensic keys unavailable — capturing raw ISO now \
-                         (Capture Discs Without Keys is on); decode deferred until keys arrive.",
-                    );
-                }
-                FmtsGate::Skip => {
-                    crate::log::device_log(
-                        device,
-                        "FMTS: forensic keys missing — not ripping. Enable \
-                         \"capture without keys\" to save an ISO for later.",
-                    );
-                    update_state_with(device, |s| {
-                        s.status = "error".to_string();
-                        s.last_error = "FMTS forensic keys missing — not ripping.".to_string();
-                    });
-                    unregister_halt(device);
-                    return;
-                }
-            }
-        }
 
         'pass1: loop {
             attempt += 1;
