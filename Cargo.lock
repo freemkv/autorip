@@ -328,7 +328,6 @@ dependencies = [
 [[package]]
 name = "freemkv-i18n"
 version = "1.5.2"
-source = "git+https://github.com/freemkv/freemkv-i18n?tag=v1.5.2#52308c1f3da1ea7554058fe7dad1c5be2941efa6"
 dependencies = [
  "serde_json",
 ]
@@ -336,7 +335,6 @@ dependencies = [
 [[package]]
 name = "freemkv-keysources"
 version = "1.5.2"
-source = "git+https://github.com/freemkv/freemkv-keysources?tag=v1.5.2#89a0b6ecb2fcf5bdfdbd64970b6975e8b7879573"
 dependencies = [
  "base64",
  "flate2",
@@ -350,7 +348,6 @@ dependencies = [
 [[package]]
 name = "freemkv-unlock"
 version = "1.5.2"
-source = "git+https://github.com/freemkv/freemkv-unlock?tag=v1.5.2#93588379c6291d252caf2186a4afef52eb236fd8"
 dependencies = [
  "aes",
  "base64",
@@ -552,7 +549,6 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libfreemkv"
 version = "1.5.2"
-source = "git+https://github.com/freemkv/libfreemkv?tag=v1.5.2#ff349fa61b672ccafb543bb56828d1433c07bcb6"
 dependencies = [
  "aes",
  "base64",

@@ -6022,6 +6022,7 @@ fn format_lib_error(phase: &str, e: &libfreemkv::Error) -> String {
              standard video disc."
         }
         Error::MkvInvalid => "the muxed output is not a valid MKV file.",
+        Error::Mp4Invalid => "the source MP4 file is malformed or truncated.",
         Error::Halted => "the rip was stopped.",
         Error::MapfileInvalid { .. } => {
             "the recovery map for a previous attempt is corrupt. Start a fresh rip to \
