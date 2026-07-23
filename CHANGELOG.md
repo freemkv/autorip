@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- CSS DVDs no longer rip to corrupt video. The rip handed the mux a disc-wide
+  key of `None` on a CSS detection miss, muxing scrambled sectors as plaintext;
+  key resolution now happens per-title at read time (via libfreemkv 1.5.2), so
+  the same disc decrypts correctly. Verified: 0 decode errors (was 328k).
+- Single-pass FMTS (AACS 2.1 UHD) now decrypts correctly. The forensic key gate
+  and read plan were nested in the multipass-only path, so a single-pass FMTS rip
+  muxed the alternate device-group half as garbage. Key resolution is now a shared
+  pre-decode step both rip paths use, with the forensic keys threaded into the
+  single-pass reader.
 - A rip with no TMDB match now files under the movie library instead of the
   share root. An empty `media_type` matched neither the movie nor TV branch and
   fell through to `output_dir`; it now coalesces to `movie`, so the disc files as
