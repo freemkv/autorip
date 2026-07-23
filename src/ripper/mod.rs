@@ -151,6 +151,19 @@ pub(crate) fn disc_is_3d(disc: &libfreemkv::Disc) -> bool {
     })
 }
 
+/// True when an `io::Error` from a mux construction call (`build_iso_pipeline` /
+/// `DiscStream::new`) is a user Stop (`Error::Halted`, code E6010) — vs a
+/// structural failure that must be quarantined. `Error` Displays as `E<code>`
+/// (Halted has no payload) or `E<code>: <data>`, so the code is ALWAYS the
+/// leading token: match it EXACTLY, never a substring-scan — a data payload that
+/// merely contains the digits (e.g. a `NoDiscKey` disc-hash rendering to
+/// `E7022: …E6010…`) must not be misread as a halt.
+pub(crate) fn is_halt_error(e: &std::io::Error) -> bool {
+    let s = e.to_string();
+    let code = s.split([':', ' ', '\n']).next().unwrap_or("");
+    code == format!("E{}", libfreemkv::error::E_HALTED)
+}
+
 /// The output file extension for a rip of `disc`: `mk3d` for a 3D main feature
 /// (Matroska stereoscopic video — RFC 9559 §27.18.3), `m2ts` for the TS
 /// passthrough, else `mkv`. `.mk3d` is byte-identical Matroska; only the
@@ -949,10 +962,12 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // slow remote link can take a minute or two — tell the user we're waiting on
     // it so the pause isn't mistaken for a hang. (Online sources are exactly the
     // ones that `needs_samples()`.)
-    // DVD decryption is CSS — fully resolved by libfreemkv's scan. The AACS
-    // key-resolution path (MKB / Unit_Key_RO.inf / sample units / keyserver)
-    // does not apply to a DVD; running it reads the disc as if it were AACS/UHD
-    // and is pure waste (and was where DVD scans stalled). Skip it for DVD.
+    // DVD decryption is CSS — resolved keylessly per title at read/mux time (the
+    // scan does no CSS key work beyond the bus-auth unlock), so there is nothing
+    // to fetch here. The AACS key-resolution path (MKB / Unit_Key_RO.inf / sample
+    // units / keyserver) does not apply to a DVD; running it reads the disc as if
+    // it were AACS/UHD and is pure waste (and was where DVD scans stalled). Skip
+    // it for DVD.
     let (disc, key_outcome, key_reach) = if matches!(disc.format, libfreemkv::DiscFormat::Dvd) {
         tracing::info!(device = %device, "resolve_keys: skipped (DVD/CSS — no AACS)");
         (disc, crate::keysource::KeyOutcome::Resolved, None)
@@ -4403,12 +4418,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Debug log reader type for mux - confirms ISO vs drive source
     tracing::debug!(target: "mux", " mux using reader: {}", if cfg_read.max_retries > 0 { "ISO file (multipass)" } else { "physical drive" });
 
-    // 0.18 round 2: DiscStream gets the per-device `Halt` at
-    // construction via the new `with_halt(...)` builder. Stop
-    // interrupts `fill_extents` at the next retry boundary on the
-    // same signal that breaks sweep, patch, and the mux frame loop —
-    // required for Stop to work during dense bad-sector regions
-    // where the outer PES read() loop may never emit a frame.
+    // DiscStream gets the per-device `Halt` at construction (passed
+    // directly to `DiscStream::new`, so it also covers the CSS crack
+    // that runs there). Stop interrupts `fill_extents` at the next
+    // retry boundary on the same signal that breaks sweep, patch, and
+    // the mux frame loop — required for Stop to work during dense
+    // bad-sector regions where the outer PES read() loop may never
+    // emit a frame.
     //
     // Multipass ISO path: wrap the reader in a `PrefetchedSectorSource`
     // so the read+decrypt work runs on a dedicated producer thread
@@ -4456,6 +4472,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             keys,
             batch,
             format,
+            false,
             Some(halt_token.clone()),
             Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
             // Fresh-key-on-failure fetch: recover a 2nd/Nth CPS-unit key MID-MUX
@@ -4466,6 +4483,21 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         ) {
             Ok(s) => Box::new(s),
             Err(e) => {
+                // A Stop pressed during the CSS crack inside pipeline construction
+                // surfaces as `Error::Halted` — a user halt, not a structural
+                // failure: preserve staging for auto-resume, no `.failed` marker.
+                // Classify on the ERROR (not the halt token): build_iso_pipeline
+                // has fallible steps AFTER the crack (AACS key map, thread spawn),
+                // and a genuine failure there that coincides with a cancelled
+                // token must still be quarantined, not masked as a stop.
+                if is_halt_error(&e) {
+                    crate::log::device_log(
+                        device,
+                        "Rip stopped by user during mux setup — staging preserved for resume.",
+                    );
+                    unregister_halt(device);
+                    return;
+                }
                 tracing::error!(target: "mux", device=%device, "build_iso_pipeline failed: {e}");
                 let msg = format!(
                     "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
@@ -4496,8 +4528,49 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // replicate that retry policy, so for live-disc reads we
         // keep the in-place fill loop. Same `on_event` closure as
         // the highway path so the UI gets one event stream.
-        let mut s = libfreemkv::DiscStream::new(reader, title, keys, batch, format)
-            .with_halt(halt_token.clone());
+        let mut s = match libfreemkv::DiscStream::new(
+            reader,
+            title,
+            keys,
+            batch,
+            format,
+            false,
+            Some(halt_token.clone()),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // A Stop pressed during construction (the CSS crack runs in
+                // `DiscStream::new`) surfaces as `Error::Halted` — a user halt,
+                // not a permanent failure. Preserve staging for resume; do NOT
+                // quarantine. Classify on the error, not the halt token.
+                if is_halt_error(&e) {
+                    crate::log::device_log(
+                        device,
+                        "Rip stopped by user during mux setup — staging preserved for resume.",
+                    );
+                    unregister_halt(device);
+                    return;
+                }
+                // Same structural-failure path as the highway branch above: a
+                // title/stream layout that can't be prepared (incl. a
+                // scrambled-but-uncrackable CSS DVD → CssKeyMissing) is permanent.
+                tracing::error!(target: "mux", device=%device, "DiscStream setup failed: {e}");
+                let msg = format!(
+                    "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
+                );
+                crate::log::device_log(device, &msg);
+                let staging_disc_path = std::path::Path::new(&staging);
+                staging::write_failed_marker(staging_disc_path, &msg);
+                staging::clear_restart_count(staging_disc_path);
+                update_state_with(device, |s| {
+                    s.status = "failed".to_string();
+                    s.last_error = msg.clone();
+                    s.failure_reason = Some(msg.clone());
+                });
+                unregister_halt(device);
+                return;
+            }
+        };
         // FMTS live single-pass: read only our-phase units (the retained pre-rip
         // map decides which), so the alternate device-group half never reaches the
         // demux — the same fix the file-backed highway applies. `None` for every
@@ -8406,6 +8479,36 @@ mod tests {
         assert!(
             loss_aborts(0, f64::NAN, u64::MAX),
             "NaN loss must abort even under the accept-loss override"
+        );
+    }
+
+    #[test]
+    fn is_halt_error_matches_only_the_leading_code_token() {
+        use super::is_halt_error;
+        // The real Halted → io::Error conversion must classify as a halt.
+        let halted: std::io::Error = libfreemkv::Error::Halted.into();
+        assert!(
+            is_halt_error(&halted),
+            "Error::Halted must classify as a halt"
+        );
+        assert!(
+            is_halt_error(&std::io::Error::other("E6010")),
+            "bare E6010 (Halted has no payload) must match"
+        );
+        // Structural failures must NOT be masked as a halt — including the exact
+        // round-4 adversarial case: a NoDiscKey whose hex disc-hash payload merely
+        // CONTAINS the digits E6010.
+        assert!(
+            !is_halt_error(&std::io::Error::other("E7022: 0x1234E6010ABCD")),
+            "a NoDiscKey hash containing E6010 must NOT be read as a halt"
+        );
+        assert!(
+            !is_halt_error(&std::io::Error::other("E7023: css key missing")),
+            "CssKeyMissing must still quarantine, not mask as a halt"
+        );
+        assert!(
+            !is_halt_error(&std::io::Error::other("E60100: some other code")),
+            "a longer code with E6010 as a prefix must NOT match"
         );
     }
 

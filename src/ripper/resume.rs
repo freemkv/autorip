@@ -1066,6 +1066,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         keys,
         batch,
         format,
+        false,
         Some(halt_token.clone()),
         Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
         // Fresh-key-on-failure fetch: recover a 2nd/Nth CPS-unit key MID-MUX by
@@ -1078,6 +1079,19 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     ) {
         Ok(s) => Box::new(s),
         Err(e) => {
+            // A Stop during the resume-mux CSS crack surfaces as `Error::Halted`:
+            // leave staging intact (the .ripped marker + ISO + mapfile stay) so
+            // the next resume retries, without flagging a spurious error. Classify
+            // on the error, not the halt token — a genuine build failure that
+            // coincides with a cancelled token must still surface as an error.
+            if super::is_halt_error(&e) {
+                crate::log::device_log(
+                    device,
+                    "Auto-resume mux stopped by user; staging preserved.",
+                );
+                super::unregister_halt(device);
+                return;
+            }
             tracing::error!(target: "mux", device=%device, "build_iso_pipeline failed: {e}");
             let msg = format!(
                 "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
