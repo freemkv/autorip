@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::session::device_halt;
 use super::state::{RipState, update_state};
@@ -776,8 +776,12 @@ pub(crate) struct IsoMuxSource {
 /// - `on_output_opened`  → `opened` flag (drives `output_opened` in the outcome
 ///   mapping).
 /// - `on_sector_skipped` / `on_read_error` → refresh `wd_last_frame`;
-///   `on_sector_skipped` also bumps `input_errors`. (~never fire on the highway.)
-/// - `on_batch_size_changed` → `rip_current_batch`. (~never fires on the highway.)
+///   `on_sector_skipped` also stores the skipped LBA into `rip_last_lba` (the UI
+///   last_sector / playhead), bumps `input_errors`, and logs the per-skip
+///   `Sector N skipped (zero-filled)` line. (Fire on the LIVE inline single-pass
+///   path from `DiscStream::fill_extents`; ~never on the ISO highway.)
+/// - `on_batch_size_changed` → `rip_current_batch` + the `Batch size → N (…)`
+///   device-log line. (Live inline path only; ~never fires on the highway.)
 struct AutoripMuxEvents {
     ui: UiState,
     atomics: SharedAtomics,
@@ -938,17 +942,46 @@ impl libfreemkv::MuxEvents for AutoripMuxEvents {
         );
     }
 
-    fn on_sector_skipped(&self, _lba: u32) {
+    fn on_sector_skipped(&self, lba: u32) {
         self.atomics
             .wd_last_frame
             .store(crate::util::epoch_secs(), Ordering::Relaxed);
+        // Store the skipped LBA into `rip_last_lba` — the UI last_sector /
+        // playhead atomic `push_mux_state` reads — AND emit the per-skip
+        // device-log line, exactly as the pre-refactor `make_stream_event_fn`
+        // did (mod.rs `SectorSkipped` arm: `last_lba.store(sector)` +
+        // `"Sector {sector} skipped (zero-filled)"`). These fire on the LIVE
+        // inline single-pass path from `DiscStream::fill_extents`; dropping them
+        // froze `last_sector` and lost the record of which sectors were
+        // zero-filled during a skip-heavy live rip. The `input_errors` bump is
+        // additive (kept from the post-refactor bridge, surfaces the skip count).
+        self.atomics
+            .rip_last_lba
+            .store(lba as u64, Ordering::Relaxed);
         self.atomics.input_errors.fetch_add(1, Ordering::Relaxed);
+        crate::log::device_log(
+            &self.ui.device,
+            &format!("Sector {} skipped (zero-filled)", lba),
+        );
     }
 
-    fn on_batch_size_changed(&self, batch: u16, _reason: libfreemkv::event::BatchSizeReason) {
+    fn on_batch_size_changed(&self, batch: u16, reason: libfreemkv::event::BatchSizeReason) {
         self.atomics
             .rip_current_batch
             .store(batch, Ordering::Relaxed);
+        // Emit the batch-change device-log line the pre-refactor
+        // `make_stream_event_fn` produced (mod.rs `BatchSizeChanged` arm).
+        // Fires on the live inline single-pass path from the adaptive sizer in
+        // `DiscStream::fill_extents`; restoring it keeps the operator-facing
+        // record of when/why the read batch adapted during a live rip.
+        let label = match reason {
+            libfreemkv::event::BatchSizeReason::Shrunk => "shrunk",
+            libfreemkv::event::BatchSizeReason::Probed => "probed up",
+        };
+        crate::log::device_log(
+            &self.ui.device,
+            &format!("Batch size → {} ({})", batch, label),
+        );
     }
 
     fn on_read_error(&self, _lba: u32) {
@@ -1219,6 +1252,10 @@ pub(crate) fn mux_iso(
         skip_errors: src.skip_errors,
         batch_sectors: inputs.batch,
         raw: src.raw,
+        // Bounded per-frame send: autorip's hard watchdog + container-restart
+        // model wants a wedged sink surfaced as a 60 s per-frame timeout, not an
+        // unbounded block. Preserves the pre-refactor `run_mux` behaviour.
+        send_deadline: Some(Duration::from_secs(60)),
     };
 
     crate::log::device_log(
@@ -1381,6 +1418,9 @@ pub(crate) fn mux_live(
         skip_errors: src.skip_errors,
         batch_sectors: inputs.batch,
         raw: false,
+        // Same bounded 60 s per-frame send as `mux_iso`: the live single-pass
+        // path is watchdog-backed too, so preserve the pre-refactor bound.
+        send_deadline: Some(Duration::from_secs(60)),
     };
 
     crate::log::device_log(
@@ -1791,6 +1831,88 @@ mod tests {
             events.opened.load(Ordering::Relaxed),
             "on_output_opened must set the opened flag"
         );
+    }
+
+    /// Regression D: `AutoripMuxEvents::on_sector_skipped` must store the
+    /// skipped LBA into `rip_last_lba` (the UI last_sector / playhead atomic
+    /// `push_mux_state` reads) — the pre-refactor `make_stream_event_fn` did
+    /// `last_lba.store(sector)` on every `SectorSkipped`. It must also refresh
+    /// the watchdog activity timestamp and bump `input_errors` (additive
+    /// behaviour kept from the post-refactor bridge).
+    ///
+    /// Mutation: reverting the handler to `_lba` unused (dropping the
+    /// `rip_last_lba.store(lba as u64, ...)`) leaves `rip_last_lba` at 0 and the
+    /// last_sector assertion fails.
+    #[test]
+    fn on_sector_skipped_stores_lba_into_rip_last_lba() {
+        use libfreemkv::MuxEvents;
+        let (atomics, _wd_bytes, wd_last_frame, _lbr) = test_shared_atomics();
+        let rip_last_lba = atomics.rip_last_lba.clone();
+        let input_errors = atomics.input_errors.clone();
+        let events = AutoripMuxEvents {
+            ui: test_ui_state(),
+            atomics,
+            progress: Mutex::new(crate::ripper::state::PassProgressState::new()),
+            last_update: Mutex::new(Instant::now()),
+            last_log: Mutex::new(Instant::now()),
+            opened: AtomicBool::new(false),
+        };
+
+        events.on_sector_skipped(4242);
+        assert_eq!(
+            rip_last_lba.load(Ordering::Relaxed),
+            4242,
+            "on_sector_skipped must store the skipped LBA into rip_last_lba \
+             (the UI last_sector / playhead), matching make_stream_event_fn"
+        );
+        assert_eq!(
+            input_errors.load(Ordering::Relaxed),
+            1,
+            "on_sector_skipped must still bump input_errors (additive)"
+        );
+        assert!(
+            wd_last_frame.load(Ordering::Relaxed) > 0,
+            "on_sector_skipped must refresh wd_last_frame (watchdog activity)"
+        );
+
+        // A later skip advances the playhead to the new LBA.
+        events.on_sector_skipped(9001);
+        assert_eq!(
+            rip_last_lba.load(Ordering::Relaxed),
+            9001,
+            "a subsequent skip must move the playhead forward"
+        );
+        assert_eq!(input_errors.load(Ordering::Relaxed), 2);
+    }
+
+    /// Regression D: `AutoripMuxEvents::on_batch_size_changed` must store the
+    /// new batch into `rip_current_batch` AND emit the batch-change device-log
+    /// line the pre-refactor `make_stream_event_fn` produced. We assert the
+    /// atomic store (the inspectable effect) and that the reason→label match is
+    /// exhaustive/panic-free for both variants (the log line is derived from it).
+    #[test]
+    fn on_batch_size_changed_stores_batch_and_logs() {
+        use libfreemkv::MuxEvents;
+        let (atomics, ..) = test_shared_atomics();
+        let rip_current_batch = atomics.rip_current_batch.clone();
+        let events = AutoripMuxEvents {
+            ui: test_ui_state(),
+            atomics,
+            progress: Mutex::new(crate::ripper::state::PassProgressState::new()),
+            last_update: Mutex::new(Instant::now()),
+            last_log: Mutex::new(Instant::now()),
+            opened: AtomicBool::new(false),
+        };
+
+        events.on_batch_size_changed(64, libfreemkv::event::BatchSizeReason::Shrunk);
+        assert_eq!(
+            rip_current_batch.load(Ordering::Relaxed),
+            64,
+            "on_batch_size_changed must store the new batch into rip_current_batch"
+        );
+        // Both variants must render (and log) without panicking.
+        events.on_batch_size_changed(128, libfreemkv::event::BatchSizeReason::Probed);
+        assert_eq!(rip_current_batch.load(Ordering::Relaxed), 128);
     }
 
     /// `map_iso_mux_outcome` preserves the pre-migration Err classification:
