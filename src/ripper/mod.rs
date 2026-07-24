@@ -2791,6 +2791,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             &mut gate_keys,
             key_fetch.as_ref(),
             disc.content_format,
+            // Thread the SAME cancel token the sweep polls: the resolve now unwinds
+            // at its next read boundary on a Stop by signature (the surrounding
+            // `gate_stopped()` checks only catch a Stop before/after the call).
+            Some(&halt_token),
         );
         if gate_stopped() {
             return;
