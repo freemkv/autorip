@@ -909,8 +909,18 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     crate::log::archive_device_log(device);
     crate::log::device_log(device, "Opening drive...");
 
-    let mut drive = match libfreemkv::Drive::open(std::path::Path::new(device_path)) {
-        Ok(d) => d,
+    // Drive open + SCSI bring-up (wait_ready/init/probe_disc — all advisory)
+    // now runs inside `DiscSession::open`; the advisory warns it emitted here
+    // are logged via the library's tracing (semantics unchanged). The owned
+    // `drive` comes back out after the scan (`into_drive`), so the rest of
+    // scan_disc — TMDB, resolve_keys, unlocker matrix, store_session — is
+    // untouched.
+    crate::log::device_log(device, "Initializing...");
+    let mut session = match libfreemkv::DiscSession::open(
+        libfreemkv::DeviceTarget::Path(std::path::PathBuf::from(device_path)),
+        libfreemkv::KeySpec::default(),
+    ) {
+        Ok(s) => s,
         Err(e) => {
             let msg = format_lib_error("Cannot open drive", &e);
             crate::log::device_log(device, &msg);
@@ -926,21 +936,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             return;
         }
     };
-    if let Err(e) = drive.wait_ready() {
-        tracing::warn!(device = %device, error = %e, "drive wait_ready failed (continuing)");
-    }
-    crate::log::device_log(device, "Initializing...");
-    if let Err(e) = drive.init() {
-        tracing::warn!(device = %device, error = %e, "drive init failed (continuing — scan may degrade)");
-    }
-    // Engage the drive's disc-type read mode before any read. Idempotent.
-    if let Err(e) = drive.probe_disc() {
-        tracing::warn!(device = %device, error = %e, "drive probe_disc failed (continuing)");
-    }
 
     // Fast identify — disc name only, no playlists
     crate::log::device_log(device, "Identifying disc...");
-    let disc_id = match libfreemkv::Disc::identify(&mut drive) {
+    let disc_id = match session.identify() {
         Ok(id) => id,
         Err(e) => {
             let msg = format_lib_error("Could not read the disc", &e);
@@ -1000,23 +999,24 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     let scan_wd = ScanWatchdog::arm(device);
     let scan_t0 = std::time::Instant::now();
     tracing::info!(device = %device, "scan: begin");
-    let disc = match libfreemkv::Disc::scan(&mut drive, &scan_opts) {
-        Ok(d) => d,
-        Err(e) => {
-            let msg = format_lib_error("Disc scan", &e);
-            crate::log::device_log(device, &msg);
-            update_state(
-                device,
-                RipState {
-                    device: device.to_string(),
-                    status: "error".to_string(),
-                    last_error: msg,
-                    ..Default::default()
-                },
-            );
-            return;
-        }
-    };
+    if let Err(e) = session.scan(scan_opts) {
+        let msg = format_lib_error("Disc scan", &e);
+        crate::log::device_log(device, &msg);
+        update_state(
+            device,
+            RipState {
+                device: device.to_string(),
+                status: "error".to_string(),
+                last_error: msg,
+                ..Default::default()
+            },
+        );
+        return;
+    }
+    // Decompose the session into the owned disc + live drive the rest of
+    // scan_disc (resolve_keys_from_drive, unlocker matrix, store_session) uses.
+    let disc = session.take_disc().expect("scan populated the disc");
+    let mut drive = session.into_drive();
     tracing::info!(device = %device, elapsed_ms = scan_t0.elapsed().as_millis() as u64, "scan: structure done");
     // Sample-based key source: resolve the Unit Key from the disc's files +
     // on-disc samples and re-scan with it (a no-op for a local source). The
@@ -6239,6 +6239,12 @@ fn format_lib_error(phase: &str, e: &libfreemkv::Error) -> String {
 /// Returns `Some(drive)` on success, or `None` once recovery is exhausted
 /// (the caller should `break 'pass1` — all per-attempt and STRATEGY_FAILURE
 /// logging is emitted here).
+// TODO(step1-followup): the SCSI transport-failure recovery ladder (this
+// backoff re-open plus the wait_ready/init/sense-inspection retry blocks in the
+// Pass-1 loop) is NOT folded into DiscSession::recover yet. It is entangled with
+// autorip's device_log/update_state UI, the `break 'pass1` control flow, and
+// disc-identity (volume-id) matching — moving it cleanly is out of the step-1
+// (read-only scan bring-up) scope. Left in autorip per contract Q3 default.
 fn open_drive_with_backoff(
     device: &str,
     attempt: u32,
