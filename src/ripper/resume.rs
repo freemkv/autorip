@@ -652,35 +652,18 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // also clear it.
     let _muxing_guard = ResumeMuxingGuard::acquire(device, &staging_dir);
 
-    // 2. Open the ISO via FileSectorSource.
-    let mut iso_reader = match libfreemkv::FileSectorSource::open(&iso_path) {
-        Ok(r) => r,
-        Err(e) => {
-            crate::log::device_log(
-                device,
-                &format!(
-                    "Auto-resume aborted: cannot open ISO {}: {}",
-                    iso_path.display(),
-                    e
-                ),
-            );
-            // Don't clear counter — fall through to next-restart's
-            // resume_or_quarantine_staging which will bump it.
-            return;
-        }
-    };
-
-    // 3. Disc::scan_image to recover Disc + titles. A sample-based key source
-    //    scans structure-only first (the title extents are needed to read the
-    //    on-disc samples), then resolves a key and re-scans with it (see
-    //    `resolve_keys_from_iso`). A local source resolves keys here.
-    // ISO scan: keyless, no handshake (so no drive credentials). Keys are
-    // resolved afterward in `resolve_keys_from_iso` via the source list.
+    // 2. Open + scan the ISO via the library's `scan_iso` entry point (opens a
+    //    FileSectorSource, reads capacity, runs the structure scan). A
+    //    sample-based key source scans structure-only first (the title extents
+    //    are needed to read the on-disc samples), then resolves a key and
+    //    re-scans with it (see `resolve_keys_from_iso`). A local source resolves
+    //    keys here. ISO scan: keyless, no handshake (so no drive credentials).
+    //    Keys are resolved afterward in `resolve_keys_from_iso` via the source
+    //    list. The reader is not reused here — `resolve_keys_from_iso` opens its
+    //    own handle for ciphertext sampling.
     let struct_opts = crate::keysource::iso_scan_opts();
-    use libfreemkv::SectorSource;
-    let capacity = iso_reader.capacity_sectors();
-    let disc = match libfreemkv::Disc::scan_image(&mut iso_reader, capacity, &struct_opts) {
-        Ok(d) => d,
+    let disc = match libfreemkv::scan_iso(&iso_path, struct_opts) {
+        Ok((d, _reader)) => d,
         Err(e) => {
             crate::log::device_log(
                 device,
