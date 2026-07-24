@@ -164,6 +164,21 @@ pub(crate) fn is_halt_error(e: &std::io::Error) -> bool {
     code == format!("E{}", libfreemkv::error::E_HALTED)
 }
 
+/// True when an `io::Error` from a mux construction call (`build_iso_pipeline`)
+/// is a missing-FMTS-forensic-key error (`Error::FmtsKeyMissing`, code E7026):
+/// the disc's base AACS keys resolved but its online-only per-index-phase
+/// forensic keys did not, so the mux can't proceed. On the resume / deferred-mux
+/// path this is treated as a retryable DEFERRAL (preserve the ISO, wait for keys),
+/// not a hard failure — mirroring the no-keys capture deferral. Uses the same
+/// exact-leading-token match as [`is_halt_error`] (`Error` Displays as `E<code>`
+/// or `E<code>: <data>`), never a substring scan, so a data payload that merely
+/// contains the digits can't false-match.
+pub(crate) fn is_fmts_key_missing_error(e: &std::io::Error) -> bool {
+    let s = e.to_string();
+    let code = s.split([':', ' ', '\n']).next().unwrap_or("");
+    code == format!("E{}", libfreemkv::error::E_FMTS_KEY_MISSING)
+}
+
 /// The output file extension for a rip of `disc`: `mk3d` for a 3D main feature
 /// (Matroska stereoscopic video — RFC 9559 §27.18.3), `m2ts` for the TS
 /// passthrough, else `mkv`. `.mk3d` is byte-identical Matroska; only the
@@ -172,6 +187,19 @@ pub(crate) fn output_extension_for(output_format: &str, disc: &libfreemkv::Disc)
     match output_format {
         "m2ts" => "m2ts",
         _ if disc_is_3d(disc) => "mk3d",
+        _ => "mkv",
+    }
+}
+
+/// The libfreemkv output URL SCHEME for a rip (`mkv` or `m2ts`). This is the
+/// muxer/container selector and is distinct from [`output_extension_for`]: a 3D
+/// rip keeps the `mkv://` scheme (libfreemkv has no `mk3d://` scheme — `.mk3d` is
+/// a filename suffix only, byte-identical Matroska). Using the `mk3d` extension as
+/// the scheme makes `libfreemkv::output` return `StreamUrlInvalid` and fails the
+/// mux, so scheme and extension must be derived separately.
+pub(crate) fn output_scheme_for(output_format: &str) -> &'static str {
+    match output_format {
+        "m2ts" => "m2ts",
         _ => "mkv",
     }
 }
@@ -272,6 +300,42 @@ fn fmts_gate_decision(map_resolved: bool, capture_without_keys: bool) -> FmtsGat
         FmtsGate::CaptureOnly
     } else {
         FmtsGate::Skip
+    }
+}
+
+/// The side-effect routing for each FMTS gate outcome, split out as a pure
+/// function so `rip_disc`'s gate handling is unit-testable (and mutation-
+/// verifiable) without driving a whole rip.
+///
+/// * `defer_forensic_mux` — arrange the deferred-capture mux-skip. Base AACS keys
+///   are present (so the no-keys `keys_missing` skip won't fire), but the online-
+///   only forensic index keys are not — muxing now would emit forensic garbage. So
+///   BOTH mux-skip points honour this flag: single-pass surfaces the "enable multi-
+///   pass" guidance; multi-pass preserves the ISO for resume (and `resume_remux`
+///   re-defers on `FmtsKeyMissing`), exactly like the no-keys capture flow.
+/// * `quarantine` — write the `.failed` marker + clear the restart count so the
+///   skipped disc's staging dir is cleaned up like every other early-failure exit
+///   in `rip_disc`, instead of being left empty and marker-less until a restart.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct FmtsGatePlan {
+    defer_forensic_mux: bool,
+    quarantine: bool,
+}
+
+fn fmts_gate_plan(gate: FmtsGate) -> FmtsGatePlan {
+    match gate {
+        FmtsGate::Proceed => FmtsGatePlan {
+            defer_forensic_mux: false,
+            quarantine: false,
+        },
+        FmtsGate::CaptureOnly => FmtsGatePlan {
+            defer_forensic_mux: true,
+            quarantine: false,
+        },
+        FmtsGate::Skip => FmtsGatePlan {
+            defer_forensic_mux: false,
+            quarantine: true,
+        },
     }
 }
 
@@ -2424,7 +2488,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
         format!("network://{}", cfg_read.network_target)
     } else {
-        format!("{}://{}", ext, output_path)
+        // Scheme is the container (mkv/m2ts), NOT the filename extension: a 3D rip
+        // writes `Title.mk3d` but must still mux through `mkv://` (no `mk3d://` scheme).
+        format!("{}://{}", output_scheme_for(&output_format), output_path)
     };
 
     crate::log::device_log(device, &format!("Ripping {} to {}", display_name, filename));
@@ -2665,6 +2731,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // live single-pass inline reader after the split. Declared here to bridge
     // those scopes. `None` for every non-FMTS disc.
     let mut fmts_key_map: Option<std::sync::Arc<libfreemkv::decrypt::AacsKeyMap>> = None;
+    // FMTS CaptureOnly deferral flag. Set true by the pre-decode gate below when it
+    // resolved an INCOMPLETE forensic key map but the operator opted into capture-
+    // without-keys. Base AACS keys are present (so `keys_missing` is false and the
+    // no-keys mux-skip won't fire), yet muxing now would emit forensic garbage — so
+    // both mux-skip points honour this to defer the mux and preserve the ISO,
+    // mirroring the no-keys capture flow. `false` for every other disc.
+    let mut defer_forensic_mux = false;
     // On-decrypt-miss key fetch. Online/sample-driven sources resolve only the
     // CPS units sampled up front; when a read hits an orphan unit no held key
     // opens, this asks the SAME key sources with that unit's ciphertext, caches
@@ -2726,6 +2799,29 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // without it, single-pass FMTS would pass the alternate device-group half
     // to the demux (the pre-fix bug).
     if disc.format == libfreemkv::DiscFormat::Fmts {
+        // Honor a Stop that lands during forensic key resolution. `resolve_mux_key_map`
+        // runs BEFORE the sweep and takes no cancel token, so a user Stop (marginal
+        // disc → repeated read-fault attempts, or a slow keyserver) can't interrupt it
+        // by signature. Gate the call with a halt check on the SAME `Arc<AtomicBool>`
+        // the sweep loop polls: a Stop before or right after the resolve exits cleanly
+        // — no `.failed` marker, because a Stop is not a failure — and libfreemkv's own
+        // read loops already poll this flag, so an in-flight resolve unwinds at its next
+        // read boundary and surfaces here on return.
+        let gate_stopped = || -> bool {
+            if halt.load(Ordering::Relaxed) {
+                crate::log::device_log(
+                    device,
+                    "Rip stopped by user during FMTS key resolution — staging preserved.",
+                );
+                unregister_halt(device);
+                true
+            } else {
+                false
+            }
+        };
+        if gate_stopped() {
+            return;
+        }
         let gate_title = disc.titles[0].clone();
         let mut gate_keys = disc.decrypt_keys();
         let resolved_map = libfreemkv::resolve_mux_key_map(
@@ -2735,7 +2831,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             key_fetch.as_ref(),
             disc.content_format,
         );
-        match fmts_gate_decision(resolved_map.is_ok(), cfg_read.capture_without_keys) {
+        if gate_stopped() {
+            return;
+        }
+        let gate = fmts_gate_decision(resolved_map.is_ok(), cfg_read.capture_without_keys);
+        // Pure side-effect routing (unit-tested via `fmts_gate_plan`): CaptureOnly sets
+        // the deferred-mux flag; Skip quarantines the staging dir. Driving both from the
+        // plan keeps the gate's behavior mutation-verifiable.
+        let plan = fmts_gate_plan(gate);
+        defer_forensic_mux = plan.defer_forensic_mux;
+        match gate {
             FmtsGate::Proceed => {
                 // Bank the resolved forensic keys onto the disc so the sweep's
                 // key persist + the mux reuse them.
@@ -2756,10 +2861,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 crate::log::device_log(device, "FMTS: complete forensic key map resolved pre-rip.");
             }
             FmtsGate::CaptureOnly => {
+                // `defer_forensic_mux` is now set (from `plan`), so the mux-skip below
+                // (single-pass) or the resume path (`resume_remux` re-defers on
+                // `FmtsKeyMissing`, multi-pass) will actually arrange the deferral this
+                // log promises — previously this arm was a no-op and the mux ran with
+                // base-only keys, producing garbage / a hard quarantine.
                 crate::log::device_log(
                     device,
                     "FMTS: forensic keys unavailable — capturing raw ISO now \
-                         (Capture Discs Without Keys is on); decode deferred until keys arrive.",
+                         (Capture Discs Without Keys is on); mux deferred until keys arrive.",
                 );
             }
             FmtsGate::Skip => {
@@ -2768,6 +2878,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     "FMTS: forensic keys missing — not ripping. Enable \
                          \"capture without keys\" to save an ISO for later.",
                 );
+                // Clean up the staging dir like every sibling early-failure exit in
+                // `rip_disc` (write the `.failed` marker + clear the restart count),
+                // instead of leaving an empty, marker-less dir orphaned until a
+                // container restart. Driven by `plan.quarantine` so the routing is
+                // pinned by `fmts_gate_plan`'s unit test.
+                if plan.quarantine {
+                    let staging_disc_path = std::path::Path::new(&staging);
+                    staging::write_failed_marker(
+                        staging_disc_path,
+                        "FMTS forensic keys missing — not ripping.",
+                    );
+                    staging::clear_restart_count(staging_disc_path);
+                }
                 update_state_with(device, |s| {
                     s.status = "error".to_string();
                     s.last_error = "FMTS forensic keys missing — not ripping.".to_string();
@@ -4394,33 +4517,62 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     //   - single-pass (max_retries == 0): live disc→MKV with no ISO
     //     intermediate. There's nothing to defer to, but we must NOT write a
     //     garbage MKV. Skip and surface the deferral reason.
-    if keys_missing {
+    // `defer_forensic_mux` (FMTS CaptureOnly) joins `keys_missing` here: the base
+    // AACS keys are present but the forensic index keys are not, so muxing now would
+    // emit garbage — defer it exactly like the no-keys capture flow. Multi-pass FMTS
+    // CaptureOnly normally returns via the `.ripped` hand-off above (and defers in
+    // `resume_remux` on `FmtsKeyMissing`); it only lands here on the rare
+    // marker-write-failure fallback, where preserving the ISO is still correct.
+    if keys_missing || defer_forensic_mux {
         let msg = keyless_failure_message(&disc);
         if cfg_read.max_retries > 0 {
-            crate::log::device_log(
-                device,
-                &format!(
-                    "Ripped to ISO — no keys, mux deferred. ISO + mapfile preserved in staging \
-                     ({staging}); auto-resume will mux once keys are available. {msg}"
-                ),
-            );
+            let (log_line, state_err) = if defer_forensic_mux {
+                (
+                    format!(
+                        "Ripped to ISO — forensic keys unavailable, mux deferred. ISO + mapfile \
+                         preserved in staging ({staging}); auto-resume will mux once keys are available."
+                    ),
+                    "Ripped to ISO — forensic keys unavailable, mux deferred.".to_string(),
+                )
+            } else {
+                (
+                    format!(
+                        "Ripped to ISO — no keys, mux deferred. ISO + mapfile preserved in staging \
+                         ({staging}); auto-resume will mux once keys are available. {msg}"
+                    ),
+                    format!("Ripped to ISO — no keys, mux deferred. {msg}"),
+                )
+            };
+            crate::log::device_log(device, &log_line);
             update_state_with(device, |s| {
                 s.status = "idle".to_string();
-                s.last_error = format!("Ripped to ISO — no keys, mux deferred. {msg}");
+                s.last_error = state_err;
             });
         } else {
-            crate::log::device_log(
-                device,
-                &format!(
-                    "Single-pass rip with no keys — cannot mux (no ISO captured). \
-                     Enable multi-pass mode to capture a deferred-mux ISO. {msg}"
-                ),
-            );
+            let (log_line, state_err) = if defer_forensic_mux {
+                (
+                    "FMTS single-pass rip — forensic keys unavailable, cannot mux (no ISO captured). \
+                     Enable multi-pass mode to capture a deferred-mux ISO."
+                        .to_string(),
+                    "Forensic keys unavailable — cannot mux. \
+                     (multi-pass mode captures an ISO for deferred mux.)"
+                        .to_string(),
+                )
+            } else {
+                (
+                    format!(
+                        "Single-pass rip with no keys — cannot mux (no ISO captured). \
+                         Enable multi-pass mode to capture a deferred-mux ISO. {msg}"
+                    ),
+                    format!(
+                        "No keys — cannot mux. {msg} (multi-pass mode captures an ISO for deferred mux.)"
+                    ),
+                )
+            };
+            crate::log::device_log(device, &log_line);
             update_state_with(device, |s| {
                 s.status = "error".to_string();
-                s.last_error = format!(
-                    "No keys — cannot mux. {msg} (multi-pass mode captures an ISO for deferred mux.)"
-                );
+                s.last_error = state_err;
             });
         }
         unregister_halt(device);
@@ -6192,9 +6344,10 @@ mod tests {
     //! State-only helpers and their tests live in `state.rs`.
 
     use super::{
-        FmtsGate, HaltGuard, SweepingGuard, aacs_failure_message, disk_space_preflight_message,
-        fmts_gate_decision, format_lib_error, format_pass_error, header_phase_outcome_is_failure,
-        incomplete_mux_status, is_safe_staging_segment, list_staging_basenames,
+        FmtsGate, FmtsGatePlan, HaltGuard, SweepingGuard, aacs_failure_message,
+        disk_space_preflight_message, fmts_gate_decision, fmts_gate_plan, format_lib_error,
+        format_pass_error, header_phase_outcome_is_failure, incomplete_mux_status,
+        is_fmts_key_missing_error, is_safe_staging_segment, list_staging_basenames,
         prune_intermediate_iso, register_halt, resumable_dir_blocked, resumable_for_disc,
         staging_dir_matches_disc, staging_disc_completed, staging_disc_owned_by_worker,
         staging_free_bytes,
@@ -6204,6 +6357,130 @@ mod tests {
     use crate::ripper::state::Resumable;
     use crate::util::MILLIS_PER_SEC;
     use libfreemkv::{Error, ScsiSense};
+
+    /// Build a single-title `Disc` whose main-feature title carries the given
+    /// streams. Only `titles[0].streams` matters for `disc_is_3d` /
+    /// `output_extension_for`; everything else is a minimal, valid skeleton.
+    fn disc_with_main_streams(streams: Vec<libfreemkv::Stream>) -> libfreemkv::Disc {
+        let mut title = libfreemkv::DiscTitle::empty();
+        title.streams = streams;
+        libfreemkv::Disc {
+            volume_id: "TEST_DISC".into(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::BluRay,
+            capacity_sectors: 0,
+            capacity_bytes: 0,
+            layers: 1,
+            titles: vec![title],
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        }
+    }
+
+    /// A plain 2D H.264 base-view video stream (not MVC-dependent).
+    fn video_2d() -> libfreemkv::Stream {
+        libfreemkv::Stream::Video(libfreemkv::disc::VideoStream {
+            pid: 0x1011,
+            codec: libfreemkv::disc::Codec::H264,
+            resolution: libfreemkv::disc::Resolution::R1080p,
+            frame_rate: libfreemkv::disc::FrameRate::F24,
+            hdr: libfreemkv::disc::HdrFormat::Sdr,
+            color_space: libfreemkv::disc::ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        })
+    }
+
+    /// The MVC dependent (right-eye) view — the presence of this in the main
+    /// feature is what marks a Blu-ray 3D rip. `is_mvc_dependent()` keys off
+    /// the exact `MVC_DEPENDENT_LABEL`, so we set that label.
+    fn video_mvc_dependent() -> libfreemkv::Stream {
+        libfreemkv::Stream::Video(libfreemkv::disc::VideoStream {
+            pid: 0x1012,
+            codec: libfreemkv::disc::Codec::H264,
+            resolution: libfreemkv::disc::Resolution::R1080p,
+            frame_rate: libfreemkv::disc::FrameRate::F24,
+            hdr: libfreemkv::disc::HdrFormat::Sdr,
+            color_space: libfreemkv::disc::ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: true,
+            label: libfreemkv::disc::MVC_DEPENDENT_LABEL.to_string(),
+            measured_cicp: None,
+        })
+    }
+
+    /// `disc_is_3d` is true iff the main feature carries an MVC-dependent view.
+    #[test]
+    fn disc_is_3d_detects_mvc_dependent_main_feature() {
+        assert!(
+            super::disc_is_3d(&disc_with_main_streams(vec![
+                video_2d(),
+                video_mvc_dependent(),
+            ])),
+            "a main feature with an MVC dependent view is a 3D rip"
+        );
+        assert!(
+            !super::disc_is_3d(&disc_with_main_streams(vec![video_2d()])),
+            "a plain base-view-only main feature is not 3D"
+        );
+        assert!(
+            !super::disc_is_3d(&libfreemkv::Disc {
+                titles: Vec::new(),
+                ..disc_with_main_streams(vec![])
+            }),
+            "an empty-titles disc must be treated as not-3D, not panic"
+        );
+    }
+
+    /// `output_extension_for` picks `mk3d` for a 3D main feature, `mkv`
+    /// otherwise, and `m2ts` always overrides (passthrough wins over 3D).
+    #[test]
+    fn output_extension_for_maps_3d_and_format_override() {
+        let disc_3d = disc_with_main_streams(vec![video_2d(), video_mvc_dependent()]);
+        let disc_2d = disc_with_main_streams(vec![video_2d()]);
+        let disc_empty = libfreemkv::Disc {
+            titles: Vec::new(),
+            ..disc_with_main_streams(vec![])
+        };
+
+        // 3D main feature → mk3d.
+        assert_eq!(super::output_extension_for("mkv", &disc_3d), "mk3d");
+        // Non-3D → mkv.
+        assert_eq!(super::output_extension_for("mkv", &disc_2d), "mkv");
+        // m2ts passthrough overrides even for a 3D disc.
+        assert_eq!(super::output_extension_for("m2ts", &disc_3d), "m2ts");
+        // Empty-titles disc → mkv, no panic.
+        assert_eq!(super::output_extension_for("mkv", &disc_empty), "mkv");
+    }
+
+    /// `output_scheme_for` is the URL SCHEME (container), never the `mk3d` filename
+    /// extension: a 3D rip muxes through `mkv://` since libfreemkv has no `mk3d://`
+    /// scheme (building `mk3d://…` fails the mux with `StreamUrlInvalid`).
+    #[test]
+    fn output_scheme_for_never_returns_mk3d() {
+        // A 3D disc still yields the `mkv` scheme even though its extension is mk3d.
+        assert_eq!(
+            super::output_extension_for("mkv", &disc_3d_for_scheme()),
+            "mk3d"
+        );
+        assert_eq!(super::output_scheme_for("mkv"), "mkv");
+        // m2ts stays m2ts; any other/unknown format falls back to the mkv scheme.
+        assert_eq!(super::output_scheme_for("m2ts"), "m2ts");
+        assert_eq!(super::output_scheme_for("iso"), "mkv");
+        // The scheme is a valid libfreemkv output scheme — never the mk3d suffix.
+        assert_ne!(super::output_scheme_for("mkv"), "mk3d");
+    }
+
+    fn disc_3d_for_scheme() -> libfreemkv::Disc {
+        disc_with_main_streams(vec![video_2d(), video_mvc_dependent()])
+    }
 
     /// The pre-rip FMTS gate honours `capture_without_keys` exactly like the base
     /// no-keys gate: a resolved map always rips; an unresolved one captures the raw
@@ -6216,6 +6493,65 @@ mod tests {
         // Incomplete map: capture-without-keys ON → capture ISO; OFF → skip.
         assert_eq!(fmts_gate_decision(false, true), FmtsGate::CaptureOnly);
         assert_eq!(fmts_gate_decision(false, false), FmtsGate::Skip);
+    }
+
+    /// The FMTS gate's side-effect routing (defects 1 + 2). `rip_disc` drives the
+    /// deferred-mux flag and the Skip-path staging quarantine from this plan, so
+    /// pinning it here mutation-verifies both fixes without running a whole rip:
+    /// * CaptureOnly must set `defer_forensic_mux` (so the mux is skipped-not-run,
+    ///   and multi-pass preserves the ISO for resume) — NOT quarantine.
+    /// * Skip must `quarantine` (write `.failed` + clear the restart count) so the
+    ///   staging dir is cleaned up like every other early-failure exit.
+    /// * Proceed does neither.
+    #[test]
+    fn fmts_gate_plan_routes_side_effects() {
+        assert_eq!(
+            fmts_gate_plan(FmtsGate::Proceed),
+            FmtsGatePlan {
+                defer_forensic_mux: false,
+                quarantine: false,
+            },
+            "Proceed rips normally — no deferral, no quarantine"
+        );
+        assert_eq!(
+            fmts_gate_plan(FmtsGate::CaptureOnly),
+            FmtsGatePlan {
+                defer_forensic_mux: true,
+                quarantine: false,
+            },
+            "CaptureOnly must defer the forensic mux (capture ISO now), not quarantine"
+        );
+        assert_eq!(
+            fmts_gate_plan(FmtsGate::Skip),
+            FmtsGatePlan {
+                defer_forensic_mux: false,
+                quarantine: true,
+            },
+            "Skip must quarantine the staging dir, not set the deferral flag"
+        );
+    }
+
+    /// The FMTS-forensic-key-missing error classifier (defect 1, resume half). A
+    /// `build_iso_pipeline` failure with this code is a retryable DEFERRAL (preserve
+    /// the ISO, wait for keys), so `resume_remux` must detect it exactly — and, like
+    /// `is_halt_error`, match only the leading `E<code>` token so a data payload that
+    /// merely contains the digits can't false-match.
+    #[test]
+    fn is_fmts_key_missing_error_matches_only_the_leading_code_token() {
+        let fmts: std::io::Error = libfreemkv::Error::FmtsKeyMissing.into();
+        assert!(
+            is_fmts_key_missing_error(&fmts),
+            "Error::FmtsKeyMissing must classify as an FMTS-key-missing error"
+        );
+        // A user Stop is NOT an FMTS-key-missing error (must not be deferred as one).
+        let halted: std::io::Error = libfreemkv::Error::Halted.into();
+        assert!(!is_fmts_key_missing_error(&halted));
+        // A payload that merely CONTAINS the digits must not false-match.
+        let other = std::io::Error::other(format!(
+            "E7022: disc-hash …E{}…",
+            libfreemkv::error::E_FMTS_KEY_MISSING
+        ));
+        assert!(!is_fmts_key_missing_error(&other));
     }
 
     /// Convergence H1 regression: `SweepingGuard` is the RAII cleanup for the

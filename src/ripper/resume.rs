@@ -380,7 +380,7 @@ pub(super) fn find_iso_and_mapfile(dir: &Path) -> Option<(PathBuf, PathBuf)> {
 /// Extracted as a free function so the unit test can exercise it
 /// without touching `Disc::scan_image` or `run_mux`.
 pub fn delete_partial_output(staging_disc_dir: &Path, sanitized_name: &str) {
-    for ext in ["mkv", "m2ts"] {
+    for ext in ["mkv", "mk3d", "m2ts"] {
         let p = staging_disc_dir.join(format!("{}.{}", sanitized_name, ext));
         match std::fs::remove_file(&p) {
             Ok(_) => tracing::info!(path = %p.display(), "removed partial mux output for resume"),
@@ -923,7 +923,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
         format!("network://{}", cfg_read.network_target)
     } else {
-        format!("{}://{}", ext, output_path)
+        // Scheme is the container (mkv/m2ts), NOT the `.mk3d` filename extension —
+        // a 3D rip muxes through `mkv://` (libfreemkv has no `mk3d://` scheme).
+        format!(
+            "{}://{}",
+            super::output_scheme_for(&output_format),
+            output_path
+        )
     };
 
     let total_bytes = if disc.capacity_bytes > 0 {
@@ -1088,6 +1094,30 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 crate::log::device_log(
                     device,
                     "Auto-resume mux stopped by user; staging preserved.",
+                );
+                super::unregister_halt(device);
+                return;
+            }
+            // FMTS forensic-key deferral: the base keys resolved but the online-only
+            // forensic index keys did not (`Error::FmtsKeyMissing`). Muxing now would
+            // emit forensic garbage, so DO NOT quarantine — leave the device "idle"
+            // (retryable) so the `.ripped` + ISO + mapfile stay staged and the mux
+            // worker re-attempts once a keydb/online update supplies the keys. This is
+            // the resume half of `rip_disc`'s FMTS CaptureOnly deferral, mirroring the
+            // no-keys capture deferral above (status "idle" ⇒ `failure_retryable`).
+            if super::is_fmts_key_missing_error(&e) {
+                crate::log::device_log(
+                    device,
+                    "Auto-resume: FMTS forensic keys unavailable — mux deferred. Staging \
+                     preserved; will mux automatically once keys are available.",
+                );
+                reset_status_after_ripping(
+                    device,
+                    "idle",
+                    &display_name,
+                    &disc_format,
+                    &duration,
+                    Some("Ripped to ISO — forensic keys unavailable, mux deferred.".to_string()),
                 );
                 super::unregister_halt(device);
                 return;
