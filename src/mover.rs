@@ -496,7 +496,8 @@ pub(crate) fn check_post_copy(src: &Path, dst: &Path) -> Result<(), MoveError> {
     // ISO path already does — the size cross-check is what actually
     // guarantees the destination isn't truncated.
     match ext.as_deref() {
-        Some("mkv") => {
+        // mk3d is byte-identical Matroska — same structural + size checks as mkv.
+        Some("mkv") | Some("mk3d") => {
             check_post_copy_mkv(dst)?;
             check_post_copy_size(src, dst)
         }
@@ -784,7 +785,9 @@ fn check_and_move(cfg: &Config) {
                     if p.extension()
                         .and_then(|x| x.to_str())
                         .map(|ext| match ext {
-                            "mkv" | "m2ts" => true,
+                            // mk3d is byte-identical Matroska (3D main feature) —
+                            // deliver it exactly like mkv.
+                            "mkv" | "mk3d" | "m2ts" => true,
                             "iso" => move_iso,
                             _ => false,
                         })
@@ -2279,6 +2282,35 @@ mod tests {
     }
 
     #[test]
+    fn check_post_copy_mk3d_runs_matroska_structural_check() {
+        // mk3d is byte-identical Matroska, so check_post_copy must route it
+        // through the same structural EBML validation as mkv (line-500 arm).
+        // A valid EBML head + tail passes; a bad head is rejected. Mutation
+        // check: drop "mk3d" from that arm and it falls to the size-only
+        // fallback, so the bad-head case would wrongly pass.
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Valid mk3d passes the structural + size check.
+        let good = tmp.path().join("good.mk3d");
+        write_minimal_mkv(&good, &vec![0xAA; 256]);
+        let good_src = tmp.path().join("good_src.mk3d");
+        write_minimal_mkv(&good_src, &vec![0xAA; 256]);
+        assert!(check_post_copy(&good_src, &good).is_ok());
+
+        // A bad-head mk3d is rejected as Matroska — proving the structural
+        // check ran rather than the size-only fallback.
+        let bad = tmp.path().join("bad.mk3d");
+        std::fs::write(&bad, b"NOPE bytes after").unwrap();
+        let bad_src = tmp.path().join("bad_src.mk3d");
+        std::fs::write(&bad_src, b"NOPE bytes after").unwrap();
+        let err = check_post_copy(&bad_src, &bad).unwrap_err();
+        assert!(
+            matches!(err, MoveError::MkvBadHead),
+            "mk3d must be validated as Matroska, got {err:?}"
+        );
+    }
+
+    #[test]
     fn check_post_copy_mkv_rejects_truncated_tail() {
         let tmp = tempfile::tempdir().unwrap();
         let dst = tmp.path().join("trunc.mkv");
@@ -2424,6 +2456,46 @@ mod tests {
         assert!(
             !disc_dir.exists(),
             "staging disc dir should have been removed after successful MKV move"
+        );
+    }
+
+    #[test]
+    fn check_and_move_delivers_mk3d_main_feature() {
+        // Regression: a Blu-ray 3D rip stages `<title>.mk3d` (byte-identical
+        // Matroska, only the extension differs so players surface it as 3D).
+        // The staging-scan extension whitelist must recognize `mk3d` for
+        // delivery — if it's dropped, a 3D rip silently never leaves staging.
+        // Mutation check: remove "mk3d" from the whitelist and this fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let movie_dir = tmp.path().join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
+
+        // One .done staging dir holding only a valid .mk3d file.
+        let disc_dir = staging.join("Stereo Vista");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Stereo Vista")).unwrap();
+        // Valid EBML head + tail-safe body so check_post_copy (mk3d → mkv
+        // structural + size checks) passes.
+        let mut mk3d = vec![0x1A, 0x45, 0xDF, 0xA3];
+        mk3d.extend_from_slice(&[0xAAu8; 1024]);
+        std::fs::write(disc_dir.join("Stereo Vista.mk3d"), &mk3d).unwrap();
+
+        check_and_move(&cfg);
+
+        // The mk3d landed in the movie library with its extension preserved.
+        let dest = movie_dir.join("Stereo Vista (2024)/Stereo Vista (2024).mk3d");
+        assert!(
+            dest.exists(),
+            "mk3d main feature should have been delivered to {}",
+            dest.display()
+        );
+        // Delivered cleanly → staging torn down.
+        assert!(
+            !disc_dir.exists(),
+            "staging disc dir should have been removed after successful mk3d move"
         );
     }
 

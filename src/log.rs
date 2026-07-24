@@ -489,6 +489,49 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_log_msg_strips_ansi_and_control_bytes() {
+        // Log-injection defense: a crafted disc string (UDF volume-id,
+        // Blu-ray `bdmt` title) logged verbatim could inject ANSI escape
+        // sequences into an operator's terminal (`docker logs` / `tail`) or
+        // the on-disk `.log`. Every control byte (C0 / DEL / C1, ESC
+        // included) must be neutralized to '?'; ordinary printable text —
+        // including non-ASCII UTF-8 — must pass through untouched.
+
+        // ESC + ANSI CSI sequences (clear screen + cursor home). Only the two
+        // ESC (\u{1b}) bytes are control; '[', digits, ';', 'J', 'H' are
+        // ordinary printable ASCII and survive.
+        assert_eq!(
+            sanitize_log_msg("\u{1b}[2J\u{1b}[1;1H"),
+            "?[2J?[1;1H",
+            "each ESC must become '?', the rest of the CSI text is preserved"
+        );
+
+        // A bare ESC is replaced.
+        assert_eq!(sanitize_log_msg("a\u{1b}b"), "a?b");
+
+        // Other C0 controls (NUL, BEL, backspace, TAB) and DEL and a C1
+        // control (0x9b, single-char CSI) all map to '?'.
+        assert_eq!(
+            sanitize_log_msg("x\u{0}\u{7}\u{8}\t\u{7f}\u{9b}y"),
+            "x??????y",
+            "all C0/DEL/C1 control bytes must be neutralized"
+        );
+
+        // Newlines are control characters too — the function replaces them
+        // (it does NOT preserve line structure), so verify that behavior
+        // explicitly rather than assuming they pass through.
+        assert_eq!(sanitize_log_msg("line1\nline2"), "line1?line2");
+
+        // Ordinary text — including multibyte UTF-8 — is preserved verbatim.
+        assert_eq!(
+            sanitize_log_msg("DUNE_PART_TWO — café 日本語"),
+            "DUNE_PART_TWO — café 日本語",
+            "printable UTF-8 must pass through unchanged"
+        );
+        assert_eq!(sanitize_log_msg(""), "");
+    }
+
+    #[test]
     fn sanitize_device_neutralizes_traversal() {
         // The hard invariant at the construction point: a device with a
         // path separator or traversal sequence can't escape logs/.
