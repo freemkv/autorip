@@ -924,7 +924,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // Halt token: register a fresh one so /api/stop has something to
     // cancel during the mux. Mirrors `rip_disc`'s pattern.
     super::register_halt(device, libfreemkv::Halt::new());
-    let halt_token = match super::device_halt(device) {
+    // Registered so `/api/stop` (and `mux_iso`'s own `device_halt` lookup) can
+    // cancel the resume mux; the bound handle itself is unused now that
+    // `mux_stream` looks the token up by device.
+    let _halt_token = match super::device_halt(device) {
         Some(h) => h,
         None => {
             // `register_halt` no-ops when the HALTS mutex is poisoned, so
@@ -1013,116 +1016,34 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // can carry sweep damage into the terminal RipState.
     let done_sweep_damage = sweep_damage_for_resume.clone();
 
-    let reader: Box<dyn libfreemkv::SectorSource> = Box::new(iso_reader_for_mux);
+    // The pre-opened `iso_reader_for_mux` above is a reachability/permission
+    // probe only; `mux_stream` (below, inside `mux_iso`) opens its own
+    // `FileSectorSource` from `iso_path`, so drop the probe handle.
+    drop(iso_reader_for_mux);
 
-    // Progress + watchdog atomics shared between the stream-event
-    // callback (below), this function's terminal-state updates, and
-    // `run_mux`'s `MuxAtomics`. Created before `build_iso_pipeline` so
-    // the producer-thread `BytesRead` events can update them in place.
+    // Progress + watchdog atomics shared between this function's terminal-state
+    // updates, the `AutoripMuxEvents` bridge, and `mux_iso`'s `MuxAtomics`.
     let latest_bytes_read = Arc::new(AtomicU64::new(0));
     let rip_last_lba = Arc::new(AtomicU64::new(0));
     let rip_current_batch = Arc::new(AtomicU16::new(batch));
     let wd_last_frame = Arc::new(AtomicU64::new(crate::util::epoch_secs()));
     let mux_input_errors = Arc::new(AtomicU32::new(0));
 
-    // Stream-event callback — mirrors `rip_disc`'s multipass highway
-    // wiring (mod.rs). The producer thread fires `BytesRead` on every
-    // sector read from the ISO; we feed that into `latest_bytes_read`
-    // (so the progress bar tracks read-ahead, not write-lagged output)
-    // and refresh `wd_last_frame` (so the soft-stall watchdog observes
-    // a pre-frame read stall, e.g. a slow NFS seek before the first
-    // frame). `BatchSizeChanged` / `SectorSkipped` never fire on the
-    // highway (no adaptive retry — the ISO is already zero-filled for
-    // any sweep-pass loss), so only `BytesRead` is handled here.
-    let wdf_stream = wd_last_frame.clone();
-    let lbr_stream = latest_bytes_read.clone();
-    let stream_event_fn = move |event: libfreemkv::event::Event| {
-        use std::sync::atomic::Ordering;
-        wdf_stream.store(crate::util::epoch_secs(), Ordering::Relaxed);
-        if let libfreemkv::event::EventKind::BytesRead { bytes, .. } = event.kind {
-            lbr_stream.store(bytes, Ordering::Relaxed);
-        }
-    };
-
-    // Resume path routes through the same `PipelinedPesStream`
-    // highway as multipass mux — same 3-stage threaded pipeline,
-    // same producer-thread BytesRead events for the UI. No skip-
-    // errors plumbing because the on-disk ISO is already clean (any
-    // sweep-pass loss got zero-filled in Pass 1).
-    let input: Box<dyn libfreemkv::pes::Stream> = match libfreemkv::build_iso_pipeline(
-        reader,
+    // STEP 4c-i: the resume mux routes through `libfreemkv::mux_stream` (via
+    // `mux::mux_iso`) exactly like the fresh multipass path. Gather the ISO mux
+    // materials; the pipeline construction (CSS crack / AACS key map / demux)
+    // and its FMTS/halt classification happen when `mux_iso` runs (below),
+    // where the Err arm preserves the deferral semantics.
+    let iso_src = super::mux::IsoMuxSource {
+        iso_path: iso_path.clone(),
         title,
-        keys,
-        batch,
         format,
-        false,
-        Some(halt_token.clone()),
-        Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
-        // Fresh-key-on-failure fetch: recover a 2nd/Nth CPS-unit key MID-MUX by
-        // handing the failing unit's ciphertext to the configured key source.
-        // Without this, a multi-CPS-unit disc (e.g. a feature spanning a second
-        // CPS unit) drops that unit's content as decrypt loss because the
-        // upfront resolve only validated ONE unit key. See
-        // `crate::keysource::build_iso_key_fetch`.
-        crate::keysource::build_iso_key_fetch(&cfg_read, &iso_path),
-    ) {
-        Ok(s) => Box::new(s),
-        Err(e) => {
-            // A Stop during the resume-mux CSS crack surfaces as `Error::Halted`:
-            // leave staging intact (the .ripped marker + ISO + mapfile stay) so
-            // the next resume retries, without flagging a spurious error. Classify
-            // on the error, not the halt token — a genuine build failure that
-            // coincides with a cancelled token must still surface as an error.
-            if super::is_halt_error(&e) {
-                crate::log::device_log(
-                    device,
-                    "Auto-resume mux stopped by user; staging preserved.",
-                );
-                super::unregister_halt(device);
-                return;
-            }
-            // FMTS forensic-key deferral: the base keys resolved but the online-only
-            // forensic index keys did not (`Error::FmtsKeyMissing`). Muxing now would
-            // emit forensic garbage, so DO NOT quarantine — leave the device "idle"
-            // (retryable) so the `.ripped` + ISO + mapfile stay staged and the mux
-            // worker re-attempts once a keydb/online update supplies the keys. This is
-            // the resume half of `rip_disc`'s FMTS CaptureOnly deferral, mirroring the
-            // no-keys capture deferral above (status "idle" ⇒ `failure_retryable`).
-            if super::is_fmts_key_missing_error(&e) {
-                crate::log::device_log(
-                    device,
-                    "Auto-resume: FMTS forensic keys unavailable — mux deferred. Staging \
-                     preserved; will mux automatically once keys are available.",
-                );
-                reset_status_after_ripping(
-                    device,
-                    "idle",
-                    &display_name,
-                    &disc_format,
-                    &duration,
-                    Some("Ripped to ISO — forensic keys unavailable, mux deferred.".to_string()),
-                );
-                super::unregister_halt(device);
-                return;
-            }
-            tracing::error!(target: "mux", device=%device, "build_iso_pipeline failed: {e}");
-            let msg = format!(
-                "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
-            );
-            crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
-            // Reset from "ripping" (set above) → "error" so the next
-            // /api/rip isn't blocked by the "already ripping" gate.
-            reset_status_after_ripping(
-                device,
-                "error",
-                &display_name,
-                &disc_format,
-                &duration,
-                Some(msg),
-            );
-            super::unregister_halt(device);
-            return;
-        }
+        keys,
+        // Fresh-key-on-failure fetch (recover a 2nd/Nth CPS-unit key MID-MUX) —
+        // the SAME closure the pre-migration build_iso_pipeline call took.
+        key_fetch: crate::keysource::build_iso_key_fetch(&cfg_read, &iso_path),
+        raw: false,
+        skip_errors: false,
     };
 
     // TMDB metadata source of truth: the DURABLE on-disk `.ripped` marker, NOT
@@ -1321,7 +1242,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         return;
     }
 
-    let mux_outcome = super::mux::run_mux(
+    let mux_outcome = match super::mux::mux_iso(
         super::mux::MuxInputs {
             device,
             display_name: display_name.clone(),
@@ -1363,7 +1284,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             staging_disc_dir: staging_dir.clone(),
             sweep_damage: sweep_damage_for_resume,
         },
-        input,
+        iso_src,
         super::mux::MuxAtomics {
             latest_bytes_read: latest_bytes_read.clone(),
             rip_last_lba: rip_last_lba.clone(),
@@ -1372,7 +1293,61 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             wd_bytes: Arc::new(AtomicU64::new(0)),
             input_errors: mux_input_errors,
         },
-    );
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            // A Stop during the resume-mux CSS crack surfaces as `Error::Halted`:
+            // leave staging intact (the .ripped marker + ISO + mapfile stay) so
+            // the next resume retries, without flagging a spurious error.
+            if super::is_halt_error(&e) {
+                crate::log::device_log(
+                    device,
+                    "Auto-resume mux stopped by user; staging preserved.",
+                );
+                super::unregister_halt(device);
+                return;
+            }
+            // FMTS forensic-key deferral: base keys resolved but the online-only
+            // forensic index keys did not (`Error::FmtsKeyMissing`). Muxing now
+            // would emit forensic garbage, so DO NOT quarantine — leave the device
+            // "idle" (retryable) so the `.ripped` + ISO + mapfile stay staged and
+            // the mux worker re-attempts once a keydb/online update supplies keys.
+            if super::is_fmts_key_missing_error(&e) {
+                crate::log::device_log(
+                    device,
+                    "Auto-resume: FMTS forensic keys unavailable — mux deferred. Staging \
+                     preserved; will mux automatically once keys are available.",
+                );
+                reset_status_after_ripping(
+                    device,
+                    "idle",
+                    &display_name,
+                    &disc_format,
+                    &duration,
+                    Some("Ripped to ISO — forensic keys unavailable, mux deferred.".to_string()),
+                );
+                super::unregister_halt(device);
+                return;
+            }
+            // Any other setup failure is structural — surface as "error" (staging
+            // preserved, no `.failed`), mirroring the pre-migration build arm.
+            tracing::error!(target: "mux", device=%device, "mux_stream failed: {e}");
+            let msg = format!(
+                "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
+            );
+            crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
+            reset_status_after_ripping(
+                device,
+                "error",
+                &display_name,
+                &disc_format,
+                &duration,
+                Some(msg),
+            );
+            super::unregister_halt(device);
+            return;
+        }
+    };
 
     super::unregister_halt(device);
 
@@ -2268,9 +2243,9 @@ mod resume_iso_auto_eject_tests {
         // completion log line up to the run_mux call that opens the MKV
         // path (the next distinct terminal in the function).
         let end = src[start..]
-            .find("super::mux::run_mux")
+            .find("super::mux::mux_iso")
             .map(|i| start + i)
-            .expect("resume.rs should call run_mux after the ISO branch");
+            .expect("resume.rs should call mux_iso after the ISO branch");
         let region = &src[start..end];
         assert!(
             region.contains("should_auto_eject(cfg_read.auto_eject, device)"),

@@ -4624,36 +4624,69 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // bar reaches 100%. Computed before `title` is moved into the stream below.
     let mux_total_bytes = mux_progress_denominator(cfg_read.max_retries, total_bytes, &title);
 
-    let input: Box<dyn libfreemkv::pes::Stream> = if cfg_read.max_retries > 0 {
-        // Multipass ISO mux → PipelinedPesStream highway. The
-        // producer thread fires BytesRead events; BatchSizeChanged
-        // and SectorSkipped never fire on the highway (no adaptive
-        // retry — the ISO is zero-filled for any sweep-pass
-        // failures).
-        match libfreemkv::build_iso_pipeline(
-            reader,
+    let _mux_span =
+        tracing::span!(tracing::Level::TRACE, "rip_disc::run_mux", device=%device, total_bytes)
+            .entered();
+    let mux_input_errors = Arc::new(AtomicU32::new(0));
+    let mux_inputs = mux::MuxInputs {
+        device,
+        display_name: display_name.clone(),
+        disc_format: disc_format.clone(),
+        tmdb_title: tmdb_title.clone(),
+        tmdb_year,
+        tmdb_poster: tmdb_poster.clone(),
+        tmdb_overview: tmdb_overview.clone(),
+        duration: duration.clone(),
+        codecs: codecs.clone(),
+        filename: filename.clone(),
+        total_bytes: mux_total_bytes,
+        title_bytes_per_sec,
+        total_passes,
+        bytes_total_disc: disc.capacity_bytes,
+        max_retries: cfg_read.max_retries,
+        bytes_unreadable_at_mux,
+        dest_url: dest_url.clone(),
+        batch,
+        // Hand the mux watchdog the per-disc staging dir so its
+        // hard-escalation path (5-minute stall → exit + Docker
+        // restart) can bump `.restart_count` before exiting.
+        staging_disc_dir: std::path::PathBuf::from(&staging),
+        sweep_damage: sweep_damage_snapshot.clone(),
+    };
+    let mux_atomics = mux::MuxAtomics {
+        latest_bytes_read: latest_bytes_read.clone(),
+        rip_last_lba: rip_last_lba.clone(),
+        rip_current_batch: rip_current_batch.clone(),
+        wd_last_frame: wd_last_frame.clone(),
+        wd_bytes: Arc::new(AtomicU64::new(0)),
+        input_errors: mux_input_errors,
+    };
+
+    let mux_outcome = if cfg_read.max_retries > 0 {
+        // Multipass ISO mux → libfreemkv::mux_stream (STEP 4c-i). The header
+        // pump / producer / write-pipeline / finish all live inside mux_stream
+        // now; AutoripMuxEvents feeds the same watchdog + UI atomics.
+        let iso_src = mux::IsoMuxSource {
+            iso_path: std::path::PathBuf::from(&iso_path_str),
             title,
-            keys,
-            batch,
             format,
-            false,
-            Some(halt_token.clone()),
-            Some(Box::new(stream_event_fn) as libfreemkv::sector::prefetched::EventFn),
-            // Fresh-key-on-failure fetch: recover a 2nd/Nth CPS-unit key MID-MUX
-            // by handing the failing unit's ciphertext to the configured key
-            // source, instead of dropping it as decrypt loss (the upfront resolve
-            // validates only ONE unit key). See `crate::keysource::build_iso_key_fetch`.
-            crate::keysource::build_iso_key_fetch(&cfg_read, std::path::Path::new(&iso_path_str)),
-        ) {
-            Ok(s) => Box::new(s),
+            keys,
+            // Fresh-key-on-failure fetch (recover a 2nd/Nth CPS-unit key mid-mux)
+            // — the SAME closure the pre-migration build_iso_pipeline call took.
+            key_fetch: crate::keysource::build_iso_key_fetch(
+                &cfg_read,
+                std::path::Path::new(&iso_path_str),
+            ),
+            raw: false,
+            skip_errors: false,
+        };
+        match mux::mux_iso(mux_inputs, iso_src, mux_atomics) {
+            Ok(o) => o,
             Err(e) => {
-                // A Stop pressed during the CSS crack inside pipeline construction
+                // Construction-time classification preserved verbatim: a Stop
+                // pressed during the CSS crack inside pipeline construction
                 // surfaces as `Error::Halted` — a user halt, not a structural
-                // failure: preserve staging for auto-resume, no `.failed` marker.
-                // Classify on the ERROR (not the halt token): build_iso_pipeline
-                // has fallible steps AFTER the crack (AACS key map, thread spawn),
-                // and a genuine failure there that coincides with a cancelled
-                // token must still be quarantined, not masked as a stop.
+                // failure: preserve staging for auto-resume, no `.failed`.
                 if is_halt_error(&e) {
                     crate::log::device_log(
                         device,
@@ -4662,17 +4695,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     unregister_halt(device);
                     return;
                 }
-                tracing::error!(target: "mux", device=%device, "build_iso_pipeline failed: {e}");
+                // A pipeline BUILD failure (header resolution, codec negotiation,
+                // format error) is structural and permanent — retries won't fix
+                // it. Quarantine the dir with `.failed` (mirrors the header-phase
+                // failure path below).
+                tracing::error!(target: "mux", device=%device, "mux_stream setup failed: {e}");
                 let msg = format!(
                     "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
                 );
                 crate::log::device_log(device, &msg);
-                // A pipeline BUILD failure (header resolution, codec
-                // negotiation, format error) is structural and permanent —
-                // retries won't fix it. Quarantine the dir with `.failed`
-                // (mirrors the header-phase failure path below) so the
-                // restart scan classifies it terminal instead of leaving
-                // it stranded `InProgress`.
                 let staging_disc_path = std::path::Path::new(&staging);
                 staging::write_failed_marker(staging_disc_path, &msg);
                 staging::clear_restart_count(staging_disc_path);
@@ -4686,120 +4717,73 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             }
         }
     } else {
-        // Drive single-pass: stays on the inline DiscStream because
-        // its adaptive batch-retry on read failure lives inside
-        // `fill_extents`. The producer-thread highway doesn't (yet)
-        // replicate that retry policy, so for live-disc reads we
-        // keep the in-place fill loop. Same `on_event` closure as
-        // the highway path so the UI gets one event stream.
-        let mut s = match libfreemkv::DiscStream::new(
-            reader,
-            title,
-            keys,
-            batch,
-            format,
-            false,
-            Some(halt_token.clone()),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                // A Stop pressed during construction (the CSS crack runs in
-                // `DiscStream::new`) surfaces as `Error::Halted` — a user halt,
-                // not a permanent failure. Preserve staging for resume; do NOT
-                // quarantine. Classify on the error, not the halt token.
-                if is_halt_error(&e) {
-                    crate::log::device_log(
-                        device,
-                        "Rip stopped by user during mux setup — staging preserved for resume.",
+        // Drive single-pass path (STEP 4c-ii — UNCHANGED): inline DiscStream +
+        // the hand-rolled producer/consumer `run_mux`.
+        let input: Box<dyn libfreemkv::pes::Stream> = {
+            // Drive single-pass: stays on the inline DiscStream because
+            // its adaptive batch-retry on read failure lives inside
+            // `fill_extents`. The producer-thread highway doesn't (yet)
+            // replicate that retry policy, so for live-disc reads we
+            // keep the in-place fill loop. Same `on_event` closure as
+            // the highway path so the UI gets one event stream.
+            let mut s = match libfreemkv::DiscStream::new(
+                reader,
+                title,
+                keys,
+                batch,
+                format,
+                false,
+                Some(halt_token.clone()),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    // A Stop pressed during construction (the CSS crack runs in
+                    // `DiscStream::new`) surfaces as `Error::Halted` — a user halt,
+                    // not a permanent failure. Preserve staging for resume; do NOT
+                    // quarantine. Classify on the error, not the halt token.
+                    if is_halt_error(&e) {
+                        crate::log::device_log(
+                            device,
+                            "Rip stopped by user during mux setup — staging preserved for resume.",
+                        );
+                        unregister_halt(device);
+                        return;
+                    }
+                    // Same structural-failure path as the highway branch above: a
+                    // title/stream layout that can't be prepared (incl. a
+                    // scrambled-but-uncrackable CSS DVD → CssKeyMissing) is permanent.
+                    tracing::error!(target: "mux", device=%device, "DiscStream setup failed: {e}");
+                    let msg = format!(
+                        "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
                     );
+                    crate::log::device_log(device, &msg);
+                    let staging_disc_path = std::path::Path::new(&staging);
+                    staging::write_failed_marker(staging_disc_path, &msg);
+                    staging::clear_restart_count(staging_disc_path);
+                    update_state_with(device, |s| {
+                        s.status = "failed".to_string();
+                        s.last_error = msg.clone();
+                        s.failure_reason = Some(msg.clone());
+                    });
                     unregister_halt(device);
                     return;
                 }
-                // Same structural-failure path as the highway branch above: a
-                // title/stream layout that can't be prepared (incl. a
-                // scrambled-but-uncrackable CSS DVD → CssKeyMissing) is permanent.
-                tracing::error!(target: "mux", device=%device, "DiscStream setup failed: {e}");
-                let msg = format!(
-                    "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
-                );
-                crate::log::device_log(device, &msg);
-                let staging_disc_path = std::path::Path::new(&staging);
-                staging::write_failed_marker(staging_disc_path, &msg);
-                staging::clear_restart_count(staging_disc_path);
-                update_state_with(device, |s| {
-                    s.status = "failed".to_string();
-                    s.last_error = msg.clone();
-                    s.failure_reason = Some(msg.clone());
-                });
-                unregister_halt(device);
-                return;
+            };
+            // FMTS live single-pass: read only our-phase units (the retained pre-rip
+            // map decides which), so the alternate device-group half never reaches the
+            // demux — the same fix the file-backed highway applies. `None` for every
+            // non-FMTS disc, leaving the read walk unchanged.
+            if let Some(map) = fmts_key_map.clone() {
+                s = s.with_key_map(map);
             }
+            if cfg_read.on_read_error == "skip" {
+                s.skip_errors = true;
+            }
+            s.on_event(stream_event_fn);
+            Box::new(s)
         };
-        // FMTS live single-pass: read only our-phase units (the retained pre-rip
-        // map decides which), so the alternate device-group half never reaches the
-        // demux — the same fix the file-backed highway applies. `None` for every
-        // non-FMTS disc, leaving the read walk unchanged.
-        if let Some(map) = fmts_key_map.clone() {
-            s = s.with_key_map(map);
-        }
-        if cfg_read.on_read_error == "skip" {
-            s.skip_errors = true;
-        }
-        s.on_event(stream_event_fn);
-        Box::new(s)
+        mux::run_mux(mux_inputs, input, mux_atomics)
     };
-
-    // 0.18 round 2 #2: the headers-ready buffering, the spawning of
-    // the consumer thread, the watchdog, and the per-frame
-    // `update_state` cadence all live in `mux::run_mux`. Round 1
-    // shipped the mux module as a placeholder; this is the lift onto
-    // libfreemkv's `Pipeline` + `Sink` primitive.
-    //
-    // The producer side of `run_mux` polls the per-device `Halt`
-    // token (looked up via `device_halt(device)`) at the top of each
-    // frame iteration — same token the orchestrator threaded through
-    // sweep / patch and the same one the HTTP /api/stop handler
-    // cancels.
-    let _mux_span =
-        tracing::span!(tracing::Level::TRACE, "rip_disc::run_mux", device=%device, total_bytes)
-            .entered();
-    let mux_input_errors = Arc::new(AtomicU32::new(0));
-    let mux_outcome = mux::run_mux(
-        mux::MuxInputs {
-            device,
-            display_name: display_name.clone(),
-            disc_format: disc_format.clone(),
-            tmdb_title: tmdb_title.clone(),
-            tmdb_year,
-            tmdb_poster: tmdb_poster.clone(),
-            tmdb_overview: tmdb_overview.clone(),
-            duration: duration.clone(),
-            codecs: codecs.clone(),
-            filename: filename.clone(),
-            total_bytes: mux_total_bytes,
-            title_bytes_per_sec,
-            total_passes,
-            bytes_total_disc: disc.capacity_bytes,
-            max_retries: cfg_read.max_retries,
-            bytes_unreadable_at_mux,
-            dest_url: dest_url.clone(),
-            batch,
-            // Hand the mux watchdog the per-disc staging dir so its
-            // hard-escalation path (5-minute stall → exit + Docker
-            // restart) can bump `.restart_count` before exiting.
-            staging_disc_dir: std::path::PathBuf::from(&staging),
-            sweep_damage: sweep_damage_snapshot.clone(),
-        },
-        input,
-        mux::MuxAtomics {
-            latest_bytes_read: latest_bytes_read.clone(),
-            rip_last_lba: rip_last_lba.clone(),
-            rip_current_batch: rip_current_batch.clone(),
-            wd_last_frame: wd_last_frame.clone(),
-            wd_bytes: Arc::new(AtomicU64::new(0)),
-            input_errors: mux_input_errors,
-        },
-    );
 
     // Output never opened. Two sub-cases:
     //
