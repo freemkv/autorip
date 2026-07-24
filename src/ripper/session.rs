@@ -498,6 +498,10 @@ pub(super) fn drop_session(device: &str) {
 /// change. Probe the original path and its neighbors to find the drive
 /// that still has the disc. Returns the new device path (e.g. "/dev/sg5").
 pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<String> {
+    // TODO(step1-followup): /dev/sgN device-path synthesis for hot-plug
+    // rediscovery is NOT moved into DiscSession. It is entangled with autorip's
+    // disc-identity matching (expected_volume_id), device_log, and the sg-number
+    // shift heuristic — out of the step-1 scope. Left in autorip per contract Q3.
     // Only meaningful for /dev/sgN paths. If the path is not sgN, a
     // numeric default (the old `unwrap_or(-1)`) plus the per-iteration
     // `< 0` skip would probe sg0..sg2 and could latch onto an unrelated
@@ -604,6 +608,11 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
 /// sectors), so this is far lighter than a full `Disc::scan` and safe to
 /// run once per shifted candidate.
 fn probe_volume_id(path: &str) -> Option<String> {
+    // TODO(step1-followup): NOT migrated to DiscSession. This path's error model
+    // is fail-fast-to-None (a wait_ready/init failure returns None WITHOUT
+    // attempting identify), whereas DiscSession::open treats wait_ready/init as
+    // advisory (logs + continues). Folding it in would change the short-circuit
+    // semantics of hot-plug rediscovery, so it stays a direct Drive open here.
     let mut drive = libfreemkv::Drive::open(std::path::Path::new(path)).ok()?;
     drive.wait_ready().ok()?;
     drive.init().ok()?;
