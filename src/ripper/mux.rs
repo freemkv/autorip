@@ -737,7 +737,7 @@ pub(crate) struct MuxAtomics {
 /// orchestrator (`rip_disc` multipass branch / `resume_remux`) fills this
 /// instead of hand-building the `build_iso_pipeline` stream — `mux_stream`
 /// re-derives the same 3-stage highway (and re-derives the AACS key map from
-/// `keys`/`key_fetch`) internally, so `key_map` stays inert on this path.
+/// `keys`/`key_fetch`) internally, so no pre-resolved map is carried on this path.
 pub(crate) struct IsoMuxSource {
     /// Path to the staged ISO image. `mux_stream` opens its own
     /// `FileSectorSource` from this (the orchestrator's validation open is a
@@ -1267,9 +1267,6 @@ pub(crate) fn mux_iso(
         title: src.title,
         format: src.format,
         keys: src.keys,
-        // Inert on the Iso path — `build_iso_pipeline` re-derives the map from
-        // `keys`/`key_fetch` internally (matches the pre-migration call).
-        key_map: None,
         key_fetch: src.key_fetch,
     };
 
