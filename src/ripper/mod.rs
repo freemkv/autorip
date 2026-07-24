@@ -40,7 +40,6 @@ pub use state::{
 // Internal-use imports for the orchestrator code that lives in this
 // file. Sub-module-private helpers (`pub(super)`) are reachable from
 // here because we are the parent of `state` / `session` / `staging`.
-use libfreemkv::event::BatchSizeReason;
 
 use crate::util::{BYTES_PER_GIB, BYTES_PER_MIB, MILLIS_PER_SEC};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -1958,44 +1957,6 @@ pub fn make_drive_event_fn(
             }
             libfreemkv::event::EventKind::ReadError { sector, .. } => {
                 crate::log::device_log(&dev, &format!("Read error at sector {}", sector));
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Build the stream-level `on_event` handler shared by the multipass ISO
-/// pipeline and the single-pass inline `DiscStream` path.
-///
-/// Resets the watchdog (`wdf`); `BytesRead` updates `latest_bytes_read`;
-/// `BatchSizeChanged` stores the new batch size (`current_batch`) and logs;
-/// `SectorSkipped` records the skipped LBA (`last_lba`) and logs. Factored
-/// out of `rip_disc` for the same testability reason as
-/// [`make_drive_event_fn`].
-pub fn make_stream_event_fn(
-    dev: String,
-    wdf: Arc<AtomicU64>,
-    last_lba: Arc<AtomicU64>,
-    current_batch: Arc<AtomicU16>,
-    latest_bytes_read: Arc<AtomicU64>,
-) -> impl Fn(libfreemkv::event::Event) + Send + 'static {
-    move |event| {
-        wdf.store(crate::util::epoch_secs(), Ordering::Relaxed);
-        match event.kind {
-            libfreemkv::event::EventKind::BytesRead { bytes, .. } => {
-                latest_bytes_read.store(bytes, Ordering::Relaxed);
-            }
-            libfreemkv::event::EventKind::BatchSizeChanged { new_size, reason } => {
-                current_batch.store(new_size, Ordering::Relaxed);
-                let label = match reason {
-                    BatchSizeReason::Shrunk => "shrunk",
-                    BatchSizeReason::Probed => "probed up",
-                };
-                crate::log::device_log(&dev, &format!("Batch size → {} ({})", new_size, label));
-            }
-            libfreemkv::event::EventKind::SectorSkipped { sector } => {
-                last_lba.store(sector, Ordering::Relaxed);
-                crate::log::device_log(&dev, &format!("Sector {} skipped (zero-filled)", sector));
             }
             _ => {}
         }
@@ -4599,18 +4560,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // single-pass path keeps the inline reader because `DiscStream`'s
     // adaptive batch retry only fires inside `fill_extents` and the
     // prefetch wrapper would bypass it.
-    // Stream-event callback — wired into both the multipass highway
-    // (BytesRead from the prefetch producer thread) and the drive
-    // single-pass inline path (BytesRead + BatchSizeChanged +
-    // SectorSkipped from DiscStream::fill_extents). Either path
-    // calls this same closure; the UI doesn't care which.
-    let stream_event_fn = make_stream_event_fn(
-        device.to_string(),
-        wd_last_frame.clone(),
-        rip_last_lba.clone(),
-        rip_current_batch.clone(),
-        latest_bytes_read.clone(),
-    );
+    //
+    // The reader-side stream events (BytesRead / BatchSizeChanged /
+    // SectorSkipped) are now forwarded by libfreemkv's `mux_stream` through the
+    // `AutoripMuxEvents` bridge (in `mux.rs`) for BOTH the multipass ISO path
+    // (`mux_iso`) and the single-pass inline path (`mux_live`) — so the old
+    // shared `make_stream_event_fn` closure is gone; the atomics it fed
+    // (`wd_last_frame`, `rip_last_lba`, `rip_current_batch`, `latest_bytes_read`)
+    // are handed to the bridge via `MuxAtomics` below.
 
     // Mux-phase progress denominator. The multipass/resume highway reads the
     // WHOLE disc-capacity ISO, so its `BytesRead` climbs to `disc.capacity_bytes`
@@ -4717,72 +4674,61 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             }
         }
     } else {
-        // Drive single-pass path (STEP 4c-ii — UNCHANGED): inline DiscStream +
-        // the hand-rolled producer/consumer `run_mux`.
-        let input: Box<dyn libfreemkv::pes::Stream> = {
-            // Drive single-pass: stays on the inline DiscStream because
-            // its adaptive batch-retry on read failure lives inside
-            // `fill_extents`. The producer-thread highway doesn't (yet)
-            // replicate that retry policy, so for live-disc reads we
-            // keep the in-place fill loop. Same `on_event` closure as
-            // the highway path so the UI gets one event stream.
-            let mut s = match libfreemkv::DiscStream::new(
-                reader,
-                title,
-                keys,
-                batch,
-                format,
-                false,
-                Some(halt_token.clone()),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    // A Stop pressed during construction (the CSS crack runs in
-                    // `DiscStream::new`) surfaces as `Error::Halted` — a user halt,
-                    // not a permanent failure. Preserve staging for resume; do NOT
-                    // quarantine. Classify on the error, not the halt token.
-                    if is_halt_error(&e) {
-                        crate::log::device_log(
-                            device,
-                            "Rip stopped by user during mux setup — staging preserved for resume.",
-                        );
-                        unregister_halt(device);
-                        return;
-                    }
-                    // Same structural-failure path as the highway branch above: a
-                    // title/stream layout that can't be prepared (incl. a
-                    // scrambled-but-uncrackable CSS DVD → CssKeyMissing) is permanent.
-                    tracing::error!(target: "mux", device=%device, "DiscStream setup failed: {e}");
-                    let msg = format!(
-                        "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
+        // Drive single-pass path (STEP 4c-ii): the live inline `DiscStream` via
+        // libfreemkv::mux_stream (`MuxInput::Live`). It stays INLINE — NOT the
+        // prefetch highway — because `DiscStream::fill_extents`' adaptive
+        // batch-retry on a bad live-drive sector only fires on the inline reader;
+        // the highway wrapper would bypass it. The header pump / write pipeline /
+        // finish loop the hand-rolled `run_mux` used to own now live inside
+        // `mux_stream`; `AutoripMuxEvents` feeds the same watchdog + UI atomics.
+        // The forensic `fmts_key_map` is applied inside `mux_stream` via
+        // `DiscStream::with_key_map` (single-pass FMTS: read only our-phase units
+        // and decrypt the forensic segment correctly); `None` for non-FMTS discs.
+        let live_src = mux::LiveMuxSource {
+            reader,
+            title,
+            format,
+            keys,
+            key_map: fmts_key_map.clone(),
+            skip_errors: cfg_read.on_read_error == "skip",
+        };
+        match mux::mux_live(mux_inputs, live_src, mux_atomics) {
+            Ok(o) => o,
+            Err(e) => {
+                // Same construction-time classification as the multipass branch
+                // and the pre-migration inline path: a Stop pressed during the CSS
+                // crack inside `DiscStream::new` (run within `mux_stream`) surfaces
+                // as `Error::Halted` — a user halt, not a structural failure:
+                // preserve staging for auto-resume, no `.failed`.
+                if is_halt_error(&e) {
+                    crate::log::device_log(
+                        device,
+                        "Rip stopped by user during mux setup — staging preserved for resume.",
                     );
-                    crate::log::device_log(device, &msg);
-                    let staging_disc_path = std::path::Path::new(&staging);
-                    staging::write_failed_marker(staging_disc_path, &msg);
-                    staging::clear_restart_count(staging_disc_path);
-                    update_state_with(device, |s| {
-                        s.status = "failed".to_string();
-                        s.last_error = msg.clone();
-                        s.failure_reason = Some(msg.clone());
-                    });
                     unregister_halt(device);
                     return;
                 }
-            };
-            // FMTS live single-pass: read only our-phase units (the retained pre-rip
-            // map decides which), so the alternate device-group half never reaches the
-            // demux — the same fix the file-backed highway applies. `None` for every
-            // non-FMTS disc, leaving the read walk unchanged.
-            if let Some(map) = fmts_key_map.clone() {
-                s = s.with_key_map(map);
+                // A build failure (header resolution, codec negotiation, or a
+                // scrambled-but-uncrackable CSS DVD → CssKeyMissing) is structural
+                // and permanent — retries won't fix it. Quarantine with `.failed`
+                // (mirrors the multipass branch and the header-phase path below).
+                tracing::error!(target: "mux", device=%device, "mux_stream (live) setup failed: {e}");
+                let msg = format!(
+                    "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
+                );
+                crate::log::device_log(device, &msg);
+                let staging_disc_path = std::path::Path::new(&staging);
+                staging::write_failed_marker(staging_disc_path, &msg);
+                staging::clear_restart_count(staging_disc_path);
+                update_state_with(device, |s| {
+                    s.status = "failed".to_string();
+                    s.last_error = msg.clone();
+                    s.failure_reason = Some(msg.clone());
+                });
+                unregister_halt(device);
+                return;
             }
-            if cfg_read.on_read_error == "skip" {
-                s.skip_errors = true;
-            }
-            s.on_event(stream_event_fn);
-            Box::new(s)
-        };
-        mux::run_mux(mux_inputs, input, mux_atomics)
+        }
     };
 
     // Output never opened. Two sub-cases:
