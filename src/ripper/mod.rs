@@ -2359,7 +2359,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     //   - made the API display `current_batch: 1` (misleading — it
     //     suggested the rip was reading sector-by-sector during sweep,
     //     but the actual sweep batch is determined inside libfreemkv's
-    //     Disc::copy and is unaffected by this value)
+    //     freemkv_engine::sweep and is unaffected by this value)
     //   - made the mux phase read the ISO **one sector at a time**
     //     (2 KB chunks) via DiscStream::new(reader, title, keys, batch,
     //     format) — a real perf bug on the mux read path
@@ -2518,7 +2518,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // legacy `Arc<AtomicBool>`. Keep the same name so the watcher
     // helpers (which still take `Arc<AtomicBool>`) compile unchanged
     // — this is a deprecated bridge, dropped together with
-    // `Disc::copy()` in round 3.
+    // `freemkv_engine::sweep()` in round 3.
     let halt = drive_halt_arc;
 
     // Rip-level wallclock watcher. Historically capped the ENTIRE rip at
@@ -2652,9 +2652,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     ));
     // Multi-pass vs direct flow.
     //
-    // When max_retries > 0, we go through an ISO intermediate: Disc::copy writes
+    // When max_retries > 0, we go through an ISO intermediate: freemkv_engine::sweep writes
     // the disc to an ISO (fast skip-forward on failure, ddrescue-style mapfile),
-    // then Disc::patch retries the bad ranges up to max_retries times, then the
+    // then freemkv_engine::patch retries the bad ranges up to max_retries times, then the
     // mux pipeline reads from the ISO (no drive involvement past this point).
     //
     // When max_retries == 0, we keep the existing direct disc→MKV flow —
@@ -3006,7 +3006,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 break;
             }
 
-            // 0.18 round 3: Pass 1 calls Disc::sweep directly. The old
+            // 0.18 round 3: Pass 1 calls freemkv_engine::sweep directly. The old
             // disc.copy(opts.multipass=true) dispatched to sweep_internal
             // which forwarded {decrypt, skip_on_error=multipass} to
             // SweepOptions. resume=true on retry attempts so the existing
@@ -3437,7 +3437,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         let mut bytes_unreadable = result.bytes_unreadable;
         let mut bytes_pending = result.bytes_pending;
 
-        // Retry passes: Disc::patch re-reads only the bad ranges
+        // Retry passes: freemkv_engine::patch re-reads only the bad ranges
         // recorded in the mapfile sector-by-sector with full
         // drive-level recovery. Each pass gets its own wallclock cap
         // watcher; cap-fire marks the rip as failed.
@@ -3553,7 +3553,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // the ranges across the pass boundary. The lib builds the snapshot
             // from the mapfile (autorip never parses it); there's no live `p`
             // yet at the boundary.
-            if let Some(snap) = libfreemkv::disc::progress_snapshot_from_mapfile(
+            if let Some(snap) = freemkv_engine::progress_snapshot_from_mapfile(
                 patch_map,
                 Some(patch_title),
                 libfreemkv::progress::PassKind::Trim { reverse: true },
@@ -3592,7 +3592,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let pass_halt = Arc::new(AtomicBool::new(false));
             let _pass_guard = spawn_pass_watcher(pass_halt.clone(), user_halt.clone());
 
-            // 0.18 round 3: Pass 2..N calls Disc::patch directly. The old
+            // 0.18 round 3: Pass 2..N calls freemkv_engine::patch directly. The old
             // disc.copy(opts.multipass=true) dispatched to patch_internal
             // when the mapfile already had retryable bytes; these PatchOptions
             // mirror what patch_internal was constructing internally.
@@ -4428,7 +4428,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // bad-range list visible through mux and into the "done" view. The lib
         // builds the snapshot from the mapfile (autorip never parses it).
         let mux_state = std::cell::RefCell::new(PassProgressState::new());
-        if let Some(snap) = libfreemkv::disc::progress_snapshot_from_mapfile(
+        if let Some(snap) = freemkv_engine::progress_snapshot_from_mapfile(
             std::path::Path::new(&mapfile_path_str),
             Some(&title_for_progress),
             libfreemkv::progress::PassKind::Mux,
