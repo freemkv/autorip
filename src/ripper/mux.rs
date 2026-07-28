@@ -1256,6 +1256,7 @@ pub(crate) fn mux_iso(
         // model wants a wedged sink surfaced as a 60 s per-frame timeout, not an
         // unbounded block. Preserves the pre-refactor `run_mux` behaviour.
         send_deadline: Some(Duration::from_secs(60)),
+        selection: Default::default(),
     };
 
     crate::log::device_log(
@@ -1418,6 +1419,7 @@ pub(crate) fn mux_live(
         // Same bounded 60 s per-frame send as `mux_iso`: the live single-pass
         // path is watchdog-backed too, so preserve the pre-refactor bound.
         send_deadline: Some(Duration::from_secs(60)),
+        selection: Default::default(),
     };
 
     crate::log::device_log(
