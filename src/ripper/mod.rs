@@ -3017,7 +3017,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // `resume_sweep` (user clicked Resume on a partial) makes even the
             // FIRST attempt resume from the existing mapfile + ISO, so the
             // ~40 GB already swept isn't re-read off the disc.
-            let sweep_opts = libfreemkv::SweepOptions {
+            let sweep_opts = freemkv_engine::SweepOptions {
                 decrypt: false,
                 resume: resume_sweep || attempt > 1,
                 batch_sectors: None,
@@ -3039,7 +3039,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 key_fetch: key_fetch.clone(),
             };
 
-            match disc.sweep(&mut session.drive, iso_path, &sweep_opts) {
+            match freemkv_engine::sweep(&disc, &mut session.drive, iso_path, &sweep_opts) {
                 Ok(r) => {
                     result = Some(r);
                     break 'pass1;
@@ -3597,7 +3597,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // disc.copy(opts.multipass=true) dispatched to patch_internal
             // when the mapfile already had retryable bytes; these PatchOptions
             // mirror what patch_internal was constructing internally.
-            let patch_opts = libfreemkv::PatchOptions {
+            let patch_opts = freemkv_engine::PatchOptions {
                 decrypt: false,
                 // Enter each bad range BATCHED (not single-sector). A bad
                 // range from Pass 1 is mostly the good skip-ahead overshoot
@@ -3651,7 +3651,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     &format!("drive spin-cycled (soft un-wedge, no eject) before pass {pass}"),
                 );
             }
-            let cr = match disc.patch(&mut session.drive, iso_path, &patch_opts) {
+            let cr = match freemkv_engine::patch(&disc, &mut session.drive, iso_path, &patch_opts) {
                 Ok(r) => r,
                 Err(e) => {
                     // Categorize the failure for debugging

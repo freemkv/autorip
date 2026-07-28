@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 libfreemkv = "1.5"
+freemkv-engine = "1.6"
 freemkv-keysources = "1.5"
 freemkv-i18n = "1.5"
 serde = { version = "1", features = ["derive"] }
@@ -67,5 +68,6 @@ codegen-units = 1
 # patch with a path patch via the gitignored .cargo/config.toml.
 [patch.crates-io]
 libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.5.2" }
+freemkv-engine = { git = "https://github.com/freemkv/freemkv-engine", tag = "v1.6.0" }
 freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.5.2" }
 freemkv-i18n = { git = "https://github.com/freemkv/freemkv-i18n", tag = "v1.5.2" }

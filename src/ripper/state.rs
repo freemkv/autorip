@@ -255,11 +255,11 @@ impl Default for RipState {
 /// fields. Wraps libfreemkv's `classify_damage` so the UI gets a stable
 /// lowercase string ("clean" / "cosmetic" / "moderate" / "serious").
 pub(super) fn damage_severity_for(errors: u32, total_lost_ms: f64) -> String {
-    use libfreemkv::DamageSeverity;
+    use freemkv_engine::DamageSeverity;
     // Direct match instead of round-tripping through serde_json::to_value
     // on every (throttled) progress callback. Strings match libfreemkv's
     // `#[serde(rename_all = "lowercase")]` repr so the UI is unchanged.
-    match libfreemkv::classify_damage(errors as u64, total_lost_ms) {
+    match freemkv_engine::classify_damage(errors as u64, total_lost_ms) {
         DamageSeverity::Clean => "clean",
         DamageSeverity::Cosmetic => "cosmetic",
         DamageSeverity::Moderate => "moderate",
