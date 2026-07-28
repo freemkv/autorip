@@ -542,16 +542,11 @@ fn range_chapter(lba: u32, title: &libfreemkv::DiscTitle) -> (Option<u32>, Optio
 /// abort snapshot, where "bad" means the drive has finally given up. Thin
 /// wrapper over [`located_ranges`].
 pub(crate) fn build_bad_ranges(
-    map: &libfreemkv::disc::mapfile::Mapfile,
+    map: &freemkv_engine::Mapfile,
     title: &libfreemkv::DiscTitle,
     bps: f64,
 ) -> (Vec<BadRange>, u32, u32, f64, f64) {
-    located_ranges(
-        map,
-        title,
-        bps,
-        &[libfreemkv::disc::mapfile::SectorStatus::Unreadable],
-    )
+    located_ranges(map, title, bps, &[freemkv_engine::SectorStatus::Unreadable])
 }
 
 /// Build a located range list (LBA + sectors + duration + chapter) for the
@@ -562,10 +557,10 @@ pub(crate) fn build_bad_ranges(
 /// **Maybe** drilldown — so a patch pass shows WHERE it is working instead of a
 /// black box. `NonTried` (unread, ahead of the head) is never included.
 pub(crate) fn located_ranges(
-    map: &libfreemkv::disc::mapfile::Mapfile,
+    map: &freemkv_engine::Mapfile,
     title: &libfreemkv::DiscTitle,
     bps: f64,
-    statuses: &[libfreemkv::disc::mapfile::SectorStatus],
+    statuses: &[freemkv_engine::SectorStatus],
 ) -> (Vec<BadRange>, u32, u32, f64, f64) {
     let raw = map.ranges_with(statuses);
     let total_count = raw.len() as u32;
@@ -1189,7 +1184,7 @@ mod tests {
     //! right thing for the right status" check.
 
     use super::*;
-    use libfreemkv::disc::mapfile::{Mapfile, SectorStatus};
+    use freemkv_engine::{Mapfile, SectorStatus};
 
     /// Create a throwaway mapfile inside a fresh `TempDir`. The returned
     /// `TempDir` guard must be held for the test's lifetime; its Drop

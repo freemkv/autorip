@@ -171,7 +171,7 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
 
     // Mapfile load. A corrupt mapfile means the post-Pass-1 state is
     // ambiguous — fall back to a full re-rip.
-    let map = match libfreemkv::disc::mapfile::Mapfile::load(&mapfile_path) {
+    let map = match freemkv_engine::Mapfile::load(&mapfile_path) {
         Ok(m) => m,
         Err(e) => {
             // Don't swallow this: a corrupt/unreadable mapfile silently
@@ -767,7 +767,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     }
     .to_string();
     let duration = crate::util::format_duration_hm(title.duration_secs);
-    let map = match libfreemkv::disc::mapfile::Mapfile::load(&mapfile_path) {
+    let map = match freemkv_engine::Mapfile::load(&mapfile_path) {
         Ok(m) => m,
         Err(e) => {
             // The classifier already loaded this mapfile cleanly; a
@@ -791,7 +791,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         }
     };
     {
-        use libfreemkv::disc::mapfile::SectorStatus;
+        use freemkv_engine::SectorStatus;
         let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
         // Scope the loss exactly as the fresh-rip post-retry abort gate does
         // (`abort_lost_ms` in mod.rs): for `output_format == "iso"` every
@@ -990,7 +990,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // bytes_unreadable / 2048. `main_lost_ms` uses `bytes_bad_in_title`
     // scoped to the longest title.
     let sweep_damage_for_resume = {
-        use libfreemkv::disc::mapfile::SectorStatus;
+        use freemkv_engine::SectorStatus;
         let (bad_ranges, num_bad_ranges, bad_ranges_truncated, total_lost_ms, largest_gap_ms) =
             super::state::build_bad_ranges(&map, &title, title_bytes_per_sec);
         let main_title_bad = map.ranges_with(&[SectorStatus::Unreadable]);
@@ -1868,7 +1868,7 @@ fn resolve_keys_from_iso(
     // correctly; a genuinely-unkeyed disc returns NoKey.
     if let Some(a) = disc.aacs.as_mut() {
         if a.volume_id == [0u8; 16] {
-            if let Some(vid) = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path)
+            if let Some(vid) = freemkv_engine::Mapfile::load(mapfile_path)
                 .ok()
                 .and_then(|m| m.vid())
             {

@@ -1682,7 +1682,7 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
                 continue;
             }
             let (iso_path, mapfile_path) = resume::find_iso_and_mapfile(&path)?;
-            let map = match libfreemkv::disc::mapfile::Mapfile::load(&mapfile_path) {
+            let map = match freemkv_engine::Mapfile::load(&mapfile_path) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -1866,7 +1866,7 @@ fn resumable_for_disc(cfg: &Config, display_name: &str) -> Option<Resumable> {
             Some(p) => p,
             None => continue,
         };
-        let map = match libfreemkv::disc::mapfile::Mapfile::load(&mapfile_path) {
+        let map = match freemkv_engine::Mapfile::load(&mapfile_path) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -3485,30 +3485,29 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // of loss when the threshold allows 10 s does NOT earn a
             // skip — there's still recoverable damage in the muxed
             // scope, so we keep trying.
-            let mux_scope_bad = match libfreemkv::disc::mapfile::Mapfile::load(
-                std::path::Path::new(&mapfile_path_str),
-            ) {
-                Ok(map) => {
-                    use libfreemkv::disc::mapfile::SectorStatus;
-                    let bad = map.ranges_with(&[
-                        SectorStatus::NonTried,
-                        SectorStatus::NonTrimmed,
-                        SectorStatus::NonScraped,
-                        SectorStatus::Unreadable,
-                    ]);
-                    if output_is_iso_image(&cfg_read.output_format) {
-                        bad.iter().map(|(_, sz)| *sz).sum::<u64>()
-                    } else {
-                        libfreemkv::disc::bytes_bad_in_title(&title_for_progress, &bad)
+            let mux_scope_bad =
+                match freemkv_engine::Mapfile::load(std::path::Path::new(&mapfile_path_str)) {
+                    Ok(map) => {
+                        use freemkv_engine::SectorStatus;
+                        let bad = map.ranges_with(&[
+                            SectorStatus::NonTried,
+                            SectorStatus::NonTrimmed,
+                            SectorStatus::NonScraped,
+                            SectorStatus::Unreadable,
+                        ]);
+                        if output_is_iso_image(&cfg_read.output_format) {
+                            bad.iter().map(|(_, sz)| *sz).sum::<u64>()
+                        } else {
+                            libfreemkv::disc::bytes_bad_in_title(&title_for_progress, &bad)
+                        }
                     }
-                }
-                Err(_) => {
-                    // Conservative fallback if we can't read the mapfile —
-                    // fall back to the whole-disc check so we don't skip
-                    // a needed pass on a transient read error.
-                    bytes_pending + bytes_unreadable
-                }
-            };
+                    Err(_) => {
+                        // Conservative fallback if we can't read the mapfile —
+                        // fall back to the whole-disc check so we don't skip
+                        // a needed pass on a transient read error.
+                        bytes_pending + bytes_unreadable
+                    }
+                };
             if mux_scope_bad == 0 {
                 let scope_label = if output_is_iso_image(&cfg_read.output_format) {
                     "whole disc"
@@ -3842,8 +3841,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         let mut main_lost_bytes_for_history = 0u64;
         if cfg_read.max_retries > 0 {
             let mapfile_path = std::path::Path::new(&mapfile_path_str);
-            if let Ok(mut map) = libfreemkv::disc::mapfile::Mapfile::load(mapfile_path) {
-                use libfreemkv::disc::mapfile::SectorStatus;
+            if let Ok(mut map) = freemkv_engine::Mapfile::load(mapfile_path) {
+                use freemkv_engine::SectorStatus;
                 // Promote still-NonTrimmed bytes to Unreadable — these are
                 // bytes that remained "maybe" across all patch passes and are
                 // now confirmed lost.
@@ -4838,9 +4837,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // skips (usually zero — ISO reads don't fail). The real bad-sector count
     // lives in the mapfile sidecar. Prefer that when present.
     if cfg_read.max_retries > 0 {
-        if let Ok(map) =
-            libfreemkv::disc::mapfile::Mapfile::load(std::path::Path::new(&mapfile_path_str))
-        {
+        if let Ok(map) = freemkv_engine::Mapfile::load(std::path::Path::new(&mapfile_path_str)) {
             let stats = map.stats();
             // Only Unreadable counts as "lost" — NonTried / NonTrimmed /
             // NonScraped at the END of a rip means the rip was interrupted,
@@ -8192,7 +8189,7 @@ mod tests {
     /// the already-promoted in-memory map, and the flush persists it to disk.
     #[test]
     fn promotion_uses_in_memory_map_and_flush_persists_to_disk() {
-        use libfreemkv::disc::mapfile::{self, SectorStatus};
+        use freemkv_engine::{Mapfile, SectorStatus};
 
         let tmp = tempfile::tempdir().unwrap();
         let mf_path = tmp.path().join("test.mapfile");
@@ -8203,8 +8200,7 @@ mod tests {
         let bad_pos: u64 = 5 * 2048;
         let bad_size: u64 = 2048;
         {
-            let mut map =
-                mapfile::Mapfile::create(&mf_path, disc_size, "test").expect("create mapfile");
+            let mut map = Mapfile::create(&mf_path, disc_size, "test").expect("create mapfile");
             // Mark everything Finished except one NonTrimmed range.
             map.record(0, bad_pos, SectorStatus::Finished)
                 .expect("record Finished before bad");
@@ -8221,7 +8217,7 @@ mod tests {
 
         // Simulate the promotion block: load, promote, flush.
         {
-            let mut map = mapfile::Mapfile::load(&mf_path).expect("load for promotion");
+            let mut map = Mapfile::load(&mf_path).expect("load for promotion");
             let nontrimmed = map.ranges_with(&[SectorStatus::NonTrimmed]);
             assert_eq!(nontrimmed.len(), 1, "precondition: one NonTrimmed range");
             for (pos, size) in nontrimmed {
@@ -8256,7 +8252,7 @@ mod tests {
 
         // Verify the flush wrote the promoted state to disk: a fresh load must
         // see Unreadable, not NonTrimmed.
-        let reloaded = mapfile::Mapfile::load(&mf_path).expect("reload after promotion flush");
+        let reloaded = Mapfile::load(&mf_path).expect("reload after promotion flush");
         let reloaded_unreadable = reloaded.ranges_with(&[SectorStatus::Unreadable]);
         assert_eq!(
             reloaded_unreadable.len(),
@@ -8460,7 +8456,7 @@ mod tests {
         let iso = disc_dir.join(format!("{sanitized}.iso"));
         std::fs::write(&iso, b"x").unwrap();
         let mapfile_path = disc_dir.join(format!("{sanitized}.iso.mapfile"));
-        libfreemkv::disc::mapfile::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
+        freemkv_engine::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
 
         assert_eq!(
             resumable_for_disc(&cfg, display_name),
@@ -8494,7 +8490,7 @@ mod tests {
             let iso = disc_dir.join(format!("{sanitized}.iso"));
             std::fs::write(&iso, b"x").unwrap();
             let mapfile_path = disc_dir.join(format!("{sanitized}.iso.mapfile"));
-            libfreemkv::disc::mapfile::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
+            freemkv_engine::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
             // Sanity: without the terminal/held marker it IS Sweep-resumable.
             assert_eq!(
                 resumable_for_disc(&cfg, display_name),
@@ -8535,7 +8531,7 @@ mod tests {
             let iso = disc_dir.join(format!("{sanitized}.iso"));
             std::fs::write(&iso, b"x").unwrap();
             let mapfile_path = disc_dir.join(format!("{sanitized}.iso.mapfile"));
-            libfreemkv::disc::mapfile::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
+            freemkv_engine::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
             // Sanity: without the worker-owned marker it IS Sweep-resumable.
             assert_eq!(
                 resumable_for_disc(&cfg, display_name),
