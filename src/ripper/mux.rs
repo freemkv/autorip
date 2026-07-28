@@ -785,7 +785,7 @@ pub(crate) struct IsoMuxSource {
 struct AutoripMuxEvents {
     ui: UiState,
     atomics: SharedAtomics,
-    progress: Mutex<crate::ripper::state::PassProgressState>,
+    progress: Mutex<freemkv_engine::SpeedEstimator>,
     /// 1 s `update_state` throttle (was `MuxSink::last_update`).
     last_update: Mutex<Instant>,
     /// 60 s device-log throttle (was `MuxSink::last_log`).
@@ -1242,7 +1242,7 @@ pub(crate) fn mux_iso(
     let events = Arc::new(AutoripMuxEvents {
         ui: ui_state_from_inputs(&inputs, total_bytes),
         atomics: shared,
-        progress: Mutex::new(crate::ripper::state::PassProgressState::new()),
+        progress: Mutex::new(freemkv_engine::SpeedEstimator::new()),
         last_update: Mutex::new(start),
         last_log: Mutex::new(start),
         opened: AtomicBool::new(false),
@@ -1404,7 +1404,7 @@ pub(crate) fn mux_live(
     let events = Arc::new(AutoripMuxEvents {
         ui: ui_state_from_inputs(&inputs, total_bytes),
         atomics: shared,
-        progress: Mutex::new(crate::ripper::state::PassProgressState::new()),
+        progress: Mutex::new(freemkv_engine::SpeedEstimator::new()),
         last_update: Mutex::new(start),
         last_log: Mutex::new(start),
         opened: AtomicBool::new(false),
@@ -1789,7 +1789,7 @@ mod tests {
         let events = AutoripMuxEvents {
             ui: test_ui_state(),
             atomics,
-            progress: Mutex::new(crate::ripper::state::PassProgressState::new()),
+            progress: Mutex::new(freemkv_engine::SpeedEstimator::new()),
             // `now` → the 1 s throttle fires and `on_write_progress` returns
             // early AFTER feeding the watchdog atomics: the feed must not be
             // gated behind the UI throttle.
@@ -1851,7 +1851,7 @@ mod tests {
         let events = AutoripMuxEvents {
             ui: test_ui_state(),
             atomics,
-            progress: Mutex::new(crate::ripper::state::PassProgressState::new()),
+            progress: Mutex::new(freemkv_engine::SpeedEstimator::new()),
             last_update: Mutex::new(Instant::now()),
             last_log: Mutex::new(Instant::now()),
             opened: AtomicBool::new(false),
@@ -1897,7 +1897,7 @@ mod tests {
         let events = AutoripMuxEvents {
             ui: test_ui_state(),
             atomics,
-            progress: Mutex::new(crate::ripper::state::PassProgressState::new()),
+            progress: Mutex::new(freemkv_engine::SpeedEstimator::new()),
             last_update: Mutex::new(Instant::now()),
             last_log: Mutex::new(Instant::now()),
             opened: AtomicBool::new(false),
