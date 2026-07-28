@@ -8,11 +8,20 @@
   now run through `libfreemkv::mux_stream` instead of a hand-rolled inner loop,
   and drive/ISO bring-up goes through `DiscSession` / `scan_iso`. No user-facing
   change; the FMTS key-resolution gate is now interruptible.
+- The recovery pipeline now runs on the shared **`freemkv-engine`** crate:
+  autorip drives `freemkv_engine::{sweep, patch}` (with `SweepOptions` /
+  `PatchOptions`) and reads the map through `freemkv_engine::{Mapfile,
+  SectorStatus}` instead of libfreemkv's now-removed `Disc::sweep` / `Disc::patch`.
+  Damage classification comes from `freemkv_engine::classify_damage`, and
+  progress speed + ETA are derived by the engine's `SpeedEstimator` (autorip's
+  local windowed-speed math was deleted and promoted into the engine, so every
+  front-end shares one derivation).
 - Builds against libfreemkv 1.6.0. The rip service keeps every audio/subtitle
   stream (the new stream-selection knob defaults to keep-everything; autorip has
-  no selection UI yet). Moving autorip's rip *orchestration* fully onto the
-  shared `freemkv-engine` crate (as the CLI already did) is in progress and
-  lands in a later 1.6.x.
+  no selection UI yet). Moving autorip's higher-level rip *orchestration* onto
+  the engine's `Sink`/`run` surface (it currently drives the passes directly, so
+  its staging/resume/watchdog can advance at pass boundaries) is a later 1.6.x
+  step.
 
 ## [1.5.2] — 2026-07-22
 

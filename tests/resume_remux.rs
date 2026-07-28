@@ -33,8 +33,8 @@ fn write_iso(path: &Path, size_bytes: u64) {
     f.set_len(size_bytes).expect("iso set_len");
 }
 
-fn write_mapfile(path: &Path, size_bytes: u64, status: libfreemkv::disc::mapfile::SectorStatus) {
-    use libfreemkv::disc::mapfile::Mapfile;
+fn write_mapfile(path: &Path, size_bytes: u64, status: freemkv_engine::SectorStatus) {
+    use freemkv_engine::Mapfile;
     let mut map = Mapfile::create(path, size_bytes, "test").expect("mapfile create");
     map.record(0, size_bytes, status).expect("mapfile record");
     map.flush().expect("mapfile flush");
@@ -49,7 +49,7 @@ fn resume_classifies_clean_mapfile_as_remux() {
     write_mapfile(
         &dir.join("MyDisc.iso.mapfile"),
         4096,
-        libfreemkv::disc::mapfile::SectorStatus::Finished,
+        freemkv_engine::SectorStatus::Finished,
     );
 
     let hint = make_hint(
@@ -86,7 +86,7 @@ fn resume_classifies_partial_mapfile_as_not_remux() {
     write_mapfile(
         &dir.join("MyDisc.iso.mapfile"),
         4096,
-        libfreemkv::disc::mapfile::SectorStatus::NonTried,
+        freemkv_engine::SectorStatus::NonTried,
     );
 
     let hint = make_hint(
@@ -119,7 +119,7 @@ fn resume_classifies_short_iso_as_not_remux() {
     write_mapfile(
         &dir.join("MyDisc.iso.mapfile"),
         4096,
-        libfreemkv::disc::mapfile::SectorStatus::Finished,
+        freemkv_engine::SectorStatus::Finished,
     );
     let hint = make_hint(
         dir,
@@ -145,7 +145,7 @@ fn resume_classifies_missing_iso_as_not_remux() {
     write_mapfile(
         &dir.join("MyDisc.iso.mapfile"),
         4096,
-        libfreemkv::disc::mapfile::SectorStatus::Finished,
+        freemkv_engine::SectorStatus::Finished,
     );
     let hint = make_hint(
         dir,
@@ -245,7 +245,7 @@ fn resume_remux_preserves_state_on_classifier_rejection() {
 /// contain some Unreadable bytes. Used to simulate a disc with bad sectors
 /// that are entirely outside the main title.
 fn write_mapfile_with_unreadable(path: &Path, total_bytes: u64, unreadable_bytes: u64) {
-    use libfreemkv::disc::mapfile::{Mapfile, SectorStatus};
+    use freemkv_engine::{Mapfile, SectorStatus};
     assert!(
         unreadable_bytes < total_bytes,
         "unreadable_bytes must be less than total_bytes"

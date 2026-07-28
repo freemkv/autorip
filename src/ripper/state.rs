@@ -252,7 +252,7 @@ impl Default for RipState {
 }
 
 /// Compute the damage-severity badge string from autorip's RipState
-/// fields. Wraps libfreemkv's `classify_damage` so the UI gets a stable
+/// fields. Wraps freemkv-engine's `classify_damage` so the UI gets a stable
 /// lowercase string ("clean" / "cosmetic" / "moderate" / "serious").
 pub(super) fn damage_severity_for(errors: u32, total_lost_ms: f64) -> String {
     use freemkv_engine::DamageSeverity;
@@ -497,7 +497,7 @@ pub(super) struct PassContext {
     /// Preferred batch size (kernel-reported max sectors per CDB) — surfaced
     /// in RipState during Pass 1 / Pass 2+ so the UI shows a non-zero
     /// `preferred_batch` / `current_batch`. Pass 1 never shrinks the batch
-    /// (Disc::copy uses a fixed size); current_batch == preferred_batch
+    /// (freemkv_engine::sweep uses a fixed size); current_batch == preferred_batch
     /// throughout. The DiscStream batch halver only operates during the
     /// mux phase and is reported via the direct-mode stream loop.
     pub(super) batch: u16,
@@ -607,27 +607,12 @@ pub(crate) fn located_ranges(
 // `PassProgress.located` (computed by libfreemkv), so autorip no longer parses
 // the mapfile on the hot path.
 
-/// Per-pass speed tracker — sliding window of `(Instant, bytes_good)`
-/// samples over the last `SPEED_WINDOW_SECS`. Speed is the average rate
-/// across the oldest and newest in-window samples. Held in a RefCell
-/// inside the callback closure so interior mutability keeps the closure
+/// Per-pass progress state. The speed/ETA math (windowed display speed +
+/// pass-start ETA rate, and why a sliding window beats an EWMA through a stall)
+/// now lives in `freemkv_engine::SpeedEstimator` — see its docs; this struct
+/// just holds one estimator plus autorip's own per-pass bookkeeping. Held in a
+/// RefCell inside the callback closure so interior mutability keeps the closure
 /// `Fn`.
-///
-/// **Why a sliding window, not EWMA**: the previous design used
-/// `0.7 × prev + 0.3 × instant`. Alpha=0.3 has a long memory tail — a
-/// 12 s stall (drive briefly slow at a marginal LBA region, common on
-/// damaged or boundary discs) drags the displayed speed for ~30 s after
-/// recovery. Empirically this presents as "the rip looks dead for
-/// minutes" when the drive recovered seconds ago. The sliding window
-/// bounds the stall's influence on the display: at most
-/// `SPEED_WINDOW_SECS` after recovery the slow samples have aged out
-/// and the display reflects the true rate.
-///
-/// **Why this isn't just averaging**: with 1.5 s callback throttling,
-/// the window holds ~6-7 samples. Each new sample shifts only one slot,
-/// so the displayed value moves smoothly (20 → 19 → 18 → 17 instead of
-/// 20 → 7 → 13 → 20 → 2 → 17 jitter). Updates are still fast — every
-/// callback recomputes from the freshest window contents.
 #[derive(Debug)]
 pub(super) struct PassProgressState {
     /// The engine's canonical speed/ETA estimator (windowed display speed +
@@ -678,12 +663,12 @@ impl PassProgressState {
     }
 }
 
-/// Read the live mapfile and push a fresh RipState snapshot for the current
-/// pass. Computes smoothed speed + ETA from successive bytes_good samples —
-/// otherwise the UI shows 0 KB/s through the whole rip since the main
-/// stream loop's speed tracker isn't running during `Disc::copy` / `patch`.
-/// No-op (quietly) if the mapfile can't be read — the next callback will
-/// try again.
+/// Push a fresh RipState snapshot for the current pass. Feeds the pass's
+/// work_done into the engine `SpeedEstimator` for the displayed speed + ETA —
+/// otherwise the UI shows 0 KB/s through the whole rip, since the main stream
+/// loop's speed tracker isn't running during `freemkv_engine::sweep` / `patch`.
+/// Buckets/drilldown come straight from `PassProgress.located` (autorip no
+/// longer parses the mapfile on this path).
 pub(super) fn push_pass_state(
     ctx: &PassContext,
     p: &libfreemkv::progress::PassProgress,

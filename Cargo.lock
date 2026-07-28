@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-autorip"
-version = "1.5.2"
+version = "1.6.0"
 dependencies = [
  "base64",
  "crossbeam-channel",
@@ -339,14 +339,14 @@ dependencies = [
 
 [[package]]
 name = "freemkv-i18n"
-version = "1.5.2"
+version = "1.6.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "freemkv-keysources"
-version = "1.5.2"
+version = "1.6.0"
 dependencies = [
  "base64",
  "flate2",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-unlock"
-version = "1.5.2"
+version = "1.6.0"
 dependencies = [
  "aes",
  "base64",
@@ -569,7 +569,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfreemkv"
-version = "1.5.2"
+version = "1.6.0"
 dependencies = [
  "aes",
  "base64",
