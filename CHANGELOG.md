@@ -1,6 +1,20 @@
 # Changelog
 
-## [1.5.2] — UNRELEASED
+## [1.6.0] — UNRELEASED
+
+### Changed
+
+- Internal: autorip's mux paths (ISO/multipass, resume, and live single-pass)
+  now run through `libfreemkv::mux_stream` instead of a hand-rolled inner loop,
+  and drive/ISO bring-up goes through `DiscSession` / `scan_iso`. No user-facing
+  change; the FMTS key-resolution gate is now interruptible.
+- Builds against libfreemkv 1.6.0. The rip service keeps every audio/subtitle
+  stream (the new stream-selection knob defaults to keep-everything; autorip has
+  no selection UI yet). Moving autorip's rip *orchestration* fully onto the
+  shared `freemkv-engine` crate (as the CLI already did) is in progress and
+  lands in a later 1.6.x.
+
+## [1.5.2] — 2026-07-22
 
 ### Fixed
 
@@ -21,7 +35,7 @@
   (2011) - 4K Ultra HD` queried TMDB as `Drive (2011)` → 0 results). `clean_title`
   strips a parenthesized 4-digit year; a bare year (`Blade Runner 2049`) is kept.
 
-## [1.5.0] — UNRELEASED
+## [1.5.0] — 2026-07-19
 
 Version sync with the workspace; inherits libfreemkv 1.5.0. No functional change to
 the service — the new extraction sinks (`audio://`, `sub://`, `chapters://`,
