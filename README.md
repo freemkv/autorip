@@ -111,7 +111,7 @@ libfreemkv (Rust library)
         ├── Drive watcher (udev + polling)
         ├── Rip engine (direct library API)
         │   ├── Direct path: DiscStream(drive) → MKV
-        │   └── Multi-pass: Disc::sweep + Disc::patch → ISO → DiscStream(ISO) → MKV
+        │   └── Multi-pass: freemkv_engine::sweep + freemkv_engine::patch → ISO → DiscStream(ISO) → MKV
         ├── File organizer (TMDB → Movies/Title/)
         ├── Web dashboard (embedded HTTP + SSE)
         └── Webhooks
