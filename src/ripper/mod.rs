@@ -5410,11 +5410,7 @@ pub(super) fn abort_lost_bytes(
     title: &libfreemkv::DiscTitle,
     bad_ranges: &[(u64, u64)],
 ) -> u64 {
-    if output_is_iso {
-        bad_ranges.iter().map(|(_, sz)| *sz).sum::<u64>()
-    } else {
-        libfreemkv::disc::bytes_bad_in_title(title, bad_ranges)
-    }
+    freemkv_engine::abort_lost_bytes(output_is_iso, title, bad_ranges)
 }
 
 pub(super) fn abort_lost_ms(
@@ -5423,10 +5419,7 @@ pub(super) fn abort_lost_ms(
     bad_ranges: &[(u64, u64)],
     title_bytes_per_sec: f64,
 ) -> f64 {
-    if title_bytes_per_sec <= 0.0 {
-        return 0.0;
-    }
-    abort_lost_bytes(output_is_iso, title, bad_ranges) as f64 / title_bytes_per_sec * MILLIS_PER_SEC
+    freemkv_engine::abort_lost_ms(output_is_iso, title, bad_ranges, title_bytes_per_sec)
 }
 
 /// Whether the post-retry abort check should fire.
@@ -5443,7 +5436,7 @@ pub(super) fn abort_lost_ms(
 /// quarantine, so an unquantifiable loss must fail safe (abort), not
 /// pass as a silent success.
 fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
-    lost_ms.is_nan() || lost_ms > abort_threshold_ms
+    freemkv_engine::should_abort_for_loss(lost_ms, abort_threshold_ms)
 }
 
 /// The flawless-rip loss gate. `abort_on_lost_secs == 0` means ZERO — abort on
@@ -5488,11 +5481,7 @@ pub(crate) fn output_is_iso_image(output_format: &str) -> bool {
 /// and accept a lossy image. MUXED output (MKV / M2TS / Network) uses the
 /// configured value unchanged.
 fn effective_abort_secs(output_format: &str, configured: u64) -> u64 {
-    if output_is_iso_image(output_format) {
-        0
-    } else {
-        configured
-    }
+    freemkv_engine::effective_abort_secs(output_is_iso_image(output_format), configured)
 }
 
 /// Human-readable main-movie loss for UI / markers. Sub-second loss shows
