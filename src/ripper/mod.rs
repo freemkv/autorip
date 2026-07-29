@@ -3885,7 +3885,21 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // not yet hit disk.
                 if bytes_unreadable > 0 {
                     let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
-                    if !bad_ranges.is_empty() && title_bytes_per_sec > 0.0 {
+                    if !bad_ranges.is_empty() {
+                        // Raw byte count under the muxed-title scope. Computed
+                        // FIRST and with NO bitrate condition, because the
+                        // perfect-rip (threshold 0) gate keys on bytes, not on
+                        // the bitrate-derived ms. This whole block used to sit
+                        // behind `title_bytes_per_sec > 0.0`, so on a disc with
+                        // no measurable bitrate the byte count stayed 0 and
+                        // confirmed unreadable loss passed the gate as a clean
+                        // rip — the exact thing the comment here claimed it
+                        // prevented.
+                        main_lost_bytes_for_history = abort_lost_bytes(
+                            output_is_iso_image(&cfg_read.output_format),
+                            &title_for_progress,
+                            &bad_ranges,
+                        );
                         // TOTAL unreadable time scoped to the muxed title (not
                         // the single largest gap, not whole-disc), exactly as
                         // the per-pass loop-exit gate does (see `mux_scope_bad`
@@ -3897,20 +3911,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         // must NOT trigger the abort. For raw ISO output there
                         // is no title to scope to, so the whole disc is the
                         // unit of loss.
-                        main_lost_ms_for_history = abort_lost_ms(
-                            output_is_iso_image(&cfg_read.output_format),
-                            &title_for_progress,
-                            &bad_ranges,
-                            title_bytes_per_sec,
-                        );
-                        // Raw byte count under the SAME scope — the perfect-rip
-                        // (threshold 0) gate keys on this, not the bitrate-derived
-                        // ms, so a zero/low bitrate can't hide unreadable loss.
-                        main_lost_bytes_for_history = abort_lost_bytes(
-                            output_is_iso_image(&cfg_read.output_format),
-                            &title_for_progress,
-                            &bad_ranges,
-                        );
+                        //
+                        // Converting bytes to time NEEDS a bitrate. Without one
+                        // the loss is real but unquantifiable in seconds, which
+                        // is NaN — and NaN fails safe to abort, matching both
+                        // `freemkv_engine::should_abort_for_loss` and the
+                        // mapfile-unreadable fail-safe below. Reporting 0.0
+                        // instead would let a configured seconds tolerance
+                        // silently accept loss it could not measure.
+                        main_lost_ms_for_history = if title_bytes_per_sec > 0.0 {
+                            abort_lost_ms(
+                                output_is_iso_image(&cfg_read.output_format),
+                                &title_for_progress,
+                                &bad_ranges,
+                                title_bytes_per_sec,
+                            )
+                        } else {
+                            f64::NAN
+                        };
                         // Mirror into the outer binding so the final done/stopped
                         // state update (after run_mux) can use the same in-title
                         // value without re-reading the mapfile.
@@ -5420,22 +5438,16 @@ pub(super) fn abort_lost_ms(
     freemkv_engine::abort_lost_ms(output_is_iso, title, bad_ranges, title_bytes_per_sec)
 }
 
-/// Whether the post-retry abort check should fire.
-///
-/// Strictly `>`, NOT `>=`: `abort_on_lost_secs=0` (threshold 0 ms) means
-/// "require a perfect in-title rip" — abort on ANY positive in-title
-/// loss, but proceed to mux when in-title loss is exactly zero. With
-/// `>=` a zero-loss title (`lost_ms == 0.0 >= 0.0`) would wrongly abort
-/// whenever any out-of-title sector was unreadable.
-///
-/// A NaN `lost_ms` is treated as "abort": `NaN > x` is `false`, so a
-/// plain comparison would silently decline to abort and mark the rip
-/// complete. This is the single chokepoint deciding perfect-rip vs.
-/// quarantine, so an unquantifiable loss must fail safe (abort), not
-/// pass as a silent success.
-fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
-    freemkv_engine::should_abort_for_loss(lost_ms, abort_threshold_ms)
-}
+// `should_abort_for_loss` lives in freemkv-engine. The local forwarder was
+// removed once `loss_aborts` started forwarding too: it had no non-test caller
+// left, and keeping a second name for the abort predicate is how the two crates
+// drifted in the first place. Tests call the engine directly.
+//
+// Its contract, for readers of the call sites here: strictly `>`, never `>=`,
+// so a threshold of 0 means "require a perfect in-title rip" — any positive
+// in-title loss aborts, exactly zero proceeds. And a NaN loss aborts, because
+// `NaN > x` is false and a plain comparison would silently mark an
+// unquantifiable loss as a complete rip.
 
 /// The flawless-rip loss gate. `abort_on_lost_secs == 0` means ZERO — abort on
 /// ANY lost byte (unreadable OR undecryptable), keyed on the raw byte count so
@@ -5444,12 +5456,12 @@ fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
 /// abort only when the loss exceeds N seconds. A NaN `lost_ms` always aborts
 /// (fail-safe: an unquantifiable loss must never pass as success).
 fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
-    if abort_on_lost_secs == 0 {
-        lost_bytes > 0 || lost_ms.is_nan()
-    } else {
-        // The `> 0` tolerance branch is exactly the ms-only gate.
-        should_abort_for_loss(lost_ms, (abort_on_lost_secs as f64) * MILLIS_PER_SEC)
-    }
+    // Forward to the engine rather than re-implementing. This was a full local
+    // copy of the engine's body — the one abort DECISION in the whole rip, kept
+    // hand-synced in two crates. The bodies stayed identical but the code
+    // feeding them drifted, so autorip and the engine could return opposite
+    // verdicts for the same damaged disc. One owner, one answer.
+    freemkv_engine::loss_aborts(lost_bytes, lost_ms, abort_on_lost_secs)
 }
 
 /// Whether the rip's deliverable is the whole-disc ISO itself rather than a
@@ -7980,7 +7992,7 @@ mod tests {
         assert_eq!(in_title_lost_ms, 0.0);
         let abort_threshold_ms = 0.0; // abort_on_lost_secs = 0
         assert!(
-            !super::should_abort_for_loss(in_title_lost_ms, abort_threshold_ms),
+            !freemkv_engine::should_abort_for_loss(in_title_lost_ms, abort_threshold_ms),
             "a fully-recovered title must NOT abort on out-of-title loss at threshold 0"
         );
     }
@@ -8060,8 +8072,14 @@ mod tests {
         // abort_on_lost_secs=0 still means "perfect in-title required":
         // ANY positive in-title loss aborts.
         let abort_threshold_ms = 0.0;
-        assert!(super::should_abort_for_loss(0.001, abort_threshold_ms));
-        assert!(super::should_abort_for_loss(5_000.0, abort_threshold_ms));
+        assert!(freemkv_engine::should_abort_for_loss(
+            0.001,
+            abort_threshold_ms
+        ));
+        assert!(freemkv_engine::should_abort_for_loss(
+            5_000.0,
+            abort_threshold_ms
+        ));
     }
 
     #[test]
@@ -8069,8 +8087,8 @@ mod tests {
         // abort_on_lost_secs=30 (30_000 ms): 20s lost is tolerated, 31s
         // aborts.
         let threshold = 30_000.0;
-        assert!(!super::should_abort_for_loss(20_000.0, threshold));
-        assert!(super::should_abort_for_loss(31_000.0, threshold));
+        assert!(!freemkv_engine::should_abort_for_loss(20_000.0, threshold));
+        assert!(freemkv_engine::should_abort_for_loss(31_000.0, threshold));
     }
 
     #[test]
@@ -8078,8 +8096,8 @@ mod tests {
         // A NaN loss is unquantifiable and must fail safe (abort), not
         // pass as a silent success. `NaN > x` is false, so a plain
         // comparison would wrongly proceed to mark the rip complete.
-        assert!(super::should_abort_for_loss(f64::NAN, 0.0));
-        assert!(super::should_abort_for_loss(f64::NAN, 30_000.0));
+        assert!(freemkv_engine::should_abort_for_loss(f64::NAN, 0.0));
+        assert!(freemkv_engine::should_abort_for_loss(f64::NAN, 30_000.0));
     }
 
     // ── final done-card uses in-title loss (telemetry audit Fix 3) ───
@@ -8323,7 +8341,7 @@ mod tests {
         let lost = single_pass_lost_secs(10, bps); // 10 skipped sectors
         assert!(lost > 0.0, "skipped sectors must produce positive loss");
         assert!(
-            super::should_abort_for_loss(lost * MILLIS_PER_SEC, threshold_ms),
+            freemkv_engine::should_abort_for_loss(lost * MILLIS_PER_SEC, threshold_ms),
             "single-pass rip with skipped sectors must abort at threshold 0"
         );
     }
@@ -8337,7 +8355,7 @@ mod tests {
         let lost = single_pass_lost_secs(0, bps);
         assert_eq!(lost, 0.0);
         assert!(
-            !super::should_abort_for_loss(lost * MILLIS_PER_SEC, threshold_ms),
+            !freemkv_engine::should_abort_for_loss(lost * MILLIS_PER_SEC, threshold_ms),
             "a clean single-pass rip must NOT abort at threshold 0"
         );
     }
@@ -8351,14 +8369,14 @@ mod tests {
         // ~1000 skipped sectors ≈ 0.248s lost — well under 30s.
         let small = single_pass_lost_secs(1000, bps);
         assert!(
-            !super::should_abort_for_loss(small * MILLIS_PER_SEC, threshold_ms),
+            !freemkv_engine::should_abort_for_loss(small * MILLIS_PER_SEC, threshold_ms),
             "single-pass loss under threshold must NOT abort, got {small:.3}s"
         );
         // Enough skips to exceed 30s: 30 * bps / 2048 sectors + slack.
         let big_sectors = (31.0 * bps / 2048.0) as u64;
         let big = single_pass_lost_secs(big_sectors, bps);
         assert!(
-            super::should_abort_for_loss(big * MILLIS_PER_SEC, threshold_ms),
+            freemkv_engine::should_abort_for_loss(big * MILLIS_PER_SEC, threshold_ms),
             "single-pass loss over threshold must abort, got {big:.3}s"
         );
     }
@@ -9008,6 +9026,42 @@ mod tests {
     /// H1 + M3: the drive-resume (Remux) selector must skip dirs that are
     /// owned (`.ripped`/`.muxing`), held (`.review`), or terminal (`.failed`),
     /// while still resuming a plain ISO+mapfile dir. Drives the pure
+    /// A tolerance-configured rip must NOT accept loss it could not measure.
+    ///
+    /// Regression: the two inputs to the gate were both computed inside a
+    /// `title_bytes_per_sec > 0.0` guard, so on a disc with no measurable
+    /// bitrate the byte count stayed 0 AND the ms stayed 0.0 — confirmed
+    /// unreadable sectors then read as a clean rip at threshold 0, and as
+    /// "0ms lost" under any seconds tolerance. The byte count is now computed
+    /// unconditionally (it needs no bitrate), and an unmeasurable time reads as
+    /// NaN, which fails safe to abort in both branches. autorip and
+    /// freemkv-engine previously returned opposite verdicts for this case.
+    #[test]
+    fn unquantifiable_loss_aborts_under_any_threshold() {
+        use super::loss_aborts;
+        // Zero bitrate → ms is NaN. Real lost bytes, perfect-rip threshold.
+        assert!(
+            loss_aborts(4096, f64::NAN, 0),
+            "lost bytes with an unmeasurable duration must abort at threshold 0"
+        );
+        // Same unmeasurable loss under a generous seconds tolerance: the
+        // seconds branch ignores bytes, so NaN is the only thing standing
+        // between this and silently shipping a title with holes.
+        assert!(
+            loss_aborts(4096, f64::NAN, 3600),
+            "unmeasurable loss must abort even under a 1-hour tolerance"
+        );
+        // Sanity: a genuinely clean rip still proceeds on both branches.
+        assert!(
+            !loss_aborts(0, 0.0, 0),
+            "a clean rip proceeds at threshold 0"
+        );
+        assert!(
+            !loss_aborts(0, 0.0, 30),
+            "a clean rip proceeds under a tolerance"
+        );
+    }
+
     /// `resumable_dir_blocked` against real snapshots.
     #[test]
     fn resumable_dir_blocked_skips_owned_held_and_terminal() {
