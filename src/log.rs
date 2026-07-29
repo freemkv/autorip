@@ -249,18 +249,25 @@ pub fn rotate_system_log_if_large() {
     }
 }
 
+/// Serializes tests that manipulate the process-wide `AUTORIP_DIR` env var
+/// (and the module-global `LOGS` state that reads it).
+///
+/// Cargo runs tests in parallel threads within ONE process, so any test that
+/// re-points `AUTORIP_DIR` races every other test that resolves a log path.
+/// `archive_device_log_moves_to_rips_dir` failed intermittently for exactly
+/// that reason: another test swapped the dir between its `device_log` write
+/// and the `exists()` assertion on the resolved path, so the path pointed
+/// into the other test's tempdir.
+///
+/// This lives at crate scope, NOT inside `log::tests`, because the racing
+/// writers are in other modules (e.g. `ripper::resume`). EVERY test that
+/// sets `AUTORIP_DIR` must hold this guard for the whole test.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Log tests manipulate the process-wide AUTORIP_DIR env var and the
-    // module-global LOGS mutex. Cargo runs tests in parallel by default,
-    // which caused `archive_device_log_moves_to_rips_dir` to fail
-    // intermittently when another test mutated AUTORIP_DIR between our
-    // `device_log` write and our assertion on the file's location. Serialize
-    // all tests in this module through a local mutex so env-and-state setup
-    // is atomic per-test.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
