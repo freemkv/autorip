@@ -2664,11 +2664,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // (which lives in the outer scope) can reference it. Single-pass mode
     // (max_retries == 0) has no multipass concept; the mux loop's checks
     // gate on `total_passes > 0` before threading it into UI state.
-    let total_passes: u8 = if cfg_read.max_retries > 0 {
-        cfg_read.max_retries + 2 // pass 1 + retries + mux
-    } else {
-        0
-    };
+    let total_passes: u8 = plan_passes(cfg_read.max_retries).total_passes;
     // Captured from the multipass branch so the mux call site (which is
     // outside that branch) can pass it into MuxInputs for total-progress
     // weighting. Stays at 0 in direct (single-pass) mode — the mux's
@@ -3443,6 +3439,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // watcher; cap-fire marks the rip as failed.
 
         let max_retries = cfg_read.max_retries;
+        // The patch-pass count comes from the pass plan (== max_retries); this
+        // ties the retry-loop bound to the same pure plan `total_passes` uses.
+        let patch_passes = plan_passes(cfg_read.max_retries).patch_passes;
 
         crate::log::device_log(
             device,
@@ -3451,7 +3450,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 max_retries, max_retries, bytes_pending
             ),
         );
-        for retry_n in 1..=max_retries {
+        for retry_n in 1..=patch_passes {
             // If user hit stop, bail.
             if user_halt.load(Ordering::Relaxed) {
                 crate::log::device_log(
@@ -3488,18 +3487,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let mux_scope_bad =
                 match freemkv_engine::Mapfile::load(std::path::Path::new(&mapfile_path_str)) {
                     Ok(map) => {
-                        use freemkv_engine::SectorStatus;
-                        let bad = map.ranges_with(&[
-                            SectorStatus::NonTried,
-                            SectorStatus::NonTrimmed,
-                            SectorStatus::NonScraped,
-                            SectorStatus::Unreadable,
-                        ]);
-                        if output_is_iso_image(&cfg_read.output_format) {
-                            bad.iter().map(|(_, sz)| *sz).sum::<u64>()
-                        } else {
-                            libfreemkv::disc::bytes_bad_in_title(&title_for_progress, &bad)
-                        }
+                        let bad = map.ranges_with(&bad_sector_statuses());
+                        scope_bad_bytes(
+                            output_is_iso_image(&cfg_read.output_format),
+                            &bad,
+                            &title_for_progress,
+                        )
                     }
                     Err(_) => {
                         // Conservative fallback if we can't read the mapfile —
@@ -3508,7 +3501,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         bytes_pending + bytes_unreadable
                     }
                 };
-            if mux_scope_bad == 0 {
+            // Loop-top convergence gate, via the unified strategy decision
+            // (`None` recovery ⇒ this is the pre-pass evaluation): Converged
+            // means the muxable scope is 100% recovered — stop and mux.
+            if patch_pass_decision(mux_scope_bad, None) == PatchDecision::Converged {
                 let scope_label = if output_is_iso_image(&cfg_read.output_format) {
                     "whole disc"
                 } else {
@@ -3773,7 +3769,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // If THIS pass made no progress, no future pass with the same
             // drive state will help. Give up retries early so we still
             // mux on what we have.
-            if recovered == 0 {
+            if !patch_made_progress(recovered) {
                 crate::log::device_log(
                     device,
                     &format!(
@@ -3845,12 +3841,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 use freemkv_engine::SectorStatus;
                 // Promote still-NonTrimmed bytes to Unreadable — these are
                 // bytes that remained "maybe" across all patch passes and are
-                // now confirmed lost.
-                let nontrimmed_ranges = map.ranges_with(&[SectorStatus::NonTrimmed]);
+                // now confirmed lost. The (from, to) pair is the pinned
+                // end-of-recovery promotion decision.
+                let (promote_from, promote_to) = end_of_recovery_promotion();
+                let nontrimmed_ranges = map.ranges_with(&[promote_from]);
                 let total_promoted: u64 = nontrimmed_ranges.iter().map(|(_, sz)| *sz).sum();
                 let n_ranges = nontrimmed_ranges.len();
                 for (pos, size) in nontrimmed_ranges {
-                    if let Err(e) = map.record(pos, size, SectorStatus::Unreadable) {
+                    if let Err(e) = map.record(pos, size, promote_to) {
                         tracing::warn!(
                             device = %device,
                             error = %e,
@@ -5532,6 +5530,188 @@ fn iso_output_needs_multipass(output_format: &str, max_retries: u8) -> bool {
     output_is_iso_image(output_format) && max_retries == 0
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Multipass recovery-loop STRATEGY DECISIONS (pure, headless-testable).
+//
+// These are the pure decisions the multipass loop in `rip_disc` makes about
+// pass ordering, scope-aware convergence, no-progress exhaustion, the
+// end-of-recovery promotion, and pass-1 transport-retry gating. They are
+// deliberately factored out of the loop body so the loop's *strategy* can be
+// characterized (and later inverted into freemkv-engine) WITHOUT a physical
+// drive: the loop calls these to make its decisions, and unit tests drive them
+// directly. Extracting them changes no behavior — each replaces an equal-valued
+// inline expression. The hardware/UI touch-points the decisions sit between
+// (drive open/reopen, spin_cycle, watchdogs, STATE painting) stay inline.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The pass plan for a rip, derived purely from `max_retries`.
+///
+/// Pins the loop's pass ordering: multipass (`max_retries > 0`) runs exactly one
+/// Pass-1 sweep (disc → ISO) followed by `max_retries` patch passes, and the UI
+/// counts `max_retries + 2` total passes (sweep + N patch + mux). Single-pass
+/// (`max_retries == 0`) is the direct disc → MKV stream: no sweep pass, no patch
+/// passes, no ISO intermediate, and a `total_passes` of 0 (the mux-progress
+/// helper falls through to mux-pct passthrough).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassPlan {
+    /// True when the rip goes through the ISO intermediate + recovery loop.
+    multipass: bool,
+    /// Number of Pass-1 sweep passes (1 in multipass, 0 in single-pass).
+    sweep_passes: u8,
+    /// Number of patch retry passes (`max_retries` in multipass, 0 otherwise).
+    patch_passes: u8,
+    /// Total passes reported to the UI (sweep + N patch + mux, else 0).
+    total_passes: u8,
+}
+
+fn plan_passes(max_retries: u8) -> PassPlan {
+    if max_retries > 0 {
+        PassPlan {
+            multipass: true,
+            sweep_passes: 1,
+            patch_passes: max_retries,
+            total_passes: max_retries + 2, // pass 1 + retries + mux
+        }
+    } else {
+        PassPlan {
+            multipass: false,
+            sweep_passes: 0,
+            patch_passes: 0,
+            total_passes: 0,
+        }
+    }
+}
+
+/// The mapfile sector statuses that count as "still bad" (not yet recovered)
+/// for the muxable-scope convergence check. Pins the exact status set the loop
+/// treats as unfinished: not-tried, not-trimmed, not-scraped, and unreadable.
+fn bad_sector_statuses() -> [freemkv_engine::SectorStatus; 4] {
+    use freemkv_engine::SectorStatus;
+    [
+        SectorStatus::NonTried,
+        SectorStatus::NonTrimmed,
+        SectorStatus::NonScraped,
+        SectorStatus::Unreadable,
+    ]
+}
+
+/// Scope-aware bad-byte count for the convergence check.
+///
+/// For ISO output the deliverable is the whole-disc image, so EVERY bad byte
+/// counts (menus / trailers / anything outside a title still has to be clean).
+/// For MKV/M2TS only bytes inside the muxed title's extents count — bad ranges
+/// in deleted scenes / menus / trailers are not going into the output and do not
+/// earn retry passes. Same scoping the abort gate uses (`abort_lost_bytes`).
+fn scope_bad_bytes(is_iso: bool, bad_ranges: &[(u64, u64)], title: &libfreemkv::DiscTitle) -> u64 {
+    if is_iso {
+        bad_ranges.iter().map(|(_, sz)| *sz).sum::<u64>()
+    } else {
+        libfreemkv::disc::bytes_bad_in_title(title, bad_ranges)
+    }
+}
+
+/// Loop-top convergence gate: the muxable scope is 100% recovered (nothing left
+/// to retry) exactly when its scope-aware bad-byte count is zero.
+fn scope_converged(mux_scope_bad: u64) -> bool {
+    mux_scope_bad == 0
+}
+
+/// Loop-bottom exhaustion gate: a patch pass made progress iff it recovered a
+/// non-zero number of bytes. `recovered == 0` means no future pass with the same
+/// drive state will help, so the loop gives up and muxes on what it has.
+fn patch_made_progress(recovered: u64) -> bool {
+    recovered != 0
+}
+
+/// The unified per-pass convergence decision, composed from the two gates the
+/// loop applies (`scope_converged` at the top of each iteration and
+/// `patch_made_progress` at the bottom). This is the single golden strategy fn
+/// the future engine inversion must reproduce.
+///
+/// `mux_scope_bad` is the scope-aware bad-byte count observed BEFORE a pass runs
+/// (0 ⇒ the scope is already clean ⇒ `Converged`). `recovered` is what a pass
+/// recovered, consulted only when the scope is still bad: `None` models the
+/// loop-top evaluation (no pass has run yet ⇒ `Continue`); `Some(0)` is a pass
+/// that recovered nothing ⇒ `NoProgress`; `Some(n>0)` ⇒ `Continue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchDecision {
+    /// Muxable scope fully recovered — stop retrying, proceed to mux.
+    Converged,
+    /// Last pass recovered nothing — stop retrying, mux on what we have.
+    NoProgress,
+    /// Keep retrying.
+    Continue,
+}
+
+fn patch_pass_decision(mux_scope_bad: u64, recovered: Option<u64>) -> PatchDecision {
+    if scope_converged(mux_scope_bad) {
+        PatchDecision::Converged
+    } else if matches!(recovered, Some(r) if !patch_made_progress(r)) {
+        PatchDecision::NoProgress
+    } else {
+        PatchDecision::Continue
+    }
+}
+
+/// The end-of-recovery promotion: after the final patch pass, bytes still left
+/// `NonTrimmed` in the mapfile (i.e. "maybe" across every pass) are promoted to
+/// `Unreadable` (confirmed lost) BEFORE the abort/loss gate reads them. Returns
+/// the `(from, to)` status pair the loop applies. libfreemkv's patch loop
+/// intentionally defers this final-verdict step to the orchestrator.
+fn end_of_recovery_promotion() -> (freemkv_engine::SectorStatus, freemkv_engine::SectorStatus) {
+    (
+        freemkv_engine::SectorStatus::NonTrimmed,
+        freemkv_engine::SectorStatus::Unreadable,
+    )
+}
+
+/// Pass-1 transport-failure gating decision (mirrors the Pass-1 sweep error
+/// arm). This is a decision-MIRROR, not a wired gate: the actual transport
+/// recovery is control flow interleaved with drive drop/reopen and operator
+/// logging in `rip_disc`'s Pass-1 loop (a hardware touch-point that stays
+/// inline), so this classifier is `#[cfg(test)]` — it exists to characterize
+/// the gating for the future engine inversion, not to run in production.
+///
+/// Pass 1 — and ONLY Pass 1 — retries after a USB-bridge transport crash
+/// by dropping and re-opening the drive across a USB re-enumeration; the patch
+/// passes have no such retry (any patch error breaks the retry loop). This pure
+/// classifier pins that gating so the future inversion knows Pass 1 owns the
+/// transport-recovery retry and the patch passes do not.
+///
+/// Precedence matches the loop: a user halt cancels regardless of cause; a
+/// non-transport error fails the rip; a transport error retries until
+/// `MAX_PASS1_ATTEMPTS` is exhausted.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepReadAction {
+    /// User halt observed — cancel the rip (preserve staging).
+    Cancel,
+    /// Non-transport error — fail the rip.
+    Fail,
+    /// Transport crash — drop + re-open the drive and retry (resume from mapfile).
+    RecoverAndRetry,
+    /// Transport crash but attempts exhausted — give up.
+    Exhausted,
+}
+
+#[cfg(test)]
+fn sweep_transport_retry(
+    is_transport: bool,
+    halted: bool,
+    attempt: u32,
+    max_attempts: u32,
+) -> SweepReadAction {
+    if halted {
+        SweepReadAction::Cancel
+    } else if !is_transport {
+        SweepReadAction::Fail
+    } else if attempt >= max_attempts {
+        SweepReadAction::Exhausted
+    } else {
+        SweepReadAction::RecoverAndRetry
+    }
+}
+
 /// Prune the disc-sized intermediate ISO and its mapfile sidecar on a
 /// successful multipass completion, unless `keep_iso` is set.
 ///
@@ -6270,13 +6450,15 @@ mod tests {
     //! State-only helpers and their tests live in `state.rs`.
 
     use super::{
-        FmtsGate, FmtsGatePlan, HaltGuard, SweepingGuard, aacs_failure_message,
-        disk_space_preflight_message, fmts_gate_decision, fmts_gate_plan, format_lib_error,
+        FmtsGate, FmtsGatePlan, HaltGuard, PatchDecision, SweepReadAction, SweepingGuard,
+        aacs_failure_message, bad_sector_statuses, disk_space_preflight_message,
+        end_of_recovery_promotion, fmts_gate_decision, fmts_gate_plan, format_lib_error,
         format_pass_error, header_phase_outcome_is_failure, incomplete_mux_status,
         is_fmts_key_missing_error, is_safe_staging_segment, list_staging_basenames,
-        prune_intermediate_iso, register_halt, resumable_dir_blocked, resumable_for_disc,
+        patch_made_progress, patch_pass_decision, plan_passes, prune_intermediate_iso,
+        register_halt, resumable_dir_blocked, resumable_for_disc, scope_bad_bytes, scope_converged,
         staging_dir_matches_disc, staging_disc_completed, staging_disc_owned_by_worker,
-        staging_free_bytes,
+        staging_free_bytes, sweep_transport_retry,
     };
     use crate::ripper::session::device_halt;
     use crate::ripper::staging;
@@ -6863,6 +7045,286 @@ mod tests {
         // title scoping.
         let lost_iso = super::abort_lost_ms(true, &title, &bad, bps);
         assert!((lost_iso - 50_000.0).abs() < 1.0, "iso whole-disc sum");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // CHARACTERIZATION TESTS — golden baseline for the multipass recovery
+    // loop's decisions. These pin `rip_disc`'s CURRENT behavior so the later
+    // inversion of the loop into freemkv-engine can be proven behavior-
+    // preserving. They exercise the pure strategy fns the loop calls; the
+    // hardware/UI touch-points the decisions sit between (drive reopen,
+    // spin_cycle, watchdogs, STATE painting) are documented in the module
+    // report as still requiring a physical drive.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// PASS ORDERING. `max_retries = N` (N > 0) plans exactly one Pass-1 sweep
+    /// then N patch passes, with `total_passes = N + 2` (sweep + N patch +
+    /// mux). `max_retries = 0` is single-pass: no sweep, no patch, no ISO,
+    /// `total_passes = 0`.
+    #[test]
+    fn char_pass_ordering_sweep_then_n_patch() {
+        // Single-pass: direct disc→MKV, no ISO intermediate.
+        let single = plan_passes(0);
+        assert!(!single.multipass, "max_retries=0 is single-pass (no ISO)");
+        assert_eq!(single.sweep_passes, 0, "single-pass runs no sweep pass");
+        assert_eq!(single.patch_passes, 0, "single-pass runs no patch passes");
+        assert_eq!(single.total_passes, 0, "single-pass reports 0 total passes");
+
+        // Multipass: 1 sweep + N patch, total = N + 2 (sweep + N + mux).
+        for n in 1u8..=10 {
+            let plan = plan_passes(n);
+            assert!(plan.multipass, "max_retries={n} is multipass");
+            assert_eq!(plan.sweep_passes, 1, "exactly one Pass-1 sweep");
+            assert_eq!(
+                plan.patch_passes, n,
+                "exactly {n} patch passes for max_retries={n}"
+            );
+            assert_eq!(
+                plan.total_passes,
+                n + 2,
+                "total = sweep(1) + patch({n}) + mux(1)"
+            );
+        }
+    }
+
+    /// SCOPE-AWARE CONVERGENCE — MKV output. Only bad bytes INSIDE the muxed
+    /// title's extents count; out-of-title damage (menus/trailers) does not
+    /// earn retry passes, so the loop converges when in-title bad == 0 even
+    /// with damage elsewhere on the disc.
+    #[test]
+    fn char_convergence_mkv_scopes_to_title() {
+        // Title covers bytes [0, 100 MB) — sectors [0, 48829).
+        let title = test_title(0, 48_829);
+
+        // Bad range OUTSIDE the title extents (well past 100 MB).
+        let out_of_title = [(500_000_000u64, 2048u64)];
+        let bad = scope_bad_bytes(false /* MKV */, &out_of_title, &title);
+        assert_eq!(bad, 0, "out-of-title damage is not counted for MKV output");
+        assert!(
+            scope_converged(bad),
+            "MKV converges when in-title scope is clean, despite out-of-title damage"
+        );
+
+        // Bad range INSIDE the title extents blocks convergence.
+        let in_title = [(1_000_000u64, 2048u64)];
+        let bad_in = scope_bad_bytes(false, &in_title, &title);
+        assert_eq!(bad_in, 2048, "in-title damage is counted for MKV output");
+        assert!(
+            !scope_converged(bad_in),
+            "MKV does not converge while the muxed title still has bad bytes"
+        );
+    }
+
+    /// SCOPE-AWARE CONVERGENCE — ISO output. The deliverable is the whole-disc
+    /// image, so EVERY bad byte counts (including out-of-title). The loop only
+    /// converges when the whole disc is clean.
+    #[test]
+    fn char_convergence_iso_scopes_whole_disc() {
+        let title = test_title(0, 48_829);
+
+        // The SAME out-of-title damage that MKV ignores blocks ISO convergence.
+        let out_of_title = [(500_000_000u64, 2048u64)];
+        let bad = scope_bad_bytes(true /* ISO */, &out_of_title, &title);
+        assert_eq!(
+            bad, 2048,
+            "ISO counts out-of-title damage (whole-disc scope)"
+        );
+        assert!(
+            !scope_converged(bad),
+            "ISO does not converge while ANY sector on the disc is bad"
+        );
+
+        // A perfectly clean disc converges.
+        assert!(
+            scope_converged(scope_bad_bytes(true, &[], &title)),
+            "ISO converges only when the whole disc is clean"
+        );
+    }
+
+    /// NO-PROGRESS EXHAUSTION. A patch pass that recovers zero bytes stops the
+    /// retry loop (no future pass with the same drive state will help); a pass
+    /// that recovers anything keeps going.
+    #[test]
+    fn char_no_progress_stops_retries() {
+        assert!(
+            !patch_made_progress(0),
+            "recovered==0 is no progress → stop"
+        );
+        assert!(patch_made_progress(1), "any recovery keeps retrying");
+        assert!(patch_made_progress(2048), "any recovery keeps retrying");
+    }
+
+    /// The unified convergence decision, composed from the two loop gates.
+    /// `mux_scope_bad==0` ⇒ Converged (whatever the recovery). Otherwise
+    /// `recovered==Some(0)` ⇒ NoProgress; `None` (loop-top, no pass yet) or
+    /// `Some(n>0)` ⇒ Continue. This is the golden strategy the future engine
+    /// inversion must reproduce.
+    #[test]
+    fn char_patch_pass_decision_matrix() {
+        // Converged dominates — scope clean means stop regardless of recovery.
+        assert_eq!(patch_pass_decision(0, None), PatchDecision::Converged);
+        assert_eq!(patch_pass_decision(0, Some(0)), PatchDecision::Converged);
+        assert_eq!(patch_pass_decision(0, Some(999)), PatchDecision::Converged);
+        // Scope still bad, no pass run yet (loop-top) → keep going.
+        assert_eq!(patch_pass_decision(2048, None), PatchDecision::Continue);
+        // Scope still bad, last pass recovered nothing → exhausted.
+        assert_eq!(
+            patch_pass_decision(2048, Some(0)),
+            PatchDecision::NoProgress
+        );
+        // Scope still bad, last pass made progress → keep going.
+        assert_eq!(
+            patch_pass_decision(2048, Some(4096)),
+            PatchDecision::Continue
+        );
+    }
+
+    /// PROMOTION DECISION. The end-of-recovery promotion is NonTrimmed →
+    /// Unreadable, and it runs BEFORE the loss/abort gate (so bytes that stayed
+    /// "maybe" across every pass are finalized as lost and counted by the abort
+    /// check). The promoted `Unreadable` status is one the scope check still
+    /// treats as bad; the source `NonTrimmed` is too (a range only leaves the
+    /// bad set by becoming `Finished`).
+    #[test]
+    fn char_promotion_nontrimmed_to_unreadable() {
+        use freemkv_engine::SectorStatus;
+        assert_eq!(
+            end_of_recovery_promotion(),
+            (SectorStatus::NonTrimmed, SectorStatus::Unreadable),
+            "end-of-recovery promotion is NonTrimmed → Unreadable"
+        );
+        // Both the promoted-from and promoted-to statuses count as "still bad"
+        // for the scope/convergence check (only Finished is good).
+        let bad_set = bad_sector_statuses();
+        assert!(bad_set.contains(&SectorStatus::NonTrimmed));
+        assert!(bad_set.contains(&SectorStatus::Unreadable));
+        assert!(
+            !bad_set.contains(&SectorStatus::Finished),
+            "Finished is the only status that leaves the bad set"
+        );
+    }
+
+    /// PROMOTION — end-to-end via the pinned decisions. Drives a real mapfile
+    /// through the promotion using `end_of_recovery_promotion()` +
+    /// `bad_sector_statuses()`: a NonTrimmed range becomes Unreadable, and the
+    /// scope-aware bad-byte count then finalizes it as lost (feeding the abort
+    /// gate). No drive required — the promotion is a pure mapfile operation.
+    #[test]
+    fn char_promotion_finalizes_loss_for_abort_gate() {
+        use freemkv_engine::Mapfile;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mf_path = tmp.path().join("promote.mapfile");
+        let disc_size: u64 = 10 * 2048;
+        let bad_pos: u64 = 5 * 2048;
+        let bad_size: u64 = 2048;
+        {
+            let mut map = Mapfile::create(&mf_path, disc_size, "test").unwrap();
+            map.record(0, bad_pos, freemkv_engine::SectorStatus::Finished)
+                .unwrap();
+            // Left "maybe" after the last patch pass.
+            map.record(bad_pos, bad_size, freemkv_engine::SectorStatus::NonTrimmed)
+                .unwrap();
+            map.record(
+                bad_pos + bad_size,
+                disc_size - bad_pos - bad_size,
+                freemkv_engine::SectorStatus::Finished,
+            )
+            .unwrap();
+            map.flush().unwrap();
+        }
+
+        let mut map = Mapfile::load(&mf_path).unwrap();
+        let title = test_title(0, 10); // whole 10-sector disc is in-title
+
+        // Before promotion the range is NonTrimmed ("maybe"), NOT yet counted
+        // as terminal Unreadable — but it IS in the bad set, so the loop would
+        // still be trying to recover it (scope not converged).
+        let pre = scope_bad_bytes(false, &map.ranges_with(&bad_sector_statuses()), &title);
+        assert_eq!(
+            pre, bad_size,
+            "NonTrimmed range is bad (still being retried)"
+        );
+        assert!(!scope_converged(pre));
+
+        // Apply the pinned promotion decision.
+        let (from, to) = end_of_recovery_promotion();
+        for (pos, size) in map.ranges_with(&[from]) {
+            map.record(pos, size, to).unwrap();
+        }
+
+        // The range is now terminal Unreadable: the abort gate reads it as lost.
+        let unreadable = map.ranges_with(&[freemkv_engine::SectorStatus::Unreadable]);
+        assert_eq!(unreadable, vec![(bad_pos, bad_size)]);
+        let lost_bytes = super::abort_lost_bytes(false, &title, &unreadable);
+        assert_eq!(
+            lost_bytes, bad_size,
+            "promoted-Unreadable bytes are counted as in-title loss by the abort gate"
+        );
+    }
+
+    /// PASS-1-ONLY TRANSPORT-RETRY GATING. The USB-bridge transport-crash
+    /// retry (drop + reopen the drive across a USB re-enumeration, resume from
+    /// mapfile) wraps the Pass-1 sweep ONLY. This pins its precedence: a user
+    /// halt cancels regardless of cause; a non-transport error fails; a
+    /// transport error retries until MAX_PASS1_ATTEMPTS is exhausted. The patch
+    /// passes have no such retry (documented below).
+    #[test]
+    fn char_pass1_transport_retry_gating() {
+        const MAX: u32 = 10; // MAX_PASS1_ATTEMPTS in rip_disc
+
+        // Halt wins over everything — even a fresh transport failure.
+        assert_eq!(
+            sweep_transport_retry(true, true, 1, MAX),
+            SweepReadAction::Cancel
+        );
+        assert_eq!(
+            sweep_transport_retry(false, true, 1, MAX),
+            SweepReadAction::Cancel
+        );
+
+        // Non-transport error (no halt) fails the rip — no reopen/retry.
+        assert_eq!(
+            sweep_transport_retry(false, false, 1, MAX),
+            SweepReadAction::Fail
+        );
+
+        // Transport crash with attempts remaining → reopen + retry.
+        assert_eq!(
+            sweep_transport_retry(true, false, 1, MAX),
+            SweepReadAction::RecoverAndRetry
+        );
+        assert_eq!(
+            sweep_transport_retry(true, false, MAX - 1, MAX),
+            SweepReadAction::RecoverAndRetry
+        );
+
+        // Transport crash but attempts exhausted → give up.
+        assert_eq!(
+            sweep_transport_retry(true, false, MAX, MAX),
+            SweepReadAction::Exhausted
+        );
+        assert_eq!(
+            sweep_transport_retry(true, false, MAX + 5, MAX),
+            SweepReadAction::Exhausted
+        );
+    }
+
+    /// PASS-1-ONLY (negative side): the patch passes carry no transport-retry
+    /// concept at all — any patch error breaks the retry loop and proceeds to
+    /// promotion/abort on what was recovered. There is no patch analogue of
+    /// `sweep_transport_retry`, which is exactly the gating asymmetry this
+    /// characterization records for the future inversion: Pass 1 owns the
+    /// USB-re-enumeration recovery; the patch passes do not. (The patch loop's
+    /// error → break is control flow in `rip_disc`; its bound is pinned by
+    /// `plan_passes(..).patch_passes` in `char_pass_ordering_sweep_then_n_patch`.)
+    #[test]
+    fn char_patch_passes_have_no_transport_retry() {
+        // The patch loop runs exactly `patch_passes` iterations with no inner
+        // reopen/resume — the only retry budget is the pass count itself.
+        assert_eq!(plan_passes(3).patch_passes, 3);
+        // Single-pass has neither a sweep nor a transport-retry surface.
+        assert_eq!(plan_passes(0).sweep_passes, 0);
     }
 
     #[test]
