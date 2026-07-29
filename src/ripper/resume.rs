@@ -2121,6 +2121,13 @@ mod resume_remux_log_archive_tests {
     /// been archived out.
     #[test]
     fn resume_remux_archives_prior_device_log() {
+        // Held for the whole test: AUTORIP_DIR is process-wide and cargo runs
+        // tests in parallel threads, so re-pointing it without this guard
+        // corrupts any concurrently-running test that resolves a log path
+        // (it made log::tests::archive_device_log_moves_to_rips_dir flaky).
+        let _guard = crate::log::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let d = tmpdir();
         // Route logs to the tempdir for this test. SAFETY: env access in
         // tests; the assertion that matters reads the in-memory ring
