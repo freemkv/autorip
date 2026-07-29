@@ -262,8 +262,50 @@ pub fn rotate_system_log_if_large() {
 /// This lives at crate scope, NOT inside `log::tests`, because the racing
 /// writers are in other modules (e.g. `ripper::resume`). EVERY test that
 /// sets `AUTORIP_DIR` must hold this guard for the whole test.
+///
+/// Acquire it through [`env_guard`], never directly: serialising the writers is
+/// only half the problem. Nothing used to RESTORE `AUTORIP_DIR`, and most tests
+/// delete their tempdir at the end, so the process-wide var was left pointing
+/// at a deleted directory for every later test in the run. Unguarded readers
+/// (any test that reaches `device_log`/`syslog` transitively) then resolved
+/// paths into it — which is what made `find_iso_tests::pairs_despite_extra_entries`
+/// and `resume_lock_and_fsync_tests::fsync_failure_below_limit_preserves_and_bumps`
+/// fail intermittently after the write race itself was fixed.
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds [`ENV_LOCK`] and restores `AUTORIP_DIR` to its prior value on drop, so
+/// a test's tempdir can never outlive the test as a stale global.
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: env access in tests, serialized by the lock this guard holds
+        // — no other guarded test can observe the intermediate state.
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("AUTORIP_DIR", v),
+                None => std::env::remove_var("AUTORIP_DIR"),
+            }
+        }
+    }
+}
+
+/// Take the `AUTORIP_DIR` test lock, capturing the current value so it is
+/// restored when the returned guard drops. Hold it for the WHOLE test.
+#[cfg(test)]
+pub(crate) fn env_guard() -> EnvGuard {
+    let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    EnvGuard {
+        _lock: lock,
+        prev: std::env::var_os("AUTORIP_DIR"),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -290,7 +332,7 @@ mod tests {
 
     #[test]
     fn device_log_writes_iso_timestamped_line() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::log::env_guard();
         let d = tmpdir("iso_ts");
         // Route the test's logs to the tempdir.
         // SAFETY: env access in single-threaded tests.
@@ -313,7 +355,7 @@ mod tests {
 
     #[test]
     fn new_session_writes_build_banner_to_file_not_ring() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::log::env_guard();
         let d = tmpdir("build_banner");
         unsafe {
             std::env::set_var("AUTORIP_DIR", &d);
@@ -353,7 +395,7 @@ mod tests {
 
     #[test]
     fn archive_device_log_moves_to_rips_dir() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::log::env_guard();
         let d = tmpdir("archive_move");
         unsafe {
             std::env::set_var("AUTORIP_DIR", &d);
@@ -384,7 +426,7 @@ mod tests {
 
     #[test]
     fn archive_device_log_no_op_when_empty() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::log::env_guard();
         let d = tmpdir("archive_empty");
         unsafe {
             std::env::set_var("AUTORIP_DIR", &d);
@@ -407,7 +449,7 @@ mod tests {
 
     #[test]
     fn archive_device_log_clears_in_memory_buffer() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::log::env_guard();
         let d = tmpdir("archive_buf");
         unsafe {
             std::env::set_var("AUTORIP_DIR", &d);
@@ -428,7 +470,7 @@ mod tests {
         // the live UI view doesn't go empty while the log is still on disk.
         // Force create_dir_all("logs/rips") to fail by planting a regular
         // file where the rips directory needs to be.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::log::env_guard();
         let d = tmpdir("archive_fail");
         unsafe {
             std::env::set_var("AUTORIP_DIR", &d);
@@ -460,7 +502,7 @@ mod tests {
     fn forget_device_clears_ring_without_archiving() {
         // Hot-unplug eviction: forget_device drops the in-memory ring but
         // leaves the on-disk device log in place (no archive).
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::log::env_guard();
         let d = tmpdir("forget");
         unsafe {
             std::env::set_var("AUTORIP_DIR", &d);
@@ -562,7 +604,7 @@ mod tests {
 
     #[test]
     fn get_device_log_respects_line_limit() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::log::env_guard();
         let d = tmpdir("line_limit");
         unsafe {
             std::env::set_var("AUTORIP_DIR", &d);
@@ -580,7 +622,7 @@ mod tests {
 
     #[test]
     fn ring_evicts_oldest_past_cap() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::log::env_guard();
         let d = tmpdir("ring_cap");
         unsafe {
             std::env::set_var("AUTORIP_DIR", &d);
@@ -600,7 +642,7 @@ mod tests {
 
     #[test]
     fn rotate_system_log_archives_only_when_large() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::log::env_guard();
         let d = tmpdir("sys_rotate");
         unsafe {
             std::env::set_var("AUTORIP_DIR", &d);
