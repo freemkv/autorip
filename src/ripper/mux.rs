@@ -1930,6 +1930,11 @@ mod tests {
                 errors: 0,
                 lost_bytes: 0,
                 streams: 2,
+                // Added to libfreemkv::MuxOutcome during the 1.6.0 audit: the
+                // stream indices the sink accepted frames for but could not put
+                // in the finished container. Empty here — this fixture is the
+                // clean completed run.
+                undelivered_streams: Vec::new(),
             }),
             true,
             "sr-test",
