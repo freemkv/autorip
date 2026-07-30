@@ -551,10 +551,10 @@ fn run_bootstrap() {
 
     // Symlink for KEYDB lookup path
     let freemkv_cfg = format!("/home/{rip_user}/.config/freemkv");
-    if let Some(parent) = std::path::Path::new(&freemkv_cfg).parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("bootstrap: mkdir {}: {e}", parent.display());
-        }
+    if let Some(parent) = std::path::Path::new(&freemkv_cfg).parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("bootstrap: mkdir {}: {e}", parent.display());
     }
     let _ = std::fs::remove_file(&freemkv_cfg);
     let _ = std::fs::remove_dir_all(&freemkv_cfg);
@@ -612,46 +612,46 @@ fn run_bootstrap() {
         std::env::var("NFS_HOST"),
         std::env::var("NFS_EXPORT"),
         std::env::var("NFS_MOUNTPOINT"),
-    ) {
-        if !host.is_empty() && !export.is_empty() && !mountpoint.is_empty() {
-            // Default keeps `hard` (no silent I/O errors once mounted)
-            // but adds `retry=1` so the foreground mount.nfs4 retry
-            // window is short, and we wrap the child in a bounded wait
-            // below. Together an unreachable server at container start
-            // degrades to an empty mountpoint instead of stalling the
-            // daemon's startup for the full retry window. Operators can
-            // still override the whole string via NFS_OPTS.
-            let opts = std::env::var("NFS_OPTS").unwrap_or_else(|_| {
-                "vers=4.1,nconnect=4,nolock,actimeo=3,hard,retry=1,_netdev".into()
-            });
-            if let Err(e) = std::fs::create_dir_all(&mountpoint) {
-                eprintln!("bootstrap: cannot create NFS mountpoint {mountpoint}: {e}");
-            }
-            if !is_mountpoint(&mountpoint) {
-                let source = format!("{host}:{export}");
-                eprintln!("bootstrap: mounting {source} -> {mountpoint} ({opts})");
-                let child = std::process::Command::new("/sbin/mount.nfs4")
-                    .arg("-o")
-                    .arg(&opts)
-                    .arg(&source)
-                    .arg(&mountpoint)
-                    .spawn();
-                match child {
-                    Ok(child) => match wait_bounded(child, std::time::Duration::from_secs(30)) {
-                        Some(s) if s.success() => eprintln!("bootstrap: NFS mount OK"),
-                        Some(s) => eprintln!(
-                            "bootstrap: NFS mount FAILED ({s}); container will start with empty {mountpoint}"
-                        ),
-                        None => eprintln!(
-                            "bootstrap: NFS mount TIMED OUT after 30s (server unreachable?); \
+    ) && !host.is_empty()
+        && !export.is_empty()
+        && !mountpoint.is_empty()
+    {
+        // Default keeps `hard` (no silent I/O errors once mounted)
+        // but adds `retry=1` so the foreground mount.nfs4 retry
+        // window is short, and we wrap the child in a bounded wait
+        // below. Together an unreachable server at container start
+        // degrades to an empty mountpoint instead of stalling the
+        // daemon's startup for the full retry window. Operators can
+        // still override the whole string via NFS_OPTS.
+        let opts = std::env::var("NFS_OPTS")
+            .unwrap_or_else(|_| "vers=4.1,nconnect=4,nolock,actimeo=3,hard,retry=1,_netdev".into());
+        if let Err(e) = std::fs::create_dir_all(&mountpoint) {
+            eprintln!("bootstrap: cannot create NFS mountpoint {mountpoint}: {e}");
+        }
+        if !is_mountpoint(&mountpoint) {
+            let source = format!("{host}:{export}");
+            eprintln!("bootstrap: mounting {source} -> {mountpoint} ({opts})");
+            let child = std::process::Command::new("/sbin/mount.nfs4")
+                .arg("-o")
+                .arg(&opts)
+                .arg(&source)
+                .arg(&mountpoint)
+                .spawn();
+            match child {
+                Ok(child) => match wait_bounded(child, std::time::Duration::from_secs(30)) {
+                    Some(s) if s.success() => eprintln!("bootstrap: NFS mount OK"),
+                    Some(s) => eprintln!(
+                        "bootstrap: NFS mount FAILED ({s}); container will start with empty {mountpoint}"
+                    ),
+                    None => eprintln!(
+                        "bootstrap: NFS mount TIMED OUT after 30s (server unreachable?); \
                              container will start with empty {mountpoint}"
-                        ),
-                    },
-                    Err(e) => eprintln!("bootstrap: NFS mount FAILED to spawn ({e})"),
-                }
-            } else {
-                eprintln!("bootstrap: {mountpoint} already mounted, skipping");
+                    ),
+                },
+                Err(e) => eprintln!("bootstrap: NFS mount FAILED to spawn ({e})"),
             }
+        } else {
+            eprintln!("bootstrap: {mountpoint} already mounted, skipping");
         }
     }
 }
@@ -697,16 +697,16 @@ fn is_valid_username(user: &str) -> bool {
 fn ensure_user_entry(user: &str) {
     use std::io::Write;
     let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
-    if !passwd.lines().any(|l| l.starts_with(&format!("{user}:"))) {
-        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open("/etc/passwd") {
-            let _ = writeln!(f, "{user}:x:1000:1000::/home/{user}:/bin/sh");
-        }
+    if !passwd.lines().any(|l| l.starts_with(&format!("{user}:")))
+        && let Ok(mut f) = std::fs::OpenOptions::new().append(true).open("/etc/passwd")
+    {
+        let _ = writeln!(f, "{user}:x:1000:1000::/home/{user}:/bin/sh");
     }
     let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
-    if !group.lines().any(|l| l.starts_with(&format!("{user}:"))) {
-        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open("/etc/group") {
-            let _ = writeln!(f, "{user}:x:1000:");
-        }
+    if !group.lines().any(|l| l.starts_with(&format!("{user}:")))
+        && let Ok(mut f) = std::fs::OpenOptions::new().append(true).open("/etc/group")
+    {
+        let _ = writeln!(f, "{user}:x:1000:");
     }
 }
 

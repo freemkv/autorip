@@ -242,18 +242,18 @@ fn dir_is_writable(p: &str) -> bool {
 ///      relative `.\config`. Move the folder, the app's state moves with it.
 ///   4. Last resort: the absolute working directory + `config`.
 pub fn default_autorip_dir() -> String {
-    if let Ok(d) = std::env::var("AUTORIP_DIR") {
-        if !d.is_empty() {
-            return d;
-        }
+    if let Ok(d) = std::env::var("AUTORIP_DIR")
+        && !d.is_empty()
+    {
+        return d;
     }
     if std::path::Path::new("/config").is_dir() && dir_is_writable("/config") {
         return "/config".to_string();
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return parent.join("config").to_string_lossy().into_owned();
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        return parent.join("config").to_string_lossy().into_owned();
     }
     if let Ok(cwd) = std::env::current_dir() {
         return cwd.join("config").to_string_lossy().into_owned();
