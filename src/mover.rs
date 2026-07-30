@@ -250,36 +250,36 @@ fn copy_counting(
     // exact name. Orphaned `.part-<other-pid>` temps from prior crashed runs
     // (different pid) would otherwise linger forever. Scan the dest parent for
     // any `<dest-name>.part-*` and remove them before creating the new temp.
-    if let Some(parent) = dest.parent() {
-        if let Some(stem) = dest.file_name().and_then(|n| n.to_str()) {
-            let prefix = format!("{stem}.part-");
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries {
-                    // Don't `.flatten()` away per-entry errors: a partial
-                    // NFS degradation can error on an individual DirEntry,
-                    // skipping a `.part-*` orphan we'd otherwise remove. The
-                    // current copy still writes its own fresh `.part-<pid>`,
-                    // so correctness is unaffected — but without this WARN a
-                    // persistently degraded mount would let orphaned temps
-                    // accumulate with no operator signal at all. (Mirrors the
-                    // no-`flatten()` rationale in `list_staging_basenames`.)
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                dir = %parent.display(),
-                                "mover: cannot read dir entry while clearing orphaned \
-                                 .part-* temps; an orphan may be left behind"
-                            );
-                            continue;
-                        }
-                    };
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name.starts_with(&prefix) {
-                            let _ = std::fs::remove_file(entry.path());
-                        }
+    if let Some(parent) = dest.parent()
+        && let Some(stem) = dest.file_name().and_then(|n| n.to_str())
+    {
+        let prefix = format!("{stem}.part-");
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries {
+                // Don't `.flatten()` away per-entry errors: a partial
+                // NFS degradation can error on an individual DirEntry,
+                // skipping a `.part-*` orphan we'd otherwise remove. The
+                // current copy still writes its own fresh `.part-<pid>`,
+                // so correctness is unaffected — but without this WARN a
+                // persistently degraded mount would let orphaned temps
+                // accumulate with no operator signal at all. (Mirrors the
+                // no-`flatten()` rationale in `list_staging_basenames`.)
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            dir = %parent.display(),
+                            "mover: cannot read dir entry while clearing orphaned \
+                             .part-* temps; an orphan may be left behind"
+                        );
+                        continue;
                     }
+                };
+                if let Some(name) = entry.file_name().to_str()
+                    && name.starts_with(&prefix)
+                {
+                    let _ = std::fs::remove_file(entry.path());
                 }
             }
         }
@@ -869,18 +869,18 @@ fn check_and_move(cfg: &Config) {
         // UNDER that real root — never the root (and thus mount) itself.
         let mut dest_ok = true;
         for (_, dest) in &planned_moves {
-            if let Some(parent) = Path::new(dest).parent() {
-                if std::fs::create_dir_all(parent).is_err() {
-                    record_error(
-                        &dir_str,
-                        &format!(
-                            "cannot create destination directory {}",
-                            absolute_for_log(&parent.to_string_lossy())
-                        ),
-                        "check write permissions on the output / movie / tv directory",
-                    );
-                    dest_ok = false;
-                }
+            if let Some(parent) = Path::new(dest).parent()
+                && std::fs::create_dir_all(parent).is_err()
+            {
+                record_error(
+                    &dir_str,
+                    &format!(
+                        "cannot create destination directory {}",
+                        absolute_for_log(&parent.to_string_lossy())
+                    ),
+                    "check write permissions on the output / movie / tv directory",
+                );
+                dest_ok = false;
             }
         }
         if !dest_ok {
@@ -1523,37 +1523,41 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
     // call site), trusting size-only here would silently keep the wrong file
     // as "already moved". Re-confirm head+tail so the skip can never clobber
     // a different file; a mismatch surfaces as a Collision instead.
-    if let (Ok(s), Ok(d)) = (&src_meta, &dest_meta) {
-        if s.is_file() && d.is_file() && s.len() == d.len() && s.len() > 0 {
-            if same_head_and_tail(src, dest) {
-                // Equal length + matching head/tail still isn't proof of a
-                // DURABLE dest: a prior copy that failed post-copy validation
-                // (short/structurally-invalid on NFS) can leave a dest that
-                // happens to match these cheap probes. Run the same fresh-FD
-                // post-copy validation the copy path runs before accepting it
-                // as already-moved; on failure, fall through to a real copy.
-                if check_post_copy(src, dest).is_ok() {
-                    return MoveOutcome::Skipped;
-                }
-                crate::log::syslog(&format!(
-                    "Pre-existing destination failed post-copy validation; re-copying: {:?}",
-                    dest
-                ));
-                // Fall through to the copy path below.
-            } else {
-                crate::log::syslog(&format!(
-                    "Move blocked (destination same size but different content): {:?} vs {:?}",
-                    src, dest
-                ));
-                return MoveOutcome::Collision;
+    if let (Ok(s), Ok(d)) = (&src_meta, &dest_meta)
+        && s.is_file()
+        && d.is_file()
+        && s.len() == d.len()
+        && s.len() > 0
+    {
+        if same_head_and_tail(src, dest) {
+            // Equal length + matching head/tail still isn't proof of a
+            // DURABLE dest: a prior copy that failed post-copy validation
+            // (short/structurally-invalid on NFS) can leave a dest that
+            // happens to match these cheap probes. Run the same fresh-FD
+            // post-copy validation the copy path runs before accepting it
+            // as already-moved; on failure, fall through to a real copy.
+            if check_post_copy(src, dest).is_ok() {
+                return MoveOutcome::Skipped;
             }
+            crate::log::syslog(&format!(
+                "Pre-existing destination failed post-copy validation; re-copying: {:?}",
+                dest
+            ));
+            // Fall through to the copy path below.
+        } else {
+            crate::log::syslog(&format!(
+                "Move blocked (destination same size but different content): {:?} vs {:?}",
+                src, dest
+            ));
+            return MoveOutcome::Collision;
         }
     }
     // Pre-flight: src missing but dest present — earlier rename succeeded.
-    if let (Err(_), Ok(d)) = (&src_meta, &dest_meta) {
-        if d.is_file() && d.len() > 0 {
-            return MoveOutcome::Moved;
-        }
+    if let (Err(_), Ok(d)) = (&src_meta, &dest_meta)
+        && d.is_file()
+        && d.len() > 0
+    {
+        return MoveOutcome::Moved;
     }
 
     if std::fs::rename(src, dest).is_ok() {
@@ -1658,8 +1662,8 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 // average so far (bytes/elapsed), surfaced in MB/s.
                 let done = written.load(std::sync::atomic::Ordering::Relaxed);
                 let elapsed = start.elapsed().as_secs_f64();
-                let pct = if src_size > 0 {
-                    (done.saturating_mul(100) / src_size).min(100) as u8
+                let pct = if let Some(p) = done.saturating_mul(100).checked_div(src_size) {
+                    p.min(100) as u8
                 } else {
                     0
                 };
