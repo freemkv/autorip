@@ -525,15 +525,15 @@ pub(super) fn byte_offset_in_title(lba: u32, title: &libfreemkv::DiscTitle) -> O
 }
 
 fn range_chapter(lba: u32, title: &libfreemkv::DiscTitle) -> (Option<u32>, Option<f64>) {
-    if let Some(byte_offset) = byte_offset_in_title(lba, title) {
-        if let Some((ch, t)) = libfreemkv::disc::chapter_at_offset(
+    if let Some(byte_offset) = byte_offset_in_title(lba, title)
+        && let Some((ch, t)) = libfreemkv::disc::chapter_at_offset(
             &title.chapters,
             byte_offset,
             title.duration_secs,
             title.size_bytes,
-        ) {
-            return (Some(ch as u32), Some(t));
-        }
+        )
+    {
+        return (Some(ch as u32), Some(t));
     }
     (None, None)
 }
@@ -713,8 +713,8 @@ pub(super) fn push_pass_state(
     // any consumer reading the old field).
     let last_pos = state.borrow().last_work_done;
     let last_work_total = state.borrow().last_work_total;
-    let pass_pct = if last_work_total > 0 {
-        (last_pos * 100 / last_work_total).min(100) as u8
+    let pass_pct = if let Some(p) = (last_pos * 100).checked_div(last_work_total) {
+        p.min(100) as u8
     } else {
         0
     };
@@ -755,8 +755,8 @@ pub(super) fn push_pass_state(
             .saturating_add(prior_retry_count.saturating_mul(retry_denom_bytes))
             .saturating_add(last_pos)
     };
-    let total_pct = if total_work_estimated > 0 {
-        (total_done * 100 / total_work_estimated).min(100) as u8
+    let total_pct = if let Some(p) = (total_done * 100).checked_div(total_work_estimated) {
+        p.min(100) as u8
     } else {
         0
     };
@@ -948,8 +948,8 @@ pub(super) fn set_pass_progress(
     bytes_maybe: u64,
     bytes_lost: u64,
 ) {
-    let pct = if ctx.bytes_total_disc > 0 {
-        (bytes_good * 100 / ctx.bytes_total_disc).min(100) as u8
+    let pct = if let Some(p) = (bytes_good * 100).checked_div(ctx.bytes_total_disc) {
+        p.min(100) as u8
     } else {
         0
     };

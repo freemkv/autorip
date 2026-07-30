@@ -77,13 +77,13 @@ pub fn register_rip_thread(device: &str, handle: JoinHandle<()>) -> Result<(), R
         if prior.is_finished() {
             // Safe to join under the lock: is_finished()==true means
             // join() won't block. Reap quietly — no warning.
-            if let Some(prior) = t.remove(device) {
-                if let Err(e) = prior.join() {
-                    tracing::error!(
-                        device = %device,
-                        "reaped prior rip thread had panicked: {:?}", e
-                    );
-                }
+            if let Some(prior) = t.remove(device)
+                && let Err(e) = prior.join()
+            {
+                tracing::error!(
+                    device = %device,
+                    "reaped prior rip thread had panicked: {:?}", e
+                );
             }
         } else {
             // A still-running prior would be orphaned by an overwrite.

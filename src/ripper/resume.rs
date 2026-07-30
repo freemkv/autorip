@@ -1866,15 +1866,13 @@ fn resolve_keys_from_iso(
     // (the uncatalogued-disc path) NEEDS the VID, and resolving it from
     // `disc.inputs()` alone regressed that case. A keyable disc re-resolves
     // correctly; a genuinely-unkeyed disc returns NoKey.
-    if let Some(a) = disc.aacs.as_mut() {
-        if a.volume_id == [0u8; 16] {
-            if let Some(vid) = freemkv_engine::Mapfile::load(mapfile_path)
-                .ok()
-                .and_then(|m| m.vid())
-            {
-                a.volume_id = vid;
-            }
-        }
+    if let Some(a) = disc.aacs.as_mut()
+        && a.volume_id == [0u8; 16]
+        && let Some(vid) = freemkv_engine::Mapfile::load(mapfile_path)
+            .ok()
+            .and_then(|m| m.vid())
+    {
+        a.volume_id = vid;
     }
     let sources = crate::keysource::build_sources(cfg);
     let mut access = crate::keysource::IsoAccess::new(iso_path);

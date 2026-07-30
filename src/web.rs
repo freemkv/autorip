@@ -1748,10 +1748,10 @@ fn handle_tmdb_search(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, ur
         const TMDB_MIN_INTERVAL: Duration = Duration::from_millis(500);
         let mut last = LAST_TMDB_SEARCH.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        if let Some(prev) = *last {
-            if now.duration_since(prev) < TMDB_MIN_INTERVAL {
-                return json_response(request, 429, r#"{"error":"rate limited"}"#);
-            }
+        if let Some(prev) = *last
+            && now.duration_since(prev) < TMDB_MIN_INTERVAL
+        {
+            return json_response(request, 429, r#"{"error":"rate limited"}"#);
         }
         *last = Some(now);
     }
@@ -1900,17 +1900,17 @@ fn resolve_webhook_urls(incoming: &[&str], existing: &[String]) -> Result<Vec<St
             // so two same-origin webhooks round-trip unambiguously. The index
             // must both be in range AND still mask to exactly this placeholder
             // (so a reordered/deleted row can't silently bind the wrong secret).
-            if let Some((origin_mask, idx_str)) = s.rsplit_once('#') {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    match existing.get(idx) {
-                        Some(stored) if mask_webhook_url(stored) == origin_mask => {
-                            resolved.push(stored.clone());
-                            continue;
-                        }
-                        // Index stale (row deleted/reordered) — reject rather
-                        // than guess.
-                        _ => return Err((*s).to_string()),
+            if let Some((origin_mask, idx_str)) = s.rsplit_once('#')
+                && let Ok(idx) = idx_str.parse::<usize>()
+            {
+                match existing.get(idx) {
+                    Some(stored) if mask_webhook_url(stored) == origin_mask => {
+                        resolved.push(stored.clone());
+                        continue;
                     }
+                    // Index stale (row deleted/reordered) — reject rather
+                    // than guess.
+                    _ => return Err((*s).to_string()),
                 }
             }
             // Fallback: no embedded index (older client). Match by origin; only
@@ -1940,10 +1940,10 @@ fn resolve_webhook_urls(incoming: &[&str], existing: &[String]) -> Result<Vec<St
 fn settings_json_redacted(c: &Config) -> String {
     let mut v = serde_json::to_value(c).unwrap_or_else(|_| serde_json::json!({}));
     for field in ["keyserver_secret", "tmdb_api_key"] {
-        if let Some(s) = v.get(field).and_then(|x| x.as_str()) {
-            if !s.is_empty() {
-                v[field] = serde_json::json!(SECRET_SENTINEL);
-            }
+        if let Some(s) = v.get(field).and_then(|x| x.as_str())
+            && !s.is_empty()
+        {
+            v[field] = serde_json::json!(SECRET_SENTINEL);
         }
     }
     // keyserver_url and keydb_url may carry auth tokens in the path/query
@@ -1951,10 +1951,10 @@ fn settings_json_redacted(c: &Config) -> String {
     // with the origin-preserving helper so the operator can see the host
     // but not the embedded secret. A masked value round-trips on POST.
     for field in ["keyserver_url", "keydb_url"] {
-        if let Some(s) = v.get(field).and_then(|x| x.as_str()) {
-            if !s.is_empty() {
-                v[field] = serde_json::json!(mask_webhook_url(s));
-            }
+        if let Some(s) = v.get(field).and_then(|x| x.as_str())
+            && !s.is_empty()
+        {
+            v[field] = serde_json::json!(mask_webhook_url(s));
         }
     }
     // webhook_urls embed bearer tokens (Discord/Slack/Jellyfin webhook
@@ -1964,21 +1964,21 @@ fn settings_json_redacted(c: &Config) -> String {
     // keydb_path is an absolute container path; leaking it to any LAN/host
     // client exposes the internal filesystem layout. Return only the filename
     // component (enough for the operator to confirm which file is in use).
-    if let Some(s) = v.get("keydb_path").and_then(|x| x.as_str()) {
-        if !s.is_empty() {
-            let name = std::path::Path::new(s)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            v["keydb_path"] = serde_json::json!(name);
-        }
+    if let Some(s) = v.get("keydb_path").and_then(|x| x.as_str())
+        && !s.is_empty()
+    {
+        let name = std::path::Path::new(s)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        v["keydb_path"] = serde_json::json!(name);
     }
     if let Some(arr) = v.get_mut("webhook_urls").and_then(|x| x.as_array_mut()) {
         for (idx, entry) in arr.iter_mut().enumerate() {
-            if let Some(s) = entry.as_str() {
-                if !s.is_empty() {
-                    *entry = serde_json::json!(mask_webhook_url_indexed(s, idx));
-                }
+            if let Some(s) = entry.as_str()
+                && !s.is_empty()
+            {
+                *entry = serde_json::json!(mask_webhook_url_indexed(s, idx));
             }
         }
     }
@@ -4115,10 +4115,8 @@ fn tail_file(path: &str, max_bytes: u64) -> std::io::Result<String> {
     let mut s = String::from_utf8_lossy(&buf).into_owned();
     // When we seeked into the middle of the file, the first line is a
     // partial record — drop it so callers never parse a half line.
-    if truncated {
-        if let Some(nl) = s.find('\n') {
-            s.drain(..=nl);
-        }
+    if truncated && let Some(nl) = s.find('\n') {
+        s.drain(..=nl);
     }
     Ok(s)
 }
@@ -4203,10 +4201,10 @@ fn handle_debug_log(request: tiny_http::Request, url: &str) {
                 continue;
             }
         }
-        if let Some(ref needle) = q {
-            if !line.contains(needle) {
-                continue;
-            }
+        if let Some(ref needle) = q
+            && !line.contains(needle)
+        {
+            continue;
         }
         out.push((*line).to_string());
     }
@@ -4288,18 +4286,19 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         // containing the sentinel is a masked "unchanged" placeholder from
         // GET /api/settings — skip validation (stored value was already
         // validated when first saved).
-        if !v.trim().is_empty() && !v.contains(SECRET_SENTINEL) {
-            if let Err(e) = validate_fetch_url(v) {
-                return json_response(
-                    request,
-                    400,
-                    &serde_json::json!({
-                        "ok": false,
-                        "error": format!("keydb_url rejected: {e}")
-                    })
-                    .to_string(),
-                );
-            }
+        if !v.trim().is_empty()
+            && !v.contains(SECRET_SENTINEL)
+            && let Err(e) = validate_fetch_url(v)
+        {
+            return json_response(
+                request,
+                400,
+                &serde_json::json!({
+                    "ok": false,
+                    "error": format!("keydb_url rejected: {e}")
+                })
+                .to_string(),
+            );
         }
     }
     if let Some(v) = patch.get("keyserver_url").and_then(|v| v.as_str()) {
@@ -4308,18 +4307,19 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         // aim it at metadata/internal hosts. Empty is allowed (disables the
         // online source). A value containing the sentinel is a masked
         // "unchanged" placeholder from GET — skip validation.
-        if !v.trim().is_empty() && !v.contains(SECRET_SENTINEL) {
-            if let Err(e) = validate_fetch_url(v) {
-                return json_response(
-                    request,
-                    400,
-                    &serde_json::json!({
-                        "ok": false,
-                        "error": format!("keyserver_url rejected: {e}")
-                    })
-                    .to_string(),
-                );
-            }
+        if !v.trim().is_empty()
+            && !v.contains(SECRET_SENTINEL)
+            && let Err(e) = validate_fetch_url(v)
+        {
+            return json_response(
+                request,
+                400,
+                &serde_json::json!({
+                    "ok": false,
+                    "error": format!("keyserver_url rejected: {e}")
+                })
+                .to_string(),
+            );
         }
     }
     if let Some(v) = patch.get("network_target").and_then(|v| v.as_str()) {
@@ -4328,18 +4328,18 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         // could beacon plaintext to an internal/metadata host. Empty clears
         // the target (no check needed). Reject any host that is or resolves
         // to a non-public address.
-        if !v.trim().is_empty() {
-            if let Err(e) = validate_network_target(v) {
-                return json_response(
-                    request,
-                    400,
-                    &serde_json::json!({
-                        "ok": false,
-                        "error": format!("network_target rejected: {e}")
-                    })
-                    .to_string(),
-                );
-            }
+        if !v.trim().is_empty()
+            && let Err(e) = validate_network_target(v)
+        {
+            return json_response(
+                request,
+                400,
+                &serde_json::json!({
+                    "ok": false,
+                    "error": format!("network_target rejected: {e}")
+                })
+                .to_string(),
+            );
         }
     }
     if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {
@@ -4395,14 +4395,14 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         ("output_format", &["mkv", "m2ts", "iso", "network"][..]),
         ("rip_mode", &["single", "multi"][..]),
     ] {
-        if let Some(v) = patch.get(field).and_then(|v| v.as_str()) {
-            if !allowed.contains(&v) {
-                return json_response(
-                    request,
-                    400,
-                    &format!(r#"{{"ok":false,"error":"invalid value for {field}"}}"#),
-                );
-            }
+        if let Some(v) = patch.get(field).and_then(|v| v.as_str())
+            && !allowed.contains(&v)
+        {
+            return json_response(
+                request,
+                400,
+                &format!(r#"{{"ok":false,"error":"invalid value for {field}"}}"#),
+            );
         }
     }
 
@@ -4553,10 +4553,10 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
                 c.keyserver_url = v.to_string();
             }
         }
-        if let Some(v) = patch.get("keyserver_secret").and_then(|v| v.as_str()) {
-            if v != SECRET_SENTINEL {
-                c.keyserver_secret = v.to_string();
-            }
+        if let Some(v) = patch.get("keyserver_secret").and_then(|v| v.as_str())
+            && v != SECRET_SENTINEL
+        {
+            c.keyserver_secret = v.to_string();
         }
         if let Some(v) = patch.get("keydb_path").and_then(|v| v.as_str()) {
             // GET /api/settings redacts keydb_path to its filename component to
@@ -5316,13 +5316,13 @@ fn percent_decode(s: &str) -> String {
         // in range, i.e. i + 3 <= len. The previous `i + 2 < len` guard
         // was off by one and dropped a trailing `%XX` (e.g. a value
         // ending in a percent-encoded byte) through to literal output.
-        if bytes[i] == b'%' && i + 3 <= bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16)
-            {
-                result.push(byte);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 3 <= bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16)
+        {
+            result.push(byte);
+            i += 3;
+            continue;
         }
         result.push(bytes[i]);
         i += 1;

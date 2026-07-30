@@ -359,11 +359,11 @@ pub fn clean_title(label: &str) -> String {
         let trimmed = clipped.trim_end_matches(|c: char| !c.is_alphanumeric());
         let mut next: Option<&str> = None;
         for suffix in &suffixes {
-            if let Some(pos) = trimmed.rfind(suffix) {
-                if pos + suffix.len() == trimmed.len() {
-                    next = Some(&trimmed[..pos]);
-                    break;
-                }
+            if let Some(pos) = trimmed.rfind(suffix)
+                && pos + suffix.len() == trimmed.len()
+            {
+                next = Some(&trimmed[..pos]);
+                break;
             }
         }
         match next {

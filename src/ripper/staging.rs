@@ -413,10 +413,10 @@ pub fn write_muxing_marker(staging_disc_dir: &Path) {
 /// worker finishes (or aborts) a dir. Not finding the file is not an error.
 pub fn clear_muxing_marker(staging_disc_dir: &Path) {
     let p = staging_disc_dir.join(MUXING_MARKER);
-    if let Err(e) = std::fs::remove_file(&p) {
-        if e.kind() != io::ErrorKind::NotFound {
-            tracing::warn!(path = %p.display(), error = %e, "failed to clear .muxing marker");
-        }
+    if let Err(e) = std::fs::remove_file(&p)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %p.display(), error = %e, "failed to clear .muxing marker");
     }
 }
 
@@ -425,10 +425,10 @@ pub fn clear_muxing_marker(staging_disc_dir: &Path) {
 /// marker for this dir. Not finding the file is not an error.
 pub fn clear_sweeping_marker(staging_disc_dir: &Path) {
     let p = staging_disc_dir.join(SWEEPING_MARKER);
-    if let Err(e) = std::fs::remove_file(&p) {
-        if e.kind() != io::ErrorKind::NotFound {
-            tracing::warn!(path = %p.display(), error = %e, "failed to clear .sweeping marker");
-        }
+    if let Err(e) = std::fs::remove_file(&p)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %p.display(), error = %e, "failed to clear .sweeping marker");
     }
 }
 

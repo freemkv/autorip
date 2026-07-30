@@ -95,7 +95,7 @@ impl ScanWatchdog {
                     break;
                 }
                 let elapsed = start.elapsed().as_secs();
-                if elapsed >= 15 && elapsed % 15 == 0 {
+                if elapsed >= 15 && elapsed.is_multiple_of(15) {
                     let last_phase = match phase_w.load(Ordering::Relaxed) {
                         0 => "scan",
                         _ => "resolve_keys",
@@ -832,12 +832,12 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         // web handlers' rollback.
                         rollback_failed_spawn(&device);
                     }
-                } else if !is_new_insert && !is_busy(&device) {
-                    if let Ok(mut s) = STATE.lock() {
-                        if let Some(rs) = s.get_mut(&device) {
-                            rs.disc_present = true;
-                        }
-                    }
+                } else if !is_new_insert
+                    && !is_busy(&device)
+                    && let Ok(mut s) = STATE.lock()
+                    && let Some(rs) = s.get_mut(&device)
+                {
+                    rs.disc_present = true;
                 }
             }
 
@@ -1546,10 +1546,11 @@ fn staging_disc_completed(staging_root: &std::path::Path, sanitized: &str) -> bo
         // snapshot is the same view every other marker-detection caller
         // (resume_or_quarantine_staging, check_and_mux, remux_from_ripped_marker)
         // relies on for NFS consistency.
-        if let Some(snap) = staging::snapshot_staging_disc(&path) {
-            if snap.completed && !snap.has_review {
-                return true;
-            }
+        if let Some(snap) = staging::snapshot_staging_disc(&path)
+            && snap.completed
+            && !snap.has_review
+        {
+            return true;
         }
     }
     false
@@ -1599,10 +1600,10 @@ fn staging_disc_owned_by_worker(staging_root: &std::path::Path, sanitized: &str)
         // through to `rip_disc`, which O_TRUNCs the ISO the mux worker is
         // reading. The snapshot matches `resumable_dir_blocked` /
         // `find_resumable_for_disc`, which are already NFS-resilient.
-        if let Some(snap) = staging::snapshot_staging_disc(&path) {
-            if snap.has_ripped || snap.has_muxing {
-                return true;
-            }
+        if let Some(snap) = staging::snapshot_staging_disc(&path)
+            && (snap.has_ripped || snap.has_muxing)
+        {
+            return true;
         }
     }
     false
@@ -2715,15 +2716,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // key (decode rejects `mkb=0` with 404). Read it once here so every
             // refetch request carries the full inf+MKB, exactly like the up-front
             // resolve did. One drive read at rip start; `inf` filled too if absent.
-            if inputs.mkb.is_empty() {
-                if let Ok((inf, mkb, _version)) =
+            if inputs.mkb.is_empty()
+                && let Ok((inf, mkb, _version)) =
                     libfreemkv::Disc::read_aacs_inputs_from_drive(&mut session.drive)
-                {
-                    if inputs.unit_key_ro.is_empty() {
-                        inputs.unit_key_ro = inf;
-                    }
-                    inputs.mkb = mkb;
+            {
+                if inputs.unit_key_ro.is_empty() {
+                    inputs.unit_key_ro = inf;
                 }
+                inputs.mkb = mkb;
             }
             let cfg = Arc::clone(cfg);
             let make: std::sync::Arc<
@@ -2805,10 +2805,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             FmtsGate::Proceed => {
                 // Bank the resolved forensic keys onto the disc so the sweep's
                 // key persist + the mux reuse them.
-                if let libfreemkv::decrypt::DecryptKeys::Aacs { unit_keys, .. } = &gate_keys {
-                    if let Some(a) = disc.aacs.as_mut() {
-                        a.unit_keys = unit_keys.clone();
-                    }
+                if let libfreemkv::decrypt::DecryptKeys::Aacs { unit_keys, .. } = &gate_keys
+                    && let Some(a) = disc.aacs.as_mut()
+                {
+                    a.unit_keys = unit_keys.clone();
                 }
                 // Re-derive the shared decode keys so BOTH paths see the forensic
                 // index keys just banked. This is essential for SINGLE-PASS, whose
@@ -2920,7 +2920,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         "disk-space preflight skipped: could not read free space at {} \
                          (path missing or volume not mounted?); a too-small or unmounted \
                          staging volume will ENOSPC mid-rip",
-                        &staging,
+                        staging,
                     ),
                 );
             }
@@ -4852,31 +4852,31 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // In multipass mode the `input.errors` counter above counts ISO→MKV demux
     // skips (usually zero — ISO reads don't fail). The real bad-sector count
     // lives in the mapfile sidecar. Prefer that when present.
-    if cfg_read.max_retries > 0 {
-        if let Ok(map) = freemkv_engine::Mapfile::load(std::path::Path::new(&mapfile_path_str)) {
-            let stats = map.stats();
-            // Only Unreadable counts as "lost" — NonTried / NonTrimmed /
-            // NonScraped at the END of a rip means the rip was interrupted,
-            // not that those bytes are damaged. For an interrupted rip the
-            // final history record reflects what we know: unreadable = bad.
-            let bad_bytes = stats.bytes_unreadable;
-            final_errors = (bad_bytes / 2048) as u32;
-            // Use the in-title-scoped loss already computed by abort_lost_ms()
-            // (same gate the abort check used above). Whole-disc `bad_bytes /
-            // title_bytes_per_sec` inflates the 'done' card when menus or trailers
-            // outside the title extents are scratched — the abort gate correctly
-            // accepted the rip because in-title loss was within threshold, but the
-            // final UI card would show a larger number from out-of-title damage.
-            final_lost_secs = if main_lost_ms_for_history_outer > 0.0 {
-                main_lost_ms_for_history_outer / MILLIS_PER_SEC
-            } else {
-                // main_lost_ms_for_history_outer is 0 when either: no bad sectors
-                // exist (clean disc), or bytes_unreadable == 0. In those cases
-                // fall back to the mux outcome's own lost_video_secs (usually 0
-                // on a clean disc, or the demux skip count for single-pass mode).
-                mux_outcome.lost_video_secs
-            };
-        }
+    if cfg_read.max_retries > 0
+        && let Ok(map) = freemkv_engine::Mapfile::load(std::path::Path::new(&mapfile_path_str))
+    {
+        let stats = map.stats();
+        // Only Unreadable counts as "lost" — NonTried / NonTrimmed /
+        // NonScraped at the END of a rip means the rip was interrupted,
+        // not that those bytes are damaged. For an interrupted rip the
+        // final history record reflects what we know: unreadable = bad.
+        let bad_bytes = stats.bytes_unreadable;
+        final_errors = (bad_bytes / 2048) as u32;
+        // Use the in-title-scoped loss already computed by abort_lost_ms()
+        // (same gate the abort check used above). Whole-disc `bad_bytes /
+        // title_bytes_per_sec` inflates the 'done' card when menus or trailers
+        // outside the title extents are scratched — the abort gate correctly
+        // accepted the rip because in-title loss was within threshold, but the
+        // final UI card would show a larger number from out-of-title damage.
+        final_lost_secs = if main_lost_ms_for_history_outer > 0.0 {
+            main_lost_ms_for_history_outer / MILLIS_PER_SEC
+        } else {
+            // main_lost_ms_for_history_outer is 0 when either: no bad sectors
+            // exist (clean disc), or bytes_unreadable == 0. In those cases
+            // fall back to the mux outcome's own lost_video_secs (usually 0
+            // on a clean disc, or the demux skip count for single-pass mode).
+            mux_outcome.lost_video_secs
+        };
     }
 
     // A loss is a loss. Mux-time (decrypt/codec) loss is missing in-title data
@@ -5335,29 +5335,29 @@ pub(crate) fn format_codecs(title: &libfreemkv::DiscTitle) -> String {
     let mut parts = Vec::new();
     // Primary video
     for s in &title.streams {
-        if let libfreemkv::Stream::Video(v) = s {
-            if !v.secondary {
-                let mut desc = format!("{} {}", v.codec.name(), v.resolution);
-                if v.hdr != libfreemkv::HdrFormat::Sdr {
-                    desc.push_str(&format!(" {}", v.hdr.name()));
-                }
-                parts.push(desc);
-                break;
+        if let libfreemkv::Stream::Video(v) = s
+            && !v.secondary
+        {
+            let mut desc = format!("{} {}", v.codec.name(), v.resolution);
+            if v.hdr != libfreemkv::HdrFormat::Sdr {
+                desc.push_str(&format!(" {}", v.hdr.name()));
             }
+            parts.push(desc);
+            break;
         }
     }
     // First primary audio only
     for s in &title.streams {
-        if let libfreemkv::Stream::Audio(a) = s {
-            if !a.secondary {
-                let mut audio = format!("{} {}", a.codec.name(), a.channels);
-                // autorip is English-only — inline the purpose tags directly.
-                if let Some(tag) = audio_purpose_tag(a.purpose) {
-                    audio.push_str(&format!(" {}", tag));
-                }
-                parts.push(audio);
-                break;
+        if let libfreemkv::Stream::Audio(a) = s
+            && !a.secondary
+        {
+            let mut audio = format!("{} {}", a.codec.name(), a.channels);
+            // autorip is English-only — inline the purpose tags directly.
+            if let Some(tag) = audio_purpose_tag(a.purpose) {
+                audio.push_str(&format!(" {}", tag));
             }
+            parts.push(audio);
+            break;
         }
     }
     parts.join(" · ")
@@ -5742,12 +5742,11 @@ fn keyless_failure_message(disc: &libfreemkv::Disc) -> String {
 /// through Settings for a key source that is actually fine (the exact
 /// confusion seen when cdxhp.com returned 502s during a deferred mux).
 pub(crate) fn deferred_keyless_message(cfg: &Config, disc: &libfreemkv::Disc) -> String {
-    if cfg.key_source == "online" {
-        if let Some(status) =
+    if cfg.key_source == "online"
+        && let Some(status) =
             key_service_transient_status(crate::keysource::probe_online_reachability(cfg))
-        {
-            return status.to_string();
-        }
+    {
+        return status.to_string();
     }
     keyless_failure_message(disc)
 }

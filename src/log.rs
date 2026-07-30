@@ -205,10 +205,8 @@ pub fn archive_device_log(device: &str) {
     // Only clear the in-memory ring once the live file is safely archived
     // (or there was nothing to archive). On a rename failure we leave the
     // ring so the live view still reflects the on-disk log.
-    if archived_ok {
-        if let Ok(mut logs) = LOGS.lock() {
-            logs.remove(device);
-        }
+    if archived_ok && let Ok(mut logs) = LOGS.lock() {
+        logs.remove(device);
     }
 }
 

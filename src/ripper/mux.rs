@@ -634,8 +634,8 @@ fn spawn_mux_watchdog(
                 // `wbytes` read so the two can't disagree.
                 let bytes = wbytes.load(Ordering::Relaxed);
                 let gb = bytes as f64 / BYTES_PER_GIB;
-                let pct = if wd_total > 0 {
-                    (bytes * 100 / wd_total).min(100) as u8
+                let pct = if let Some(p) = (bytes * 100).checked_div(wd_total) {
+                    p.min(100) as u8
                 } else {
                     0
                 };
@@ -851,8 +851,8 @@ impl libfreemkv::MuxEvents for AutoripMuxEvents {
         // event fires — identical to `MuxSink::apply`.
         let lbr = self.atomics.latest_bytes_read.load(Ordering::Relaxed);
         let bytes_done = if lbr > 0 { lbr } else { bytes_written };
-        let pct = if self.ui.total_bytes > 0 {
-            (bytes_done * 100 / self.ui.total_bytes).min(100) as u8
+        let pct = if let Some(p) = (bytes_done * 100).checked_div(self.ui.total_bytes) {
+            p.min(100) as u8
         } else {
             0
         };
