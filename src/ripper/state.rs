@@ -1070,17 +1070,6 @@ mod tests {
         }
     }
 
-    /// A title whose feature occupies one extent of `sector_count` sectors
-    /// starting at `start_lba` — i.e. bytes `[start_lba*2048, (start_lba+count)*2048)`.
-    fn title_with_extent(start_lba: u32, sector_count: u32) -> libfreemkv::DiscTitle {
-        let mut t = minimal_title();
-        t.extents = vec![libfreemkv::Extent {
-            start_lba,
-            sector_count,
-        }];
-        t
-    }
-
     // The live at-risk / located-drilldown behaviour these tests used to cover
     // (in-feature pending counts as at-risk; out-of-feature reads 0:00; the live
     // drilldown shows pending while the terminal verdict hides it) moved into
