@@ -8,35 +8,311 @@ on:
     branches: [main, dev]
   pull_request:
 
-# autorip depends on libfreemkv from crates.io (see Cargo.toml).
-# No sibling-repo checkout is needed.
-
+# WHY THE SIBLING CHECKOUTS — this is NOT a monorepo.
+#
+# The committed Cargo.toml resolves every freemkv crate from a git TAG, and one
+# of those tags (freemkv-engine v1.6.0) DOES NOT EXIST — release.sh creates it.
+# So every job here failed at dependency resolution with "failed to find tag
+# v1.6.0" before compiling a line. Even once that tag exists, pinning it means
+# CI validates this branch against the last release of the libraries rather than
+# their dev tips, so a change spanning repos cannot be verified until the tags
+# are cut — the worst moment to find a build error.
+#
+# The fix mirrors the developer's local layout. Every repo is checked out into a
+# subdirectory of $GITHUB_WORKSPACE, reproducing ~/Developer/freemkv/*, and a
+# generated .cargo/config.toml redirects the git-tag patches at those paths.
+# Config-level [patch.crates-io] wins over the manifest one — the same mechanism
+# local development already uses (see the note in Cargo.toml).
+#
+# Subdirectories rather than `../libfreemkv` because actions/checkout refuses
+# any `path:` outside $GITHUB_WORKSPACE, and the workspace IS the repo dir.
+# Repos stay separate, tags stay separate, the release cascade is untouched.
+#
+# freemkv-unlock gets a checkout but no patch entry: it is reached as
+# libfreemkv's path dep (../freemkv-unlock), which resolves to the workspace
+# root under this layout.
+#
+# `--locked` is not used. The committed Cargo.lock resolves the freemkv crates
+# as path packages and carries [[patch.unused]] entries — artifacts of whichever
+# local cargo config last wrote it, describing a developer's machine rather than
+# a release. release.sh regenerates it with the real tags at ship time, which is
+# where the pin has to hold.
+#
+# OS COVERAGE. autorip rips discs through /dev/sg*, so Linux is what it RUNS on
+# — but release.yml ships four targets: x86_64/aarch64 musl, aarch64-apple-darwin
+# and x86_64-pc-windows-msvc. CI compiled only Linux-gnu, so three shipped
+# targets were first built by the release workflow, after the version bump and
+# the tag push. An old comment here claimed "freemkv CLI covers cross-platform";
+# it does not — autorip has its own web UI, scheduler and job store, none of
+# which the CLI compiles.
 jobs:
+  # --all-targets so the test code is linted too, not just the binary.
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          ref: dev
+          path: libfreemkv
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: dev
+          path: freemkv-keysources
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-engine
+          ref: dev
+          path: freemkv-engine
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-i18n
+          ref: dev
+          path: freemkv-i18n
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: dev
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: autorip
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy, rustfmt
-      # Cache ~/.cargo/registry + target/ across runs. Saves ~30-60s
-      # of crates.io index download per job; incremental compilation
-      # helps on re-runs that don't bump Cargo.lock.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: autorip-ci
+          workspaces: autorip
       - run: cargo fmt --check
-      - run: cargo clippy --locked -- -D warnings
+        working-directory: autorip
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: autorip
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          ref: dev
+          path: libfreemkv
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: dev
+          path: freemkv-keysources
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-engine
+          ref: dev
+          path: freemkv-engine
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-i18n
+          ref: dev
+          path: freemkv-i18n
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: dev
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: autorip
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: autorip-ci
-      - run: cargo test --locked --tests
+          workspaces: autorip
+      - run: cargo test --tests
+        working-directory: autorip
 
-  # autorip targets Linux only (disc access via /dev/sg*)
-  # Windows check removed — freemkv CLI covers cross-platform
+  # The shipped Linux artifact — and the GHCR image — is a static musl release
+  # build, not the gnu dev build the jobs above produce. Static linking is
+  # exactly where a new C-linking dependency breaks, and nothing else here
+  # compiles that target.
+  release-build-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          ref: dev
+          path: libfreemkv
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: dev
+          path: freemkv-keysources
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-engine
+          ref: dev
+          path: freemkv-engine
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-i18n
+          ref: dev
+          path: freemkv-i18n
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: dev
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: autorip
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: autorip
+      - name: Install musl cross-compilation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+        working-directory: autorip
+
+  # aarch64-apple-darwin is a SHIPPED target (release.yml builds it), and no
+  # job compiled it until now. Build the tests rather than `cargo check` —
+  # check skips codegen and never compiles test-only code.
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          ref: dev
+          path: libfreemkv
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: dev
+          path: freemkv-keysources
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-engine
+          ref: dev
+          path: freemkv-engine
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-i18n
+          ref: dev
+          path: freemkv-i18n
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: dev
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: autorip
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: autorip
+      - run: cargo build --tests
+        working-directory: autorip
+
+  # x86_64-pc-windows-msvc is a SHIPPED target too. This is the only job that
+  # compiles autorip's `#[cfg(windows)]` paths at all, so without it a broken
+  # Windows build surfaces during the release, after the tag is pushed.
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          ref: dev
+          path: libfreemkv
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: dev
+          path: freemkv-keysources
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-engine
+          ref: dev
+          path: freemkv-engine
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-i18n
+          ref: dev
+          path: freemkv-i18n
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: dev
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: autorip
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: autorip
+      - run: cargo build --tests
+        working-directory: autorip

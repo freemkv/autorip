@@ -23,7 +23,7 @@
 //! event-wiring half that those cannot reach.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use freemkv_autorip::ripper::make_drive_event_fn;
 use libfreemkv::event::{Event, EventKind};

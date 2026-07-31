@@ -1563,7 +1563,7 @@ mod tests {
         // A coded error that maps to the generic IoError code must also not
         // gain a spurious `(E5000)` annotation — only its tail names it.
         let io_coded: std::io::Error =
-            libfreemkv::Error::from(std::io::Error::new(std::io::ErrorKind::Other, "boom")).into();
+            libfreemkv::Error::from(std::io::Error::other("boom")).into();
         let cause = producer_read_error_cause(&io_coded);
         assert!(
             !cause.contains(&format!("(E{})", libfreemkv::error::E_IO_ERROR)),
