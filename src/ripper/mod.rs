@@ -1015,7 +1015,26 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Decompose the session into the owned disc + live drive the rest of
     // scan_disc (resolve_keys_from_drive, unlocker matrix, store_session) uses.
     let disc = session.take_disc().expect("scan populated the disc");
-    let mut drive = session.into_drive();
+    // into_drive is fallible: stage_drive_as_reader moves the drive out, so an
+    // empty slot is reachable through ordinary API use rather than being a
+    // caller error. Report it the same way a failed scan is reported.
+    let mut drive = match session.into_drive() {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format_lib_error("Disc scan", &e);
+            crate::log::device_log(device, &msg);
+            update_state(
+                device,
+                RipState {
+                    device: device.to_string(),
+                    status: "error".to_string(),
+                    last_error: msg,
+                    ..Default::default()
+                },
+            );
+            return;
+        }
+    };
     tracing::info!(device = %device, elapsed_ms = scan_t0.elapsed().as_millis() as u64, "scan: structure done");
     // Sample-based key source: resolve the Unit Key from the disc's files +
     // on-disc samples and re-scan with it (a no-op for a local source). The
