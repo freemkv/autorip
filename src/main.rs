@@ -918,6 +918,13 @@ mod tests {
         assert_eq!(normalize_mount_path("///"), "/");
     }
 
+    // Backdating a file's mtime needs a platform API, and the one used here
+    // (libc::utimes) comes from a cfg(unix) dependency — libc is not linked on
+    // Windows at all. autorip runs on Linux (disc access is via /dev/sg*), so
+    // the pruning logic is exercised on every OS it actually rips on; the
+    // Windows build only has to compile, and an ungated helper stopped it from
+    // doing even that.
+    #[cfg(unix)]
     #[test]
     fn prune_recurses_into_subdirs_and_only_touches_old_logs() {
         // Repo-local scratch, never /tmp (wiped on reboot; remove_dir_all
@@ -956,6 +963,7 @@ mod tests {
     }
 
     /// Set a file's mtime via libc::utimes (no extra crate dependency).
+    #[cfg(unix)]
     fn filetime_set(path: &std::path::Path, t: std::time::SystemTime) {
         use std::os::unix::ffi::OsStrExt;
         let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as libc::time_t;
