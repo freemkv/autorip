@@ -14,11 +14,12 @@ Works with DVD, Blu-ray, and 4K UHD discs. DVDs (CSS) work out of the box; Blu-r
 
 ```bash
 curl -O https://raw.githubusercontent.com/freemkv/autorip/main/docker-compose.example.yml
-# Edit environment variables (TMDB_API_KEY, paths, etc.)
+# Edit the volume mounts and device passthrough to match your host
 docker-compose up -d
 ```
 
-Open http://localhost:8080
+Open http://localhost:8080 and set the TMDB key, library paths and rip
+options in Settings. They are config fields, not environment variables.
 
 **First-time setup:** DVDs (CSS) work out of the box — no key setup needed. For Blu-ray and UHD (AACS) discs, go to Settings and enter a KEYDB Update URL; autorip will fetch and refresh `keydb.cfg` automatically. TMDB API key is optional (enables automatic title/poster lookup).
 
@@ -59,22 +60,22 @@ cargo build --release
 
 ## Configuration
 
+Almost everything is configured in the **web UI** (Settings) or by editing
+`config.json` in `AUTORIP_DIR` — *not* by environment variable. Output and
+library paths, the TMDB key, `min_length`, `main_feature`, `auto_eject`,
+`on_insert`, `on_read_error`, `max_retries` and `keep_iso` are all config
+fields; setting them in the environment has no effect.
+
+Only these environment variables are read:
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AUTORIP_DIR` | `/config` | Config/history/logs directory |
-| `OUTPUT_DIR` | `/output` | Where finished MKVs go |
-| `MOVIE_DIR` | | Organized movie library |
-| `TV_DIR` | | Organized TV library |
-| `STAGING_DIR` | `/staging` | Temporary rip directory |
-| `TMDB_API_KEY` | | TMDB API key for metadata |
-| `MIN_LENGTH` | `600` | Minimum title length (seconds) |
-| `MAIN_FEATURE` | `true` | Rip longest title only |
-| `AUTO_EJECT` | `true` | Eject after rip |
-| `ON_INSERT` | `scan` | `nothing` / `scan` / `rip` |
-| `ON_READ_ERROR` | `stop` | `stop` (abort on bad sector) or `skip` (zero-fill and continue) — direct mode only |
-| `MAX_RETRIES` | `1` | Retry passes after the initial disc→ISO pass. `0` = single-pass direct disc→MKV (fastest, no retry). `1..=10` = multi-pass |
-| `KEEP_ISO` | `false` | Preserve the intermediate ISO + mapfile in staging after MKV mux |
+| `AUTORIP_DIR` | `/config` | Config, logs and state directory |
 | `PORT` | `8080` | Web UI port |
+| `AUTORIP_LOG_LEVEL` | | Log verbosity override |
+| `AUTORIP_SKIP_DISKCHECK` | | Skip the startup free-space check |
+| `RIP_USER` | | User to drop privileges to |
+| `NFS_HOST`, `NFS_EXPORT`, `NFS_MOUNTPOINT`, `NFS_OPTS` | | Optional NFS mount for final output |
 
 ## Rip flow
 
@@ -130,17 +131,15 @@ All endpoints are served on port 8080 (configurable via `PORT`). The web UI is a
 | GET | `/` or `/index.html` | Serve dashboard HTML |
 | GET | `/api/state` | Current state for all devices (JSON) |
 | GET | `/api/version` | `{"version":"X.Y.Z"}` |
-| GET | `/api/settings` | Full config as JSON |
+| GET | `/api/settings` | Config as JSON, with secrets redacted and webhook URLs masked |
 | POST | `/api/settings` | Partial JSON merge of config fields |
-| GET | `/api/system` | KEYDB status, move queue, syslog (last 50 lines) |
+| GET | `/api/system` | Move/mux queues and errors, truncation count, syslog, debug flag |
 | GET | `/events` | SSE stream pushing same JSON as `/api/state` every 1s |
 
 ### History & Logs
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/history` | Last 50 history entries |
-| GET | `/api/history/{file}` | Download single history JSON file |
 | GET | `/api/logs/{device}` | Last 200 lines of device log (plain text) |
 | GET | `/api/debug[?n=&level=&device=&q=]` | Filtered JSONL debug events |
 
@@ -152,7 +151,6 @@ All endpoints are served on port 8080 (configurable via `PORT`). The web UI is a
 | POST | `/api/rip/{device}` | Start a full rip |
 | POST | `/api/stop/{device}` | Stop rip/verify, wipe staging, reset to idle |
 | POST | `/api/eject/{device}` | Eject disc tray, reset state |
-| POST | `/api/verify/{device}` | Start disc health verification |
 | POST | `/api/update-keydb` | Download KEYDB.cfg from configured URL |
 
 ## Getting a debug log (for bug reports)

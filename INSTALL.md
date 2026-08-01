@@ -83,17 +83,17 @@ uses whatever local (or already-mounted) paths you give it. Mount your
 NFS/SMB share with the host's normal `/etc/fstab` or autofs if you want
 network staging; autorip just reads and writes ordinary directories.
 
-Configure paths with environment variables (same names as the Docker
-README's config table):
+Only two paths come from the environment:
 
 | Variable | Suggested bare-install value | Purpose |
 |----------|------------------------------|---------|
-| `AUTORIP_DIR` | `/var/lib/autorip` | config / history / logs |
-| `OUTPUT_DIR` | `/srv/media/output` | finished MKVs |
-| `STAGING_DIR` | `/srv/media/staging` | temporary rip / ISO working dir |
-| `MOVIE_DIR` | `/srv/media/Movies` | organized library (optional) |
-| `TV_DIR` | `/srv/media/TV` | organized library (optional) |
+| `AUTORIP_DIR` | `/var/lib/autorip` | config, logs and state |
 | `PORT` | `8080` | web UI / API port |
+
+The output, staging and library paths are **config fields, not environment
+variables** — set them in the web UI's Settings page (or directly in
+`config.json` under `AUTORIP_DIR`) once the service is up. Setting them in the
+environment has no effect; the process never reads them.
 
 ```bash
 sudo mkdir -p /var/lib/autorip /srv/media/{output,staging,Movies,TV}
@@ -105,8 +105,6 @@ A quick foreground smoke test before wiring up systemd:
 ```bash
 sudo -u autorip env \
   AUTORIP_DIR=/var/lib/autorip \
-  OUTPUT_DIR=/srv/media/output \
-  STAGING_DIR=/srv/media/staging \
   PORT=8080 \
   autorip
 # open http://localhost:8080
@@ -137,13 +135,9 @@ Group=autorip
 SupplementaryGroups=cdrom
 
 Environment=AUTORIP_DIR=/var/lib/autorip
-Environment=OUTPUT_DIR=/srv/media/output
-Environment=STAGING_DIR=/srv/media/staging
-# Optional:
-# Environment=MOVIE_DIR=/srv/media/Movies
-# Environment=TV_DIR=/srv/media/TV
-# Environment=TMDB_API_KEY=...
 Environment=PORT=8080
+# Output/staging/library paths and the TMDB key are config fields, set in the
+# web UI's Settings page — they are NOT read from the environment.
 
 ExecStart=/usr/local/bin/autorip
 Restart=on-failure
