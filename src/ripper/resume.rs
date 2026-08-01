@@ -1411,15 +1411,27 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // contributed loss the sweep §3 gate couldn't see. Over threshold →
     // quarantine to a RESUMABLE `.aborted-loss` (a keydb refresh + re-mux can
     // complete it). ISO output is exempt (whole-disc, gated by 100% elsewhere).
-    if demux_lost_secs > 0.0 && !super::output_is_iso_image(&output_format) {
+    {
         let effective_abort =
             super::effective_abort_secs(&output_format, cfg_read.abort_on_lost_secs);
-        let over = if effective_abort == 0 {
-            done_lost_video_secs > 0.0
-        } else {
-            done_lost_video_secs > effective_abort as f64
-        };
-        if over {
+        // Route through the SAME `mux_loss_aborts` the fresh-rip path
+        // (`rip_disc` in mod.rs) uses — its doc comment calls it out as "the
+        // SOLE enforcement point for mux-time loss" precisely because an
+        // earlier version of this decision was hand-rolled inline in four
+        // places and a mutation run flipped every one of them undetected.
+        // This resume path had its own fifth hand-rolled copy (`demux_lost_secs
+        // > 0.0 && !is_iso` guarding an inline `effective_abort == 0` branch)
+        // that duplicated `mux_loss_aborts` verbatim instead of calling it —
+        // exactly the pattern the doc comment warns about. `mux_outcome.completed`
+        // is already guaranteed true here (the `!mux_outcome.completed` branch
+        // above returned), matching the function's `completed` precondition.
+        if super::mux_loss_aborts(
+            true,
+            super::output_is_iso_image(&output_format),
+            done_lost_video_secs,
+            demux_lost_secs,
+            effective_abort,
+        ) {
             crate::log::device_log(
                 device,
                 &format!(
@@ -1734,6 +1746,44 @@ pub(crate) struct MuxHandoffOutcome {
     pub failure_retryable: bool,
 }
 
+/// Whether `resume_remux` finished this staging dir cleanly: it wrote
+/// `.completed`. Anything else (halt, `scan_image` failure, mux loop break)
+/// leaves `.completed` absent.
+///
+/// Probes via `snapshot_staging_disc` (3-retry, NFS-resilient) rather than a
+/// bare `Path::exists()`. On NFS with a cold attribute cache — the scenario
+/// `snapshot_staging_disc` exists to defend against — a bare `.exists()` can
+/// false-negative immediately after `write_completed_marker`, making
+/// `check_and_mux` record a spurious `MuxerError` (the success path's
+/// `clear_error` is skipped) that sticks on the System page even though the
+/// MKV was fully written. This mirrors `check_and_mux`'s completion guard.
+///
+/// Pulled out of `remux_from_ripped_marker` so it has exactly one
+/// implementation: this expression was previously duplicated verbatim inside
+/// a test (`completion_detection_tests`) that only proved the expression
+/// itself was correct, never that `remux_from_ripped_marker` actually used
+/// it — the exact "hand-rolled copy" trap.
+pub(crate) fn mux_handoff_success(staging_dir: &std::path::Path) -> bool {
+    crate::ripper::staging::snapshot_staging_disc(staging_dir)
+        .map(|s| s.completed)
+        .unwrap_or(false)
+}
+
+/// Build the initial `MuxHandoffOutcome` from the success signal. Pulled out
+/// of `remux_from_ripped_marker` as its own function so the `success` field
+/// assignment is directly unit-testable — a mutant that drops `success` from
+/// this struct literal (falling back to `Default`'s `false`) would leave a
+/// genuinely successful resumed mux reporting `success: false`, which never
+/// flips the origin device's tile off "ripping" (see `crate::muxer::
+/// check_and_mux`'s use of `outcome.success`) and can wedge the "already
+/// ripping" gate for that device indefinitely.
+fn build_mux_handoff_outcome(success: bool) -> MuxHandoffOutcome {
+    MuxHandoffOutcome {
+        success,
+        ..Default::default()
+    }
+}
+
 pub(crate) fn remux_from_ripped_marker(
     cfg: &Arc<RwLock<Config>>,
     staging_dir: &std::path::Path,
@@ -1774,22 +1824,8 @@ pub(crate) fn remux_from_ripped_marker(
     // Success signal: `resume_remux` wrote `.completed` to staging.
     // Anything else (halt, scan_image failure, mux loop break)
     // leaves `.completed` absent.
-    //
-    // Probe via `snapshot_staging_disc` (3-retry, NFS-resilient) rather
-    // than a bare `Path::exists()`. On NFS with a cold attribute cache —
-    // the scenario `snapshot_staging_disc` exists to defend against — a
-    // bare `.exists()` can false-negative immediately after
-    // `write_completed_marker`, making `check_and_mux` record a spurious
-    // `MuxerError` (the success path's `clear_error` is skipped) that
-    // sticks on the System page even though the MKV was fully written.
-    // This mirrors `check_and_mux`'s completion guard.
-    let success = crate::ripper::staging::snapshot_staging_disc(staging_dir)
-        .map(|s| s.completed)
-        .unwrap_or(false);
-    let mut outcome = MuxHandoffOutcome {
-        success,
-        ..Default::default()
-    };
+    let success = mux_handoff_success(staging_dir);
+    let mut outcome = build_mux_handoff_outcome(success);
     if success {
         // Hand-off consumed. Drop the marker so this dir doesn't get
         // re-queued on the next muxer tick. If the delete fails, surface
@@ -1998,37 +2034,46 @@ mod completion_detection_tests {
         p
     }
 
-    /// The exact success expression used by `remux_from_ripped_marker`. After
-    /// `write_completed_marker`, the snapshot must report `completed=true`, so
-    /// the success path runs `clear_error` and no spurious MuxerError sticks.
+    /// Calls the real `mux_handoff_success` helper (not a hand-rolled copy of
+    /// its expression) so this test actually proves what
+    /// `remux_from_ripped_marker` will observe. After `write_completed_marker`,
+    /// it must report `true`, so the success path runs `clear_error` and no
+    /// spurious MuxerError sticks.
     #[test]
     fn snapshot_reports_completed_after_marker_write() {
         let d = tmpdir();
         staging::write_completed_marker(&d);
-        let success = staging::snapshot_staging_disc(&d)
-            .map(|s| s.completed)
-            .unwrap_or(false);
         assert!(
-            success,
-            "snapshot_staging_disc must report completed after write_completed_marker"
+            super::mux_handoff_success(&d),
+            "mux_handoff_success must report true after write_completed_marker"
         );
     }
 
     /// And without the marker (halt / scan_image failure / mux loop break) it
-    /// must report `completed=false` so the failure path records the error.
+    /// must report `false` so the failure path records the error.
     #[test]
     fn snapshot_reports_not_completed_without_marker() {
         let d = tmpdir();
         // A partial dir with ISO/mapfile but no `.completed`.
         std::fs::write(d.join("Movie.iso"), b"x").unwrap();
         std::fs::write(d.join("Movie.iso.mapfile"), b"x").unwrap();
-        let success = staging::snapshot_staging_disc(&d)
-            .map(|s| s.completed)
-            .unwrap_or(false);
         assert!(
-            !success,
-            "snapshot_staging_disc must report not-completed without the marker"
+            !super::mux_handoff_success(&d),
+            "mux_handoff_success must report false without the .completed marker"
         );
+    }
+
+    /// `build_mux_handoff_outcome` is what `remux_from_ripped_marker` uses to
+    /// turn the success signal into the returned `MuxHandoffOutcome`. A
+    /// mutant that drops the `success` field from that struct literal (falling
+    /// back to `Default`'s `false`) would report a genuinely successful
+    /// resumed mux as failed — the origin device's tile never flips off
+    /// "ripping" (see `crate::muxer::check_and_mux`'s use of
+    /// `outcome.success`), wedging the "already ripping" gate for that device.
+    #[test]
+    fn build_mux_handoff_outcome_carries_success_both_ways() {
+        assert!(super::build_mux_handoff_outcome(true).success);
+        assert!(!super::build_mux_handoff_outcome(false).success);
     }
 }
 

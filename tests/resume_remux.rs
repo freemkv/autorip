@@ -331,3 +331,57 @@ fn classify_resume_rejects_heavy_damage_when_abort_on_lost_secs_positive() {
         "heavy whole-disc damage should be rejected as NotEligible when abort_on_lost_secs>0"
     );
 }
+
+/// Tight boundary check on the pre-filter's `lost_secs > abort_on_lost_secs`
+/// gate. The two tests above use damage an order of magnitude past the
+/// threshold, so a `/` → `%` mutant on `bad_bytes as f64 /
+/// FALLBACK_BITRATE_BYTES_PER_SEC` still lands on the reject side by
+/// accident (both a correct ~2.4x-over lost-secs value and a `%`-corrupted
+/// one exceed a 1-second threshold). Pin the exact arithmetic instead:
+/// `FALLBACK_BITRATE_BYTES_PER_SEC` is 8_250_000.0 bytes/sec, so at a
+/// 10-second threshold the boundary is exactly 82_500_000 bytes. One byte
+/// under must classify as Remux (deferred to the real per-title check);
+/// exactly at the threshold must ALSO defer (`>`, not `>=` — the code comment
+/// establishes the gate is strictly-greater); one byte over must reject.
+/// A `%` in place of `/` turns 82_500_001 % 8_250_000 == 1, which is nowhere
+/// near 10 and would wrongly classify as Remux; a `*` in place of `/` turns
+/// even 82_499_999 bytes into an astronomically large "lost_secs" and would
+/// wrongly reject. Either mutant flips one of the three assertions below.
+#[test]
+fn classify_resume_pre_filter_boundary_is_strictly_greater_than() {
+    const FALLBACK_BITRATE_BYTES_PER_SEC: u64 = 8_250_000;
+    let abort_on_lost_secs: u64 = 10;
+    let boundary_bytes = FALLBACK_BITRATE_BYTES_PER_SEC * abort_on_lost_secs; // 82_500_000
+    let total: u64 = boundary_bytes * 4;
+
+    let classify_at = |bad_bytes: u64| -> ResumeClass {
+        let td = tmpdir();
+        let dir = td.path().join("MyDisc");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_iso(&dir.join("MyDisc.iso"), total);
+        write_mapfile_with_unreadable(&dir.join("MyDisc.iso.mapfile"), total, bad_bytes);
+        let hint = make_hint(
+            dir,
+            ResumeAction::ResumePreserved {
+                attempt: 1,
+                has_iso: true,
+                has_mapfile: true,
+                has_mkv: false,
+            },
+        );
+        classify_resume(&hint, abort_on_lost_secs)
+    };
+
+    assert!(
+        matches!(classify_at(boundary_bytes - 1), ResumeClass::Remux { .. }),
+        "one byte under the threshold must defer to the per-title check, not reject"
+    );
+    assert!(
+        matches!(classify_at(boundary_bytes), ResumeClass::Remux { .. }),
+        "exactly at the threshold the gate is strictly-greater, so this must still defer"
+    );
+    assert!(
+        matches!(classify_at(boundary_bytes + 1), ResumeClass::NotEligible),
+        "one byte over the threshold must reject at the pre-filter"
+    );
+}
