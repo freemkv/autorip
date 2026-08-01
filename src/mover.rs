@@ -1341,6 +1341,14 @@ fn resolve_media_root(output_dir: &str, sub: &str) -> String {
 ///
 /// (The join is the "Mercy" fix — see `resolve_media_root`. Returns an
 /// owned String now that the root is computed, not a borrowed cfg field.)
+///
+/// The two `is_empty()` guards below are documentation, not behaviour: with an
+/// empty dir the arm would return `resolve_media_root(output_dir, "")`, and
+/// that helper returns `output_dir` verbatim — the same string as the
+/// fall-through. They exist to mirror `build_destination`, where the guards ARE
+/// load-bearing (an empty dir there must not fabricate a per-title / Season 1
+/// tree at the library root — see
+/// `destination_root_and_build_destination_agree_including_empty_dirs`).
 fn destination_root(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>) -> String {
     if let Some(result) = tmdb {
         match routing_media_type(result) {
@@ -1643,14 +1651,30 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 // Collision (which would wedge the move permanently). If the
                 // removal ITSELF fails, the stuck partial silently wedges the
                 // move — surface it so the operator can delete it by hand.
-                if let Err(rm) = std::fs::remove_file(&dest_str) {
-                    record_error(
-                        &dest_str,
-                        "partial copy could not be removed",
-                        &format!(
-                            "partial copy could not be removed from {dest_str}; delete manually to unblock ({rm})"
-                        ),
-                    );
+                //
+                // NotFound is NOT such a failure: `copy_counting` writes to a
+                // sibling `.part-<pid>` and only renames over the final name
+                // once the bytes are durable, so the overwhelmingly common
+                // failed-copy shape (ENOSPC, EACCES, a dropped mount) leaves
+                // NOTHING at `dest`. Recording an error there told the operator
+                // to hand-delete a file that does not exist, and — because that
+                // entry is keyed by the DESTINATION path, which no later tick
+                // ever clears (only the staging-dir key is cleared on a clean
+                // move) — the bogus row stuck on the System page until it was
+                // dismissed by hand. Only a real, still-present leftover is
+                // worth surfacing.
+                match std::fs::remove_file(&dest_str) {
+                    Ok(()) => {}
+                    Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(rm) => {
+                        record_error(
+                            &dest_str,
+                            "partial copy could not be removed",
+                            &format!(
+                                "partial copy could not be removed from {dest_str}; delete manually to unblock ({rm})"
+                            ),
+                        );
+                    }
                 }
                 crate::log::syslog(&format!("fs::copy failed for {}: {}", dest_str, e));
                 return MoveOutcome::Failed;
@@ -1757,6 +1781,35 @@ mod tests {
             overview: String::new(),
             media_type: "movie".into(),
         }
+    }
+
+    fn tmdb_tv(title: &str, year: u16) -> tmdb::TmdbResult {
+        tmdb::TmdbResult {
+            title: title.into(),
+            year,
+            poster_url: String::new(),
+            overview: String::new(),
+            media_type: "tv".into(),
+        }
+    }
+
+    /// `MOVE_ERRORS` is process-global. Tests that assert on its contents (or
+    /// that clear it wholesale) serialize on this so a parallel test thread
+    /// can't wipe or observe another's entries mid-assertion.
+    fn errors_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Read one `MOVE_ERRORS` entry and release the lock immediately, so a
+    /// failing assertion can't panic while holding it (which would poison the
+    /// map for every other test in the binary).
+    fn error_snapshot(path: &str) -> Option<MoverError> {
+        MOVE_ERRORS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+            .cloned()
     }
 
     #[test]
@@ -1969,6 +2022,84 @@ mod tests {
         let dest = build_destination(&cfg, &tmdb, "disc.mkv");
         // movie_dir empty → fall-through to output_dir + filename.
         assert_eq!(dest, "/out/disc.mkv");
+    }
+
+    /// Companion to `build_destination_empty_movie_dir_falls_to_output_dir`:
+    /// the TV arm's `!cfg.tv_dir.is_empty()` guard is load-bearing in exactly
+    /// the same way, and nothing pinned it. With an EMPTY `tv_dir` the arm must
+    /// not fire — the file falls through to the output root under its own
+    /// sanitized name. If the guard is dropped, `resolve_media_root` collapses
+    /// the "tv root" back to `output_dir` and the mover invents a
+    /// `Title/Season 1/` tree at the bare library root, while
+    /// `destination_root` (whose fall-through is unconditional here) keeps
+    /// validating plain `output_dir` — the two functions drift apart and the
+    /// pre-flight guards a directory the write does not use.
+    #[test]
+    fn build_destination_empty_tv_dir_falls_to_output_dir() {
+        let cfg = cfg_with_dirs("/out/Movies", "", "/out");
+        let tv = tmdb_tv("Severance", 2022);
+        let dest = build_destination(&cfg, &Some(tv.clone()), "sev_s01e01.mkv");
+        assert_eq!(
+            dest, "/out/sev_s01e01.mkv",
+            "an empty tv_dir must fall through to the output root, not \
+             fabricate a Season 1 tree there"
+        );
+        assert!(
+            !dest.contains("Season 1"),
+            "no season tree may be created when tv_dir is unset: {dest}"
+        );
+        assert_eq!(destination_root(&cfg, &Some(tv)), "/out");
+    }
+
+    /// The lock-step contract stated as a property over the whole
+    /// configured-dir matrix, including the empty-dir edges the older
+    /// `destination_root_matches_build_destination_root` test never covered:
+    /// whatever root the pre-flight validates, `build_destination` must write
+    /// UNDER it — and when the media dir for the routed type is empty, BOTH
+    /// functions must take the plain `output_dir` fall-through (dest is
+    /// exactly `output_dir/<leaf>`, with no per-title tree).
+    #[test]
+    fn destination_root_and_build_destination_agree_including_empty_dirs() {
+        for (movie_dir, tv_dir) in [
+            ("/mnt/movies", "/mnt/tv"),
+            ("movies", "tv"),
+            ("", "/mnt/tv"),
+            ("/mnt/movies", ""),
+            ("", ""),
+        ] {
+            for media_type in ["movie", "tv", ""] {
+                let cfg = cfg_with_dirs(movie_dir, tv_dir, "/mnt/out");
+                let mut r = tmdb_movie("Some Title", 2024);
+                r.media_type = media_type.to_string();
+                let root = destination_root(&cfg, &Some(r.clone()));
+                let dest = build_destination(&cfg, &Some(r), "Disc.mkv");
+                assert!(
+                    dest.starts_with(&format!("{root}/")),
+                    "dest {dest} must live under the validated root {root} \
+                     (movie_dir={movie_dir:?} tv_dir={tv_dir:?} media={media_type:?})"
+                );
+                // Which dir governs this routing decision — empty means the
+                // fall-through must be taken by BOTH functions.
+                let routing_dir = match media_type {
+                    "tv" => tv_dir,
+                    // "" coalesces to "movie" (routing_media_type).
+                    _ => movie_dir,
+                };
+                if routing_dir.is_empty() {
+                    assert_eq!(
+                        root, "/mnt/out",
+                        "an empty routing dir must validate the output root \
+                         (media={media_type:?})"
+                    );
+                    assert_eq!(
+                        dest, "/mnt/out/Disc.mkv",
+                        "an empty routing dir must write the bare leaf at the \
+                         output root — no per-title/season tree \
+                         (media={media_type:?})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2418,6 +2549,7 @@ mod tests {
         // Same path + same reason twice → second insert is a no-op
         // logger-wise (the syslog call is gated on reason change).
         // We assert state by checking the map snapshot.
+        let _g = errors_guard();
         let path = "/tmp/fakemover-dedup-test";
         record_error(path, "stuck", "do thing");
         record_error(path, "stuck", "do thing");
@@ -2579,6 +2711,7 @@ mod tests {
         std::fs::write(disc_dir.join(".done"), marker_json("Unlistable")).unwrap();
 
         let dir_str = disc_dir.to_string_lossy().to_string();
+        let _g = errors_guard();
         clear_error(&dir_str);
 
         // Owner execute-only (0o100): search bit lets read_to_string open
@@ -2930,6 +3063,7 @@ mod tests {
         let staged_mkv = disc_dir.join("Clash.mkv");
         std::fs::write(&staged_mkv, &new).unwrap();
 
+        let _g = errors_guard();
         check_and_move(&cfg);
 
         // Library file must be untouched (still the OLD content).
@@ -2955,6 +3089,241 @@ mod tests {
         }
         clear_error(&key);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The collision guard's stat classification: ONLY `NotFound` means "there
+    /// is no destination, the move is safe". Any other stat error (ESTALE, EIO,
+    /// EACCES, a dropped NFS mount) must defer the entry to a later tick.
+    ///
+    /// This is the worst outcome in the crate if it regresses: treating a
+    /// transient stat error as "no dest" skips the collision check entirely and
+    /// hands the path straight to `move_file`, whose own guards ALSO can't stat
+    /// the dest — so `rename(2)` (which needs no read access to the victim,
+    /// only write access to the directory) silently overwrites a good library
+    /// file with an unrelated disc's rip.
+    ///
+    /// Driven through the real `check_and_move`, not a helper: an unreadable
+    /// (mode 000) destination makes the dest stat fail with EACCES rather than
+    /// ENOENT, which is exactly the shape a degraded mount produces.
+    #[cfg(unix)]
+    #[test]
+    fn check_and_move_defers_on_non_notfound_dest_stat_error_and_never_clobbers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("deststat");
+        let staging = dir.join("staging");
+        let movie_dir = dir.join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
+
+        // A good, DIFFERENT library file already at the destination path.
+        let dest_dir = movie_dir.join("Vault (2024)");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest_file = dest_dir.join("Vault (2024).mkv");
+        let mut old = vec![0x1A, 0x45, 0xDF, 0xA3];
+        old.extend_from_slice(&[0x77u8; 8192]);
+        std::fs::write(&dest_file, &old).unwrap();
+        std::fs::set_permissions(&dest_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root (some CI sandboxes) reads through mode 000, so the stat would
+        // succeed and this scenario can't be produced. Skip rather than assert
+        // something the environment isn't exercising.
+        if std::fs::File::open(&dest_file).is_ok() {
+            std::fs::set_permissions(&dest_file, std::fs::Permissions::from_mode(0o644)).ok();
+            std::fs::remove_dir_all(&dir).ok();
+            eprintln!(
+                "SKIP check_and_move_defers_on_non_notfound_dest_stat_error: running with \
+                 read-through privileges, cannot make the dest stat fail with EACCES"
+            );
+            return;
+        }
+
+        // The new rip in staging, routed to that same destination path.
+        let disc_dir = staging.join("Vault");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Vault")).unwrap();
+        let mut new = vec![0x1A, 0x45, 0xDF, 0xA3];
+        new.extend_from_slice(&[0x88u8; 4096]);
+        let staged_mkv = disc_dir.join("Vault.mkv");
+        std::fs::write(&staged_mkv, &new).unwrap();
+
+        let key = disc_dir.to_string_lossy().to_string();
+        let _g = errors_guard();
+        clear_error(&key);
+        check_and_move(&cfg);
+        std::fs::set_permissions(&dest_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            std::fs::read(&dest_file).unwrap(),
+            old,
+            "an unstattable destination must NEVER be overwritten — a transient \
+             stat error is not proof the path is free"
+        );
+        assert!(
+            staged_mkv.exists() && disc_dir.exists(),
+            "the new rip must stay in staging so a later tick can retry"
+        );
+        let recorded = error_snapshot(&key);
+        clear_error(&key);
+        assert!(
+            recorded.is_some(),
+            "the deferred move must be surfaced to the operator"
+        );
+        drop(_g);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same-size content probe must compare a window large enough to be
+    /// meaningful. Two different discs' muxes that happen to share a byte
+    /// length AND their first/last kilobyte are not a realistic pair, but two
+    /// that share their first/last 64 KiB are not realistic either — the whole
+    /// point of the constant. Shrink the window and the probe starts calling
+    /// distinct files identical, which routes a genuine collision down the
+    /// IDEMPOTENT path: `move_file` returns `Skipped`, `remove_dir_all` then
+    /// deletes the new rip, and the library keeps the wrong file. Both discs'
+    /// data is now one disc's data.
+    ///
+    /// Here the two files differ only at byte 2000 — inside the real 64 KiB
+    /// window, outside anything much smaller.
+    #[test]
+    fn check_and_move_collision_probe_window_is_large_enough_to_see_a_2kb_diff() {
+        let dir = scratch_dir("windowprobe");
+        let staging = dir.join("staging");
+        let movie_dir = dir.join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
+
+        let mut old = vec![0x1A, 0x45, 0xDF, 0xA3];
+        old.extend_from_slice(&[0x5Au8; 256 * 1024]);
+        let mut new = old.clone();
+        new[2000] ^= 0xFF; // sole difference, ~2 KiB in
+
+        let dest_dir = movie_dir.join("Twin (2024)");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest_file = dest_dir.join("Twin (2024).mkv");
+        std::fs::write(&dest_file, &old).unwrap();
+
+        let disc_dir = staging.join("Twin");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Twin")).unwrap();
+        let staged_mkv = disc_dir.join("Twin.mkv");
+        std::fs::write(&staged_mkv, &new).unwrap();
+
+        let key = disc_dir.to_string_lossy().to_string();
+        let _g = errors_guard();
+        clear_error(&key);
+        check_and_move(&cfg);
+
+        assert_eq!(
+            std::fs::read(&dest_file).unwrap(),
+            old,
+            "the existing library file must survive untouched"
+        );
+        assert!(
+            staged_mkv.exists() && disc_dir.exists(),
+            "a same-size DIFFERENT file must be a collision — the new rip must \
+             not be swept up as an idempotent re-move"
+        );
+        let recorded = error_snapshot(&key);
+        clear_error(&key);
+        assert!(recorded.is_some(), "collision must be recorded");
+        drop(_g);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed copy that left NOTHING at the destination must not raise a
+    /// "partial copy could not be removed" error. `copy_counting` only ever
+    /// publishes the final name via `rename(2)`, so "no file at dest" is the
+    /// normal shape of a failed copy — and that error row is keyed by the
+    /// DESTINATION path, which no later tick clears, so a bogus one sticks on
+    /// the System page until the operator dismisses it by hand.
+    #[cfg(unix)]
+    #[test]
+    fn move_file_copy_failure_with_no_dest_records_no_partial_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("nopartial");
+        let src_dir = dir.join("staging");
+        let dest_dir = dir.join("library");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let src = src_dir.join("a.mkv");
+        let dest = dest_dir.join("a.mkv");
+        write_minimal_mkv(&src, b"source bytes that cannot be read");
+
+        // src unreadable → the copy fails at `File::open(src)`, before any temp
+        // exists. src's DIRECTORY unwritable → `rename(2)` fails first (it must
+        // unlink the source name), so we reach the copy branch at all.
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let readable_anyway = std::fs::File::open(&src).is_ok();
+        let outcome = if readable_anyway {
+            MoveOutcome::Failed // placeholder; skipped below
+        } else {
+            let _g = errors_guard();
+            let dest_key = dest.to_string_lossy().to_string();
+            clear_error(&dest_key);
+            let o = move_file(&src, &dest, &noop_progress);
+            let recorded = error_snapshot(&dest_key);
+            clear_error(&dest_key);
+            assert!(
+                recorded.is_none(),
+                "a failed copy that created no destination must not claim a \
+                 partial copy needs hand-deleting, got: {recorded:?}"
+            );
+            assert!(!dest.exists(), "no destination may be left behind");
+            o
+        };
+
+        std::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if readable_anyway {
+            eprintln!(
+                "SKIP move_file_copy_failure_with_no_dest_records_no_partial_error: \
+                 running with read-through privileges"
+            );
+        } else {
+            assert_eq!(outcome, MoveOutcome::Failed, "a failed copy is Failed");
+            assert!(src.exists(), "the source must survive a failed move");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The System-tab "✕" and "Clear all" actually remove entries. Nothing
+    /// touched `MOVE_ERRORS` lifecycle before this, so both handlers could
+    /// become no-ops and every test still passed — the operator would dismiss
+    /// a resolved error and watch it sit there forever.
+    #[test]
+    fn clear_move_error_and_clear_all_remove_entries() {
+        let _g = errors_guard();
+        let a = "/staging/clear-one";
+        let b = "/staging/clear-two";
+        record_error(a, "stuck a", "hint");
+        record_error(b, "stuck b", "hint");
+        assert!(
+            error_snapshot(a).is_some() && error_snapshot(b).is_some(),
+            "both recorded"
+        );
+
+        clear_move_error(a);
+        assert!(
+            error_snapshot(a).is_none(),
+            "the dismissed error must be removed"
+        );
+        assert!(
+            error_snapshot(b).is_some(),
+            "clearing one error must not clear the others"
+        );
+
+        clear_all_move_errors();
+        let left = MOVE_ERRORS
+            .lock()
+            .map(|m| m.len())
+            .unwrap_or_else(|e| e.into_inner().len());
+        assert_eq!(left, 0, "Clear all must empty the map");
     }
 
     #[test]
@@ -3316,6 +3685,19 @@ mod tests {
         std::fs::write(&c, &mid).unwrap();
         assert!(same_head_and_tail(&a, &b), "identical files match");
         assert!(same_head_and_tail(&a, &c), "interior-only diff matches");
+
+        // e: same length, differs ~2 KiB in — INSIDE the 64 KiB head window, so
+        // the probe must see it. This is the size the window is actually load-
+        // bearing at: a much smaller window would call these two identical and
+        // wave a real collision through as an idempotent re-move.
+        let e = dir.join("e.bin");
+        let mut neardiff = base.clone();
+        neardiff[2000] ^= 0xFF;
+        std::fs::write(&e, &neardiff).unwrap();
+        assert!(
+            !same_head_and_tail(&a, &e),
+            "a difference 2 KiB in must fall inside the head window"
+        );
 
         // d: differs at the head → not identical.
         let d = dir.join("d.bin");
