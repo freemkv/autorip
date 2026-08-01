@@ -61,10 +61,17 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
 /// gate construction.
 fn validate_keyserver_url(raw: &str) -> Result<(), String> {
     let url = raw.trim();
+    // Log/error-message identifier for `url`: origin only, never the raw
+    // string. `keyserver_url` can carry a bearer token in its path or query
+    // (like a webhook URL), and `build_sources` logs this function's Err at
+    // ERROR level into autorip.jsonl, which unauthenticated GET /api/debug
+    // serves verbatim — so the two error arms below that used to interpolate
+    // `{url}` directly would leak that token to any LAN caller.
+    let safe_ref = crate::webhook::webhook_url_origin(url);
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
-        .ok_or_else(|| format!("keyserver URL must be http(s): {url}"))?;
+        .ok_or_else(|| format!("keyserver URL must be http(s): {safe_ref}"))?;
 
     // host[:port] is everything before the first '/', '?' or '#'.
     let authority = rest
@@ -75,7 +82,7 @@ fn validate_keyserver_url(raw: &str) -> Result<(), String> {
         .next()
         .unwrap_or("");
     if authority.is_empty() {
-        return Err(format!("keyserver URL has no host: {url}"));
+        return Err(format!("keyserver URL has no host: {safe_ref}"));
     }
 
     // Split host / port, handling bracketed IPv6 literals ([::1]:443).
@@ -675,6 +682,35 @@ mod tests {
         assert!(validate_keyserver_url("https://1.1.1.1:443").is_ok());
     }
 
+    /// The two rejection arms that fire BEFORE a host is extracted (missing
+    /// scheme, empty host) must never echo the raw input back — `keyserver_url`
+    /// can carry a bearer token in its path/query, and `build_sources` logs
+    /// this `Err` at ERROR level into autorip.jsonl, which unauthenticated
+    /// `GET /api/debug` serves verbatim to any LAN host.
+    #[test]
+    fn validate_keyserver_url_error_never_echoes_raw_token() {
+        let scheme_missing =
+            validate_keyserver_url("keys.example.org/decode?token=SUPERSECRET").unwrap_err();
+        assert!(
+            !scheme_missing.contains("SUPERSECRET"),
+            "scheme-missing error leaked the token: {scheme_missing}"
+        );
+        assert!(
+            !scheme_missing.contains("token="),
+            "scheme-missing error leaked the query string: {scheme_missing}"
+        );
+
+        let no_host = validate_keyserver_url("https:///decode?token=SUPERSECRET").unwrap_err();
+        assert!(
+            !no_host.contains("SUPERSECRET"),
+            "no-host error leaked the token: {no_host}"
+        );
+        assert!(
+            !no_host.contains("token="),
+            "no-host error leaked the query string: {no_host}"
+        );
+    }
+
     #[test]
     fn ssrf_classifier_ranges() {
         use std::net::{Ipv4Addr, Ipv6Addr};
@@ -748,6 +784,60 @@ mod tests {
         ));
     }
 
+    /// IPv6 Unique-Local-Address range (`fc00::/7`) — IPv6's rough equivalent
+    /// of RFC1918 — has no dedicated test elsewhere in this file, unlike every
+    /// other branch of `is_blocked_ip` (loopback, RFC1918, link-local, CGNAT,
+    /// Class-E, multicast are all covered above). A keyserver_url pointed at
+    /// a bare ULA literal must still be rejected.
+    #[test]
+    fn ssrf_classifier_ipv6_unique_local_address() {
+        use std::net::Ipv6Addr;
+        assert!(is_blocked_ip("fc00::1".parse::<Ipv6Addr>().unwrap().into()));
+        // fd00::/8 is the "locally assigned" half of fc00::/7.
+        assert!(is_blocked_ip(
+            "fd12:3456::1".parse::<Ipv6Addr>().unwrap().into()
+        ));
+        // Sanity: a real global-unicast address just outside the range.
+        assert!(!is_blocked_ip(
+            "2001:4860:4860::8888".parse::<Ipv6Addr>().unwrap().into()
+        ));
+    }
+
+    /// TEST-NET ranges (RFC 5737: 192.0.2.0/24, 198.51.100.0/24,
+    /// 203.0.113.0/24) are `Ipv4Addr::is_documentation()` — a defense-in-depth
+    /// layer with no dedicated test. These ranges aren't routable to anything
+    /// sensitive, but the guard should still actually block them.
+    #[test]
+    fn ssrf_classifier_test_net_documentation_ranges() {
+        use std::net::Ipv4Addr;
+        assert!(is_blocked_ip(Ipv4Addr::new(192, 0, 2, 1).into()));
+        assert!(is_blocked_ip(Ipv4Addr::new(198, 51, 100, 1).into()));
+        assert!(is_blocked_ip(Ipv4Addr::new(203, 0, 113, 1).into()));
+    }
+
+    /// CGNAT (100.64.0.0/10) is `octets[0] == 100 && (octets[1] & 0xc0) ==
+    /// 0x40` — an AND of two conditions on DIFFERENT octets. A public address
+    /// whose second octet merely falls in the 64-127 range (top two bits
+    /// `01`) but whose first octet ISN'T 100 must NOT be blocked by this
+    /// term: the existing test IPs (8.8.8.8, 1.1.1.1) both have a second
+    /// octet outside 64-127, so they can't catch a regression that widened
+    /// this to an OR.
+    #[test]
+    fn ssrf_classifier_cgnat_does_not_overreach_public_space() {
+        use std::net::Ipv4Addr;
+        // Public IP with second-octet in the CGNAT-shaped bit pattern
+        // (64..127) but a first octet that is NOT 100 — must be allowed.
+        assert!(!is_blocked_ip(Ipv4Addr::new(93, 64, 0, 1).into()));
+        assert!(!is_blocked_ip(Ipv4Addr::new(8, 100, 0, 1).into()));
+        // Real CGNAT must still be blocked.
+        assert!(is_blocked_ip(Ipv4Addr::new(100, 64, 0, 1).into()));
+        assert!(is_blocked_ip(Ipv4Addr::new(100, 127, 255, 255).into()));
+        // Just outside the CGNAT /10 (100.128.0.0) must NOT be blocked by
+        // this term (first octet matches but second-octet bit pattern
+        // doesn't).
+        assert!(!is_blocked_ip(Ipv4Addr::new(100, 128, 0, 1).into()));
+    }
+
     /// Cross-side agreement: autorip's sample selector (`read_encrypted_units`)
     /// hands the key service only units the service's own gate accepts —
     /// because both sides call the SAME predicate,
@@ -801,6 +891,80 @@ mod tests {
             &clear,
             libfreemkv::disc::ContentFormat::BdTs
         ));
+    }
+
+    /// The test above drives the free function `read_encrypted_units`
+    /// directly, never the actual `IsoAccess::sample_units` trait impl that
+    /// `resolve_keys` calls in production (which opens the file via
+    /// `libfreemkv::FileSectorSource::open` and handles the Err path itself).
+    /// Route the same scrambled-ISO fixture through the REAL trait impl so a
+    /// regression there (e.g. `IsoAccess::sample_units` silently stops
+    /// sampling real disc content) is actually caught — a bug that would
+    /// otherwise let the online key service validate against fake ciphertext
+    /// and every ISO/resume key resolution spuriously report `NoKey`.
+    #[test]
+    fn iso_access_sample_units_reads_through_the_real_trait_impl() {
+        use std::io::Write;
+
+        const SECTORS: usize = 1200;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&vec![0xE5u8; SECTORS * 2048]).unwrap();
+        tmp.flush().unwrap();
+
+        let title = libfreemkv::DiscTitle {
+            playlist: "00800.mpls".into(),
+            playlist_id: 800,
+            duration_secs: 0.0,
+            size_bytes: (SECTORS * 2048) as u64,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: vec![libfreemkv::Extent {
+                start_lba: 0,
+                sector_count: SECTORS as u32,
+            }],
+            content_format: libfreemkv::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        };
+
+        // Through the trait object, exactly as `resolve_keys` calls it.
+        let mut access: Box<dyn DiscKeyAccess> = Box::new(IsoAccess::new(tmp.path()));
+        let units = access.sample_units(&title, SAMPLE_UNITS);
+        assert_eq!(
+            units.len(),
+            SAMPLE_UNITS,
+            "IsoAccess::sample_units must actually sample real ISO content"
+        );
+        for u in &units {
+            assert_eq!(u.len(), 6144);
+        }
+    }
+
+    /// `IsoAccess::sample_units` against a path that isn't a valid ISO (the
+    /// `FileSectorSource::open` Err branch) must fail SAFE — an empty sample
+    /// list, not a panic — since a bad/missing staged ISO must not crash key
+    /// resolution.
+    #[test]
+    fn iso_access_sample_units_empty_on_open_failure() {
+        let title = libfreemkv::DiscTitle {
+            playlist: "00800.mpls".into(),
+            playlist_id: 800,
+            duration_secs: 0.0,
+            size_bytes: 0,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: Vec::new(),
+            content_format: libfreemkv::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        };
+        let missing = Path::new("/nonexistent-autorip-iso-fixture-xyz.iso");
+        let mut access = IsoAccess::new(missing);
+        let units = access.sample_units(&title, SAMPLE_UNITS);
+        assert!(
+            units.is_empty(),
+            "a missing ISO must yield no samples, not panic"
+        );
     }
 
     /// autorip's keydb *writes* and the startup *existence check* must land on
@@ -944,6 +1108,56 @@ mod tests {
         let written = std::fs::read_to_string(&dest).unwrap();
         assert!(written.contains("0xBBBB"), "newest keydb content must win");
         assert!(!written.contains("0xAAAA"), "old content fully replaced");
+    }
+
+    /// `drive_scan_opts_for_keydb` must wire `DriveCredentials` when the
+    /// keydb carries at least one host cert, so the AACS host-cert handshake
+    /// actually gets the credentials it needs. No existing test drives this
+    /// function with a real keydb fixture (the `save_keydb`/`keydb_path`
+    /// tests never call it).
+    #[test]
+    fn drive_scan_opts_for_keydb_wires_credentials_when_host_certs_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keydb.cfg");
+        // A single AACS 1.0 host-cert row: 20-byte priv key + 92-byte cert,
+        // all-zero placeholders (never a real key) — same shape
+        // freemkv-keysources' own `test_parse_host_cert` uses.
+        let line = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{} ; Revoked\n",
+            "00".repeat(20),
+            "00".repeat(92)
+        );
+        std::fs::write(&path, line).unwrap();
+
+        let opts = drive_scan_opts_for_keydb(&path);
+        let credentials = opts
+            .credentials
+            .expect("a keydb with a host cert must produce Some(DriveCredentials)");
+        assert!(
+            !credentials.host_certs.is_empty(),
+            "the wired credentials must actually carry the cert"
+        );
+    }
+
+    /// A keydb with NO host certs (or no keydb at all) must yield `None` —
+    /// not `Some` wrapping an empty cert list, which would look "present"
+    /// to a caller checking `.is_some()` while carrying nothing usable.
+    #[test]
+    fn drive_scan_opts_for_keydb_no_credentials_without_host_certs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A keydb with disc entries but no `| HC |` row.
+        let path = tmp.path().join("keydb.cfg");
+        std::fs::write(&path, b"0xDEADBEEFDEADBEEFDEADBEEFDEADBEEF = Test\n").unwrap();
+        let opts = drive_scan_opts_for_keydb(&path);
+        assert!(
+            opts.credentials.is_none(),
+            "no host certs must mean no DriveCredentials at all"
+        );
+
+        // No keydb file at all — same expectation.
+        let missing = tmp.path().join("does-not-exist.cfg");
+        let opts2 = drive_scan_opts_for_keydb(&missing);
+        assert!(opts2.credentials.is_none());
     }
 
     // --- KeyOutcome reporting via resolve_keys (rc.6 WS3) --------------------
@@ -1187,5 +1401,33 @@ mod tests {
         assert!(ServiceReachability::Down.is_transient());
         assert!(ServiceReachability::RateLimited.is_transient());
         assert!(!ServiceReachability::Up.is_transient());
+    }
+
+    // --- build_iso_key_fetch (rc.6 WS3 multi-CPS-unit recovery) --------------
+
+    /// `build_iso_key_fetch` reads the ISO's AACS inputs via
+    /// `libfreemkv::Disc::read_aacs_inputs`, which requires a real UDF
+    /// filesystem structure (/AACS/Unit_Key_RO.inf etc) — building that from
+    /// scratch here would duplicate libfreemkv's own extensive UDF fixture
+    /// tests. The one cheap, real thing to pin from autorip's side is the
+    /// fail-safe path: a path that isn't a readable ISO at all (not just
+    /// "no AACS data") must return `None`, not panic or propagate an error
+    /// past the `Option`-returning signature the mux code depends on.
+    #[test]
+    fn build_iso_key_fetch_none_for_unreadable_path() {
+        let cfg = Config::default();
+        let missing = Path::new("/nonexistent-autorip-iso-fixture-xyz.iso");
+        assert!(build_iso_key_fetch(&cfg, missing).is_none());
+    }
+
+    /// Same fail-safe expectation for a file that exists but is not a valid
+    /// ISO/UDF image (e.g. a truncated or non-disc file) — `read_aacs_inputs`
+    /// must fail cleanly and `build_iso_key_fetch` must surface `None`.
+    #[test]
+    fn build_iso_key_fetch_none_for_non_iso_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"not a disc image").unwrap();
+        let cfg = Config::default();
+        assert!(build_iso_key_fetch(&cfg, tmp.path()).is_none());
     }
 }
