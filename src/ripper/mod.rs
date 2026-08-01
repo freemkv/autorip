@@ -1645,6 +1645,38 @@ fn resumable_dir_blocked(snap: &staging::StagingSnapshot) -> bool {
     snap.has_ripped || snap.has_muxing || snap.has_review || snap.has_failed
 }
 
+/// The end-of-recovery loss figure in milliseconds, and whether it is
+/// trustworthy.
+///
+/// Pure and separate from the rip loop deliberately. This decision lived inline
+/// inside a function that needs a drive, a mapfile and live config, so no test
+/// could reach it — which is how it shipped stepping over a failed promotion.
+/// A test of `loss_aborts` alone does NOT guard it: the bug was never in the
+/// gate, it was that the caller handed the gate a number it should not have
+/// trusted.
+///
+/// `promotion_intact == false` means the damage record is incomplete, so no
+/// figure derived from it can be believed and the answer is NaN — which
+/// `loss_aborts` treats as abort under every threshold, including the operator's
+/// accept-loss override. Mirrors `freemkv_engine`'s own end-of-recovery gate.
+pub(crate) fn end_of_recovery_lost_ms(
+    promotion_intact: bool,
+    title_bytes_per_sec: f64,
+    lost_bytes: u64,
+) -> f64 {
+    if !promotion_intact {
+        return f64::NAN;
+    }
+    if title_bytes_per_sec > 0.0 && title_bytes_per_sec.is_finite() {
+        lost_bytes as f64 / title_bytes_per_sec * 1000.0
+    } else if lost_bytes == 0 {
+        0.0
+    } else {
+        // Real loss, no bitrate to convert it with.
+        f64::NAN
+    }
+}
+
 /// Look at the staging dirs for a Remux-eligible entry whose
 /// dir basename matches (exact, prefix-either-way) the sanitized
 /// display_name of the currently-scanned disc. Returns the
@@ -3870,9 +3902,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 let nontrimmed_ranges = map.ranges_with(promote_from);
                 let total_promoted: u64 = nontrimmed_ranges.iter().map(|(_, sz)| *sz).sum();
                 let n_ranges = nontrimmed_ranges.len();
+                // Promotion is what MAKES the loss visible: the abort gate below
+                // reads Unreadable ranges only, so a range that fails to promote
+                // is loss the gate cannot see. Logging and carrying on turns a
+                // write error into a rip delivered as good — the comment above
+                // says exactly this, and the code did it anyway.
+                let mut promotion_intact = true;
                 for (pos, size) in nontrimmed_ranges {
                     if let Err(e) = map.record(pos, size, promote_to) {
-                        tracing::warn!(
+                        promotion_intact = false;
+                        tracing::error!(
                             device = %device,
                             error = %e,
                             "end_of_recovery_promote: failed to mark range Unreadable"
@@ -3890,7 +3929,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // Surface flush errors as warnings rather than silently
                 // dropping them.
                 if let Err(e) = map.flush() {
-                    tracing::warn!(
+                    // Downstream (mux, resume) re-reads the mapfile from DISK,
+                    // so an unflushed promotion means they see the pre-promotion
+                    // state and report the delivered rip as undamaged.
+                    promotion_intact = false;
+                    tracing::error!(
                         device = %device,
                         error = %e,
                         "end_of_recovery_promote: failed to flush promoted mapfile"
@@ -3942,15 +3985,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         // mapfile-unreadable fail-safe below. Reporting 0.0
                         // instead would let a configured seconds tolerance
                         // silently accept loss it could not measure.
-                        main_lost_ms_for_history = if title_bytes_per_sec > 0.0 {
-                            abort_lost_ms(
-                                output_is_iso_image(&cfg_read.output_format),
-                                &title_for_progress,
-                                &bad_ranges,
+                        main_lost_ms_for_history = {
+                            if !promotion_intact {
+                                tracing::error!(
+                                    device = %device,
+                                    "end_of_recovery_promote: damage record is \
+                                     incomplete — treating loss as unquantifiable"
+                                );
+                            }
+                            end_of_recovery_lost_ms(
+                                promotion_intact,
                                 title_bytes_per_sec,
+                                main_lost_bytes_for_history,
                             )
-                        } else {
-                            f64::NAN
                         };
                         // Mirror into the outer binding so the final done/stopped
                         // state update (after run_mux) can use the same in-title
@@ -6366,8 +6413,57 @@ fn log_init_recovery_failure(device: &str, e: &libfreemkv::Error) {
 
 #[cfg(test)]
 mod tests {
+
     //! Tests for orchestrator-level helpers that live in this file.
     //! State-only helpers and their tests live in `state.rs`.
+
+    /// An incomplete damage record must abort, not deliver.
+    ///
+    /// The end-of-recovery promotion (NonTrimmed/NonScraped -> Unreadable) is
+    /// what MAKES residual loss visible: the abort gate reads Unreadable ranges
+    /// only. A failed `record()` leaves those bytes invisible to the gate, and
+    /// a failed `flush()` leaves them invisible to the mux and resume paths,
+    /// which re-read the mapfile from disk. Both were logged and stepped over,
+    /// so a damaged rip shipped as clean — the code's own comment said "a state
+    /// left unpromoted is loss the gate cannot see" and then did exactly that.
+    ///
+    /// An earlier version of this test asserted `loss_aborts(.., NaN, ..)` and
+    /// PASSED with the fix reverted, because the bug was never in the gate — it
+    /// was that the caller handed the gate a number it should not have trusted.
+    /// So this calls the caller's own decision function.
+    #[test]
+    fn an_incomplete_damage_record_aborts_regardless_of_tolerance() {
+        let bitrate = 8_250_000.0_f64;
+        let lost = 40 * 1024 * 1024u64; // 40 MB still bad
+
+        // Intact promotion, measurable loss -> a real figure the gate can judge.
+        let ok = super::end_of_recovery_lost_ms(true, bitrate, lost);
+        assert!(
+            ok.is_finite() && ok > 0.0,
+            "expected a real figure, got {ok}"
+        );
+        assert!(
+            !freemkv_engine::loss_aborts(lost, ok, 3600),
+            "measured loss well under an hour's tolerance should proceed"
+        );
+
+        // Promotion failed -> unquantifiable, whatever the bitrate says.
+        let broken = super::end_of_recovery_lost_ms(false, bitrate, lost);
+        assert!(broken.is_nan(), "expected NaN, got {broken}");
+        assert!(
+            freemkv_engine::loss_aborts(lost, broken, 3600),
+            "an incomplete damage record must abort even at a 1h tolerance"
+        );
+        assert!(
+            freemkv_engine::loss_aborts(0, broken, u64::MAX),
+            "and even at the accept-loss override"
+        );
+
+        // No bitrate but real loss is also unquantifiable...
+        assert!(super::end_of_recovery_lost_ms(true, 0.0, lost).is_nan());
+        // ...while genuinely no loss stays zero, so a clean rip never aborts.
+        assert_eq!(super::end_of_recovery_lost_ms(true, 0.0, 0), 0.0);
+    }
 
     use super::{
         FmtsGate, FmtsGatePlan, HaltGuard, PatchDecision, SweepReadAction, SweepingGuard,
