@@ -1390,6 +1390,37 @@ mod tests {
         );
     }
 
+    /// `clear_inprogress_markers` is the graceful-shutdown belt-and-suspenders:
+    /// it strips every `.sweeping`/`.muxing` marker under the staging root so a
+    /// clean SIGTERM doesn't get misread by the next startup's resume
+    /// classifier as a crash. A no-op here (the exact shape of the
+    /// `replace clear_inprogress_markers with ()` mutant) leaves both markers
+    /// in place, and the next startup would restart-count a perfectly healthy
+    /// stop toward a false `.failed`.
+    #[test]
+    fn clear_inprogress_markers_strips_sweeping_and_muxing_under_root() {
+        let root = tmpdir();
+        let disc_a = root.join("DiscA");
+        let disc_b = root.join("DiscB");
+        fs::create_dir_all(&disc_a).unwrap();
+        fs::create_dir_all(&disc_b).unwrap();
+        write_sweeping_marker(&disc_a);
+        write_muxing_marker(&disc_b);
+        assert!(disc_a.join(SWEEPING_MARKER).exists());
+        assert!(disc_b.join(MUXING_MARKER).exists());
+
+        clear_inprogress_markers(&root);
+
+        assert!(
+            !disc_a.join(SWEEPING_MARKER).exists(),
+            ".sweeping must be cleared on graceful shutdown"
+        );
+        assert!(
+            !disc_b.join(MUXING_MARKER).exists(),
+            ".muxing must be cleared on graceful shutdown"
+        );
+    }
+
     #[test]
     fn resume_marks_failed_after_limit() {
         // Build a fake staging tree: <root>/<disc>/foo.iso plus
