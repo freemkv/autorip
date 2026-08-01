@@ -257,6 +257,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// `list_held`'s OR-guard has no dedicated test for a dir with NEITHER
+    /// `.review` NOR `.done` — e.g. a perfectly normal, still-actively
+    /// ripping/muxing staging dir. `lists_only_held_and_resolves`'s "not
+    /// held" fixture happens to have `.done` present, which makes two of
+    /// the three OR terms simultaneously true — so mutating the guard's
+    /// first `||` to `&&` (`!dir.is_dir() && !review.exists()`, merged with
+    /// `|| done.exists()`) still excludes that fixture by coincidence (both
+    /// merged terms are true anyway). A dir with no markers at all is the
+    /// one input that distinguishes a real OR from that mutation: it must
+    /// still be excluded from the held list.
+    #[test]
+    fn list_held_excludes_dir_with_neither_review_nor_done() {
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-nomark-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // A dir mid-rip: has a `.ripped` progress marker, but neither
+        // `.review` (not yet held for review) nor `.done` (not finished).
+        let in_progress = tmp.join("Still Ripping");
+        std::fs::create_dir_all(&in_progress).unwrap();
+        touch(&in_progress.join(".ripped"), "{}");
+
+        let held_list = list_held(tmp.to_str().unwrap());
+        assert!(
+            held_list.is_empty(),
+            "a dir with no .review and no .done must never appear in the held list, got {held_list:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn traversal_guard_rejects_escapes_accepts_dotted_titles() {
         // Component-based guard: reject anything that isn't a single
@@ -277,6 +310,69 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "not a held rip", "dotted title must clear the guard");
+    }
+
+    /// The test above uses a NONEXISTENT `staging_root`, so for every "bad"
+    /// input it can't tell "the traversal guard rejected this" from "the
+    /// directory happened not to exist" — `Path::new(staging_root).join(bad)`
+    /// also fails `!d.is_dir()` independently, producing the SAME `Err(_)`
+    /// either way. Confirmed by hand: mutating the guard's first `||` to
+    /// `&&` (so `dir.is_empty() && count() != 1`, leaving only the
+    /// non-Normal-component check to actually reject anything) still passes
+    /// `traversal_guard_rejects_escapes_accepts_dotted_titles` for EVERY
+    /// entry, including `"a/b"` — because `Path::new("a/b").components()` are
+    /// both `Normal`, so the surviving third clause doesn't catch it either,
+    /// yet the downstream `!d.is_dir()` check does (there is no real
+    /// `/nonexistent-staging-root/a/b` directory) and produces an
+    /// indistinguishable `Err`.
+    ///
+    /// This test closes that gap: `staging_root` REALLY EXISTS, and a
+    /// `.review` marker is planted in its PARENT — the exact directory `".."`
+    /// and `"a/b"`-shaped escapes would land on if the guard were bypassed.
+    /// If the guard doesn't fire, `resolve` would find a real, `.review`-
+    /// bearing directory at that escaped path and proceed to act on it
+    /// (writing `.done` into the PARENT of the staging root) instead of
+    /// erroring — so asserting the SPECIFIC `"invalid dir"` message, and that
+    /// the parent is untouched, actually proves the guard — not a downstream
+    /// coincidence — produced the rejection.
+    #[test]
+    fn traversal_guard_rejects_escapes_against_a_real_existing_parent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-traversal-real-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let staging_root = tmp.join("staging");
+        std::fs::create_dir_all(&staging_root).unwrap();
+        // A `.review` marker in the PARENT of staging_root, not inside it —
+        // exactly what an escaped ".." would land on if the guard failed.
+        touch(
+            &tmp.join(".review"),
+            r#"{"title":"Parent Escape","year":0}"#,
+        );
+
+        for bad in ["..", ".", "../etc", "a/b", "/abs", "./x"] {
+            let err = resolve(staging_root.to_str().unwrap(), bad, Resolve::Proceed)
+                .expect_err(&format!("should reject {bad:?}"));
+            assert_eq!(
+                err, "invalid dir",
+                "{bad:?} must be rejected by the TRAVERSAL GUARD itself, not a \
+                 downstream is_dir()/exists() check — got {err:?}"
+            );
+        }
+
+        // No write ever escaped to the parent.
+        assert!(
+            tmp.join(".review").exists(),
+            "parent .review must be untouched"
+        );
+        assert!(
+            !tmp.join(".done").exists(),
+            "must never have promoted the parent directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

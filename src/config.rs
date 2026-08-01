@@ -262,6 +262,47 @@ pub fn default_autorip_dir() -> String {
     "config".to_string()
 }
 
+/// Parse the `PORT` env var's raw string value into a bind port. Returns
+/// `None` for anything that isn't a valid 1..=65535 port (unparseable, or
+/// the reserved `0` sentinel) so the caller can warn and fall back to 8080
+/// instead of silently binding an ephemeral OS-assigned port. Pulled out of
+/// [`load`] as a pure function so the exact boundary (`"0"` rejected, a
+/// real custom port accepted) is directly testable without touching the
+/// real process environment.
+fn parse_port_env(s: &str) -> Option<u16> {
+    match s.trim().parse::<u16>() {
+        Ok(p) if p != 0 => Some(p),
+        _ => None,
+    }
+}
+
+/// Build the bootstrap `Config` from the two env-sourced values layered
+/// onto the hardcoded defaults. Pulled out of [`load`] as its own function
+/// (rather than an inline struct-update literal) so a test can assert the
+/// env-sourced `port`/`autorip_dir` actually survive into the returned
+/// `Config` — a field silently dropped from the literal would otherwise
+/// fall back to `Config::default()`'s value via the `..` and pass every
+/// existing test.
+fn build_bootstrap_config(port: u16, autorip_dir: String) -> Config {
+    Config {
+        port,
+        autorip_dir,
+        ..Config::default()
+    }
+}
+
+/// Decide whether a bare-run (no container) relocation of `dir` should
+/// happen: only when `dir` is still exactly the container-default path AND
+/// that default path doesn't exist on disk (no bind mount). Pulled out of
+/// [`load`] as a pure predicate — the common case (an operator who never
+/// customized `staging_dir`/`output_dir`, running in Docker with the real
+/// mount present) must NOT relocate, or every normal deployment would have
+/// its rips silently redirected into the container's ephemeral overlay
+/// instead of the operator's real storage.
+fn should_relocate_bare_run_dir(dir: &str, default_path: &str, default_path_exists: bool) -> bool {
+    dir == default_path && !default_path_exists
+}
+
 pub fn load() -> Arc<RwLock<Config>> {
     // Only the two bootstrap-only env vars are read here. Everything
     // else comes from settings.json (or Config::default if it's a
@@ -272,9 +313,9 @@ pub fn load() -> Arc<RwLock<Config>> {
     // that would bind 8080 while the operator believes their value took
     // effect. Warn and fall back so the misconfiguration is diagnosable.
     let port: u16 = match std::env::var("PORT") {
-        Ok(s) => match s.trim().parse::<u16>() {
-            Ok(p) if p != 0 => p,
-            _ => {
+        Ok(s) => match parse_port_env(&s) {
+            Some(p) => p,
+            None => {
                 tracing::warn!(
                     value = %s,
                     "PORT env var is not a valid 1-65535 port; falling back to 8080"
@@ -285,11 +326,7 @@ pub fn load() -> Arc<RwLock<Config>> {
         Err(_) => 8080,
     };
 
-    let mut cfg = Config {
-        port,
-        autorip_dir,
-        ..Config::default()
-    };
+    let mut cfg = build_bootstrap_config(port, autorip_dir);
     cfg = load_saved(cfg);
 
     // Bare-run (no container): when staging/output are still the container
@@ -303,7 +340,11 @@ pub fn load() -> Arc<RwLock<Config>> {
     // start must not relocate staging/output to the config dir — that would
     // orphan an in-progress ISO and split data across two directories. Bare run
     // (downloadable binary, no mounts) is the only case where they don't exist.
-    if cfg.staging_dir == "/staging" && !std::path::Path::new("/staging").exists() {
+    if should_relocate_bare_run_dir(
+        &cfg.staging_dir,
+        "/staging",
+        std::path::Path::new("/staging").exists(),
+    ) {
         // Native join so the derived path uses the platform separator (clean
         // `...\config\staging` on Windows, not a mixed-slash `config/staging`).
         cfg.staging_dir = std::path::Path::new(&cfg.autorip_dir)
@@ -311,7 +352,11 @@ pub fn load() -> Arc<RwLock<Config>> {
             .to_string_lossy()
             .into_owned();
     }
-    if cfg.output_dir == "/output" && !std::path::Path::new("/output").exists() {
+    if should_relocate_bare_run_dir(
+        &cfg.output_dir,
+        "/output",
+        std::path::Path::new("/output").exists(),
+    ) {
         cfg.output_dir = std::path::Path::new(&cfg.autorip_dir)
             .join("output")
             .to_string_lossy()
@@ -1025,6 +1070,160 @@ mod tests {
         assert_eq!(cfg.log_retention_days, 3650, "retention clamps to 10y");
         assert_eq!(cfg.decrypt_threads, 256, "decrypt_threads clamps to 256");
         assert_eq!(cfg.max_retries, 10, "max_retries clamps to 10");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A realistic operator-configured duration comfortably under the 30-day
+    /// ceiling but well above an hour must survive `load_saved` UNCLAMPED.
+    /// Unlike `load_saved_clamps_pathological_durations` (which feeds
+    /// `u64::MAX` and asserts against the SAME `30 * 24 * 3600` literal the
+    /// production code uses — so a collapsed constant still passes
+    /// tautologically), this pins an absolute value: if `MAX_DURATION_SECS`
+    /// ever regressed to something near an hour (e.g. `30 + 24 + 3600`,
+    /// ~61 minutes), the UHD default of 8h (28800s) — or this test's 6h —
+    /// would get silently clamped down and this assertion would catch it.
+    #[test]
+    fn realistic_mid_range_duration_survives_unclamped() {
+        let d = scratch("mid_range_duration");
+        let path = cfg_in(&d).settings_file();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "max_rip_duration_secs": 21_600u64, // 6h — realistic, not pathological
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = load_saved(cfg_in(&d));
+        assert_eq!(
+            cfg.max_rip_duration_secs, 21_600,
+            "a realistic 6h duration must not be clamped"
+        );
+        // The shipped 8h UHD default itself must also survive a fresh load
+        // (no settings.json override) — this is the value the whole ceiling
+        // exists to NOT interfere with in normal operation.
+        assert_eq!(Config::default().max_rip_duration_secs, 28_800);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `Debug for Config` must mask every secret-bearing field and must
+    /// NEVER print the raw secret value. Nothing in the suite previously
+    /// called `format!("{:?}", cfg)` at all, so a future edit swapping
+    /// `redact(&self.x)` for `&self.x` on any of these fields would leak
+    /// straight into any `tracing::debug!(?cfg)` call site and pass every
+    /// existing test.
+    #[test]
+    fn debug_redacts_all_secret_fields() {
+        let cfg = Config {
+            tmdb_api_key: "tmdb-real-secret-abc123".into(),
+            keydb_url: "https://keydb.example.org/export/keydb_eng.zip?token=KEYDB_SECRET".into(),
+            keyserver_url: "https://keys.example.org/decode".into(),
+            keyserver_secret: "keyserver-bearer-token-xyz789".into(),
+            webhook_urls: vec![
+                "https://discord.com/api/webhooks/1/DISCORD_SECRET_TOKEN".into(),
+                "https://hooks.example.com?token=WEBHOOK_SECRET".into(),
+            ],
+            ..Config::default()
+        };
+
+        let debug_output = format!("{:?}", cfg);
+
+        // None of the raw secrets may appear anywhere in the output.
+        assert!(!debug_output.contains("tmdb-real-secret-abc123"));
+        assert!(!debug_output.contains("KEYDB_SECRET"));
+        assert!(!debug_output.contains("keyserver-bearer-token-xyz789"));
+        assert!(!debug_output.contains("DISCORD_SECRET_TOKEN"));
+        assert!(!debug_output.contains("WEBHOOK_SECRET"));
+        // keyserver_url is non-secret-bearing in the field list's own
+        // documented sense (it's masked anyway by this impl) but the token
+        // it might carry as userinfo/query must not leak either; the field
+        // is always redacted here so just confirm the placeholder appears.
+
+        // The redaction markers must actually be present (proves the
+        // fields were visited and masked, not merely absent from a
+        // truncated/no-op Debug impl).
+        assert!(debug_output.contains("<redacted>"));
+        assert!(debug_output.contains("2 redacted")); // webhook_urls count
+        // Non-secret fields must still print normally — Debug stays useful.
+        assert!(debug_output.contains("Config"));
+        assert!(debug_output.contains("port"));
+    }
+
+    /// `Debug for Config` on an all-empty-secrets `Config::default()` must
+    /// show the "<unset>" marker, not "<redacted>" — proves `redact()`
+    /// still distinguishes "no secret configured" from "secret present and
+    /// hidden" rather than collapsing both to a fixed placeholder.
+    #[test]
+    fn debug_marks_empty_secrets_as_unset_not_redacted() {
+        let cfg = Config::default();
+        let debug_output = format!("{:?}", cfg);
+        assert!(debug_output.contains("<unset>"));
+    }
+
+    /// `should_relocate_bare_run_dir` — the pure decision behind `load()`'s
+    /// bare-run relocation guard. The common real-world case (operator never
+    /// customized the path, running in Docker with the bind mount healthy)
+    /// must NOT relocate: mutating this guard's `&&`/`==`/`!` would make a
+    /// normal deployment silently redirect every rip into the container's
+    /// ephemeral overlay instead of the operator's real storage.
+    #[test]
+    fn should_relocate_only_when_default_path_and_mount_absent() {
+        // Default path, mount present (normal Docker deployment) -> do NOT relocate.
+        assert!(!should_relocate_bare_run_dir("/staging", "/staging", true));
+        // Default path, mount absent (bare-run binary, no container) -> relocate.
+        assert!(should_relocate_bare_run_dir("/staging", "/staging", false));
+        // Customized path -> never relocate, regardless of mount state.
+        assert!(!should_relocate_bare_run_dir(
+            "/mnt/media/staging",
+            "/staging",
+            true
+        ));
+        assert!(!should_relocate_bare_run_dir(
+            "/mnt/media/staging",
+            "/staging",
+            false
+        ));
+        // Same shape for the output_dir case.
+        assert!(!should_relocate_bare_run_dir("/output", "/output", true));
+        assert!(should_relocate_bare_run_dir("/output", "/output", false));
+    }
+
+    /// `build_bootstrap_config` must carry the env-derived `port` and
+    /// `autorip_dir` through into the returned `Config`, not silently fall
+    /// back to `Config::default()`'s values via the struct-update `..`.
+    #[test]
+    fn build_bootstrap_config_carries_env_derived_fields() {
+        let cfg = build_bootstrap_config(9999, "/custom/autorip/dir".to_string());
+        assert_eq!(cfg.port, 9999);
+        assert_eq!(cfg.autorip_dir, "/custom/autorip/dir");
+        // Values not sourced from these two env vars still come from
+        // Config::default() via the struct-update.
+        assert_eq!(cfg.staging_dir, Config::default().staging_dir);
+    }
+
+    /// `parse_port_env` — the pure guard behind `load()`'s `PORT` handling.
+    /// `"0"` is the reserved "ephemeral/unset" sentinel and must be
+    /// rejected (falls back to 8080 with a warning), not silently bound.
+    #[test]
+    fn parse_port_env_rejects_zero_and_garbage_accepts_valid_port() {
+        assert_eq!(parse_port_env("8081"), Some(8081));
+        assert_eq!(parse_port_env("1"), Some(1));
+        assert_eq!(parse_port_env("65535"), Some(65535));
+        assert_eq!(parse_port_env("0"), None);
+        assert_eq!(parse_port_env("not-a-number"), None);
+        assert_eq!(parse_port_env(""), None);
+        assert_eq!(parse_port_env("-1"), None);
+        assert_eq!(parse_port_env("99999"), None); // out of u16 range
+    }
+
+    /// `dir_is_writable` against a real filesystem: an existing, writable
+    /// directory must return true; a nonexistent directory (parent doesn't
+    /// exist either) must return false rather than panicking.
+    #[test]
+    fn dir_is_writable_true_for_real_dir_false_for_missing() {
+        let d = scratch("writable_probe");
+        assert!(dir_is_writable(d.to_str().unwrap()));
+        assert!(!dir_is_writable("/nonexistent-autorip-probe-dir-xyz/sub"));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

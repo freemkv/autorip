@@ -64,12 +64,18 @@ pub fn send_rich(cfg: &Config, ev: &RipEvent) {
 }
 
 /// Return only the `scheme://host[:port]` portion of `url`, dropping any
-/// path/query/fragment. Webhook URLs commonly embed a secret token in the
-/// path (Discord, Slack, Jellyfin) or query string, so logging the full URL
-/// would expose that token in the system log, which GET /api/system serves
-/// unredacted to any LAN client. Logging the origin is enough to identify
-/// the destination.
-pub(crate) fn webhook_url_origin(url: &str) -> &str {
+/// userinfo, path, query, or fragment. Webhook/keyserver URLs commonly embed
+/// a secret token in the path (Discord, Slack, Jellyfin), in the query
+/// string, or as HTTP basic-auth userinfo (`scheme://user:token@host/...`),
+/// so logging the full URL would expose that secret in the system log,
+/// which GET /api/system serves unredacted to any LAN client. Logging the
+/// origin is enough to identify the destination.
+///
+/// The userinfo-stripping step mirrors `web.rs`'s `mask_webhook_url` (which
+/// has its own test proving it strips userinfo) — this is the same policy,
+/// applied here as the one place it was missing rather than a second copy
+/// of the logic.
+pub(crate) fn webhook_url_origin(url: &str) -> String {
     if let Some(scheme_end) = url.find("://") {
         let after = scheme_end + 3;
         // Treat '/', '?', and '#' as origin-terminating so a token in a
@@ -78,46 +84,82 @@ pub(crate) fn webhook_url_origin(url: &str) -> &str {
             .find(['/', '?', '#'])
             .map(|i| after + i)
             .unwrap_or(url.len());
-        return &url[..origin_end];
+        // The authority span is `url[after..origin_end]`. If it carries
+        // HTTP basic-auth userinfo (`user:pass@host`), drop everything up
+        // to and including the last '@' so only `host[:port]` survives —
+        // otherwise the credential would leak straight through unredacted.
+        let authority = &url[after..origin_end];
+        let host_start = match authority.rfind('@') {
+            Some(at) => after + at + 1,
+            None => after,
+        };
+        return format!("{}{}", &url[..after], &url[host_start..origin_end]);
     }
     // No scheme — log nothing identifiable.
-    "<redacted>"
+    "<redacted>".to_string()
+}
+
+/// Return only the non-blank webhook URLs, in order. Pulled out of [`fire`]
+/// as a pure, directly-testable predicate — a blank/whitespace-only entry
+/// (e.g. an unconfigured slot in the settings array) must never be treated
+/// as a real destination to dispatch.
+pub(crate) fn active_urls(urls: &[String]) -> Vec<String> {
+    urls.iter()
+        .filter(|u| !u.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
+// Bound the number of concurrent webhook-dispatch threads. Each event
+// otherwise spawns an unbounded OS thread; a burst of events (or a hostile
+// client triggering many) could exhaust threads. Past the cap, drop the
+// event with a warning rather than spawning.
+use std::sync::atomic::{AtomicUsize, Ordering};
+const MAX_INFLIGHT: usize = 8;
+static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Attempt to claim one slot of a bounded concurrency counter. Returns
+/// `true` and increments `counter` if it is currently below `max`;
+/// otherwise leaves `counter` untouched and returns `false`.
+///
+/// Pulled out of [`fire`] as a pure function parameterised on `counter`
+/// (rather than reaching for the module's `static INFLIGHT` directly) so a
+/// test can drive the cap logic — including the exact boundary at `max` —
+/// against a private counter instead of racing the real process-wide one
+/// shared with every other test in the binary.
+pub(crate) fn try_acquire_slot(counter: &AtomicUsize, max: usize) -> bool {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < max).then_some(n + 1)
+        })
+        .is_ok()
+}
+
+/// Release one slot claimed by [`try_acquire_slot`]. The single decrement
+/// path used both by production's `InflightGuard::drop` and directly by
+/// tests, so there is exactly one copy of the release logic.
+pub(crate) fn release_slot(counter: &AtomicUsize) {
+    counter.fetch_sub(1, Ordering::AcqRel);
+}
+
+// Decrement the in-flight counter however the dispatch thread exits.
+struct InflightGuard;
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        release_slot(&INFLIGHT);
+    }
 }
 
 fn fire(cfg: &Config, payload: &serde_json::Value) {
-    let urls: Vec<String> = cfg
-        .webhook_urls
-        .iter()
-        .filter(|u| !u.trim().is_empty())
-        .cloned()
-        .collect();
+    let urls = active_urls(&cfg.webhook_urls);
     if urls.is_empty() {
         return;
     }
     let body = payload.to_string();
 
-    // Bound the number of concurrent webhook-dispatch threads. Each event
-    // otherwise spawns an unbounded OS thread; a burst of events (or a hostile
-    // client triggering many) could exhaust threads. Past the cap, drop the
-    // event with a warning rather than spawning.
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    const MAX_INFLIGHT: usize = 8;
-    static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-    if INFLIGHT
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < MAX_INFLIGHT).then_some(n + 1)
-        })
-        .is_err()
-    {
+    if !try_acquire_slot(&INFLIGHT, MAX_INFLIGHT) {
         crate::log::syslog("Webhook dropped: too many concurrent deliveries in flight");
         return;
-    }
-    // Decrement the in-flight counter however the thread exits.
-    struct InflightGuard;
-    impl Drop for InflightGuard {
-        fn drop(&mut self) {
-            INFLIGHT.fetch_sub(1, Ordering::AcqRel);
-        }
     }
 
     std::thread::spawn(move || {
@@ -268,5 +310,169 @@ mod tests {
             "query param leaked: {log_line}"
         );
         assert!(log_line.contains("hooks.example.com"));
+    }
+
+    // The tests above all use long example hostnames (discord.com,
+    // jellyfin.example:8096, hooks.example.com, example.com). A previous
+    // arithmetic bug in this function (`scheme_end + 3` accidentally written
+    // as `scheme_end * 3`) happened to still compute the right origin for
+    // those specific hosts, because `scheme_end * 3` (12 or 15, since
+    // `scheme_end` is 4/5 for "http"/"https") lands inside or past the real
+    // host boundary for a long enough hostname. It does NOT for a short one.
+    // These tests pin the token-stripping behaviour against hosts short
+    // enough that the `* 3` bug would visibly leak the token, so a
+    // regression back to that arithmetic is caught regardless of hostname
+    // length used elsewhere in the suite.
+
+    #[test]
+    fn webhook_url_origin_short_host_path_token() {
+        let url = "https://a.b/SECRET_TOKEN";
+        let origin = webhook_url_origin(url);
+        assert_eq!(origin, "https://a.b");
+        assert!(!origin.contains("SECRET_TOKEN"));
+    }
+
+    #[test]
+    fn webhook_url_origin_short_host_query_token() {
+        let url = "https://x?token=SECRET";
+        let origin = webhook_url_origin(url);
+        assert_eq!(origin, "https://x");
+        assert!(!origin.contains("SECRET"));
+    }
+
+    #[test]
+    fn webhook_url_origin_short_host_nested_path_token() {
+        let url = "https://ab.cd/tokenpath/SECRET";
+        let origin = webhook_url_origin(url);
+        assert_eq!(origin, "https://ab.cd");
+        assert!(!origin.contains("SECRET"));
+        assert!(!origin.contains("tokenpath"));
+    }
+
+    #[test]
+    fn webhook_url_origin_short_host_fragment_token() {
+        let url = "https://a.b#SECRET_FRAGMENT_TOKEN";
+        let origin = webhook_url_origin(url);
+        assert_eq!(origin, "https://a.b");
+        assert!(!origin.contains("SECRET_FRAGMENT_TOKEN"));
+    }
+
+    #[test]
+    fn webhook_url_origin_ip_literal_with_port_and_token() {
+        let url = "http://1.2.3.4:9000/hook/SECRET_TOKEN";
+        let origin = webhook_url_origin(url);
+        assert_eq!(origin, "http://1.2.3.4:9000");
+        assert!(!origin.contains("SECRET_TOKEN"));
+    }
+
+    #[test]
+    fn webhook_url_origin_no_scheme_with_embedded_secret_is_fully_redacted() {
+        // A malformed/no-scheme "URL" that still contains something
+        // token-shaped must never leak that content — the whole thing is
+        // replaced with the fixed placeholder, not partially echoed back.
+        let url = "hooks.example.com/SECRET_TOKEN?token=ALSO_SECRET";
+        let origin = webhook_url_origin(url);
+        assert_eq!(origin, "<redacted>");
+        assert!(!origin.contains("SECRET_TOKEN"));
+        assert!(!origin.contains("ALSO_SECRET"));
+    }
+
+    #[test]
+    fn webhook_url_origin_strips_basic_auth_userinfo() {
+        // HTTP basic-auth userinfo can carry a bearer token
+        // (`scheme://user:token@host/...`). It must not survive into the
+        // logged origin any more than a path- or query-embedded token does.
+        let url = "https://autorip:s3cr3t-token@hooks.example.com/notify";
+        let origin = webhook_url_origin(url);
+        assert_eq!(origin, "https://hooks.example.com");
+        assert!(!origin.contains("s3cr3t-token"));
+        assert!(!origin.contains("autorip:"));
+        assert!(!origin.contains('@'));
+    }
+
+    #[test]
+    fn webhook_url_origin_strips_basic_auth_userinfo_short_host() {
+        let url = "http://user:pw@a.b/hook";
+        let origin = webhook_url_origin(url);
+        assert_eq!(origin, "http://a.b");
+        assert!(!origin.contains("pw"));
+        assert!(!origin.contains('@'));
+    }
+
+    #[test]
+    fn active_urls_filters_blank_and_whitespace_entries() {
+        let urls = vec![
+            "".to_string(),
+            "   ".to_string(),
+            "https://real.example/hook".to_string(),
+            "\t\n".to_string(),
+            "https://second.example/hook".to_string(),
+        ];
+        let filtered = active_urls(&urls);
+        assert_eq!(
+            filtered,
+            vec![
+                "https://real.example/hook".to_string(),
+                "https://second.example/hook".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_urls_all_blank_yields_empty() {
+        let urls = vec!["".to_string(), "  ".to_string()];
+        assert!(active_urls(&urls).is_empty());
+    }
+
+    /// Drives `try_acquire_slot`/`release_slot` directly against a private
+    /// counter (not the shared process-wide `INFLIGHT` static, to avoid
+    /// cross-test interference) through several full acquire/release
+    /// cycles. This is the real cap-and-release logic `fire()` uses, not a
+    /// re-implementation of it — so a regression in either function is
+    /// caught here directly, including `InflightGuard::drop` never
+    /// decrementing (which would show up as slot 9+ never becoming
+    /// available again).
+    #[test]
+    fn inflight_slot_cap_and_release_cycle() {
+        let counter = AtomicUsize::new(0);
+        let max = 3usize;
+
+        // Fill up to the cap.
+        assert!(try_acquire_slot(&counter, max));
+        assert!(try_acquire_slot(&counter, max));
+        assert!(try_acquire_slot(&counter, max));
+        assert_eq!(counter.load(Ordering::Acquire), max);
+
+        // At the cap: the next acquire must be rejected and must NOT bump
+        // the counter past `max`.
+        assert!(!try_acquire_slot(&counter, max));
+        assert_eq!(counter.load(Ordering::Acquire), max);
+
+        // Release one slot; a new acquire must now succeed.
+        release_slot(&counter);
+        assert_eq!(counter.load(Ordering::Acquire), max - 1);
+        assert!(try_acquire_slot(&counter, max));
+        assert_eq!(counter.load(Ordering::Acquire), max);
+
+        // Release everything currently held (3 slots) and confirm the
+        // counter returns all the way to zero — this is the guarantee that
+        // `InflightGuard::drop` must uphold on every dispatch thread exit,
+        // otherwise the counter ratchets upward forever and every webhook
+        // past the cap gets silently dropped for the rest of the process.
+        release_slot(&counter);
+        release_slot(&counter);
+        release_slot(&counter);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+
+        // Fully available again after the drain.
+        assert!(try_acquire_slot(&counter, max));
+        release_slot(&counter);
+    }
+
+    #[test]
+    fn try_acquire_slot_rejects_when_max_is_zero() {
+        let counter = AtomicUsize::new(0);
+        assert!(!try_acquire_slot(&counter, 0));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 }
