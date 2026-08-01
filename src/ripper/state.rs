@@ -340,6 +340,14 @@ pub(super) fn forget_device_state(device: &str) {
 /// override for a drive that doesn't exist. Recovers a poisoned guard for
 /// the same reason `is_busy` does (a stale poison must not make every
 /// device look unknown).
+/// Number of devices currently tracked in STATE. Test-only: used to assert
+/// that an unauthenticated request for a nonexistent device cannot grow the
+/// map, which was an OOM denial of service on the unauthenticated LAN surface.
+#[cfg(test)]
+pub fn state_len_for_test() -> usize {
+    STATE.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
 pub fn device_known(device: &str) -> bool {
     let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
     s.contains_key(device)
