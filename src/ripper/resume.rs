@@ -574,6 +574,37 @@ impl Drop for ResumeMuxingGuard<'_> {
     }
 }
 
+/// Resume's call-site wiring into the shared `title_is_confident` policy
+/// (mod.rs). Pulled out of `resume_remux` as its own function so the
+/// argument plumbing is directly unit-testable without a real
+/// `Disc::scan_image` (which `resume_remux` itself still requires — see the
+/// documented gap in the module tests): a mutant that swapped an argument, or
+/// a future edit that quietly reintroduced resume's own copy of the
+/// disjunction instead of calling through, would be caught here even though
+/// `resume_remux` end-to-end cannot be driven from a synthetic fixture.
+///
+/// `carried_confident` is the fresh-rip completion's full `title_is_confident`
+/// verdict, carried across the `.ripped` hand-off (`None` on a cold
+/// auto-resume, which has no hand-off). It fills `title_is_confident`'s
+/// `overridden` parameter: OR-ing in a prior `true` composes identically
+/// whether that `true` came from an operator override or a genuine TMDB
+/// match, so this is not a semantic mismatch, just parameter reuse.
+fn resume_title_confident(
+    tmdb_api_key: &str,
+    carried_confident: Option<bool>,
+    disc_label: &str,
+    title_for_match: &str,
+    tmdb_year: u16,
+) -> bool {
+    super::title_is_confident(
+        tmdb_api_key,
+        carried_confident.unwrap_or(false),
+        disc_label,
+        title_for_match,
+        tmdb_year,
+    )
+}
+
 pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: ResumeClass) {
     let ResumeClass::Remux {
         iso_path,
@@ -1094,8 +1125,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // marker rather than relying on the reader's fallback.
     let media_type = resolve_media_type(&tmdb_media_type);
 
-    // Title-confidence gate — mirror rip_disc's completion path
-    // (mod.rs: `if title_confident { ".done" } else { ".review" }`).
+    // Title-confidence gate — routes through the SAME `title_is_confident` /
+    // `handoff_marker_name` (mod.rs) the fresh-rip completion path uses, so
+    // the two routes can't drift on whether a guessed title is trustworthy
+    // enough to auto-file.
     // Auto-resume previously wrote `.done` unconditionally, auto-filing a
     // resumed rip into the library under a possibly-guessed title and
     // bypassing the operator-review hold the fresh-rip path enforces.
@@ -1127,14 +1160,23 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // exists. Treat "no API key" as confident: file under the disc label and
     // write `.done` so the mover promotes it. The review hold is preserved
     // ONLY when TMDB IS configured but returns a low-confidence match.
-    let tmdb_unconfigured = cfg_read.tmdb_api_key.trim().is_empty();
-    let title_confident = tmdb_unconfigured
-        || carried_confident.unwrap_or(false)
-        || crate::tmdb::is_confident_match(
-            &crate::tmdb::clean_title(&disc_label),
-            &title_for_match,
-            tmdb_year,
-        );
+    // Route through the SAME `title_is_confident` the fresh-rip path (mod.rs)
+    // uses: its own doc comment calls it "the whole policy" for `.done` vs
+    // `.review`, kept in one place precisely so the two completion routes
+    // can't drift. `carried_confident.unwrap_or(false)` fills the `overridden`
+    // parameter — OR-ing in the fresh-rip side's full prior verdict (which
+    // already folds in any operator override) composes identically to the
+    // inline disjunction this replaces, since a boolean OR term doesn't care
+    // whether the "true" it contributes came from an override or a genuine
+    // match; on cold auto-resume `carried_confident` is `None` and this
+    // degrades to `false`, exactly matching "no override concept" below.
+    let title_confident = resume_title_confident(
+        &cfg_read.tmdb_api_key,
+        carried_confident,
+        &disc_label,
+        &title_for_match,
+        tmdb_year,
+    );
 
     // ISO output: deliver the whole-disc image, don't re-mux a title. Mirrors
     // rip_disc's inline ISO terminal so the two completion routes can't diverge
@@ -1167,7 +1209,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             super::unregister_halt(device);
             return;
         }
-        let marker_name = if title_confident { ".done" } else { ".review" };
+        let marker_name = super::handoff_marker_name(title_confident);
         // Mirror the fresh-rip ISO marker (mod.rs) field-for-field so the
         // mover gets identical metadata on a resume: `disc_name` (the disc's
         // own label, distinct from the resolved `title`), `media_type` (mover
@@ -1503,7 +1545,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         );
         return;
     }
-    let marker_name = if title_confident { ".done" } else { ".review" };
+    let marker_name = super::handoff_marker_name(title_confident);
     // Mirror the fresh-rip MKV marker (mod.rs) field-for-field: `disc_name`,
     // `media_type`, `poster_url`, `overview`. Without them a resume completion
     // handed the mover impoverished metadata vs a fresh rip of the same disc
@@ -2003,6 +2045,130 @@ mod find_iso_tests {
         let (iso, map) = find_iso_and_mapfile(&d).expect("should pair");
         assert!(iso.ends_with("Movie.iso"));
         assert!(map.ends_with("Movie.iso.mapfile"));
+    }
+}
+
+// Resume's wiring into the shared `.done`/`.review` policy (mod.rs
+// `title_is_confident` / `handoff_marker_name`). resume_remux previously
+// hand-rolled its own copy of this disjunction and its own `.done`/`.review`
+// ternary — the same "one policy, two copies, only one hardened" pattern
+// that `mux_loss_aborts` had. These pin the call-site plumbing.
+#[cfg(test)]
+mod title_confidence_routing_tests {
+    use super::super::handoff_marker_name;
+    use super::resume_title_confident;
+
+    /// No TMDB key configured → always confident, regardless of carried
+    /// state or match, matching `title_is_confident`'s "operators running
+    /// keyless expect the disc-label filename" rule.
+    #[test]
+    fn no_api_key_is_always_confident() {
+        assert!(resume_title_confident(
+            "",
+            None,
+            "BD_ROM_R1",
+            "Casablanca",
+            1942
+        ));
+        assert!(resume_title_confident(
+            "   ",
+            Some(false),
+            "BD_ROM_R1",
+            "Casablanca",
+            1942
+        ));
+    }
+
+    /// `carried_confident = Some(true)` (the fresh-rip hand-off already
+    /// judged this confident, whether via a real match or an operator
+    /// override) must be OR'd in even when the current match check alone
+    /// would say no — an operator's deliberate pick must not be
+    /// second-guessed back into `.review` on resume.
+    #[test]
+    fn carried_confident_true_overrides_a_weak_match() {
+        assert!(resume_title_confident(
+            "tmdb-key",
+            Some(true),
+            "BD_ROM_R1",
+            "Some Guessed Title",
+            0,
+        ));
+    }
+
+    /// `carried_confident = None` (cold auto-resume, no hand-off) must fall
+    /// through to the plain match check — not treated as confident by
+    /// default.
+    #[test]
+    fn no_carried_state_falls_through_to_the_match_check() {
+        assert!(
+            !resume_title_confident("tmdb-key", None, "BD_ROM_R1", "Casablanca", 1942),
+            "a disc-label title with no year match must not be confident"
+        );
+        assert!(resume_title_confident(
+            "tmdb-key",
+            None,
+            "THE_MATRIX",
+            "The Matrix",
+            1999,
+        ));
+    }
+
+    /// The marker-name choice itself: confident → `.done`, not → `.review`.
+    #[test]
+    fn marker_name_follows_confidence() {
+        assert_eq!(handoff_marker_name(true), ".done");
+        assert_eq!(handoff_marker_name(false), ".review");
+    }
+
+    /// `resume_title_confident` itself is directly unit-tested above, but
+    /// `resume_remux`'s actual call site cannot be: it's reached only after a
+    /// real `Disc::scan_image` (the documented gap this module's own tests
+    /// call out — `resume_remux`, `reset_status_after_ripping`, and
+    /// `resolve_keys_from_iso` are never exercised end-to-end). An argument
+    /// swap at that call site (e.g. `disc_label` and `title_for_match`
+    /// transposed) would pass every unit test above yet silently change which
+    /// string gets matched against which, and nothing would fail. Pin the
+    /// call site at the source level as a stopgap, matching the pattern
+    /// `completed_mux_with_loss_gated_by_abort_on_lost_secs` already uses for
+    /// the same class of gap.
+    #[test]
+    fn resume_remux_calls_resume_title_confident_with_disc_label_then_match_title() {
+        let src = include_str!("resume.rs");
+        assert!(
+            src.contains(
+                "resume_title_confident(\n        &cfg_read.tmdb_api_key,\n        carried_confident,\n        &disc_label,\n        &title_for_match,\n        tmdb_year,\n    )"
+            ),
+            "resume_remux must call resume_title_confident(tmdb_api_key, carried_confident, \
+             disc_label, title_for_match, tmdb_year) in that exact argument order"
+        );
+    }
+
+    /// The cold-auto-resume ISO completion branch is a separate call site
+    /// from the MKV one (`completed_mux_with_loss_gated_by_abort_on_lost_secs`
+    /// pins that one) and sits outside the region that test scans, so it needs
+    /// its own pin: it must route through `handoff_marker_name`, not keep its
+    /// own copy of the `.done`/`.review` ternary.
+    #[test]
+    fn iso_completion_uses_handoff_marker_name() {
+        let src = include_str!("resume.rs");
+        let start = src
+            .find("ISO output: deliver the whole-disc image")
+            .expect("resume.rs should have the ISO completion branch");
+        // Bound at the MKV-path's own gate note (pinned separately by
+        // `completed_mux_with_loss_gated_by_abort_on_lost_secs`), NOT at the
+        // shared `auto_eject` tail both branches fall through to — that tail
+        // comes after BOTH branches, so scanning to it would let this test
+        // pass by accidentally matching the MKV site's `handoff_marker_name`
+        // call instead of the ISO site's.
+        let end = src[start..]
+            .find("A loss is a loss. Mux-time")
+            .map(|i| start + i)
+            .expect("resume.rs should have the mux-time-loss note after the ISO branch");
+        let region = &src[start..end];
+        assert!(
+            region.contains("handoff_marker_name(title_confident)"),
+            "the ISO completion branch must hand off via handoff_marker_name, not a duplicated ternary"
+        );
     }
 }
 
@@ -2599,9 +2765,11 @@ mod post_mux_loss_reporting_tests {
             region.contains("demux_lost_secs"),
             "completed-mux success region must report demux-time loss"
         );
-        // (b) Within threshold it hands off via a `.done`/`.review` marker.
+        // (b) Within threshold it hands off via a `.done`/`.review` marker,
+        // routed through the shared `handoff_marker_name` policy (mod.rs) so
+        // this completion route can't drift from the fresh-rip one.
         assert!(
-            region.contains("if title_confident { \".done\" } else { \".review\" }"),
+            region.contains("handoff_marker_name(title_confident)"),
             "completed mux must hand off to .done (confident) or .review (not)"
         );
         assert!(
