@@ -976,4 +976,57 @@ mod tests {
         let rc = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
         assert_eq!(rc, 0, "utimes failed");
     }
+
+    /// `join_bounded` is the only thing between a wedged mover/muxer thread
+    /// and either hanging shutdown forever or abandoning an in-flight file
+    /// move before it finishes. Both failure directions matter: hanging keeps
+    /// the container from restarting, and abandoning early can leave the
+    /// operator's media half-moved.
+    ///
+    /// It had no test at all, and a mutation run flipped every part of it.
+    /// Note the `delete !` mutant is the subtle one — it skips the loop body
+    /// entirely and falls through to an unconditional `join()`, silently
+    /// turning the bounded join back into an unbounded one. A healthy-thread
+    /// test cannot see that, because joining works fine there. Only timing a
+    /// thread that outlives its deadline exposes it.
+    #[test]
+    fn join_bounded_waits_for_a_healthy_worker_but_abandons_a_wedged_one() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        // A worker that finishes well inside the timeout must be joined, and
+        // its work must be observable afterwards.
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            d.store(true, Ordering::SeqCst);
+        });
+        let t0 = Instant::now();
+        super::join_bounded(h, "healthy", Duration::from_secs(5));
+        assert!(
+            done.load(Ordering::SeqCst),
+            "a worker that finished must have been joined, not abandoned"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "must return as soon as the worker finishes, not sit out the timeout"
+        );
+
+        // A worker that outlives its deadline must be abandoned at roughly the
+        // timeout — NOT waited on until it happens to finish.
+        let h = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(30)));
+        let t0 = Instant::now();
+        super::join_bounded(h, "wedged", Duration::from_millis(150));
+        let waited = t0.elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "a wedged worker must not pin shutdown: waited {waited:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(100),
+            "must actually give the worker its timeout: waited {waited:?}"
+        );
+    }
 }
