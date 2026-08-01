@@ -32,9 +32,9 @@ pub use session::{
 };
 #[allow(unused_imports)]
 pub use state::{
-    BadRange, Resumable, RipState, STATE, current_disc_name, device_known, is_busy,
-    set_stop_cooldown, set_title_override, take_title_override, try_claim_active,
-    try_claim_active_checked, update_state, update_state_with,
+    BadRange, Resumable, RipState, STATE, device_known, is_busy, set_stop_cooldown,
+    set_title_override, take_title_override, try_claim_active, try_claim_active_checked,
+    update_state, update_state_with,
 };
 
 // Internal-use imports for the orchestrator code that lives in this
@@ -1003,6 +1003,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             status: "scanning".to_string(),
             disc_present: true,
             disc_name: display_name.clone(),
+            // The raw volume label, carried alongside the TMDB title from the
+            // first state push onward: it is the only thing that distinguishes
+            // the discs of a boxset, which all resolve to one title.
+            disc_label: id_name.clone(),
             disc_format: String::new(),
             tmdb_title: tmdb.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
             tmdb_year: tmdb.as_ref().map(|t| t.year).unwrap_or(0),
@@ -1188,8 +1192,11 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // the operator sees "failed: restart loop detected" on the
     // dashboard before triggering a fresh rip. `failure_reason`
     // overrides the normal idle status when present.
-    let staging_disc =
-        cfg_read.staging_device_dir(&crate::util::sanitize_path_compact(&display_name));
+    let staging_disc = cfg_read.staging_device_dir(&staging::staging_basename(
+        std::path::Path::new(&cfg_read.staging_dir),
+        &display_name,
+        &id_name,
+    ));
     let failure_reason = staging::read_failed_reason(std::path::Path::new(&staging_disc));
     let (status_str, last_error_str, failure_field) = match failure_reason.as_ref() {
         Some(r) => ("failed".to_string(), r.clone(), Some(r.clone())),
@@ -1198,7 +1205,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     // Does this disc have resumable partial staging? Drives the dashboard's
     // Resume-vs-Rip choice. Computed before `display_name` moves into the state.
-    let resumable = resumable_for_disc(&cfg_read, &display_name);
+    let resumable = resumable_for_disc(&cfg_read, &display_name, &id_name);
 
     update_state(
         device,
@@ -1207,6 +1214,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             status: status_str,
             disc_present: true,
             disc_name: display_name,
+            disc_label: id_name.clone(),
             disc_format,
             tmdb_title: tmdb.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
             tmdb_year: tmdb.as_ref().map(|t| t.year).unwrap_or(0),
@@ -1510,6 +1518,35 @@ fn list_staging_basenames(staging_dir: &std::path::Path) -> Option<Vec<String>> 
     }
 }
 
+/// The staging-dir basename for the disc currently in `device`, or None when
+/// STATE has no disc name for it (nothing scanned — the sanitized empty name
+/// would otherwise point at the staging ROOT).
+///
+/// The single entry point for every STATE-reading caller that needs a staging
+/// path. It reads BOTH halves of the disc's identity — the TMDB display title
+/// (which names the dir) and the raw volume label (which says whose dir it is)
+/// — and hands them to [`staging::staging_basename`], the one place the naming
+/// rule lives. Callers that already hold the two values locally (`scan_disc`,
+/// `rip_disc`) call `staging::staging_basename` directly; nobody re-derives.
+pub fn staging_basename_for_device(cfg: &Config, device: &str) -> Option<String> {
+    // Recover from a poisoned mutex rather than silently returning None:
+    // callers read this to decide "already ripped?" / "resumable?", and a
+    // dropped answer either re-rips a finished disc or hides a resume.
+    let (display_name, disc_label) = {
+        let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let rs = s.get(device)?;
+        (rs.disc_name.clone(), rs.disc_label.clone())
+    };
+    if display_name.is_empty() {
+        return None;
+    }
+    Some(staging::staging_basename(
+        std::path::Path::new(&cfg.staging_dir),
+        &display_name,
+        &disc_label,
+    ))
+}
+
 /// Does the currently-scanned disc have a resumable `.aborted-loss` staging dir
 /// (a swept ISO that aborted only on the main-movie loss threshold)? Used to
 /// stop the unattended Default path from re-sweeping over — and clobbering — an
@@ -1519,16 +1556,9 @@ fn disc_loss_aborted(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
         Ok(c) => c.clone(),
         Err(_) => return false,
     };
-    let display_name = STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(device)
-        .map(|rs| rs.disc_name.clone())
-        .unwrap_or_default();
-    if display_name.is_empty() {
+    let Some(sanitized) = staging_basename_for_device(&cfg_read, device) else {
         return false;
-    }
-    let sanitized = crate::util::sanitize_path_compact(&display_name);
+    };
     let dir = std::path::Path::new(&cfg_read.staging_dir).join(&sanitized);
     dir.join(staging::ABORTED_LOSS_MARKER).exists()
 }
@@ -1540,16 +1570,14 @@ fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
     };
     // Recover from a poisoned mutex rather than silently returning false (which
     // would re-rip an already-completed disc). Matches update_state/is_busy.
-    let display_name = STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(device)
-        .map(|rs| rs.disc_name.clone())
-        .unwrap_or_default();
-    if display_name.is_empty() {
+    //
+    // The basename is disc-specific, not just title-specific: disc 2 of a
+    // boxset resolves to disc 1's TMDB title, and matching on the title alone
+    // is what made this function find disc 1's `.completed` and skip disc 2
+    // entirely — the disc was never read.
+    let Some(sanitized) = staging_basename_for_device(&cfg_read, device) else {
         return false;
-    }
-    let sanitized = crate::util::sanitize_path_compact(&display_name);
+    };
     // NFS-resilient listing (retries + surfaces per-entry errors) instead of
     // `read_dir(...).flatten()`, which would silently drop the disc's own dir
     // on a cold-cache DirEntry error and wrongly re-rip a completed disc.
@@ -1614,16 +1642,9 @@ fn disc_owned_by_worker(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
         Ok(c) => c.clone(),
         Err(_) => return false,
     };
-    let display_name = STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(device)
-        .map(|rs| rs.disc_name.clone())
-        .unwrap_or_default();
-    if display_name.is_empty() {
+    let Some(sanitized) = staging_basename_for_device(&cfg_read, device) else {
         return false;
-    }
-    let sanitized = crate::util::sanitize_path_compact(&display_name);
+    };
     let staging_root = std::path::Path::new(&cfg_read.staging_dir);
     staging_disc_owned_by_worker(staging_root, &sanitized)
 }
@@ -1783,16 +1804,7 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
     let cfg_read = cfg.read().ok()?.clone();
     // Recover from a poisoned mutex rather than silently returning None (which
     // would fail to resume a valid staged ISO). Matches disc_already_completed.
-    let display_name = STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(device)
-        .map(|rs| rs.disc_name.clone())
-        .unwrap_or_default();
-    if display_name.is_empty() {
-        return None;
-    }
-    let sanitized = crate::util::sanitize_path_compact(&display_name);
+    let sanitized = staging_basename_for_device(&cfg_read, device)?;
     // NFS-resilient listing (retries + surfaces per-entry errors) instead of
     // `read_dir(...).flatten()`, which would silently drop the disc's own dir
     // on a cold-cache DirEntry error and fall through to a fresh sweep rather
@@ -1906,15 +1918,12 @@ fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
         Ok(c) => c.clone(),
         Err(_) => return,
     };
-    let display_name = STATE
-        .lock()
-        .ok()
-        .and_then(|s| s.get(device).map(|rs| rs.disc_name.clone()))
-        .unwrap_or_default();
-    if display_name.is_empty() {
+    // Wipe THIS disc's dir, not merely the one its title names: with a boxset
+    // in the drive, `Movie` may belong to disc 1 while disc 2 owns `Movie_2`,
+    // and wiping by title would destroy the wrong disc's staging.
+    let Some(sanitized) = staging_basename_for_device(&cfg_read, device) else {
         return;
-    }
-    let sanitized = crate::util::sanitize_path_compact(&display_name);
+    };
     // Defence-in-depth: never let an untrusted disc label sanitize to a
     // segment that escapes (or resolves to) the staging root. Without
     // this a label of `..` makes `join("..")` point at staging's parent
@@ -1961,11 +1970,17 @@ fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
 /// `bytes_pending == 0` → [`Resumable::Remux`], `> 0` → [`Resumable::Sweep`].
 /// Pure (no STATE, no side effects); used by both the scan-time detector and
 /// the `?resume=yes` action.
-fn resumable_for_disc(cfg: &Config, display_name: &str) -> Option<Resumable> {
+fn resumable_for_disc(cfg: &Config, display_name: &str, disc_label: &str) -> Option<Resumable> {
     if display_name.is_empty() {
         return None;
     }
-    let sanitized = crate::util::sanitize_path_compact(display_name);
+    // Disc-specific, not title-specific: `disc_label` is what stops disc 2 of a
+    // boxset being offered disc 1's partial ISO to "resume" onto.
+    let sanitized = staging::staging_basename(
+        std::path::Path::new(&cfg.staging_dir),
+        display_name,
+        disc_label,
+    );
     // NFS-resilient listing (retries + surfaces per-entry errors) instead of
     // `read_dir(...).flatten()`, which would silently drop the disc's own dir
     // on a cold-cache DirEntry error and hide an existing resumable staging
@@ -2033,11 +2048,12 @@ fn resumable_for_disc(cfg: &Config, display_name: &str) -> Option<Resumable> {
 /// action (the disc has been scanned, so its name is in STATE).
 fn resumable_for_device(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<Resumable> {
     let cfg_read = cfg.read().ok()?.clone();
-    let display_name = STATE
-        .lock()
-        .ok()
-        .and_then(|s| s.get(device).map(|rs| rs.disc_name.clone()))?;
-    resumable_for_disc(&cfg_read, &display_name)
+    let (display_name, disc_label) = {
+        let s = STATE.lock().ok()?;
+        let rs = s.get(device)?;
+        (rs.disc_name.clone(), rs.disc_label.clone())
+    };
+    resumable_for_disc(&cfg_read, &display_name, &disc_label)
 }
 
 /// RAII guard that unregisters a device's halt-map entry on drop. Created
@@ -2547,7 +2563,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
     let ext = output_extension_for(&output_format, &disc);
 
-    let staging = cfg_read.staging_device_dir(&crate::util::sanitize_path_compact(&display_name));
+    // `disc_name` is the RAW volume label (meta_title, else volume_id) — the
+    // same value `DiscId::name()` gives the scan path, and the only thing that
+    // distinguishes two discs of a boxset behind their one shared TMDB title.
+    // The dir this resolves to must agree exactly with the one
+    // `disc_already_completed` / `find_resumable_for_disc` looked at a moment
+    // ago, which is why both go through `staging::staging_basename`.
+    let staging = cfg_read.staging_device_dir(&staging::staging_basename(
+        std::path::Path::new(&cfg_read.staging_dir),
+        &display_name,
+        &disc_name,
+    ));
     if let Err(e) = std::fs::create_dir_all(&staging) {
         // Bail loudly instead of pressing on: a missing staging dir
         // makes the free-space preflight skip its check and the sweep
@@ -2562,6 +2588,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         unregister_halt(device);
         return;
     }
+    // Stamp the dir with this disc's raw volume label so the NEXT disc of the
+    // same boxset — same TMDB title, different disc — is routed to its own dir
+    // instead of reading this one's `.completed` and being skipped unread.
+    // Also adopts a legacy dir that predates labels: it matches every disc
+    // until someone claims it, and the disc ripping into it now is the owner.
+    // Never overwrites an existing, different label (see `adopt_disc_label`).
+    staging::adopt_disc_label(std::path::Path::new(&staging), &disc_name);
     // Write the `.sweeping` in-progress marker immediately after the staging
     // dir exists, before Pass 1. This governs the whole multi-hour sweep+patch
     // window: without it the dir has only ISO+mapfile until `.ripped`, so a
@@ -2578,6 +2611,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let _sweeping_guard = SweepingGuard {
         staging: std::path::PathBuf::from(&staging),
     };
+    // FILE names inside the staging dir, NOT the dir basename — deliberately
+    // plain `sanitize(display_name)`, with no `_2` disc suffix. The dir already
+    // separates the discs, so these are unambiguous on disk, and two things
+    // break if they take the suffix: `resume::delete_partial_output` looks for
+    // `<dir>/<display_name>.<ext>` when clearing a partial mux, and the mover's
+    // TV/fallback branches derive the DELIVERED filename from the staged
+    // filename (the movie branch rebuilds it from the TMDB title). Whether the
+    // suffix should reach output naming is a separate decision — see the mover.
     let filename = format!(
         "{}.{}",
         crate::util::sanitize_path_compact(&display_name),
@@ -2588,6 +2629,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // once here from `staging` + `display_name`. Only the `max_retries > 0`
     // branch writes/reads these; single-pass rips never produce an ISO. They
     // were previously rebuilt at ~5 sites scattered through this function.
+    // Plain title, no disc suffix — same reasoning as `filename` above.
     let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
     let iso_path_str = format!("{staging}/{iso_filename}");
     let mapfile_path_str = format!("{iso_path_str}.mapfile");
@@ -2608,6 +2650,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             status: "ripping".to_string(),
             disc_present: true,
             disc_name: display_name.clone(),
+            // Set explicitly rather than relying on `update_state`'s carry —
+            // an operator title override changes `disc_name` mid-flight, which
+            // (correctly) suppresses the carry, and the label must survive it.
+            disc_label: disc_name.clone(),
             disc_format: disc_format.clone(),
             output_file: filename.clone(),
             tmdb_title: tmdb_title.clone(),
@@ -9146,7 +9192,7 @@ mod tests {
         freemkv_engine::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
 
         assert_eq!(
-            resumable_for_disc(&cfg, display_name),
+            resumable_for_disc(&cfg, display_name, ""),
             Some(Resumable::Sweep),
         );
     }
@@ -9180,14 +9226,14 @@ mod tests {
             freemkv_engine::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
             // Sanity: without the terminal/held marker it IS Sweep-resumable.
             assert_eq!(
-                resumable_for_disc(&cfg, display_name),
+                resumable_for_disc(&cfg, display_name, ""),
                 Some(Resumable::Sweep),
                 "precondition: partial sweep is resumable before {marker}"
             );
             // …but a terminal/held marker blocks the Resume affordance entirely.
             std::fs::write(disc_dir.join(marker), b"{}").unwrap();
             assert_eq!(
-                resumable_for_disc(&cfg, display_name),
+                resumable_for_disc(&cfg, display_name, ""),
                 None,
                 "{marker} must suppress the Resume affordance (operator must Wipe)"
             );
@@ -9221,14 +9267,14 @@ mod tests {
             freemkv_engine::Mapfile::create(&mapfile_path, 4096, "test").unwrap();
             // Sanity: without the worker-owned marker it IS Sweep-resumable.
             assert_eq!(
-                resumable_for_disc(&cfg, display_name),
+                resumable_for_disc(&cfg, display_name, ""),
                 Some(Resumable::Sweep),
                 "precondition: partial sweep is resumable before {marker}"
             );
             // …but a worker-owned marker blocks the Resume affordance entirely.
             std::fs::write(disc_dir.join(marker), b"{}").unwrap();
             assert_eq!(
-                resumable_for_disc(&cfg, display_name),
+                resumable_for_disc(&cfg, display_name, ""),
                 None,
                 "{marker} must suppress Resume (mux worker owns the dir)"
             );
@@ -10016,6 +10062,130 @@ mod tests {
             staging_dir: staging_root.to_string_lossy().into_owned(),
             ..Default::default()
         }))
+    }
+
+    /// As [`seed_scanned_disc`], but also records the disc's RAW volume label —
+    /// what the drive thread puts in `RipState::disc_label` at identify time,
+    /// and the only thing that tells two discs of a boxset apart.
+    fn seed_scanned_disc_labelled(
+        device: &str,
+        disc_name: &str,
+        disc_label: &str,
+        staging_root: &std::path::Path,
+    ) -> std::sync::Arc<std::sync::RwLock<crate::config::Config>> {
+        let cfg = seed_scanned_disc(device, disc_name, staging_root);
+        super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(device.to_string())
+            .and_modify(|s| s.disc_label = disc_label.to_string());
+        cfg
+    }
+
+    /// THE boxset bug: insert disc 2 after disc 1 has finished and disc 2 is
+    /// silently never ripped.
+    ///
+    /// `tmdb::clean_title` strips "disc 1".."disc 4" before the lookup, so every
+    /// disc of a set resolves to ONE title. The staging dir was named from that
+    /// title alone, so `disc_already_completed` found disc 1's `.completed`,
+    /// logged "already ripped — skipping", and the drive never read disc 2.
+    /// With `on_insert=rip` that is the product's core workflow failing silently.
+    ///
+    /// The other half matters just as much: re-inserting the SAME disc must
+    /// still land on its own dir. If it didn't, every container restart with a
+    /// disc in the drive would re-sweep a finished rip.
+    #[test]
+    fn disc_two_of_a_boxset_is_not_skipped_as_already_ripped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // One TMDB title, because clean_title already stripped "Disc N".
+        let title = "Boxset Movie";
+        let d1 = "sg_boxset_disc1_test";
+        let d2 = "sg_boxset_disc2_test";
+
+        // ── Disc 1 rips to completion ────────────────────────────────────
+        let cfg1 = seed_scanned_disc_labelled(d1, title, "BOXSET_DISC_1", root);
+        let base1 = {
+            let c = cfg1.read().unwrap();
+            super::staging_basename_for_device(&c, d1).expect("disc 1 has a staging basename")
+        };
+        assert_eq!(
+            base1,
+            crate::util::sanitize_path_compact(title),
+            "the first disc keeps the plain TMDB-title dir — display and output \
+             naming must not change"
+        );
+        staging_disc_with_markers(root, &base1, &[".completed"]);
+        staging::write_disc_label(&root.join(&base1), "BOXSET_DISC_1");
+
+        // Same disc back in the drive (container restart, disc still loaded):
+        // it must find ITS OWN dir and still be recognised as finished.
+        assert!(
+            super::disc_already_completed(&cfg1, d1),
+            "re-inserting the SAME disc must still resolve to its own completed \
+             dir — otherwise every restart re-sweeps a finished rip"
+        );
+
+        // ── Disc 2 goes in ───────────────────────────────────────────────
+        let cfg2 = seed_scanned_disc_labelled(d2, title, "BOXSET_DISC_2", root);
+        assert!(
+            !super::disc_already_completed(&cfg2, d2),
+            "disc 2 of a boxset shares disc 1's TMDB title but is a DIFFERENT \
+             disc: it must be ripped, not skipped as already completed"
+        );
+        let base2 = {
+            let c = cfg2.read().unwrap();
+            super::staging_basename_for_device(&c, d2).expect("disc 2 has a staging basename")
+        };
+        assert_ne!(
+            base2, base1,
+            "disc 2 must not be handed disc 1's staging dir — the raw volume \
+             label is what distinguishes them"
+        );
+
+        // And it isn't offered disc 1's staging to resume onto either.
+        assert!(
+            !super::disc_owned_by_worker(&cfg2, d2),
+            "disc 2 must not inherit disc 1's worker-ownership verdict"
+        );
+
+        forget_device(d1);
+        forget_device(d2);
+    }
+
+    /// The upgrade path: a staging dir written before `.disc-label` existed
+    /// carries no label, so it must keep reading as "this disc" — an upgrade
+    /// must not re-rip finished staging or orphan a partial one. The first disc
+    /// to rip into it adopts it, and only THEN does a different disc move aside.
+    #[test]
+    fn a_legacy_unlabelled_staging_dir_still_counts_as_the_inserted_disc() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let device = "sg_boxset_legacy_test";
+        let title = "Legacy Movie";
+        let sanitized = crate::util::sanitize_path_compact(title);
+
+        // Pre-upgrade staging: `.completed`, no `.disc-label`.
+        staging_disc_with_markers(root, &sanitized, &[".completed"]);
+
+        let cfg = seed_scanned_disc_labelled(device, title, "LEGACY_DISC_1", root);
+        assert!(
+            super::disc_already_completed(&cfg, device),
+            "an unlabelled legacy dir must still stop the unattended path \
+             re-ripping a disc it already finished"
+        );
+
+        // Once adopted, the sibling disc gets its own dir.
+        staging::adopt_disc_label(&root.join(&sanitized), "LEGACY_DISC_1");
+        let other = "sg_boxset_legacy_sibling_test";
+        let cfg2 = seed_scanned_disc_labelled(other, title, "LEGACY_DISC_2", root);
+        assert!(
+            !super::disc_already_completed(&cfg2, other),
+            "after adoption, a different disc of the same title must rip"
+        );
+
+        forget_device(device);
+        forget_device(other);
     }
 
     fn forget_device(device: &str) {
