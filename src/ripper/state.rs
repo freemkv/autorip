@@ -455,12 +455,59 @@ pub fn update_state_with<F: FnOnce(&mut RipState)>(device: &str, f: F) {
 /// concurrent writes to one staging dir). Poison-recovers like the rest of this
 /// module. The caller may follow with a full `update_state` to populate the
 /// remaining fields — the claim has already made the device read as busy.
+///
+/// Thin wrapper over [`try_claim_active_checked`] with `known = true` —
+/// every existing call site (the poll loop's own enumerated device list;
+/// `handle_scan`/`handle_rip`/`handle_eject` in web.rs) is left with
+/// identical behaviour. See `try_claim_active_checked`'s doc for why a
+/// caller that has NOT independently verified the device is a real,
+/// enumerated drive must use that function instead.
 pub fn try_claim_active(device: &str) -> bool {
+    try_claim_active_checked(device, true)
+}
+
+/// Same contract as [`try_claim_active`], but `known` tells it whether the
+/// caller has already verified `device` names a real, currently-enumerated
+/// drive. When `known` is `false` and the device has no existing STATE
+/// entry, the claim is refused instead of creating one.
+///
+/// Why this matters: `device` on the web path is caller-supplied (the URL
+/// segment of `/api/scan/{device}`, `/api/rip/{device}`,
+/// `/api/eject/{device}`) and is only shape-checked by
+/// `web.rs::is_valid_device_name` — a 3..=64-character ASCII-alphanumeric
+/// check, explicitly documented there as NOT an existence check. This
+/// server binds `0.0.0.0:8080` with no authentication, so any LAN host can
+/// loop `POST /api/scan/<random-alnum-name>`. Before this guard, every such
+/// call reached the old `try_claim_active`'s `.entry(...).or_insert_with(..)`
+/// and created a brand-new, permanent `RipState` — and, once `handle_scan`'s
+/// `spawn_rip_thread` follows a successful claim, a permanent `JoinHandle` in
+/// `session::RIP_THREADS` too. Nothing ever prunes either: the hot-unplug
+/// sweep in `drive_poll_loop` only removes devices that were previously in
+/// its own enumerated `drive_paths` list, and a forged name never enters
+/// that list. The two maps would grow without bound until the process is
+/// OOM-killed.
+///
+/// A device that legitimately exists always has a STATE entry already —
+/// `drive_poll_loop` pushes one (idle or with a disc) on every poll tick for
+/// every device it enumerates, before the operator can ever see it in the
+/// dashboard (the UI only offers Scan/Rip/Eject for devices `/api/state`
+/// already reports) — so gating the *new-entry* path on `known` does not
+/// affect any real device, only a name nothing has ever enumerated.
+///
+/// `known` should be `true` for the poll loop's own internal claim (its
+/// `device` always comes from a just-enumerated `drive_paths` entry) and for
+/// any caller that has cross-checked `device` against the live drive list.
+/// Callers that receive `device` verbatim from an untrusted request and
+/// have NOT done that cross-check must pass `false`.
+pub fn try_claim_active_checked(device: &str, known: bool) -> bool {
     let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if s.get(device)
         .map(|r| r.status == "scanning" || r.status == "ripping")
         .unwrap_or(false)
     {
+        return false;
+    }
+    if !known && !s.contains_key(device) {
         return false;
     }
     let entry = s.entry(device.to_string()).or_insert_with(|| RipState {
@@ -622,7 +669,7 @@ pub(super) struct PassProgressState {
     /// `PassProgressState` is built per pass, so this anchors cleanly each pass.
     pub(super) speed: freemkv_engine::SpeedEstimator,
     /// Wall-clock of the last throttled callback. The progress closure
-    /// checks this to skip work when less than 1.5 s have passed.
+    /// checks this to skip work when less than 250 ms have passed.
     pub(super) last_update: std::time::Instant,
     /// Wall-clock of the last device-log line emitted from this pass.
     pub(super) last_log: std::time::Instant,
@@ -1237,6 +1284,11 @@ mod tests {
         assert_eq!(snap.preferred_batch, 60, "preferred_batch wiped");
         assert_eq!(snap.progress_pct, 42, "new field not applied");
         assert_eq!(snap.status, "ripping", "new field not applied");
+        // update_state_with's or_insert_with builds `RipState { device:
+        // device.to_string(), ..Default::default() }` for a brand-new entry
+        // — that field is independent of the HashMap key above, so assert
+        // it directly.
+        assert_eq!(snap.device, dev, "device field not set on first insert");
     }
 
     fn minimal_pass_ctx(device: &str) -> PassContext {
@@ -1458,6 +1510,437 @@ mod tests {
         assert!(
             !is_in_cooldown(dev),
             "device must not read as in cooldown after eviction"
+        );
+    }
+
+    #[test]
+    fn try_claim_active_checked_refuses_unknown_device_and_state_does_not_grow() {
+        // Security: `/api/scan/{device}`, `/api/rip/{device}`, and
+        // `/api/eject/{device}` are unauthenticated and reachable from any
+        // LAN host; `device` is only shape-checked (3..=64 ASCII
+        // alphanumeric), never checked against the real drive list. Before
+        // this guard, `try_claim_active` unconditionally inserted a brand
+        // new permanent RipState for ANY such name, and nothing ever prunes
+        // an entry for a device that was never actually enumerated (the
+        // hot-unplug sweep only removes devices that were in its own
+        // enumerated list). A caller looping fabricated names could grow
+        // STATE (and, via a successful claim unlocking spawn_rip_thread,
+        // RIP_THREADS) without bound. Pin: an unknown device with
+        // known=false must be refused, and must leave no trace in STATE.
+        let dev = format!("test-forged-device-{}-xyz", std::process::id());
+        assert!(
+            STATE.lock().unwrap().get(&dev).is_none(),
+            "precondition: device must not already exist"
+        );
+
+        assert!(
+            !try_claim_active_checked(&dev, false),
+            "an unknown device must not be claimable"
+        );
+        assert!(
+            STATE.lock().unwrap().get(&dev).is_none(),
+            "refusing the claim must not have inserted a STATE entry \
+             (else looping forged names grows STATE without bound)"
+        );
+
+        // Looping the same forged name must not eventually succeed either.
+        for _ in 0..5 {
+            assert!(!try_claim_active_checked(&dev, false));
+        }
+        assert!(
+            STATE.lock().unwrap().get(&dev).is_none(),
+            "repeated attempts on an unknown device must never insert an entry"
+        );
+    }
+
+    #[test]
+    fn try_claim_active_checked_allows_known_true_for_new_device() {
+        // known=true is exactly today's try_claim_active behaviour (used by
+        // the poll loop's own trusted, just-enumerated device list) — must
+        // still create a fresh entry and succeed.
+        let dev = format!("test-known-new-{}", std::process::id());
+        assert!(try_claim_active_checked(&dev, true));
+        let snap = STATE.lock().unwrap().get(&dev).cloned().unwrap();
+        assert_eq!(snap.status, "scanning");
+        // The map key and the RipState.device field are independent — the
+        // struct literal's `device: device.to_string()` could be deleted
+        // (falling back to Default's "") without affecting the HashMap
+        // lookup above. Assert it explicitly.
+        assert_eq!(
+            snap.device, dev,
+            "device field in the freshly-inserted RipState must match"
+        );
+    }
+
+    #[test]
+    fn try_claim_active_checked_allows_unknown_flag_once_device_already_present() {
+        // A real device always has a STATE entry before an operator can act
+        // on it (the poll loop pushes one every tick for every enumerated
+        // drive, and the UI only offers Scan/Rip/Eject for devices
+        // /api/state already reports) — so `known=false` must not block a
+        // second legitimate claim on a device that is already known to
+        // STATE by other means (e.g. idle after a previous rip).
+        let dev = format!("test-known-existing-{}", std::process::id());
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "idle".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            try_claim_active_checked(&dev, false),
+            "a device already present in STATE must remain claimable even \
+             when the caller couldn't independently verify it"
+        );
+    }
+
+    #[test]
+    fn try_claim_active_rejects_second_claim_on_busy_device() {
+        // HIGH (rule 1/2): try_claim_active's whole purpose is to refuse a
+        // second claim on a device that is already scanning/ripping,
+        // closing the double-rip TOCTOU. No existing test calls it twice on
+        // the same device — every test only checks the first call
+        // succeeds. `r.status == "scanning" || r.status == "ripping"`
+        // mutated to `&&` can never be true for one string, silently
+        // disabling the whole guard.
+        let dev = format!("test-doubleclaim-{}", std::process::id());
+        assert!(
+            try_claim_active(&dev),
+            "first claim on a fresh device must succeed"
+        );
+        assert!(
+            !try_claim_active(&dev),
+            "a second claim on an already-scanning device must be refused"
+        );
+    }
+
+    #[test]
+    fn update_state_carries_forward_zero_claim_gen() {
+        // MEDIUM (concurrency): callers build a fresh RipState with
+        // `..Default::default()` (claim_gen = 0) for almost every push; if
+        // update_state didn't carry the real generation forward, every
+        // ordinary state push after try_claim_active would silently reset
+        // claim_gen to 0, defeating the stale-worker-detach guard the
+        // generation exists for.
+        let dev = format!("test-claimgen-carry-{}", std::process::id());
+        assert!(try_claim_active(&dev), "claim bumps claim_gen to 1");
+        // A normal mid-rip push, exactly as push_pass_state/set_pass_progress
+        // build it: claim_gen defaults to 0 via ..Default::default().
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "ripping".to_string(),
+                ..Default::default()
+            },
+        );
+        let snap = STATE.lock().unwrap().get(&dev).cloned().unwrap();
+        assert_eq!(
+            snap.claim_gen, 1,
+            "claim_gen must be carried forward from the prior push, not reset to 0"
+        );
+    }
+
+    #[test]
+    fn update_state_does_not_clobber_explicit_nonzero_claim_gen() {
+        // Companion to the above: a caller that DOES set a real nonzero
+        // claim_gen explicitly (not the ..Default::default() zero) must
+        // have that value stored verbatim, not overwritten by the
+        // previous push's generation.
+        let dev = format!("test-claimgen-explicit-{}", std::process::id());
+        assert!(try_claim_active(&dev)); // claim_gen -> 1
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "ripping".to_string(),
+                claim_gen: 99,
+                ..Default::default()
+            },
+        );
+        let snap = STATE.lock().unwrap().get(&dev).cloned().unwrap();
+        assert_eq!(
+            snap.claim_gen, 99,
+            "an explicit nonzero claim_gen must not be overwritten by the carried-forward value"
+        );
+    }
+
+    #[test]
+    fn take_title_override_returns_and_clears_the_override() {
+        // set_title_override / take_title_override are otherwise only
+        // exercised via forget_device_state's eviction test, which never
+        // calls take_title_override at all — so a `take_title_override` ->
+        // `()` mutant (return type would fail to compile, but a body ->
+        // `None` mutant) or a `set_title_override` -> `()` mutant both pass
+        // the whole suite today.
+        let dev = format!("/dev/test-override-{}", std::process::id());
+        assert!(take_title_override(&dev).is_none(), "no override set yet");
+        let picked = crate::tmdb::TmdbResult {
+            title: "Override Title".to_string(),
+            year: 1999,
+            poster_url: String::new(),
+            overview: String::new(),
+            media_type: "movie".to_string(),
+        };
+        set_title_override(&dev, picked.clone());
+        let taken = take_title_override(&dev).expect("override must be present after set");
+        assert_eq!(taken.title, "Override Title");
+        assert_eq!(taken.year, 1999);
+        // take clears it — a second take must come back empty.
+        assert!(
+            take_title_override(&dev).is_none(),
+            "take_title_override must remove the entry, not just read it"
+        );
+    }
+
+    #[test]
+    fn device_known_reflects_state_membership() {
+        let dev = format!("test-deviceknown-{}", std::process::id());
+        assert!(
+            !device_known(&dev),
+            "unclaimed device must not read as known"
+        );
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "idle".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            device_known(&dev),
+            "device with a STATE entry must read as known"
+        );
+    }
+
+    #[test]
+    fn current_disc_name_none_when_empty_some_when_set() {
+        let dev = format!("test-discname-{}", std::process::id());
+        assert_eq!(
+            current_disc_name(&dev),
+            None,
+            "unknown device must report no disc name"
+        );
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "ripping".to_string(),
+                disc_name: "MY_MOVIE_UHD".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            current_disc_name(&dev),
+            Some("MY_MOVIE_UHD".to_string()),
+            "current_disc_name must return the live disc_name"
+        );
+        // An empty disc_name must read as None (the Accept-damage handler
+        // treats an empty name as "no staging dir to find"), not Some("").
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "ripping".to_string(),
+                disc_name: String::new(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            current_disc_name(&dev),
+            None,
+            "empty disc_name must read as None, not Some(\"\")"
+        );
+    }
+
+    #[test]
+    fn push_pass_state_preserves_every_damage_indicator_field() {
+        // HIGH (rule 1) — by far the largest survivor cluster in this file:
+        // push_pass_state builds a ~40-field RipState struct literal ending
+        // in `..Default::default()`. Deleting ANY one named field from that
+        // literal (cargo-mutants' "delete field X from struct expression")
+        // makes the field silently fall back to RipState::default()'s
+        // zero/empty value. No existing test reads push_pass_state's output
+        // back field-by-field, so ~30 of those deletions passed the whole
+        // suite untouched. The fields checked here are exactly the ones the
+        // UI/API use to tell a damaged rip from a clean one: if any of them
+        // regressed to Default, a disc actively losing sectors would
+        // present as if it had none.
+        let dev = format!("test-pps-fields-{}", std::process::id());
+        let mut ctx = minimal_pass_ctx(&dev);
+        // Give the metadata pass-through fields non-default values too —
+        // `minimal_pass_ctx`'s empty-string/0 defaults are indistinguishable
+        // from `RipState::default()`, so a field-deletion mutant on
+        // tmdb_title/year/poster/overview/media_type/duration/codecs would
+        // be invisible against them.
+        ctx.tmdb_title = "Example Movie".to_string();
+        ctx.tmdb_year = 2024;
+        ctx.tmdb_poster = "https://example/poster.jpg".to_string();
+        ctx.tmdb_overview = "An example overview.".to_string();
+        ctx.tmdb_media_type = "movie".to_string();
+        ctx.duration = "2:15:00".to_string();
+        ctx.codecs = "HEVC/DTS-HD".to_string();
+        let pass_state = std::cell::RefCell::new(PassProgressState::new());
+        // Mirrors what the real caller (mod.rs's sweep/patch progress
+        // closures) does before invoking push_pass_state: seed the
+        // per-pass work_done/work_total the library just reported.
+        {
+            let mut s = pass_state.borrow_mut();
+            s.last_work_done = 1_000_000;
+            s.last_work_total = 2_000_000;
+        }
+
+        let located = libfreemkv::progress::LocatedProgress {
+            ranges: vec![libfreemkv::progress::LocatedRange {
+                lba: 12345,
+                count: 7,
+                duration_ms: 42.0,
+                chapter: Some(3),
+                time_offset_secs: Some(120.0),
+            }],
+            num_ranges: 1,
+            truncated: 3,
+            main_at_risk_ms: 999.0,
+            largest_gap_ms: 888.0,
+        };
+        let p = libfreemkv::progress::PassProgress {
+            kind: libfreemkv::progress::PassKind::Sweep,
+            work_done: 1_000_000,
+            work_total: 2_000_000,
+            bytes_good_total: 500_000,
+            bytes_unreadable_total: 20_480, // 10 sectors * 2048
+            bytes_pending_total: 4_096,
+            bytes_retryable_total: 4_096,
+            bytes_total_disc: ctx.bytes_total_disc,
+            disc_duration_secs: None,
+            bytes_bad_in_main_title: 20_480,
+            main_title_duration_secs: None,
+            main_title_size_bytes: None,
+            located,
+        };
+
+        push_pass_state(&ctx, &p, 2048.0, 3, 7, &pass_state);
+
+        let snap = STATE
+            .lock()
+            .unwrap()
+            .get(&dev)
+            .cloned()
+            .expect("push_pass_state must insert an entry for the device");
+
+        assert_eq!(snap.device, dev, "device field dropped to Default");
+        assert_eq!(snap.status, "ripping", "status field dropped to Default");
+        assert!(snap.disc_present, "disc_present field dropped to Default");
+        assert_eq!(
+            snap.disc_name, "Test Disc",
+            "disc_name field dropped to Default"
+        );
+        assert_eq!(
+            snap.disc_format, "uhd",
+            "disc_format field dropped to Default"
+        );
+        assert_eq!(
+            snap.output_file, "test.mkv",
+            "output_file field dropped to Default"
+        );
+        assert_eq!(snap.pass, 3, "pass field dropped to Default");
+        assert_eq!(
+            snap.total_passes, 7,
+            "total_passes field dropped to Default"
+        );
+        assert_eq!(
+            snap.bytes_good, 500_000,
+            "bytes_good field dropped to Default"
+        );
+        assert_eq!(
+            snap.bytes_maybe, 4_096,
+            "bytes_maybe field dropped to Default"
+        );
+        assert_eq!(
+            snap.bytes_lost, 20_480,
+            "bytes_lost field dropped to Default"
+        );
+        assert_eq!(
+            snap.bytes_total_disc, ctx.bytes_total_disc,
+            "bytes_total_disc field dropped to Default"
+        );
+        assert_eq!(
+            snap.num_bad_ranges, 1,
+            "num_bad_ranges field dropped to Default"
+        );
+        assert_eq!(
+            snap.bad_ranges_truncated, 3,
+            "bad_ranges_truncated field dropped to Default"
+        );
+        assert_eq!(
+            snap.bad_ranges.len(),
+            1,
+            "bad_ranges field dropped to Default"
+        );
+        assert_eq!(
+            snap.bad_ranges[0].lba, 12345,
+            "bad_ranges content lost across the DTO mapping"
+        );
+        assert!(
+            (snap.main_at_risk_ms - 999.0).abs() < 0.001,
+            "main_at_risk_ms field dropped to Default"
+        );
+        assert!(
+            (snap.largest_gap_ms - 888.0).abs() < 0.001,
+            "largest_gap_ms field dropped to Default"
+        );
+        assert_eq!(
+            snap.errors, 10,
+            "errors field dropped to Default (bytes_lost / SECTOR_BYTES)"
+        );
+        assert!(
+            snap.total_lost_ms > 0.0,
+            "total_lost_ms field dropped to Default"
+        );
+        assert_eq!(
+            snap.preferred_batch, 32,
+            "preferred_batch field dropped to Default"
+        );
+        assert_eq!(
+            snap.current_batch, 32,
+            "current_batch field dropped to Default"
+        );
+        assert_eq!(
+            snap.last_sector,
+            1_000_000 / SECTOR_BYTES,
+            "last_sector field dropped to Default"
+        );
+        assert_eq!(
+            snap.progress_pct, 50,
+            "progress_pct field dropped to Default (1_000_000 / 2_000_000)"
+        );
+        assert_eq!(
+            snap.tmdb_title, "Example Movie",
+            "tmdb_title field dropped to Default"
+        );
+        assert_eq!(snap.tmdb_year, 2024, "tmdb_year field dropped to Default");
+        assert_eq!(
+            snap.tmdb_poster, "https://example/poster.jpg",
+            "tmdb_poster field dropped to Default"
+        );
+        assert_eq!(
+            snap.tmdb_overview, "An example overview.",
+            "tmdb_overview field dropped to Default"
+        );
+        assert_eq!(
+            snap.tmdb_media_type, "movie",
+            "tmdb_media_type field dropped to Default"
+        );
+        assert_eq!(
+            snap.duration, "2:15:00",
+            "duration field dropped to Default"
+        );
+        assert_eq!(
+            snap.codecs, "HEVC/DTS-HD",
+            "codecs field dropped to Default"
         );
     }
 }

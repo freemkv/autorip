@@ -547,7 +547,7 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
         // device node, so it is by definition the same drive. Accept
         // without a disc-identity read (which would be a redundant probe
         // of a drive we already trust).
-        if delta == 0 {
+        if path_unchanged(delta) {
             tracing::info!(
                 device = %device,
                 new_path = %path,
@@ -569,16 +569,18 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
             return Some(path);
         };
 
-        match probe_volume_id(&path) {
-            Some(vid) if vid == expected => {
-                tracing::info!(
-                    device = %device,
-                    new_path = %path,
-                    volume_id = %vid,
-                    "rediscovered drive after USB re-enumeration (disc identity confirmed)"
-                );
-                return Some(path);
-            }
+        let probed = probe_volume_id(&path);
+        if candidate_identity_confirmed(probed.as_deref(), expected) {
+            let vid = probed.as_deref().unwrap_or_default();
+            tracing::info!(
+                device = %device,
+                new_path = %path,
+                volume_id = %vid,
+                "rediscovered drive after USB re-enumeration (disc identity confirmed)"
+            );
+            return Some(path);
+        }
+        match probed {
             Some(vid) => {
                 tracing::warn!(
                     device = %device,
@@ -598,6 +600,28 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
         }
     }
     None
+}
+
+/// True when a rediscovery probe's sg-number delta indicates the candidate
+/// path did not change from the original — i.e. it's definitionally the
+/// same physical device node, not a shifted candidate needing disc-identity
+/// verification. Extracted from [`rediscover_drive`] so the branch decision
+/// is unit-testable without the surrounding real-hardware probe loop
+/// (`libfreemkv::drive_has_disc`).
+fn path_unchanged(delta: i32) -> bool {
+    delta == 0
+}
+
+/// Whether a shifted-sg rediscovery candidate's probed volume id confirms it
+/// carries the expected disc. `probed` is `None` when the identity read
+/// itself failed (drive not ready, no volume label, etc.). Extracted from
+/// `rediscover_drive` so the accept/reject decision — "does this candidate
+/// carry the SAME disc, or could it be an unrelated one in a neighbouring
+/// bay" — is unit-testable without real drive I/O, which the enclosing
+/// function otherwise requires end-to-end (`drive_has_disc`,
+/// `probe_volume_id` both talk to hardware).
+fn candidate_identity_confirmed(probed: Option<&str>, expected: &str) -> bool {
+    probed == Some(expected)
 }
 
 /// Read the UDF Volume Identifier of the disc currently in the drive at
@@ -656,6 +680,83 @@ mod rollback_tests {
         assert_eq!(snap.status, "idle", "must roll back to idle");
         assert!(snap.disc_present, "disc still present after rollback");
         assert!(!super::super::is_busy(&dev), "device no longer busy");
+        // rollback_failed_spawn builds its own `RipState { device: ...,
+        // status: "idle", disc_present: true, ..Default::default() }`
+        // literal — the map lookup above only proves the KEY is right, not
+        // that the struct's own `device` field survived. Assert it too.
+        assert_eq!(
+            snap.device, dev,
+            "device field in the rollback RipState must match"
+        );
+    }
+
+    #[test]
+    fn swap_halt_carrying_cancel_carries_forward_a_pending_cancel() {
+        // HIGH-ish (rule 3, TOCTOU): swap_halt_carrying_cancel exists
+        // specifically so a Stop that lands on the OUTGOING placeholder
+        // token between rip_disc allocating it and swapping in the real
+        // one is not lost. No existing test calls it at all. Pin both
+        // halves of the contract: (1) a cancelled outgoing token's Stop
+        // carries onto the incoming token, and (2) an un-cancelled
+        // outgoing token does NOT spuriously cancel the incoming one.
+        let dev = format!("swap-halt-test-{}", std::process::id());
+
+        // Case 1: outgoing token already cancelled (a Stop raced the swap).
+        let placeholder = Halt::new();
+        super::super::register_halt(&dev, placeholder.clone());
+        placeholder.cancel();
+        let real = Halt::new();
+        super::super::swap_halt_carrying_cancel(&dev, real.clone());
+        assert!(
+            real.is_cancelled(),
+            "a Stop that landed on the outgoing placeholder must carry \
+             forward onto the freshly-swapped-in token, or the drain hangs \
+             waiting for a Halt nobody ever cancels"
+        );
+
+        // Case 2: outgoing token NOT cancelled — the new token must stay
+        // live, not get spuriously cancelled by the swap itself.
+        let dev2 = format!("swap-halt-test-clean-{}", std::process::id());
+        let placeholder2 = Halt::new();
+        super::super::register_halt(&dev2, placeholder2);
+        let real2 = Halt::new();
+        super::super::swap_halt_carrying_cancel(&dev2, real2.clone());
+        assert!(
+            !real2.is_cancelled(),
+            "swapping in a new Halt must not cancel it when nothing asked \
+             to stop"
+        );
+    }
+
+    #[test]
+    fn path_unchanged_only_for_zero_delta() {
+        // rediscover_drive's delta==0 fast path skips disc-identity
+        // verification entirely (same physical device node => trusted by
+        // construction). Any nonzero delta is a SHIFTED candidate and must
+        // go through the identity check instead.
+        assert!(path_unchanged(0));
+        assert!(!path_unchanged(1));
+        assert!(!path_unchanged(-1));
+        assert!(!path_unchanged(3));
+    }
+
+    #[test]
+    fn candidate_identity_confirmed_requires_exact_match() {
+        // The whole point of the disc-identity check rediscover_drive relies
+        // on: a shifted-sg candidate is only accepted if its probed volume
+        // id EXACTLY matches the expected one. A failed probe (None) or a
+        // different disc's id must both be rejected — accepting either
+        // would let a neighbouring drive's unrelated disc silently take
+        // over an in-flight rip's session after a USB re-enumeration.
+        assert!(candidate_identity_confirmed(
+            Some("DISC_VOL_123"),
+            "DISC_VOL_123"
+        ));
+        assert!(!candidate_identity_confirmed(
+            Some("SOME_OTHER_DISC"),
+            "DISC_VOL_123"
+        ));
+        assert!(!candidate_identity_confirmed(None, "DISC_VOL_123"));
     }
 
     /// Regression: `take_session` and `drop_session` must recover from a
