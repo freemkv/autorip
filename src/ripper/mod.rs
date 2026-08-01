@@ -30,11 +30,13 @@ pub use session::{
     register_rip_thread, rollback_failed_spawn, spawn_rip_thread, stop_and_drain,
     swap_halt_carrying_cancel, take_rip_thread, unregister_halt,
 };
+#[cfg(test)]
+pub use state::state_len_for_test;
 #[allow(unused_imports)]
 pub use state::{
     BadRange, Resumable, RipState, STATE, current_disc_name, device_known, is_busy,
-    set_stop_cooldown, set_title_override, take_title_override, try_claim_active, update_state,
-    update_state_with,
+    set_stop_cooldown, set_title_override, take_title_override, try_claim_active,
+    try_claim_active_checked, update_state, update_state_with,
 };
 
 // Internal-use imports for the orchestrator code that lives in this
