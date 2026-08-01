@@ -3874,6 +3874,43 @@ mod web_tests {
             assert!(body.contains("invalid device name"));
         }
 
+        /// A shape-VALID but nonexistent device name must not create state.
+        ///
+        /// `/api/scan`, `/api/rip` and `/api/eject` are unauthenticated and
+        /// reachable from any LAN host, and `is_valid_device_name` only checks
+        /// the shape (3..=64 ASCII alphanumeric) — never that the drive exists.
+        /// `try_claim_active` used to insert a permanent STATE entry for any
+        /// such name, and `spawn_rip_thread` a permanent JoinHandle, while the
+        /// hot-unplug sweep only prunes devices it actually enumerated. Looping
+        /// `POST /api/scan/<random>` therefore grew both maps without bound
+        /// until the process was OOM-killed.
+        ///
+        /// This asserts the END-TO-END property through the real HTTP handler,
+        /// not just the helper: the guard lives in `try_claim_active_checked`,
+        /// but it is inert unless the handlers actually pass `known = false`.
+        #[test]
+        fn unauthenticated_scan_of_a_nonexistent_device_does_not_grow_state() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let before = crate::ripper::state_len_for_test();
+            for i in 0..25 {
+                let dev = format!("zznotadrive{i:03}");
+                let (code, _) = roundtrip(&cfg, "POST", &format!("/api/scan/{dev}"), None, &[]);
+                assert_ne!(
+                    code, 200,
+                    "a nonexistent device must not be accepted for scanning"
+                );
+                assert!(
+                    !crate::ripper::device_known(&dev),
+                    "no STATE entry may be created for unknown device {dev}"
+                );
+            }
+            assert_eq!(
+                crate::ripper::state_len_for_test(),
+                before,
+                "STATE must not grow by even one entry for 25 fabricated devices"
+            );
+        }
+
         #[test]
         fn stop_route_rejects_invalid_device_name() {
             let cfg = Arc::new(RwLock::new(Config::default()));
@@ -5197,7 +5234,7 @@ fn handle_sse(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
     // Atomic check-and-claim under one STATE lock — closes the TOCTOU where two
     // concurrent POSTs both pass a separate busy-check and both start a scan.
-    if !ripper::try_claim_active(device) {
+    if !ripper::try_claim_active_checked(device, false) {
         json_response(request, 409, r#"{"ok":false,"error":"busy"}"#);
         return;
     }
@@ -5260,7 +5297,7 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
     // delegated to the worker thread (it scans the disc, cheap, then picks
     // resume_remux vs rip_disc based on the staging dir), keeping scan logic in
     // one place.
-    if !ripper::try_claim_active(device) {
+    if !ripper::try_claim_active_checked(device, false) {
         json_response(request, 409, r#"{"ok":false,"error":"already ripping"}"#);
         return;
     }
@@ -5362,7 +5399,7 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
     // the stale override and mux a rip whose loss was never actually
     // accepted for that run — a damaged rip filed as finished with no
     // operator confirmation for that abort.
-    if !ripper::try_claim_active(device) {
+    if !ripper::try_claim_active_checked(device, false) {
         json_response(request, 409, r#"{"ok":false,"error":"already ripping"}"#);
         return;
     }
@@ -5615,7 +5652,7 @@ fn handle_eject(request: tiny_http::Request, device: &str) {
     // the device is already scanning/ripping, and once it has claimed the device
     // (status="scanning") any concurrent rip-start's claim fails for the duration
     // of the eject. The idle reset below releases the claim.
-    if !ripper::try_claim_active(device) {
+    if !ripper::try_claim_active_checked(device, false) {
         return json_response(
             request,
             409,
