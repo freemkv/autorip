@@ -5380,20 +5380,27 @@ fn spawn_rip_after_claim(
 /// `resume_remux` honors the marker and bypasses the abort gate. Fixes the
 /// exhaust → `.failed` → wasteful full-re-rip loop.
 fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
-    let Some(disc_name) = ripper::current_disc_name(device) else {
-        json_response(
-            request,
-            404,
-            r#"{"ok":false,"error":"no disc state for device"}"#,
-        );
-        return;
-    };
+    // Resolve the staging dir through the one naming rule
+    // (`ripper::staging_basename_for_device`), not from the title alone: with a
+    // boxset in the drive the operator's Accept must arm the marker on THIS
+    // disc's dir, not on the sibling disc that happens to share its title.
     let staging = {
         let c = match cfg.read() {
             Ok(c) => c,
             Err(e) => e.into_inner(),
         };
-        c.staging_device_dir(&crate::util::sanitize_path_compact(&disc_name))
+        match ripper::staging_basename_for_device(&c, device) {
+            Some(base) => c.staging_device_dir(&base),
+            None => {
+                drop(c);
+                json_response(
+                    request,
+                    404,
+                    r#"{"ok":false,"error":"no disc state for device"}"#,
+                );
+                return;
+            }
+        }
     };
     let dir = std::path::Path::new(&staging);
     if !dir.exists() {

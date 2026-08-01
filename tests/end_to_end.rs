@@ -28,6 +28,7 @@ fn test_state_json_serialization_round_trip() {
         status: "ripping".to_string(),
         disc_present: true,
         disc_name: "TEST DISC".to_string(),
+        disc_label: "TEST_DISC_1".to_string(),
         disc_format: "bluray".to_string(),
         progress_pct: 42,
         progress_gb: 13.5,
@@ -86,6 +87,12 @@ fn test_state_json_serialization_round_trip() {
     assert_eq!(v["status"], "ripping");
     assert_eq!(v["disc_present"], true);
     assert_eq!(v["disc_name"], "TEST DISC");
+    // `disc_label` is server-side bookkeeping (which staging dir this disc
+    // owns), not dashboard data — it must stay out of the wire format.
+    assert!(
+        v.get("disc_label").is_none(),
+        "disc_label must not be serialized into the state JSON"
+    );
     assert_eq!(v["disc_format"], "bluray");
     assert_eq!(v["progress_pct"], 42);
     assert!(
