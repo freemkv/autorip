@@ -3890,24 +3890,38 @@ mod web_tests {
         /// but it is inert unless the handlers actually pass `known = false`.
         #[test]
         fn unauthenticated_scan_of_a_nonexistent_device_does_not_grow_state() {
+            // Assert per-device, never on the total STATE size. STATE is a
+            // process-global and the suite runs in parallel, so a sibling test
+            // registering its own device between a snapshot and a later
+            // comparison would fail this for a reason that has nothing to do
+            // with the guard. That is exactly what happened: an earlier version
+            // compared `state_len_for_test()` before and after, passed on a
+            // laptop, and failed on a 96-core CI box where far more tests run
+            // concurrently. Counting only OUR devices is both stricter about
+            // the property under test and immune to the neighbours.
             let cfg = Arc::new(RwLock::new(Config::default()));
-            let before = crate::ripper::state_len_for_test();
-            for i in 0..25 {
-                let dev = format!("zznotadrive{i:03}");
+            let devices: Vec<String> = (0..25).map(|i| format!("zznotadrive{i:03}")).collect();
+            for dev in &devices {
                 let (code, _) = roundtrip(&cfg, "POST", &format!("/api/scan/{dev}"), None, &[]);
                 assert_ne!(
                     code, 200,
                     "a nonexistent device must not be accepted for scanning"
                 );
                 assert!(
-                    !crate::ripper::device_known(&dev),
+                    !crate::ripper::device_known(dev),
                     "no STATE entry may be created for unknown device {dev}"
                 );
             }
-            assert_eq!(
-                crate::ripper::state_len_for_test(),
-                before,
-                "STATE must not grow by even one entry for 25 fabricated devices"
+            // Re-check every one after the whole loop: a handler that deferred
+            // the insert (spawning a worker that registers later) would pass
+            // the per-iteration check above and still leak all 25.
+            let leaked: Vec<&String> = devices
+                .iter()
+                .filter(|d| crate::ripper::device_known(d))
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "fabricated devices left in STATE: {leaked:?}"
             );
         }
 

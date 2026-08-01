@@ -30,8 +30,6 @@ pub use session::{
     register_rip_thread, rollback_failed_spawn, spawn_rip_thread, stop_and_drain,
     swap_halt_carrying_cancel, take_rip_thread, unregister_halt,
 };
-#[cfg(test)]
-pub use state::state_len_for_test;
 #[allow(unused_imports)]
 pub use state::{
     BadRange, Resumable, RipState, STATE, current_disc_name, device_known, is_busy,
