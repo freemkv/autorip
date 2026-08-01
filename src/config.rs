@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 /// than a muxed title. The one place this literal lives — compare through it
 /// (or [`crate::ripper::output_is_iso_image`]), never a bare `== "iso"`.
 pub(crate) const OUTPUT_FORMAT_ISO: &str = "iso";
+pub(crate) const OUTPUT_FORMAT_NETWORK: &str = "network";
 
 /// Runtime config. Single source of truth is `settings.json` on disk;
 /// the UI POSTs updates to it via `/api/settings`.
