@@ -3863,7 +3863,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // now confirmed lost. The (from, to) pair is the pinned
                 // end-of-recovery promotion decision.
                 let (promote_from, promote_to) = end_of_recovery_promotion();
-                let nontrimmed_ranges = map.ranges_with(&[promote_from]);
+                // `from` is a SET: NonTrimmed and NonScraped are both "maybe"
+                // states that survived every pass, and the abort gate reads
+                // only Unreadable, so a state left unpromoted is loss the
+                // gate cannot see.
+                let nontrimmed_ranges = map.ranges_with(promote_from);
                 let total_promoted: u64 = nontrimmed_ranges.iter().map(|(_, sz)| *sz).sum();
                 let n_ranges = nontrimmed_ranges.len();
                 for (pos, size) in nontrimmed_ranges {
@@ -7106,7 +7110,10 @@ mod tests {
         use freemkv_engine::SectorStatus;
         assert_eq!(
             end_of_recovery_promotion(),
-            (SectorStatus::NonTrimmed, SectorStatus::Unreadable),
+            (
+                &[SectorStatus::NonTrimmed, SectorStatus::NonScraped][..],
+                SectorStatus::Unreadable,
+            ),
             "end-of-recovery promotion is NonTrimmed → Unreadable"
         );
         // Both the promoted-from and promoted-to statuses count as "still bad"
@@ -7165,7 +7172,7 @@ mod tests {
 
         // Apply the pinned promotion decision.
         let (from, to) = end_of_recovery_promotion();
-        for (pos, size) in map.ranges_with(&[from]) {
+        for (pos, size) in map.ranges_with(from) {
             map.record(pos, size, to).unwrap();
         }
 
