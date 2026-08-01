@@ -5465,6 +5465,78 @@ fn parse_resume_param(query: &str) -> ResumeMode {
     ResumeMode::Default
 }
 
+#[cfg(test)]
+mod resume_param_tests {
+    use super::{ResumeMode, parse_resume_param};
+
+    /// `?resume=no` selects `Wipe`, which DELETES an existing staging dir
+    /// before starting a fresh sweep. That makes this the only query-parameter
+    /// decision in the crate that can destroy an in-progress or not-yet-moved
+    /// rip — the operator's media — and it is reachable unauthenticated from
+    /// any host on the LAN.
+    ///
+    /// It had no test at all. A mutation run flipped the `k == "resume"`
+    /// comparison and deleted each value arm with the whole suite still green.
+    #[test]
+    fn resume_param_maps_only_the_documented_values() {
+        // The destructive one. Every spelling of it.
+        for q in ["resume=no", "resume=false", "resume=0"] {
+            assert_eq!(
+                parse_resume_param(q),
+                ResumeMode::Wipe,
+                "{q} must select Wipe"
+            );
+        }
+        for q in ["resume=yes", "resume=true", "resume=1"] {
+            assert_eq!(
+                parse_resume_param(q),
+                ResumeMode::Require,
+                "{q} must select Require"
+            );
+        }
+
+        // Anything else is Default — never the destructive mode. An
+        // unrecognised value must not be read as "no".
+        for q in [
+            "resume=maybe",
+            "resume=",
+            "resume",
+            "foo=bar",
+            "",
+            "RESUME=no", // the key match is case-sensitive
+            "resume=NO", // ...and so is the value
+        ] {
+            assert_eq!(
+                parse_resume_param(q),
+                ResumeMode::Default,
+                "{q:?} must fall through to Default, never Wipe"
+            );
+        }
+    }
+
+    /// The scan must match on the KEY, not stumble into the first value that
+    /// happens to look like one. With `==` flipped to `!=` the first
+    /// non-`resume` pair would decide the mode, so a URL carrying
+    /// `?title=no&resume=yes` would wipe the staging dir the operator just
+    /// asked to keep.
+    #[test]
+    fn resume_param_reads_the_resume_key_not_a_neighbouring_one() {
+        assert_eq!(
+            parse_resume_param("title=no&resume=yes"),
+            ResumeMode::Require
+        );
+        assert_eq!(parse_resume_param("a=1&b=2&resume=no"), ResumeMode::Wipe);
+        // A key that merely contains "resume" is not the resume key.
+        assert_eq!(parse_resume_param("presume=no"), ResumeMode::Default);
+        assert_eq!(parse_resume_param("resumed=no"), ResumeMode::Default);
+        // First match wins and stops the scan.
+        assert_eq!(
+            parse_resume_param("resume=yes&resume=no"),
+            ResumeMode::Require
+        );
+    }
+}
+
 /// Shared cap for all three KEYDB download paths (startup, daily refresh, web
 /// handler). All paths use `read_capped_keydb_body` so overflow is detected
 /// rather than silently truncating at the cap.
