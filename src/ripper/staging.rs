@@ -766,19 +766,18 @@ pub fn staging_name_for_disc(staging_root: &Path, base: &str, raw_label: &str) -
     if raw_label.is_empty() {
         return base.to_string();
     }
-    let first = staging_root.join(base);
-    if !first.exists() || dir_is_same_disc(&first, raw_label) {
-        return base.to_string();
-    }
-    // Bounded: a title with 64 distinct discs behind it is a bug, not a boxset.
-    for n in 2..=64u32 {
-        let candidate = format!("{base}_{n}");
-        let path = staging_root.join(&candidate);
-        if !path.exists() || dir_is_same_disc(&path, raw_label) {
-            return candidate;
-        }
-    }
-    base.to_string()
+    // The suffix policy itself lives in `util::disc_variant` — shared with the
+    // mover's output naming, so the two can't drift. All this supplies is what
+    // "claimable" means for a staging dir: free, or carrying this disc's label.
+    crate::util::disc_variant(|n| {
+        let path = staging_root.join(crate::util::disc_variant_name(base, n));
+        !path.exists() || dir_is_same_disc(&path, raw_label)
+    })
+    .map(|n| crate::util::disc_variant_name(base, n))
+    // Every variant belongs to a different disc. Fall back to the plain title:
+    // the caller's own `.completed` / collision checks then run against it, so
+    // this degrades to the pre-existing behaviour rather than inventing a name.
+    .unwrap_or_else(|| base.to_string())
 }
 
 /// THE staging-directory naming rule. Every caller that needs the staging dir

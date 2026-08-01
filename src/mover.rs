@@ -176,9 +176,9 @@ fn fresh_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
 
 /// Cheap content-identity probe for two files KNOWN to be the same length.
 /// Reads a fixed-size head and tail window from each and compares them.
-/// Used by the collision guard to tell an idempotent re-move (the
-/// dest IS this rip's output, copied on a prior tick whose unlink failed)
-/// apart from a genuine collision (a wrong title match routed two
+/// Used by [`dest_claim`] and the collision guard to tell an idempotent re-move
+/// (the dest IS this rip's output, copied on a prior tick whose unlink failed)
+/// apart from a second disc (a boxset or a wrong title match routed two
 /// DIFFERENT discs to the same path, and their muxes happen to be the same
 /// byte length). Returns `true` only when both windows match on both files.
 ///
@@ -854,6 +854,70 @@ fn check_and_move(cfg: &Config) {
             planned_moves.push((file_path.clone(), dest));
         }
 
+        // Two discs of one boxset resolve to the same TMDB title, so they also
+        // resolve to the same destination FILENAME. Giving each its own staging
+        // dir only moves the problem here: disc 2 finally rips, then the
+        // collision guard (rightly) refuses to overwrite disc 1's file and the
+        // operator's disc is stranded with an error instead of filed. So carry
+        // the staging rule through to delivery — `util::disc_variant`, the same
+        // policy, the same code — and give disc 2 `Title (Year)_2.mkv`.
+        //
+        // ONE variant for the whole set of files, not one per file: a rip can
+        // deliver an MKV and its companion ISO, and they must stay a matched
+        // pair (`Title_2.mkv` + `Title_2.iso`), never `_2` and `_3`. So a
+        // variant is only claimable when EVERY planned destination is.
+        //
+        // Variant 1 is the plain name, so a single-disc title — nearly the
+        // whole library — is byte-for-byte unaffected, and a retried move of
+        // the SAME disc re-claims the name it already wrote (see
+        // `dest_claimable_by`) rather than stepping upward on every attempt.
+        //
+        // A destination we could not STAT aborts the search outright
+        // (`uncertain`). A mount hiccup is not evidence of a second disc, and
+        // answering it with a `_2` would deliver beside a file we never looked
+        // at. Keeping the base name hands the decision to the collision guard,
+        // which defers the move and surfaces it — the pre-suffix behaviour.
+        let mut uncertain = false;
+        let variant = crate::util::disc_variant(|n| {
+            if uncertain {
+                return false;
+            }
+            for (src, dest) in planned_moves.iter() {
+                match dest_claim(src, &dest_with_variant(dest, n)) {
+                    DestClaim::Claimable => {}
+                    DestClaim::OtherFile => return false,
+                    DestClaim::Unknown => {
+                        uncertain = true;
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+        match variant {
+            Some(n) => {
+                for (_, dest) in planned_moves.iter_mut() {
+                    *dest = dest_with_variant(dest, n);
+                }
+            }
+            None if uncertain => {
+                // Left to the collision guard's stat-error branch, which logs
+                // the deferral and retries next tick.
+            }
+            None => {
+                // Every one of the 64 variants is held by a DIFFERENT file we
+                // cannot account for. Leave the base names in place: the
+                // collision guard below then refuses the move, preserves
+                // staging, and surfaces the operator error — exactly the
+                // behaviour before suffixes existed. Never overwrite.
+                crate::log::syslog(&format!(
+                    "Move blocked ({}): every disc-variant destination name is taken by a \
+                     different file — resolve the library conflict manually",
+                    display_name
+                ));
+            }
+        }
+
         // FAIL-LOUD destination-root validation (Mercy incident hardening).
         // Before creating ANY per-title subdir, confirm the configured root
         // (the mount point: movie_dir / tv_dir / output_dir) ALREADY EXISTS,
@@ -956,9 +1020,18 @@ fn check_and_move(cfg: &Config) {
                 }
             };
             // Overwrite guard: never clobber an existing destination that is
-            // a DIFFERENT file. A wrong TMDB match can route two discs to the
-            // same `Title (Year)/Title (Year).ext` name; overwriting would
-            // destroy a good prior rip.
+            // a DIFFERENT file. A boxset (or a wrong TMDB match) routes two
+            // discs to the same `Title (Year)/Title (Year).ext` name;
+            // overwriting would destroy a good prior rip.
+            //
+            // The disc-variant resolution above has already moved the ordinary
+            // case out of the way: a destination held by a different disc was
+            // given `_2`, `_3`, ... and this guard sees a free path. What
+            // survives here is defence in depth — variant exhaustion, a
+            // destination that changed between resolution and now, and the
+            // stat-error deferral (which the resolver deliberately declines to
+            // answer). Reaching a Collision therefore means a conflict nothing
+            // upstream could account for, and it is still refused and reported.
             //
             // A DIFFERENT-size dest is unambiguously a collision. A SAME-size
             // dest is the tricky case: it is normally the idempotent re-move
@@ -1127,7 +1200,7 @@ fn check_and_move(cfg: &Config) {
             record_error(
                 &dir_str,
                 "destination already exists as a different file — not overwriting",
-                "likely a wrong title match (two discs resolving to the same name). Verify/rename the existing library file, or correct the title, then re-run; the new rip is preserved in staging.",
+                "another disc of the same title is normally filed alongside as `_2`, `_3`, ... — reaching this means that could not be done: every variant name is taken, or the destination changed mid-move. Verify/rename the existing library file, or correct the title, then re-run; the new rip is preserved in staging.",
             );
             continue;
         }
@@ -1223,6 +1296,84 @@ fn routing_media_type(result: &tmdb::TmdbResult) -> &str {
         "movie"
     } else {
         result.media_type.as_str()
+    }
+}
+
+/// Render disc variant `n` onto a destination path by suffixing its file STEM:
+/// `.../Aurora Drift (2024).mkv` at variant 3 → `.../Aurora Drift (2024)_3.mkv`.
+/// Variant 1 returns the path unchanged, so the first disc of a set (and every
+/// single-disc title, i.e. almost the whole library) keeps its existing name.
+///
+/// The suffix format itself comes from [`crate::util::disc_variant_name`] —
+/// the same call the staging-directory rule makes.
+fn dest_with_variant(dest: &str, variant: u32) -> String {
+    if variant <= 1 {
+        return dest.to_string();
+    }
+    let p = Path::new(dest);
+    let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+        return dest.to_string();
+    };
+    let suffixed = crate::util::disc_variant_name(stem, variant);
+    let name = match p.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{suffixed}.{ext}"),
+        None => suffixed,
+    };
+    p.with_file_name(name).to_string_lossy().into_owned()
+}
+
+/// Whether a move may take a particular destination path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestClaim {
+    /// Free, or already holding THIS rip's own output (an idempotent re-move).
+    Claimable,
+    /// Held by a different file. Try the next disc variant.
+    OtherFile,
+    /// We could not find out. NOT a licence to try another name — see
+    /// [`dest_claim`].
+    Unknown,
+}
+
+/// Can this move claim `dest` — is it free, or already THIS rip's own output?
+///
+/// The destination-domain answer to the question `dir_is_same_disc` asks in the
+/// staging domain, and deliberately the SAME evidence the collision guard uses
+/// further down: sizes must match and a head+tail content probe must confirm
+/// it. That is what makes a retried move idempotent — a re-move of the same
+/// disc re-claims the name it already wrote instead of walking the suffix
+/// upward and littering the library with `Movie_2.mkv`, `Movie_3.mkv`.
+///
+/// The third state is the important one. A stat we could not perform is NOT
+/// evidence of a different disc — a transient NFS ESTALE/EIO or a dropped
+/// mount must not be answered by inventing a `_2` and quietly delivering
+/// beside a file we never managed to look at. `Unknown` stops the variant
+/// search dead; the caller keeps the base name and the collision guard defers
+/// the move to a later tick exactly as it did before suffixes existed.
+///
+/// A zero-length dest is claimable: the collision guard already treats an empty
+/// dest as no file at all and overwrites it, and diverging here would strand
+/// every interrupted copy behind a permanent suffix bump.
+fn dest_claim(src: &Path, dest: &str) -> DestClaim {
+    let d = match fresh_metadata(Path::new(dest)) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DestClaim::Claimable,
+        Err(_) => return DestClaim::Unknown,
+    };
+    if !d.is_file() || d.len() == 0 {
+        return DestClaim::Claimable;
+    }
+    // Dest exists and is a real file. A source we cannot stat leaves us unable
+    // to compare — unknown, not "someone else's".
+    let Ok(s) = fresh_metadata(src) else {
+        return DestClaim::Unknown;
+    };
+    if !s.is_file() {
+        return DestClaim::Unknown;
+    }
+    if s.len() == d.len() && same_head_and_tail(src, Path::new(dest)) {
+        DestClaim::Claimable
+    } else {
+        DestClaim::OtherFile
     }
 }
 
@@ -2762,6 +2913,82 @@ mod tests {
         assert!(movie_dir.join("Keepme (2024)/Keepme (2024).iso").exists());
     }
 
+    /// A rip can deliver an MKV and its companion ISO. When a second disc of
+    /// the same title takes the `_2` suffix, BOTH files must take the same one
+    /// — `Title_2.mkv` alongside `Title_2.iso`. Resolving the variant per file
+    /// would split the pair (`_2` and `_3`) the moment one of the two happened
+    /// to be free at the destination, which is exactly the state a partially
+    /// failed first move leaves behind.
+    #[test]
+    fn check_and_move_gives_a_discs_companion_files_the_same_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let movie_dir = tmp.path().join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), true);
+
+        // Disc 1 already delivered its MKV — but its ISO never made it, so the
+        // base ISO name is FREE while the base MKV name is taken.
+        let dest_dir = movie_dir.join("Pair (2024)");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let mut first = vec![0x1A, 0x45, 0xDF, 0xA3];
+        first.extend_from_slice(&[0x11u8; 4096]);
+        std::fs::write(dest_dir.join("Pair (2024).mkv"), &first).unwrap();
+
+        // Disc 2 in staging, MKV + ISO.
+        let disc_dir = staging.join("Pair");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Pair")).unwrap();
+        let mut second = vec![0x1A, 0x45, 0xDF, 0xA3];
+        second.extend_from_slice(&[0x22u8; 4096]);
+        std::fs::write(disc_dir.join("Pair.mkv"), &second).unwrap();
+        std::fs::write(disc_dir.join("Pair.iso"), vec![0x33u8; 4096]).unwrap();
+
+        check_and_move(&cfg);
+
+        assert!(
+            dest_dir.join("Pair (2024)_2.mkv").exists(),
+            "disc 2's MKV must move aside from disc 1's"
+        );
+        assert!(
+            dest_dir.join("Pair (2024)_2.iso").exists(),
+            "disc 2's ISO must take the SAME variant as its MKV, not the free base name"
+        );
+        assert!(
+            !dest_dir.join("Pair (2024).iso").exists(),
+            "the pair must not be split across the base name and `_2`"
+        );
+        assert_eq!(
+            std::fs::read(dest_dir.join("Pair (2024).mkv")).unwrap(),
+            first,
+            "disc 1's delivered file must be untouched"
+        );
+    }
+
+    #[test]
+    fn dest_with_variant_suffixes_the_stem_and_leaves_variant_one_alone() {
+        let d = "/mnt/media/movies/Aurora Drift (2024)/Aurora Drift (2024).mkv";
+        assert_eq!(
+            dest_with_variant(d, 1),
+            d,
+            "the first disc keeps the plain name — existing libraries must not churn"
+        );
+        assert_eq!(
+            dest_with_variant(d, 3),
+            "/mnt/media/movies/Aurora Drift (2024)/Aurora Drift (2024)_3.mkv",
+            "the suffix goes on the STEM, never after the extension, and the \
+             per-title DIRECTORY is left alone so a set stays in one folder"
+        );
+        // Extensionless leaf: suffix still lands on the name.
+        assert_eq!(dest_with_variant("/a/b/Title", 2), "/a/b/Title_2");
+        // Same rendering as the staging-directory rule — one policy.
+        assert_eq!(
+            dest_with_variant("/a/b/Title.mkv", 2),
+            format!("/a/b/{}.mkv", crate::util::disc_variant_name("Title", 2))
+        );
+    }
+
     #[test]
     fn copy_counting_copies_bytes_and_publishes_total() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -3030,14 +3257,19 @@ mod tests {
         );
     }
 
+    /// Two DIFFERENT discs route to the same `Title (Year)` path and their
+    /// muxes happen to be the SAME byte length — the boxset case, and also what
+    /// a wrong TMDB match looks like from here.
+    ///
+    /// The size-only guard used to wave this through to Skipped, then
+    /// `remove_dir_all` deleted the NEW rip's staging while the library kept
+    /// the OLD file. The content probe catches it. What it does about it is
+    /// what changed with the boxset fix: a different disc is no longer an
+    /// operator error, it is disc 2 — it gets `Title (Year)_2.mkv` and is
+    /// FILED. The invariant that matters is unchanged and still asserted here:
+    /// the existing library file is never overwritten.
     #[test]
-    fn check_and_move_collision_same_size_different_content_preserves_staging() {
-        // Two DIFFERENT discs route to the same Title (Year) path and
-        // their muxes happen to be the SAME byte length. The size-only
-        // guard waved this through to Skipped, then remove_dir_all deleted
-        // the NEW rip's staging while the library kept the OLD wrong file.
-        // The content-aware guard must catch it: Collision, staging
-        // preserved, library file untouched.
+    fn check_and_move_second_disc_of_a_title_is_filed_beside_the_first() {
         let dir = scratch_dir("collision");
         let staging = dir.join("staging");
         let movie_dir = dir.join("output/Movies");
@@ -3066,27 +3298,51 @@ mod tests {
         let _g = errors_guard();
         check_and_move(&cfg);
 
-        // Library file must be untouched (still the OLD content).
+        // Disc 1's library file must be untouched (still the OLD content).
         assert_eq!(
             std::fs::read(&dest_file).unwrap(),
             old,
             "existing library file must NOT be overwritten or removed"
         );
-        // The NEW rip must still be in staging — NOT deleted.
+        // Disc 2 must be DELIVERED, not stranded: same title dir, `_2` name.
+        let second = dest_dir.join("Clash (2024)_2.mkv");
         assert!(
-            staged_mkv.exists(),
-            "new rip must be preserved in staging on a collision"
+            second.exists(),
+            "the second disc of a title must be filed as `_2`, not left in staging"
         );
-        assert!(disc_dir.exists(), "staging dir must not be torn down");
-        // A collision error must be surfaced for the operator.
+        assert_eq!(
+            std::fs::read(&second).unwrap(),
+            new,
+            "the `_2` file must be THIS disc's output"
+        );
+        // Delivered means delivered — no operator error to clear.
         let key = disc_dir.to_string_lossy().to_string();
-        {
-            let m = MOVE_ERRORS.lock().unwrap();
-            assert!(
-                m.contains_key(&key),
-                "collision must be recorded for the staging dir"
-            );
-        }
+        assert!(
+            error_snapshot(&key).is_none(),
+            "a successfully filed second disc is not an operator error"
+        );
+
+        // Idempotency: a retried tick must re-claim `_2`, never walk to `_3`.
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join(".done"), marker_json("Clash")).unwrap();
+        std::fs::write(&staged_mkv, &new).unwrap();
+        check_and_move(&cfg);
+        assert!(
+            !dest_dir.join("Clash (2024)_3.mkv").exists(),
+            "a re-move of the SAME disc must re-claim its own name, not litter \
+             the library with _3, _4, ..."
+        );
+        assert_eq!(
+            std::fs::read(&second).unwrap(),
+            new,
+            "the re-move must leave this disc's delivered file intact"
+        );
+        assert_eq!(
+            std::fs::read(&dest_file).unwrap(),
+            old,
+            "the re-move must still not touch disc 1"
+        );
+
         clear_error(&key);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3179,10 +3435,14 @@ mod tests {
     /// length AND their first/last kilobyte are not a realistic pair, but two
     /// that share their first/last 64 KiB are not realistic either — the whole
     /// point of the constant. Shrink the window and the probe starts calling
-    /// distinct files identical, which routes a genuine collision down the
-    /// IDEMPOTENT path: `move_file` returns `Skipped`, `remove_dir_all` then
-    /// deletes the new rip, and the library keeps the wrong file. Both discs'
-    /// data is now one disc's data.
+    /// distinct files identical, which routes a second disc down the IDEMPOTENT
+    /// path: `move_file` returns `Skipped`, `remove_dir_all` then deletes the
+    /// new rip, and the library keeps only the first disc. Both discs' data is
+    /// now one disc's data.
+    ///
+    /// The probe is what tells "this is my own file, re-claim its name" from
+    /// "this is another disc, take the next `_N`". Shrink the window and the
+    /// second disc is destroyed instead of filed.
     ///
     /// Here the two files differ only at byte 2000 — inside the real 64 KiB
     /// window, outside anything much smaller.
@@ -3221,14 +3481,24 @@ mod tests {
             old,
             "the existing library file must survive untouched"
         );
+        let second = dest_dir.join("Twin (2024)_2.mkv");
         assert!(
-            staged_mkv.exists() && disc_dir.exists(),
-            "a same-size DIFFERENT file must be a collision — the new rip must \
-             not be swept up as an idempotent re-move"
+            second.exists(),
+            "a same-size DIFFERENT file must be recognised as another disc and \
+             filed as `_2` — never swept up as an idempotent re-move"
+        );
+        assert_eq!(
+            std::fs::read(&second).unwrap(),
+            new,
+            "the `_2` file must carry the second disc's bytes, not a copy of the first"
         );
         let recorded = error_snapshot(&key);
         clear_error(&key);
-        assert!(recorded.is_some(), "collision must be recorded");
+        assert!(
+            recorded.is_none(),
+            "filing the second disc is a success, not an operator error"
+        );
+        let _ = &staged_mkv;
         drop(_g);
         std::fs::remove_dir_all(&dir).ok();
     }
