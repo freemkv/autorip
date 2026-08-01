@@ -509,20 +509,39 @@ pub(crate) fn check_post_copy(src: &Path, dst: &Path) -> Result<(), MoveError> {
     }
 }
 
+/// One pass of the mover loop: take a config SNAPSHOT, release the lock, then
+/// move. Returns false if the config could not be read.
+///
+/// The move is injected so this is testable. It matters because the bug was a
+/// property of WHEN the lock is released, not of the move itself: `run()` used
+/// to pass the `RwLockReadGuard` straight into `check_and_move`, so the guard
+/// lived for the whole pass — including a cross-filesystem NFS copy of an 80 GB
+/// MKV. Any `POST /api/settings` taking `cfg.write()` blocked for the duration,
+/// and std's RwLock is write-preferring on Linux, so one queued writer then
+/// blocks new READERS too: the entire unauthenticated web UI stops answering
+/// for as long as the copy takes, triggered by any LAN client.
+///
+/// A `Config` clone is nothing next to the copy it precedes.
+fn mover_tick(cfg: &Arc<RwLock<Config>>, do_move: impl FnOnce(&Config)) -> bool {
+    let snapshot = match cfg.read() {
+        Ok(c) => c.clone(),
+        Err(e) => {
+            tracing::warn!(error = %e, "mover: config lock poisoned, retrying");
+            return false;
+        }
+    };
+    do_move(&snapshot);
+    true
+}
+
 pub fn run(cfg: &Arc<RwLock<Config>>) {
     use std::sync::atomic::Ordering;
     tracing::info!("mover loop starting");
     while !crate::SHUTDOWN.load(Ordering::Relaxed) {
-        let cfg_snapshot = match cfg.read() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "mover: config lock poisoned, retrying");
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                continue;
-            }
-        };
-        check_and_move(&cfg_snapshot);
-        drop(cfg_snapshot);
+        if !mover_tick(cfg, check_and_move) {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            continue;
+        }
         // SHUTDOWN-responsive sleep — break early on signal so SIGTERM
         // doesn't have to wait the full 10 s tick.
         for _ in 0..100 {
@@ -1685,6 +1704,40 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
 
 #[cfg(test)]
 mod tests {
+
+    /// The mover must not hold the config lock WHILE moving.
+    ///
+    /// `run()` used to pass the `RwLockReadGuard` itself into `check_and_move`,
+    /// so the guard lived for the whole pass — including a cross-filesystem
+    /// copy of an 80 GB MKV. Any `POST /api/settings` blocked for the duration,
+    /// and std's RwLock is write-preferring on Linux, so one queued writer then
+    /// blocks new READERS too: the entire unauthenticated web UI stops
+    /// answering for however long the copy takes.
+    ///
+    /// An earlier version of this test built its own snapshot inline and
+    /// PASSED with the fix reverted, because it never exercised `run()`'s
+    /// shape. This one observes the lock from INSIDE the injected move, which
+    /// is the only place the property is actually observable.
+    #[test]
+    fn the_config_lock_is_free_while_the_move_runs() {
+        use std::sync::{Arc, RwLock};
+        let cfg = Arc::new(RwLock::new(Config::default()));
+
+        let mut observed_writable = false;
+        let ok = super::mover_tick(&cfg, |snapshot| {
+            // We are "mid-move" here. A writer must be able to proceed.
+            observed_writable = cfg.try_write().is_ok();
+            // And the snapshot is still usable, so releasing early costs nothing.
+            let _ = &snapshot.staging_dir;
+        });
+
+        assert!(ok, "mover_tick should succeed on a healthy lock");
+        assert!(
+            observed_writable,
+            "a writer was blocked DURING the move — the guard is held across it, \
+             so any POST /api/settings would wedge the web UI for the whole copy"
+        );
+    }
     use super::*;
 
     fn cfg_with_dirs(movie_dir: &str, tv_dir: &str, output_dir: &str) -> Config {
