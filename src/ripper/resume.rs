@@ -903,7 +903,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let filename = format!("{}.{}", display_name, ext);
     let staging_str = staging_dir.to_string_lossy().into_owned();
     let output_path = format!("{}/{}", staging_str, filename);
-    let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
+    let dest_url = if staging::is_network_output(&output_format, &cfg_read.network_target) {
         format!("network://{}", cfg_read.network_target)
     } else {
         // Scheme is the container (mkv/m2ts), NOT the `.mk3d` filename extension —
@@ -1143,7 +1143,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // gate above already scoped loss whole-disc for this mode; the mover
     // validates + moves `.iso` and the prune below retains it for ISO output.
     if super::output_is_iso_image(&output_format) {
-        if !staging::fsync_output_file(&iso_path) {
+        if !staging::durability_gate_passes(false, || staging::fsync_output_file(&iso_path)) {
             let quarantined = handle_resume_fsync_failure(device, &staging_dir, "ISO image output");
             let detail = if quarantined {
                 "ISO image not durable (fsync failed repeatedly); quarantined (.failed)"
@@ -1467,8 +1467,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // If the fsync fails, do NOT write .done/.completed: preserve the
     // staging dir so the next restart's resume re-runs the durable flush
     // rather than handing a possibly-truncated file to the mover.
-    let is_network = output_format == "network" && !cfg_read.network_target.is_empty();
-    if !is_network && !staging::fsync_output_file(std::path::Path::new(&output_path)) {
+    let is_network = staging::is_network_output(&output_format, &cfg_read.network_target);
+    if !staging::durability_gate_passes(is_network, || {
+        staging::fsync_output_file(std::path::Path::new(&output_path))
+    }) {
         let quarantined = handle_resume_fsync_failure(device, &staging_dir, "mux output");
         let detail = if quarantined {
             "mux output not durable (fsync failed repeatedly); quarantined (.failed)"

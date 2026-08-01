@@ -507,6 +507,37 @@ pub fn write_handoff_marker(marker_path: &Path, contents: &[u8]) -> io::Result<(
 /// Call this ONLY on the success path, immediately before the marker
 /// write, and only for a real local output file (skip `network://` sinks,
 /// which have no local path).
+/// Whether the deliverable is a `network://` sink rather than a local file.
+///
+/// A network target has no local path, so the durability gate has nothing to
+/// fsync and must be skipped. Both halves matter: the format must be
+/// `"network"` AND a target must actually be configured, because a
+/// `"network"` format with an empty target falls back to local output and
+/// still needs the flush. Four hand-rolled copies of this expression existed;
+/// a mutation run flipped `==` to `!=`, `&&` to `||`, and dropped the `!` in
+/// each, and nothing failed.
+pub fn is_network_output(output_format: &str, network_target: &str) -> bool {
+    output_format == crate::config::OUTPUT_FORMAT_NETWORK && !network_target.is_empty()
+}
+
+/// The durability gate: may a success marker be written yet?
+///
+/// `false` means the output is not provably on stable storage, so `.done` and
+/// `.completed` must be withheld and the staging dir preserved for a retry —
+/// writing them anyway hands the mover a page-cache-only, possibly truncated
+/// file and files it into the operator's library as a finished title.
+///
+/// The fsync is injected so the decision is testable without a filesystem. It
+/// is NOT evaluated for a network sink, which is the point: an eagerly
+/// evaluated `is_network || fsync(path)` would still stat a path that does not
+/// exist.
+pub fn durability_gate_passes(is_network: bool, fsync: impl FnOnce() -> bool) -> bool {
+    if is_network {
+        return true;
+    }
+    fsync()
+}
+
 pub fn fsync_output_file(output_path: &Path) -> bool {
     // Delegate to the shared, platform-aware durability primitive. It opens the
     // file read+write before `sync_all` so the flush works on Windows, where
@@ -1231,6 +1262,43 @@ mod tests {
         clear_restart_count(&d);
         assert_eq!(restart_count(&d), 0);
         clear_restart_count(&d); // already gone — must not error
+    }
+
+    /// The durability gate decides whether `.done`/`.completed` may be
+    /// written. Getting it backwards files a page-cache-only, possibly
+    /// truncated file into the operator's library as a finished title. It was
+    /// four hand-rolled copies of `!is_network && !fsync(..)`; a mutation run
+    /// dropped the `!` in each and nothing failed.
+    #[test]
+    fn durability_gate_blocks_markers_unless_the_output_is_provably_durable() {
+        // A failed fsync must withhold the markers.
+        assert!(!durability_gate_passes(false, || false));
+        // A successful one must not.
+        assert!(durability_gate_passes(false, || true));
+
+        // A network sink has no local file, so the gate passes WITHOUT
+        // evaluating the fsync at all — an eager `is_network || fsync(path)`
+        // would stat a path that does not exist.
+        let mut called = false;
+        assert!(durability_gate_passes(true, || {
+            called = true;
+            false
+        }));
+        assert!(!called, "the fsync must not run for a network sink");
+    }
+
+    /// Both halves of the network check matter: a `"network"` format with no
+    /// target configured falls back to LOCAL output and still needs the flush.
+    /// Mutants flipped `==` to `!=`, `&&` to `||`, and dropped the `!`.
+    #[test]
+    fn network_output_requires_both_the_format_and_a_target() {
+        assert!(is_network_output("network", "nfs://box/media"));
+        assert!(
+            !is_network_output("network", ""),
+            "no target means local output — the durability gate must still run"
+        );
+        assert!(!is_network_output("mkv", "nfs://box/media"));
+        assert!(!is_network_output("iso", ""));
     }
 
     /// `fsync_output_file` is the mux durability gate: `true` only when the
