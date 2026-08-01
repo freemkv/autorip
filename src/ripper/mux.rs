@@ -1775,6 +1775,40 @@ mod tests {
         }
     }
 
+    /// `push_mux_state` is the only place that writes the live per-frame
+    /// `RipState` to `/api/state` during a mux — both the single-pass
+    /// `MuxSink::apply` path and the ISO/multipass `AutoripMuxEvents` bridge
+    /// funnel through it. `status: "ripping"` and `disc_present: true` are
+    /// what the "already ripping" concurrent-dispatch gate and the
+    /// live-progress UI key off: if either silently reverted to
+    /// `RipState::default()`'s "idle"/`false` (the exact shape of a `delete
+    /// field` mutant on this struct literal), a mux in progress would report
+    /// the device as idle — the operator sees nothing happening while the
+    /// drive is busy, and a second `/api/rip` could be dispatched against it.
+    /// A private device key avoids racing any other test's `STATE` entry.
+    #[test]
+    fn push_mux_state_reports_ripping_and_disc_present() {
+        let device = "push_mux_state_test_device";
+        let mut ui = test_ui_state();
+        ui.device = device.to_string();
+        let (atomics, ..) = test_shared_atomics();
+
+        push_mux_state(&ui, &atomics, 10, 5.0, "1:00".into(), 1000, 0.0, 0);
+
+        let rs = super::super::STATE
+            .lock()
+            .unwrap()
+            .get(device)
+            .cloned()
+            .expect("push_mux_state must write a STATE entry for the device");
+        assert_eq!(rs.status, "ripping");
+        assert!(
+            rs.disc_present,
+            "a live mux tick must report disc_present=true"
+        );
+        super::super::STATE.lock().unwrap().remove(device);
+    }
+
     /// THE watchdog preservation check: `AutoripMuxEvents::on_write_progress`
     /// must feed `wd_bytes` (the atomic `spawn_mux_watchdog` reads for both its
     /// hard `exit(1)` escalation and the "stalled at X GB" UI) and refresh
@@ -1946,6 +1980,40 @@ mod tests {
         .expect("completed run maps to Ok");
         assert!(ok.completed && ok.output_opened);
         assert_eq!(ok.bytes_done, 1234);
+
+        // Ok(..) with completed=false — a clean operator stop or a
+        // join-timeout wedge (see the code comment on the `Ok(o)` non-guard
+        // arm). This must NOT be reported as a finished mux: a mutant that
+        // widens the `Ok(o) if o.completed` guard to unconditionally match
+        // would report this halted/wedged run as `completed=true`, which is
+        // rule 1 verbatim (a damaged/incomplete rip filed as good).
+        let not_done = map_iso_mux_outcome(
+            Ok(libfreemkv::MuxOutcome {
+                completed: false,
+                output_opened: true,
+                bytes_written: 500,
+                errors: 0,
+                lost_bytes: 0,
+                streams: 2,
+                undelivered_streams: Vec::new(),
+            }),
+            true,
+            "sr-test",
+            0.0,
+            start,
+            0,
+            0,
+        )
+        .expect("a non-completed Ok result still maps to Ok, just completed=false");
+        assert!(
+            !not_done.completed,
+            "an Ok(..) result with completed=false must not be reported as a finished mux"
+        );
+        assert!(
+            not_done.output_opened,
+            "output_opened is carried through unchanged from the engine outcome"
+        );
+        assert_eq!(not_done.bytes_done, 500);
 
         // Halt during construction → propagated as Err for call-site handling.
         let halt_err: std::io::Error = libfreemkv::Error::Halted.into();
