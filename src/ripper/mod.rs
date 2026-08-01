@@ -2498,7 +2498,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
     let iso_path_str = format!("{staging}/{iso_filename}");
     let mapfile_path_str = format!("{iso_path_str}.mapfile");
-    let dest_url = if output_format == "network" && !cfg_read.network_target.is_empty() {
+    let dest_url = if staging::is_network_output(&output_format, &cfg_read.network_target) {
         format!("network://{}", cfg_read.network_target)
     } else {
         // Scheme is the container (mkv/m2ts), NOT the filename extension: a 3D rip
@@ -4192,7 +4192,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // pointing at a page-cache-only ISO. If the fsync fails, withhold
             // the markers and preserve staging so a later attempt re-runs the
             // flush rather than handing the mover a possibly-truncated image.
-            if !staging::fsync_output_file(iso_path) {
+            if !staging::durability_gate_passes(false, || staging::fsync_output_file(iso_path)) {
                 crate::log::device_log(
                     device,
                     "Durability gate failed: could not fsync ISO image to stable storage; \
@@ -4985,17 +4985,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // exactly as the pre-mux abort does. ISO output is exempt (whole-disc, gated
     // by 100% elsewhere). Only fires when the MUX itself contributed loss —
     // read-time loss alone already passed the pre-mux gate.
-    if completed && !output_is_iso_image(&cfg_read.output_format) {
+    {
         let effective_abort =
             effective_abort_secs(&cfg_read.output_format, cfg_read.abort_on_lost_secs);
         let read_lost_secs = main_lost_ms_for_history_outer / MILLIS_PER_SEC;
         let total_lost_secs = read_lost_secs + demux_lost_secs;
-        let over = if effective_abort == 0 {
-            total_lost_secs > 0.0
-        } else {
-            total_lost_secs > effective_abort as f64
-        };
-        if over && demux_lost_secs > 0.0 {
+        if mux_loss_aborts(
+            completed,
+            output_is_iso_image(&cfg_read.output_format),
+            total_lost_secs,
+            demux_lost_secs,
+            effective_abort,
+        ) {
             crate::log::device_log(
                 device,
                 &format!(
@@ -5056,8 +5057,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // durable, so treat the rip as resumable this cycle. Leaving
             // the staging dir intact lets a later attempt re-run the flush
             // rather than handing a possibly-truncated file to the mover.
-            let is_network = output_format == "network" && !cfg_read.network_target.is_empty();
-            if !is_network && !staging::fsync_output_file(std::path::Path::new(&output_path)) {
+            let is_network = staging::is_network_output(&output_format, &cfg_read.network_target);
+            if !staging::durability_gate_passes(is_network, || {
+                staging::fsync_output_file(std::path::Path::new(&output_path))
+            }) {
                 crate::log::device_log(
                     device,
                     "Durability gate failed: could not fsync mux output to stable storage; \
@@ -5532,6 +5535,43 @@ fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
     // feeding them drifted, so autorip and the engine could return opposite
     // verdicts for the same damaged disc. One owner, one answer.
     freemkv_engine::loss_aborts(lost_bytes, lost_ms, abort_on_lost_secs)
+}
+
+/// Whether mux-time (decrypt/codec) loss must quarantine the rip instead of
+/// filing it as done.
+///
+/// This is the SOLE enforcement point for mux-time loss: the pre-mux gate reads
+/// only the mapfile Unreadable set, and decrypt/codec skips never appear there.
+/// It was four inline conditions inside `rip_disc`, where nothing could reach
+/// it — a mutation run flipped every one of them (`&&`→`||`, `>`→`<`, dropped
+/// `!`) and the whole suite still passed, in both directions: silently filing a
+/// rip with concealed in-title loss as `.done`, and quarantining a clean rip.
+///
+/// - ISO output is exempt: whole-disc, gated at 100% elsewhere.
+/// - Only fires when the MUX itself contributed loss; read-time loss alone has
+///   already passed the pre-mux gate, so re-gating it here would double-count.
+/// - `effective_abort == 0` means ZERO tolerance: any loss at all aborts.
+fn mux_loss_aborts(
+    completed: bool,
+    is_iso: bool,
+    total_lost_secs: f64,
+    demux_lost_secs: f64,
+    effective_abort: u64,
+) -> bool {
+    // Bind the comparison rather than writing `!(demux_lost_secs > 0.0)`:
+    // clippy rejects a negated comparison on a partially ordered type, and the
+    // obvious rewrite `demux_lost_secs <= 0.0` is NOT equivalent — every NaN
+    // comparison is false, so `<=` would let a NaN fall through to the
+    // threshold check instead of declining to abort. The test pins the NaN case.
+    let mux_contributed_loss = demux_lost_secs > 0.0;
+    if !completed || is_iso || !mux_contributed_loss {
+        return false;
+    }
+    if effective_abort == 0 {
+        total_lost_secs > 0.0
+    } else {
+        total_lost_secs > effective_abort as f64
+    }
 }
 
 /// Whether the rip's deliverable is the whole-disc ISO itself rather than a
@@ -9307,6 +9347,54 @@ mod tests {
             !is_halt_error(&std::io::Error::other("E60100: some other code")),
             "a longer code with E6010 as a prefix must NOT match"
         );
+    }
+
+    /// The mux-time loss gate is the sole enforcement point for decrypt/codec
+    /// loss — the pre-mux gate reads only the mapfile Unreadable set, where
+    /// those skips never appear. It lived as four inline conditions inside
+    /// `rip_disc`; a mutation run flipped every one of them and the whole suite
+    /// still passed, in both directions (concealed loss filed as `.done`, and a
+    /// clean rip quarantined). Table-drive every axis.
+    #[test]
+    fn mux_loss_gate_fires_only_on_mux_contributed_loss_over_threshold() {
+        use super::mux_loss_aborts;
+
+        // The case the gate exists for: mux contributed loss over threshold.
+        assert!(mux_loss_aborts(true, false, 5.0, 5.0, 2));
+        // ...and at zero tolerance, any mux loss at all.
+        assert!(mux_loss_aborts(true, false, 0.5, 0.5, 0));
+
+        // Exactly at the threshold is NOT over it.
+        assert!(
+            !mux_loss_aborts(true, false, 2.0, 2.0, 2),
+            "the comparison is strictly greater-than"
+        );
+
+        // A failed mux never reaches the gate — the failure path owns it.
+        assert!(!mux_loss_aborts(false, false, 5.0, 5.0, 2));
+
+        // ISO output is whole-disc and gated at 100% elsewhere.
+        assert!(
+            !mux_loss_aborts(true, true, 5.0, 5.0, 2),
+            "ISO deliverables are exempt from the mux-time gate"
+        );
+
+        // Read-time loss alone already passed the PRE-mux gate. Re-gating it
+        // here would double-count and quarantine a rip the operator accepted.
+        assert!(
+            !mux_loss_aborts(true, false, 99.0, 0.0, 2),
+            "no mux-contributed loss means this gate must not fire"
+        );
+        assert!(
+            !mux_loss_aborts(true, false, 99.0, 0.0, 0),
+            "...including at zero tolerance"
+        );
+
+        // NaN loss must not silently read as "under threshold" and file a
+        // damaged rip as done. Every NaN comparison is false, so the gate
+        // declines to abort — record that so a future change to the upstream
+        // fail-safe cannot quietly turn this into a wrong pass.
+        assert!(!mux_loss_aborts(true, false, f64::NAN, f64::NAN, 0));
     }
 
     #[test]
