@@ -2849,6 +2849,61 @@ mod web_tests {
         }
     }
 
+    #[test]
+    fn queue_view_cache_reuses_within_ttl_and_refreshes_after() {
+        // The /events SSE loop calls get_state_json once per second per
+        // connected client; build_queue_views_cached exists so those
+        // concurrent per-client calls share ONE staging-dir scan instead of
+        // each re-walking it. Pin: (1) a second call against the SAME
+        // staging dir within the TTL reuses the first scan's result even
+        // though the directory changed underneath it, (2) a call against a
+        // DIFFERENT staging dir is never served the wrong dir's cache, and
+        // (3) once the TTL elapses the next call re-scans and picks up the
+        // change.
+        use std::fs;
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let staging_a = tmp_a.path().to_string_lossy().to_string();
+        let disc1 = tmp_a.path().join("First");
+        fs::create_dir_all(&disc1).unwrap();
+        crate::muxer::write_marker(&disc1, &ripped_marker_for("First", "sg0")).unwrap();
+
+        let (mux1, _, _, _) = build_queue_views_cached(&staging_a);
+        assert!(
+            mux1.iter().any(|s| s.contains("First")),
+            "initial scan must see the pre-existing disc"
+        );
+
+        // A different staging dir, scanned right after, must reflect ITS
+        // OWN contents (empty), not staging_a's cached entry.
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        let staging_b = tmp_b.path().to_string_lossy().to_string();
+        let (mux_b, _, _, _) = build_queue_views_cached(&staging_b);
+        assert!(
+            mux_b.is_empty(),
+            "a different staging dir must not be served staging_a's cached queue"
+        );
+
+        // Add a second disc to staging_a's directory, then immediately
+        // re-query staging_a within the TTL window: the cache must still
+        // return the STALE (pre-addition) view.
+        let disc2 = tmp_a.path().join("Second");
+        fs::create_dir_all(&disc2).unwrap();
+        crate::muxer::write_marker(&disc2, &ripped_marker_for("Second", "sg1")).unwrap();
+        let (mux2, _, _, _) = build_queue_views_cached(&staging_a);
+        assert!(
+            !mux2.iter().any(|s| s.contains("Second")),
+            "a call within the TTL must reuse the cached (stale) scan, not re-walk the dir"
+        );
+
+        // After the TTL elapses, the next call must re-scan and see the new disc.
+        std::thread::sleep(QUEUE_VIEW_CACHE_TTL + std::time::Duration::from_millis(150));
+        let (mux3, _, _, _) = build_queue_views_cached(&staging_a);
+        assert!(
+            mux3.iter().any(|s| s.contains("Second")),
+            "after the TTL expires, the next call must re-scan and see the new disc"
+        );
+    }
+
     /// Helper: current status string of a device in the global STATE map.
     fn device_status(device: &str) -> Option<String> {
         ripper::STATE
@@ -3026,6 +3081,39 @@ mod web_tests {
     }
 
     #[test]
+    fn settings_get_redacts_keydb_path_to_filename() {
+        // keydb_path is an absolute container path (mount layout, username);
+        // GET /api/settings must strip it down to the bare filename so a LAN
+        // client can confirm which file is active without learning the
+        // container's filesystem layout.
+        let c = Config {
+            keydb_path: Some("/data/keys/subdir/KEYDB.cfg".into()),
+            ..Config::default()
+        };
+        let json: serde_json::Value = serde_json::from_str(&settings_json_redacted(&c)).unwrap();
+        assert_eq!(json["keydb_path"], "KEYDB.cfg");
+        assert!(
+            !json["keydb_path"].as_str().unwrap().contains('/'),
+            "redacted keydb_path must not leak any directory component"
+        );
+        // No keydb_path set (None) — field passes through untouched (null),
+        // no panic, nothing to redact.
+        let json_none: serde_json::Value =
+            serde_json::from_str(&settings_json_redacted(&Config::default())).unwrap();
+        assert!(json_none["keydb_path"].is_null());
+        // An explicitly empty string is left alone (not redacted into "" ->
+        // something else), matching the other secret fields' "empty stays
+        // empty" convention.
+        let c_empty = Config {
+            keydb_path: Some(String::new()),
+            ..Config::default()
+        };
+        let json_empty: serde_json::Value =
+            serde_json::from_str(&settings_json_redacted(&c_empty)).unwrap();
+        assert_eq!(json_empty["keydb_path"], "");
+    }
+
+    #[test]
     fn mask_webhook_url_variants() {
         assert_eq!(
             mask_webhook_url("https://discord.com/api/webhooks/1/tok"),
@@ -3087,6 +3175,36 @@ mod web_tests {
             mask_webhook_url("https://user:pass@example.com"),
             "https://example.com/********"
         );
+    }
+
+    #[test]
+    fn is_masked_webhook_recognizes_only_real_placeholders() {
+        // Bare sentinel (mask_webhook_url's own output, e.g. no identifiable
+        // scheme).
+        assert!(is_masked_webhook(SECRET_SENTINEL));
+        // Indexed placeholder form produced by mask_webhook_url_indexed.
+        assert!(is_masked_webhook(&format!(
+            "https://discord.com/{SECRET_SENTINEL}#1"
+        )));
+        // Index 0 is still a valid, non-empty all-digit index.
+        assert!(is_masked_webhook(&format!(
+            "https://discord.com/{SECRET_SENTINEL}#0"
+        )));
+        // Empty index after '#' must NOT be treated as masked.
+        assert!(!is_masked_webhook(&format!(
+            "https://discord.com/{SECRET_SENTINEL}#"
+        )));
+        // Non-digit index must NOT be treated as masked.
+        assert!(!is_masked_webhook(&format!(
+            "https://discord.com/{SECRET_SENTINEL}#abc"
+        )));
+        // A hostile, never-masked URL that merely ends in "#<digits>" must NOT
+        // be misclassified as a redacted placeholder — this is the exact SSRF
+        // bypass an &&->|| mutation in is_masked_webhook would open up: a
+        // plain metadata URL with a `#1` fragment must still be validated.
+        assert!(!is_masked_webhook("http://169.254.169.254/x#1"));
+        // No '#' at all, and no sentinel — not masked.
+        assert!(!is_masked_webhook("http://example.com/hook/realtoken"));
     }
 
     #[test]
@@ -3361,6 +3479,39 @@ mod web_tests {
         assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
             0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111
         ))));
+    }
+
+    #[test]
+    fn blocks_multicast_ipv4_and_ipv6() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // Pure multicast, not caught by any of the loopback/private/
+        // link-local/broadcast/documentation/unspecified/CGN/0.x/240+
+        // branches — this is only reachable via is_multicast(). An
+        // `||`->`&&` mutant immediately before is_multicast() in the IPv4
+        // chain (folding it into `is_unspecified() && is_multicast()`,
+        // which can never be true) would let this through.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(230, 1, 2, 3))));
+        // IPv6 multicast, not unspecified — same shape of gap on the v6 side.
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xff02, 0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn cgn_check_does_not_over_block_unrelated_public_space() {
+        use std::net::Ipv4Addr;
+        // Carrier-grade NAT 100.64.0.0/10: octet[0]==100 AND top two bits of
+        // octet[1] == 01 (0x40..0x7f). 100.64.0.1 is inside the range and
+        // must be blocked; 100.128.0.1 has octet[1]=128 (0x80, top bits 10)
+        // so it is OUTSIDE the /10 and must be allowed. A `&&`->`||` mutant
+        // in the CGN check blocks both (and much unrelated public space with
+        // octet[0]!=100 too).
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+        // A public address whose second octet has the CGN-like bit pattern
+        // (01xxxxxx) but whose first octet is NOT 100 must NOT be blocked —
+        // pins the `&&` (not `||`) between the two octet checks.
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(1, 65, 2, 3))));
     }
 
     #[test]
@@ -3760,6 +3911,32 @@ mod web_tests {
         }
 
         #[test]
+        fn exact_cap_request_body_is_accepted_not_413() {
+            // A body of EXACTLY MAX_REQUEST_BODY bytes is in-spec and must be
+            // accepted, distinguishing read_body_capped's `>` from a `>=`
+            // mutant (the existing oversize test uses cap+1, which trips
+            // both operators identically). Pad a valid JSON settings patch
+            // with leading whitespace (which serde_json skips) out to
+            // exactly the cap.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let payload = r#"{"abort_on_lost_secs": 31}"#;
+            let padding = " ".repeat((MAX_REQUEST_BODY as usize) - payload.len());
+            let body = format!("{padding}{payload}");
+            assert_eq!(body.len() as u64, MAX_REQUEST_BODY);
+            let (code, resp) = roundtrip(&cfg, "POST", "/api/settings", Some(&body), &[]);
+            assert_ne!(
+                code, 413,
+                "a body of exactly MAX_REQUEST_BODY bytes must not be rejected as too large"
+            );
+            assert_eq!(
+                code, 200,
+                "the exact-cap body is valid JSON and must succeed, got: {resp}"
+            );
+            assert_eq!(cfg.read().unwrap().abort_on_lost_secs, 31);
+        }
+
+        #[test]
         fn malformed_json_body_is_rejected_400() {
             let tmp = tempfile::TempDir::new().unwrap();
             let cfg = cfg_in_tempdir(tmp.path());
@@ -3902,6 +4079,67 @@ mod web_tests {
                 "a wired /api/stop/<dev> must not hit the dispatch 404"
             );
         }
+
+        // ── handle_accept_loss: rejected claim must not arm the override ──
+
+        #[test]
+        fn accept_loss_rejected_while_busy_does_not_arm_marker() {
+            // A rip already in flight on this device means handle_accept_loss's
+            // OWN try_claim_active loses, and the request must be rejected 409
+            // WITHOUT writing `.accept-loss` (or clearing `.failed`/restart
+            // markers) into the staging dir. Before the fix this order was
+            // reversed: the marker was written first and handle_rip's claim
+            // (called after) was what actually produced the 409, leaving the
+            // override armed on disk for a rip that never consumed it — the
+            // next resume on this device would then mux a rip whose loss was
+            // never actually accepted.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let device = "sgacceptloss1";
+            let disc_name = "DamagedDisc";
+
+            let staging_dir = {
+                let c = cfg.read().unwrap();
+                c.staging_device_dir(&crate::util::sanitize_path_compact(disc_name))
+            };
+            let dir = std::path::Path::new(&staging_dir);
+            std::fs::create_dir_all(dir).unwrap();
+            // Pre-existing terminal markers a real damaged/failed rip would
+            // have left behind — these must survive a rejected accept too.
+            std::fs::write(dir.join(ripper::staging::FAILED_MARKER), b"loss").unwrap();
+
+            // Mark the device busy (as if a rip were already running) with a
+            // known current disc name, exactly like a real in-flight rip.
+            ripper::update_state(
+                device,
+                ripper::RipState {
+                    device: device.to_string(),
+                    status: "ripping".to_string(),
+                    disc_name: disc_name.to_string(),
+                    ..Default::default()
+                },
+            );
+
+            let (code, _) = roundtrip(
+                &cfg,
+                "POST",
+                &format!("/api/accept-loss/{device}"),
+                None,
+                &[],
+            );
+            assert_eq!(
+                code, 409,
+                "accept-loss on a busy device must be rejected, not silently dropped"
+            );
+            assert!(
+                !dir.join(ripper::staging::ACCEPT_LOSS_MARKER).exists(),
+                "a rejected accept-loss must NOT arm the one-shot override on disk"
+            );
+            assert!(
+                dir.join(ripper::staging::FAILED_MARKER).exists(),
+                "a rejected accept-loss must leave the existing .failed marker intact"
+            );
+        }
     }
 }
 
@@ -3916,6 +4154,77 @@ fn text_response(request: tiny_http::Request, body: &str) {
         .unwrap(),
     );
     let _ = request.respond(response);
+}
+
+/// Cached result of [`build_queue_views`], shared across every concurrent
+/// `/events` (SSE) client and `/api/state` poller.
+///
+/// `/events` holds one thread per client for the life of the connection
+/// (up to `MAX_SSE_CLIENTS`) and each thread independently rebuilds the
+/// Mux/Move queue view every second — a fresh `read_dir` over the whole
+/// staging directory plus a handful of `Path::exists()`/marker reads per
+/// subdirectory (see [`build_queue_views`] / `crate::muxer::pending_queue`).
+/// With a large staging backlog and several dashboard tabs open, that is
+/// the same filesystem the ripper and mover are actively writing to,
+/// scanned redundantly by every open tab in lockstep. The queue view only
+/// changes when a rip/mux/move transitions state, so a sub-second-stale
+/// shared snapshot is invisible in a UI that itself only polls once a
+/// second — trading a small, bounded staleness window for turning N
+/// concurrent full-directory scans per second into at most one.
+struct QueueViewCache {
+    computed_at: std::time::Instant,
+    mux_queue: Vec<String>,
+    move_queue: Vec<String>,
+    mux_full: usize,
+    move_full: usize,
+}
+
+/// Keyed by staging_dir rather than a single slot: the staging path can
+/// change at runtime (a Settings edit), and — just as importantly — this
+/// keeps two DIFFERENT staging dirs from evicting each other's cached scan
+/// (a real scenario if the operator ever repoints staging, and exactly the
+/// shape our own parallel tests exercise with distinct tempdirs).
+static QUEUE_VIEW_CACHE: Lazy<std::sync::Mutex<std::collections::HashMap<String, QueueViewCache>>> =
+    Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// How long a cached queue view is served before the next caller triggers a
+/// fresh scan. Kept comfortably under the ~1s SSE tick so no client ever
+/// observes staleness worse than what the poll cadence already implies.
+const QUEUE_VIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// [`build_queue_views`], but shared across concurrent callers within
+/// `QUEUE_VIEW_CACHE_TTL` instead of re-scanning the staging directory once
+/// per caller. Used by [`get_state_json`] (the per-second SSE/`/api/state`
+/// payload); `handle_system_info`'s on-demand `/api/system` panel calls the
+/// uncached `build_queue_views` directly so a manual refresh always sees the
+/// latest disk state.
+fn build_queue_views_cached(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usize) {
+    let mut map = QUEUE_VIEW_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = map.get(staging_dir)
+        && c.computed_at.elapsed() < QUEUE_VIEW_CACHE_TTL
+    {
+        return (
+            c.mux_queue.clone(),
+            c.move_queue.clone(),
+            c.mux_full,
+            c.move_full,
+        );
+    }
+    let (mux_queue, move_queue, mux_full, move_full) = build_queue_views(staging_dir);
+    // Opportunistic prune so a staging path that keeps changing (or a test
+    // suite hammering many distinct tempdirs) can't grow this map forever.
+    map.retain(|_, v| v.computed_at.elapsed() < QUEUE_VIEW_CACHE_TTL);
+    map.insert(
+        staging_dir.to_string(),
+        QueueViewCache {
+            computed_at: std::time::Instant::now(),
+            mux_queue: mux_queue.clone(),
+            move_queue: move_queue.clone(),
+            mux_full,
+            move_full,
+        },
+    );
+    (mux_queue, move_queue, mux_full, move_full)
 }
 
 fn get_state_json(staging_dir: &str) -> String {
@@ -3951,7 +4260,7 @@ fn get_state_json(staging_dir: &str) -> String {
     // did. `pending_queue` already enforces mutual exclusion (a `.done`/
     // `.review`/`.muxing`/`.completed`/`.failed` dir is never "(queued)"),
     // so within this one snapshot a disc appears in at most one queue.
-    let (mux_queue, move_queue, _, _) = build_queue_views(staging_dir);
+    let (mux_queue, move_queue, _, _) = build_queue_views_cached(staging_dir);
     obj["_mux_queue"] = serde_json::to_value(&mux_queue).unwrap_or_default();
     obj["_move_queue"] = serde_json::to_value(&move_queue).unwrap_or_default();
     obj.to_string()
@@ -4249,6 +4558,60 @@ fn parse_query(url: &str) -> std::collections::HashMap<String, String> {
         }
     }
     map
+}
+
+#[cfg(test)]
+mod parse_query_tests {
+    use super::*;
+
+    // parse_query's internal `clamp` truncates a query field to
+    // MAX_FIELD_LEN (256) bytes on a char boundary. These pin the three
+    // shapes an off-by-one (`-=`->`+=`, or the no-op `/=`) mutant in that
+    // loop would break: (1) a value that truncates mid multi-byte char and
+    // must back up to the last full char, (2) a value exactly at the cap
+    // (no truncation), (3) a value over the cap that already lands on a
+    // boundary at the cutoff (loop body never runs). An `end += 1` mutant
+    // would spin forever on case (1); this test completing at all is part
+    // of what pins it, but we also assert the exact returned bytes so a
+    // silent off-by-one can't hide.
+    #[test]
+    fn clamps_query_value_at_char_boundary_when_cutoff_lands_mid_char() {
+        // 255 ASCII bytes, then a 2-byte 'é' straddling the 256-byte cutoff
+        // (occupies bytes 255..257), then more filler. Byte offset 256 sits
+        // inside 'é', so clamp must back up to 255 and drop 'é' entirely.
+        let value = format!("{}é{}", "a".repeat(255), "b".repeat(10));
+        let url = format!("/x?q={value}");
+        let map = parse_query(&url);
+        assert_eq!(
+            map.get("q").map(String::as_str),
+            Some("a".repeat(255).as_str()),
+            "must truncate to the last full character before the cutoff, not split 'é'"
+        );
+    }
+
+    #[test]
+    fn query_value_exactly_at_cap_is_not_truncated() {
+        // Exactly 256 bytes (128 two-byte 'é' chars) — s.len() <= n, the
+        // `<=` early-return branch, no truncation at all.
+        let value = "é".repeat(128);
+        assert_eq!(value.len(), 256);
+        let url = format!("/x?q={value}");
+        let map = parse_query(&url);
+        assert_eq!(map.get("q").map(String::as_str), Some(value.as_str()));
+    }
+
+    #[test]
+    fn query_value_over_cap_already_on_boundary_truncates_cleanly() {
+        // 260 plain ASCII bytes: over the cap, but byte 256 is already a
+        // char boundary, so the backward-scan loop body never executes.
+        let value = "a".repeat(260);
+        let url = format!("/x?q={value}");
+        let map = parse_query(&url);
+        assert_eq!(
+            map.get("q").map(String::as_str),
+            Some("a".repeat(256).as_str())
+        );
+    }
 }
 
 /// Deadline for the bounded settings-save on the HTTP handler thread.
@@ -4901,7 +5264,20 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
         json_response(request, 409, r#"{"ok":false,"error":"already ripping"}"#);
         return;
     }
+    spawn_rip_after_claim(request, cfg, device, resume_mode);
+}
 
+/// Spawn the rip worker thread for `device`, assuming the caller has ALREADY
+/// won the claim via `ripper::try_claim_active`. Shared by [`handle_rip`]
+/// (claims for itself) and [`handle_accept_loss`] (must claim BEFORE writing
+/// any staging markers, so a losing claim leaves the on-disk override
+/// unarmed — see the comment there).
+fn spawn_rip_after_claim(
+    request: tiny_http::Request,
+    cfg: &Arc<RwLock<Config>>,
+    device: &str,
+    resume_mode: ResumeMode,
+) {
     let dev = device.to_string();
     let dev_path = format!("/dev/{}", device);
     let cfg = Arc::clone(cfg);
@@ -4977,6 +5353,19 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
         );
         return;
     }
+    // Claim the device BEFORE touching any on-disk marker. A rejected
+    // (409) accept must leave the staging dir exactly as it was: if we
+    // wrote `.accept-loss` first and only THEN discovered the device was
+    // already ripping (handle_rip's own try_claim_active), the override
+    // stays armed on disk with no rip in flight to consume it. The NEXT
+    // legitimate rip/resume on this device would then silently pick up
+    // the stale override and mux a rip whose loss was never actually
+    // accepted for that run — a damaged rip filed as finished with no
+    // operator confirmation for that abort.
+    if !ripper::try_claim_active(device) {
+        json_response(request, 409, r#"{"ok":false,"error":"already ripping"}"#);
+        return;
+    }
     // Arm the one-shot override and clear the terminal/abort markers so the dir
     // resumes (re-mux) instead of being refused as failed.
     ripper::staging::write_accept_loss_marker(dir);
@@ -4987,8 +5376,10 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
         device,
         "Accept-damage requested — re-muxing the existing ISO with the loss override.",
     );
-    // Delegate to the resume path; resume_remux consumes `.accept-loss`.
-    handle_rip(request, cfg, device, "resume=yes");
+    // Delegate to the already-claimed spawn path (resume_remux consumes
+    // `.accept-loss`); do NOT go through handle_rip, which would try to
+    // claim a second time and always lose against the claim just above.
+    spawn_rip_after_claim(request, cfg, device, ResumeMode::Require);
 }
 
 /// Resume-mode chosen by the caller of `/api/rip`. The dispatch logic
