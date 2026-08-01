@@ -69,6 +69,21 @@ pub const SWEEPING_MARKER: &str = ".sweeping";
 pub const MUXING_MARKER: &str = ".muxing";
 pub const RESTART_COUNT_FILE: &str = ".restart_count";
 
+/// The disc's RAW volume label (UDF `meta_title`, else `volume_id`), recorded
+/// in its staging dir at creation.
+///
+/// The dir itself is named for the TMDB-resolved title, which is deliberately
+/// NOT unique: `tmdb::clean_title` strips "disc 1".."disc 4" before the lookup,
+/// so every disc of a boxset resolves to the same title and wants the same
+/// directory. The raw label is the thing that still tells them apart, so it is
+/// recorded here and used to decide whether an existing dir belongs to THIS
+/// disc or merely to one with the same title.
+///
+/// Absent in dirs written before this existed. A missing label reads as "same
+/// disc", which preserves the old skip-on-`.completed` behaviour for legacy
+/// staging rather than re-ripping it on upgrade.
+pub const DISC_LABEL_FILE: &str = ".disc-label";
+
 /// Available bytes at the given path's filesystem, via `statvfs(3)`.
 /// Returns None on any error (path missing, not POSIX, syscall failure).
 /// Used by the pre-flight check in `rip_disc` to refuse rips that would
@@ -698,6 +713,103 @@ impl ScanObservations {
     ///    and walked toward `.failed` over RESTART_LIMIT restarts.
     fn contents_unknown(&self) -> bool {
         !self.saw_read_ok || (self.had_entry_error && self.observed_nothing())
+    }
+}
+
+/// Record the disc's raw volume label in its staging dir. Best-effort: a
+/// failure just means the dir reads as "unlabelled" later, which falls back to
+/// the pre-existing same-disc assumption.
+pub fn write_disc_label(dir: &Path, raw_label: &str) {
+    let _ = std::fs::write(dir.join(DISC_LABEL_FILE), raw_label.as_bytes());
+}
+
+/// The raw volume label recorded in a staging dir, if any.
+pub fn read_disc_label(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(DISC_LABEL_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Does `dir` belong to the disc with raw label `raw_label`?
+///
+/// An unlabelled dir (written before labels existed) counts as a match: the
+/// conservative answer, because treating legacy staging as a DIFFERENT disc
+/// would re-rip it on the first insert after an upgrade.
+pub fn dir_is_same_disc(dir: &Path, raw_label: &str) -> bool {
+    match read_disc_label(dir) {
+        Some(recorded) => recorded == raw_label,
+        None => true,
+    }
+}
+
+/// Pick a staging dir name for `raw_label` under `staging_root`, given the
+/// title-derived `base` name.
+///
+/// Returns `base` when it is free or already belongs to this disc, and
+/// `base_2`, `base_3`, ... when it is taken by a DIFFERENT disc — the discs of
+/// a boxset all resolve to one title, and before this they silently shared one
+/// directory, so inserting disc 2 after disc 1 finished was read as "already
+/// ripped" and disc 2 was never read at all.
+///
+/// Deliberately does NOT uniquify for the same disc: re-inserting one disc
+/// after a container restart must still find its own dir, or every restart
+/// would re-sweep a finished disc into a fresh directory.
+///
+/// An EMPTY `raw_label` means the caller does not know which disc this is (a
+/// state entry seeded by the mux/mover paths rather than by a drive scan).
+/// That is the mirror of an unlabelled dir and takes the same conservative
+/// answer — plain `base`, the pre-existing behaviour. Without this an unknown
+/// label would compare unequal to every recorded label and send such a caller
+/// off to a fresh `base_2` that no rip ever created.
+pub fn staging_name_for_disc(staging_root: &Path, base: &str, raw_label: &str) -> String {
+    if raw_label.is_empty() {
+        return base.to_string();
+    }
+    let first = staging_root.join(base);
+    if !first.exists() || dir_is_same_disc(&first, raw_label) {
+        return base.to_string();
+    }
+    // Bounded: a title with 64 distinct discs behind it is a bug, not a boxset.
+    for n in 2..=64u32 {
+        let candidate = format!("{base}_{n}");
+        let path = staging_root.join(&candidate);
+        if !path.exists() || dir_is_same_disc(&path, raw_label) {
+            return candidate;
+        }
+    }
+    base.to_string()
+}
+
+/// THE staging-directory naming rule. Every caller that needs the staging dir
+/// for a disc goes through here: sanitize the TMDB display title into a path
+/// segment, then let [`staging_name_for_disc`] hand back a `_2`/`_3` variant if
+/// that segment is already owned by a DIFFERENT disc.
+///
+/// One function on purpose. This bug — disc 2 of a boxset silently skipped as
+/// "already ripped" — exists because the "staging dir name" rule was spelled
+/// out inline at ten call sites, so hardening any one of them fixed nothing.
+/// Do not re-derive a staging basename anywhere else; call this.
+pub fn staging_basename(staging_root: &Path, display_name: &str, raw_label: &str) -> String {
+    let base = crate::util::sanitize_path_compact(display_name);
+    staging_name_for_disc(staging_root, &base, raw_label)
+}
+
+/// Adopt `dir` for the disc with raw label `raw_label`, writing the label if
+/// the dir does not already carry one.
+///
+/// The "if absent" half is what upgrades legacy staging: a dir created before
+/// labels existed reads as every disc's dir (see [`dir_is_same_disc`]), which
+/// is right once but would keep matching disc 2 as well. The first disc to use
+/// it stamps its label and takes ownership, so the next different disc gets its
+/// own directory. An existing, different label is left alone — that dir is
+/// someone else's and `staging_basename` should not have routed here.
+pub fn adopt_disc_label(dir: &Path, raw_label: &str) {
+    if raw_label.is_empty() {
+        return;
+    }
+    if read_disc_label(dir).is_none() {
+        write_disc_label(dir, raw_label);
     }
 }
 
@@ -2585,5 +2697,91 @@ mod tests {
             "the .tmp sibling must be cleaned up after a rename failure, found: {}",
             tmp.display()
         );
+    }
+
+    /// Every disc of a boxset resolves to one TMDB title, so before this they
+    /// shared a staging dir: insert disc 2 after disc 1 finished and
+    /// `disc_already_completed` saw disc 1's `.completed`, logged "already
+    /// ripped", and never read disc 2. The raw volume label is what still
+    /// tells the discs apart.
+    #[test]
+    fn a_different_disc_with_the_same_title_gets_its_own_staging_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+
+        // Nothing there yet: the plain title wins.
+        assert_eq!(staging_name_for_disc(r, "Movie", "MOVIE_DISC_1"), "Movie");
+
+        // Disc 1 rips and finishes.
+        std::fs::create_dir_all(r.join("Movie")).unwrap();
+        write_disc_label(&r.join("Movie"), "MOVIE_DISC_1");
+
+        // Disc 1 re-inserted (a container restart with the disc still in the
+        // drive) must find ITS OWN dir, not spawn a new one — otherwise every
+        // Watchtower deploy re-sweeps a finished disc.
+        assert_eq!(staging_name_for_disc(r, "Movie", "MOVIE_DISC_1"), "Movie");
+
+        // Disc 2 is a different disc with the same title: its own dir.
+        assert_eq!(staging_name_for_disc(r, "Movie", "MOVIE_DISC_2"), "Movie_2");
+
+        // ...and once disc 2 exists, disc 3 goes past both.
+        std::fs::create_dir_all(r.join("Movie_2")).unwrap();
+        write_disc_label(&r.join("Movie_2"), "MOVIE_DISC_2");
+        assert_eq!(staging_name_for_disc(r, "Movie", "MOVIE_DISC_3"), "Movie_3");
+        // Disc 2 still finds its own.
+        assert_eq!(staging_name_for_disc(r, "Movie", "MOVIE_DISC_2"), "Movie_2");
+    }
+
+    /// A staging dir written before labels existed has none. It must read as
+    /// "this disc", so an upgrade does not re-rip staging that is already
+    /// finished, and does not orphan a partial rip into a new directory.
+    #[test]
+    fn an_unlabelled_legacy_staging_dir_is_treated_as_the_same_disc() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("Movie")).unwrap();
+        // No .disc-label written — this is what the previous version left.
+        assert!(dir_is_same_disc(&r.join("Movie"), "ANY_LABEL"));
+        assert_eq!(staging_name_for_disc(r, "Movie", "ANY_LABEL"), "Movie");
+    }
+
+    /// The mirror case: the CALLER doesn't know the label. Some `RipState`s are
+    /// seeded by the mux/mover paths, not by a drive scan, and carry no raw
+    /// label. An unknown label must resolve to the plain title dir — the
+    /// pre-existing behaviour — and never to a `_2` that no rip created.
+    #[test]
+    fn an_unknown_disc_label_resolves_to_the_plain_title_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("Movie")).unwrap();
+        write_disc_label(&r.join("Movie"), "MOVIE_DISC_1");
+        assert_eq!(staging_name_for_disc(r, "Movie", ""), "Movie");
+        assert_eq!(staging_basename(r, "Movie", ""), "Movie");
+    }
+
+    /// `adopt_disc_label` stamps an unlabelled (legacy) dir for the first disc
+    /// that uses it, so the NEXT different disc no longer matches it — and
+    /// never rewrites a label that is already there.
+    #[test]
+    fn adopting_a_legacy_dir_stamps_it_once_for_its_first_user() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        let dir = r.join("Movie");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        adopt_disc_label(&dir, "MOVIE_DISC_1");
+        assert_eq!(read_disc_label(&dir).as_deref(), Some("MOVIE_DISC_1"));
+        // Now that it is owned, a different disc of the same title moves over.
+        assert_eq!(staging_name_for_disc(r, "Movie", "MOVIE_DISC_2"), "Movie_2");
+
+        // Never clobbers an existing label.
+        adopt_disc_label(&dir, "MOVIE_DISC_2");
+        assert_eq!(read_disc_label(&dir).as_deref(), Some("MOVIE_DISC_1"));
+
+        // An unknown label adopts nothing — it would record a lie.
+        let dir2 = r.join("Other");
+        std::fs::create_dir_all(&dir2).unwrap();
+        adopt_disc_label(&dir2, "");
+        assert!(read_disc_label(&dir2).is_none());
     }
 }

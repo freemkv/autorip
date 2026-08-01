@@ -49,6 +49,21 @@ pub struct RipState {
     pub status: String, // "idle", "scanning", "ripping", "moving", "done", "error"
     pub disc_present: bool,
     pub disc_name: String,
+    /// The disc's RAW volume label (`DiscId::name()`), before the TMDB lookup.
+    ///
+    /// [`Self::disc_name`] is the TMDB-resolved title, and it is deliberately
+    /// NOT unique per disc: `tmdb::clean_title` strips "disc 1".."disc 4"
+    /// before the lookup, so every disc of a boxset resolves to one title and
+    /// wants one staging directory. This is the field that still tells them
+    /// apart, and it is what
+    /// [`staging::staging_name_for_disc`](crate::ripper::staging::staging_name_for_disc)
+    /// uses to decide whether an existing staging dir belongs to THIS disc.
+    ///
+    /// Server-side bookkeeping only — not serialized, the UI shows the TMDB
+    /// title. Carried forward across state pushes by [`update_state`] (see
+    /// there), because nearly every caller builds a fresh `RipState`.
+    #[serde(skip)]
+    pub disc_label: String,
     pub disc_format: String, // "uhd", "bluray", "dvd"
     pub progress_pct: u8,
     pub progress_gb: f64,
@@ -204,6 +219,7 @@ impl Default for RipState {
             status: "idle".to_string(),
             disc_present: false,
             disc_name: String::new(),
+            disc_label: String::new(),
             disc_format: String::new(),
             progress_pct: 0,
             progress_gb: 0.0,
@@ -345,19 +361,12 @@ pub fn device_known(device: &str) -> bool {
     s.contains_key(device)
 }
 
-/// The disc display-name currently associated with `device` (from the live
-/// state), if any. Used by the `Accept damage` handler to locate the disc's
-/// staging dir without re-scanning.
-pub fn current_disc_name(device: &str) -> Option<String> {
-    let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    s.get(device).and_then(|r| {
-        if r.disc_name.is_empty() {
-            None
-        } else {
-            Some(r.disc_name.clone())
-        }
-    })
-}
+// `current_disc_name` lived here: the display name alone, used by the
+// `Accept damage` handler to locate a staging dir. Removed with the boxset
+// fix — the display name is NOT enough to identify a disc (every disc of a set
+// shares one TMDB title), and every staging lookup now goes through
+// `ripper::staging_basename_for_device`, which reads the raw volume label too.
+// Reintroducing a name-only accessor invites the same bug back.
 
 pub fn is_busy(device: &str) -> bool {
     // Recover the poisoned guard instead of treating poison as "not
@@ -395,6 +404,24 @@ pub fn update_state(device: &str, mut state: RipState) {
     let prev_claim_gen = s.get(device).map(|p| p.claim_gen).unwrap_or(0);
     if state.claim_gen == 0 {
         state.claim_gen = prev_claim_gen;
+    }
+    // Preserve the raw volume label across pushes, for the same reason as
+    // `claim_gen`: nearly every caller drops a fresh `RipState` with
+    // `..Default::default()` into `update_state` and sets only `disc_name`.
+    // Without this carry-forward the label — the ONLY thing distinguishing two
+    // discs of a boxset, which share one TMDB title — would be erased by the
+    // first progress push, and every staging lookup after that would collapse
+    // back onto disc 1's directory.
+    //
+    // Guarded on the display name being unchanged (and non-empty): a state
+    // push for a different disc, or for an empty/ejected drive, must NOT
+    // inherit the previous disc's label and claim its staging dir.
+    if state.disc_label.is_empty()
+        && !state.disc_name.is_empty()
+        && let Some(prev) = s.get(device)
+        && prev.disc_name == state.disc_name
+    {
+        state.disc_label = prev.disc_label.clone();
     }
     let prev_started = s.get(device).map(|p| p.started_epoch_secs).unwrap_or(0);
     let now_active = is_active_status(&state.status);
@@ -1716,43 +1743,78 @@ mod tests {
         );
     }
 
+    /// `disc_label` is the raw volume label — the only thing telling two discs
+    /// of a boxset apart behind their one shared TMDB title, and what decides
+    /// which staging dir a disc owns. Nearly every caller pushes a fresh
+    /// `RipState` with `..Default::default()`, so `update_state` must carry it
+    /// forward or the first progress push erases it and the disc collapses back
+    /// onto its sibling's directory. It must NOT be carried onto a different
+    /// disc, or onto an empty drive.
     #[test]
-    fn current_disc_name_none_when_empty_some_when_set() {
-        let dev = format!("test-discname-{}", std::process::id());
-        assert_eq!(
-            current_disc_name(&dev),
-            None,
-            "unknown device must report no disc name"
-        );
+    fn update_state_carries_the_disc_label_but_never_onto_another_disc() {
+        let dev = format!("test-disclabel-{}", std::process::id());
         update_state(
             &dev,
             RipState {
                 device: dev.clone(),
-                status: "ripping".to_string(),
-                disc_name: "MY_MOVIE_UHD".to_string(),
+                status: "scanning".to_string(),
+                disc_name: "Boxset Movie".to_string(),
+                disc_label: "BOXSET_DISC_2".to_string(),
                 ..Default::default()
             },
         );
-        assert_eq!(
-            current_disc_name(&dev),
-            Some("MY_MOVIE_UHD".to_string()),
-            "current_disc_name must return the live disc_name"
-        );
-        // An empty disc_name must read as None (the Accept-damage handler
-        // treats an empty name as "no staging dir to find"), not Some("").
+
+        // A progress push that names the same disc but sets no label.
         update_state(
             &dev,
             RipState {
                 device: dev.clone(),
                 status: "ripping".to_string(),
+                disc_name: "Boxset Movie".to_string(),
+                ..Default::default()
+            },
+        );
+        let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.get(&dev).map(|r| r.disc_label.as_str()),
+            Some("BOXSET_DISC_2"),
+            "the raw volume label must survive a default-built state push"
+        );
+        drop(s);
+
+        // A DIFFERENT disc must not inherit it.
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "scanning".to_string(),
+                disc_name: "Some Other Film".to_string(),
+                ..Default::default()
+            },
+        );
+        let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.get(&dev).map(|r| r.disc_label.as_str()),
+            Some(""),
+            "a different disc must not inherit the previous disc's label"
+        );
+        drop(s);
+
+        // Nor must an ejected / empty drive.
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "idle".to_string(),
                 disc_name: String::new(),
                 ..Default::default()
             },
         );
+        let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
-            current_disc_name(&dev),
-            None,
-            "empty disc_name must read as None, not Some(\"\")"
+            s.get(&dev).map(|r| r.disc_label.as_str()),
+            Some(""),
+            "an empty drive must not keep a stale label"
         );
     }
 
