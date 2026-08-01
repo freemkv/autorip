@@ -44,21 +44,34 @@ fn search_multi_url(query: &str, api_key: &str) -> String {
 /// broken endpoint from streaming an unbounded body into memory (DoS).
 const MAX_TMDB_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Read at most `MAX_TMDB_BYTES` from the response body, rejecting anything
-/// over the cap, then parse as JSON. Replaces `resp.into_json()`, which reads
-/// the whole body with no upper bound.
-fn read_capped_json(resp: ureq::Response) -> std::io::Result<serde_json::Value> {
-    use std::io::Read;
+/// Read at most `cap` bytes from `reader`, rejecting anything over the cap
+/// (an oversized body streams a `cap+1`-byte read successfully, then fails
+/// the boundary check below rather than being silently truncated to `cap`
+/// bytes and parsed as if that were the whole response).
+///
+/// Pulled out of [`read_capped_json`] as a pure function over any `Read` —
+/// not tied to `ureq::Response`, which can't be constructed in a unit test
+/// without a live HTTP server — so the cap boundary itself (accept at
+/// exactly `cap`, reject at `cap + 1`) is directly testable against an
+/// in-memory `Cursor`.
+fn read_capped_bytes(reader: impl std::io::Read, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
     let mut buf = Vec::new();
-    resp.into_reader()
-        .take(MAX_TMDB_BYTES + 1)
-        .read_to_end(&mut buf)?;
-    if buf.len() as u64 > MAX_TMDB_BYTES {
+    reader.take(cap + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > cap {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "tmdb response exceeded size cap",
         ));
     }
+    Ok(buf)
+}
+
+/// Read at most `MAX_TMDB_BYTES` from the response body, rejecting anything
+/// over the cap, then parse as JSON. Replaces `resp.into_json()`, which reads
+/// the whole body with no upper bound.
+fn read_capped_json(resp: ureq::Response) -> std::io::Result<serde_json::Value> {
+    let buf = read_capped_bytes(resp.into_reader(), MAX_TMDB_BYTES)?;
     serde_json::from_slice(&buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
@@ -173,6 +186,22 @@ pub fn search(query: &str, api_key: &str, limit: usize) -> Vec<TmdbResult> {
     let Some(results) = json["results"].as_array() else {
         return Vec::new();
     };
+    rank_search_results(query, results, limit)
+}
+
+/// The pure ranking half of [`search`]: parse every `movie`/`tv` entry in
+/// `results`, then sort exact-dated-match first, dated second, popularity as
+/// the final tiebreaker, and cap at `limit`. Pulled out as its own function
+/// (taking already-fetched JSON rather than making the HTTP call itself) so
+/// this — the actual decision logic behind the manual "needs review"
+/// correction picker — can be driven directly in a test without a network
+/// round trip, instead of leaving it exercised only via the untestable
+/// `search()` entry point.
+fn rank_search_results(
+    query: &str,
+    results: &[serde_json::Value],
+    limit: usize,
+) -> Vec<TmdbResult> {
     let want = norm(query);
     let mut parsed: Vec<(TmdbResult, f64, bool)> = results
         .iter()
@@ -675,6 +704,49 @@ mod tests {
         assert_eq!(r.year, 2022);
     }
 
+    /// Every prior pick_best test puts the WRONG (dateless/non-exact)
+    /// candidate first and the CORRECT (exact+dated) one second — so an
+    /// already-exact `best` is never at risk of being displaced. Reverse
+    /// the order: the correct exact+dated match arrives FIRST, then a more
+    /// popular but non-exact/dateless candidate arrives SECOND. The correct
+    /// one must still win — a later, merely-more-popular candidate must
+    /// never displace an already-exact best.
+    #[test]
+    fn pick_best_exact_dated_first_survives_a_more_popular_non_exact_later() {
+        let results = serde_json::json!([
+            {"media_type": "movie", "title": "Civil War",
+             "release_date": "2024-04-10", "popularity": 30.0},
+            {"media_type": "movie", "title": "Captain America: Civil War",
+             "release_date": "2016-04-27", "popularity": 200.0}
+        ]);
+        let r = pick_best("Civil War", results.as_array().unwrap()).unwrap();
+        assert_eq!(
+            r.title, "Civil War",
+            "an already-exact, dated best must not be displaced by a later, \
+             merely more popular non-exact candidate"
+        );
+        assert_eq!(r.year, 2024);
+    }
+
+    /// Same "wrong order" shape for the dated-vs-undated tie-break (not the
+    /// exact-match tier): a DATED best found first must survive a later,
+    /// more popular but UNDATED candidate.
+    #[test]
+    fn pick_best_dated_first_survives_a_more_popular_undated_later() {
+        let results = serde_json::json!([
+            {"media_type": "movie", "title": "Dune: Part Two",
+             "release_date": "2024-02-27", "popularity": 10.0},
+            {"media_type": "movie", "title": "Dune Part Two",
+             "release_date": "", "popularity": 500.0}
+        ]);
+        let r = pick_best("", results.as_array().unwrap()).unwrap();
+        assert_eq!(
+            r.year, 2024,
+            "a dated best found first must not be displaced by a later, \
+             more popular but undated candidate"
+        );
+    }
+
     /// Verify that the error_kind string produced for transport/status errors
     /// in fetch_multi never contains the api_key (which lives in the URL
     /// query string). We replicate the summary logic that fetch_multi uses so
@@ -710,5 +782,168 @@ mod tests {
             !transport_summary.contains(api_key),
             "api_key leaked in transport summary"
         );
+    }
+
+    // --- read_capped_bytes: the DoS-cap boundary itself ----------------------
+
+    #[test]
+    fn read_capped_bytes_accepts_exactly_at_cap() {
+        let body = vec![b'x'; 100];
+        let got = read_capped_bytes(std::io::Cursor::new(&body), 100).unwrap();
+        assert_eq!(got.len(), 100);
+    }
+
+    #[test]
+    fn read_capped_bytes_rejects_one_byte_over_cap() {
+        let body = vec![b'x'; 101];
+        let err = read_capped_bytes(std::io::Cursor::new(&body), 100).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_capped_bytes_accepts_well_under_cap() {
+        let body = b"short body".to_vec();
+        let got = read_capped_bytes(std::io::Cursor::new(&body), MAX_TMDB_BYTES).unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn read_capped_json_end_to_end_rejects_oversized_body_via_real_response() {
+        // Exercise the actual `read_capped_json` (not just the extracted
+        // helper) against a real `ureq::Response`, built from a local TCP
+        // listener that streams a body over `MAX_TMDB_BYTES` — proving the
+        // real function, not a copy of its logic, enforces the cap.
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let oversized_len = MAX_TMDB_BYTES + 1024;
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf); // drain the request
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {oversized_len}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream
+                .write_all(&vec![b'{'; oversized_len as usize])
+                .unwrap();
+        });
+
+        let resp = ureq::get(&format!("http://{addr}/"))
+            .timeout(std::time::Duration::from_secs(5))
+            .call()
+            .expect("local server must respond");
+        let err = read_capped_json(resp).expect_err("oversized body must be rejected");
+        // Check the SPECIFIC message, not just the io::ErrorKind: a truncated
+        // read (e.g. a regressed `take(cap)` instead of `take(cap + 1)`) would
+        // silently hand a truncated `cap`-byte body to serde_json, which is
+        // ALSO invalid JSON and ALSO produces `ErrorKind::InvalidData` — so a
+        // bare kind() check can't tell "the size cap fired" from "the
+        // (wrongly) truncated body failed to parse". The message text is the
+        // one observable difference between those two failure causes.
+        assert_eq!(
+            err.to_string(),
+            "tmdb response exceeded size cap",
+            "must be rejected by the SIZE CAP specifically, not a downstream JSON parse failure \
+             on a silently-truncated body — got {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    // --- norm(): pin the actual character content, not just cross-equality ---
+
+    #[test]
+    fn norm_collapses_separator_runs_to_single_space() {
+        // Every existing norm() test applies it to BOTH sides of an equality
+        // check with structurally-parallel inputs, so a regression that
+        // collapsed the collapse-to-one-space step (word concatenation
+        // instead) would degrade both sides identically and still compare
+        // equal. Assert the actual character content instead.
+        assert_eq!(norm("Top  Gun"), "top gun");
+        assert_eq!(norm("Top Gun: Maverick"), "top gun maverick");
+        assert_eq!(norm("Top___Gun"), "top gun");
+    }
+
+    // --- search(): the manual "needs review" correction picker ---------------
+    // No existing test called `search()` (or the ranking logic it now
+    // delegates to) at all — every mutation inside it, including replacing
+    // the whole function body with an empty Vec, passed trivially.
+
+    #[test]
+    fn search_empty_api_key_or_query_yields_empty() {
+        assert!(search("Some Movie", "", 5).is_empty());
+        assert!(search("", "key", 5).is_empty());
+        assert!(search("   ", "key", 5).is_empty());
+    }
+
+    #[test]
+    fn rank_search_results_orders_exact_dated_first_then_dated_then_popularity() {
+        // The real ranking logic `search()` calls after `fetch_multi` — pure,
+        // so it's driven directly here rather than needing a network round
+        // trip. Same fixture shape as the pick_best tests, but this checks
+        // the FULL returned order (search's whole reason to exist over
+        // pick_best), and includes a highly-popular but DATELESS decoy that
+        // must sort last despite its popularity.
+        let results = serde_json::json!([
+            {"media_type": "movie", "title": "Captain America: Civil War",
+             "release_date": "2016-04-27", "popularity": 200.0},
+            {"media_type": "movie", "title": "Civil War",
+             "release_date": "2024-04-10", "popularity": 30.0},
+            {"media_type": "movie", "title": "Some Undated Civil War Thing",
+             "release_date": "", "popularity": 500.0}
+        ]);
+        let ranked = rank_search_results("Civil War", results.as_array().unwrap(), 10);
+        let titles: Vec<&str> = ranked.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Civil War",                    // exact + dated: wins outright
+                "Captain America: Civil War",   // dated, non-exact
+                "Some Undated Civil War Thing", // undated, even though most popular
+            ]
+        );
+    }
+
+    #[test]
+    fn rank_search_results_respects_limit() {
+        let results = serde_json::json!([
+            {"media_type": "movie", "title": "A", "release_date": "2001-01-01", "popularity": 1.0},
+            {"media_type": "movie", "title": "B", "release_date": "2002-01-01", "popularity": 2.0},
+            {"media_type": "movie", "title": "C", "release_date": "2003-01-01", "popularity": 3.0}
+        ]);
+        let ranked = rank_search_results("", results.as_array().unwrap(), 2);
+        assert_eq!(ranked.len(), 2, "must cap at the requested limit");
+    }
+
+    #[test]
+    fn rank_search_results_empty_input_yields_empty() {
+        assert!(rank_search_results("anything", &[], 5).is_empty());
+    }
+
+    // --- lookup(): the guard logic ahead of the untestable network call ------
+    // `lookup()` itself has zero test coverage — a regression collapsing it to
+    // unconditional `None` would pass every existing test. The happy path
+    // needs HTTP mocking (out of scope here), but the two guards that decide
+    // whether it even ATTEMPTS a request are pure and cheap to pin directly.
+
+    #[test]
+    fn lookup_empty_api_key_returns_none_without_network() {
+        // No api_key configured: must short-circuit before ever building a
+        // request (an empty key would otherwise round-trip to TMDB and get
+        // a 401 on every single insert).
+        assert!(lookup("Some Movie", "").is_none());
+    }
+
+    #[test]
+    fn lookup_blank_query_returns_none_without_network() {
+        // A separator-only volume label reduces to an empty query after
+        // clean_title; must short-circuit rather than firing a bare
+        // `query=&...` request that TMDB answers with HTTP 422.
+        assert!(lookup("", "some_api_key").is_none());
+        assert!(lookup("   ", "some_api_key").is_none());
     }
 }
