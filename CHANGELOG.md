@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.1]
+
+### Fixed
+
+- Chapter marks and title durations on NTSC DVDs were roughly 0.1% short —
+  about 3.6 seconds per hour of running time — so a mark near the end of a
+  long feature could land several seconds before the scene it names. Fixed
+  in `libfreemkv`; see its changelog for the detail. No change in autorip
+  itself.
+
 ## [1.6.0] — 2026-08-03
 
 ### Changed
