@@ -4,6 +4,20 @@
 
 ### Fixed
 
+- **Blu-ray titles built from several clips could run minutes longer than the
+  film, with sound drifting ahead of picture.** Many discs store the feature as
+  a chain of clips and use the playlist to say which part of each one to play —
+  the parts overlap or skip, and a player follows the playlist's marks. freemkv
+  never read those marks. It joined the clips by guessing from their internal
+  timestamps, so every skipped stretch became dead time in the output and every
+  overlap put the same moment on the timeline twice, which shoved the audio
+  ahead of the video and left it there. One affected title declared 2h11m and
+  contained 2h13m; the worst ran 13 minutes long. Sound came adrift about half
+  an hour in and stayed adrift. The marks are now read, each clip contributes
+  exactly the span the playlist gives it, and every track crosses a join on its
+  own frame — so a title runs exactly as long as the disc says it does. Titles
+  made of a single clip were never affected and are unchanged, as are DVDs and
+  HD-DVDs.
 - Chapter marks and title durations on NTSC DVDs were roughly 0.1% short —
   about 3.6 seconds per hour of running time — so a mark near the end of a
   long feature could land several seconds before the scene it names. Fixed
