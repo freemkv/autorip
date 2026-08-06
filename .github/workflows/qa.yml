@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ['ubuntu-latest', 'macos-latest']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -172,4 +172,58 @@ jobs:
           workspaces: autorip
       - run: rustup target add x86_64-unknown-linux-gnu
       - run: cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+        working-directory: autorip
+
+  # Windows compiles the tests but does not run them, matching the policy
+  # ci.yml already set. The value here is codegen: the #[cfg(windows)] halves
+  # of the SCSI transport and platform layers compile on no other runner, so
+  # without this they are first built at release time.
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          ref: qa
+          path: libfreemkv
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: qa
+          path: freemkv-keysources
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-engine
+          ref: qa
+          path: freemkv-engine
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-i18n
+          ref: qa
+          path: freemkv-i18n
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: qa
+          path: freemkv-unlock
+      - name: Resolve siblings from their qa tips
+        shell: bash
+        working-directory: autorip
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: autorip
+      - run: cargo build --release --tests
         working-directory: autorip
