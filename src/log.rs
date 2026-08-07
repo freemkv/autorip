@@ -657,9 +657,18 @@ mod tests {
         let big = "x".repeat((SYSTEM_LOG_ROTATE_BYTES + 1024) as usize);
         std::fs::write(device_log_path("system"), big).unwrap();
         rotate_system_log_if_large();
+        // The invariant is that the OVERSIZED log is gone, not that no log
+        // exists. `syslog()` is reached transitively by tests in other modules
+        // that do not hold the env guard, and it resolves its path through the
+        // process-global AUTORIP_DIR — into this test's tempdir. One such
+        // append immediately after rotation recreates the file, which failed a
+        // bare `!exists()` while rotation had in fact done its job. Assert what
+        // rotation actually promises: nothing oversized is left behind.
+        let live_path = device_log_path("system");
+        let live_len = std::fs::metadata(&live_path).map(|m| m.len()).unwrap_or(0);
         assert!(
-            !std::path::Path::new(&device_log_path("system")).exists(),
-            "oversized system log must be rotated out"
+            live_len <= SYSTEM_LOG_ROTATE_BYTES,
+            "oversized system log must be rotated out (live log is {live_len} bytes)"
         );
         let rips_dir = d.join("logs").join("rips");
         let archived: Vec<_> = std::fs::read_dir(&rips_dir)
