@@ -318,12 +318,10 @@ jobs:
           workspaces: autorip
       - run: cargo build --tests
         working-directory: autorip
-      # Windows is a SHIPPED target, so its test results are worth knowing even
-      # though the suite does not pass there yet: mover.rs has real path-handling
-      # failures that no other runner can see. Non-blocking ON PURPOSE — the
-      # failures are pre-existing, and gating dev on them would stall unrelated
-      # work. This becomes a blocking step once the count reaches zero.
-      - name: Run tests (reporting only — mover.rs path handling)
-        continue-on-error: true
+      # Windows is a SHIPPED target, and this is the only runner that executes
+      # the suite there. It went in reporting-only with five known failures —
+      # four POSIX-path assertions and a CRLF-sensitive source match — and is a
+      # real gate now that those are fixed, so the next one cannot creep in.
+      - name: Run tests
         working-directory: autorip
         run: cargo test --tests
