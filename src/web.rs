@@ -3678,7 +3678,7 @@ mod web_tests {
         // a bare `INFLIGHT.fetch_sub(...)` inside the resolver closure (the old
         // shape that leaked when thread::spawn panicked). It must flow through
         // a ConnGuard whose Drop releases the slot on every path.
-        let src = include_str!("web.rs");
+        let src = crate::util::source_lf(include_str!("web.rs"));
         let start = src
             .find("pub(crate) fn resolve_with_timeout")
             .expect("resolve_with_timeout present");

@@ -2133,7 +2133,7 @@ mod title_confidence_routing_tests {
     /// the same class of gap.
     #[test]
     fn resume_remux_calls_resume_title_confident_with_disc_label_then_match_title() {
-        let src = include_str!("resume.rs");
+        let src = crate::util::source_lf(include_str!("resume.rs"));
         assert!(
             src.contains(
                 "resume_title_confident(\n        &cfg_read.tmdb_api_key,\n        carried_confident,\n        &disc_label,\n        &title_for_match,\n        tmdb_year,\n    )"
@@ -2150,7 +2150,7 @@ mod title_confidence_routing_tests {
     /// own copy of the `.done`/`.review` ternary.
     #[test]
     fn iso_completion_uses_handoff_marker_name() {
-        let src = include_str!("resume.rs");
+        let src = crate::util::source_lf(include_str!("resume.rs"));
         let start = src
             .find("ISO output: deliver the whole-disc image")
             .expect("resume.rs should have the ISO completion branch");
@@ -2404,7 +2404,7 @@ mod resume_remux_webhook_tests {
     /// invokes `send_rich`, so a refactor can't silently drop it again.
     #[test]
     fn success_path_fires_completion_webhook() {
-        let src = include_str!("resume.rs");
+        let src = crate::util::source_lf(include_str!("resume.rs"));
         let start = src
             .find("Auto-resume complete")
             .expect("resume.rs should log \"Auto-resume complete\" on the success path");
@@ -2453,7 +2453,7 @@ mod resume_iso_auto_eject_tests {
     /// device guard.
     #[test]
     fn resume_iso_success_path_honors_auto_eject() {
-        let src = include_str!("resume.rs");
+        let src = crate::util::source_lf(include_str!("resume.rs"));
         let start = src
             .find("Auto-resume: ISO output complete")
             .expect("resume.rs should log \"Auto-resume: ISO output complete\" on the ISO path");
@@ -2485,7 +2485,7 @@ mod resume_iso_auto_eject_tests {
     /// the `_mux` worker re-eject the physical drive.
     #[test]
     fn resume_mkv_terminal_gates_eject_through_predicate() {
-        let src = include_str!("resume.rs");
+        let src = crate::util::source_lf(include_str!("resume.rs"));
         let start = src
             .find("Honor auto_eject after a successful resume")
             .expect("resume.rs should have the MKV terminal auto_eject comment");
@@ -2636,7 +2636,7 @@ mod post_mux_loss_reporting_tests {
     /// into the reported figures.
     #[test]
     fn resume_reports_demux_loss_on_accepted_rip() {
-        let src = include_str!("resume.rs");
+        let src = crate::util::source_lf(include_str!("resume.rs"));
         // Bound to the accepted-success region: from the combined-loss
         // (sweep + demux) computation up to the auto-eject tail.
         let start = src
@@ -2694,7 +2694,7 @@ mod post_mux_loss_reporting_tests {
     /// idle/None verdict.
     #[test]
     fn resume_incomplete_mux_surfaces_read_error_not_silent_idle() {
-        let src = include_str!("resume.rs");
+        let src = crate::util::source_lf(include_str!("resume.rs"));
         // Bound to the mux-incomplete early-return: from the guard up to the
         // "A loss is a loss" mux-time-loss note that immediately follows it. The
         // new anchor brackets just the ~35-line guard block.
@@ -2748,7 +2748,7 @@ mod post_mux_loss_reporting_tests {
     /// `abort_on_lost_secs` to a resumable `.aborted-loss`.
     #[test]
     fn completed_mux_with_loss_gated_by_abort_on_lost_secs() {
-        let src = include_str!("resume.rs");
+        let src = crate::util::source_lf(include_str!("resume.rs"));
         // The completed-mux success region: from the "A loss is a loss" mux-time-
         // loss note through the auto-eject tail.
         let start = src
