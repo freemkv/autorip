@@ -2117,8 +2117,115 @@ mod tests {
         assert_eq!(destination_root(&cfg, &tmdb), "/srv/library/movies");
     }
 
+    /// The media-root rules on NATIVE paths, so Windows exercises this logic
+    /// instead of skipping it. The absolute-wins case is the load-bearing one:
+    /// it is what keeps a configured absolute library path from being buried
+    /// under `output_dir` (the "Mercy" incident was the relative half of the
+    /// same rule).
+    #[test]
+    fn resolve_media_root_joins_natively() {
+        let base = if cfg!(windows) {
+            r"D:\media"
+        } else {
+            "/mnt/media"
+        };
+        let elsewhere = if cfg!(windows) {
+            r"E:\library\movies"
+        } else {
+            "/srv/movies"
+        };
+
+        // A relative sub joins UNDER the base.
+        let joined = resolve_media_root(base, "movies");
+        assert_eq!(joined, Path::new(base).join("movies").to_string_lossy());
+        assert!(
+            Path::new(&joined).starts_with(base),
+            "a relative sub must stay under output_dir: {joined}"
+        );
+
+        // An absolute sub WINS outright — it must not be joined under base.
+        assert_eq!(
+            resolve_media_root(base, elsewhere),
+            elsewhere,
+            "an absolute media dir must override output_dir"
+        );
+
+        // An empty sub yields output_dir verbatim.
+        assert_eq!(resolve_media_root(base, ""), base);
+    }
+
+    /// `absolute_for_log`'s actual invariant, on every platform: whatever goes
+    /// in, what comes out is absolute. The POSIX test above pins the literal
+    /// pass-through; this pins the property.
+    #[test]
+    fn absolute_for_log_is_always_absolute_natively() {
+        let abs = if cfg!(windows) {
+            r"D:\media\movies\Mercy (2024)\Mercy (2024).mkv"
+        } else {
+            "/mnt/media/movies/Mercy (2024)/Mercy (2024).mkv"
+        };
+        assert_eq!(
+            absolute_for_log(abs),
+            abs,
+            "an absolute path passes through"
+        );
+        let rel = absolute_for_log("movies/Mercy/Mercy.mkv");
+        assert!(
+            Path::new(&rel).is_absolute(),
+            "a relative path must be anchored: {rel}"
+        );
+    }
+
+    /// The variant-suffix RULES on native paths: the suffix lands on the stem,
+    /// the extension survives, and the per-title directory is untouched so a
+    /// multi-disc set stays in one folder.
+    #[test]
+    fn dest_with_variant_suffixes_the_stem_natively() {
+        let dir = if cfg!(windows) {
+            r"D:\media\movies\Aurora Drift (2024)"
+        } else {
+            "/mnt/media/movies/Aurora Drift (2024)"
+        };
+        let d = Path::new(dir)
+            .join("Aurora Drift (2024).mkv")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            dest_with_variant(&d, 1),
+            d,
+            "the first disc keeps the plain name"
+        );
+
+        let v3 = dest_with_variant(&d, 3);
+        let p3 = Path::new(&v3);
+        assert_eq!(
+            p3.parent(),
+            Path::new(&d).parent(),
+            "the per-title directory must be left alone: {v3}"
+        );
+        assert_eq!(
+            p3.extension().and_then(|e| e.to_str()),
+            Some("mkv"),
+            "the suffix goes on the stem, never after the extension: {v3}"
+        );
+        assert_eq!(
+            p3.file_stem().and_then(|e| e.to_str()),
+            Some("Aurora Drift (2024)_3"),
+            "the suffix lands on the stem: {v3}"
+        );
+    }
+
     /// `resolve_media_root` unit semantics: relative joins, absolute wins,
     /// trailing slashes normalize, empty sub → output_dir.
+    ///
+    /// POSIX-only because the fixtures are POSIX paths: on Windows
+    /// "/mnt/media" is drive-RELATIVE, not absolute, so `Path::join` correctly
+    /// yields `/mnt/media\movies` and the absolute-wins case never triggers.
+    /// That is the platform behaving correctly on input that is not a path
+    /// there. `resolve_media_root_joins_natively` covers the same rules with
+    /// real paths on whichever platform is running.
+    #[cfg(unix)]
     #[test]
     fn resolve_media_root_semantics() {
         assert_eq!(
@@ -2463,6 +2570,10 @@ mod tests {
     /// `check_post_copy_*` validation (its own tests), and the copy-FAILURE
     /// cleanup path (`move_file_copy_failure_leaves_no_partial_dest`). Closing
     /// the gap fully needs a real EXDEV mount or an injectable rename seam.
+    /// POSIX-only: the whole premise is `st_dev` and EXDEV. `dev_id_of`
+    /// returns None off unix, so the fixture cannot even identify a second
+    /// filesystem, let alone force a cross-device rename.
+    #[cfg(unix)]
     #[test]
     fn move_file_cross_device_copy_unlink_success_when_two_filesystems_exist() {
         // Find a tempdir on a filesystem different from std::env::temp_dir().
@@ -2966,6 +3077,12 @@ mod tests {
         );
     }
 
+    /// POSIX-only: `with_file_name` re-renders the parent with the platform
+    /// separator, so a POSIX fixture comes back mixed on Windows. The RULES —
+    /// suffix on the stem, extension preserved, directory untouched — are
+    /// asserted natively in
+    /// `dest_with_variant_suffixes_the_stem_natively`.
+    #[cfg(unix)]
     #[test]
     fn dest_with_variant_suffixes_the_stem_and_leaves_variant_one_alone() {
         let d = "/mnt/media/movies/Aurora Drift (2024)/Aurora Drift (2024).mkv";
@@ -3242,7 +3359,7 @@ mod tests {
         // EBML element close" — neither of which the code does (it reads 8
         // tail bytes). Source-pin the corrected comment so the false claim
         // can't creep back in.
-        let src = include_str!("mover.rs");
+        let src = crate::util::source_lf(include_str!("mover.rs"));
         let start = src
             .find("fn check_post_copy_mkv")
             .expect("check_post_copy_mkv present");
@@ -4114,6 +4231,12 @@ mod tests {
 
     /// `absolute_for_log` never yields a cwd-relative path: absolute passes
     /// through; relative is anchored to an absolute cwd.
+    ///
+    /// POSIX-only for the pass-through case: "/mnt/media/..." is not absolute
+    /// on Windows, so it is correctly anchored to the current drive rather
+    /// than passed through. `absolute_for_log_is_always_absolute_natively`
+    /// asserts the actual invariant — the result is absolute — everywhere.
+    #[cfg(unix)]
     #[test]
     fn absolute_for_log_is_always_absolute() {
         assert_eq!(

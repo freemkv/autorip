@@ -188,9 +188,36 @@ pub fn format_duration_hm(secs: f64) -> String {
     format!("{}h {:02}m", h, m)
 }
 
+/// A source file read by `include_str!`, with line endings normalised to `\n`.
+///
+/// Several tests pin a call site by matching its source text, because the site
+/// is only reachable after a real disc scan and an argument swap there would
+/// pass every unit test. Those patterns are written with `\n`, but a checkout
+/// on Windows has `core.autocrlf=true` by default, so the file arrives with
+/// `\r\n` and every multi-line pattern misses — a green suite on Linux and a
+/// red one on Windows, over a difference that has nothing to do with the code
+/// under test.
+#[cfg(test)]
+pub fn source_lf(src: &str) -> std::borrow::Cow<'_, str> {
+    if src.contains('\r') {
+        std::borrow::Cow::Owned(src.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(src)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_lf_normalises_crlf_and_leaves_lf_alone() {
+        assert_eq!(source_lf("a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(source_lf("a\nb\n"), "a\nb\n");
+        // A borrowed return on the common path means the normalisation costs
+        // nothing on the platform that does not need it.
+        assert!(matches!(source_lf("a\nb\n"), std::borrow::Cow::Borrowed(_)));
+    }
 
     #[test]
     fn civil_from_days_epoch() {
