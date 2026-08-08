@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.6.2] — 2026-08-08
+
+### Fixed
+
+- **A stray moment of sound at the end of an HD-DVD title, and a click at every
+  chapter break on a DVD.** Where a title is stitched from segments, a few
+  frames of sound arriving just before or just after the picture that marks the
+  join were timed against the wrong segment — placing one trailing frame hours
+  past the end of an HD-DVD title, and squeezing about half a second of sound
+  into an instant at each of a DVD's eight chapter breaks. Sound is now timed
+  against the segment it belongs to. Blu-ray was never affected.
+
 ## [1.6.1] — 2026-08-07
 
 ### Fixed
