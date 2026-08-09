@@ -2,6 +2,13 @@
 
 ## [1.6.2] — 2026-08-08
 
+### Added
+
+- **Track languages can be chosen once instead of on every disc.** Preferred
+  audio, subtitle and forced-subtitle languages are honoured when a disc is
+  scanned. A disc carrying none of them falls back to the previous behaviour
+  rather than ripping without a track.
+
 ### Fixed
 
 - **A stray moment of sound at the end of an HD-DVD title, and a click at every
