@@ -267,7 +267,7 @@ jobs:
       # docker build context. Dockerfile.ci consumes ./autorip from
       # the context root (no in-container cargo build).
       - name: Download binary from build job
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: autorip-binary-x86_64-unknown-linux-musl
           path: .
