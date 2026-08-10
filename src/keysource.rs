@@ -434,16 +434,22 @@ pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
         // Can't safely reach it (bad scheme / blocked IP) — not an "outage".
         Err(_) => return ServiceReachability::Up,
     };
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout_connect(std::time::Duration::from_secs(4))
-        .timeout_read(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS))
-        .resolver(move |_netloc: &str| Ok(pinned.clone()))
-        .build();
+    // Same pinned-resolver hardening as every other operator-supplied-URL
+    // fetch in autorip — `guarded_agent` owns it, including the
+    // `with_parts`-not-`new_with_config` requirement.
+    let agent = crate::web::guarded_agent_with_timeouts(
+        pinned,
+        std::time::Duration::from_secs(4),
+        std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+    );
     let outcome = match agent.get(url).call() {
-        Ok(resp) => ProbeOutcome::Status(resp.status()),
-        Err(ureq::Error::Status(code, _)) => ProbeOutcome::Status(code),
-        Err(ureq::Error::Transport(_)) => ProbeOutcome::Transport,
+        Ok(resp) => ProbeOutcome::Status(resp.status().as_u16()),
+        Err(ureq::Error::StatusCode(code)) => ProbeOutcome::Status(code),
+        // ureq 3 fans v2's single `Transport` variant out across `Io`,
+        // `Timeout`, `Tls`, `HostNotFound` and more, and the enum is
+        // non_exhaustive. They all mean the same thing to this probe: the
+        // service never answered.
+        Err(_) => ProbeOutcome::Transport,
     };
     classify_reachability(outcome)
 }

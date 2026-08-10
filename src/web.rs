@@ -2306,19 +2306,104 @@ pub(crate) fn validate_network_target(target: &str) -> Result<(), String> {
 /// TOCTOU: ureq connects to the validated IPs instead of re-resolving
 /// the hostname (which an attacker could flip to 169.254.169.254 /
 /// RFC1918 in the window between validation and fetch).
+/// ureq's `ResolvedSocketAddrs` is a fixed 16-slot array whose `push` writes
+/// straight into it, so handing it a 17th address is an out-of-bounds panic —
+/// on a host that merely publishes a lot of A records. Keep the first 16; all
+/// of them were vetted by [`validate_fetch_url`].
+const MAX_PINNED_ADDRS: usize = 16;
+
+/// The pinned-address resolver behind [`guarded_agent`].
+///
+/// ureq 3 replaced v2's resolver closure with this trait, and the agent must be
+/// built through `Agent::with_parts` to take one. `Agent::new_with_config`
+/// compiles identically and then silently uses the DEFAULT resolver — which
+/// would re-resolve the hostname over live DNS and reopen the exact rebinding
+/// TOCTOU this agent exists to close, with no visible symptom. Pinned by
+/// `guarded_agent_connects_to_the_pinned_address_not_dns`.
+#[derive(Debug)]
+struct PinnedResolver(Vec<SocketAddr>);
+
+impl ureq::unversioned::resolver::Resolver for PinnedResolver {
+    fn resolve(
+        &self,
+        _uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let mut out = self.empty();
+        for addr in self.0.iter().take(MAX_PINNED_ADDRS) {
+            out.push(*addr);
+        }
+        if out.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(out)
+    }
+}
+
+/// A short, URL-FREE description of a ureq failure.
+///
+/// ureq's own `Display` embeds the full request URL, and these summaries reach
+/// syslog, `autorip.jsonl` and the unauthenticated `/api/system` + `/api/debug`
+/// endpoints. The URLs involved carry secrets: a TMDB api_key in the query
+/// string, a Discord/Slack/Jellyfin token in the webhook path, a token-bearing
+/// keydb_url. So the error is never formatted — each variant maps to a fixed
+/// label instead.
+///
+/// ureq 3 split v2's single `Transport(t)` (which had `.kind()`) across many
+/// variants, and the enum is `non_exhaustive`, so the catch-all is both
+/// required and the safe default: an unrecognised variant degrades to a bare
+/// label rather than to something that might interpolate a URL.
+pub(crate) fn ureq_error_kind(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::StatusCode(code) => format!("HTTP {code}"),
+        // `io::ErrorKind`'s Display is a fixed description, never the URL.
+        ureq::Error::Io(io) => format!("io: {}", io.kind()),
+        ureq::Error::Timeout(_) => "timeout".to_string(),
+        ureq::Error::HostNotFound => "host not found".to_string(),
+        ureq::Error::ConnectionFailed => "connection failed".to_string(),
+        ureq::Error::TooManyRedirects => "too many redirects".to_string(),
+        ureq::Error::Tls(_) => "tls error".to_string(),
+        ureq::Error::BodyExceedsLimit(_) => "body exceeds limit".to_string(),
+        _ => "transport error".to_string(),
+    }
+}
+
 pub(crate) fn guarded_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
-    // ureq 2.x sets NO default connect/read timeout. Without one a peer
-    // that accepts the connection but never responds would block the
-    // caller's thread (and hold its socket) forever — for webhooks a
-    // fresh thread spawns on every move/rip-complete, so a dead receiver
-    // would leak threads and sockets without bound. Bound both alongside
-    // the SSRF pinning (resolver) and redirect block.
-    ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout_connect(std::time::Duration::from_secs(5))
-        .timeout_read(std::time::Duration::from_secs(30))
-        .resolver(move |_netloc: &str| Ok(pinned.clone()))
-        .build()
+    // ureq sets NO default connect/read timeout. Without one a peer that
+    // accepts the connection but never responds would block the caller's
+    // thread (and hold its socket) forever — for webhooks a fresh thread
+    // spawns on every move/rip-complete, so a dead receiver would leak
+    // threads and sockets without bound. Bound both alongside the SSRF
+    // pinning (resolver) and redirect block.
+    guarded_agent_with_timeouts(
+        pinned,
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(30),
+    )
+}
+
+/// [`guarded_agent`] with caller-chosen timeouts, for the key-service
+/// reachability probe — which wants to give up much sooner than a webhook or a
+/// keydb download. Identical hardening otherwise; kept as the ONE place the
+/// pinned agent is constructed so a second call site can't quietly drop the
+/// resolver.
+pub(crate) fn guarded_agent_with_timeouts(
+    pinned: Vec<SocketAddr>,
+    connect: std::time::Duration,
+    read: std::time::Duration,
+) -> ureq::Agent {
+    let config = ureq::config::Config::builder()
+        .max_redirects(0)
+        .timeout_connect(Some(connect))
+        .timeout_recv_response(Some(read))
+        .build();
+    // `with_parts`, never `new_with_config` — see [`PinnedResolver`].
+    ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::new(),
+        PinnedResolver(pinned),
+    )
 }
 
 /// SSRF-guarded HTTP GET. Runs [`validate_fetch_url`] (scheme + resolved-IP
@@ -2338,18 +2423,16 @@ pub(crate) fn guarded_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
 /// and the test module do — so `pub(crate)` would trip `dead_code`. Exposing
 /// it as the crate's public SSRF-guarded fetch entry point is also the honest
 /// description of its role.
-pub fn guarded_get(url: &str) -> Result<ureq::Response, String> {
+pub fn guarded_get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
     let pinned = validate_fetch_url(url)?;
-    guarded_agent(pinned).get(url).call().map_err(|e| {
-        // Do NOT embed `e` directly: ureq's Display includes the full
-        // request URL, which leaks a token-bearing keydb_url into the
-        // system log (and thence the unauthenticated /api/system endpoint).
-        // Summarise by status code or transport-error kind only.
-        match &e {
-            ureq::Error::Status(code, _) => format!("fetch failed: HTTP {code}"),
-            ureq::Error::Transport(t) => format!("fetch failed: {}", t.kind()),
-        }
-    })
+    guarded_agent(pinned)
+        .get(url)
+        .call()
+        // Do NOT embed `e` directly: ureq's Display includes the full request
+        // URL, which leaks a token-bearing keydb_url into the system log (and
+        // thence the unauthenticated /api/system endpoint). See
+        // [`ureq_error_kind`].
+        .map_err(|e| format!("fetch failed: {}", ureq_error_kind(&e)))
 }
 
 // ── Connection caps ────────────────────────────────────────────────────
@@ -3546,6 +3629,64 @@ mod web_tests {
         assert!(guarded_get("http://[::1]:9000/keydb.zip").is_err());
         // Wrong scheme is rejected too (no connect attempt).
         assert!(guarded_get("file:///etc/passwd").is_err());
+    }
+
+    /// The tests above prove which addresses `validate_fetch_url` REJECTS.
+    /// None of them makes a connection, so every one still passes if
+    /// `guarded_agent` ignores the pinned addresses and resolves through live
+    /// DNS instead — which is exactly how the rebinding TOCTOU gets back in,
+    /// with no visible symptom. This is the test that notices.
+    ///
+    /// Pin the agent at a loopback listener this test owns, then ask for a
+    /// host that cannot resolve (`.invalid`, reserved by RFC 2606). Only a
+    /// consulted resolver can turn that name into a connection. Touches no
+    /// network, and drives `guarded_agent` directly, since `guarded_get`'s
+    /// guard blocks loopback by design.
+    #[test]
+    fn guarded_agent_connects_to_the_pinned_address_not_dns() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener =
+            TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
+        let pinned = listener.local_addr().expect("stub listener address");
+        let (tx, rx) = mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _peer) = listener.accept().expect("stub listener accept failed");
+            let _ = tx.send(());
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match sock.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+            let _ = sock.flush();
+            head
+        });
+
+        let sent = guarded_agent(vec![pinned])
+            .get("http://keydb-mirror.invalid/keydb.zip")
+            .call();
+
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "guarded_agent never connected to the pinned address — the custom \
+             resolver is not being consulted, so a DNS rebind between \
+             validate_fetch_url and the fetch can still redirect the request",
+        );
+        let resp = sent.expect("the pinned round-trip must complete");
+        assert_eq!(resp.status(), 200, "the stub server's reply must come back");
+        let head = server.join().expect("stub server panicked");
+        let head = String::from_utf8_lossy(&head);
+        assert!(
+            head.contains("keydb-mirror.invalid"),
+            "the pinned agent must still address the original host; got: {head}"
+        );
     }
 
     /// Secret-leak guard: guarded_get error strings from the ureq transport
@@ -5644,8 +5785,14 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     let keydb_cap = KEYDB_MAX_BYTES;
 
     // Download via ureq (supports HTTPS) then save via libfreemkv
-    let body = match agent.get(&keydb_url).timeout(KEYDB_FETCH_TIMEOUT).call() {
-        Ok(resp) => match read_capped_keydb_body(resp.into_reader(), keydb_cap) {
+    let body = match agent
+        .get(&keydb_url)
+        .config()
+        .timeout_global(Some(KEYDB_FETCH_TIMEOUT))
+        .build()
+        .call()
+    {
+        Ok(resp) => match read_capped_keydb_body(resp.into_body().into_reader(), keydb_cap) {
             Ok(buf) => buf,
             Err(KeydbReadError::Io) => {
                 json_response(
@@ -5664,7 +5811,7 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
                 return;
             }
         },
-        Err(ureq::Error::Status(code, _)) => {
+        Err(ureq::Error::StatusCode(code)) => {
             let msg = format!(
                 r#"{{"ok":false,"error":"Server returned HTTP {}. Check the URL in Settings."}}"#,
                 code
