@@ -186,8 +186,8 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
             let agent = crate::web::guarded_agent(pinned);
             match agent
                 .post(url)
-                .set("Content-Type", "application/json")
-                .send_string(&body)
+                .header("Content-Type", "application/json")
+                .send(&body)
             {
                 Ok(_) => {
                     // Log only the origin — the path may contain a secret token.
@@ -199,10 +199,7 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
                     // leaks the token embedded in Discord/Slack/Jellyfin
                     // webhook URLs into the system log (and thence the
                     // unauthenticated GET /api/system endpoint).
-                    let summary = match &e {
-                        ureq::Error::Status(c, _) => format!("HTTP {c}"),
-                        ureq::Error::Transport(t) => t.kind().to_string(),
-                    };
+                    let summary = crate::web::ureq_error_kind(&e);
                     crate::log::syslog(&format!(
                         "Webhook failed {}: {}",
                         webhook_url_origin(url),

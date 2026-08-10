@@ -7,14 +7,19 @@ pub struct TmdbResult {
     pub media_type: String, // "movie" or "tv"
 }
 
-/// Shared agent for all TMDB calls. ureq 2.x sets NO connect/read timeout by
+/// Shared agent for all TMDB calls. ureq sets NO connect/read timeout by
 /// default, so a hung api.themoviedb.org connection would wedge the rip thread
 /// (lookup runs on it) or a web handler (search) indefinitely. Bound both.
+///
+/// No pinned resolver here (unlike `web::guarded_agent`): the host is the
+/// hard-coded `api.themoviedb.org`, not an operator-supplied URL, so there is
+/// no SSRF/rebinding surface to close.
 static AGENT: once_cell::sync::Lazy<ureq::Agent> = once_cell::sync::Lazy::new(|| {
-    ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(5))
-        .timeout_read(std::time::Duration::from_secs(10))
-        .build()
+    let config = ureq::config::Config::builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(5)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(10)))
+        .build();
+    ureq::Agent::new_with_config(config)
 });
 
 /// Build the `search/multi` URL. Both `api_key` and `query` are
@@ -70,8 +75,8 @@ fn read_capped_bytes(reader: impl std::io::Read, cap: u64) -> std::io::Result<Ve
 /// Read at most `MAX_TMDB_BYTES` from the response body, rejecting anything
 /// over the cap, then parse as JSON. Replaces `resp.into_json()`, which reads
 /// the whole body with no upper bound.
-fn read_capped_json(resp: ureq::Response) -> std::io::Result<serde_json::Value> {
-    let buf = read_capped_bytes(resp.into_reader(), MAX_TMDB_BYTES)?;
+fn read_capped_json(resp: ureq::http::Response<ureq::Body>) -> std::io::Result<serde_json::Value> {
+    let buf = read_capped_bytes(resp.into_body().into_reader(), MAX_TMDB_BYTES)?;
     serde_json::from_slice(&buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
@@ -86,11 +91,11 @@ fn fetch_multi(query: &str, api_key: &str) -> Option<serde_json::Value> {
                 None
             }
         },
-        Err(ureq::Error::Status(401, _)) => {
+        Err(ureq::Error::StatusCode(401)) => {
             warn_bad_key_throttled();
             None
         }
-        Err(ureq::Error::Status(code, _)) => {
+        Err(ureq::Error::StatusCode(code)) => {
             tracing::warn!(query = %query, status = code, "tmdb: HTTP error status");
             None
         }
@@ -98,10 +103,7 @@ fn fetch_multi(query: &str, api_key: &str) -> Option<serde_json::Value> {
             // Do NOT log `e` directly — ureq's Display embeds the full
             // request URL, which contains the api_key in the query string.
             // autorip.jsonl is served unauthenticated by GET /api/debug.
-            let error_kind = match &e {
-                ureq::Error::Transport(t) => t.kind().to_string(),
-                ureq::Error::Status(c, _) => format!("HTTP {c}"),
-            };
+            let error_kind = crate::web::ureq_error_kind(&e);
             tracing::warn!(query = %query, error_kind = %error_kind, "tmdb: request failed (network/transport)");
             None
         }
@@ -834,7 +836,9 @@ mod tests {
         });
 
         let resp = ureq::get(&format!("http://{addr}/"))
-            .timeout(std::time::Duration::from_secs(5))
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build()
             .call()
             .expect("local server must respond");
         let err = read_capped_json(resp).expect_err("oversized body must be rejected");

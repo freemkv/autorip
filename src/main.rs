@@ -189,7 +189,10 @@ fn main() {
             // keydb_url reach loopback / RFC1918 / cloud-metadata.
             match web::guarded_get(&url) {
                 Ok(resp) => {
-                    match web::read_capped_keydb_body(resp.into_reader(), web::KEYDB_MAX_BYTES) {
+                    match web::read_capped_keydb_body(
+                        resp.into_body().into_reader(),
+                        web::KEYDB_MAX_BYTES,
+                    ) {
                         Ok(buf) => {
                             let saved = cfg
                                 .read()
@@ -276,8 +279,10 @@ fn main() {
                 // settings save and manual update already enforce.
                 match web::guarded_get(&url) {
                     Ok(resp) => {
-                        match web::read_capped_keydb_body(resp.into_reader(), web::KEYDB_MAX_BYTES)
-                        {
+                        match web::read_capped_keydb_body(
+                            resp.into_body().into_reader(),
+                            web::KEYDB_MAX_BYTES,
+                        ) {
                             Ok(buf) => {
                                 let saved = cfg2
                                     .read()
