@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.6.3] — 2026-08-10
+
+### Changed
+
+- **Housekeeping only — nothing about automatic ripping has changed.** The HTTP
+  client behind webhooks, the metadata lookup and the key-database download
+  moved to its current release, and two crates that were declared but never used
+  were removed from the build.
+
+### Security
+
+- **Failure messages still cannot leak the URLs they came from, and the pinned
+  connections are now proven by a test.** Webhook, metadata and key-database
+  URLs can carry a token in the path or the query, and the summaries that reach
+  the log and the status endpoints are built from a fixed description of the
+  failure rather than from the underlying error, which would quote the whole
+  URL. Both that and the address pinning behave as before; each now has a test
+  that fails if it stops.
+
 ## [1.6.2] — 2026-08-08
 
 ### Added
