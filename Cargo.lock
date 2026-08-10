@@ -351,8 +351,6 @@ dependencies = [
 name = "freemkv-autorip"
 version = "1.6.2"
 dependencies = [
- "base64",
- "crossbeam-channel",
  "freemkv-engine",
  "freemkv-i18n",
  "freemkv-keysources",
