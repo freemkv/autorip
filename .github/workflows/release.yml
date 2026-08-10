@@ -230,7 +230,7 @@ jobs:
       # false), so a "released" binary for a fast target isn't gated on the
       # slowest one.
       - name: Upload assets to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             *.tar.gz
