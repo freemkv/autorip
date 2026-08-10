@@ -3638,7 +3638,7 @@ mod web_tests {
     /// with no visible symptom. This is the test that notices.
     ///
     /// Pin the agent at a loopback listener this test owns, then ask for a
-    /// host that cannot resolve (`.invalid`, reserved by RFC 2606). Only a
+    /// host that cannot resolve (`.test`, reserved by RFC 6761). Only a
     /// consulted resolver can turn that name into a connection. Touches no
     /// network, and drives `guarded_agent` directly, since `guarded_get`'s
     /// guard blocks loopback by design.
@@ -3671,7 +3671,7 @@ mod web_tests {
         });
 
         let sent = guarded_agent(vec![pinned])
-            .get("http://keydb-mirror.invalid/keydb.zip")
+            .get("http://keydb-mirror.test/keydb.zip")
             .call();
 
         rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
@@ -3684,7 +3684,7 @@ mod web_tests {
         let head = server.join().expect("stub server panicked");
         let head = String::from_utf8_lossy(&head);
         assert!(
-            head.contains("keydb-mirror.invalid"),
+            head.contains("keydb-mirror.test"),
             "the pinned agent must still address the original host; got: {head}"
         );
     }
