@@ -437,9 +437,12 @@ pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
     // Same pinned-resolver hardening as every other operator-supplied-URL
     // fetch in autorip — `guarded_agent` owns it, including the
     // `with_parts`-not-`new_with_config` requirement.
+    // The probe keeps its own short idle bound: it must give up fast, and a
+    // longer shared default would defeat the whole point of this call site.
     let agent = crate::web::guarded_agent_with_timeouts(
         pinned,
         std::time::Duration::from_secs(4),
+        std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
         std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
     );
     let outcome = match agent.get(url).call() {

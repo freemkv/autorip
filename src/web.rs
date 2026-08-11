@@ -2369,17 +2369,25 @@ pub(crate) fn ureq_error_kind(e: &ureq::Error) -> String {
     }
 }
 
+/// No progress for this long on an open connection means the peer is dead,
+/// whatever it promised in its headers. This is the knob ureq 2's
+/// `timeout_read` used to provide and the 2→3 migration dropped: it is
+/// ROLLING, re-armed on every read that returns bytes, so it kills a stalled
+/// transfer without putting a ceiling on a slow-but-progressing one.
+pub(crate) const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub(crate) fn guarded_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
     // ureq sets NO default connect/read timeout. Without one a peer that
     // accepts the connection but never responds would block the caller's
     // thread (and hold its socket) forever — for webhooks a fresh thread
     // spawns on every move/rip-complete, so a dead receiver would leak
-    // threads and sockets without bound. Bound both alongside the SSRF
+    // threads and sockets without bound. Bound them alongside the SSRF
     // pinning (resolver) and redirect block.
     guarded_agent_with_timeouts(
         pinned,
         std::time::Duration::from_secs(5),
         std::time::Duration::from_secs(30),
+        STALL_TIMEOUT,
     )
 }
 
@@ -2388,15 +2396,28 @@ pub(crate) fn guarded_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
 /// keydb download. Identical hardening otherwise; kept as the ONE place the
 /// pinned agent is constructed so a second call site can't quietly drop the
 /// resolver.
+///
+/// `response` is NOT just a header timeout, despite ureq naming it
+/// `timeout_recv_response`. In ureq 3 the body read also checks its preceding
+/// timeout, and that deadline is absolute — `headers_complete + response` — so
+/// `response` is the ceiling on the WHOLE transfer. Measured against a real
+/// socket: with `response = 2s` a server that trickles one byte every 500 ms
+/// is killed at 2.0 s, four bytes in. Size it for the largest body this caller
+/// should ever accept, not for how long a header may take.
+///
+/// `idle` is the rolling stall detector ([`STALL_TIMEOUT`]) — the one that
+/// catches a dead peer quickly regardless of how generous `response` is.
 pub(crate) fn guarded_agent_with_timeouts(
     pinned: Vec<SocketAddr>,
     connect: std::time::Duration,
-    read: std::time::Duration,
+    response: std::time::Duration,
+    idle: std::time::Duration,
 ) -> ureq::Agent {
     let config = ureq::config::Config::builder()
         .max_redirects(0)
         .timeout_connect(Some(connect))
-        .timeout_recv_response(Some(read))
+        .timeout_recv_response(Some(response))
+        .timeout_recv_body(Some(idle))
         .build();
     // `with_parts`, never `new_with_config` — see [`PinnedResolver`].
     ureq::Agent::with_parts(
@@ -2424,15 +2445,59 @@ pub(crate) fn guarded_agent_with_timeouts(
 /// it as the crate's public SSRF-guarded fetch entry point is also the honest
 /// description of its role.
 pub fn guarded_get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
+    guarded_get_within(url, KEYDB_TRANSFER_BUDGET)
+}
+
+/// End-to-end ceiling on the unauthenticated `/api` KEYDB update.
+///
+/// Deliberately tighter than [`KEYDB_TRANSFER_BUDGET`]: this path is reachable
+/// without authentication, holds an in-flight handler slot and the
+/// process-wide update flag that 429s every other attempt, so a hostile peer
+/// must not be able to hold it for minutes.
+pub(crate) const KEYDB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a KEYDB body may take IN TOTAL, once headers are in.
+///
+/// [`guarded_agent`]'s 30 s is right for a webhook POST and far too short
+/// here: `read_capped_keydb_body` accepts up to [`KEYDB_MAX_BYTES`], and 30 s
+/// is the ceiling on the whole transfer (see
+/// [`guarded_agent_with_timeouts`]), so a keydb that takes longer than half a
+/// minute to arrive fails on a link that is merely slow rather than broken —
+/// and the daily refresh thread then retries on the same too-short budget
+/// once every 24 hours.
+///
+/// A dead peer is still caught in [`STALL_TIMEOUT`] seconds, because the idle
+/// timeout is rolling and independent of this ceiling. This number only buys
+/// patience for a transfer that is actually progressing.
+///
+/// Sized to the REAL artifact, not to [`KEYDB_MAX_BYTES`]: that 100 MiB is a
+/// defensive ceiling on what will be read, and a published keydb is a
+/// single-digit-MB compressed export. Two minutes covers ~10 MB at well under
+/// 1 Mbit/s. Deriving the budget from the DoS cap instead would put a
+/// five-minute stall in front of the operator at first boot — `main.rs`
+/// fetches the keydb BEFORE the web server thread starts, so a slow keydb
+/// host would hold back the very Settings page they would use to fix the URL.
+pub(crate) const KEYDB_TRANSFER_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// [`guarded_get`] with an explicit total-transfer budget.
+pub(crate) fn guarded_get_within(
+    url: &str,
+    budget: std::time::Duration,
+) -> Result<ureq::http::Response<ureq::Body>, String> {
     let pinned = validate_fetch_url(url)?;
-    guarded_agent(pinned)
-        .get(url)
-        .call()
-        // Do NOT embed `e` directly: ureq's Display includes the full request
-        // URL, which leaks a token-bearing keydb_url into the system log (and
-        // thence the unauthenticated /api/system endpoint). See
-        // [`ureq_error_kind`].
-        .map_err(|e| format!("fetch failed: {}", ureq_error_kind(&e)))
+    guarded_agent_with_timeouts(
+        pinned,
+        std::time::Duration::from_secs(5),
+        budget,
+        STALL_TIMEOUT,
+    )
+    .get(url)
+    .call()
+    // Do NOT embed `e` directly: ureq's Display includes the full request
+    // URL, which leaks a token-bearing keydb_url into the system log (and
+    // thence the unauthenticated /api/system endpoint). See
+    // [`ureq_error_kind`].
+    .map_err(|e| format!("fetch failed: {}", ureq_error_kind(&e)))
 }
 
 // ── Connection caps ────────────────────────────────────────────────────
@@ -3629,6 +3694,137 @@ mod web_tests {
         assert!(guarded_get("http://[::1]:9000/keydb.zip").is_err());
         // Wrong scheme is rejected too (no connect attempt).
         assert!(guarded_get("file:///etc/passwd").is_err());
+    }
+
+    /// A KEYDB body that is SLOW but PROGRESSING must be allowed to finish.
+    ///
+    /// ureq 2's `timeout_read` was a per-read bound, so a slow transfer never
+    /// tripped it. ureq 3's `timeout_recv_response` — what the 2→3 migration
+    /// replaced it with — is an ABSOLUTE deadline anchored at header
+    /// completion that also caps the body, so `guarded_agent`'s 30 s became a
+    /// hard 30 s ceiling on the whole download. Measured against a real
+    /// socket: with a 2 s bound, a server trickling a byte every 500 ms dies
+    /// at 2.0 s having delivered four bytes.
+    ///
+    /// What this guards is the NEW idle knob: `timeout_recv_body` is ROLLING,
+    /// so a body that keeps arriving must survive even when the transfer takes
+    /// many times the idle bound. Wire it up as a total instead — the easy
+    /// mistake — and this test fails. It is a guard on the fix, not a
+    /// reproduction of the original defect: the budget change itself
+    /// (`guarded_get`'s 30 s → `KEYDB_TRANSFER_BUDGET`) has no automated proof
+    /// here, because `guarded_get` resolves and rejects loopback before it
+    /// connects, so no local listener can stand in for a keydb mirror.
+    #[test]
+    fn a_slow_but_progressing_keydb_body_is_not_killed_by_the_header_deadline() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener =
+            TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
+        let pinned = listener.local_addr().expect("stub listener address");
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _peer) = listener.accept().expect("accept failed");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match sock.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n");
+            let _ = sock.flush();
+            // Eight bytes, 250 ms apart: 2 s in total, never a gap anywhere
+            // near STALL_TIMEOUT.
+            for _ in 0..8 {
+                if sock.write_all(b"k").is_err() {
+                    return;
+                }
+                let _ = sock.flush();
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        });
+
+        // idle = 1 s, and the body takes 2 s in 250 ms steps: it outlives the
+        // idle bound several times over, which only a ROLLING bound permits.
+        let agent = guarded_agent_with_timeouts(
+            vec![pinned],
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(1),
+        );
+        let resp = agent
+            .get("http://keydb-mirror.test/keydb.zip")
+            .call()
+            .expect("headers must arrive");
+        let mut body = Vec::new();
+        let read = resp.into_body().into_reader().read_to_end(&mut body);
+        let _ = server.join();
+
+        assert!(
+            read.is_ok(),
+            "a steadily-progressing body was aborted: {:?}",
+            read.err()
+        );
+        assert_eq!(body, b"kkkkkkkk", "the whole body must arrive");
+    }
+
+    /// The other half: a peer that sends headers and then NOTHING must be cut
+    /// off by the rolling idle bound, not held until the (much larger) total
+    /// budget expires. This is the protection ureq 2's `timeout_read` gave and
+    /// the migration dropped; without `timeout_recv_body` a dead peer would be
+    /// held for the whole KEYDB budget.
+    #[test]
+    fn a_stalled_body_is_cut_off_by_the_idle_bound_not_the_total_budget() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener =
+            TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
+        let pinned = listener.local_addr().expect("stub listener address");
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _peer) = listener.accept().expect("accept failed");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match sock.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
+            let _ = sock.flush();
+            // Promise a megabyte, send none of it, hold the socket open.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+
+        let idle = std::time::Duration::from_secs(1);
+        let agent = guarded_agent_with_timeouts(
+            vec![pinned],
+            std::time::Duration::from_secs(5),
+            // A total budget far larger than the idle bound, so only the idle
+            // bound can be what ends this.
+            std::time::Duration::from_secs(120),
+            idle,
+        );
+        let started = std::time::Instant::now();
+        let resp = agent
+            .get("http://keydb-mirror.test/keydb.zip")
+            .call()
+            .expect("headers must arrive");
+        let mut body = Vec::new();
+        let read = resp.into_body().into_reader().read_to_end(&mut body);
+        let elapsed = started.elapsed();
+
+        assert!(read.is_err(), "a stalled body must not read as success");
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "a stalled peer was held for {elapsed:?} — the idle bound did not fire, \
+             so the total budget is the only thing ending this"
+        );
+        drop(server);
     }
 
     /// The tests above prove which addresses `validate_fetch_url` REJECTS.
@@ -5774,11 +5970,27 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             return;
         }
     };
-    let agent = guarded_agent(pinned);
+    // NOT the plain `guarded_agent`: its 30 s `response` is the ceiling on the
+    // whole body (see `guarded_agent_with_timeouts`), which would silently
+    // override the KEYDB_FETCH_TIMEOUT budget below — the two would disagree
+    // and the smaller, unstated one would win. Built with that budget as the
+    // response ceiling so the constant means what it says.
+    //
+    // This LAN-facing path deliberately keeps the tighter 60 s ceiling rather
+    // than `KEYDB_TRANSFER_BUDGET`: it is reachable unauthenticated, holds an
+    // in-flight handler slot and the process-wide update flag that 429s every
+    // other attempt, so it must not be holdable for five minutes.
+    let agent = guarded_agent_with_timeouts(
+        pinned,
+        std::time::Duration::from_secs(5),
+        KEYDB_FETCH_TIMEOUT,
+        STALL_TIMEOUT,
+    );
 
     // Wall-clock bound on the whole download so a slow-loris server can't hold
-    // the in-flight slot (and the handler thread) indefinitely.
-    const KEYDB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    // the in-flight slot (and the handler thread) indefinitely. Anchored at
+    // request start, where the response ceiling above is anchored at header
+    // completion, so this stays the true end-to-end bound.
     // Cap is the shared module-level KEYDB_MAX_BYTES (100 MiB); using
     // read_capped_keydb_body means an oversized body returns 413 rather than
     // silently truncating at the limit.
