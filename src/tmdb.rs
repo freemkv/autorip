@@ -100,9 +100,12 @@ fn fetch_multi(query: &str, api_key: &str) -> Option<serde_json::Value> {
             None
         }
         Err(e) => {
-            // Do NOT log `e` directly — ureq's Display embeds the full
-            // request URL, which contains the api_key in the query string.
-            // autorip.jsonl is served unauthenticated by GET /api/debug.
+            // Do NOT log `e` directly. Written against ureq 2, whose Display
+            // carried the request URL — and this URL has the api_key in its
+            // query string, with autorip.jsonl served unauthenticated by GET
+            // /api/debug. ureq 3's Display is URL-free on the variants
+            // reachable here, but `BadUri` still prints the URI it rejected,
+            // so the masking stays and the reason is now the accurate one.
             let error_kind = crate::web::ureq_error_kind(&e);
             tracing::warn!(query = %query, error_kind = %error_kind, "tmdb: request failed (network/transport)");
             None
