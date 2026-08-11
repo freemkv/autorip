@@ -4034,6 +4034,43 @@ mod web_tests {
         assert_eq!(C.load(Ordering::SeqCst), 0);
     }
 
+    /// The fourth ureq log site. Round 1 routed three failures through
+    /// `ureq_error_kind` and missed this one, which masks the configured KEYDB
+    /// origin from the CLIENT and then logged the raw error anyway — and
+    /// `keydb_url` is token-bearing, with this line reaching `autorip.jsonl`
+    /// and thence the unauthenticated `GET /api/debug`.
+    ///
+    /// A source-pin, like `resolve_with_timeout_uses_raii_guard_...` above,
+    /// because the leak is in a `tracing` field inside a handler that wants a
+    /// live `tiny_http::Request` and a real connection failure to reach. What
+    /// it pins is exactly the shape of the defect: `%e` on the ureq error.
+    #[test]
+    fn the_keydb_update_handler_masks_its_ureq_error() {
+        let src = crate::util::source_lf(include_str!("web.rs"));
+        // Anchored on the DEFINITION, not the name: this test mentions the
+        // name too, and it is the earlier occurrence in the file. Both ends
+        // are `expect`ed rather than defaulted — an anchor that stopped
+        // matching would otherwise silently widen the slice to the rest of
+        // the module and start reporting other handlers' log lines.
+        let start = src
+            .find("\nfn handle_update_keydb(request: tiny_http::Request")
+            .expect("handle_update_keydb definition present");
+        let end = start
+            + src[start..]
+                .find("\n    // Write to the service-canonical keydb path")
+                .expect("the handler's post-fetch section still starts here");
+        let body = &src[start..end];
+        assert!(
+            body.contains("ureq_error_kind(&e)"),
+            "the keydb-update handler must summarise its ureq failure through \
+             ureq_error_kind, which is URL-free"
+        );
+        assert!(
+            !body.contains("error = %e"),
+            "the keydb-update handler must not format its ureq error by Display"
+        );
+    }
+
     #[test]
     fn resolve_with_timeout_uses_raii_guard_not_closure_side_fetch_sub() {
         // Source-pin for the INFLIGHT-leak fix: the decrement must NOT live as
@@ -6060,9 +6097,16 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             // Do NOT echo the configured KEYDB origin/hostname back to the
             // client — that leaks server-side configuration to any LAN caller.
             // Keep the detail (URL origin + underlying error) in the log only.
+            //
+            // The error goes through `ureq_error_kind`, like the three sibling
+            // sites: `keydb_url` is token-bearing, this log line reaches
+            // `autorip.jsonl` and thence the unauthenticated `GET /api/debug`,
+            // and `ureq::Error`'s own Display is not guaranteed URL-free
+            // (`BadUri` prints the URI it rejected). The deliberate `origin`
+            // field above is the whole disclosure this line intends.
             tracing::warn!(
                 origin = %crate::webhook::webhook_url_origin(&keydb_url),
-                error = %e,
+                error_kind = %ureq_error_kind(&e),
                 "keydb update: could not connect to configured KEYDB server"
             );
             json_response(
