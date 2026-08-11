@@ -2493,10 +2493,14 @@ pub(crate) fn guarded_get_within(
     )
     .get(url)
     .call()
-    // Do NOT embed `e` directly: ureq's Display includes the full request
-    // URL, which leaks a token-bearing keydb_url into the system log (and
-    // thence the unauthenticated /api/system endpoint). See
-    // [`ureq_error_kind`].
+    // Do NOT embed `e` directly. This was written against ureq 2, whose
+    // Display carried the request URL — a token-bearing keydb_url would have
+    // reached the system log and thence the unauthenticated /api/system.
+    // ureq 3's Display is URL-free on every variant reachable here (`io:
+    // {kind}`, `timeout: …`, `connection failed`, `host not found`), so this
+    // is no longer load-bearing for THAT leak — but `BadUri` does print the
+    // offending URI, and it is one refactor away from this path. Keep the
+    // masking and state the real reason. See [`ureq_error_kind`].
     .map_err(|e| format!("fetch failed: {}", ureq_error_kind(&e)))
 }
 
@@ -3887,13 +3891,15 @@ mod web_tests {
 
     /// Secret-leak guard: guarded_get error strings from the ureq transport
     /// layer must never embed the full request URL (which may contain a token
-    /// in the path/query). ureq's Display includes the URL; our map_err must
-    /// strip it to a status code / transport kind only.
+    /// in the path/query). ureq 2's Display included the URL, which is what
+    /// this guards; ureq 3's does not for the variants reachable here, but
+    /// `BadUri` still prints its URI — so the map_err must keep stripping to a
+    /// status code / transport kind only.
     ///
     /// We test this via a public literal IP that passes the SSRF guard (so we
     /// reach the ureq call), but where the connection is immediately refused
     /// (no server listening). This exercises the Transport error arm of our
-    /// map_err, where ureq's Display would otherwise include the full URL.
+    /// map_err, which is what keeps the full URL out of the message.
     ///
     /// Note: the RFC1918-rejection errors come from validate_fetch_url (via ?)
     /// before ureq is called; those contain the blocked IP, which is expected
