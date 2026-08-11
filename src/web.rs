@@ -3710,6 +3710,13 @@ mod web_tests {
     /// socket: with a 2 s bound, a server trickling a byte every 500 ms dies
     /// at 2.0 s having delivered four bytes.
     ///
+    /// NOTE what this does NOT prove: delete `timeout_recv_body` entirely and
+    /// this test still passes, because with no body timeout at all the slow
+    /// body also arrives. Removal is caught by its sibling
+    /// (`a_stalled_body_is_cut_off_by_the_idle_bound_not_the_total_budget`),
+    /// which was proven red at 30 s and green at 1 s. This one guards the
+    /// complementary property, and the two are only meaningful together.
+    ///
     /// What this guards is the NEW idle knob: `timeout_recv_body` is ROLLING,
     /// so a body that keeps arriving must survive even when the transfer takes
     /// many times the idle bound. Wire it up as a total instead — the easy
@@ -3746,17 +3753,21 @@ mod web_tests {
                     return;
                 }
                 let _ = sock.flush();
-                std::thread::sleep(std::time::Duration::from_millis(250));
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         });
 
-        // idle = 1 s, and the body takes 2 s in 250 ms steps: it outlives the
-        // idle bound several times over, which only a ROLLING bound permits.
+        // idle = 5 s against 100 ms between writes: a 50x margin, so a loaded
+        // CI box cannot fail this by scheduling alone. (The first draft used
+        // 250 ms against 1 s — a 4x margin, the same shape as the wall-clock
+        // test this audit already replaced for flaking under load.) The body
+        // still outlives the idle bound many times over, which only a ROLLING
+        // bound permits.
         let agent = guarded_agent_with_timeouts(
             vec![pinned],
             std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
         );
         let resp = agent
             .get("http://keydb-mirror.test/keydb.zip")
@@ -3800,8 +3811,14 @@ mod web_tests {
             }
             let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
             let _ = sock.flush();
-            // Promise a megabyte, send none of it, hold the socket open.
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            // Promise a megabyte and send none of it — but hold the socket by
+            // BLOCKING ON A READ, not by sleeping. The read returns the moment
+            // the client gives up and drops the connection, so this thread
+            // ends with the test instead of outliving it. A `sleep(30s)` here
+            // detached a thread holding an accepted socket for ~28 s after the
+            // test returned, overlapping every other test in the binary.
+            let mut sink = [0u8; 1];
+            let _ = sock.read(&mut sink);
         });
 
         let idle = std::time::Duration::from_secs(1);
@@ -3828,7 +3845,9 @@ mod web_tests {
             "a stalled peer was held for {elapsed:?} — the idle bound did not fire, \
              so the total budget is the only thing ending this"
         );
-        drop(server);
+        // Joinable because the stub ends on client disconnect; `drop` on a
+        // JoinHandle only detaches, it does not stop the thread.
+        let _ = server.join();
     }
 
     /// The tests above prove which addresses `validate_fetch_url` REJECTS.

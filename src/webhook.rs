@@ -255,7 +255,8 @@ mod tests {
             TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
         let pinned = listener.local_addr().expect("stub listener address");
 
-        let server = std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _server = std::thread::spawn(move || {
             let (mut sock, _peer) = listener.accept().expect("accept failed");
             let mut buf = Vec::new();
             let mut byte = [0u8; 1];
@@ -279,7 +280,7 @@ mod tests {
             let _ = sock.read_exact(&mut body);
             let _ = sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
             let _ = sock.flush();
-            (head, String::from_utf8_lossy(&body).to_string())
+            let _ = tx.send((head, String::from_utf8_lossy(&body).to_string()));
         });
 
         super::deliver(
@@ -288,7 +289,14 @@ mod tests {
             r#"{"event":"rip_complete"}"#,
         );
 
-        let (head, body) = server.join().expect("stub server panicked");
+        // Hand the observation back over a channel and take it with a
+        // DEADLINE. `deliver` swallows transport errors (it only logs), so if
+        // the pinned-resolver wiring ever regresses, no request arrives, the
+        // stub blocks in `accept`, and an unconditional `join()` turns a test
+        // failure into a hung suite.
+        let (head, body) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("no request reached the stub — deliver() never sent one");
         let head_lc = head.to_lowercase();
         assert!(
             head.starts_with("POST /services/T000/B000/xxxx HTTP/1.1"),
