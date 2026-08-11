@@ -183,36 +183,128 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
                     continue;
                 }
             };
-            let agent = crate::web::guarded_agent(pinned);
-            match agent
-                .post(url)
-                .header("Content-Type", "application/json")
-                .send(&body)
-            {
-                Ok(_) => {
-                    // Log only the origin — the path may contain a secret token.
-                    crate::log::syslog(&format!("Webhook sent to {}", webhook_url_origin(url)));
-                }
-                Err(e) => {
-                    // Summarise the error WITHOUT embedding `e` directly —
-                    // ureq's Display includes the full request URL, which
-                    // leaks the token embedded in Discord/Slack/Jellyfin
-                    // webhook URLs into the system log (and thence the
-                    // unauthenticated GET /api/system endpoint).
-                    let summary = crate::web::ureq_error_kind(&e);
-                    crate::log::syslog(&format!(
-                        "Webhook failed {}: {}",
-                        webhook_url_origin(url),
-                        summary
-                    ));
-                }
-            }
+            deliver(pinned, url, &body);
         }
     });
 }
 
+/// POST one payload to one already-validated URL.
+///
+/// Split out of [`fire`] so it can be TESTED. `fire` resolves and validates
+/// every URL through `web::validate_fetch_url`, which rejects loopback by
+/// design, so no test can point `fire` itself at a local listener — and until
+/// this seam existed, the only HTTP call in this module (the one carrying the
+/// user's rip-complete event) had no test at all. A mistake in it — a header
+/// that stopped being sent, a body that never reached the wire — would compile,
+/// pass every test, and be discovered by an operator whose Discord webhook
+/// silently stopped arriving.
+///
+/// `pinned` is what validation resolved to, so this function never consults
+/// DNS: the connection goes to the address that was checked, which is also
+/// what makes it testable against a loopback stub.
+fn deliver(pinned: Vec<std::net::SocketAddr>, url: &str, body: &str) {
+    let agent = crate::web::guarded_agent(pinned);
+    match agent
+        .post(url)
+        .header("Content-Type", "application/json")
+        .send(body)
+    {
+        Ok(_) => {
+            // Log only the origin — the path may contain a secret token.
+            crate::log::syslog(&format!("Webhook sent to {}", webhook_url_origin(url)));
+        }
+        Err(e) => {
+            // Summarise the error WITHOUT embedding `e` directly. NOTE: in
+            // ureq 3 the Display of the variants reachable here is already
+            // URL-free (`io: {kind}`, `timeout: …`, `connection failed`); the
+            // habit is kept because `ureq_error_kind` is the one place that
+            // guarantee is stated, and `BadUri` — which does embed the URI —
+            // would otherwise be one refactor away from the log.
+            let summary = crate::web::ureq_error_kind(&e);
+            crate::log::syslog(&format!(
+                "Webhook failed {}: {}",
+                webhook_url_origin(url),
+                summary
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The webhook POST itself, driven to a real socket.
+    ///
+    /// Everything else in this module is helper-level (URL masking, the
+    /// in-flight counter); the request that actually carries the user's event
+    /// was never exercised. It was migrated from ureq 2's
+    /// `.set()`/`.send_string()` to ureq 3's `.header()`/`.send()` without a
+    /// test, and a mistake there — wrong header, a body that never reached the
+    /// wire — compiles and passes everything.
+    ///
+    /// Pinned at a loopback listener with an RFC 6761 `.test` host that cannot
+    /// resolve, the same technique `web::guarded_agent_connects_to_the_pinned_address_not_dns`
+    /// uses. Asserts the request line, the content type and the body, and
+    /// nothing else — header order and `User-Agent` are ureq's business and
+    /// would make this brittle across a version bump.
+    #[test]
+    fn deliver_posts_json_with_the_content_type_header() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener =
+            TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
+        let pinned = listener.local_addr().expect("stub listener address");
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _peer) = listener.accept().expect("accept failed");
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            // Read headers, then exactly the promised body length.
+            while !buf.ends_with(b"\r\n\r\n") {
+                match sock.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => buf.push(byte[0]),
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).to_string();
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("content-length: ")
+                        .or_else(|| l.strip_prefix("Content-Length: "))
+                })
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            let _ = sock.read_exact(&mut body);
+            let _ = sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            let _ = sock.flush();
+            (head, String::from_utf8_lossy(&body).to_string())
+        });
+
+        super::deliver(
+            vec![pinned],
+            "http://hooks.test/services/T000/B000/xxxx",
+            r#"{"event":"rip_complete"}"#,
+        );
+
+        let (head, body) = server.join().expect("stub server panicked");
+        let head_lc = head.to_lowercase();
+        assert!(
+            head.starts_with("POST /services/T000/B000/xxxx HTTP/1.1"),
+            "unexpected request line: {:?}",
+            head.lines().next()
+        );
+        assert!(
+            head_lc.contains("content-type: application/json"),
+            "the JSON content type was not sent: {head}"
+        );
+        assert_eq!(
+            body, r#"{"event":"rip_complete"}"#,
+            "the payload did not reach the wire"
+        );
+    }
+
     use super::*;
 
     #[test]
