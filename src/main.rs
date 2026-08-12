@@ -844,6 +844,25 @@ fn prune_old_logs(log_dir: &str, retention_days: u64) {
 /// covered); non-`.log` files are left alone. IO errors on individual entries
 /// are skipped, not propagated — pruning is best-effort and must never break
 /// the daemon.
+/// Whether a filename is one of the log files retention applies to.
+///
+/// NOT `extension() == "log"`, which is what this was. `tracing-appender`'s
+/// daily rotation writes `autorip.log.2026-05-01`, whose extension is the DATE
+/// — so every rolled daily was skipped and `log_retention_days` reclaimed only
+/// `device_*.log` and the per-rip logs. The central human-readable log grew for
+/// the container's lifetime while the prune reported zero files removed, on
+/// every install, at the shipped log level.
+///
+/// Matches on the `.log` component instead, which covers both the live file and
+/// every rolled name, and still excludes `autorip.jsonl` — whose unbounded
+/// growth is a separate, documented decision.
+fn is_prunable_log_name(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name.ends_with(".log") || name.contains(".log.")
+}
+
 fn prune_dir_recursive(dir: &std::path::Path, cutoff: std::time::SystemTime) -> u32 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -856,7 +875,7 @@ fn prune_dir_recursive(dir: &std::path::Path, cutoff: std::time::SystemTime) -> 
             pruned += prune_dir_recursive(&path, cutoff);
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("log") {
+        if !is_prunable_log_name(&path) {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -871,6 +890,41 @@ fn prune_dir_recursive(dir: &std::path::Path, cutoff: std::time::SystemTime) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Log retention has to see the ROLLED files ─────────────────────────
+    //
+    // `tracing-appender`'s daily rotation writes `autorip.log.YYYY-MM-DD`, and
+    // `Path::extension()` on that returns the date. The old `extension() ==
+    // "log"` test therefore skipped every rolled daily, so the operator-visible
+    // `log_retention_days` reclaimed only `device_*.log` and `logs/rips/*.log`
+    // while the central log grew forever and the prune reported 0.
+
+    #[test]
+    fn a_rolled_daily_log_is_prunable() {
+        use std::path::Path;
+        assert!(
+            is_prunable_log_name(Path::new("/l/autorip.log.2026-05-01")),
+            "the rolled daily is the file that actually accumulates"
+        );
+        assert!(is_prunable_log_name(Path::new("/l/autorip.log")));
+        assert!(is_prunable_log_name(Path::new("/l/device_sg0.log")));
+        assert!(is_prunable_log_name(Path::new(
+            "/l/rips/2026-05-01_disc.log"
+        )));
+    }
+
+    /// The jsonl is NOT swept up by the widened match. Its unbounded growth is
+    /// a separate decision, recorded where it is made, and quietly deleting it
+    /// here would take `GET /api/debug`'s history with it.
+    #[test]
+    fn the_jsonl_is_not_caught_by_the_widened_match() {
+        use std::path::Path;
+        assert!(!is_prunable_log_name(Path::new("/l/autorip.jsonl")));
+        assert!(!is_prunable_log_name(Path::new(
+            "/l/autorip.jsonl.2026-05-01"
+        )));
+        assert!(!is_prunable_log_name(Path::new("/l/notes.txt")));
+    }
 
     #[test]
     fn valid_usernames_accepted() {

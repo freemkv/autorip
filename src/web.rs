@@ -2312,6 +2312,23 @@ pub(crate) fn validate_network_target(target: &str) -> Result<(), String> {
 /// of them were vetted by [`validate_fetch_url`].
 const MAX_PINNED_ADDRS: usize = 16;
 
+/// The addresses a resolve may actually hand back, capped.
+///
+/// Separated from the `Resolver` impl so the cap is TESTABLE: ureq's
+/// `ResolvedSocketAddrs` and `NextTimeout` are built from types that are not
+/// nameable outside the crate, so nothing in the suite could construct a
+/// resolve call — and every socket test pins exactly one address, so deleting
+/// the cap left the whole suite green.
+///
+/// The cap is not a nicety. `ResolvedSocketAddrs` is a fixed 16-slot array
+/// whose `push` writes `self.arr[self.len]` with no bounds check, so a
+/// seventeenth address is an out-of-bounds panic inside a resolver that runs on
+/// every request. `validate_fetch_url` returns whatever DNS gave it, with no
+/// count limit of its own.
+fn pinned_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    addrs.iter().copied().take(MAX_PINNED_ADDRS).collect()
+}
+
 /// The pinned-address resolver behind [`guarded_agent`].
 ///
 /// ureq 3 replaced v2's resolver closure with this trait, and the agent must be
@@ -2330,12 +2347,13 @@ impl ureq::unversioned::resolver::Resolver for PinnedResolver {
         _config: &ureq::config::Config,
         _timeout: ureq::unversioned::transport::NextTimeout,
     ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
-        let mut out = self.empty();
-        for addr in self.0.iter().take(MAX_PINNED_ADDRS) {
-            out.push(*addr);
-        }
-        if out.is_empty() {
+        let addrs = pinned_addrs(&self.0);
+        if addrs.is_empty() {
             return Err(ureq::Error::HostNotFound);
+        }
+        let mut out = self.empty();
+        for addr in addrs {
+            out.push(addr);
         }
         Ok(out)
     }
@@ -3744,11 +3762,12 @@ mod web_tests {
                     Ok(_) => head.push(byte[0]),
                 }
             }
-            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n");
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n");
             let _ = sock.flush();
-            // Eight bytes, 250 ms apart: 2 s in total, never a gap anywhere
-            // near STALL_TIMEOUT.
-            for _ in 0..8 {
+            // Forty bytes, 100 ms apart: ~4 s of body, with no single gap
+            // anywhere near the idle bound. The TOTAL is what matters — see
+            // the timeout comment below.
+            for _ in 0..40 {
                 if sock.write_all(b"k").is_err() {
                     return;
                 }
@@ -3757,17 +3776,25 @@ mod web_tests {
             }
         });
 
-        // idle = 5 s against 100 ms between writes: a 50x margin, so a loaded
-        // CI box cannot fail this by scheduling alone. (The first draft used
-        // 250 ms against 1 s — a 4x margin, the same shape as the wall-clock
-        // test this audit already replaced for flaking under load.) The body
-        // still outlives the idle bound many times over, which only a ROLLING
-        // bound permits.
+        // The two numbers this test lives or dies by:
+        //
+        //   per-gap margin: 100 ms between writes against a 1 s idle bound —
+        //     10x, so a loaded CI box cannot fail this by scheduling alone.
+        //   total overrun:  ~4 s of body against that same 1 s bound — 4x, so
+        //     a ROLLING bound passes and any TOTAL interpretation fails.
+        //
+        // Both are required, and the second was missing. An earlier revision
+        // widened the idle bound to 5 s while shortening the writes to 100 ms,
+        // which left a 0.8 s body inside every deadline in play: the doc above
+        // still claimed "wire it up as a total instead and this test fails",
+        // and it no longer did. Nor did shrinking the 30 s response ceiling to
+        // 2 s. The guard had quietly become an assertion that a fast download
+        // finishes.
         let agent = guarded_agent_with_timeouts(
             vec![pinned],
             std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(1),
         );
         let resp = agent
             .get("http://keydb-mirror.test/keydb.zip")
@@ -3782,7 +3809,7 @@ mod web_tests {
             "a steadily-progressing body was aborted: {:?}",
             read.err()
         );
-        assert_eq!(body, b"kkkkkkkk", "the whole body must arrive");
+        assert_eq!(body, vec![b'k'; 40], "the whole body must arrive");
     }
 
     /// The other half: a peer that sends headers and then NOTHING must be cut
@@ -4032,6 +4059,62 @@ mod web_tests {
         );
         drop(g0);
         assert_eq!(C.load(Ordering::SeqCst), 0);
+    }
+
+    // ── Two guards nothing exercised ──────────────────────────────────────
+
+    /// The pin caps at what ureq's fixed 16-slot array can hold. A seventeenth
+    /// address is an out-of-bounds panic inside a resolver that runs on every
+    /// request, and `validate_fetch_url` applies no count limit of its own.
+    #[test]
+    fn the_pinned_address_list_cannot_overrun_ureqs_fixed_array() {
+        let many: Vec<SocketAddr> = (0..MAX_PINNED_ADDRS + 1)
+            .map(|i| SocketAddr::from(([203, 0, 113, 1], 1000 + i as u16)))
+            .collect();
+        assert_eq!(
+            pinned_addrs(&many).len(),
+            MAX_PINNED_ADDRS,
+            "more addresses than ureq's array holds must be truncated"
+        );
+        // An ordinary answer is passed through untouched.
+        let few: Vec<SocketAddr> = many.iter().copied().take(3).collect();
+        assert_eq!(pinned_addrs(&few), few);
+    }
+
+    /// An EMPTY pin must not resolve to anything: the resolver turns that into
+    /// `HostNotFound` rather than letting the agent fall back to live DNS,
+    /// which would reopen the rebinding hole the pin exists to close.
+    #[test]
+    fn an_empty_pin_yields_no_addresses() {
+        assert!(pinned_addrs(&[]).is_empty());
+    }
+
+    /// `ureq_error_kind` is the single chokepoint keeping token-bearing URLs
+    /// out of four log sites that reach the unauthenticated `/api/debug` and
+    /// `/api/system`. The only test that reached it made ONE connection-refused
+    /// call, which lands in the explicit `Io` arm — so mutating the CATCH-ALL
+    /// to `e.to_string()` stayed green, and the catch-all is exactly where
+    /// `BadUri` (which prints the URI it rejected) arrives, the enum being
+    /// non_exhaustive.
+    #[test]
+    fn no_ureq_error_kind_output_can_carry_a_url() {
+        let cases = vec![
+            ureq::Error::StatusCode(404),
+            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+            ureq::Error::HostNotFound,
+            ureq::Error::ConnectionFailed,
+            ureq::Error::TooManyRedirects,
+            // The variant the catch-all exists for: its Display embeds the URI.
+            ureq::Error::BadUri("https://keydb.example/t/SECRETTOKEN/keydb.zip".into()),
+        ];
+        for e in &cases {
+            let kind = ureq_error_kind(e);
+            assert!(
+                !kind.contains("://") && !kind.contains("SECRETTOKEN"),
+                "a URL reached the summary for {e:?}: {kind}"
+            );
+        }
+        assert_eq!(ureq_error_kind(&ureq::Error::StatusCode(404)), "HTTP 404");
     }
 
     /// The fourth ureq log site. Round 1 routed three failures through
