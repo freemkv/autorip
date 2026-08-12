@@ -162,30 +162,45 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
         return;
     }
 
-    std::thread::spawn(move || {
-        let _guard = InflightGuard;
-        for url in &urls {
-            // SSRF guard at fire time (defence-in-depth; the URL is also
-            // validated at store time in handle_settings_post). Resolve +
-            // validate once and pin the connection to those IPs so DNS
-            // rebinding can't redirect this POST to an internal/metadata
-            // host, and so a permitted public URL can't 30x-redirect there
-            // either (guarded_agent uses redirects(0)).
-            let pinned = match crate::web::validate_fetch_url(url) {
-                Ok(addrs) => addrs,
-                Err(e) => {
-                    // Log only the origin — the path may contain a secret token.
-                    crate::log::syslog(&format!(
-                        "Webhook blocked {}: {}",
-                        webhook_url_origin(url),
-                        e
-                    ));
-                    continue;
-                }
-            };
-            deliver(pinned, url, &body);
-        }
-    });
+    // The guard is built HERE, on the spawning thread, and moved in — not
+    // constructed inside the closure. If `std::thread::spawn` itself fails the
+    // OS refuses a thread and std panics; with the guard built inside, the slot
+    // stayed claimed forever, and eight of those silence every webhook for the
+    // life of the process. `web.rs`'s `ConnGuard` was reshaped for exactly this
+    // and its comment says so.
+    let guard = InflightGuard;
+    let spawned = std::thread::Builder::new()
+        .name("webhook".into())
+        .spawn(move || {
+            let _guard = guard;
+            for url in &urls {
+                // SSRF guard at fire time (defence-in-depth; the URL is also
+                // validated at store time in handle_settings_post). Resolve +
+                // validate once and pin the connection to those IPs so DNS
+                // rebinding can't redirect this POST to an internal/metadata
+                // host, and so a permitted public URL can't 30x-redirect there
+                // either (guarded_agent uses redirects(0)).
+                let pinned = match crate::web::validate_fetch_url(url) {
+                    Ok(addrs) => addrs,
+                    Err(e) => {
+                        // Log only the origin — the path may contain a secret token.
+                        crate::log::syslog(&format!(
+                            "Webhook blocked {}: {}",
+                            webhook_url_origin(url),
+                            e
+                        ));
+                        continue;
+                    }
+                };
+                let _ = deliver(pinned, url, &body);
+            }
+        });
+    if spawned.is_err() {
+        // The guard was moved into the closure that never ran, so the slot is
+        // already released by the failed spawn's drop — nothing leaks. Say so
+        // and carry on: a notification is not worth taking the rip down for.
+        crate::log::syslog("Webhook dropped: could not spawn a delivery thread");
+    }
 }
 
 /// POST one payload to one already-validated URL.
@@ -202,16 +217,32 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
 /// `pinned` is what validation resolved to, so this function never consults
 /// DNS: the connection goes to the address that was checked, which is also
 /// what makes it testable against a loopback stub.
-fn deliver(pinned: Vec<std::net::SocketAddr>, url: &str, body: &str) {
+fn deliver(pinned: Vec<std::net::SocketAddr>, url: &str, body: &str) -> bool {
     let agent = crate::web::guarded_agent(pinned);
     match agent
         .post(url)
         .header("Content-Type", "application/json")
         .send(body)
     {
-        Ok(_) => {
+        // NOT every `Ok` is a delivery. `guarded_agent` sets
+        // `max_redirects(0)`, and at zero ureq's `max_redirects_do_error` is
+        // false, so a 3xx comes back as `Ok` rather than an error — and
+        // `validate_fetch_url` accepts `http://`, so an http webhook URL that
+        // its receiver redirects to https logged "Webhook sent" forever while
+        // nothing was ever delivered. A 4xx/5xx already arrives as `Err`; this
+        // closes the redirect gap and anything else non-2xx with it.
+        Ok(r) if r.status().is_success() => {
             // Log only the origin — the path may contain a secret token.
             crate::log::syslog(&format!("Webhook sent to {}", webhook_url_origin(url)));
+            true
+        }
+        Ok(r) => {
+            crate::log::syslog(&format!(
+                "Webhook not accepted {}: HTTP {}",
+                webhook_url_origin(url),
+                r.status().as_u16()
+            ));
+            false
         }
         Err(e) => {
             // Summarise the error WITHOUT embedding `e` directly. NOTE: in
@@ -226,12 +257,74 @@ fn deliver(pinned: Vec<std::net::SocketAddr>, url: &str, body: &str) {
                 webhook_url_origin(url),
                 summary
             ));
+            false
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A redirect is NOT a delivery.
+    ///
+    /// `guarded_agent` sets `max_redirects(0)`, and at zero ureq's
+    /// `max_redirects_do_error` is false — so a 3xx comes back as `Ok`, and
+    /// `deliver` logged "Webhook sent". `validate_fetch_url` accepts
+    /// `http://`, so an http webhook URL whose receiver redirects to https
+    /// reported success forever while nothing was ever delivered, with nothing
+    /// in the log to say otherwise.
+    #[test]
+    fn a_redirect_is_not_reported_as_a_delivered_webhook() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener =
+            TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
+        let pinned = listener.local_addr().expect("stub listener address");
+
+        let _server = std::thread::spawn(move || {
+            let Ok((mut sock, _peer)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                match sock.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => buf.push(byte[0]),
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).to_string();
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("content-length: ")
+                        .or_else(|| l.strip_prefix("Content-Length: "))
+                })
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            let _ = sock.read_exact(&mut body);
+            // The shape a real receiver produces for an http:// webhook URL.
+            let _ = sock.write_all(
+                b"HTTP/1.1 301 Moved Permanently\r\n\
+                  Location: https://hooks.test/services/T000/B000/xxxx\r\n\
+                  Content-Length: 0\r\n\r\n",
+            );
+            let _ = sock.flush();
+        });
+
+        let delivered = super::deliver(
+            vec![pinned],
+            "http://hooks.test/services/T000/B000/xxxx",
+            r#"{"event":"rip_complete"}"#,
+        );
+        assert!(
+            !delivered,
+            "a 301 means the payload went nowhere; reporting it as sent is \
+             how a silently-broken webhook stays broken"
+        );
+    }
+
     /// The webhook POST itself, driven to a real socket.
     ///
     /// Everything else in this module is helper-level (URL masking, the
@@ -283,11 +376,12 @@ mod tests {
             let _ = tx.send((head, String::from_utf8_lossy(&body).to_string()));
         });
 
-        super::deliver(
+        let delivered = super::deliver(
             vec![pinned],
             "http://hooks.test/services/T000/B000/xxxx",
             r#"{"event":"rip_complete"}"#,
         );
+        assert!(delivered, "a 204 is a delivery");
 
         // Hand the observation back over a channel and take it with a
         // DEADLINE. `deliver` swallows transport errors (it only logs), so if
