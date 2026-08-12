@@ -1300,13 +1300,27 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
         // Bound concurrent handler threads so a connection flood can't
         // fork the container to death (unauthenticated LAN DoS). Over the
         // cap we answer 503 on this thread and move on without spawning.
-        let guard = match ConnGuard::try_acquire(&INFLIGHT_HANDLERS, MAX_INFLIGHT_HANDLERS) {
+        //
+        // The cap a request is measured against depends on whether it carries
+        // a BODY. tiny_http yields a request once its headers have parsed and
+        // the handler thread reads the body itself, holding its admission
+        // token for the whole read — and tiny_http 0.12 sets no socket read
+        // timeout and exposes no way to set one, so a peer that sends headers
+        // and then stalls parks a token indefinitely. Sixty-four of those took
+        // every slot, and the FIRST casualty is the container healthcheck
+        // (`GET /api/state`), whose three failed retries restart the daemon —
+        // possibly mid-rip. Body-carrying requests are therefore held to a
+        // lower cap, leaving slots that only a bodyless request can use, so a
+        // stall storm can no longer starve the healthcheck.
+        let cap = if carries_body(&request) {
+            MAX_INFLIGHT_BODY_HANDLERS
+        } else {
+            MAX_INFLIGHT_HANDLERS
+        };
+        let guard = match ConnGuard::try_acquire(&INFLIGHT_HANDLERS, cap) {
             Some(g) => g,
             None => {
-                tracing::warn!(
-                    max = MAX_INFLIGHT_HANDLERS,
-                    "request rejected: in-flight handler cap reached"
-                );
+                tracing::warn!(max = cap, "request rejected: in-flight handler cap reached");
                 json_response(request, 503, r#"{"ok":false,"error":"server busy"}"#);
                 continue;
             }
@@ -2536,6 +2550,45 @@ pub(crate) fn guarded_get_within(
 /// handful of browser tabs polling — but finite so a flood can't fork
 /// the box to death.
 const MAX_INFLIGHT_HANDLERS: usize = 64;
+
+/// The cap for a request that carries a BODY, which the handler thread must
+/// read off the socket while holding its admission token.
+///
+/// Lower than [`MAX_INFLIGHT_HANDLERS`] on purpose, and the gap is the whole
+/// point: those remaining slots can only ever be taken by a bodyless request,
+/// so no number of stalled POSTs can keep `GET /api/state` — the container
+/// healthcheck — from being answered. Without the gap, 64 half-sent POSTs held
+/// every slot until their sockets died, the healthcheck 503'd three times, and
+/// the daemon was restarted, possibly mid-rip.
+///
+/// This bounds the DAMAGE, not the stall: the honest fix is a socket read
+/// timeout, and tiny_http 0.12 neither sets one nor exposes the stream to set
+/// it on. That needs a server change, which is not a thing to do quietly.
+const MAX_INFLIGHT_BODY_HANDLERS: usize = 48;
+
+/// The gap between the two caps is what the healthcheck survives on, so it is
+/// checked at COMPILE time rather than in a test — equalising them cannot even
+/// build. (A test asserting it would be an assertion over two constants, which
+/// clippy rejects for exactly this reason: the compiler is the right place.)
+const _: () = assert!(MAX_INFLIGHT_BODY_HANDLERS < MAX_INFLIGHT_HANDLERS);
+
+/// Whether a request will make its handler read a body off the socket.
+///
+/// Read from the headers tiny_http has ALREADY parsed by the time the request
+/// is yielded, so this costs nothing and cannot itself block. A chunked or
+/// unknown-length body counts too: the length is what the reader waits for.
+fn carries_body(request: &tiny_http::Request) -> bool {
+    match request.body_length() {
+        Some(0) => false,
+        Some(_) => true,
+        // No Content-Length. For a method that never has a body this is just
+        // an ordinary GET; for anything else, assume the reader will wait.
+        None => !matches!(
+            request.method(),
+            tiny_http::Method::Get | tiny_http::Method::Head | tiny_http::Method::Options
+        ),
+    }
+}
 /// Max concurrent SSE (`/events`) streams. Each pins a thread for its
 /// whole lifetime, so this is the tighter bound.
 const MAX_SSE_CLIENTS: usize = 8;
@@ -4059,6 +4112,41 @@ mod web_tests {
         );
         drop(g0);
         assert_eq!(C.load(Ordering::SeqCst), 0);
+    }
+
+    // ── A stalled POST must not starve the healthcheck ────────────────────
+    //
+    // tiny_http yields a request once its HEADERS parse; the handler thread
+    // reads the body itself while holding its admission token, and tiny_http
+    // 0.12 sets no socket read timeout and exposes no stream to set one on. So
+    // a peer that sends headers and then stalls parks a token indefinitely.
+    // The first casualty was `GET /api/state` — the container healthcheck —
+    // whose three failed retries restart the daemon, possibly mid-rip.
+
+    /// The reservation, exercised against the real counter: fill it to the
+    /// body cap, then show a bodyless request still gets in and a
+    /// body-carrying one does not.
+    #[test]
+    fn a_bodyless_request_is_admitted_while_the_body_cap_is_full() {
+        static C: AtomicUsize = AtomicUsize::new(0);
+        let held: Vec<_> = (0..MAX_INFLIGHT_BODY_HANDLERS)
+            .map(|_| {
+                ConnGuard::try_acquire(&C, MAX_INFLIGHT_BODY_HANDLERS).expect("under the body cap")
+            })
+            .collect();
+        assert!(
+            ConnGuard::try_acquire(&C, MAX_INFLIGHT_BODY_HANDLERS).is_none(),
+            "the body cap must actually stop admitting"
+        );
+        let spare = ConnGuard::try_acquire(&C, MAX_INFLIGHT_HANDLERS);
+        assert!(
+            spare.is_some(),
+            "a bodyless request must still be admitted — this is the slot the \
+             healthcheck lives in"
+        );
+        drop(spare);
+        drop(held);
+        assert_eq!(C.load(Ordering::SeqCst), 0, "every slot released");
     }
 
     // ── Two guards nothing exercised ──────────────────────────────────────
