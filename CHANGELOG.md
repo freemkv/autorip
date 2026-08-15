@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.6.4] — UNRELEASED
+
+### Fixed
+
+- **A stalled upload could restart the daemon mid-rip.** A client that sent
+  request headers and then stalled parked a connection slot; enough of them
+  starved `GET /api/state` — the container healthcheck — whose failed retries
+  restart the daemon. Body-carrying requests are now held to a lower cap than
+  bodyless ones, so a healthcheck always has a slot to answer on.
+
+- **Log retention reclaimed nothing from the main log.** Daily-rotated files
+  (`autorip.log.YYYY-MM-DD`) were skipped by a check that read the date as the
+  file extension, so the log the operator actually reads grew for the life of
+  the container. Rotated files are now matched correctly.
+
+- **A redirected webhook was reported as delivered.** With redirects disabled a
+  3xx returned success, so an `http` webhook that redirected to `https` logged
+  "Webhook sent" while nothing was ever delivered; only a 2xx now counts. A
+  failed thread spawn also no longer permanently leaks a delivery slot.
+
+### Security
+
+- **Two more paths that reach the unauthenticated API are held to URL-free
+  logging.** The resolver's address cap and the ureq error-masking catch-all —
+  which keep token-bearing URLs out of the debug endpoint — are now covered by
+  tests, and a fourth key-database-update error path that logged a raw ureq
+  error (whose display can embed the URL) now goes through the same masking as
+  its siblings.
+
+### Changed
+
+- Rebuilt against libfreemkv 1.6.4 (the single-clip audio-tail fix); automatic
+  ripping is otherwise unchanged.
+
 ## [1.6.3] — 2026-08-10
 
 ### Changed
