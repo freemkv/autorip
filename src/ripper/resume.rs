@@ -61,8 +61,10 @@ pub enum ResumeClass {
     Remux {
         iso_path: PathBuf,
         mapfile_path: PathBuf,
-        /// Sanitized display name — the staging subdirectory's
-        /// `file_name()`. Used for the MKV filename, dest URL, and the
+        /// Sanitized display name — a FILE basename (the staged ISO's
+        /// `file_stem()`), NOT the staging subdirectory's name, which
+        /// carries the `_2`-style boxset disc suffix that files inside it
+        /// never take. Used for the MKV filename, dest URL, and the
         /// `display_name` in `MuxInputs`. The original TMDB-resolved
         /// title isn't available at resume time (no fresh scan_disc
         /// has run yet); the sanitized form is what every other
@@ -267,15 +269,26 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
         }
     }
 
-    // file_name() returns None only for a path ending in `..`. Defaulting to
-    // "" here would make the output filename ".mkv"/".m2ts" and point
-    // delete_partial_output at "<staging>/.mkv" at the staging root — a
-    // destructive write outside the disc subdir. hint.dir is always a child
-    // of staging_dir today so this never fires, but bail loudly if it ever does.
-    let display_name = match hint.dir.file_name() {
+    // The ISO's OWN stem, not the staging dir's name. `rip_disc` builds every
+    // file inside a staging dir from `sanitize_path_compact(display_name)`
+    // with NO disc suffix, while the DIRECTORY carries the `_2`-style suffix
+    // that separates the discs of a boxset (see the `filename` comment in
+    // `ripper/mod.rs`). This value is used as a FILE basename — by
+    // `delete_partial_output`, which clears `<dir>/<name>.<ext>`, and by
+    // `resume_remux`, which muxes to the same path — so taking it from the
+    // directory made a boxset variant dir miss its own partial and mux a
+    // SECOND file beside it, both of which the mover then delivers. The ISO
+    // sits next to that partial and was written by the same rule, so its stem
+    // is the basename by construction.
+    //
+    // file_stem() returns None only for a path ending in `..`, which
+    // `find_iso_and_mapfile` cannot produce (it returns real `read_dir`
+    // entries). Defaulting to "" would make the output filename ".mkv" and
+    // point delete_partial_output at a dotfile; bail loudly instead.
+    let display_name = match iso_path.file_stem() {
         Some(n) => n.to_string_lossy().into_owned(),
         None => {
-            tracing::warn!(dir = %hint.dir.display(), "resume: staging dir has no file_name component; not eligible");
+            tracing::warn!(iso = %iso_path.display(), "resume: staged ISO has no file_stem component; not eligible");
             return ResumeClass::NotEligible;
         }
     };
@@ -427,6 +440,61 @@ fn reset_status_after_ripping(
             ..Default::default()
         },
     );
+}
+
+/// Fill the NON-success half of a [`MuxHandoffOutcome`] from the terminal
+/// `_mux` state: the real reason the dir didn't advance, and whether that
+/// reason is a retryable DEFERRAL.
+///
+/// Retryability is what the exit RECORDED (`failure_deferred`), never what
+/// the status happens to read — `"idle"` is written by both the keyless
+/// deferrals and by three hard failures (no title after key resolution, an
+/// unreadable mapfile, an over-threshold loss abort), and inferring from it
+/// put "will mux automatically once keys are available" on the error card of
+/// a corrupt ISO. That is the seam this crate got wrong.
+///
+/// It is a function rather than two lines inline in
+/// [`remux_from_ripped_marker`] so the grading is reachable from a test
+/// without an ISO + mapfile + decrypt + mux pipeline — the same reason
+/// [`mux_handoff_success`] and [`build_mux_handoff_outcome`] were pulled out.
+/// An empty `last_error` records NOTHING: `crate::muxer` dispatches on
+/// `failure_reason.is_some()`, so `Some("")` would print a blank error card
+/// instead of falling through to its own fallback hints.
+fn apply_failure_fields(outcome: &mut MuxHandoffOutcome, rs: &super::RipState) {
+    if rs.last_error.is_empty() {
+        return;
+    }
+    outcome.failure_reason = Some(rs.last_error.clone());
+    outcome.failure_retryable = rs.failure_deferred;
+}
+
+/// [`reset_status_after_ripping`] for the exits that are DEFERRALS rather
+/// than failures: the mux did not happen because keys are not available yet,
+/// staging is intact, and a later pass will complete it untouched.
+///
+/// Terminal status is `"idle"` — same as the hard-failure exits beside it,
+/// because that is what the dashboard needs to show — so the deferral is
+/// recorded explicitly on [`RipState::failure_deferred`] instead. The
+/// alternative, reading `status == "idle"` back out, is what
+/// `remux_from_ripped_marker` used to do, and it told the operator that an
+/// unreadable mapfile or a corrupt ISO would "mux automatically once keys are
+/// available" — advice that can only ever be wrong for those causes.
+fn defer_status_after_ripping(
+    device: &str,
+    display_name: &str,
+    disc_format: &str,
+    duration: &str,
+    reason: String,
+) {
+    reset_status_after_ripping(
+        device,
+        "idle",
+        display_name,
+        disc_format,
+        duration,
+        Some(reason),
+    );
+    super::update_state_with(device, |s| s.failure_deferred = true);
 }
 
 /// Callers and what they actually provide:
@@ -918,13 +986,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // actively writes status="idle" here — a clear non-error
         // terminal state that keeps the disc identity and surfaces the
         // deferral reason without flagging a hard failure.
-        reset_status_after_ripping(
+        defer_status_after_ripping(
             device,
-            "idle",
             &display_name,
             &disc_format,
             &duration,
-            Some(format!("Ripped to ISO — no keys, mux deferred. {msg}")),
+            format!("Ripped to ISO — no keys, mux deferred. {msg}"),
         );
         return;
     }
@@ -1360,13 +1427,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                     "Auto-resume: FMTS forensic keys unavailable — mux deferred. Staging \
                      preserved; will mux automatically once keys are available.",
                 );
-                reset_status_after_ripping(
+                defer_status_after_ripping(
                     device,
-                    "idle",
                     &display_name,
                     &disc_format,
                     &duration,
-                    Some("Ripped to ISO — forensic keys unavailable, mux deferred.".to_string()),
+                    "Ripped to ISO — forensic keys unavailable, mux deferred.".to_string(),
                 );
                 super::unregister_halt(device);
                 return;
@@ -1914,9 +1980,13 @@ pub(crate) fn remux_from_ripped_marker(
                 outcome.errors = rs.errors;
                 outcome.total_lost_ms = rs.total_lost_ms;
                 outcome.main_lost_ms = rs.main_lost_ms;
-            } else if !rs.last_error.is_empty() {
-                outcome.failure_reason = Some(rs.last_error.clone());
-                outcome.failure_retryable = rs.status == "idle";
+            } else {
+                // Never inferred from the terminal status: three hard-failure
+                // exits in `resume_remux` write "idle" too, so that inference
+                // told the operator a corrupt ISO or an unreadable mapfile
+                // would mux itself once keys landed. `apply_failure_fields`
+                // owns the grading (and is where the tests reach it).
+                apply_failure_fields(&mut outcome, rs);
             }
         }
         // Clean up the synthetic STATE entry so the device tile grid
@@ -2045,6 +2115,151 @@ mod find_iso_tests {
         let (iso, map) = find_iso_and_mapfile(&d).expect("should pair");
         assert!(iso.ends_with("Movie.iso"));
         assert!(map.ends_with("Movie.iso.mapfile"));
+    }
+}
+
+/// A hard failure must not be advertised to the operator as a deferral that
+/// will fix itself.
+///
+/// `remux_from_ripped_marker` graded the `_mux` device by `status == "idle"`,
+/// and three hard-failure exits in `resume_remux` write exactly that — so a
+/// corrupt ISO, an unreadable mapfile or an over-threshold loss abort all
+/// came back `failure_retryable = true` and the muxer's error card said "no
+/// decryption keys yet — the disc stays staged and will mux automatically".
+/// Drive the REAL producers (both terminal-state writers) and grade with the
+/// REAL predicate.
+#[cfg(test)]
+mod failure_retryability_tests {
+    use super::*;
+
+    fn state_of(device: &str) -> crate::ripper::RipState {
+        super::super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .cloned()
+            .expect("the terminal write must have created a STATE entry")
+    }
+
+    /// Grade a terminal state exactly as `remux_from_ripped_marker`'s
+    /// non-success branch does, and hand back the outcome the muxer reads.
+    fn graded(device: &str) -> MuxHandoffOutcome {
+        let rs = state_of(device);
+        let mut outcome = build_mux_handoff_outcome(false);
+        apply_failure_fields(&mut outcome, &rs);
+        outcome
+    }
+
+    #[test]
+    fn a_hard_failure_that_lands_on_idle_is_not_reported_as_retryable() {
+        // Unique per test: STATE is process-global.
+        let dev = format!("_retryable-hard-{}", std::process::id());
+        // Verbatim shape of resume_remux's unreadable-mapfile exit.
+        reset_status_after_ripping(
+            &dev,
+            "idle",
+            "Some Disc",
+            "bluray",
+            "1:52",
+            Some("Could not read this disc's saved recovery map".to_string()),
+        );
+        assert_eq!(
+            state_of(&dev).status,
+            "idle",
+            "the fixture must reproduce the trap"
+        );
+
+        let outcome = graded(&dev);
+
+        assert_eq!(
+            outcome.failure_reason.as_deref(),
+            Some("Could not read this disc's saved recovery map"),
+            "the operator must be told the real reason the dir didn't advance"
+        );
+        assert!(
+            !outcome.failure_retryable,
+            "a hard failure must not be graded retryable just because its \
+             terminal status is \"idle\" — that puts \"will mux automatically \
+             once keys are available\" on a corrupt ISO's error card"
+        );
+    }
+
+    #[test]
+    fn a_keyless_deferral_is_reported_as_retryable() {
+        let dev = format!("_retryable-deferral-{}", std::process::id());
+        defer_status_after_ripping(
+            &dev,
+            "Some Disc",
+            "bluray",
+            "1:52",
+            "Ripped to ISO — no keys, mux deferred.".to_string(),
+        );
+        assert_eq!(
+            state_of(&dev).status,
+            "idle",
+            "a deferral still reads as idle"
+        );
+
+        let outcome = graded(&dev);
+
+        assert!(
+            outcome.failure_retryable,
+            "the keyless deferral is the case that IS retryable — the ISO \
+             stays staged and muxes itself once keys land"
+        );
+    }
+
+    /// A non-success with NO recorded error records nothing at all.
+    /// `crate::muxer` dispatches on `failure_reason.is_some()`, so a
+    /// `Some("")` here would render a blank error card instead of falling
+    /// through to its own `.aborted-loss` / failed-reason fallbacks.
+    #[test]
+    fn a_non_success_without_a_recorded_error_reports_no_reason() {
+        let dev = format!("_retryable-silent-{}", std::process::id());
+        reset_status_after_ripping(&dev, "idle", "Some Disc", "bluray", "1:52", None);
+        assert!(
+            state_of(&dev).last_error.is_empty(),
+            "the fixture must leave last_error empty"
+        );
+
+        let outcome = graded(&dev);
+
+        assert!(
+            outcome.failure_reason.is_none(),
+            "an empty last_error must leave failure_reason None so the muxer \
+             uses its own fallback hints"
+        );
+        assert!(!outcome.failure_retryable);
+    }
+
+    /// The grading above only protects the operator if `remux_from_ripped_marker`
+    /// still routes through it. Driving that function needs a real ISO +
+    /// mapfile + decrypt + mux pipeline, so pin the wiring at source level —
+    /// the same technique this file already uses for `resume_remux`'s
+    /// webhook and `handoff_marker_name` call sites. Without this, inlining
+    /// `outcome.failure_retryable = rs.status == "idle"` back into the
+    /// non-success branch reinstates the bug with every test still green.
+    #[test]
+    fn the_non_success_branch_routes_through_apply_failure_fields() {
+        let src = crate::util::source_lf(include_str!("resume.rs"));
+        let start = src
+            .find("pub(crate) fn remux_from_ripped_marker(")
+            .expect("remux_from_ripped_marker must exist");
+        let region = &src[start..];
+        let end = region
+            .find("\n/// Resolve keys for a resumed disc")
+            .unwrap_or(region.len());
+        let region = &region[..end];
+        assert!(
+            region.contains("apply_failure_fields(&mut outcome, rs);"),
+            "remux_from_ripped_marker's non-success branch must grade through \
+             apply_failure_fields, not a hand-rolled status inference"
+        );
+        assert!(
+            !region.contains("rs.status == \"idle\""),
+            "remux_from_ripped_marker must never infer retryability from the \
+             terminal status: three hard-failure exits write \"idle\" too"
+        );
     }
 }
 

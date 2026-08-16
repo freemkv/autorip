@@ -278,6 +278,16 @@ jobs:
           workspaces: autorip
       - run: cargo build --tests
         working-directory: autorip
+      # aarch64-apple-darwin is a SHIPPED target and this is the only job that
+      # RUNS the suite on it: release.yml's macOS matrix entry is build-only,
+      # and qa.yml's macOS run is release-mode on the qa branch. Building the
+      # test binaries and never executing them left every macOS-specific
+      # behaviour (path handling, the fs metadata the mover stats, thread
+      # timing) unchecked in debug on any branch — the same gap the Windows
+      # job below was added to close.
+      - name: Run tests
+        working-directory: autorip
+        run: cargo test --tests
 
   # x86_64-pc-windows-msvc is a SHIPPED target too. This is the only job that
   # compiles autorip's `#[cfg(windows)]` paths at all, so without it a broken

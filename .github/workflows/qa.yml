@@ -15,9 +15,12 @@ name: qa
 # one being released, which is the exact failure this branch exists to prevent.
 #
 # What this gate CANNOT cover: `disc://` and real `iso://` need physical media,
-# and no hosted runner has an optical drive or the image hoard. Those run on a
-# self-hosted runner (see the media job at the end) and are the one leg that
-# stays on hardware.
+# and no hosted runner has an optical drive or the image hoard. That leg is NOT
+# a job in this file — it never has been — and looking for one here is why this
+# comment was wrong for its whole life. It runs out-of-band on the rig against
+# real discs, and the release script refuses to tag unless a green run of it is
+# newer than the newest cascade commit. That refusal, not a job here, is what
+# keeps the hardware leg honest.
 on:
   push:
     branches: [qa]

@@ -85,7 +85,8 @@ jobs:
   # Tests run as a PARALLEL TRIPWIRE: they fail the run if they fail, but the
   # build/docker jobs do NOT `needs:` this job, so artifact build starts
   # immediately rather than serializing behind the test suite. The tag decision
-  # was already gated by the local precommit (same Rust 1.86, same commit) — CI
+  # was already gated by the local precommit (same Rust 1.97 this workflow
+  # pins below and in `build`, same commit) — CI
   # tests here are a safety net, not the gate.
   test:
     needs: verify

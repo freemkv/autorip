@@ -1016,6 +1016,30 @@ fn ui_state_from_inputs(inputs: &MuxInputs<'_>, total_bytes: u64) -> UiState {
     }
 }
 
+/// The ONE wording for "this mux completed, and the file still does not match
+/// the pre-mux plan".
+///
+/// libfreemkv's contract: a non-empty `undelivered_streams` means the finished
+/// file is missing streams the plan promised even though `completed == true`,
+/// and a caller that reports a successful export must report these too — a
+/// lossy outcome is never silent.
+///
+/// Two sites used to spell this out independently — here and `rip_disc`'s
+/// completed-mux summary — writing two differently-worded lines into the SAME
+/// per-device log for the SAME event: one lossy mux read as two, and an
+/// operator grepping or alerting on either exact phrase saw half the story.
+/// `map_iso_mux_outcome` produces every outcome that can carry undelivered
+/// streams (every other construction site is empty by definition), so it is
+/// the one emitter, and this is the one wording it emits.
+fn undelivered_streams_note(streams: &[usize]) -> String {
+    format!(
+        "Mux completed but {} stream(s) could not be delivered into the output \
+         (streams={:?}) — the file does not match the pre-mux plan",
+        streams.len(),
+        streams
+    )
+}
+
 /// Map a `mux_stream` result into autorip's [`MuxOutcome`] + staging decisions,
 /// preserving the pre-migration Err classification:
 /// - `is_halt_error` / `is_fmts_key_missing_error` are RETURNED as `Err` so the
@@ -1055,17 +1079,31 @@ fn map_iso_mux_outcome(
         }
     };
     match result {
-        Ok(o) if o.completed => Ok(MuxOutcome {
-            completed: true,
-            bytes_done: o.bytes_written,
-            elapsed_secs,
-            speed_mbs: speed_of(o.bytes_written),
-            errors: u32::try_from(o.errors).unwrap_or(u32::MAX),
-            lost_video_secs: lost_secs(o.lost_bytes),
-            output_opened: true,
-            finalize_error: None,
-            read_error: None,
-        }),
+        Ok(o) if o.completed => {
+            // libfreemkv's contract: non-empty `undelivered_streams` means the
+            // finished file does NOT match the pre-mux plan even though
+            // `completed == true` — a lossy-but-successful export. Dormant
+            // today (only the `mp4://` sink populates it; autorip's
+            // `output_scheme_for` never returns "mp4"), but a caller that
+            // reports a successful export must report these too, so this
+            // logs loudly the moment it stops being empty rather than
+            // waiting for an mp4 destination to make the silence a HIGH.
+
+            if !o.undelivered_streams.is_empty() {
+                crate::log::device_log(device, &undelivered_streams_note(&o.undelivered_streams));
+            }
+            Ok(MuxOutcome {
+                completed: true,
+                bytes_done: o.bytes_written,
+                elapsed_secs,
+                speed_mbs: speed_of(o.bytes_written),
+                errors: u32::try_from(o.errors).unwrap_or(u32::MAX),
+                lost_video_secs: lost_secs(o.lost_bytes),
+                output_opened: true,
+                finalize_error: None,
+                read_error: None,
+            })
+        }
         Ok(o) => {
             // A clean operator stop (halt) or a join-timeout wedge: resumable,
             // no error marker — the orchestrator's "stopped" path handles it.
@@ -2039,5 +2077,87 @@ mod tests {
             .expect("mapped");
         assert!(!hdr.output_opened);
         assert!(hdr.finalize_error.is_some());
+    }
+
+    /// libfreemkv's contract on `MuxOutcome::undelivered_streams`: non-empty
+    /// means the finished output does NOT match the pre-mux plan **even with
+    /// `completed = true`**, and "a caller that reports a successful export
+    /// must report these too — a lossy outcome is never silent." Today only
+    /// the `mp4://` sink populates it (autorip never offers that destination
+    /// — see `output_scheme_for`), but `map_iso_mux_outcome` must not drop
+    /// the field on the floor: the day an mp4 destination exists, a
+    /// completed-but-lossy mux must not be silently reported as a clean
+    /// success.
+    #[test]
+    fn map_iso_mux_outcome_surfaces_undelivered_streams_on_a_completed_run() {
+        let start = Instant::now();
+        let lossy = map_iso_mux_outcome(
+            Ok(libfreemkv::MuxOutcome {
+                completed: true,
+                output_opened: true,
+                bytes_written: 1234,
+                errors: 0,
+                lost_bytes: 0,
+                streams: 2,
+                undelivered_streams: vec![1],
+            }),
+            true,
+            "sr-test",
+            0.0,
+            start,
+            0,
+            0,
+        )
+        .expect("completed run maps to Ok");
+        assert!(lossy.completed);
+        // REPORTED, not merely carried: the per-device log is where this fact
+        // reaches the operator, and it is the only place it was ever consumed.
+        // Exactly once — zero is a silently lossy "success", two is the
+        // duplicate-wording bug this replaced.
+        let logged = crate::log::get_device_log("sr-test", 50);
+        let notes: Vec<&String> = logged
+            .iter()
+            .filter(|l| l.contains("could not be delivered into the output"))
+            .collect();
+        assert_eq!(
+            notes.len(),
+            1,
+            "a completed-but-lossy mux must report its undelivered streams \
+             exactly once; got {logged:?}"
+        );
+        assert!(
+            notes[0].contains("[1]"),
+            "the note must name the streams that were dropped: {:?}",
+            notes[0]
+        );
+    }
+
+    /// ONE event, ONE wording, ONE emitter.
+    ///
+    /// The note had two independently-maintained spellings —
+    /// `map_iso_mux_outcome`'s "could not be delivered" and `rip_disc`'s
+    /// completed-mux summary "were not delivered" — both written to the same
+    /// per-device log for the same event. A future wording change to one would
+    /// silently diverge from its twin, and an alert on either phrase already
+    /// missed the other. Dormant only until an `mp4://` destination exists,
+    /// which is exactly when nobody will re-read this code.
+    #[test]
+    fn the_undelivered_streams_note_has_a_single_emitter() {
+        let mux_src = crate::util::source_lf(include_str!("mux.rs"));
+        let mod_src = crate::util::source_lf(include_str!("mod.rs"));
+        assert!(
+            mux_src.contains("fn undelivered_streams_note("),
+            "the note's wording must live in one shared function"
+        );
+        assert!(
+            !mod_src.contains("stream(s) were not delivered"),
+            "rip_disc must not carry a second, independently-worded copy of \
+             the undelivered-streams note"
+        );
+        assert!(
+            !mod_src.contains("stream(s) could not be delivered"),
+            "rip_disc must not re-emit the note at all — map_iso_mux_outcome \
+             already logged it for every outcome that can carry one"
+        );
     }
 }

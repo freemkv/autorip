@@ -1668,7 +1668,7 @@ fn handle_title_override(request: tiny_http::Request, device: &str) {
     }
     let poster = clamp_chars(poster_raw, 1000);
     let overview = clamp_chars(v["overview"].as_str().unwrap_or(""), 2000);
-    let media_type = v["media_type"].as_str().unwrap_or("movie").to_string();
+    let media_type = normalize_media_type(v["media_type"].as_str().unwrap_or("movie"));
     ripper::set_title_override(
         device,
         crate::tmdb::TmdbResult {
@@ -1908,7 +1908,15 @@ fn is_masked_webhook(s: &str) -> bool {
 fn resolve_webhook_urls(incoming: &[&str], existing: &[String]) -> Result<Vec<String>, String> {
     let mut resolved: Vec<String> = Vec::with_capacity(incoming.len());
     for s in incoming {
-        if s.contains(SECRET_SENTINEL) {
+        // Same predicate the SSRF filter uses (`is_masked_webhook`), and it
+        // has to be: with `contains` here, a genuine URL that merely EMBEDS
+        // the sentinel mid-path was validated as real by the filter and then
+        // treated as a placeholder here — resolving against nothing and
+        // failing the whole save with "ambiguous masked webhook entry", an
+        // error about a masking that never happened, with no way to enter
+        // that URL at all. Two predicates for one question is the defect;
+        // there is now one.
+        if is_masked_webhook(s) {
             // Preferred path: the masked form carries a stable `#<idx>`
             // identifier (see mask_webhook_url_indexed). Resolve by that index
             // so two same-origin webhooks round-trip unambiguously. The index
@@ -2081,6 +2089,24 @@ fn is_valid_device_name(s: &str) -> bool {
 /// Clamp `s` to at most `max` characters (Unicode scalar values), never
 /// splitting a multi-byte char. Used to bound operator-supplied free text
 /// (title/overview/poster_url) before it's persisted and re-broadcast.
+/// The stored `media_type` for a title override, reduced to the vocabulary
+/// the router actually understands.
+///
+/// `media_type` is the one field of `handle_title_override` that was neither
+/// clamped nor allow-listed, on a route reachable unauthenticated from the
+/// LAN — the sibling fields all go through `clamp_chars`. It is also not
+/// free-form data: `mover::routing_media_type` recognises `"tv"` and treats
+/// everything else as a movie, and TMDB itself only ever yields these two. An
+/// allow-list is therefore both the tighter bound AND the honest description
+/// of the field — it stores what the router will act on, instead of persisting
+/// and re-broadcasting an arbitrary caller-supplied string to every dashboard.
+fn normalize_media_type(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "tv" => "tv".to_string(),
+        _ => "movie".to_string(),
+    }
+}
+
 fn clamp_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((byte_idx, _)) => s[..byte_idx].to_string(),
@@ -2152,6 +2178,32 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 /// (unauthenticated) handler thread. Run it on a spawned thread and join with
 /// a short deadline; error on timeout. Shared by `validate_fetch_url` and
 /// `validate_network_target` so neither can re-introduce an unbounded lookup.
+/// The three failure strings [`resolve_with_timeout`] and
+/// [`validate_fetch_url`] emit for "we could not find out", as opposed to
+/// "this URL is not allowed". They are constants because
+/// [`is_transient_resolve_error`] classifies on them: a caller that has to
+/// tell a DNS blip from a config error would otherwise be matching literals
+/// typed twice, and the day one side is reworded the classification silently
+/// inverts.
+pub(crate) const RESOLVE_TIMEOUT_MSG: &str = "DNS resolution timed out";
+pub(crate) const RESOLVE_FAILED_PREFIX: &str = "could not resolve host: ";
+pub(crate) const RESOLVE_NO_ADDRS_MSG: &str = "host did not resolve to any address";
+
+/// True when a [`validate_fetch_url`] / [`resolve_with_timeout`] error means
+/// the host could not be LOOKED UP right now — a DNS timeout, a resolver
+/// failure, or an empty answer — rather than a permanent verdict on the URL
+/// (bad scheme, no host, blocked address).
+///
+/// The distinction matters wherever a failed validation is folded into a
+/// judgement about the remote SERVICE: a resolver blip is not evidence that
+/// the service answered. See `keysource::probe_online_reachability`, where
+/// getting this wrong finalised a rippable disc as permanently keyless.
+pub(crate) fn is_transient_resolve_error(msg: &str) -> bool {
+    msg == RESOLVE_TIMEOUT_MSG
+        || msg == RESOLVE_NO_ADDRS_MSG
+        || msg.starts_with(RESOLVE_FAILED_PREFIX)
+}
+
 pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -2172,7 +2224,7 @@ pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAd
     // on the spawning thread instead, so the counter never leaks.
     let guard = match ConnGuard::try_acquire(&INFLIGHT, MAX_INFLIGHT) {
         Some(g) => g,
-        None => return Err("DNS resolution timed out".to_string()),
+        None => return Err(RESOLVE_TIMEOUT_MSG.to_string()),
     };
 
     let host = host.to_string();
@@ -2191,8 +2243,8 @@ pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAd
     });
     match rx.recv_timeout(DNS_TIMEOUT) {
         Ok(Ok(addrs)) => Ok(addrs),
-        Ok(Err(e)) => Err(format!("could not resolve host: {e}")),
-        Err(_) => Err("DNS resolution timed out".to_string()),
+        Ok(Err(e)) => Err(format!("{RESOLVE_FAILED_PREFIX}{e}")),
+        Err(_) => Err(RESOLVE_TIMEOUT_MSG.to_string()),
     }
 }
 
@@ -2249,7 +2301,7 @@ pub(crate) fn validate_fetch_url(url: &str) -> Result<Vec<SocketAddr>, String> {
     // Resolve once, with a bounded deadline (see resolve_with_timeout).
     let addrs: Vec<SocketAddr> = resolve_with_timeout(&host, port)?;
     if addrs.is_empty() {
-        return Err("host did not resolve to any address".to_string());
+        return Err(RESOLVE_NO_ADDRS_MSG.to_string());
     }
     for a in &addrs {
         if is_blocked_ip(&a.ip()) {
@@ -2300,7 +2352,7 @@ pub(crate) fn validate_network_target(target: &str) -> Result<(), String> {
     // unauthenticated settings POST can't freeze the handler on a slow resolver.
     let addrs: Vec<SocketAddr> = resolve_with_timeout(&host, port)?;
     if addrs.is_empty() {
-        return Err("host did not resolve to any address".to_string());
+        return Err(RESOLVE_NO_ADDRS_MSG.to_string());
     }
     for a in &addrs {
         if is_blocked_ip(&a.ip()) {
@@ -3127,6 +3179,297 @@ mod web_tests {
         );
     }
 
+    /// `/api/state` (and therefore `--healthcheck`, and therefore the
+    /// Dockerfile HEALTHCHECK) must stay responsive while a staging-dir
+    /// refresh is in flight. A slow `read_dir` must never be able to park
+    /// every other caller behind it.
+    ///
+    /// Timing margin: the in-flight scan is held for 1500 ms; the reader is
+    /// asserted to return in under 250 ms — a 6x margin over a code path
+    /// that, when it does not block, is a HashMap lookup plus two Vec
+    /// clones (microseconds). The test FAILS rather than hangs: a blocked
+    /// reader returns after the 1500 ms scan and trips the bound.
+    #[test]
+    fn queue_view_cache_reader_not_blocked_by_in_flight_scan() {
+        use std::time::{Duration, Instant};
+        const SCAN_MS: u64 = 1500;
+        const READER_BOUND_MS: u128 = 250;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Unique fixture path (tempdir) so the process-global probe/cache
+        // keyed by staging_dir cannot collide with another test.
+        let staging = tmp.path().to_string_lossy().to_string();
+        let disc = tmp.path().join("Primed");
+        std::fs::create_dir_all(&disc).unwrap();
+        crate::muxer::write_marker(&disc, &ripped_marker_for("Primed", "sg0")).unwrap();
+
+        // Prime the cache with a fast scan (the steady state on the rig:
+        // /api/state has been polled once a second for the container's life).
+        let (primed, _, _, _) = build_queue_views_cached(&staging);
+        assert!(
+            primed.iter().any(|s| s.contains("Primed")),
+            "priming scan must see the pre-existing disc"
+        );
+
+        // Now make this dir's scan pathologically slow, and let the cached
+        // entry age past the TTL so the next caller triggers a refresh.
+        queue_scan_probe::arm(&staging, SCAN_MS);
+        std::thread::sleep(QUEUE_VIEW_CACHE_TTL + Duration::from_millis(50));
+
+        let s2 = staging.clone();
+        let refresher = std::thread::spawn(move || build_queue_views_cached(&s2));
+
+        // Bounded wait until the slow scan is genuinely in flight.
+        let spin = Instant::now();
+        while queue_scan_probe::scans(&staging) < 1 && spin.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            queue_scan_probe::scans(&staging),
+            1,
+            "the slow refresh scan never started; test setup is wrong"
+        );
+
+        // The healthcheck-equivalent read, concurrent with that scan.
+        let t0 = Instant::now();
+        let (mux, _, _, _) = build_queue_views_cached(&staging);
+        let elapsed = t0.elapsed();
+        let _ = refresher.join();
+
+        assert!(
+            mux.iter().any(|s| s.contains("Primed")),
+            "a reader served during a refresh must still get a usable (stale) queue view"
+        );
+        assert!(
+            elapsed.as_millis() < READER_BOUND_MS,
+            "/api/state reader blocked {elapsed:?} behind an in-flight staging scan \
+             (bound {READER_BOUND_MS}ms, scan {SCAN_MS}ms) — a stalled scan can stall \
+             the Docker healthcheck"
+        );
+    }
+
+    /// The counterpart guard: fixing the blocking above must NOT turn the
+    /// cache into a thundering herd. N concurrent cold callers must produce
+    /// ONE scan of the staging dir, not N.
+    #[test]
+    fn queue_view_cache_single_flights_concurrent_callers() {
+        const SCAN_MS: u64 = 300;
+        const CALLERS: usize = 8;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let staging = tmp.path().to_string_lossy().to_string();
+        let disc = tmp.path().join("Solo");
+        std::fs::create_dir_all(&disc).unwrap();
+        crate::muxer::write_marker(&disc, &ripped_marker_for("Solo", "sg0")).unwrap();
+
+        // Armed BEFORE the first call: this dir has never been scanned, so
+        // every caller below is a cold miss racing every other one.
+        queue_scan_probe::arm(&staging, SCAN_MS);
+
+        let handles: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let s = staging.clone();
+                std::thread::spawn(move || build_queue_views_cached(&s))
+            })
+            .collect();
+        for h in handles {
+            let (mux, _, _, _) = h.join().expect("caller thread panicked");
+            assert!(
+                mux.iter().any(|s| s.contains("Solo")),
+                "every concurrent caller must get the real queue view"
+            );
+        }
+        assert_eq!(
+            queue_scan_probe::scans(&staging),
+            1,
+            "{CALLERS} concurrent callers caused {} staging scans; single-flight is broken \
+             (thundering herd on the staging dir)",
+            queue_scan_probe::scans(&staging)
+        );
+
+        // And a further caller inside the TTL window still re-uses it.
+        let _ = build_queue_views_cached(&staging);
+        assert_eq!(
+            queue_scan_probe::scans(&staging),
+            1,
+            "a caller within the TTL must be served from cache"
+        );
+    }
+
+    /// Run `build_queue_views_cached(dir)` on a scratch thread and return its
+    /// result, or `None` if it had not returned within `bound`.
+    ///
+    /// Every timing assertion below goes through this: the call under test is
+    /// the thing that might block forever, so a regression must surface as a
+    /// FAILED assertion, not as a suite that hangs until CI's job timeout.
+    /// The scratch thread is deliberately never joined on the timeout path —
+    /// a wedged scan is exactly what we are simulating, and the process exits
+    /// fine with it parked.
+    fn cached_within(
+        dir: &str,
+        bound: std::time::Duration,
+    ) -> Option<(Vec<String>, Vec<String>, usize, usize)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(build_queue_views_cached(&d));
+        });
+        rx.recv_timeout(bound).ok()
+    }
+
+    /// Spin until this dir has taken `n` scans, or `bound` elapses.
+    fn await_scans(dir: &str, n: usize, bound: std::time::Duration) -> bool {
+        let t0 = std::time::Instant::now();
+        while queue_scan_probe::scans(dir) < n {
+            if t0.elapsed() >= bound {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// A refresher that HANGS — a wedged `read_dir` on an unresponsive mount,
+    /// no panic needed — must not latch the single-flight marker forever.
+    ///
+    /// The `refreshing` marker was a plain bool cleared only by the refresher
+    /// itself, so a refresher that never returns left it set for the process
+    /// lifetime: every later caller took the serve-stale branch and the queue
+    /// views froze permanently. `/api/state` kept 200-ing with a snapshot from
+    /// the moment the mount wedged, so nothing surfaced the freeze either.
+    ///
+    /// Timing margin: the wedged scan is held for 60 s; this dir's marker
+    /// deadline is cut to 300 ms; the takeover is asserted to land within
+    /// 4 s — a >13x margin over the deadline, and 1/200th of the wedge, so
+    /// a pass can only mean a real takeover. Bounded by `cached_within`, so
+    /// a regression that blocks the caller FAILS instead of hanging.
+    #[test]
+    fn queue_view_cache_recovers_from_a_refresher_that_never_returns() {
+        use std::time::Duration;
+        const WEDGE_MS: u64 = 60_000;
+        const DEADLINE_MS: u64 = 300;
+        const TAKEOVER_BOUND: Duration = Duration::from_secs(4);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Unique to this test: the cache, the probe and STATE are all
+        // process-global, so a shared fixture name would be a real race.
+        let staging = tmp.path().to_string_lossy().to_string();
+        let first = tmp.path().join("WedgeFirst");
+        std::fs::create_dir_all(&first).unwrap();
+        crate::muxer::write_marker(&first, &ripped_marker_for("WedgeFirst", "sg0")).unwrap();
+
+        // Steady state: the cache is warm, as it is on the rig after the
+        // first second of /api/state polling.
+        let (primed, _, _, _) =
+            cached_within(&staging, Duration::from_secs(5)).expect("priming scan must return");
+        assert!(
+            primed.iter().any(|s| s.contains("WedgeFirst")),
+            "priming scan must see the pre-existing disc"
+        );
+
+        queue_scan_probe::set_refresh_deadline(&staging, DEADLINE_MS);
+        // The mount wedges. Age the entry past the TTL so the next caller
+        // owns the refresh, then let that caller disappear into `read_dir`.
+        queue_scan_probe::arm(&staging, WEDGE_MS);
+        std::thread::sleep(QUEUE_VIEW_CACHE_TTL + Duration::from_millis(50));
+        let wedged = staging.clone();
+        std::thread::spawn(move || build_queue_views_cached(&wedged));
+        assert!(
+            await_scans(&staging, 1, Duration::from_secs(2)),
+            "the wedged refresh never started; test setup is wrong"
+        );
+
+        // Reality moves on underneath the wedged refresher.
+        let second = tmp.path().join("WedgeSecond");
+        std::fs::create_dir_all(&second).unwrap();
+        crate::muxer::write_marker(&second, &ripped_marker_for("WedgeSecond", "sg1")).unwrap();
+        // ...and the mount comes back for anyone who tries again. The
+        // original refresher is still parked in its 60 s `read_dir`.
+        queue_scan_probe::arm(&staging, 0);
+
+        // Poll as /api/state does. Once the marker's deadline passes, some
+        // caller must take the refresh over and publish the new disc.
+        let deadline = std::time::Instant::now() + TAKEOVER_BOUND;
+        let mut saw_second = false;
+        while std::time::Instant::now() < deadline {
+            let (mux, _, _, _) = cached_within(&staging, TAKEOVER_BOUND)
+                .expect("a caller blocked past the takeover bound behind a wedged refresh");
+            if mux.iter().any(|s| s.contains("WedgeSecond")) {
+                saw_second = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            saw_second,
+            "the single-flight marker latched on a refresher that never returned: \
+             the queue views are frozen at the moment the mount wedged and will \
+             stay frozen for the process lifetime"
+        );
+    }
+
+    /// The cold-path counterpart: when there is NOTHING to serve and the
+    /// in-flight first scan is wedged, callers must neither park forever nor
+    /// pile up.
+    ///
+    /// The old cold valve abandoned single-flight — after 5 s each waiter went
+    /// and scanned for itself — so on a wedged staging mount one HTTP worker
+    /// thread (and its admission token) was consumed every 5 s until
+    /// `/api/state` started 503-ing and the container HEALTHCHECK restarted
+    /// the daemon mid-rip.
+    ///
+    /// Timing margin: the wedged scan is held for 60 s and the cold wait is
+    /// cut to 200 ms; callers are asserted to return within 3 s — 15x the cold
+    /// wait, 1/20th of the wedge. `cached_within` bounds every call, so both
+    /// failure modes (park forever / pile up behind a 60 s scan) FAIL here
+    /// rather than hang.
+    #[test]
+    fn queue_view_cache_cold_callers_neither_park_nor_pile_up_on_a_wedged_scan() {
+        use std::time::Duration;
+        const WEDGE_MS: u64 = 60_000;
+        const COLD_WAIT_MS: u64 = 200;
+        const CALLER_BOUND: Duration = Duration::from_secs(3);
+        const CALLERS: usize = 6;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let staging = tmp.path().to_string_lossy().to_string();
+        let disc = tmp.path().join("ColdWedge");
+        std::fs::create_dir_all(&disc).unwrap();
+        crate::muxer::write_marker(&disc, &ripped_marker_for("ColdWedge", "sg0")).unwrap();
+
+        // Armed before the first ever call: this key is genuinely cold, so
+        // there is no snapshot to fall back on.
+        queue_scan_probe::arm(&staging, WEDGE_MS);
+        queue_scan_probe::set_cold_wait(&staging, COLD_WAIT_MS);
+        let wedged = staging.clone();
+        std::thread::spawn(move || build_queue_views_cached(&wedged));
+        assert!(
+            await_scans(&staging, 1, Duration::from_secs(2)),
+            "the wedged cold scan never started; test setup is wrong"
+        );
+
+        // Every subsequent caller must come back — degraded is fine, wedged
+        // is not. This is the /api/state + --healthcheck path.
+        for i in 0..CALLERS {
+            assert!(
+                cached_within(&staging, CALLER_BOUND).is_some(),
+                "cold caller {i} was still parked after {CALLER_BOUND:?} behind a wedged \
+                 first scan — /api/state (and the Docker HEALTHCHECK) stalls with it"
+            );
+        }
+
+        // ...and none of them may launch a scan of its own: that is the
+        // accumulation that eats an HTTP worker per giving-up caller.
+        assert_eq!(
+            queue_scan_probe::scans(&staging),
+            1,
+            "{CALLERS} cold callers launched {} scans of a wedged staging dir; the cold \
+             valve abandoned single-flight, so each one burns an HTTP worker thread and \
+             its admission token until /api/state 503s",
+            queue_scan_probe::scans(&staging),
+        );
+    }
+
     /// Helper: current status string of a device in the global STATE map.
     fn device_status(device: &str) -> Option<String> {
         ripper::STATE
@@ -3270,6 +3613,67 @@ mod web_tests {
             serde_json::from_str(&settings_json_redacted(&Config::default())).unwrap();
         assert_eq!(json2["keyserver_url"], "");
         assert_eq!(json2["keydb_url"], "");
+    }
+
+    /// `handle_settings_post` must finish mutating and DROP the config write
+    /// guard before it saves: `config::save` does `fs::write` + `fs::rename`
+    /// on `/config/settings.json`, and on NFS those can hang indefinitely,
+    /// blocking every concurrent `cfg.read()` — which is nearly the whole
+    /// `/api/*` surface (the 0.20.8 lock stall).
+    ///
+    /// This is an ORDERING property inside one private function, so it is
+    /// pinned against that function's own source, the way the resume-path
+    /// invariants in `ripper/resume.rs` are. The test it replaces lived in
+    /// `tests/watchdog.rs` and re-implemented the pattern inline — it never
+    /// called the handler, so reinstating the bug left it green.
+    ///
+    /// The behavioural half (the handler really does persist through
+    /// `config::save`) is covered by `http::settings_post_persists_a_field_to_disk`.
+    #[test]
+    fn settings_post_saves_outside_the_config_write_guard() {
+        let src = crate::util::source_lf(include_str!("web.rs"));
+        // Leading newline so this does not match the literal on this line.
+        let start = src
+            .find("\nfn handle_settings_post(")
+            .expect("web.rs must define handle_settings_post");
+        let body = &src[start..];
+
+        // The mutation window: a `snapshot` bound from a block that takes
+        // `cfg.write()`, closing at the block's `};`.
+        let snap = body
+            .find("let snapshot: Config = {")
+            .expect("handle_settings_post must snapshot the config out of the guard");
+        assert!(
+            body[snap..].starts_with("let snapshot: Config = {")
+                && body[snap..]
+                    .find("cfg.write()")
+                    .is_some_and(|w| w < body[snap..].find("\n    };").unwrap_or(usize::MAX)),
+            "the write guard must be taken INSIDE the snapshot block"
+        );
+        let guard_end = snap
+            + body[snap..]
+                .find("\n    };")
+                .expect("the snapshot block must close at function-body indentation");
+
+        let save = guard_end
+            + body[guard_end..]
+                .find("config::save(")
+                .expect("handle_settings_post must call config::save");
+
+        // Nothing may re-take the write guard between the snapshot block and
+        // the save — that is the whole ordering.
+        assert!(
+            !body[guard_end..save].contains("cfg.write()"),
+            "the config write guard must not be held across config::save; \
+             re-taking it before the save reintroduces the 0.20.8 lock stall"
+        );
+        // And the save must be handed to the bounded-syscall worker, which
+        // owns the snapshot — a guard cannot travel with it.
+        assert!(
+            body[guard_end..save].contains("std::thread::Builder::new()"),
+            "config::save must run on the bounded save worker, not inline on \
+             the handler thread"
+        );
     }
 
     // NOTE: the keyserver_url sentinel round-trip is now tested
@@ -3443,6 +3847,32 @@ mod web_tests {
         // The masked form DOES end with the sentinel and IS filtered.
         let masked = format!("https://discord.com/{}", sentinel);
         assert!(masked.ends_with(sentinel));
+    }
+
+    /// One question, one predicate. A genuine URL that merely EMBEDS the
+    /// sentinel is not masked (`is_masked_webhook` says so, and the SSRF
+    /// filter therefore validates it as real) — so the resolver must take it
+    /// verbatim. While the resolver used `contains` instead, that URL was
+    /// validated as genuine and then rejected 400 as an "ambiguous masked
+    /// webhook entry", an error about a masking that never happened, and the
+    /// whole settings save died with no way to enter the URL at all.
+    #[test]
+    fn a_url_that_only_embeds_the_sentinel_is_saved_verbatim() {
+        // Not masked by the strict predicate — the filter validates it.
+        let embedded = format!("https://example.com/hook/{SECRET_SENTINEL}/tail");
+        assert!(
+            !is_masked_webhook(&embedded),
+            "fixture must be a NON-masked URL for this test to mean anything"
+        );
+
+        let existing: Vec<String> = vec!["https://discord.com/api/webhooks/1/aaa".into()];
+        let resolved = resolve_webhook_urls(&[embedded.as_str()], &existing)
+            .expect("a genuine URL must not be rejected as an ambiguous placeholder");
+        assert_eq!(
+            resolved,
+            vec![embedded],
+            "a non-masked entry is taken verbatim"
+        );
     }
 
     #[test]
@@ -4023,6 +4453,32 @@ mod web_tests {
         );
     }
 
+    /// `is_transient_resolve_error` must say NO to every permanent verdict
+    /// `validate_fetch_url` can reach without a network round-trip. Its
+    /// consumer (`keysource::probe_online_reachability`) turns a `true` here
+    /// into "the key service is down", which parks a disc — so a scheme
+    /// error or a blocked address must never be mistaken for a DNS blip.
+    /// Driven through the REAL validator, not against hand-written strings.
+    #[test]
+    fn a_rejected_url_is_never_classified_as_a_failed_lookup() {
+        for url in [
+            "",
+            "ftp://example.com/keys",
+            "http://",
+            // Literal, so no DNS is involved — the guard rejects the address.
+            "http://127.0.0.1:8080/keys",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            let err = validate_fetch_url(url)
+                .expect_err("this URL must be rejected outright, not accepted");
+            assert!(
+                !is_transient_resolve_error(&err),
+                "{url:?} is a permanent verdict on the URL, but its error \
+                 {err:?} classifies as a failed lookup"
+            );
+        }
+    }
+
     #[test]
     fn validate_network_target_rejects_internal_hosts() {
         // Bare host:port (no scheme). Internal/metadata literals resolve
@@ -4297,6 +4753,53 @@ mod web_tests {
         assert_eq!(percent_decode("50%2"), "50%2");
     }
 
+    /// `media_type` is the one title-override field that was neither clamped
+    /// nor allow-listed, on an unauthenticated-LAN route whose value is
+    /// persisted into the `.done` marker and re-broadcast to every dashboard.
+    /// The router only ever acts on `"tv"`; anything else is a movie. Store
+    /// that vocabulary, not an arbitrary caller string.
+    #[test]
+    fn media_type_is_reduced_to_the_routers_vocabulary() {
+        assert_eq!(normalize_media_type("tv"), "tv");
+        assert_eq!(normalize_media_type("movie"), "movie");
+        // Case/whitespace noise still resolves to the real values.
+        assert_eq!(normalize_media_type(" TV "), "tv");
+        // Anything else routes as a movie today, so it is stored as one
+        // instead of being persisted verbatim.
+        assert_eq!(normalize_media_type("anime"), "movie");
+        assert_eq!(normalize_media_type(""), "movie");
+        assert_eq!(
+            normalize_media_type(&"A".repeat(10_000)),
+            "movie",
+            "an unbounded caller-supplied string must never reach STATE, the \
+             .done marker, or the dashboard broadcast"
+        );
+    }
+
+    /// Only ASCII hex digits are percent-escape payloads.
+    ///
+    /// `u8::from_str_radix` accepts a leading sign, so `%+3` parsed as 3 and a
+    /// device segment or settings value carrying a literal `%+3` decoded to a
+    /// control byte instead of staying as typed. RFC 3986 admits `HEXDIG`
+    /// only; anything else is literal text.
+    #[test]
+    fn percent_decode_rejects_non_hex_escape_payloads() {
+        assert_eq!(
+            percent_decode("a%+3b"),
+            "a%+3b",
+            "'+' is not a hex digit — `%+3` must stay literal, not decode to 0x03"
+        );
+        assert_eq!(
+            percent_decode("%-1"),
+            "%-1",
+            "a leading '-' must not be accepted as a sign either"
+        );
+        // Whitespace is the other thing from_str_radix-adjacent parsers trip
+        // on; and the valid cases must keep working, upper and lower case.
+        assert_eq!(percent_decode("%2f"), "/");
+        assert_eq!(percent_decode("%2F"), "/");
+    }
+
     // ── Real HTTP integration: drive handle_request via a live server ──
     //
     // tiny_http::Request has no public constructor, so these tests bind a
@@ -4358,6 +4861,81 @@ mod web_tests {
 
             let raw = client.join().expect("client thread");
             parse_response(&raw)
+        }
+
+        /// Classify ONE real `tiny_http::Request` — built by sending `head`
+        /// verbatim over a loopback socket — with the production
+        /// [`carries_body`] predicate.
+        ///
+        /// Verbatim, because the arm that matters is the one with NO
+        /// `Content-Length` header at all, and `roundtrip` always sends one.
+        ///
+        /// Watchdog: `recv_timeout(5s)` rather than `recv()`, so a request
+        /// the server never sees FAILS this test instead of parking the
+        /// suite forever. The client writes a complete request head before
+        /// the accept, so the real margin is a loopback round-trip.
+        fn carries_body_of(head: &str) -> bool {
+            let server = Server::http("127.0.0.1:0").expect("bind loopback server");
+            let addr = server.server_addr().to_ip().expect("ip addr");
+            let head = head.to_string();
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(addr).expect("connect");
+                stream.write_all(head.as_bytes()).expect("write request");
+                stream.flush().ok();
+                let mut resp = Vec::new();
+                let _ = stream.read_to_end(&mut resp);
+            });
+            let request = server
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("server error")
+                .expect("the request must arrive within 5s");
+            let carries = carries_body(&request);
+            let _ = request.respond(tiny_http::Response::empty(204));
+            client.join().expect("client thread");
+            carries
+        }
+
+        /// The accept loop reserves a smaller admission cap for requests that
+        /// carry a body, because those hold a handler thread across an
+        /// unbounded socket read. Which cap a request gets is decided ONLY by
+        /// [`carries_body`], and no test called it: the sibling cap test
+        /// exercises `ConnGuard` arithmetic at two literal caps, so inverting
+        /// `Some(0) => false`, dropping `Get` from the bodyless methods, or
+        /// negating the `None` arm all stayed green while every healthcheck
+        /// GET started consuming a body slot. Drive it with real requests.
+        #[test]
+        fn carries_body_classifies_real_requests() {
+            // No Content-Length, bodyless method — the healthcheck's own
+            // shape. This is the slot that must stay available when the body
+            // cap is full.
+            assert!(
+                !carries_body_of("GET /api/state HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+                "a GET with no Content-Length carries no body"
+            );
+            // Explicit zero length: a body header, but nothing to read.
+            assert!(
+                !carries_body_of(
+                    "POST /api/settings HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                ),
+                "Content-Length: 0 is not a body"
+            );
+            // A real body.
+            assert!(
+                carries_body_of(
+                    "POST /api/settings HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\
+                     Connection: close\r\n\r\nhello"
+                ),
+                "a non-zero Content-Length carries a body"
+            );
+            // No Content-Length on a method that may carry one: assume the
+            // reader will wait, and charge it the body cap.
+            assert!(
+                carries_body_of(
+                    "POST /api/settings HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                ),
+                "a POST with no Content-Length must be charged the body cap"
+            );
         }
 
         /// Extract the status code and body from a raw HTTP/1.1 response.
@@ -4592,6 +5170,43 @@ mod web_tests {
             );
         }
 
+        /// A present-but-invalid `on_read_error` must not block the legacy
+        /// `abort_on_error` migration.
+        ///
+        /// The legacy fallback was gated on the KEY EXISTING
+        /// (`patch.get(..).is_some()`) while the assignment required a
+        /// STRING. A body carrying `"on_read_error": null` (a templating bug,
+        /// an older client) alongside `abort_on_error` therefore took neither
+        /// branch: the new field was never applied, the migration was skipped
+        /// as "explicitly overridden", and the PATCH still answered 200. The
+        /// operator sees the save succeed while the read-error policy silently
+        /// keeps its old value — config drift that only shows up as rips
+        /// behaving under a policy nobody selected.
+        #[test]
+        fn settings_post_null_on_read_error_still_applies_the_legacy_migration() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            cfg.write().unwrap().on_read_error = "skip".to_string();
+
+            let (code, body) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"on_read_error": null, "abort_on_error": true}"#),
+                &[],
+            );
+
+            assert_eq!(code, 200, "the PATCH reports success: {body}");
+            assert_eq!(
+                cfg.read().unwrap().on_read_error,
+                "stop",
+                "a null on_read_error carries no policy, so the legacy \
+                 abort_on_error=true must still migrate to \"stop\" — \
+                 answering 200 while applying neither is a save that looks \
+                 like it worked and did nothing"
+            );
+        }
+
         #[test]
         fn settings_post_masked_keyserver_url_preserves_stored() {
             // The secret-sentinel guard, MASKED half: a POST carrying the
@@ -4676,6 +5291,42 @@ mod web_tests {
                 cfg.read().unwrap().keyserver_url,
                 "https://8.8.8.8/keep/decode",
                 "a rejected keyserver_url must not mutate the stored value"
+            );
+        }
+
+        #[test]
+        fn settings_post_unresolvable_masked_webhook_leaves_output_dir_unmutated() {
+            // Red/green regression for the write-guard early-return defect:
+            // `resolve_webhook_urls` runs INSIDE the `cfg.write()` guard, after
+            // ~20 other fields (including output_dir) have already been
+            // written onto the live in-memory Config. When resolution fails
+            // (an unresolvable masked webhook entry), the handler returns 400
+            // from inside the guard, but the earlier mutations are never
+            // undone — the live Config silently diverges from settings.json
+            // while the operator is told the save was rejected.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let original_output_dir = cfg.read().unwrap().output_dir.clone();
+
+            // A valid output_dir change ordered BEFORE an unresolvable masked
+            // webhook entry in the patch (mirrors field-mutation order inside
+            // the guard: output_dir first, webhook_urls near the end).
+            let patch = serde_json::json!({
+                "output_dir": "/mnt/zz-settings-guard-fixture-4711/output",
+                "webhook_urls": ["https://hooks.slack.com/********"],
+            })
+            .to_string();
+            let (code, body) = roundtrip(&cfg, "POST", "/api/settings", Some(&patch), &[]);
+
+            assert_eq!(
+                code, 400,
+                "an unresolvable masked webhook_urls entry must be rejected, got: {body}"
+            );
+            assert_eq!(
+                cfg.read().unwrap().output_dir,
+                original_output_dir,
+                "output_dir on the live Config must be UNCHANGED when the save is \
+                 rejected — a partial in-memory mutation must never survive a 400"
             );
         }
 
@@ -4792,12 +5443,70 @@ fn text_response(request: tiny_http::Request, body: &str) {
 /// shared snapshot is invisible in a UI that itself only polls once a
 /// second — trading a small, bounded staleness window for turning N
 /// concurrent full-directory scans per second into at most one.
-struct QueueViewCache {
+struct QueueViewSnapshot {
     computed_at: std::time::Instant,
     mux_queue: Vec<String>,
     move_queue: Vec<String>,
     mux_full: usize,
     move_full: usize,
+}
+
+impl QueueViewSnapshot {
+    fn views(&self) -> (Vec<String>, Vec<String>, usize, usize) {
+        (
+            self.mux_queue.clone(),
+            self.move_queue.clone(),
+            self.mux_full,
+            self.move_full,
+        )
+    }
+}
+
+struct QueueViewCache {
+    /// `None` only between the moment a key's FIRST scan starts and the
+    /// moment it finishes — there is simply nothing to serve yet.
+    snapshot: Option<QueueViewSnapshot>,
+    /// When the scan that currently owns this key STARTED, if one does.
+    ///
+    /// Single-flight marker, deliberately a timestamp rather than a bool: a
+    /// bool can only be cleared by the refresher that set it, so a refresher
+    /// that never returns latches it forever. Trusted for
+    /// `QUEUE_VIEW_REFRESH_DEADLINE`, after which the owner is presumed dead
+    /// and the next caller may take the key over.
+    refresh_started: Option<std::time::Instant>,
+    /// How many threads are inside `scan_queue_views` for this key right now.
+    /// Maintained by `RefreshGuard`, so it is decremented on panic too, and
+    /// capped at `QUEUE_VIEW_MAX_REFRESHERS` so repeated takeovers of a key
+    /// that stays wedged cannot pile threads up without bound.
+    refreshers: usize,
+}
+
+/// RAII owner of a key's single-flight marker.
+///
+/// Drop — not the happy path — is what releases the marker, so a scan that
+/// panics inside `read_dir` (or anywhere else in `build_queue_views`) hands
+/// the key straight back instead of stranding it until the deadline.
+struct RefreshGuard {
+    key: String,
+    claimed_at: std::time::Instant,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        {
+            let mut map = QUEUE_VIEW_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = map.get_mut(&self.key) {
+                entry.refreshers = entry.refreshers.saturating_sub(1);
+                // Only clear the marker if it is still OURS. A refresher that
+                // was presumed dead and taken over must not clear the marker
+                // of the live refresher that replaced it.
+                if entry.refresh_started == Some(self.claimed_at) {
+                    entry.refresh_started = None;
+                }
+            }
+        }
+        QUEUE_VIEW_REFRESHED.notify_all();
+    }
 }
 
 /// Keyed by staging_dir rather than a single slot: the staging path can
@@ -4808,10 +5517,165 @@ struct QueueViewCache {
 static QUEUE_VIEW_CACHE: Lazy<std::sync::Mutex<std::collections::HashMap<String, QueueViewCache>>> =
     Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Signalled when an in-flight scan completes. Only the cold-start case
+/// (no snapshot to serve at all) ever waits on it; a caller that has ANY
+/// snapshot, however stale, is served immediately instead.
+static QUEUE_VIEW_REFRESHED: Lazy<std::sync::Condvar> = Lazy::new(std::sync::Condvar::new);
+
+/// Safety valve for the cold-start wait: a caller with NOTHING to serve gives
+/// up after this long and returns an empty queue view rather than parking on
+/// the condvar for as long as the in-flight scan takes. It deliberately does
+/// NOT scan for itself — that abandons single-flight, and on a wedged staging
+/// mount it consumes one HTTP worker thread (plus its admission token) per
+/// give-up, which is how `/api/state` starts 503-ing and the container
+/// HEALTHCHECK restarts the daemon mid-rip. Recovery from a dead scanner is
+/// `QUEUE_VIEW_REFRESH_DEADLINE`'s job instead. Never hit in normal operation.
+const QUEUE_VIEW_COLD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the per-key single-flight marker is TRUSTED. A refresher that has
+/// held it longer than this is presumed dead — panicked before the drop guard
+/// could run, or wedged inside `read_dir` on an unresponsive mount — and the
+/// next caller that needs fresh data is allowed to take the marker over.
+///
+/// Without this, `refreshing` is a latch: a refresher that never returns makes
+/// every later caller take the serve-stale branch forever, so the queue views
+/// freeze for the process lifetime.
+const QUEUE_VIEW_REFRESH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hard ceiling on threads inside `scan_queue_views` for ONE key at a time.
+/// The deadline above permits a takeover; this bounds how many takeovers can
+/// pile up when the takeover ALSO wedges (a mount that is down stays down).
+/// Two: the original plus one retry. When the mount recovers both publish, the
+/// count drops back to zero, and normal single-flight resumes.
+const QUEUE_VIEW_MAX_REFRESHERS: usize = 2;
+
 /// How long a cached queue view is served before the next caller triggers a
 /// fresh scan. Kept comfortably under the ~1s SSE tick so no client ever
 /// observes staleness worse than what the poll cadence already implies.
 const QUEUE_VIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Test-only seam around the staging-dir scan a cache miss performs.
+///
+/// Keyed by staging dir so tests that arm it are isolated from every other
+/// test in this process (the cache itself, `STATE`, and the log dir are all
+/// process-global here, so a shared fixture name would be a real race).
+/// Lets a test (a) make one specific dir's scan artificially slow and
+/// (b) count how many scans a dir actually received.
+#[cfg(test)]
+pub(crate) mod queue_scan_probe {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default, Clone, Copy)]
+    pub struct Probe {
+        pub delay_ms: u64,
+        /// Incremented on scan ENTRY (before the delay), so a waiting test
+        /// can tell that the slow scan is genuinely in flight.
+        pub scans: usize,
+        /// Per-dir override of `QUEUE_VIEW_REFRESH_DEADLINE` (0 = use the
+        /// production value). Keyed by dir like everything else here so a
+        /// timing test cannot perturb another test's staging dir.
+        pub refresh_deadline_ms: u64,
+        /// Per-dir override of `QUEUE_VIEW_COLD_WAIT` (0 = production value).
+        pub cold_wait_ms: u64,
+    }
+
+    static PROBES: Mutex<Option<HashMap<String, Probe>>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut HashMap<String, Probe>) -> R) -> R {
+        let mut g = PROBES.lock().unwrap_or_else(|e| e.into_inner());
+        f(g.get_or_insert_with(HashMap::new))
+    }
+
+    /// Arm the probe for `dir`; every subsequent scan of it sleeps `delay_ms`.
+    pub fn arm(dir: &str, delay_ms: u64) {
+        with(|m| {
+            m.entry(dir.to_string()).or_default().delay_ms = delay_ms;
+        });
+    }
+
+    /// Number of scans this dir has received since it was first armed.
+    pub fn scans(dir: &str) -> usize {
+        with(|m| m.get(dir).map(|p| p.scans).unwrap_or(0))
+    }
+
+    /// Shorten (or lengthen) how long this dir's in-flight refresh marker is
+    /// trusted before it is presumed dead. Lets a test observe the
+    /// wedged-refresher takeover in milliseconds instead of the production
+    /// deadline.
+    pub fn set_refresh_deadline(dir: &str, ms: u64) {
+        with(|m| {
+            m.entry(dir.to_string()).or_default().refresh_deadline_ms = ms;
+        });
+    }
+
+    /// Shorten how long a COLD caller (nothing at all to serve) parks before
+    /// giving up on the in-flight scan.
+    pub fn set_cold_wait(dir: &str, ms: u64) {
+        with(|m| {
+            m.entry(dir.to_string()).or_default().cold_wait_ms = ms;
+        });
+    }
+
+    /// `(refresh_deadline_ms, cold_wait_ms)`; 0 means "use production".
+    pub fn overrides(dir: &str) -> (u64, u64) {
+        with(|m| {
+            m.get(dir)
+                .map(|p| (p.refresh_deadline_ms, p.cold_wait_ms))
+                .unwrap_or((0, 0))
+        })
+    }
+
+    /// Called from the production scan path. Never holds the probe lock
+    /// across the sleep.
+    pub fn enter(dir: &str) {
+        let delay = with(|m| match m.get_mut(dir) {
+            Some(p) => {
+                p.scans += 1;
+                p.delay_ms
+            }
+            None => 0,
+        });
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+    }
+}
+
+/// How long an in-flight refresh marker for `dir` is trusted.
+#[cfg(not(test))]
+fn queue_view_refresh_deadline(_dir: &str) -> std::time::Duration {
+    QUEUE_VIEW_REFRESH_DEADLINE
+}
+
+#[cfg(test)]
+fn queue_view_refresh_deadline(dir: &str) -> std::time::Duration {
+    match queue_scan_probe::overrides(dir).0 {
+        0 => QUEUE_VIEW_REFRESH_DEADLINE,
+        ms => std::time::Duration::from_millis(ms),
+    }
+}
+
+/// How long a cold caller parks for someone else's first scan of `dir`.
+#[cfg(not(test))]
+fn queue_view_cold_wait(_dir: &str) -> std::time::Duration {
+    QUEUE_VIEW_COLD_WAIT
+}
+
+#[cfg(test)]
+fn queue_view_cold_wait(dir: &str) -> std::time::Duration {
+    match queue_scan_probe::overrides(dir).1 {
+        0 => QUEUE_VIEW_COLD_WAIT,
+        ms => std::time::Duration::from_millis(ms),
+    }
+}
+
+/// The scan a cache miss performs, behind a test-only instrumentation seam.
+fn scan_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usize) {
+    #[cfg(test)]
+    queue_scan_probe::enter(staging_dir);
+    build_queue_views(staging_dir)
+}
 
 /// [`build_queue_views`], but shared across concurrent callers within
 /// `QUEUE_VIEW_CACHE_TTL` instead of re-scanning the staging directory once
@@ -4819,32 +5683,192 @@ const QUEUE_VIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_mill
 /// payload); `handle_system_info`'s on-demand `/api/system` panel calls the
 /// uncached `build_queue_views` directly so a manual refresh always sees the
 /// latest disk state.
+///
+/// The cache mutex is NEVER held across the scan. `build_queue_views` does
+/// `read_dir` plus a stat per entry, and this function backs `/api/state` —
+/// which `--healthcheck` probes and the Dockerfile HEALTHCHECK runs — so a
+/// staging dir that is slow to enumerate must not be able to park every
+/// other caller (and get the container restarted mid-rip). Single-flight is
+/// preserved without the lock: a per-key marker means exactly one caller
+/// scans, while everyone else is served the previous snapshot
+/// (stale-while-revalidate) and never blocks. Only a genuinely cold key —
+/// no snapshot at all — makes callers wait, and they wait on a condvar with
+/// the map lock released, not on the scan's mutex.
+///
+/// Three separate bounds keep a refresher that never comes back from wedging
+/// the whole daemon, and they are deliberately distinct:
+///
+/// * `QUEUE_VIEW_REFRESH_DEADLINE` bounds the MARKER. A single-flight bool can
+///   only be cleared by the thread that set it, so a thread stuck in `read_dir`
+///   latches it and every later caller serves stale forever. A timestamp lets a
+///   later caller decide the owner is dead and take the key over, which is what
+///   unfreezes the views.
+/// * `QUEUE_VIEW_MAX_REFRESHERS` bounds the takeovers that deadline permits, so
+///   a mount that stays down cannot accumulate one wedged thread per deadline.
+/// * `QUEUE_VIEW_COLD_WAIT` bounds an individual COLD caller, which returns an
+///   empty view rather than scanning: the give-up path must not start work, or
+///   the caller bound becomes an accumulation rate.
 fn build_queue_views_cached(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usize) {
-    let mut map = QUEUE_VIEW_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(c) = map.get(staging_dir)
-        && c.computed_at.elapsed() < QUEUE_VIEW_CACHE_TTL
-    {
-        return (
-            c.mux_queue.clone(),
-            c.move_queue.clone(),
-            c.mux_full,
-            c.move_full,
-        );
+    // Phase 1 — decide, under the lock, whether THIS caller scans. The lock
+    // is never held across `scan_queue_views` (read_dir + a stat per entry):
+    // a staging dir that is slow to enumerate must not be able to park
+    // `/api/state`, which is what `--healthcheck` — and so the Dockerfile
+    // HEALTHCHECK — probes.
+    enum Decision {
+        /// Serve this (possibly stale) snapshot; do not touch the disk.
+        Serve(Vec<String>, Vec<String>, usize, usize),
+        /// This caller owns the refresh.
+        Scan,
+        /// Cold key with a scan already in flight — wait for its result.
+        Wait,
     }
-    let (mux_queue, move_queue, mux_full, move_full) = build_queue_views(staging_dir);
+
+    let deadline = queue_view_refresh_deadline(staging_dir);
+    let cold_wait = queue_view_cold_wait(staging_dir);
+    let mut map = QUEUE_VIEW_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let waited_from = std::time::Instant::now();
+    let claimed_at = loop {
+        let decision = match map.get_mut(staging_dir) {
+            // Never seen: claim the slot and scan.
+            None => Decision::Scan,
+            Some(entry) => {
+                // "A refresh is in flight" is a marker YOUNGER than the
+                // deadline. Past it the owner is presumed dead — panicked
+                // past its guard, or wedged in `read_dir` on a mount that
+                // stopped answering — and its claim stops justifying either
+                // serving stale data or making a cold caller wait.
+                let live_refresh = entry
+                    .refresh_started
+                    .is_some_and(|t| t.elapsed() < deadline);
+                // Serve a snapshot if it is fresh, OR if it is stale but a
+                // live refresh is already in flight: queueing behind someone
+                // else's I/O is exactly the stall we are avoiding. A
+                // sub-second-stale queue view is invisible in a UI that
+                // polls once a second; an unresponsive /api/state is not.
+                let serve = entry
+                    .snapshot
+                    .as_ref()
+                    .filter(|s| s.computed_at.elapsed() < QUEUE_VIEW_CACHE_TTL || live_refresh)
+                    .map(|s| s.views());
+                // The takeover a dead marker permits is itself capped: if
+                // this key already has the maximum number of threads inside
+                // `read_dir`, the mount is not merely slow, and adding
+                // another thread to it only burns another HTTP worker.
+                let may_scan = !live_refresh && entry.refreshers < QUEUE_VIEW_MAX_REFRESHERS;
+                match serve {
+                    Some((mux, mv, mux_full, move_full)) => {
+                        Decision::Serve(mux, mv, mux_full, move_full)
+                    }
+                    // Stale (or cold) with no live refresher: take the key
+                    // over, unless we are already at the refresher cap.
+                    None if may_scan => Decision::Scan,
+                    // Capped out but we have SOMETHING: never block a warm
+                    // caller — hand back the stale view.
+                    None => match entry.snapshot.as_ref().map(|s| s.views()) {
+                        Some((mux, mv, mux_full, move_full)) => {
+                            Decision::Serve(mux, mv, mux_full, move_full)
+                        }
+                        None => Decision::Wait,
+                    },
+                }
+            }
+        };
+        match decision {
+            Decision::Serve(mux, mv, mux_full, move_full) => {
+                return (mux, mv, mux_full, move_full);
+            }
+            Decision::Scan => {
+                let claimed_at = std::time::Instant::now();
+                let entry = map
+                    .entry(staging_dir.to_string())
+                    .or_insert_with(|| QueueViewCache {
+                        snapshot: None,
+                        refresh_started: None,
+                        refreshers: 0,
+                    });
+                entry.refresh_started = Some(claimed_at);
+                entry.refreshers += 1;
+                break claimed_at;
+            }
+            // Cold key, live scan in flight: wait for its result instead of
+            // launching a duplicate one (single-flight). The wait RELEASES
+            // the map lock, so every other staging dir and every warm reader
+            // keeps running while we sleep here.
+            Decision::Wait => {
+                if waited_from.elapsed() >= cold_wait {
+                    // Nothing to serve and the owner is still working. Give
+                    // up on THIS call rather than start a competing scan:
+                    // a caller that scans anyway is a caller (and an HTTP
+                    // worker, and its admission token) consumed every
+                    // `cold_wait` for as long as the mount stays wedged,
+                    // which is how /api/state ends up 503-ing and the
+                    // container HEALTHCHECK restarts the daemon mid-rip.
+                    // Empty is what a cold key looks like before its first
+                    // scan lands anyway; the owner (or a post-deadline
+                    // takeover) publishes the real view shortly.
+                    tracing::warn!(
+                        staging_dir = %staging_dir,
+                        waited_ms = waited_from.elapsed().as_millis() as u64,
+                        "queue view still cold after waiting for an in-flight staging scan; \
+                         serving an empty queue view for this request"
+                    );
+                    return (Vec::new(), Vec::new(), 0, 0);
+                }
+                let (m, _) = QUEUE_VIEW_REFRESHED
+                    .wait_timeout(map, std::time::Duration::from_millis(50))
+                    .unwrap_or_else(|e| e.into_inner());
+                map = m;
+            }
+        }
+    };
+    drop(map);
+    // Marker released on EVERY exit from here on, panic included.
+    let _refresh_guard = RefreshGuard {
+        key: staging_dir.to_string(),
+        claimed_at,
+    };
+
+    // Phase 2 — scan with NO lock held.
+    let (mux_queue, move_queue, mux_full, move_full) = scan_queue_views(staging_dir);
+
+    // Phase 3 — publish. The single-flight marker is released by
+    // `_refresh_guard` as this function returns.
+    let mut map = QUEUE_VIEW_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     // Opportunistic prune so a staging path that keeps changing (or a test
     // suite hammering many distinct tempdirs) can't grow this map forever.
-    map.retain(|_, v| v.computed_at.elapsed() < QUEUE_VIEW_CACHE_TTL);
-    map.insert(
-        staging_dir.to_string(),
-        QueueViewCache {
+    // Keep anything with a scan in flight, and this key (updated below).
+    map.retain(|k, v| {
+        k == staging_dir
+            || v.refreshers > 0
+            || v.snapshot
+                .as_ref()
+                .is_some_and(|s| s.computed_at.elapsed() < QUEUE_VIEW_CACHE_TTL)
+    });
+    let entry = map
+        .entry(staging_dir.to_string())
+        .or_insert_with(|| QueueViewCache {
+            snapshot: None,
+            refresh_started: None,
+            refreshers: 0,
+        });
+    // A presumed-dead refresher that comes back to life must not overwrite the
+    // fresher snapshot its replacement already published. Anything computed
+    // after we started is at least as current as what we hold.
+    let superseded = entry
+        .snapshot
+        .as_ref()
+        .is_some_and(|s| s.computed_at > claimed_at);
+    if !superseded {
+        entry.snapshot = Some(QueueViewSnapshot {
             computed_at: std::time::Instant::now(),
             mux_queue: mux_queue.clone(),
             move_queue: move_queue.clone(),
             mux_full,
             move_full,
-        },
-    );
+        });
+    }
+    drop(map);
+    QUEUE_VIEW_REFRESHED.notify_all();
     (mux_queue, move_queue, mux_full, move_full)
 }
 
@@ -4940,8 +5964,17 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // Degrade gracefully on a poisoned lock, matching every other handler
     // (e.g. GET /api/settings) rather than panicking this handler thread
     // and silently breaking the System tab.
-    let cfg = match cfg.read() {
-        Ok(c) => c,
+    //
+    // Copy the two paths we need out of the config and DROP the read guard
+    // before any I/O. Everything below does filesystem work — a staging-dir
+    // scan and a log tail — and holding the RwLock across it would block any
+    // concurrent `cfg.write()`, i.e. the Settings-save path an operator would
+    // use to repoint the very staging dir that is being slow.
+    let (staging_dir, syslog_path) = match cfg.read() {
+        Ok(c) => (
+            c.staging_dir.clone(),
+            format!("{}/device_system.log", c.log_dir()),
+        ),
         Err(_) => {
             return json_response(
                 request,
@@ -4958,8 +5991,7 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // at most one of the two lists) and returns the uncapped totals from the
     // same scan, so the "+N more" overflow math below shares one snapshot with
     // the displayed lists (no count-vs-list TOCTOU).
-    let (mux_queue, move_queue, mux_full_count, move_full_count) =
-        build_queue_views(&cfg.staging_dir);
+    let (mux_queue, move_queue, mux_full_count, move_full_count) = build_queue_views(&staging_dir);
 
     // Mover errors: stuck staging dirs the user needs to act on.
     let move_errors: Vec<crate::mover::MoverError> = crate::mover::MOVE_ERRORS
@@ -4977,7 +6009,6 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // System log: last 50 lines. Tail from the end with a bounded read
     // rather than slurping the whole file — device_system.log is never
     // rotated and the System page polls this endpoint every few seconds.
-    let syslog_path = format!("{}/device_system.log", cfg.log_dir());
     let syslog = tail_file(&syslog_path, SYSLOG_TAIL_BYTES)
         .unwrap_or_default()
         .lines()
@@ -5331,8 +6362,9 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         // rip/move events. Validate every one at store time so a LAN client
         // can't make autorip beacon to internal/metadata hosts. A sentinel
         // entry is a redacted "unchanged" placeholder (resolved to the
-        // stored URL under the write guard), so skip it here — the stored
-        // value was already validated when it was first saved.
+        // stored URL just below, still before the write guard), so skip it
+        // here — the stored value was already validated when it was first
+        // saved.
         for u in arr
             .iter()
             .filter_map(|v| v.as_str())
@@ -5351,6 +6383,60 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             }
         }
     }
+    // Resolve masked webhook_urls placeholders BEFORE the write guard, same
+    // trust-boundary rationale as `port` below: resolve_webhook_urls used to
+    // run INSIDE cfg.write(), so an ambiguous/orphaned masked entry returned
+    // 400 only after ~20 earlier fields (including output_dir) had already
+    // been mutated onto the live in-memory Config — a partial update behind
+    // a rejected save. resolve_webhook_urls does no I/O (pure string
+    // matching against the existing stored URLs), so it is cheap to run
+    // under a short-lived `cfg.read()` here; the result is threaded into the
+    // write guard below instead of being recomputed there.
+    //
+    // Race note: the `cfg.read()` here and the `cfg.write()` later are two
+    // separate, non-overlapping lock acquisitions (never held together, so
+    // no lock-ordering/deadlock risk). If a second settings POST races in
+    // between and changes webhook_urls, this request's resolution was
+    // computed against a now-stale `existing` snapshot. The write guard does
+    // not re-validate — it applies the already-resolved value — so the
+    // worst case is last-write-wins on a resolution computed one snapshot
+    // earlier, the same TOCTOU window `keydb_path`'s redacted-round-trip
+    // check below already accepts (it also reads `cfg` outside the write
+    // guard). It cannot bind a masked entry to a WRONG secret: resolution
+    // still only succeeds when the origin (or index) unambiguously matches
+    // one entry in whichever snapshot was read.
+    let webhook_urls_resolved: Option<Vec<String>> = if let Some(arr) =
+        patch.get("webhook_urls").and_then(|v| v.as_array())
+    {
+        let incoming: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        let existing = match cfg.read() {
+            Ok(c) => c.webhook_urls.clone(),
+            Err(_) => {
+                return json_response(
+                    request,
+                    500,
+                    r#"{"ok":false,"error":"config lock poisoned"}"#,
+                );
+            }
+        };
+        match resolve_webhook_urls(&incoming, &existing) {
+            Ok(urls) => Some(urls),
+            Err(_) => {
+                // A masked entry's origin matched 0 (deleted row) or >1
+                // (shared-origin) stored secrets — refuse to guess which
+                // secret was meant rather than silently bind the wrong
+                // one. Returned BEFORE the write guard so no other field
+                // in this patch is mutated onto the live Config either.
+                return json_response(
+                    request,
+                    400,
+                    r#"{"ok":false,"error":"ambiguous masked webhook entry; re-enter the full webhook URL"}"#,
+                );
+            }
+        }
+    } else {
+        None
+    };
     if let Some(v) = patch.get("port").and_then(|v| v.as_u64()) {
         // Reject out-of-range BEFORE taking the write guard. Validating
         // inside the guard meant a bad port returned 400 only after other
@@ -5576,7 +6662,15 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         if let Some(v) = patch.get("auto_eject").and_then(|v| v.as_bool()) {
             c.auto_eject = v;
         }
-        let on_read_error_in_patch = patch.get("on_read_error").is_some();
+        // Presence is not the question the fallback below is asking — VALIDITY
+        // is. Gating on `.is_some()` while the assignment requires `.as_str()`
+        // meant a present-but-non-string value (`null`, a number, an object)
+        // applied neither the new field nor the legacy migration, and still
+        // answered 200: a settings save that looks applied and is not.
+        let on_read_error_in_patch = patch
+            .get("on_read_error")
+            .and_then(|v| v.as_str())
+            .is_some();
         if let Some(v) = patch.get("on_read_error").and_then(|v| v.as_str()) {
             c.on_read_error = v.to_string();
         }
@@ -5627,34 +6721,12 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
                 c.max_retries = 1;
             }
         }
-        if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {
-            // Validated above the write guard (SSRF). A sentinel entry is a
-            // redacted "unchanged" placeholder: resolve it back to the stored
-            // token-bearing URL so a GET→POST round-trip of the redacted form
-            // doesn't wipe the real secret.
-            //
-            // Resolution is BY ORIGIN PREFIX, never by array position. The UI
-            // can delete or reorder webhook rows between GET and POST; a
-            // positional match would then bind a masked entry to a DIFFERENT
-            // stored secret (or a deleted one) — a silent secret-confusion bug.
-            // If a masked entry's origin prefix matches 0 or >1 stored entries
-            // it is ambiguous: reject the whole save with a 400 rather than
-            // guessing which secret the operator meant.
-            let existing = c.webhook_urls.clone();
-            let incoming: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-            match resolve_webhook_urls(&incoming, &existing) {
-                Ok(urls) => c.webhook_urls = urls,
-                Err(_) => {
-                    // A masked entry's origin matched 0 (deleted row) or >1
-                    // (shared-origin) stored secrets — refuse to guess which
-                    // secret was meant rather than silently bind the wrong one.
-                    return json_response(
-                        request,
-                        400,
-                        r#"{"ok":false,"error":"ambiguous masked webhook entry; re-enter the full webhook URL"}"#,
-                    );
-                }
-            }
+        if let Some(urls) = webhook_urls_resolved {
+            // Resolved (SSRF-validated + masked-placeholder-resolved) above
+            // the write guard — see the rationale there. Applying it here is
+            // infallible: any ambiguity already returned 400 before any
+            // field, including this one, could be mutated.
+            c.webhook_urls = urls;
         }
         // decrypt_threads + log_retention_days: operator-tunable from the
         // Settings page.
@@ -6436,8 +7508,14 @@ fn percent_decode(s: &str) -> String {
         // in range, i.e. i + 3 <= len. The previous `i + 2 < len` guard
         // was off by one and dropped a trailing `%XX` (e.g. a value
         // ending in a percent-encoded byte) through to literal output.
+        // Both payload bytes must be ASCII hex digits. `from_str_radix` alone
+        // is too lenient: it accepts a leading sign, so `%+3` parsed as 3 and
+        // decoded to a control byte instead of staying the literal text the
+        // client sent. RFC 3986 percent-escapes are `HEXDIG` only.
         if bytes[i] == b'%'
             && i + 3 <= bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
             && let Ok(byte) = u8::from_str_radix(&String::from_utf8_lossy(&bytes[i + 1..i + 3]), 16)
         {
             result.push(byte);

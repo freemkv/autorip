@@ -29,6 +29,7 @@ fn test_state_json_serialization_round_trip() {
         disc_present: true,
         disc_name: "TEST DISC".to_string(),
         disc_label: "TEST_DISC_1".to_string(),
+        failure_deferred: false,
         disc_format: "bluray".to_string(),
         progress_pct: 42,
         progress_gb: 13.5,

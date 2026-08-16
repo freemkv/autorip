@@ -317,9 +317,66 @@ pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
 /// per fetch (the cold path, ~once per CPS unit), rebuilding the SAME sources
 /// the upfront resolve used, so `online`/`local` config is honored identically.
 pub fn build_iso_key_fetch(cfg: &Config, iso_path: &Path) -> Option<libfreemkv::sector::KeyFetch> {
-    let (inf, mkb, version) = libfreemkv::Disc::read_aacs_inputs(iso_path).ok()?;
+    match build_iso_key_fetch_outcome(cfg, iso_path) {
+        IsoKeyFetch::Ready(fetch) => Some(fetch),
+        IsoKeyFetch::NotAacs => None,
+        IsoKeyFetch::Unreadable(err) => {
+            tracing::warn!(
+                phase = "key_resolve",
+                path = %iso_path.display(),
+                err = %err,
+                "could not read the ISO's AACS inputs; mid-mux key recovery is disabled for this rip"
+            );
+            None
+        }
+    }
+}
+
+/// Why [`build_iso_key_fetch`] did or did not produce a fetch seam.
+///
+/// Both negative arms collapse to `None` at the call site, but only one of
+/// them is normal, and the difference is the whole point: a non-AACS ISO has
+/// nothing to fetch, whereas an ISO we could not READ (ESTALE on the staging
+/// mount, a truncated file, EACCES) is a fault that used to vanish into the
+/// same `.ok()?` — the mux then dropped the 2nd CPS unit as decrypt loss with
+/// no line anywhere saying why.
+///
+/// This is an enum rather than a log line alone so the distinction can be
+/// asserted directly. The previous test drove the real function under a
+/// capturing subscriber and asserted on captured output; that passed alone and
+/// failed in the full suite, because sibling tests dispatch the same `warn!`
+/// callsite with no subscriber installed and tracing caches `Interest::never`
+/// for the whole process. Testing the decision instead of its rendering has no
+/// such race.
+pub enum IsoKeyFetch {
+    /// AACS inputs read; mid-mux CPS-unit key recovery is available.
+    Ready(libfreemkv::sector::KeyFetch),
+    /// The ISO is readable and simply carries no AACS data. Nothing to fetch.
+    NotAacs,
+    /// The ISO's AACS inputs could not be read. A fault, not a normal outcome.
+    Unreadable(libfreemkv::Error),
+}
+
+// Hand-written: `KeyFetch` is a boxed closure and carries no `Debug`. Only the
+// arm matters for diagnostics — the seam itself has nothing printable.
+impl std::fmt::Debug for IsoKeyFetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IsoKeyFetch::Ready(_) => f.write_str("Ready(<key fetch>)"),
+            IsoKeyFetch::NotAacs => f.write_str("NotAacs"),
+            IsoKeyFetch::Unreadable(err) => write!(f, "Unreadable({err})"),
+        }
+    }
+}
+
+/// The decision behind [`build_iso_key_fetch`], as data. See [`IsoKeyFetch`].
+pub fn build_iso_key_fetch_outcome(cfg: &Config, iso_path: &Path) -> IsoKeyFetch {
+    let (inf, mkb, version) = match libfreemkv::Disc::read_aacs_inputs(iso_path) {
+        Ok(v) => v,
+        Err(err) => return IsoKeyFetch::Unreadable(err),
+    };
     if inf.is_empty() {
-        return None;
+        return IsoKeyFetch::NotAacs;
     }
     let inputs = libfreemkv::DiscInputs {
         disc_hash: String::new(),
@@ -333,7 +390,7 @@ pub fn build_iso_key_fetch(cfg: &Config, iso_path: &Path) -> Option<libfreemkv::
     let cfg = cfg.clone();
     let make_sources: std::sync::Arc<dyn Fn() -> Vec<Box<dyn KeySource>> + Send + Sync> =
         std::sync::Arc::new(move || build_sources(&cfg));
-    Some(libfreemkv::keysource::key_fetch(inputs, make_sources))
+    IsoKeyFetch::Ready(libfreemkv::keysource::key_fetch(inputs, make_sources))
 }
 
 /// Whether the configured source talks to a remote key service —
@@ -408,6 +465,29 @@ pub fn classify_reachability(outcome: ProbeOutcome) -> ServiceReachability {
     }
 }
 
+/// What a URL we could not even validate says about the key SERVICE.
+///
+/// `validate_fetch_url` fails for two unrelated reasons and the probe used to
+/// answer [`ServiceReachability::Up`] to both:
+///
+/// * A permanent verdict on the URL — empty, not http(s), no host, or an
+///   address the SSRF guard blocks. The online source was already dropped for
+///   such a URL, so a resulting no-key is genuine and `Up` is right: calling
+///   it an outage would park every disc forever on a config mistake.
+/// * A failed LOOKUP — DNS timed out (including the `MAX_INFLIGHT` fail-fast),
+///   the resolver errored, or the host resolved to nothing. That is the same
+///   evidence `ProbeOutcome::Transport` is built from: we never reached the
+///   service. Reporting `Up` here made a DNS blip finalise a rippable disc as
+///   permanently keyless, which is precisely what the `Down` path exists to
+///   prevent — the disc parks, retries, and rips when the network returns.
+fn reachability_for_unprobeable_url(err: &str) -> ServiceReachability {
+    if crate::web::is_transient_resolve_error(err) {
+        ServiceReachability::Down
+    } else {
+        ServiceReachability::Up
+    }
+}
+
 /// Read timeout for the reachability probe. Short and bounded — we only need to
 /// learn *whether* the service answers, not to complete a key exchange.
 const PROBE_TIMEOUT_SECS: u64 = 8;
@@ -424,6 +504,9 @@ const PROBE_TIMEOUT_SECS: u64 = 8;
 /// [`ServiceReachability::Up`] — that preserves the pre-fix behaviour (the
 /// online source was already dropped for such a URL, so the no-key is treated
 /// as genuine rather than a spurious "outage").
+///
+/// A validation failure that is merely a failed LOOKUP is the opposite case
+/// and is classified by [`reachability_for_unprobeable_url`]: see there.
 pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
     let url = cfg.keyserver_url.trim();
     if url.is_empty() {
@@ -431,8 +514,7 @@ pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
     }
     let pinned = match crate::web::validate_fetch_url(url) {
         Ok(addrs) => addrs,
-        // Can't safely reach it (bad scheme / blocked IP) — not an "outage".
-        Err(_) => return ServiceReachability::Up,
+        Err(e) => return reachability_for_unprobeable_url(&e),
     };
     // Same pinned-resolver hardening as every other operator-supplied-URL
     // fetch in autorip — `guarded_agent` owns it, including the
@@ -1427,6 +1509,81 @@ mod tests {
         let cfg = Config::default();
         let missing = Path::new("/nonexistent-autorip-iso-fixture-xyz.iso");
         assert!(build_iso_key_fetch(&cfg, missing).is_none());
+    }
+
+    /// An ISO we could not READ must not vanish silently. Both negative
+    /// outcomes of `build_iso_key_fetch` are `None` and the caller cannot tell
+    /// them apart — so a staging mount that ESTALEs, or a truncated ISO, used
+    /// to disable mid-mux CPS-unit key recovery with nothing anywhere saying
+    /// why, and the rip surfaced it only as decrypt loss.
+    ///
+    /// Asserted on the decision, not on captured log output: the earlier
+    /// version of this test drove the function under a capturing subscriber,
+    /// which passed alone and failed in the full suite because sibling tests
+    /// dispatch the same callsite with no subscriber installed and tracing
+    /// caches `Interest::never` process-wide.
+    #[test]
+    fn an_unreadable_iso_is_distinguishable_from_a_non_aacs_one() {
+        let cfg = Config::default();
+
+        let missing = Path::new("/nonexistent-autorip-iso-fixture-xyz.iso");
+        match build_iso_key_fetch_outcome(&cfg, missing) {
+            IsoKeyFetch::Unreadable(_) => {}
+            other => panic!(
+                "an unreadable ISO must be a distinct fault, not collapsed into \
+                 the same silent outcome as a non-AACS disc; got {other:?}"
+            ),
+        }
+
+        // A file that exists but is not a disc image is equally unreadable as
+        // an ISO — it must not be misreported as "readable, simply no AACS".
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"not a disc image").unwrap();
+        match build_iso_key_fetch_outcome(&cfg, tmp.path()) {
+            IsoKeyFetch::Unreadable(_) => {}
+            other => panic!("a truncated non-image file must read as a fault; got {other:?}"),
+        }
+    }
+
+    /// A URL the probe cannot even validate is classified by WHY.
+    ///
+    /// The three transient literals come from `web`'s own constants, which
+    /// `resolve_with_timeout` / `validate_fetch_url` build their errors from,
+    /// so this cannot drift from the producer. The permanent side is pinned
+    /// against real `validate_fetch_url` output below.
+    #[test]
+    fn a_failed_lookup_is_an_outage_but_a_rejected_url_is_not() {
+        assert_eq!(
+            reachability_for_unprobeable_url(crate::web::RESOLVE_TIMEOUT_MSG),
+            ServiceReachability::Down,
+            "a DNS timeout is not evidence that the key service answered"
+        );
+        assert_eq!(
+            reachability_for_unprobeable_url(crate::web::RESOLVE_NO_ADDRS_MSG),
+            ServiceReachability::Down
+        );
+        assert_eq!(
+            reachability_for_unprobeable_url(&format!(
+                "{}Temporary failure in name resolution",
+                crate::web::RESOLVE_FAILED_PREFIX
+            )),
+            ServiceReachability::Down
+        );
+
+        // Permanent verdicts on the URL itself: the online source was already
+        // dropped for these, so a no-key is genuine and must NOT park the disc.
+        for permanent in [
+            "URL is empty",
+            "URL must start with http:// or https://",
+            "URL has no host",
+            "refusing to connect to non-public address 127.0.0.1 (SSRF guard)",
+        ] {
+            assert_eq!(
+                reachability_for_unprobeable_url(permanent),
+                ServiceReachability::Up,
+                "{permanent:?} is a config verdict, not an outage"
+            );
+        }
     }
 
     /// Same fail-safe expectation for a file that exists but is not a valid

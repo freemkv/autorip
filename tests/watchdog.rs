@@ -5,9 +5,10 @@
 //!     bounded-syscall pattern around `increment_restart_count` returns
 //!     within its 5 s deadline even when the underlying call would never
 //!     complete; on the happy path the counter does increment.
-//!   - cfg.write() must drop guard before Config::save:
-//!     `handle_settings_post` releases the write lock before invoking
-//!     the on-disk save, and the on-disk file matches the snapshot.
+//!
+//! The settings-save guard-drop coverage that used to be claimed here now
+//! lives in `src/web.rs`, where `handle_settings_post` is actually reachable —
+//! see the note further down.
 //!
 //! Hard-to-test caveat: simulating an actually-wedged NFS write
 //! requires a real wedged mount or kernel-level hook. We approximate
@@ -101,59 +102,21 @@ fn watchdog_counter_bump_times_out_when_op_hangs() {
     );
 }
 
-#[test]
-fn handle_settings_post_drops_write_guard_before_save() {
-    // After `handle_settings_post` returns, the
-    // `RwLock<Config>` must be in a state where a fresh writer can
-    // acquire it without contention — i.e. the handler's write guard
-    // is dropped before the on-disk save. The pre-fix code held the
-    // guard across `Config::save` (an unbounded NFS write), blocking
-    // every concurrent reader for the duration.
-    //
-    // We can't easily route a tiny_http::Request through the real
-    // handler from a unit test (the type doesn't expose constructors
-    // for fake requests), so we model the post-fix code path here:
-    // mutate inside a guard, snapshot, drop the guard, then call
-    // save. After save returns, try_write must succeed immediately.
-    use freemkv_autorip::config::Config;
-    use std::sync::{Arc, RwLock};
-
-    let tmp = tempdir().expect("tempdir");
-    let autorip_dir = tmp.path().to_string_lossy().to_string();
-    let cfg = Arc::new(RwLock::new(Config {
-        autorip_dir: autorip_dir.clone(),
-        ..Config::default()
-    }));
-
-    // Same shape as handle_settings_post post-fix: mutate, snapshot,
-    // drop guard.
-    let snapshot: Config = {
-        let mut c = cfg.write().unwrap();
-        c.tmdb_api_key = "abc123".into();
-        c.main_feature = false;
-        c.clone()
-    };
-    // Lock MUST be available immediately — pre-fix `cfg.write()` held
-    // across save would have made this `try_write` fail until save
-    // completed.
-    assert!(
-        cfg.try_write().is_ok(),
-        "write lock should be released before save runs"
-    );
-
-    // Persist the snapshot. Note: with this Config's `autorip_dir`
-    // pointing at the tempdir, save writes settings.json there.
-    freemkv_autorip::config::save(&snapshot).expect("save to tempdir should succeed");
-
-    let settings_path = std::path::Path::new(&autorip_dir).join("settings.json");
-    assert!(settings_path.exists(), "settings.json should exist");
-    let on_disk = std::fs::read_to_string(&settings_path).expect("read settings.json");
-    assert!(
-        on_disk.contains("abc123"),
-        "settings.json should contain mutated tmdb_api_key, got: {on_disk}"
-    );
-    assert!(
-        on_disk.contains("\"main_feature\": false"),
-        "settings.json should reflect the snapshot's main_feature"
-    );
-}
+// The settings-save guard-drop test that used to live here has been REMOVED,
+// not moved: it never invoked `handle_settings_post`. It re-implemented the
+// post-fix shape inline ("Same shape as handle_settings_post post-fix"),
+// dropped its own guard at the end of its own block expression, and then
+// asserted `try_write().is_ok()` — i.e. it asserted that Rust drops a scoped
+// `RwLockWriteGuard`. Reintroducing the exact production bug (holding
+// `cfg.write()` across `config::save`) left it green, so it was a guard in
+// name only, and its presence here made the real gap look covered.
+//
+// `handle_settings_post` is private to `src/web.rs` and takes a
+// `tiny_http::Request`, which has no public constructor — an integration test
+// in this crate cannot reach it at all. The real coverage lives in-crate,
+// where both are reachable:
+//
+//   * `web::web_tests::http::settings_post_persists_a_field_to_disk` — drives
+//     the handler through a live loopback server and reads settings.json back.
+//   * `web::web_tests::settings_post_saves_outside_the_config_write_guard` —
+//     pins the drop-before-save ORDERING against the handler's own source.
