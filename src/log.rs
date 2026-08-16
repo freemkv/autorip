@@ -66,7 +66,7 @@ fn device_log_path(device: &str) -> String {
 /// ANSI escape sequences into an operator's terminal (`docker logs` / `tail`) or
 /// the on-disk `.log`. Replaces any control character (C0 / DEL / C1, ESC
 /// included) with `?`; ordinary text is untouched.
-fn sanitize_log_msg(msg: &str) -> String {
+pub(crate) fn sanitize_log_msg(msg: &str) -> String {
     msg.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()

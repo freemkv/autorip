@@ -432,23 +432,40 @@ pub(super) fn take_session(device: &str) -> Option<DriveSession> {
         .remove(device)
 }
 
+/// Record (or clear) the device's cached disc identity for the rediscovery
+/// path. `volume_id` is the freshly-scanned disc's UDF Volume Identifier;
+/// empty means the disc has no usable label.
+///
+/// An empty label is not a discriminator — storing it would match every
+/// other label-less disc — but it must still CLEAR any previous disc's
+/// entry. Skipping the write outright (what this did before) left the
+/// PREVIOUS disc's volume id cached against a device that now holds a
+/// different, unlabelled disc, and `rediscover_drive` would then "confirm" a
+/// shifted candidate against a disc that is no longer in the drive: the
+/// exact wrong-disc attachment the identity check exists to prevent.
+pub(super) fn cache_disc_identity(device: &str, volume_id: &str) {
+    let vid = volume_id.trim();
+    // Recover-and-proceed on poison (module convention): a skipped clear is
+    // a stale identity, which is worse than no identity.
+    let mut ids = DISC_IDENTITY.lock().unwrap_or_else(|e| e.into_inner());
+    if vid.is_empty() {
+        ids.remove(device);
+    } else {
+        ids.insert(device.to_string(), vid.to_string());
+    }
+}
+
 pub(super) fn store_session(device: &str, session: DriveSession) {
     // Cache the scanned disc's volume identifier before storing, so the
-    // rediscovery path can match it after the session is dropped. A
-    // disc with no UDF volume label (empty string) is not a usable
-    // discriminator — skip caching it rather than store an empty key
-    // that would match every other label-less disc.
-    if let Some(vid) = session
-        .disc
-        .as_ref()
-        .map(|d| d.volume_id.trim())
-        .filter(|v| !v.is_empty())
-    {
-        DISC_IDENTITY
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(device.to_string(), vid.to_string());
-    }
+    // rediscovery path can match it after the session is dropped.
+    cache_disc_identity(
+        device,
+        session
+            .disc
+            .as_ref()
+            .map(|d| d.volume_id.as_str())
+            .unwrap_or(""),
+    );
     // Recover-and-proceed on poison (matching register_halt / register_rip_thread):
     // dropping the session silently would make session_is_scanned return false
     // and fire a redundant 10-30s re-scan (clearing TMDB metadata in the UI).
@@ -456,6 +473,91 @@ pub(super) fn store_session(device: &str, session: DriveSession) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(device.to_string(), session);
+}
+
+/// Is a rip/scan worker for `device` still running?
+///
+/// The thread-liveness fact `is_busy` cannot give. `is_busy` is
+/// `STATE[device].status == "scanning" | "ripping"`, and a worker writes its
+/// TERMINAL status and then keeps running its tail on the same thread —
+/// auto-eject (`Drive::open` + `session.eject()`, real hardware I/O), the
+/// eject-failure device log lines, guard drops. Teardown paths that would
+/// pull state out from under that tail must ask this too, exactly as
+/// [`forget_device_session_state`] asks the handle itself rather than
+/// trusting the status.
+///
+/// `false` for a device with no registered handle: nothing is running, so
+/// nothing is deferred. Residual window (unchanged by this predicate, and
+/// narrower than the one it closes): [`join_rip_thread`] takes the handle OUT
+/// of the map for the duration of an off-thread drain, so while another
+/// thread sits in that poll a live worker reads as not-running here. The
+/// self-join drain — the auto-eject tail, which is the tail that actually
+/// races the hot-unplug rescan — re-stashes the handle immediately and so is
+/// covered.
+pub(super) fn rip_thread_running(device: &str) -> bool {
+    // Recover-and-proceed on poison (module convention): a poisoned map means
+    // a worker panicked, and reporting "nothing is running" there is the
+    // permission-to-tear-down this predicate exists to withhold.
+    RIP_THREADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(device)
+        .is_some_and(|h| !h.is_finished())
+}
+
+/// Evict the per-device state THIS module owns, on hot-unplug teardown:
+/// the cached [`DISC_IDENTITY`] entry, and — only if the rip thread has
+/// already exited — its [`RIP_THREADS`] handle and its [`HALTS`] token.
+/// Called from [`super::state::forget_device_state`], which is the single
+/// teardown entry point; see its doc for the full per-device inventory.
+///
+/// Returns `true` if a finished rip-thread handle was reaped.
+///
+/// A *running* handle is deliberately left in place. Dropping it makes the
+/// thread unjoinable, so a later stop/eject/shutdown drain returns while the
+/// worker is still mid-write and staging can be wiped underneath it — the
+/// v0.13.6 bug class that `register_rip_thread` and `join_rip_thread` are
+/// both built around. `forget_removed_device` only calls in here for a
+/// device that is not `is_busy`, but "not busy" is a STATE *status*, not a
+/// thread-liveness fact: the worker clears its status and then keeps
+/// unwinding (eject, log flush, guard drops). So we ask the handle itself,
+/// and leave a live one for the next `register_rip_thread` reap or the
+/// shutdown `join_all_rip_threads` to collect.
+///
+/// The `Halt` is evicted on the same condition, and only then: while a
+/// thread is still running its token must stay reachable so `/api/stop`
+/// can cancel it. Once the thread is gone nothing polls the token, and a
+/// leftover entry would shadow the next rip's fresh one.
+pub(super) fn forget_device_session_state(device: &str) -> bool {
+    // Recover-and-proceed on poison (module convention): a skipped eviction
+    // here is the unbounded growth this function exists to prevent.
+    DISC_IDENTITY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(device);
+    let reaped = {
+        let mut t = RIP_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        if t.get(device).is_some_and(|h| h.is_finished()) {
+            // is_finished() == true means join() cannot block, so joining
+            // under the lock is safe (same argument as register_rip_thread).
+            if let Some(h) = t.remove(device)
+                && let Err(e) = h.join()
+            {
+                tracing::error!(
+                    device = %device,
+                    "reaped rip thread of a removed device had panicked: {:?}", e
+                );
+            }
+            true
+        } else {
+            false
+        }
+    };
+    // Take HALTS only after RIP_THREADS is released — never nest the two.
+    if reaped {
+        unregister_halt(device);
+    }
+    reaped
 }
 
 /// The UDF Volume Identifier last scanned for `device`, if any. Used by
@@ -575,7 +677,7 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
             tracing::info!(
                 device = %device,
                 new_path = %path,
-                volume_id = %vid,
+                volume_id = %vid_for_log(vid),
                 "rediscovered drive after USB re-enumeration (disc identity confirmed)"
             );
             return Some(path);
@@ -585,8 +687,8 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
                 tracing::warn!(
                     device = %device,
                     candidate = %path,
-                    candidate_volume_id = %vid,
-                    expected_volume_id = %expected,
+                    candidate_volume_id = %vid_for_log(&vid),
+                    expected_volume_id = %vid_for_log(expected),
                     "skipping rediscovery candidate — disc identity mismatch (unrelated disc in a neighbouring drive)"
                 );
             }
@@ -624,6 +726,18 @@ fn candidate_identity_confirmed(probed: Option<&str>, expected: &str) -> bool {
     probed == Some(expected)
 }
 
+/// A disc-supplied UDF Volume Identifier, made safe to put in a log field.
+///
+/// `log::sanitize_log_msg`'s own doc names the UDF volume-id as the string it
+/// exists to defend against, but it only ran on `device_log`'s path — these
+/// `tracing` fields reach the human-readable `autorip.log` and stderr (so
+/// `docker logs` / `tail`) formatted with plain `Display` and no escaping, so a
+/// crafted disc could inject ANSI into an operator's terminal through the
+/// rediscovery path.
+fn vid_for_log(vid: &str) -> String {
+    crate::log::sanitize_log_msg(vid)
+}
+
 /// Read the UDF Volume Identifier of the disc currently in the drive at
 /// `path`, for disc-identity matching during rediscovery. Returns None
 /// on any failure (open / ready / init / identify) — the caller treats
@@ -653,6 +767,32 @@ fn probe_volume_id(path: &str) -> Option<String> {
 #[cfg(test)]
 mod rollback_tests {
     use super::*;
+
+    /// A disc-supplied volume-id must not carry terminal escapes into a log.
+    ///
+    /// `log::sanitize_log_msg`'s own doc names the UDF volume-id as the string
+    /// it exists to defend against, but it only ran on `device_log`'s path.
+    /// The rediscovery `tracing` fields reach `autorip.log` and stderr — so
+    /// `docker logs` and `tail` — formatted with plain `Display` and no
+    /// escaping, so a crafted disc could paint an operator's terminal.
+    ///
+    /// The expectation is control-bytes-out, taken from what a terminal must
+    /// never receive, not from what the sanitizer happens to do.
+    #[test]
+    fn a_volume_id_reaches_a_log_field_with_no_terminal_escapes() {
+        // ESC [ 2 J is "clear screen"; a bare CR hides the line before it.
+        let hostile = "DISC\x1b[2J\rHARMLESS\x07";
+        let logged = vid_for_log(hostile);
+        assert!(
+            !logged.chars().any(|c| c.is_control()),
+            "a disc-supplied volume-id must reach a log field with no control \
+             bytes; got {logged:?}"
+        );
+        assert!(
+            logged.contains("DISC") && logged.contains("HARMLESS"),
+            "sanitising must not destroy the identifier's readable text; got {logged:?}"
+        );
+    }
 
     #[test]
     fn rollback_failed_spawn_clears_halt_and_idles() {
@@ -757,6 +897,144 @@ mod rollback_tests {
             "DISC_VOL_123"
         ));
         assert!(!candidate_identity_confirmed(None, "DISC_VOL_123"));
+    }
+
+    /// Swapping in a disc with NO volume label must not leave the previous
+    /// disc's identity cached. `store_session` used to `filter(|v|
+    /// !v.is_empty())` and simply skip the write, so `expected_volume_id`
+    /// kept answering with a disc that had been ejected — and
+    /// `rediscover_drive` would accept a shifted sg candidate carrying that
+    /// old disc as "identity confirmed".
+    #[test]
+    fn an_unlabelled_disc_clears_the_previous_discs_cached_identity() {
+        let dev = format!("disc-identity-swap-{}", std::process::id());
+
+        cache_disc_identity(&dev, "FIRST_DISC_VOL");
+        assert_eq!(
+            expected_volume_id(&dev).as_deref(),
+            Some("FIRST_DISC_VOL"),
+            "a labelled disc is cached"
+        );
+
+        // Operator swaps in a disc with no UDF volume label.
+        cache_disc_identity(&dev, "");
+        assert_eq!(
+            expected_volume_id(&dev),
+            None,
+            "an unlabelled disc must leave NO identity, not the ejected \
+             disc's — verifying a rediscovery candidate against a disc that \
+             is no longer in the drive is how the wrong disc gets attached"
+        );
+
+        // Whitespace-only is the same non-label (the label is trimmed).
+        cache_disc_identity(&dev, "SECOND_DISC_VOL");
+        cache_disc_identity(&dev, "   ");
+        assert_eq!(expected_volume_id(&dev), None);
+    }
+
+    /// Regression: hot-unplug teardown must not leak this module's
+    /// per-device maps. `forget_device_state` used to evict only
+    /// `TITLE_OVERRIDES` + `STOP_COOLDOWNS` (and said so in a doc that
+    /// claimed they were the only other per-device state), leaving the
+    /// device's finished `JoinHandle` in `RIP_THREADS`, its cached volume
+    /// id in `DISC_IDENTITY` and its token in `HALTS` for the container's
+    /// lifetime — one set per device path the kernel ever handed out.
+    #[test]
+    fn forgetting_a_removed_device_reaps_its_finished_thread_and_identity() {
+        // Fixture name unique to this test: RIP_THREADS / DISC_IDENTITY /
+        // HALTS are process-global and shared across the whole test binary.
+        let dev = format!("forget-reap-{}", std::process::id());
+
+        // A worker that exits immediately, registered exactly as the poll
+        // loop registers a real rip thread.
+        spawn_rip_thread(&dev, "rip", || {}).expect("spawn must succeed");
+        register_halt(&dev, Halt::new());
+        DISC_IDENTITY
+            .lock()
+            .unwrap()
+            .insert(dev.clone(), "VOL_FORGET_REAP".to_string());
+
+        // Watchdog: wait for the worker to actually exit before asserting on
+        // the reap, but never block the suite. The closure is empty, so 5 s
+        // is ~4 orders of magnitude of margin over a thread spawn+exit; a
+        // regression that never finishes fails here instead of hanging.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let finished = RIP_THREADS
+                .lock()
+                .unwrap()
+                .get(&dev)
+                .is_some_and(|h| h.is_finished());
+            if finished {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker thread did not exit within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        super::super::state::forget_device_state(&dev);
+
+        assert!(
+            !RIP_THREADS.lock().unwrap().contains_key(&dev),
+            "a finished JoinHandle must be reaped when the device is torn \
+             down, not left in RIP_THREADS forever"
+        );
+        assert!(
+            !DISC_IDENTITY.lock().unwrap().contains_key(&dev),
+            "the cached disc identity must be dropped when the device is \
+             torn down — nothing else ever removes from DISC_IDENTITY"
+        );
+        assert!(
+            super::super::device_halt(&dev).is_none(),
+            "the halt token of an exited thread must go with its handle"
+        );
+    }
+
+    /// The other half of the contract: a rip thread that is still RUNNING
+    /// must keep its registration. Dropping a live `JoinHandle` makes the
+    /// thread unjoinable, so a later stop/eject/shutdown drain returns while
+    /// the worker is still mid-write and staging is wiped underneath it —
+    /// the v0.13.6 bug class. Teardown is allowed to be slower, never
+    /// unsafe.
+    #[test]
+    fn forgetting_a_device_leaves_a_still_running_thread_registered() {
+        let dev = format!("forget-keep-running-{}", std::process::id());
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_gate = gate.clone();
+        spawn_rip_thread(&dev, "rip", move || {
+            // Watchdog: 5 s is the ceiling, not the expectation — the
+            // assertions below run in microseconds, so the release comes
+            // essentially immediately. The bound only stops a regression
+            // from parking this thread for the life of the suite.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !worker_gate.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .expect("spawn must succeed");
+        register_halt(&dev, Halt::new());
+
+        super::super::state::forget_device_state(&dev);
+
+        assert!(
+            RIP_THREADS.lock().unwrap().contains_key(&dev),
+            "a still-running rip thread's handle must survive teardown — \
+             dropping it makes the thread unjoinable and breaks \
+             drain-before-wipe"
+        );
+        assert!(
+            super::super::device_halt(&dev).is_some(),
+            "a still-running thread's Halt must stay reachable so /api/stop \
+             can still cancel it"
+        );
+
+        gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = join_rip_thread(&dev, Duration::from_secs(5));
     }
 
     /// Regression: `take_session` and `drop_session` must recover from a

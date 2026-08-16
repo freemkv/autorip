@@ -18,6 +18,16 @@ static AGENT: once_cell::sync::Lazy<ureq::Agent> = once_cell::sync::Lazy::new(||
     let config = ureq::config::Config::builder()
         .timeout_connect(Some(std::time::Duration::from_secs(5)))
         .timeout_recv_response(Some(std::time::Duration::from_secs(10)))
+        // Follow NO redirects, like every other outbound agent here. The
+        // no-pinned-resolver argument above is about where the REQUEST is
+        // aimed; it says nothing about where a RESPONSE can send it. This
+        // URL carries the operator's api_key in its query string, so a 3xx
+        // — TMDB compromised, misconfigured, or tampered with on-path —
+        // would hand that key to an arbitrary host. At zero, ureq returns
+        // the 3xx as a normal response instead of erroring, and
+        // `read_capped_json` then fails to parse it, which `fetch_multi`
+        // already reports as "no result" rather than a match.
+        .max_redirects(0)
         .build();
     ureq::Agent::new_with_config(config)
 });
@@ -756,6 +766,24 @@ mod tests {
     /// in fetch_multi never contains the api_key (which lives in the URL
     /// query string). We replicate the summary logic that fetch_multi uses so
     /// a future edit to that arm will be caught here.
+    #[test]
+    fn tmdb_agent_follows_no_redirects() {
+        // The agent skips resolver pinning because the host is the hard-coded
+        // api.themoviedb.org — but that argument covers where the REQUEST is
+        // aimed, not where a RESPONSE can send it. The request URL carries the
+        // operator's TMDB api_key in its query string, so following a 3xx
+        // (TMDB compromise, misconfiguration, or on-path tampering) hands that
+        // key to whatever host the redirect names. Nothing in this crate needs
+        // redirect-following, and every other outbound agent already sets
+        // max_redirects(0).
+        assert_eq!(
+            AGENT.config().max_redirects(),
+            0,
+            "the TMDB agent must not follow redirects — the request URL \
+             carries the api_key"
+        );
+    }
+
     #[test]
     fn fetch_multi_error_summary_no_api_key_leak() {
         // Verify the Status variant: just a code, no URL.

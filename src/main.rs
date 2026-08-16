@@ -839,11 +839,6 @@ fn prune_old_logs(log_dir: &str, retention_days: u64) {
     }
 }
 
-/// Recursively delete `.log` files under `dir` older than `cutoff`, returning
-/// the count removed. Subdirectories are descended into (so `logs/rips/` is
-/// covered); non-`.log` files are left alone. IO errors on individual entries
-/// are skipped, not propagated — pruning is best-effort and must never break
-/// the daemon.
 /// Whether a filename is one of the log files retention applies to.
 ///
 /// NOT `extension() == "log"`, which is what this was. `tracing-appender`'s
@@ -863,6 +858,11 @@ fn is_prunable_log_name(path: &std::path::Path) -> bool {
     name.ends_with(".log") || name.contains(".log.")
 }
 
+/// Recursively delete the log files under `dir` older than `cutoff`, returning
+/// the count removed. Subdirectories are descended into (so `logs/rips/` is
+/// covered); anything [`is_prunable_log_name`] rejects is left alone. IO errors
+/// on individual entries are skipped, not propagated — pruning is best-effort
+/// and must never break the daemon.
 fn prune_dir_recursive(dir: &std::path::Path, cutoff: std::time::SystemTime) -> u32 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;

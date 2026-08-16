@@ -517,7 +517,17 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                 continue;
             }
         };
-        let title = marker.display_name.clone();
+        // Sanitised once, here, because this one binding feeds three sinks
+        // below (two tracing fields and a syslog line). `display_name` is the
+        // TMDB title when there is one and the disc's OWN raw meta_title /
+        // volume_id when there is not — i.e. attacker-controlled bytes off the
+        // disc, on the ordinary path where a lookup simply found nothing.
+        //
+        // `sanitize_log_msg`'s doc names the Blu-ray `bdmt` title alongside the
+        // volume-id as exactly what it exists to defend against; a sibling fix
+        // routed the volume-id through it at three rediscovery sites and left
+        // this one, which is the half-applied shape that keeps recurring.
+        let title = crate::log::sanitize_log_msg(&marker.display_name);
         tracing::info!(
             staging = %dir.display(),
             title = %title,

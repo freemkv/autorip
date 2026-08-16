@@ -140,7 +140,7 @@ All endpoints are served on port 8080 (configurable via `PORT`). The web UI is a
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/logs/{device}` | Last 200 lines of device log (plain text) |
+| GET | `/api/logs/{device}` | Device log, plain text (up to the 500-line in-memory ring) |
 | GET | `/api/debug[?n=&level=&device=&q=]` | Filtered JSONL debug events |
 
 ### Device Actions

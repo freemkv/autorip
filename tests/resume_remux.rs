@@ -385,3 +385,79 @@ fn classify_resume_pre_filter_boundary_is_strictly_greater_than() {
         "one byte over the threshold must reject at the pre-filter"
     );
 }
+
+/// Cold resume must hand `resume_remux` a FILE basename, not the staging
+/// DIRECTORY name.
+///
+/// `rip_disc` documents the split explicitly (`src/ripper/mod.rs`, where
+/// `filename` is built): the staging DIR carries the `_2` disc suffix that
+/// separates the discs of a boxset, but the FILES inside it are named from the
+/// plain title with no suffix, because `delete_partial_output` looks for
+/// `<dir>/<display_name>.<ext>` and the mover derives the delivered filename
+/// from the staged one.
+///
+/// `classify_resume` was taking `hint.dir.file_name()` — the suffixed
+/// directory name — so on a boxset variant dir it looked for the partial under
+/// the wrong name, left it in place, and muxed a SECOND file next to it. Both
+/// then carry a `.done` hand-off and the mover delivers both.
+#[test]
+fn cold_resume_of_a_boxset_variant_dir_uses_the_file_basename_not_the_dir_name() {
+    let td = tmpdir();
+    // The staging dir for disc 2 of a set: sanitized title + `_2`.
+    let dir = td.path().join("Boxset Movie_2");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The files inside it are named from the plain title — no suffix.
+    write_iso(&dir.join("Boxset Movie.iso"), 4096);
+    write_mapfile(
+        &dir.join("Boxset Movie.iso.mapfile"),
+        4096,
+        freemkv_engine::SectorStatus::Finished,
+    );
+    // A partial mux left behind by the interrupted attempt.
+    let partial = dir.join("Boxset Movie.mkv");
+    std::fs::write(&partial, b"partial mux output").unwrap();
+
+    let hint = make_hint(
+        dir.clone(),
+        ResumeAction::ResumePreserved {
+            attempt: 1,
+            has_iso: true,
+            has_mapfile: true,
+            has_mkv: true,
+        },
+    );
+    let display_name = match classify_resume(&hint, 0) {
+        ResumeClass::Remux { display_name, .. } => display_name,
+        other => panic!("expected Remux, got {:?}", other),
+    };
+
+    assert_eq!(
+        display_name, "Boxset Movie",
+        "cold resume passed the staging DIRECTORY name (with its `_2` disc suffix) as the \
+         file basename; the invariant in rip_disc is that files inside the dir carry no suffix"
+    );
+
+    // What resume_remux does with it, in order: clear the partial, then mux to
+    // `<dir>/<display_name>.<ext>`.
+    delete_partial_output(&dir, &display_name);
+    assert!(
+        !partial.exists(),
+        "the stale partial mux output was not cleared — resume looked for it under the \
+         suffixed directory name"
+    );
+    std::fs::write(dir.join(format!("{display_name}.mkv")), b"remuxed").unwrap();
+
+    let mkvs: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".mkv"))
+        .collect();
+    assert_eq!(
+        mkvs.len(),
+        1,
+        "cold resume produced {} MKVs in one staging dir ({:?}) — the mover delivers BOTH",
+        mkvs.len(),
+        mkvs
+    );
+}
