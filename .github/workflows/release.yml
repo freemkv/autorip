@@ -245,7 +245,7 @@ jobs:
       # binary into a slim Debian base and pushes to GHCR.
       - name: Upload binary artifact for docker job
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: autorip-binary-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/autorip
