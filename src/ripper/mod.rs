@@ -481,7 +481,8 @@ fn retry_online_keys_on_outage(
 }
 
 use session::{
-    DriveSession, drop_session, rediscover_drive, session_is_scanned, store_session, take_session,
+    DriveSession, drop_session, rediscover_drive, rip_thread_running, session_is_scanned,
+    store_session, take_session,
 };
 use staging::staging_free_bytes;
 use state::{PassContext, PassProgressState, is_in_cooldown, push_pass_state, set_pass_progress};
@@ -497,6 +498,110 @@ const POLL_INTERVAL_SECS: u64 = 5;
 /// platform paths in `DriveInfo`.
 fn device_key(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
+/// Tear down every piece of per-device state for a drive that vanished from
+/// the enumeration (hot-unplug), returning `true` if the teardown ran.
+///
+/// Extracted from the hot-plug reconcile in [`drive_poll_loop`] so the
+/// decision is testable without driving the 30-second poll loop.
+///
+/// A device whose worker still holds it is never torn down, and the caller
+/// must keep polling it. That takes TWO facts, not one:
+///
+/// * `is_busy` is `STATE[device].status == "scanning" | "ripping"` — it IS the
+///   double-rip guard, so removing the STATE entry of a drive that is mid-rip
+///   makes every later `is_busy()` return false and opens the rip/scan
+///   dispatch guards for a second concurrent rip on the same physical drive. A
+///   device only has to miss ONE enumeration pass for that to happen, and a
+///   SCSI/USB reset during wedge recovery does exactly that while a multi-hour
+///   rip runs. The 60s `device_first_seen` grace on re-add delays the
+///   re-probe; it does not prevent it.
+/// * [`rip_thread_running`] is the thread-liveness fact `is_busy` cannot give.
+///   A worker writes its TERMINAL status and then keeps running: auto-eject
+///   (`Drive::open` + `session.eject()` — slow hardware I/O, and opening a
+///   tray is itself a documented trigger for re-enumeration), the
+///   eject-failure log lines, guard drops. Gating on status alone tore the
+///   session, the STATE row and the log ring out from under that tail.
+///   `forget_device_session_state` already refuses to reap a live
+///   `JoinHandle` for this reason; both halves of one teardown now ask the
+///   same question.
+///
+/// So: defer the whole teardown while busy, rather than tearing down but
+/// preserving STATE, or force-failing the rip. Preserving only STATE would
+/// evict the log ring and the session out from under a live rip thread that
+/// is still writing to both — trading a double-rip for a truncated device log
+/// and a lost `DriveSession`. Force-failing the rip would let one missed
+/// enumeration pass kill a good rip that is still making progress; the rip
+/// thread has its own watchdog and its own I/O errors to decide that with.
+///
+/// The cost of this choice: if the drive really was unplugged, its state
+/// (STATE row, session, log ring, overrides) lingers until the rip thread
+/// notices the dead device and exits — the UI shows a phantom drive for that
+/// window, and a rip thread that hangs forever leaks it for the container's
+/// lifetime. Adding the liveness half extends that accepted cost from the
+/// ripping phase to the worker's tail; it self-heals on the next rescan the
+/// moment the thread exits (a panicked thread reads as finished). That is
+/// still the cheaper failure: a stale UI row versus two rips on one drive, or
+/// a live worker's session and log ring pulled out from under it.
+fn forget_removed_device(device: &str) -> bool {
+    if is_busy(device) || rip_thread_running(device) {
+        tracing::warn!(
+            device = %device,
+            "drive vanished from enumeration while a worker still holds it — \
+             deferring teardown to preserve the double-rip guard"
+        );
+        return false;
+    }
+    drop_session(device);
+    if let Ok(mut s) = STATE.lock() {
+        s.remove(device);
+    }
+    // No eject/scan boundary fires here, so the device's in-memory log
+    // ring would otherwise linger for the container's lifetime. Evict it
+    // like archive_device_log does on the planned-eject path.
+    crate::log::forget_device(device);
+    // Evict the remaining per-device maps (title override, stop cooldown,
+    // cached disc identity, and the rip-thread handle + halt token once the
+    // thread has exited) so nothing accumulates as device paths churn.
+    // `forget_device_state`'s doc carries the authoritative inventory.
+    state::forget_device_state(device);
+    true
+}
+
+/// What one poll tick does about a disc it can see in a drive.
+struct InsertTick {
+    /// Run the auto-scan / auto-rip trigger for this disc now.
+    dispatch: bool,
+    /// Carry this device into the next tick's "already seen" set.
+    latch: bool,
+}
+
+/// Decide both halves of a tick's response to an observed disc.
+///
+/// The two answers have to agree, and that is the whole point of this
+/// function. `dispatch` is suppressed during the post-Stop cooldown so a
+/// stop-then-reinsert does not immediately re-rip. `latch` feeds `had_disc`,
+/// which is what makes the NEXT tick's `is_new_insert` false — and
+/// `is_new_insert` gates the only auto-scan/auto-rip trigger the poll loop
+/// has. Latching a disc this tick declined to dispatch therefore retires the
+/// trigger permanently: the disc is remembered as handled when nothing
+/// handled it, and no later tick will ever act on it again until the operator
+/// physically ejects and reinserts.
+///
+/// So: latch only what was dispatched, or what was already latched.
+/// `POLL_INTERVAL_SECS` (5) equals `STOP_COOLDOWN_SECS` (5), so at most one
+/// tick is deferred this way before the cooldown expires and the disc is
+/// picked up normally.
+fn insert_tick(is_new_insert: bool, in_cooldown: bool) -> InsertTick {
+    let dispatch = is_new_insert && !in_cooldown;
+    InsertTick {
+        dispatch,
+        // Latch what this tick dispatched, plus anything already latched (a
+        // resident disc, which must keep NOT re-triggering). The only case
+        // left unlatched is the one the cooldown deferred.
+        latch: dispatch || !is_new_insert,
+    }
 }
 
 /// Poll drives for disc insertion. Only triggers on state change
@@ -599,29 +704,28 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 }
             }
             // Removed: in drive_paths but not in fresh_paths.
+            // `forget_removed_device` refuses to tear down a busy drive.
+            // Those paths are carried over into the new `drive_paths` below
+            // so the NEXT rescan sees them as removed again and retries the
+            // teardown once the rip/scan finishes. Dropping them here instead
+            // would make the device silently disappear from the loop with its
+            // STATE, session and log ring left behind forever.
+            let mut deferred_removals: Vec<String> = Vec::new();
             for path in &drive_paths {
                 if !fresh_paths.contains(path) {
                     let device = device_key(path);
                     tracing::info!(device = %device, path = %path, "drive removed (hot-unplug)");
-                    drop_session(&device);
-                    if let Ok(mut s) = STATE.lock() {
-                        s.remove(&device);
+                    if !forget_removed_device(&device) {
+                        deferred_removals.push(path.clone());
+                        continue;
                     }
                     had_disc.remove(&device);
                     warned_probe_fail.remove(&device);
                     device_first_seen.remove(&device);
-                    // No eject/scan boundary fires here, so the device's
-                    // in-memory log ring would otherwise linger for the
-                    // container's lifetime. Evict it like archive_device_log
-                    // does on the planned-eject path.
-                    crate::log::forget_device(&device);
-                    // TITLE_OVERRIDES + STOP_COOLDOWNS are the only other
-                    // per-device state; evict them too so stale entries
-                    // don't accumulate as device paths churn.
-                    state::forget_device_state(&device);
                 }
             }
             drive_paths = fresh_paths;
+            drive_paths.extend(deferred_removals);
         }
 
         {
@@ -631,10 +735,18 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
             for path in &drive_paths {
                 let device = device_key(path);
 
-                // Don't touch drives that are actively scanning/ripping —
-                // they hold a Drive instance + sometimes the SCSI bus.
-                // Probing them mid-rip would conflict.
-                if is_busy(&device) {
+                // Don't touch drives a worker still holds — it has a Drive
+                // instance and sometimes the SCSI bus. Probing them would
+                // conflict. `is_busy` alone misses the worker's tail (it has
+                // written its terminal status but is still inside
+                // `eject_drive`'s `Drive::open`/`eject`), which is precisely
+                // when the drive is being yanked open; it is also the state a
+                // teardown deferred by `forget_removed_device` sits in, and
+                // probing a device that just vanished from enumeration would
+                // overwrite its terminal STATE row with a "drive firmware
+                // unresponsive" error and tell an operator to power-cycle a
+                // drive they unplugged on purpose.
+                if is_busy(&device) || rip_thread_running(&device) {
                     current_with_disc.insert(device.clone());
                     continue;
                 }
@@ -720,15 +832,27 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     continue;
                 }
 
-                current_with_disc.insert(device.clone());
-
                 let is_new_insert = !had_disc.contains(&device);
+                // One `is_in_cooldown` read for both halves of the decision:
+                // asking twice could straddle the expiry and dispatch without
+                // latching, or latch without dispatching.
+                let tick = insert_tick(is_new_insert, is_in_cooldown(&device));
 
-                if is_new_insert {
-                    tracing::info!(device = %device, "disc inserted");
+                if tick.latch {
+                    current_with_disc.insert(device.clone());
                 }
 
-                if is_new_insert && !is_in_cooldown(&device) {
+                if is_new_insert && tick.dispatch {
+                    tracing::info!(device = %device, "disc inserted");
+                } else if is_new_insert {
+                    tracing::debug!(
+                        device = %device,
+                        "disc present during the post-stop cooldown; \
+                         deferring the insert trigger to the next tick"
+                    );
+                }
+
+                if tick.dispatch {
                     let on_insert = cfg
                         .read()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1876,10 +2000,21 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
                     continue;
                 }
             }
+            // FILE basename (the staged ISO's stem), never `basename` — that
+            // is the DIRECTORY name and carries the `_2` boxset disc suffix
+            // the files inside it never take. Same invariant, and same
+            // reasoning, as `classify_resume`: `resume_remux` uses this to
+            // clear the partial at `<dir>/<name>.<ext>` and to name its own
+            // output, so the directory form misses the partial and muxes a
+            // second file the mover then delivers alongside it.
+            let display_name = match iso_path.file_stem() {
+                Some(n) => n.to_string_lossy().into_owned(),
+                None => continue,
+            };
             return Some(resume::ResumeClass::Remux {
                 iso_path,
                 mapfile_path,
-                display_name: basename,
+                display_name,
                 // Cold disc-insert resume from preserved staging: no `.ripped`
                 // hand-off and no operator-override concept, so confidence is
                 // unknown — resume_remux falls back to its own match check.
@@ -2123,6 +2258,51 @@ pub fn make_drive_event_fn(
     }
 }
 
+/// Install this rip attempt's initial [`Halt`](libfreemkv::Halt).
+///
+/// The spawn site (`/api/rip`, `/api/scan`, and the disc-insert poll loop)
+/// registers a fresh token before the thread starts, so an HTTP Stop during
+/// the scan phase has something to flip. `rip_disc` replaces it here, and
+/// again at the drive-backed swap once the drive is open.
+///
+/// The replacement must CARRY the outgoing token's cancel. `handle_rip_request`
+/// checks `device_halt(device).is_cancelled()` after the scan and before
+/// calling `rip_disc`; a Stop that lands in the gap between that check and
+/// this line cancels the spawn-site token, and a blind insert then throws it
+/// away — the operator's Stop is silently discarded and the rip runs to
+/// completion. There is no stale token to worry about: `HaltGuard` unregisters
+/// on every exit from `rip_disc`, and the spawn site registers a fresh one
+/// per attempt, so whatever is here is THIS attempt's token.
+fn install_rip_halt(device: &str) {
+    swap_halt_carrying_cancel(device, libfreemkv::Halt::new());
+}
+
+/// Report a post-mux failure that leaves the staging dir RESUMABLE, and hand
+/// the drive back.
+///
+/// The two hand-off failures late in `rip_disc` (the fsync durability gate and
+/// the `.done`/`.review` marker write) are not disc failures: the MKV is in
+/// staging and a later attempt can finish the job, so neither writes `.failed`
+/// and neither is terminal for the disc. They ARE terminal for this rip
+/// attempt, though, and every other exit from `rip_disc` says so by leaving a
+/// terminal status behind. Reporting only through `last_error` and returning
+/// with `status` still `"ripping"` leaves `is_busy()` true forever: the poll
+/// loop then skips that drive on every tick for the container's lifetime while
+/// `/api/state` renders a healthy in-progress rip.
+fn abort_post_mux_preserving_staging(device: &str, log_line: &str, last_error: &str) {
+    crate::log::device_log(device, log_line);
+    update_state_with(device, |s| {
+        // "error", not "failed": `failed` is the quarantined-disc status that
+        // pairs with a `.failed` marker, and neither of these sites writes
+        // one. Matches the mux-time loss-abort return a few lines above,
+        // which is the other resumable-but-over exit from this function.
+        s.status = "error".to_string();
+        if s.last_error.is_empty() {
+            s.last_error = last_error.to_string();
+        }
+    });
+}
+
 /// Rip a disc. Reuses the existing drive session from scan_disc.
 /// If no session exists, opens fresh (for on_insert=rip).
 ///
@@ -2136,10 +2316,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // this device (so an HTTP stop during scan has something to flip).
     // Replace it with a Halt backed by the drive's halt-flag once the
     // drive is open below — that way Stop also pre-empts in-flight
-    // `Drive::read` calls inside libfreemkv. Until then a stale halt
-    // from a prior rip on the same device must NOT survive into this
-    // rip's checks.
-    register_halt(device, libfreemkv::Halt::new());
+    // `Drive::read` calls inside libfreemkv. The swap CARRIES a Stop that
+    // landed on the spawn-site token (see `install_rip_halt`); it cannot
+    // carry a stale one from a prior rip, because `HaltGuard` unregisters
+    // on every exit and the spawn site registers fresh per attempt.
+    install_rip_halt(device);
 
     // RAII cleanup for the halt-map entry. Every exit path from `rip_disc`
     // (including the many early returns on scan/open/keys/staging errors)
@@ -5014,6 +5195,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // resumable (no `.failed` quarantine — a transient drive/NFS read may
     // succeed on retry), matching run_mux's resumable-stop semantics.
     let read_error = mux_outcome.read_error.clone();
+    // Streams the sink accepted frames for but could not deliver into the
+    // finished container are NOT re-reported here. `map_iso_mux_outcome`
+    // produces every outcome that can carry them and already logs
+    // `undelivered_streams_note` into this same device log, so a summary copy
+    // here was a second, differently-worded line for one event — one lossy mux
+    // reading as two, and an alert on either phrase seeing half the story.
     let mut final_errors = mux_outcome.errors;
     let final_last_sector = rip_last_lba.load(Ordering::Relaxed);
     let final_current_batch = rip_current_batch.load(Ordering::Relaxed);
@@ -5169,18 +5356,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             if !staging::durability_gate_passes(is_network, || {
                 staging::fsync_output_file(std::path::Path::new(&output_path))
             }) {
-                crate::log::device_log(
+                abort_post_mux_preserving_staging(
                     device,
                     "Durability gate failed: could not fsync mux output to stable storage; \
                      withholding .done/.completed and preserving staging for retry",
+                    "mux output not durable (fsync failed); rip preserved for retry",
                 );
-                update_state_with(device, |s| {
-                    if s.last_error.is_empty() {
-                        s.last_error =
-                            "mux output not durable (fsync failed); rip preserved for retry"
-                                .to_string();
-                    }
-                });
                 return;
             }
             // Confident match (exact title + year) → hand straight to the mover
@@ -5213,18 +5394,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // in staging forever with no signal. Surface it so the
                 // operator can see the rip is staged-but-unqueued rather
                 // than silently lost.
-                crate::log::device_log(
+                abort_post_mux_preserving_staging(
                     device,
                     &format!(
                         "{marker_name} marker write failed ({e}); MKV is staged but the mover cannot pick it up"
                     ),
+                    &format!("MKV staged but {marker_name} marker write failed: {e}"),
                 );
-                update_state_with(device, |s| {
-                    if s.last_error.is_empty() {
-                        s.last_error =
-                            format!("MKV staged but {marker_name} marker write failed: {e}");
-                    }
-                });
                 // The durable hand-off marker never landed. Do NOT proceed to
                 // `.completed` / `clear_restart_count`: that would make the
                 // staging dir look terminal-complete while the mover has no
@@ -5423,10 +5599,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         },
     );
 
-    if cfg_read.auto_eject {
-        eject_drive(device_path);
-    }
-
     // Prune intermediate ISO + mapfile unless keep_iso is set. Shared with the
     // resume/`.ripped` completion path (resume::resume_remux) so the
     // keep_iso=false reclaim can't diverge between the two completion routes.
@@ -5460,6 +5632,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             lost_video_secs: done_lost_secs,
         },
     );
+
+    // Eject LAST. `eject_drive` archives the device log partway through, so
+    // every line this rip still had to write — the ISO prune above, "Rip
+    // complete", and anything the webhook logs — has to be emitted first or
+    // it lands in the NEXT rip's ring instead of this rip's archived log.
+    // Routed through `should_auto_eject` like the other two completion
+    // terminals: that predicate, not an inline flag test, is where the
+    // "fires once, at read-complete, never from the mux worker" rule lives.
+    if should_auto_eject(cfg_read.auto_eject, device) {
+        eject_drive(device_path);
+    }
 }
 
 /// Pure decision: should this completion path auto-eject the drive?
@@ -10195,6 +10378,152 @@ mod tests {
             .remove(device);
     }
 
+    /// A Stop that lands in the gap between `handle_rip_request`'s
+    /// `is_cancelled()` check and `rip_disc`'s own halt registration must be
+    /// honoured, not discarded.
+    ///
+    /// The spawn site registers a `Halt` before the rip thread starts so an
+    /// HTTP Stop during the scan phase has a token to flip. `rip_disc` then
+    /// installed its own with a blind `register_halt`, so a `/api/stop` that
+    /// cancelled the spawn-site token microseconds too late was overwritten
+    /// and lost: the operator's Stop did nothing and the rip ran to
+    /// completion. `swap_halt_carrying_cancel` exists for exactly this race
+    /// and is already used at the drive-backed swap ~565 lines later.
+    #[test]
+    fn rip_entry_halt_carries_a_stop_that_landed_in_the_dispatch_gap() {
+        // Unique to this test: HALTS is a process-global registry.
+        let device = "sg_rip_entry_halt_carries_dispatch_gap_stop_test";
+        super::unregister_halt(device);
+
+        // The spawn site's token, as `spawn_rip_thread` leaves it.
+        let spawn_token = libfreemkv::Halt::new();
+        super::register_halt(device, spawn_token.clone());
+
+        // `handle_rip_request` has already checked is_cancelled() (false) and
+        // is on its way into rip_disc. The operator hits Stop right now:
+        // /api/stop resolves the device's registered token and cancels it.
+        super::device_halt(device)
+            .expect("the spawn-site token must be registered")
+            .cancel();
+
+        // rip_disc's entry registration runs a moment later.
+        super::install_rip_halt(device);
+
+        assert!(
+            super::device_halt(device)
+                .expect("a token must still be registered")
+                .is_cancelled(),
+            "rip_disc's entry registration discarded a Stop that landed after \
+             handle_rip_request's check — the rip proceeds and the operator's Stop \
+             is a silent no-op"
+        );
+        super::unregister_halt(device);
+
+        // The ordinary case is unchanged: no pending Stop, fresh live token.
+        super::register_halt(device, libfreemkv::Halt::new());
+        super::install_rip_halt(device);
+        assert!(
+            !super::device_halt(device).unwrap().is_cancelled(),
+            "a rip with no pending Stop must start with a live token"
+        );
+        super::unregister_halt(device);
+    }
+
+    /// Put a device into the state `rip_disc` holds while it works.
+    fn seed_ripping(device: &str) {
+        forget_device(device);
+        super::update_state(
+            device,
+            super::RipState {
+                device: device.to_string(),
+                status: "ripping".to_string(),
+                disc_present: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            super::is_busy(device),
+            "test setup: the device must be busy before the abort"
+        );
+    }
+
+    /// The fsync durability gate late in `rip_disc` bails without writing
+    /// `.done`/`.completed`, on purpose — the output is not provably durable,
+    /// so staging stays resumable. But it reported only through `last_error`
+    /// and returned with `status` still `"ripping"`.
+    ///
+    /// `is_busy()` IS `status == "scanning" | "ripping"`, so the drive stays
+    /// busy for the container's lifetime: the poll loop skips it on every
+    /// tick, /api/rip 409s, and `/api/state` renders a healthy in-progress rip
+    /// that will never end. Every other exit from `rip_disc` leaves a terminal
+    /// status; these must too.
+    #[test]
+    fn post_mux_durability_abort_releases_the_drive() {
+        // Unique to this test: STATE is process-global and a shared fixture
+        // name would race the other tests in this binary.
+        let device = "sg_post_mux_durability_abort_releases_drive_test";
+        seed_ripping(device);
+
+        super::abort_post_mux_preserving_staging(
+            device,
+            "Durability gate failed: could not fsync mux output to stable storage; \
+             withholding .done/.completed and preserving staging for retry",
+            "mux output not durable (fsync failed); rip preserved for retry",
+        );
+
+        assert!(
+            !super::is_busy(device),
+            "the durability-gate early return left status=\"ripping\": is_busy() stays true \
+             forever, so the poll loop skips this drive for the container's lifetime while \
+             /api/state shows a rip in progress"
+        );
+        let st = super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .cloned()
+            .expect("state entry");
+        assert!(
+            st.last_error.contains("not durable"),
+            "the reason must still reach the UI, got {:?}",
+            st.last_error
+        );
+        forget_device(device);
+    }
+
+    /// Same contract for the other post-mux early return: the `.done` /
+    /// `.review` hand-off marker write failed, so the MKV is staged but the
+    /// mover has no signal. Resumable, but this rip attempt is over.
+    #[test]
+    fn post_mux_marker_write_abort_releases_the_drive() {
+        let device = "sg_post_mux_marker_abort_releases_drive_test";
+        seed_ripping(device);
+
+        super::abort_post_mux_preserving_staging(
+            device,
+            ".done marker write failed (disk full); MKV is staged but the mover cannot pick it up",
+            "MKV staged but .done marker write failed: disk full",
+        );
+
+        assert!(
+            !super::is_busy(device),
+            "the hand-off-marker early return left status=\"ripping\": the drive is busy \
+             forever and no further rip or scan can be dispatched to it"
+        );
+        let st = super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .cloned()
+            .expect("state entry");
+        assert!(
+            st.last_error.contains("marker write failed"),
+            "the reason must still reach the UI, got {:?}",
+            st.last_error
+        );
+        forget_device(device);
+    }
+
     #[test]
     fn disc_loss_aborted_sees_the_scanned_discs_quarantine() {
         let device = "sg_loss_aborted_wrapper_test";
@@ -10296,5 +10625,250 @@ mod tests {
 
         forget_device(device);
         forget_device(unscanned);
+    }
+
+    /// A drive that is mid-rip must NOT have its STATE entry deleted just
+    /// because one enumeration pass missed it.
+    ///
+    /// `is_busy` (the double-rip guard) is `STATE[device].status ==
+    /// "scanning" | "ripping"`. The hot-plug reconcile's removal branch used
+    /// to delete that entry unconditionally, so a device that dropped out of
+    /// a single `list_drives()` pass during a hours-long rip (a SCSI/USB
+    /// reset in wedge recovery does exactly this) made `is_busy` return
+    /// false, opening the rip/scan dispatch guards for a second concurrent
+    /// rip on the same drive.
+    #[test]
+    fn hot_unplug_teardown_keeps_the_double_rip_guard_for_a_busy_drive() {
+        // Unique to this test: STATE is a process-global static and a shared
+        // fixture name would race the other tests in this binary.
+        let device = "sg_hotplug_busy_double_rip_guard_test";
+        forget_device(device);
+
+        super::update_state(
+            device,
+            super::RipState {
+                device: device.to_string(),
+                status: "ripping".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            super::is_busy(device),
+            "test setup: the device must be busy before the reconcile"
+        );
+
+        // The device vanished from the fresh enumeration while ripping.
+        let torn_down = super::forget_removed_device(device);
+
+        assert!(
+            super::is_busy(device),
+            "hot-unplug reconcile deleted the STATE entry of a ripping drive — \
+             is_busy() now returns false and a second rip can launch on it"
+        );
+        assert!(
+            !torn_down,
+            "teardown of a busy device must be deferred, not executed"
+        );
+
+        // An idle drive that really went away is still torn down.
+        super::update_state(
+            device,
+            super::RipState {
+                device: device.to_string(),
+                status: "idle".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            super::forget_removed_device(device),
+            "an idle removed device must still be torn down"
+        );
+        assert!(
+            !super::device_known(device),
+            "an idle removed device's STATE entry must be evicted"
+        );
+
+        forget_device(device);
+    }
+
+    /// The fresh-rip completion tail must log and notify BEFORE it ejects,
+    /// and must route the eject through the shared predicate.
+    ///
+    /// `eject_drive` calls `archive_device_log` partway through, so anything
+    /// logged after it lands in the NEXT rip's log ring instead of the
+    /// archived per-rip log — the archived log for a completed rip was missing
+    /// its own "Rip complete" line, and the completion webhook fired after the
+    /// archive too. The eject is also the one completion terminal that tested
+    /// `cfg_read.auto_eject` inline instead of `should_auto_eject`, which is
+    /// the predicate whose whole stated purpose is to be the single place that
+    /// decision lives ("never from the mux worker"). Driving `rip_disc` needs
+    /// a real drive, so pin the ordering and the predicate at source level.
+    #[test]
+    fn the_completion_tail_logs_and_notifies_before_ejecting() {
+        let src = crate::util::source_lf(include_str!("mod.rs"));
+        // Bound the scan to the fresh-rip completion tail: from the last field
+        // of its terminal done-state write to the `should_auto_eject` doc that
+        // follows the function. Both anchors are unique in this file, so the
+        // ordering below is this tail's, not some other eject site's.
+        let start = src
+            .find("largest_gap_ms: sweep_damage_snapshot.largest_gap_ms,")
+            .expect("the fresh-rip completion tail must write its done state");
+        let end = src
+            .find("/// Pure decision: should this completion path auto-eject")
+            .expect("should_auto_eject must still be documented below the tail");
+        let tail = &src[start..end];
+        let log_line = tail
+            .find(r#"crate::log::device_log(device, "Rip complete");"#)
+            .expect("the fresh-rip completion tail must log \"Rip complete\"");
+        let webhook = tail
+            .find("crate::webhook::send_rich(")
+            .expect("the completion tail must fire the rip_complete webhook");
+        let eject = tail
+            .find("eject_drive(device_path);")
+            .expect("the completion tail must still auto-eject");
+        assert!(
+            log_line < eject && webhook < eject,
+            "\"Rip complete\" and the completion webhook must be emitted \
+             BEFORE eject_drive — it archives the device log, so anything \
+             after it is lost from this rip's archived log"
+        );
+        assert!(
+            tail.contains("should_auto_eject(cfg_read.auto_eject, device)"),
+            "this completion terminal must route its eject through \
+             should_auto_eject, like the other two — that predicate is where \
+             the \"never from the mux worker\" rule lives"
+        );
+    }
+
+    /// The teardown must be gated on the WORKER, not on the status the
+    /// worker already wrote.
+    ///
+    /// A rip thread writes its terminal status ("done"/"idle") and then keeps
+    /// running its tail on the same thread: `eject_drive` (`Drive::open` +
+    /// `session.eject()` — real, slow hardware I/O), the eject-failure device
+    /// log lines, and its guard drops. `is_busy` is `status == "scanning" |
+    /// "ripping"`, so for that whole window it reads FALSE while the worker is
+    /// very much alive — and `forget_removed_device` used to take that as
+    /// permission to `drop_session`, evict the STATE row and forget the log
+    /// ring out from under it. `forget_device_session_state`'s doc states this
+    /// exact hazard and defends RIP_THREADS/HALTS against it with
+    /// `JoinHandle::is_finished()`; this pins the other half of the same
+    /// teardown to the same fact.
+    #[test]
+    fn hot_unplug_teardown_defers_while_the_rip_thread_is_still_unwinding() {
+        let device = "sg_hotplug_tail_liveness_test";
+        forget_device(device);
+
+        // A worker that is still running, registered exactly as the rip
+        // dispatch registers one.
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_gate = std::sync::Arc::clone(&gate);
+        super::spawn_rip_thread(device, "rip", move || {
+            // Watchdog, not the expectation: the assertions below run in
+            // microseconds. The bound stops a regression parking this
+            // thread for the life of the suite.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !worker_gate.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+        .expect("spawn must succeed");
+
+        // The worker's own tail: terminal status already written, thread
+        // still executing.
+        super::update_state(
+            device,
+            super::RipState {
+                device: device.to_string(),
+                status: "done".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !super::is_busy(device),
+            "test setup: the unwinding tail is exactly the window is_busy \
+             cannot see"
+        );
+
+        let torn_down = super::forget_removed_device(device);
+
+        assert!(
+            !torn_down,
+            "teardown must be deferred while the rip thread is still \
+             unwinding — its tail is still using the session, the STATE row \
+             and the device log ring"
+        );
+        assert!(
+            super::device_known(device),
+            "the STATE row of a device whose worker is still running must \
+             survive the hot-unplug reconcile"
+        );
+
+        // And it is a DEFERRAL, not a leak: once the worker is gone the next
+        // rescan tears the device down.
+        gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = super::join_rip_thread(device, std::time::Duration::from_secs(5));
+        assert!(
+            super::forget_removed_device(device),
+            "once the worker has exited the deferred teardown must run"
+        );
+        assert!(
+            !super::device_known(device),
+            "the deferred teardown must evict the STATE row when it finally runs"
+        );
+
+        forget_device(device);
+    }
+}
+
+#[cfg(test)]
+mod insert_tick_tests {
+    use super::insert_tick;
+
+    /// A disc seen during the 5 s post-Stop cooldown must still be ripped
+    /// once the cooldown expires.
+    ///
+    /// The trigger is gated on `is_new_insert`, which is false for anything
+    /// in `had_disc`. So if a tick that declines to dispatch still latches
+    /// the device, the disc is recorded as handled when nothing handled it,
+    /// and the poll loop — which has no other auto-rip trigger — will never
+    /// act on it again until a physical eject and reinsert. On an unattended
+    /// daemon that is a silent, permanent stall.
+    ///
+    /// Mutation: return `latch: true` unconditionally from `insert_tick`
+    /// (the pre-fix rule) and the tick-2 assertion goes red.
+    #[test]
+    fn a_disc_seen_during_the_stop_cooldown_is_still_ripped_once_it_expires() {
+        // Tick 1 — new disc, device still cooling down after a Stop.
+        let t1 = insert_tick(true, true);
+        assert!(!t1.dispatch, "the cooldown must suppress the trigger");
+        assert!(
+            !t1.latch,
+            "a disc this tick did NOT act on must not be recorded as seen — \
+             latching it retires the only auto-rip trigger the loop has"
+        );
+
+        // Tick 2 — cooldown expired. Tick 1 did not latch, so the device is
+        // still absent from had_disc and this is still a new insert.
+        let t2 = insert_tick(true, false);
+        assert!(
+            t2.dispatch,
+            "once the cooldown expires the disc must be ripped"
+        );
+        assert!(t2.latch, "a dispatched disc is now genuinely handled");
+    }
+
+    /// The regression this fix could plausibly cause: a disc that simply sits
+    /// in the drive must not re-trigger a rip on every tick.
+    #[test]
+    fn a_resident_disc_does_not_retrigger() {
+        let t = insert_tick(false, false);
+        assert!(!t.dispatch, "an already-handled disc must not re-trigger");
+        assert!(
+            t.latch,
+            "and it stays latched so it keeps not re-triggering"
+        );
     }
 }

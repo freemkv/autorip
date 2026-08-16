@@ -64,6 +64,21 @@ pub struct RipState {
     /// there), because nearly every caller builds a fresh `RipState`.
     #[serde(skip)]
     pub disc_label: String,
+    /// This device's terminal state is a DEFERRAL, not a failure: the work
+    /// stopped for a reason that fixes itself (keys arrive), staging is
+    /// intact, and the next pass will pick it up unchanged.
+    ///
+    /// Set only by the deferral exits themselves. The alternative — inferring
+    /// it from `status == "idle"` — is wrong, and was: `"idle"` is also what
+    /// several HARD failures in `resume_remux` write (no title after key
+    /// resolution, an unreadable mapfile, an over-threshold loss abort), so a
+    /// corrupt ISO was presented to the operator as "no keys yet, it'll mux
+    /// itself". Status says how the device LOOKS; this says what happened.
+    ///
+    /// Server-side bookkeeping only — not serialized. Deliberately NOT
+    /// carried forward across state pushes: it describes one terminal push.
+    #[serde(skip)]
+    pub failure_deferred: bool,
     pub disc_format: String, // "uhd", "bluray", "dvd"
     pub progress_pct: u8,
     pub progress_gb: f64,
@@ -220,6 +235,7 @@ impl Default for RipState {
             disc_present: false,
             disc_name: String::new(),
             disc_label: String::new(),
+            failure_deferred: false,
             disc_format: String::new(),
             progress_pct: 0,
             progress_gb: 0.0,
@@ -310,22 +326,30 @@ pub fn take_title_override(device: &str) -> Option<crate::tmdb::TmdbResult> {
     m.remove(device)
 }
 
-/// Stop cooldowns: device -> epoch seconds when cooldown expires.
+/// Stop cooldowns: device -> the MONOTONIC instant the cooldown expires.
+///
+/// `Instant`, not an `epoch_secs()` deadline. This is a 5-second interval, and
+/// a wall-clock deadline is only as good as the wall clock: a backward step
+/// bigger than the window (NTP correction, host clock reset, VM snapshot
+/// resume) keeps `now < expires` true until the clock catches up, and
+/// `insert_tick` suppresses the auto-scan/auto-rip dispatch for that whole
+/// time — an unattended box quietly ignoring the disc in the drive. `Instant`
+/// cannot step backwards.
 pub(super) static STOP_COOLDOWNS: once_cell::sync::Lazy<
-    Mutex<std::collections::HashMap<String, u64>>,
+    Mutex<std::collections::HashMap<String, std::time::Instant>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
-const STOP_COOLDOWN_SECS: u64 = 5;
+const STOP_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub fn set_stop_cooldown(device: &str) {
-    let now = crate::util::epoch_secs();
+    let expires = std::time::Instant::now() + STOP_COOLDOWN;
     // Recover-and-proceed on poison (same convention as is_busy/update_state).
     let mut cd = STOP_COOLDOWNS.lock().unwrap_or_else(|e| e.into_inner());
-    cd.insert(device.to_string(), now + STOP_COOLDOWN_SECS);
+    cd.insert(device.to_string(), expires);
 }
 
 pub(super) fn is_in_cooldown(device: &str) -> bool {
-    let now = crate::util::epoch_secs();
+    let now = std::time::Instant::now();
     let cd = STOP_COOLDOWNS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&expires) = cd.get(device) {
         return now < expires;
@@ -333,12 +357,30 @@ pub(super) fn is_in_cooldown(device: &str) -> bool {
     false
 }
 
-/// Drop the per-device entries in the auxiliary maps (`TITLE_OVERRIDES`,
-/// `STOP_COOLDOWNS`) on hot-unplug. STATE/log/session are evicted by the
-/// caller; these two maps are the only other per-device state, and without
-/// this they'd accumulate stale entries if device paths churn over a long
-/// container lifetime. Recover-and-proceed on poison (same convention as
-/// the rest of this module).
+/// Drop the auxiliary per-device state on hot-unplug, so nothing accumulates
+/// as device paths churn over a long container lifetime.
+///
+/// The complete per-device inventory, and who evicts each map — this list is
+/// the contract, so add to it when a new per-device map appears:
+///
+/// | map | where | evicted by |
+/// |---|---|---|
+/// | `STATE` | `state.rs` | `forget_removed_device` directly |
+/// | log ring | `log.rs` | `forget_removed_device` (`log::forget_device`) |
+/// | `SESSIONS` | `session.rs` | `forget_removed_device` (`drop_session`) |
+/// | `TITLE_OVERRIDES` | `state.rs` | here |
+/// | `STOP_COOLDOWNS` | `state.rs` | here |
+/// | `DISC_IDENTITY` | `session.rs` | here, via `forget_device_session_state` |
+/// | `RIP_THREADS` | `session.rs` | here, via `forget_device_session_state` (finished handles only) |
+/// | `HALTS` | `session.rs` | here, via `forget_device_session_state` (with the handle) |
+///
+/// The doc this replaces claimed `TITLE_OVERRIDES` and `STOP_COOLDOWNS` were
+/// "the only other per-device state". They are not: `DISC_IDENTITY` had no
+/// remover anywhere in the crate, and a torn-down device's finished
+/// `JoinHandle` sat in `RIP_THREADS` forever — one entry per device path the
+/// kernel ever handed out.
+///
+/// Recover-and-proceed on poison (same convention as the rest of this module).
 pub(super) fn forget_device_state(device: &str) {
     TITLE_OVERRIDES
         .lock()
@@ -348,6 +390,7 @@ pub(super) fn forget_device_state(device: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(device);
+    super::session::forget_device_session_state(device);
 }
 
 /// True when `device` is a known drive tracked in STATE. Used by routes
@@ -590,7 +633,14 @@ pub(super) struct PassContext {
 pub(super) fn byte_offset_in_title(lba: u32, title: &libfreemkv::DiscTitle) -> Option<u64> {
     let mut cumulative = 0u64;
     for ext in &title.extents {
-        if lba >= ext.start_lba && lba < ext.start_lba + ext.sector_count {
+        // `start_lba` / `sector_count` are disc-supplied (UDF allocation
+        // descriptors), so their sum is untrusted arithmetic: a corrupt or
+        // hostile image can overflow it, panicking the rip thread in debug and
+        // wrapping the containment test in release. Widen to u64 — an extent
+        // whose end does not fit in u32 simply cannot contain a u32 LBA past
+        // it, and this keeps the comparison honest instead of wrapped.
+        let end = ext.start_lba as u64 + ext.sector_count as u64;
+        if lba >= ext.start_lba && (lba as u64) < end {
             return Some(cumulative + (lba - ext.start_lba) as u64 * SECTOR_BYTES);
         }
         cumulative += ext.sector_count as u64 * SECTOR_BYTES;
@@ -1151,6 +1201,111 @@ mod tests {
     // `locate_ranges` tests in libfreemkv (src/disc/mod.rs). The terminal
     // `build_bad_ranges` path (still autorip-side, for the done card) keeps its
     // own coverage below.
+
+    /// The post-Stop cooldown is a SHORT INTERVAL, so it must be measured on
+    /// the monotonic clock, not the wall clock.
+    ///
+    /// It was stored as an absolute `epoch_secs()` deadline. A backward wall
+    /// clock step larger than the 5s window — an NTP correction, a container
+    /// host clock reset, a VM resuming from a snapshot — leaves `now <
+    /// expires` true for as long as the clock takes to catch back up, and the
+    /// device stays wedged in "just stopped, ignore this insert" for that whole
+    /// time: `insert_tick` suppresses the auto-scan/auto-rip dispatch, so an
+    /// unattended box quietly ignores the disc sitting in the drive. `Instant`
+    /// cannot step backwards, which is the whole reason it exists.
+    ///
+    /// Proven structurally: stepping the system clock inside the test process
+    /// is not portable. The behavioural halves (active when set, inactive once
+    /// the deadline has passed) are pinned below.
+    #[test]
+    fn the_stop_cooldown_is_not_measured_on_the_wall_clock() {
+        let src = crate::util::source_lf(include_str!("state.rs"));
+        let start = src
+            .find("pub fn set_stop_cooldown(")
+            .expect("set_stop_cooldown must exist");
+        let end = src
+            .find("/// Drop the auxiliary per-device state on hot-unplug")
+            .expect("forget_device_state's doc must follow the cooldown fns");
+        let region = &src[start..end];
+        assert!(
+            !region.contains("epoch_secs()"),
+            "the stop cooldown must not be derived from the wall clock — a \
+             backward NTP step wedges the device out of auto-dispatch for as \
+             long as the clock is behind"
+        );
+        assert!(
+            region.contains("Instant::now()"),
+            "the cooldown deadline must be monotonic (Instant)"
+        );
+    }
+
+    /// Both ends of the cooldown's observable contract, through the real
+    /// accessors: a freshly-set cooldown suppresses dispatch, and a deadline
+    /// that has already passed does not.
+    #[test]
+    fn a_stop_cooldown_expires() {
+        let dev = "sg_cooldown_expiry_test";
+        set_stop_cooldown(dev);
+        assert!(
+            is_in_cooldown(dev),
+            "a cooldown just set must suppress the next insert tick"
+        );
+
+        // A deadline in the past is exactly what the poll loop sees once the
+        // window has elapsed.
+        STOP_COOLDOWNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                dev.to_string(),
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            );
+        assert!(
+            !is_in_cooldown(dev),
+            "once the deadline has passed the device must dispatch again — \
+             a cooldown that never expires silently stops ripping the disc"
+        );
+
+        STOP_COOLDOWNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(dev);
+    }
+
+    /// A disc-supplied extent must never be able to panic the rip thread.
+    ///
+    /// `start_lba` and `sector_count` come straight from the UDF allocation
+    /// descriptors — untrusted, disc-controlled data. `start_lba +
+    /// sector_count` is `u32` arithmetic: a corrupt or hostile image with
+    /// `start_lba` near `u32::MAX` overflows, which panics in debug (killing
+    /// the rip thread mid-rip, on damage attribution of all things) and wraps
+    /// in release, making the containment test answer nonsense. An extent that
+    /// cannot express its own end simply does not contain the LBA.
+    #[test]
+    fn byte_offset_in_title_survives_an_overflowing_extent() {
+        let mut title = minimal_title();
+        title.extents = vec![libfreemkv::Extent {
+            start_lba: u32::MAX - 4,
+            sector_count: u32::MAX,
+        }];
+
+        // Any LBA at all: the question is only whether this panics/wraps.
+        let below = byte_offset_in_title(1000, &title);
+        let inside = byte_offset_in_title(u32::MAX - 2, &title);
+
+        assert_eq!(
+            below, None,
+            "an LBA below an extent that cannot express its own end must not \
+             be reported as inside it (wrapped comparison)"
+        );
+        // Two sectors past the extent's start, so two sectors' worth of bytes
+        // into the title.
+        assert_eq!(
+            inside,
+            Some(2 * SECTOR_BYTES),
+            "an LBA inside the extent must still map to its byte offset"
+        );
+    }
 
     #[test]
     fn build_bad_ranges_excludes_not_yet_tried() {

@@ -19,6 +19,28 @@ pub struct MoveState {
 pub static MOVE_STATE: once_cell::sync::Lazy<Mutex<Option<MoveState>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
+/// Clears [`MOVE_STATE`] when the per-directory pass leaves scope, **by any
+/// path**: normal completion, one of the four failure `continue`s, or an
+/// unwind.
+///
+/// The clear used to be the last statement of the loop body. Every failure
+/// branch (`any_collision`, `any_size_mismatch`, `any_post_copy_invalid`,
+/// `any_failed`) `continue`s past it, and the progress bar had already been
+/// published by the copy's `on_progress` callback — so a blocked delivery
+/// left "60%, ETA 1:23" on the System page forever. Nothing else writes
+/// `None`: the only other writer is `on_progress` itself, and it only ever
+/// writes `Some`. An RAII guard is used rather than a clear on each branch
+/// so a new early exit cannot reintroduce the leak.
+struct MoveStateGuard;
+
+impl Drop for MoveStateGuard {
+    fn drop(&mut self) {
+        // Recover-and-proceed on poison: skipping the clear is exactly the
+        // stuck-bar-for-the-process-lifetime failure this guard prevents.
+        *MOVE_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 /// Per-staging-dir error surfaced to the System page so the user can act
 /// on it (e.g. orphaned source files that the container can't unlink due
 /// to NFS squash perms). Keyed by staging dir path. The stored entry is
@@ -57,6 +79,58 @@ fn clear_error(path: &str) {
     if let Ok(mut m) = MOVE_ERRORS.lock() {
         m.remove(path);
     }
+}
+
+/// Drop any `MOVE_ERRORS` row keyed by this DESTINATION path, on every exit
+/// from [`move_file`] that leaves valid bytes at `dest`.
+///
+/// The "partial copy could not be removed" row is the one row the mover keys
+/// by destination rather than by staging dir, and it had no automatic remover
+/// at all: `clear_error`'s only other call site is the staging clean-teardown
+/// arm (keyed by the staging dir), and `prune_move_errors` deliberately skips
+/// keys outside the staging root. Every rip has its own destination filename,
+/// so a library mount with a persistent unlink fault added one PERMANENT key
+/// per rip, unbounded, on a daemon nobody is watching — the operator's ✕ was
+/// the only way out.
+///
+/// A move that ends with validated bytes at `dest` is proof that whatever the
+/// row described is gone, which is exactly the self-healing contract
+/// [`clear_move_error`] already documents: dismiss a solved error and it stays
+/// gone, while a still-real one re-records within a tick.
+fn clear_stale_dest_error(dest: &Path) {
+    clear_error(&dest.to_string_lossy());
+}
+
+/// Drop [`MOVE_ERRORS`] rows whose staging dir is gone.
+///
+/// `clear_error` runs at exactly one place — the clean-teardown arm of the
+/// per-dir loop — so an entry can only be cleared by a *later pass over the
+/// same dir*. Both hints the mover prints for a blocked teardown tell the
+/// operator to `rm -rf` that staging dir by hand; the moment they do, the dir
+/// stops appearing in the pass, no later tick ever revisits the key, and the
+/// row it told them to fix is pinned on the System page until they also find
+/// the ✕. The whole self-healing story in `clear_move_error`'s doc — dismiss
+/// it, and a still-real block re-records within a tick — only holds for dirs
+/// that still exist.
+///
+/// `seen` is every staging child this pass listed. A key is dropped only if
+/// it is a direct child of `staging_root` AND was absent from that listing:
+///
+/// * Keys outside the staging root are left alone. One `record_error` call
+///   site keys by DESTINATION path instead (the "partial copy could not be
+///   removed" row), which lives on the library mount — a different mount,
+///   with a different liveness story — and is not this function's business.
+/// * The caller only reaches here after `read_dir(staging_root)` SUCCEEDED,
+///   so a dropped staging mount returns early and prunes nothing. That is
+///   the case where "the dir isn't there" must not mean "the problem went
+///   away": every row would vanish at once, precisely when the operator
+///   needs them.
+fn prune_move_errors(staging_root: &str, seen: &std::collections::HashSet<String>) {
+    let root = Path::new(staging_root);
+    // Recover-and-proceed on poison, matching record_error's peers: leaving
+    // the map untouched is the unbounded growth this exists to stop.
+    let mut m = MOVE_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    m.retain(|key, _| Path::new(key).parent() != Some(root) || seen.contains(key));
 }
 
 /// Operator-initiated clear of a single move error (the System-tab ✕). Removes
@@ -229,6 +303,26 @@ fn copy_counting(
     dest: &Path,
     written: &std::sync::atomic::AtomicU64,
 ) -> std::io::Result<u64> {
+    copy_counting_cancellable(src, dest, written, &|| {
+        crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// [`copy_counting`] with the abort signal injected.
+///
+/// The only reason this seam exists is testability: `crate::SHUTDOWN` is a
+/// process-global `AtomicBool` that the mover, muxer and poll loop all read,
+/// so a test that set it to drive the abort path would abort every other
+/// mover test running in parallel in the same binary. The loop body below —
+/// the thing that actually has to notice — is the same code production runs;
+/// only the source of the bit differs, and `copy_counting` above is the one
+/// line that binds it to `SHUTDOWN`.
+fn copy_counting_cancellable(
+    src: &Path,
+    dest: &Path,
+    written: &std::sync::atomic::AtomicU64,
+    cancel: &dyn Fn() -> bool,
+) -> std::io::Result<u64> {
     use std::io::{Read, Write};
     use std::sync::atomic::Ordering;
 
@@ -291,6 +385,22 @@ fn copy_counting(
         let mut buf = vec![0u8; 4 * 1024 * 1024];
         let mut total = 0u64;
         loop {
+            // Honour SIGTERM between chunks. `move_file`'s shutdown branch
+            // joins this worker and its comment claims the join is "bounded
+            // to its current chunk write" — that was only true if the loop
+            // itself checks, and it didn't: the join blocked for the whole
+            // remaining multi-GB copy while docker stop's 10 s grace ran out
+            // and SIGKILL landed mid-write. Returning Interrupted here takes
+            // the `Err` arm below, which unlinks the `.part-<pid>` temp, so
+            // an aborted copy leaves nothing behind and the next run starts
+            // clean. The source is untouched — `move_file` only unlinks it
+            // after a successful copy.
+            if cancel() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "copy aborted: shutdown requested",
+                ));
+            }
             let n = reader.read(&mut buf)?;
             if n == 0 {
                 break;
@@ -642,6 +752,12 @@ fn check_and_move(cfg: &Config) {
         }
     };
 
+    // Every staging child this pass listed, for the `MOVE_ERRORS` prune
+    // below. Populated for every directory we see, including the ones we
+    // skip — a dir that is still ripping is present, just not ready, and
+    // must keep any error row it already has.
+    let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for entry in entries {
         // Don't silently drop a per-entry error (e.g. NFS ESTALE on a
         // specific dentry): on a loaded share a completed rip would be
@@ -661,6 +777,7 @@ fn check_and_move(cfg: &Config) {
         if !dir.is_dir() {
             continue;
         }
+        seen_dirs.insert(dir.to_string_lossy().to_string());
 
         let marker_path = dir.join(".done");
         // No pre-flight exists() check: it races with the read below (a `.done`
@@ -773,64 +890,25 @@ fn check_and_move(cfg: &Config) {
         // IS the deliverable (the ripper skipped the title mux), so the
         // staging dir holds no `.mkv` — only the `.iso` to promote.
         let move_iso = cfg.keep_iso || crate::ripper::output_is_iso_image(&cfg.output_format);
-        let ripped_files: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
-            Ok(entries) => {
-                // Don't `.filter_map(|e| e.ok())` away per-entry errors: on a
-                // cold-cache or degraded NFS mount a single DirEntry I/O error
-                // can silently drop the only .mkv, leaving `ripped_files` empty
-                // and the job skipped every tick with no operator visibility.
-                // Mirror the outer staging-root loop (line ~550) and
-                // `find_iso_and_mapfile` (resume.rs): match each entry
-                // explicitly and surface the error via record_error.
-                let mut files = Vec::new();
-                for entry in entries {
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(e) => {
-                            record_error(
-                                &dir.to_string_lossy(),
-                                &format!(
-                                    "per-entry error listing staging directory {}: {}",
-                                    dir.display(),
-                                    e
-                                ),
-                                "check that the staging mount is healthy and readable; \
-                                 staging contents are unknown for this directory",
-                            );
-                            continue;
-                        }
-                    };
-                    let p = entry.path();
-                    if p.extension()
-                        .and_then(|x| x.to_str())
-                        .map(|ext| match ext {
-                            // mk3d is byte-identical Matroska (3D main feature) —
-                            // deliver it exactly like mkv.
-                            "mkv" | "mk3d" | "m2ts" => true,
-                            "iso" => move_iso,
-                            _ => false,
-                        })
-                        .unwrap_or(false)
-                    {
-                        files.push(p);
-                    }
+        let (ripped_files, listing_complete): (Vec<std::path::PathBuf>, bool) =
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => {
+                    collect_ripped_files(entries.map(|r| r.map(|e| e.path())), move_iso, &dir)
                 }
-                files
-            }
-            Err(e) => {
-                // Enumerating the staging dir's contents failed (e.g. a
-                // transient NFS read_dir error). Without this arm the dir
-                // would be skipped silently every tick — a `.done` marker
-                // that never gets acted on, invisible on the System page.
-                // Surface it like every other error path in this function.
-                record_error(
-                    &dir.to_string_lossy(),
-                    &format!("cannot list staging directory {}: {}", dir.display(), e),
-                    "check that the staging mount is healthy and readable",
-                );
-                continue;
-            }
-        };
+                Err(e) => {
+                    // Enumerating the staging dir's contents failed (e.g. a
+                    // transient NFS read_dir error). Without this arm the dir
+                    // would be skipped silently every tick — a `.done` marker
+                    // that never gets acted on, invisible on the System page.
+                    // Surface it like every other error path in this function.
+                    record_error(
+                        &dir.to_string_lossy(),
+                        &format!("cannot list staging directory {}: {}", dir.display(), e),
+                        "check that the staging mount is healthy and readable",
+                    );
+                    continue;
+                }
+            };
 
         if ripped_files.is_empty() {
             // Nothing the mover should promote. Skip; the dir's lifetime
@@ -841,6 +919,12 @@ fn check_and_move(cfg: &Config) {
         }
 
         let dir_str = dir.to_string_lossy().to_string();
+
+        // From here on the pass can publish move progress, and can leave by
+        // four different `continue`s. Arm the RAII clear before the first of
+        // them. (Placed after the not-ready skips above, which return before
+        // any progress is published.)
+        let _move_state = MoveStateGuard;
 
         // Build destination paths
         let mut planned_moves: Vec<(std::path::PathBuf, String)> = Vec::new();
@@ -1234,8 +1318,25 @@ fn check_and_move(cfg: &Config) {
             continue;
         }
 
-        // All files are accounted for (Skipped / Moved / MovedDirty). Try to
-        // tear down the staging dir; if it can't be removed (typically
+        // Every file this pass could SEE is accounted for — which is not the
+        // same as every file that is there. A per-entry listing error dropped
+        // an entry that was never planned, never copied and never delivered,
+        // and the teardown below is `remove_dir_all`: it would delete that
+        // file and log "Move complete" over the top of it. The listing being
+        // incomplete is exactly as disqualifying as a failed copy, so it is
+        // handled like one — leave the dir, keep the row `collect_ripped_files`
+        // already recorded (with the specific I/O error in it), retry next
+        // tick. Placed after the moves so the entries that DID enumerate are
+        // still delivered; only the destructive half is withheld.
+        if !listing_complete {
+            crate::log::syslog(&format!(
+                "Staging teardown skipped — directory could not be fully listed: {}",
+                dir.display()
+            ));
+            continue;
+        }
+
+        // Try to tear down the staging dir; if it can't be removed (typically
         // because the orphan source files can't be unlinked), surface the
         // dir on the UI with a remediation hint.
         let cleanup_err = std::fs::remove_dir_all(&dir).err();
@@ -1264,11 +1365,69 @@ fn check_and_move(cfg: &Config) {
             crate::webhook::send_move(cfg, &display_name, dest_path);
         }
 
-        // Clear move state
-        if let Ok(mut ms) = MOVE_STATE.lock() {
-            *ms = None;
+        // MOVE_STATE is cleared by `_move_state`'s Drop as this iteration
+        // ends — including via the four `continue`s above.
+    }
+
+    prune_move_errors(staging_root, &seen_dirs);
+}
+
+/// The deliverable files in one staging dir, and whether the listing was
+/// COMPLETE.
+///
+/// Don't `.filter_map(|e| e.ok())` away per-entry errors: on a cold-cache or
+/// degraded NFS mount a single `DirEntry` I/O error can silently drop the only
+/// `.mkv`. Each error is surfaced via `record_error` (keyed by the staging dir,
+/// the same key the teardown arms use).
+///
+/// The second half of the return is the one the staging dir's LIFE depends on.
+/// A dropped entry is a file this pass cannot see — never planned, never
+/// copied, never delivered — and the caller goes on to `remove_dir_all` the
+/// directory once the entries it COULD see are accounted for. `false` here is
+/// what stops that: an incomplete listing is not a completed move.
+fn collect_ripped_files<I>(
+    entries: I,
+    move_iso: bool,
+    dir: &Path,
+) -> (Vec<std::path::PathBuf>, bool)
+where
+    I: IntoIterator<Item = std::io::Result<std::path::PathBuf>>,
+{
+    let mut files = Vec::new();
+    let mut complete = true;
+    for entry in entries {
+        let p = match entry {
+            Ok(p) => p,
+            Err(e) => {
+                complete = false;
+                record_error(
+                    &dir.to_string_lossy(),
+                    &format!(
+                        "per-entry error listing staging directory {}: {}",
+                        dir.display(),
+                        e
+                    ),
+                    "check that the staging mount is healthy and readable; \
+                     staging contents are unknown for this directory",
+                );
+                continue;
+            }
+        };
+        if p.extension()
+            .and_then(|x| x.to_str())
+            .map(|ext| match ext {
+                // mk3d is byte-identical Matroska (3D main feature) —
+                // deliver it exactly like mkv.
+                "mkv" | "mk3d" | "m2ts" => true,
+                "iso" => move_iso,
+                _ => false,
+            })
+            .unwrap_or(false)
+        {
+            files.push(p);
         }
     }
+    (files, complete)
 }
 
 /// The media type used to ROUTE a planned move, coalescing an empty
@@ -1715,6 +1874,7 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             // post-copy validation the copy path runs before accepting it
             // as already-moved; on failure, fall through to a real copy.
             if check_post_copy(src, dest).is_ok() {
+                clear_stale_dest_error(dest);
                 return MoveOutcome::Skipped;
             }
             crate::log::syslog(&format!(
@@ -1731,7 +1891,33 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
         }
     }
     // Pre-flight: src missing but dest present — earlier rename succeeded.
-    if let (Err(_), Ok(d)) = (&src_meta, &dest_meta)
+    //
+    // Must be a genuine NotFound, not a bare `Err(_)`. Any OTHER stat
+    // failure (EACCES from a permission change, EIO from a failing disk,
+    // ESTALE on NFS) means src's fate is UNKNOWN — it may still be present
+    // and be the only good copy, e.g. a `MovedDirty` leftover from a prior
+    // tick whose unlink of src failed after a successful cross-fs copy. A
+    // stale PARTIAL at dest from an unrelated earlier attempt would also
+    // satisfy `is_file() && len() > 0` with no size/content check possible
+    // (src_meta is unavailable), so treating any error as "src is gone" can
+    // report `Moved` for a dest that is actually garbage — the caller then
+    // tears down the staging dir, permanently losing the real src. Matches
+    // the convention already used elsewhere in this file (`:585`, `:707`,
+    // `:717`) of branching on `ErrorKind::NotFound` specifically rather than
+    // treating every stat error alike.
+    //
+    // A non-NotFound error intentionally falls through to the rename/copy
+    // attempt below instead of returning here: that is a deliberate "we
+    // don't know src's state, so try the normal path and let it fail
+    // safely on its own terms" rather than second-guessing it with a new
+    // outcome. That fall-through is safe for dest: if the copy attempt then
+    // fails to even open src (same underlying fault), the failure-cleanup
+    // arms below delete dest ONLY when `dest_absent_before` — a dest that
+    // pre-dates this attempt, as it does here, is left in place. See the
+    // `dest_absent_before` doc below for why "unknown prior state" must not
+    // authorise a delete either.
+    if let (Err(e), Ok(d)) = (&src_meta, &dest_meta)
+        && e.kind() == std::io::ErrorKind::NotFound
         && d.is_file()
         && d.len() > 0
     {
@@ -1739,10 +1925,34 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
     }
 
     if std::fs::rename(src, dest).is_ok() {
+        clear_stale_dest_error(dest);
         return MoveOutcome::Moved;
     }
 
     let dest_str = dest.to_string_lossy().to_string();
+    // Did `dest` positively NOT exist before this attempt started?
+    //
+    // `dest_meta` was taken above, BEFORE any byte was written, so it is the
+    // only evidence of dest's prior state. The failure-cleanup arms below may
+    // only delete `dest` when this is true — anything else at that name
+    // PRE-DATES us and is not ours to remove. It is routinely a complete,
+    // validated copy: a `MovedDirty` leftover (copy ok, unlink of src failed
+    // on an earlier tick). If src then develops a persistent stat/open fault,
+    // an unconditional cleanup would delete the only readable copy while src
+    // sits stuck — unrecoverable loss.
+    //
+    // Only a genuine NotFound counts, matching the convention used by the
+    // src-missing pre-flight above (`:585`, `:707`, `:717`): any OTHER stat
+    // error (EACCES on an existing-but-unreadable dest, ESTALE on NFS) leaves
+    // dest's prior state UNKNOWN, and "unknown" must not authorise a delete.
+    //
+    // Keeping a pre-existing dest cannot wedge the next tick: the Skipped
+    // pre-flight needs equal size AND matching content AND a passing
+    // post-copy validation, so a stale/partial leftover simply falls through
+    // to the rename/copy path and is overwritten (see
+    // `move_file_overwrites_when_dest_size_differs`).
+    let dest_absent_before =
+        matches!(&dest_meta, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     let src_size = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let total_gb = src_size as f64 / crate::util::BYTES_PER_GIB;
 
@@ -1790,6 +2000,7 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                         | MoveError::Unreadable(_) => MoveOutcome::PostCopyInvalid,
                     };
                 }
+                clear_stale_dest_error(dest);
                 return match std::fs::remove_file(src) {
                     Ok(_) => MoveOutcome::Moved,
                     Err(_) => MoveOutcome::MovedDirty,
@@ -1814,25 +2025,52 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 // move) — the bogus row stuck on the System page until it was
                 // dismissed by hand. Only a real, still-present leftover is
                 // worth surfacing.
-                match std::fs::remove_file(&dest_str) {
-                    Ok(()) => {}
-                    Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(rm) => {
-                        record_error(
-                            &dest_str,
-                            "partial copy could not be removed",
-                            &format!(
-                                "partial copy could not be removed from {dest_str}; delete manually to unblock ({rm})"
-                            ),
-                        );
+                //
+                // And it is only OURS to remove when `dest` was positively
+                // absent before this attempt (`dest_absent_before`). A dest
+                // that pre-dates us is a different file — typically a
+                // complete `MovedDirty` copy — and deleting it here destroys
+                // the only good bytes when src is the side that is faulting.
+                if dest_absent_before {
+                    match std::fs::remove_file(&dest_str) {
+                        Ok(()) => {}
+                        // Record ONLY a leftover that is really there. Testing
+                        // the errno is not the same question: `unlink` in a
+                        // directory the container cannot write reports the
+                        // permission failure (EACCES), not ENOENT, even when
+                        // there is no file at that name — which is precisely
+                        // the NFS-squash export this hint is written for. The
+                        // errno filter therefore missed its own scenario and
+                        // told the operator to hand-delete a file that never
+                        // existed. Ask the filesystem what is there instead.
+                        Err(rm) => {
+                            if Path::new(&dest_str).exists() {
+                                record_error(
+                                    &dest_str,
+                                    "partial copy could not be removed",
+                                    &format!(
+                                        "partial copy could not be removed from {dest_str}; delete manually to unblock ({rm})"
+                                    ),
+                                );
+                            }
+                        }
                     }
+                } else {
+                    crate::log::syslog(&format!(
+                        "Copy failed; leaving pre-existing destination in place: {}",
+                        dest_str
+                    ));
                 }
                 crate::log::syslog(&format!("fs::copy failed for {}: {}", dest_str, e));
                 return MoveOutcome::Failed;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                // Sender dropped without sending — worker panicked.
-                let _ = std::fs::remove_file(&dest_str);
+                // Sender dropped without sending — worker panicked. Same
+                // ownership rule as the Ok(Err) arm: only clean up a dest
+                // this attempt could have created.
+                if dest_absent_before {
+                    let _ = std::fs::remove_file(&dest_str);
+                }
                 crate::log::syslog(&format!("fs::copy thread panicked for {}", dest_str));
                 return MoveOutcome::Failed;
             }
@@ -1841,13 +2079,22 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 // sleep only gates BETWEEN ticks, so without this a multi-GB
                 // cross-fs copy would run to completion ignoring the signal,
                 // and docker stop's 10 s grace would SIGKILL mid-write. Join
-                // the worker (bounded to its current chunk write) and bail.
+                // the worker and bail. The join is bounded to the worker's
+                // current 4 MiB chunk because `copy_counting`'s loop polls
+                // the SAME flag at the top of every iteration — without that
+                // poll (it was missing until this audit) this join waited out
+                // the entire remaining copy, i.e. exactly the multi-GB stall
+                // the branch exists to avoid.
                 if crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = copy_handle.join();
                     // Drop the partial destination (see Ok(Err) arm) so a
                     // restart's first tick doesn't wedge on a size-mismatch
-                    // Collision against this interrupted copy.
-                    let _ = std::fs::remove_file(&dest_str);
+                    // Collision against this interrupted copy — but only if
+                    // this attempt could have created it; a pre-existing dest
+                    // is not ours to delete on the way out.
+                    if dest_absent_before {
+                        let _ = std::fs::remove_file(&dest_str);
+                    }
                     crate::log::syslog(&format!("Move aborted (shutdown) mid-copy: {}", dest_str));
                     return MoveOutcome::Failed;
                 }
@@ -2433,6 +2680,52 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"new full content");
     }
 
+    /// A destination-keyed `MOVE_ERRORS` row must clear itself once a later
+    /// move to that same destination succeeds.
+    ///
+    /// This is the ONLY row the mover keys by destination path rather than by
+    /// staging dir, and nothing automatic ever removed it: `clear_error` is
+    /// called only from the staging clean-teardown arm, and `prune_move_errors`
+    /// deliberately skips keys outside the staging root. On a library mount
+    /// with a persistent unlink fault, every rip produced a NEW permanent key
+    /// (each disc has its own destination filename) and the map grew for the
+    /// container's lifetime, on a daemon nobody is watching. A later
+    /// *successful* move to that destination is proof the row is stale — that
+    /// is the self-healing behaviour `clear_move_error`'s doc already promises
+    /// for the staging-keyed rows.
+    #[test]
+    fn a_successful_move_clears_a_stale_destination_keyed_error() {
+        let _g = errors_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.mkv");
+        let dest = tmp.path().join("b.mkv");
+        std::fs::write(&src, b"complete content").unwrap();
+        let dest_key = dest.to_string_lossy().to_string();
+
+        // The row a previous failed copy + failed cleanup left behind.
+        record_error(
+            &dest_key,
+            "partial copy could not be removed",
+            "delete manually to unblock",
+        );
+        assert!(
+            error_snapshot(&dest_key).is_some(),
+            "fixture: the stale row must exist before the successful move"
+        );
+
+        let outcome = move_file(&src, &dest, &noop_progress);
+
+        let left = error_snapshot(&dest_key);
+        clear_error(&dest_key);
+        assert_eq!(outcome, MoveOutcome::Moved, "the move itself must succeed");
+        assert!(
+            left.is_none(),
+            "a successful move to this destination proves the stuck-partial \
+             row is stale; leaving it makes MOVE_ERRORS grow one permanent \
+             entry per rip with no automatic remover"
+        );
+    }
+
     /// Partial-dest cleanup contract (already-landed fix). When the copy
     /// path fails, `move_file` must NOT leave a partial/garbage destination
     /// behind — otherwise the next mover tick sees a phantom size-mismatch
@@ -2507,6 +2800,58 @@ mod tests {
         std::fs::write(&dest, b"already there").unwrap();
         let outcome = move_file(&src, &dest, &noop_progress);
         assert_eq!(outcome, MoveOutcome::Moved);
+    }
+
+    /// The pre-flight "src missing, dest present" branch must require a
+    /// genuine `NotFound` on the src stat, not just any error. A bare
+    /// `Err(_)` also matches EACCES/EIO/ESTALE — none of which prove src is
+    /// gone. If the stat fails for one of those reasons while src is still
+    /// physically present (here: its parent directory loses traversal
+    /// permission, so `stat` can't even resolve the path), src has NOT been
+    /// consumed by an earlier rename. Reporting `Moved` anyway would let the
+    /// caller tear down the staging dir — deleting the still-present,
+    /// possibly-only-good src — on the strength of a dest that could just as
+    /// easily be a stale partial from an unrelated earlier attempt.
+    #[cfg(unix)]
+    #[test]
+    fn move_file_does_not_report_moved_on_non_notfound_src_stat_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("staging");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("a.mkv");
+        std::fs::write(&src, b"still here, just unreadable right now").unwrap();
+
+        let dest = tmp.path().join("b.mkv");
+        // Predates this attempt — could be the real completed copy (e.g. a
+        // MovedDirty leftover whose src unlink failed on a prior tick) or a
+        // stale partial from an unrelated attempt. Either way, not proof.
+        std::fs::write(&dest, b"already at the destination").unwrap();
+
+        // Strip all permissions from src's PARENT so `stat(src)` fails with
+        // EACCES (can't even traverse to look it up) rather than ENOENT —
+        // src still physically exists on disk.
+        std::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let perms_enforced = std::fs::File::open(&src).is_err();
+        let outcome = move_file(&src, &dest, &noop_progress);
+
+        // Restore so tempdir cleanup can remove everything.
+        std::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if !perms_enforced {
+            eprintln!(
+                "SKIP move_file_does_not_report_moved_on_non_notfound_src_stat_error: \
+                 running with read-through privileges (root?)"
+            );
+            return;
+        }
+        assert_ne!(
+            outcome,
+            MoveOutcome::Moved,
+            "a non-NotFound src stat error proves nothing about src; got {outcome:?}"
+        );
     }
 
     #[test]
@@ -3231,6 +3576,76 @@ mod tests {
         assert_eq!(std::fs::read(&dst).unwrap(), vec![0x11u8; 1024]);
     }
 
+    /// SIGTERM must be observed BETWEEN CHUNKS, not at the end of the copy.
+    ///
+    /// `move_file`'s shutdown branch joins the copy worker and its comment
+    /// promised the join was "bounded to its current chunk write" — but the
+    /// copy loop polled nothing, so the join waited out the whole remaining
+    /// multi-GB copy while `docker stop`'s 10 s grace expired and SIGKILL
+    /// landed mid-write. Drive the real loop with the abort signal already
+    /// raised and require it to give up.
+    #[test]
+    fn copy_counting_aborts_between_chunks_when_shutdown_is_requested() {
+        use std::sync::atomic::AtomicU64;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("abort-src.bin");
+        let dst = tmp.path().join("abort-final.bin");
+        // Two full 4 MiB chunks plus change, so "abort" and "ran to
+        // completion" are distinguishable by the byte counter.
+        std::fs::write(&src, vec![0x7Eu8; 9 * 1024 * 1024]).unwrap();
+        let written = AtomicU64::new(0);
+
+        let err = copy_counting_cancellable(&src, &dst, &written, &|| true)
+            .expect_err("a copy must not run to completion after shutdown is requested");
+
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted,
+            "the abort must be reported as Interrupted, not as a copy failure"
+        );
+        assert_eq!(
+            written.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the abort must be seen before the first chunk is written"
+        );
+        assert!(
+            !dst.exists(),
+            "an aborted copy must not leave a file at the final name"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".part-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "an aborted copy must unlink its .part temp, found {leftovers:?}"
+        );
+        assert_eq!(
+            std::fs::read(&src).unwrap().len(),
+            9 * 1024 * 1024,
+            "the source must survive an aborted copy untouched"
+        );
+    }
+
+    /// The counterpart: a predicate that never fires must copy everything.
+    /// Without this, "abort immediately, always" would satisfy the test
+    /// above.
+    #[test]
+    fn copy_counting_completes_when_the_abort_signal_stays_low() {
+        use std::sync::atomic::AtomicU64;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("noabort-src.bin");
+        let dst = tmp.path().join("noabort-final.bin");
+        let data = vec![0x2Cu8; 5 * 1024 * 1024];
+        std::fs::write(&src, &data).unwrap();
+        let written = AtomicU64::new(0);
+        let n = copy_counting_cancellable(&src, &dst, &written, &|| false).unwrap();
+        assert_eq!(n, 5 * 1024 * 1024);
+        assert_eq!(std::fs::read(&dst).unwrap(), data);
+    }
+
     // ---- post-copy integrity + collision hardening tests ----
 
     /// Repo-local, gitignored scratch dir (never /tmp). Each call makes a
@@ -3679,6 +4094,136 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// DATA LOSS regression: a failed copy must never delete a destination
+    /// that PRE-DATES the attempt.
+    ///
+    /// `dest` legitimately pre-exists as a `MovedDirty` leftover — a
+    /// cross-fs copy that SUCCEEDED and passed post-copy validation, but
+    /// whose unlink of `src` failed on an earlier tick. That file is a
+    /// complete, good copy and may be the only readable one.
+    ///
+    /// Shape that reaches the failure-cleanup arm with such a dest: `src`
+    /// develops a persistent read fault. `fresh_metadata` opens the file, so
+    /// the stat fails EACCES (NOT NotFound) — which skips BOTH pre-flights
+    /// (the size/content one needs `Ok` on both sides; the src-missing one
+    /// needs a genuine NotFound). `rename(2)` then fails (unwritable staging
+    /// dir), the copy fails at `File::open(src)`, and the cleanup arm runs.
+    /// Pre-fix it unconditionally `remove_file`d `dest`, destroying the only
+    /// good copy while `src` sat stuck and unreadable.
+    #[cfg(unix)]
+    #[test]
+    fn move_file_copy_failure_keeps_pre_existing_dest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("keepdest");
+        let src_dir = dir.join("staging");
+        let dest_dir = dir.join("library");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let src = src_dir.join("keepdest.mkv");
+        let dest = dest_dir.join("keepdest.mkv");
+        write_minimal_mkv(&src, b"staging source bytes that cannot be read");
+        // The complete library copy an earlier MovedDirty tick left behind.
+        write_minimal_mkv(&dest, b"the complete library copy from an earlier tick");
+        let good_bytes = std::fs::read(&dest).unwrap();
+
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let readable_anyway = std::fs::File::open(&src).is_ok();
+        let outcome = if readable_anyway {
+            MoveOutcome::Failed // placeholder; skipped below
+        } else {
+            let _g = errors_guard();
+            let dest_key = dest.to_string_lossy().to_string();
+            clear_error(&dest_key);
+            let o = move_file(&src, &dest, &noop_progress);
+            clear_error(&dest_key);
+            assert!(
+                dest.exists(),
+                "a pre-existing destination must survive a failed copy — it \
+                 may be the only good copy of the rip"
+            );
+            assert_eq!(
+                std::fs::read(&dest).unwrap(),
+                good_bytes,
+                "the pre-existing destination must be left byte-identical"
+            );
+            o
+        };
+
+        std::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if readable_anyway {
+            eprintln!(
+                "SKIP move_file_copy_failure_keeps_pre_existing_dest: \
+                 running with read-through privileges"
+            );
+        } else {
+            assert_eq!(outcome, MoveOutcome::Failed, "a failed copy is Failed");
+            assert!(src.exists(), "the source must survive a failed move");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Complement of the test above, and the behaviour that must NOT
+    /// regress: when `dest` did NOT pre-date the attempt, the failure
+    /// cleanup still runs and nothing this attempt produced is left at the
+    /// destination name. (Same chmod harness; `dest` is absent at entry.)
+    #[cfg(unix)]
+    #[test]
+    fn move_file_copy_failure_removes_this_attempts_dest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("dropdest");
+        let src_dir = dir.join("staging");
+        let dest_dir = dir.join("library");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let src = src_dir.join("dropdest.mkv");
+        let dest = dest_dir.join("dropdest.mkv");
+        write_minimal_mkv(&src, b"staging source bytes that cannot be read");
+        assert!(!dest.exists(), "dest must not pre-date the attempt");
+
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let readable_anyway = std::fs::File::open(&src).is_ok();
+        let outcome = if readable_anyway {
+            MoveOutcome::Failed // placeholder; skipped below
+        } else {
+            let _g = errors_guard();
+            let dest_key = dest.to_string_lossy().to_string();
+            clear_error(&dest_key);
+            let o = move_file(&src, &dest, &noop_progress);
+            let recorded = error_snapshot(&dest_key);
+            clear_error(&dest_key);
+            assert!(
+                !dest.exists(),
+                "no output of THIS attempt may be left at the destination name"
+            );
+            assert!(
+                recorded.is_none(),
+                "a failed copy that created no destination must not claim a \
+                 partial copy needs hand-deleting, got: {recorded:?}"
+            );
+            o
+        };
+
+        std::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if readable_anyway {
+            eprintln!(
+                "SKIP move_file_copy_failure_removes_this_attempts_dest: \
+                 running with read-through privileges"
+            );
+        } else {
+            assert_eq!(outcome, MoveOutcome::Failed, "a failed copy is Failed");
+            assert!(src.exists(), "the source must survive a failed move");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The System-tab "✕" and "Clear all" actually remove entries. Nothing
     /// touched `MOVE_ERRORS` lifecycle before this, so both handlers could
     /// become no-ops and every test still passed — the operator would dismiss
@@ -3759,6 +4304,205 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pass that ends in one of the four failure branches must still clear
+    /// the move progress bar.
+    ///
+    /// The clear used to be the last statement of the loop body and all four
+    /// branches `continue` past it, so a blocked delivery left the System
+    /// page showing a live-looking "60 %, ETA 1:23" for a move that had
+    /// already given up — for the life of the process, since nothing else
+    /// ever writes `None`.
+    ///
+    /// Reaching `any_failed` deterministically, without depending on file
+    /// permissions: occupy the destination PATH with a DIRECTORY. Its stat
+    /// is neither `Ok(file)` nor `NotFound`, so the variant resolver goes
+    /// `uncertain` (no `_2` rename) and the collision guard's stat arm
+    /// defers the entry as `Failed`.
+    #[test]
+    fn a_blocked_pass_clears_the_move_progress_bar() {
+        // MOVE_STATE and MOVE_ERRORS are process-global; serialize with the
+        // other tests that assert on them.
+        let _g = errors_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let movie_dir = tmp.path().join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
+
+        let disc = staging.join("MoveBarDisc");
+        std::fs::create_dir_all(&disc).unwrap();
+        std::fs::write(disc.join(".done"), marker_json("MoveBarDisc")).unwrap();
+        let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3];
+        mkv.extend_from_slice(&[0xC7u8; 2048]);
+        std::fs::write(disc.join("MoveBarDisc.mkv"), &mkv).unwrap();
+
+        std::fs::create_dir_all(
+            movie_dir
+                .join("MoveBarDisc (2024)")
+                .join("MoveBarDisc (2024).mkv"),
+        )
+        .unwrap();
+
+        // The bar an earlier dir's copy left published.
+        *MOVE_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(MoveState {
+            name: "MoveBarDisc".to_string(),
+            progress_pct: 60,
+            progress_gb: 1.2,
+            total_gb: 2.0,
+            speed_mbs: 30.0,
+            eta: "1:23".to_string(),
+        });
+
+        check_and_move(&cfg);
+
+        let key = disc.to_string_lossy().to_string();
+        let recorded = error_snapshot(&key);
+        assert!(
+            disc.exists(),
+            "the staging dir must be left alone when delivery is blocked \
+             (otherwise this test is not exercising a failure branch)"
+        );
+        assert_eq!(
+            recorded.map(|e| e.reason),
+            Some("copy to destination failed".to_string()),
+            "the pass must have ended in the any_failed branch"
+        );
+        let bar = MOVE_STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none();
+        clear_error(&key);
+        assert!(
+            bar,
+            "a blocked pass must clear the move progress bar, not leave a \
+             stale one on the System page forever"
+        );
+    }
+
+    /// A per-entry listing error must mark the listing INCOMPLETE, not just
+    /// drop the entry.
+    ///
+    /// The dropped entry is a media file this pass cannot see: it is never
+    /// planned, never copied, never delivered. If the entries the pass COULD
+    /// see all move successfully, the caller reaches `remove_dir_all` and
+    /// deletes the staging dir — including the file that was never moved.
+    /// Only the single-entry case is caught today, by the `ripped_files
+    /// .is_empty()` skip; a dir where one entry errors and the rest succeed
+    /// loses data and logs "Move complete".
+    #[test]
+    fn a_per_entry_listing_error_marks_the_listing_incomplete() {
+        let _g = errors_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("IncompleteListing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let readable = dir.join("Movie.mkv");
+
+        // One entry the pass can see, one it cannot (the degraded-NFS
+        // DirEntry error this arm exists for).
+        let entries = vec![
+            Ok(readable.clone()),
+            Err(std::io::Error::other("stale NFS file handle")),
+        ];
+
+        let (files, complete) = collect_ripped_files(entries, false, &dir);
+
+        clear_error(&dir.to_string_lossy());
+        assert_eq!(
+            files,
+            vec![readable],
+            "the entries that DID enumerate must still be planned"
+        );
+        assert!(
+            !complete,
+            "a listing that dropped an entry must report itself INCOMPLETE — \
+             reporting it complete is what lets the caller tear the staging \
+             dir down over a file it never moved"
+        );
+    }
+
+    /// The flag only saves the file if the teardown is actually gated on it.
+    /// Inducing a real `DirEntry` error from a test needs a fault-injecting
+    /// filesystem, so pin the wiring at source level (the technique this crate
+    /// already uses for `resume_remux`'s webhook and marker call sites): the
+    /// `!listing_complete` guard must stand between the copy-outcome guards
+    /// and `remove_dir_all`. Deleting it puts the data loss straight back.
+    #[test]
+    fn the_teardown_is_gated_on_a_complete_listing() {
+        let src = crate::util::source_lf(include_str!("mover.rs"));
+        let guard = src
+            .find("if !listing_complete {")
+            .expect("check_and_move must refuse to tear down an incompletely-listed staging dir");
+        let teardown = src
+            .find("let cleanup_err = std::fs::remove_dir_all(&dir).err();")
+            .expect("the staging teardown must still exist");
+        assert!(
+            guard < teardown,
+            "the incomplete-listing guard must come BEFORE remove_dir_all — \
+             after it, the file the pass never saw is already deleted"
+        );
+    }
+
+    /// `MOVE_ERRORS` rows for a staging dir the operator removed by hand —
+    /// which is exactly what both blocked-teardown hints tell them to do —
+    /// must be pruned, because the only `clear_error` call site is reached
+    /// by revisiting that same dir on a later pass, and a removed dir is
+    /// never revisited.
+    #[test]
+    fn move_errors_for_a_vanished_staging_dir_are_pruned() {
+        let _g = errors_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let movie_dir = tmp.path().join("output/Movies");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&movie_dir).unwrap();
+        let cfg = cfg_for_staging(&staging, &movie_dir.to_string_lossy(), false);
+
+        // Gone: the dir the operator `rm -rf`'d after reading the hint.
+        let gone = staging.join("PruneGhostDisc").to_string_lossy().to_string();
+        // Alive: still in staging, no `.done` yet — the pass sees it and
+        // skips it, and its row must survive.
+        let alive_dir = staging.join("PruneLiveDisc");
+        std::fs::create_dir_all(&alive_dir).unwrap();
+        let alive = alive_dir.to_string_lossy().to_string();
+        // Outside the staging root: the destination-keyed row. Different
+        // mount, different liveness story — not ours to prune.
+        let outside = movie_dir
+            .join("PruneOutside.mkv")
+            .to_string_lossy()
+            .to_string();
+
+        record_error(&gone, "staging cleanup failed: whatever", "rm -rf it");
+        record_error(&alive, "copy to destination failed", "see the log");
+        record_error(&outside, "partial copy could not be removed", "delete it");
+
+        check_and_move(&cfg);
+
+        let (g, a, o) = (
+            error_snapshot(&gone),
+            error_snapshot(&alive),
+            error_snapshot(&outside),
+        );
+        clear_error(&gone);
+        clear_error(&alive);
+        clear_error(&outside);
+
+        assert!(
+            g.is_none(),
+            "the row for a staging dir that no longer exists must be pruned"
+        );
+        assert!(
+            a.is_some(),
+            "a staging dir that is still present keeps its row, even when \
+             this pass skipped it as not-ready"
+        );
+        assert!(
+            o.is_some(),
+            "a row keyed outside the staging root must not be pruned by the \
+             staging scan"
+        );
     }
 
     // ===================================================================

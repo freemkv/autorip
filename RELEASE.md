@@ -11,12 +11,17 @@
 ## Quick Reference
 
 ```bash
-# 1. Pre-commit (run locally, Rust 1.86 — matches CI)
-cargo +1.86 fmt --check && cargo +1.86 clippy --locked -- -D warnings && cargo +1.86 test
+# 1. Pre-commit (run locally, Rust 1.97 — matches CI)
+# --all-targets because ci.yml lints test code too; a warning reachable only
+# from a #[cfg(test)] module passes without it and fails on push.
+cargo +1.97 fmt --check && cargo +1.97 clippy --all-targets -- -D warnings && cargo +1.97 test
 
-# 2. Tag and push
-git tag -a v1.0.0-rc.1 -m "v1.0.0-rc.1"
-git push origin v1.0.0-rc.1
+# 2. Tag and push a RELEASE tag. NOT an -rc tag: release.yml filters those
+#    out ("!v*-rc*"), so pushing v1.0.0-rc.1 by hand triggers nothing at all.
+#    Every push to `qa` already stamps its own v<version>-rc<N> automatically
+#    (qa.yml's rc-tag job) purely so a run can be named.
+git tag -a v1.0.0 -m "v1.0.0"
+git push origin v1.0.0
 
 # 3. Wait for CI + Release (~3 min)
 gh run list --repo freemkv/autorip --limit 1
@@ -32,11 +37,11 @@ docker compose pull && docker compose up -d
 Run lint + tests before pushing:
 
 ```bash
-# Whole workspace (Rust 1.86 — matches CI)
-cargo +1.86 fmt --check && cargo +1.86 clippy --locked -- -D warnings && cargo +1.86 test
+# Whole workspace (Rust 1.97 — matches CI)
+cargo +1.97 fmt --check && cargo +1.97 clippy --all-targets -- -D warnings && cargo +1.97 test
 
 # Single crate
-cargo +1.86 clippy -p freemkv-autorip --locked -- -D warnings && cargo +1.86 test -p freemkv-autorip
+cargo +1.97 clippy -p freemkv-autorip --all-targets -- -D warnings && cargo +1.97 test -p freemkv-autorip
 ```
 
 This runs:
@@ -51,14 +56,18 @@ This runs:
 git add -A
 git commit -m "description"
 
-# Tag with semver
-git tag -a v1.0.0-rc.1 -m "v1.0.0-rc.1"
+# Tag with semver — a RELEASE tag, not an -rc one
+git tag -a v1.0.0 -m "v1.0.0"
 
 # Push commit AND tag
-git push origin main v1.0.0-rc.1
+git push origin main v1.0.0
 ```
 
-**Important:** Push the tag! Release workflow only runs when a tag is pushed, not on every commit.
+**Important:** Push the tag! release.yml only runs when a tag is pushed, not on
+every commit — and it runs only for RELEASE tags. Its trigger is `v*` minus
+`!v*-rc*`, so a hand-pushed `v1.0.0-rc.1` fires nothing: no verify, no test, no
+build, no image. The `-rc` tags exist so a `qa` run can be named, and qa.yml
+stamps them for you.
 
 ### Step 3: Wait for CI
 
@@ -106,5 +115,5 @@ docker compose up -d
 | Push | Image |
 |------|-------|
 | `main` branch | Not built |
-| `v1.0.0-rc.1` tag | `ghcr.io/freemkv/autorip:v1.0.0-rc.1` |
-| Tag push | `ghcr.io/freemkv/autorip:latest` + tag |
+| `v*-rc*` tag (auto-stamped by a `qa` push) | Not built — release.yml excludes these |
+| `v*` release tag | `ghcr.io/freemkv/autorip:latest` + the tag |
