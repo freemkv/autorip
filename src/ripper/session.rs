@@ -63,10 +63,14 @@ pub enum RegisterError {
 ///   exits (staging could be wiped mid-write — the v0.13.6 bug class).
 ///   We leave the running prior in place and return
 ///   `Err(RegisterError::PriorThreadRunning(new))`, handing the new
-///   handle back so the caller reaps the worker it just spawned. In
-///   practice the spawn sites gate on [`try_claim_active`] (STATE-level
-///   mutual exclusion) so this branch should be unreachable, but we
-///   defend it rather than trust that invariant.
+///   handle back so the caller reaps the worker it just spawned. The
+///   spawn sites gate on [`try_claim_active`], which now consults thread
+///   liveness as well as STATE status, so this branch should be
+///   unreachable — but it is the last line of defense and is defended
+///   rather than trusted. (It was previously justified by STATE status
+///   ALONE, which is not a liveness fact: a worker writes its terminal
+///   status and then keeps unwinding, so this branch was reachable from
+///   an unauthenticated LAN POST.)
 pub fn register_rip_thread(device: &str, handle: JoinHandle<()>) -> Result<(), RegisterError> {
     // Recover from poison rather than silently dropping the handle: a
     // dropped JoinHandle here can never be reaped, breaking
@@ -121,6 +125,25 @@ pub fn take_rip_thread(device: &str) -> Option<JoinHandle<()>> {
 ///
 /// `role` is a short tag (e.g. "rip", "scan") used for the OS thread
 /// name; `device` is both the registration key and part of the name.
+///
+/// **Registration is decided BEFORE the worker does any work.** The spawned
+/// thread parks on a one-shot channel and runs `f` only once this function has
+/// confirmed it won the `RIP_THREADS` slot. The previous order — spawn, *then*
+/// register — meant a duplicate spawn ran `f` to completion (for the rip role,
+/// `handle_rip_request`: a full multi-hour disc rip) before
+/// `register_rip_thread` rejected it and the `join()` below reaped it. That
+/// turned a "refused" spawn into: an HTTP worker thread blocked for the whole
+/// rip, a second worker writing the same staging dir as the incumbent, and
+/// finally a `rollback_failed_spawn` + 500 for a rip that had actually
+/// finished. Parking first makes the rejection cost a channel `recv` instead
+/// of an hour of disk work.
+///
+/// The gate cannot hang either side. The worker's only pre-`f` action is the
+/// `recv`, and every exit from this function either sends (accepted) or drops
+/// the sender (rejected, or a panic between spawn and register) — a dropped
+/// sender wakes the `recv` with `Err` and the worker returns without touching
+/// anything. So the `join()` in the rejection branch is bounded by a thread
+/// that is already on its way out.
 pub fn spawn_rip_thread<F>(device: &str, role: &str, f: F) -> std::io::Result<()>
 where
     F: FnOnce() + Send + 'static,
@@ -135,7 +158,18 @@ where
     let span_build = crate::VERSION_LABEL;
     let span_device = device.to_string();
     let span_role = role.to_string();
+    // The registration gate (see this function's doc). `recv()` returns
+    // `Ok(())` only if we won the slot; `Err` means the sender was dropped —
+    // rejection, or an unexpected unwind between the spawn and the decision —
+    // and the worker must abort before running a single line of `f`.
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let wrapped = move || {
+        if go_rx.recv().is_err() {
+            // Not registered: another worker owns this device. Returning here
+            // is what keeps a duplicate `/api/rip` POST from executing a whole
+            // second rip against the incumbent's staging dir.
+            return;
+        }
         let _span =
             tracing::info_span!("worker", build = span_build, device = %span_device, role = %span_role)
                 .entered();
@@ -143,14 +177,21 @@ where
     };
     let handle = std::thread::Builder::new().name(name).spawn(wrapped)?;
     match register_rip_thread(device, handle) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // Release the worker. A send error is impossible in practice (the
+            // receiver cannot be dropped before its `recv` returns) and would
+            // only mean the worker is already gone, so it is not actionable.
+            let _ = go_tx.send(());
+            Ok(())
+        }
         Err(RegisterError::PriorThreadRunning(new_handle)) => {
-            // A prior worker for this device is still running and owns
-            // the registration slot. We just spawned a duplicate — reap
-            // it so it can't leak (its work closure shares no exclusive
-            // resources yet because the caller gates on try_claim_active,
-            // but join it to be sure it exits) and surface failure so the
-            // caller runs its existing spawn-failure rollback path.
+            // A prior worker for this device is still running and owns the
+            // registration slot. We just spawned a duplicate: drop the gate's
+            // sender so it aborts at its `recv` WITHOUT running `f` — it must
+            // never touch the incumbent's device, staging dir or Halt token —
+            // then join it so it can't leak, and surface failure so the caller
+            // runs its existing spawn-failure rollback path.
+            drop(go_tx);
             if let Err(e) = new_handle.join() {
                 tracing::error!(
                     device = %device,
@@ -382,6 +423,24 @@ pub fn unregister_halt(device: &str) {
 /// handlers (`/api/scan`, `/api/rip`) and the disc-insert poll loop so
 /// they can't drift. The disc is assumed still present.
 pub fn rollback_failed_spawn(device: &str) {
+    // Never roll back a device whose worker is still alive. A spawn can fail
+    // for two very different reasons: the OS refused the thread (nothing is
+    // registered for this device — the case this function exists for), or
+    // `spawn_rip_thread` refused to displace a still-running incumbent. In the
+    // second case the "failure" belongs to the duplicate, and rolling back
+    // would vandalise the WINNER: `unregister_halt` deletes the token
+    // `/api/stop` needs to cancel the live rip, and the idle push overwrites a
+    // running (or just-completed) rip's state with `idle`. Liveness, not
+    // status, is the right question here for the usual reason — a worker
+    // writes its terminal status and then keeps unwinding.
+    if rip_thread_running(device) {
+        tracing::warn!(
+            device = %device,
+            "declining spawn rollback: a worker still owns this device (the spawn that \
+             failed was the duplicate, not the incumbent)"
+        );
+        return;
+    }
     super::unregister_halt(device);
     super::update_state(
         device,
@@ -792,6 +851,62 @@ mod rollback_tests {
             logged.contains("DISC") && logged.contains("HARMLESS"),
             "sanitising must not destroy the identifier's readable text; got {logged:?}"
         );
+    }
+
+    /// Catches the mutation that deletes the `rip_thread_running` guard from
+    /// `rollback_failed_spawn` (or weakens it to `is_busy`).
+    ///
+    /// A spawn can fail for two unrelated reasons, and only one of them means
+    /// "this device has no owner". When `spawn_rip_thread` refuses to displace
+    /// a still-running incumbent, the loser's caller runs this same rollback —
+    /// and an unguarded rollback then vandalises the WINNER: it unregisters the
+    /// `Halt` that `/api/stop` needs to cancel the live rip, and overwrites the
+    /// running rip's state with `idle`, which also re-opens the device to the
+    /// next claim. Status is not the right question (a worker writes its
+    /// terminal status and keeps unwinding); liveness is.
+    #[test]
+    fn rollback_failed_spawn_declines_while_a_worker_still_owns_the_device() {
+        let dev = format!("rollback-live-worker-test-{}", std::process::id());
+        let _ = super::take_rip_thread(&dev);
+        assert!(super::super::try_claim_active(&dev), "claim must succeed");
+        super::super::register_halt(&dev, Halt::new());
+
+        // A worker that is still on the CPU — the incumbent.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        super::spawn_rip_thread(&dev, "rip", move || {
+            let _ = release_rx.recv();
+        })
+        .expect("the first spawn owns the device");
+
+        super::rollback_failed_spawn(&dev);
+
+        assert!(
+            super::super::device_halt(&dev).is_some(),
+            "rollback must NOT unregister the live worker's Halt — /api/stop \
+             would then have no token with which to cancel the running rip"
+        );
+        let snap = super::super::STATE
+            .lock()
+            .unwrap()
+            .get(&dev)
+            .cloned()
+            .expect("state entry exists");
+        assert_eq!(
+            snap.status, "scanning",
+            "rollback must NOT idle a device whose worker is still running"
+        );
+
+        // Let the incumbent finish, then confirm the ordinary rollback still
+        // works once nothing owns the device (the guard must not be a
+        // permanent refusal).
+        drop(release_tx);
+        let _ = super::join_rip_thread(&dev, std::time::Duration::from_secs(10));
+        super::rollback_failed_spawn(&dev);
+        assert!(
+            super::super::device_halt(&dev).is_none(),
+            "with no live worker the rollback must behave exactly as before"
+        );
+        super::super::STATE.lock().unwrap().remove(&dev);
     }
 
     #[test]

@@ -2090,6 +2090,16 @@ mod tests {
     /// success.
     #[test]
     fn map_iso_mux_outcome_surfaces_undelivered_streams_on_a_completed_run() {
+        // Unique to this test: the per-device log ring is a process-global
+        // static and `"sr-test"` is the shared fixture name seven sibling
+        // tests in this module also pass to `map_iso_mux_outcome`. Reading
+        // back the last 50 lines of a ring those tests are concurrently
+        // appending to made BOTH assertions below unsound: the exact-count
+        // assertion could see a sibling's line, and — because the ring is
+        // never cleared between tests — the `notes[0]` assertion could be
+        // reading a note this test did not write at all. Mint a unique name,
+        // per the convention in `mod.rs`'s hot-unplug tests.
+        let device = "sr_mux_undelivered_streams_note_test";
         let start = Instant::now();
         let lossy = map_iso_mux_outcome(
             Ok(libfreemkv::MuxOutcome {
@@ -2102,7 +2112,7 @@ mod tests {
                 undelivered_streams: vec![1],
             }),
             true,
-            "sr-test",
+            device,
             0.0,
             start,
             0,
@@ -2114,7 +2124,7 @@ mod tests {
         // reaches the operator, and it is the only place it was ever consumed.
         // Exactly once — zero is a silently lossy "success", two is the
         // duplicate-wording bug this replaced.
-        let logged = crate::log::get_device_log("sr-test", 50);
+        let logged = crate::log::get_device_log(device, 50);
         let notes: Vec<&String> = logged
             .iter()
             .filter(|l| l.contains("could not be delivered into the output"))

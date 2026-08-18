@@ -712,10 +712,38 @@ pub(crate) fn should_revert_origin_to_done(origin: &str, status: Option<&str>) -
 pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
     let entries = match std::fs::read_dir(staging_dir) {
         Ok(e) => e,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            // An unreadable staging root is NOT an empty mux queue. Returning
+            // a bare `Vec::new()` made a degraded share (NFS down, permissions
+            // lost) render as "nothing queued" on the System page — a failure
+            // that looks like success. Log it so the absence of jobs is
+            // attributable. Mirrors `staging::resume_or_quarantine_staging`,
+            // which already reports the same two failures.
+            tracing::warn!(
+                staging_dir = %staging_dir.display(),
+                error = %e,
+                "could not list staging root for the mux queue; reporting an empty queue this refresh"
+            );
+            return Vec::new();
+        }
     };
     let mut out = Vec::new();
-    for entry in entries.filter_map(|e| e.ok()) {
+    for entry in entries {
+        // Don't `.filter_map(|e| e.ok())` a per-entry error away: an ESTALE
+        // on one dentry of an NFS share silently drops a whole disc subdir
+        // from the queue, and the operator sees a queued title simply vanish.
+        // Same defense, same reasoning, as the staging-root scan.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    staging_dir = %staging_dir.display(),
+                    error = %e,
+                    "per-entry error listing staging root for the mux queue - skipping this entry, share may be degraded"
+                );
+                continue;
+            }
+        };
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
@@ -1551,6 +1579,107 @@ mod tests {
             mux_dispatch_verdict(s2.as_ref()),
             MuxVerdict::SkipTerminal,
             "after .failed the worker must never re-dispatch (the re-mux-forever loop)"
+        );
+    }
+
+    /// Catches the mutation that restores `pending_queue`'s silent
+    /// `Err(_) => return Vec::new()` on an unreadable staging root.
+    ///
+    /// An unreadable staging root is not an empty mux queue. When the share is
+    /// down (NFS timeout, permissions lost, the mount not yet up at container
+    /// start) the System page rendered "no jobs queued" and there was nothing
+    /// anywhere — no log line, no error card — to say the list was a guess.
+    /// That is the failure-that-looks-like-success class: an operator sees a
+    /// queue they believe is empty and concludes the mux worker is idle.
+    #[test]
+    fn pending_queue_logs_an_unreadable_staging_root() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(buf.clone())
+                .with_ansi(false),
+        );
+
+        // A path that cannot be listed. Under the workspace's gitignored
+        // scratch root, per the project's never-/tmp convention.
+        let missing = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(format!("autorip-no-such-staging-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+
+        let queue = tracing::subscriber::with_default(subscriber, || pending_queue(&missing));
+
+        assert!(
+            queue.is_empty(),
+            "an unreadable root still yields no jobs — the fix is the report, \
+             not the return value"
+        );
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("could not list staging root for the mux queue"),
+            "an unreadable staging root must be reported, not rendered as an \
+             empty queue; captured logs were:\n{out}"
+        );
+    }
+
+    /// Catches the mutation that restores `pending_queue`'s
+    /// `.filter_map(|e| e.ok())` over the staging entries.
+    ///
+    /// A source-pin because the branch needs a dentry-level failure (an NFS
+    /// ESTALE on one entry of an otherwise-healthy directory) that cannot be
+    /// synthesised locally. `staging::resume_or_quarantine_staging` already
+    /// carries the same defense with the same reasoning: dropping a per-entry
+    /// error silently removes a whole disc subdir from the queue, and the
+    /// operator watches a queued title simply disappear.
+    #[test]
+    fn pending_queue_does_not_flatten_away_a_per_entry_error() {
+        let src = crate::util::source_lf(include_str!("muxer.rs"));
+        let start = src
+            .find("\npub fn pending_queue(staging_dir: &Path) -> Vec<String> {")
+            .expect("muxer.rs must define pending_queue");
+        let end = start
+            + src[start..]
+                .find("\n    out\n}")
+                .expect("pending_queue still returns `out` at its end");
+        // Comment lines are stripped: `pending_queue`'s own comment quotes the
+        // defective shape verbatim (house style — the comment names the defect
+        // it defends against), and a naive substring search would match the
+        // explanation of the fix rather than the code.
+        let body: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains(".filter_map(|e| e.ok())"),
+            "pending_queue must not discard a per-entry read_dir error: one \
+             ESTALE silently drops a whole disc subdir from the mux queue"
+        );
+        assert!(
+            body.contains("per-entry error listing staging root for the mux queue"),
+            "the per-entry failure must be reported — an absent log is the bug"
         );
     }
 }
