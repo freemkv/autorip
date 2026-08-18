@@ -4698,6 +4698,58 @@ mod web_tests {
         );
     }
 
+    /// Catches the mutation that restores `get_state_json`'s
+    /// `Err(_) => return "{}"` bail-out on a poisoned STATE.
+    ///
+    /// A source-pin, like the handler pins above, because the only way to
+    /// exercise the behaviour is to poison the process-global `ripper::STATE`,
+    /// and a `Mutex` stays poisoned for the life of the process — it would
+    /// panic every other test in this binary that locks STATE with `unwrap`.
+    ///
+    /// What it pins is the whole point of the defect: this was the ONE STATE
+    /// consumer that abandoned on poison instead of recovering the guard like
+    /// its ten siblings. STATE is poisoned by the first panic taken while its
+    /// guard is held, so from that moment `GET /api/state` answered `{}` with
+    /// HTTP 200 forever: a blank dashboard, and — because
+    /// `main.rs::run_healthcheck` only checks for an `HTTP/1.1 200` status
+    /// line — a permanently green Docker HEALTHCHECK that never restarts the
+    /// container. The map's contents are still perfectly readable; serving
+    /// them is both correct and the house convention.
+    #[test]
+    fn get_state_json_recovers_a_poisoned_state_lock() {
+        let src = crate::util::source_lf(include_str!("web.rs"));
+        // Anchored on the DEFINITION (leading newline) so this test's own
+        // mention of the name cannot match, and both ends are `expect`ed so a
+        // stale anchor fails loudly instead of silently widening the slice.
+        let start = src
+            .find("\nfn get_state_json(staging_dir: &str) -> String {")
+            .expect("web.rs must define get_state_json");
+        let end = start
+            + src[start..]
+                .find("\n    let move_state =")
+                .expect("get_state_json still binds move_state after the STATE lock");
+        // Comment lines are stripped: this function's own comment quotes the
+        // defective arm verbatim (that is the house style — the comment names
+        // the defect), and a naive substring search would match the very
+        // explanation of the fix.
+        let body: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("STATE.lock().unwrap_or_else(|e| e.into_inner())"),
+            "get_state_json must recover a poisoned STATE guard, like every \
+             other STATE consumer in the crate"
+        );
+        assert!(
+            !body.contains("Err(_) =>"),
+            "get_state_json must not have an abandon-on-poison arm: it turns \
+             one panic into a permanently blank dashboard served with 200, \
+             which run_healthcheck reads as healthy forever"
+        );
+    }
+
     #[test]
     fn resolve_with_timeout_uses_raii_guard_not_closure_side_fetch_sub() {
         // Source-pin for the INFLIGHT-leak fix: the decrement must NOT live as
@@ -5873,10 +5925,18 @@ fn build_queue_views_cached(staging_dir: &str) -> (Vec<String>, Vec<String>, usi
 }
 
 fn get_state_json(staging_dir: &str) -> String {
-    let state = match ripper::STATE.lock() {
-        Ok(s) => s,
-        Err(_) => return "{}".to_string(),
-    };
+    // Recover-and-proceed on poison, like every other STATE consumer
+    // (`is_busy`, `update_state`, `try_claim_active_checked`, ...). This was
+    // the ONE site that bailed out with `Err(_) => "{}"`, and the consequence
+    // was permanent and silent: STATE is poisoned by the first panic taken
+    // while its guard is held, and a `Mutex` stays poisoned for the life of
+    // the process. So every later `GET /api/state` returned `{}` with a 200 —
+    // a blank dashboard forever, AND a permanently green Docker HEALTHCHECK,
+    // because `main.rs::run_healthcheck` only looks for an `HTTP/1.1 200`
+    // status line and so never restarts the container. A failure that looks
+    // like success is exactly the class this project refuses to ship: the
+    // poisoned map's contents are still perfectly readable, so serve them.
+    let state = ripper::STATE.lock().unwrap_or_else(|e| e.into_inner());
     let move_state = crate::mover::MOVE_STATE
         .lock()
         .ok()

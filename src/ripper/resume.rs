@@ -2551,9 +2551,17 @@ mod resume_remux_log_archive_tests {
         // tests in parallel threads, so re-pointing it without this guard
         // corrupts any concurrently-running test that resolves a log path
         // (it made log::tests::archive_device_log_moves_to_rips_dir flaky).
-        let _guard = crate::log::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        //
+        // `env_guard()` and not a raw `ENV_LOCK.lock()`: the guard also
+        // RESTORES the prior AUTORIP_DIR on drop. Taking the lock alone left
+        // AUTORIP_DIR pointing at this test's tempdir, which `tmpdir()` then
+        // deletes at the end of the test — so every later test in this binary
+        // that took the lock without setting the var resolved its log paths
+        // under a deleted directory, and (worse) every later `env_guard()`
+        // faithfully captured and restored that stale value. That is the exact
+        // "a test's tempdir can never outlive the test as a stale global"
+        // failure `env_guard` was written for.
+        let _guard = crate::log::env_guard();
         let d = tmpdir();
         // Route logs to the tempdir for this test. SAFETY: env access in
         // tests; the assertion that matters reads the in-memory ring

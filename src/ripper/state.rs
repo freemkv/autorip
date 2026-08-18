@@ -569,7 +569,54 @@ pub fn try_claim_active(device: &str) -> bool {
 /// any caller that has cross-checked `device` against the live drive list.
 /// Callers that receive `device` verbatim from an untrusted request and
 /// have NOT done that cross-check must pass `false`.
+///
+/// # The claim needs TWO facts, not one
+///
+/// The claim refuses a device whose `STATE` status is scanning/ripping **and**
+/// a device whose rip thread is still alive. Those are independent facts. A
+/// worker writes its TERMINAL status (`done` / `error`) and then keeps running
+/// its tail on the same thread: auto-eject (`Drive::open` + `eject()`, real
+/// hardware I/O), the eject-failure device-log lines, guard drops. For that
+/// whole window `is_busy` is false while the worker still owns the drive, the
+/// staging dir and the device's `Halt` token.
+///
+/// Checking status alone was directly reachable from the network. This server
+/// binds `0.0.0.0` with no authentication, so a `POST /api/rip/sr0` landing in
+/// that tail won the claim, `spawn_rip_after_claim` overwrote the incumbent's
+/// `Halt` with a fresh token (so the incumbent's trailing `unregister_halt`
+/// then deleted the NEW rip's token and `/api/stop` could not cancel it), and
+/// the duplicate worker ran until `register_rip_thread` rejected it. The other
+/// half of that fix lives in [`super::session::spawn_rip_thread`], which now
+/// decides registration before the worker runs any work; this half stops the
+/// duplicate from being admitted in the first place.
+///
+/// **Ordering, and why it cannot deadlock.** The liveness question is asked
+/// BEFORE `STATE` is locked, so `RIP_THREADS` and `STATE` are never held at
+/// the same time and no lock-order inversion is possible; `rip_thread_running`
+/// only reads `JoinHandle::is_finished`, never `join`, so it cannot block
+/// either. Splitting the two checks is not a TOCTOU in the dangerous
+/// direction: a handle can only APPEAR for a device after some caller wins
+/// this very claim, so a `false -> true` transition between our read and our
+/// `STATE` lock implies a competitor already took the `STATE` lock and our own
+/// claim fails anyway. The benign direction (`true -> false`: the worker
+/// exited in between) merely admits a claim for a device that is now genuinely
+/// free, which is correct.
+///
+/// The accepted cost is the same one `forget_removed_device` already accepts:
+/// a worker that hangs forever keeps its device unclaimable. A finished
+/// handle reads as not-running, so an ordinary completed rip frees the device
+/// the instant the thread exits, with no reaping required first.
 pub fn try_claim_active_checked(device: &str, known: bool) -> bool {
+    // Liveness first, and OUTSIDE the STATE lock (see the doc above for both
+    // the why and the ordering argument).
+    if super::session::rip_thread_running(device) {
+        tracing::warn!(
+            device = %device,
+            "refusing claim: a worker thread for this device is still running \
+             (its status is already terminal, but it has not exited yet)"
+        );
+        return false;
+    }
     let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if s.get(device)
         .map(|r| r.status == "scanning" || r.status == "ripping")
@@ -1776,6 +1823,84 @@ mod tests {
             "a device already present in STATE must remain claimable even \
              when the caller couldn't independently verify it"
         );
+    }
+
+    /// Catches the mutation that deletes the thread-liveness half of the
+    /// claim (leaving only the STATE-status check it had before).
+    ///
+    /// The device is left with a TERMINAL status — exactly the state a worker
+    /// writes just before it starts unwinding (auto-eject, log archive, guard
+    /// drops) — while its thread is still on the CPU. `is_busy` is false for
+    /// that whole window, so a status-only claim admitted an unauthenticated
+    /// LAN `POST /api/rip/{device}` into a device another worker still owns:
+    /// the new claim overwrote the incumbent's `Halt` token (so `/api/stop`
+    /// could no longer cancel either rip) and launched a second worker against
+    /// the same staging dir.
+    ///
+    /// The second half of the test is just as load-bearing: once the worker
+    /// really has exited, the device must be claimable again immediately. A
+    /// "fix" that latched the device shut would break every normal
+    /// rip-then-rip-again sequence.
+    #[test]
+    fn try_claim_active_refuses_a_device_whose_worker_is_still_unwinding() {
+        let dev = format!("sg_claim_liveness_test_{}", std::process::id());
+        let _ = super::super::take_rip_thread(&dev);
+        // Terminal status: the worker has published "done" and is now in its
+        // tail. STATE says free; the thread says otherwise.
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "done".to_string(),
+                disc_present: true,
+                ..Default::default()
+            },
+        );
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        super::super::session::spawn_rip_thread(&dev, "rip", move || {
+            let _ = release_rx.recv();
+        })
+        .expect("the worker owns the device");
+
+        assert!(
+            !is_busy(&dev),
+            "test setup: the status half of the claim must already read free, \
+             otherwise this test cannot distinguish the two facts"
+        );
+        assert!(
+            !try_claim_active_checked(&dev, false),
+            "a claim must be refused while the device's worker thread is still \
+             running, even though its status is terminal"
+        );
+        assert!(
+            !try_claim_active(&dev),
+            "the known=true wrapper must refuse on the same grounds"
+        );
+
+        // The worker exits. Its handle is deliberately left REGISTERED and
+        // unreaped — that is the normal state after any completed rip, and the
+        // gate must read a finished handle as "not running" or every device
+        // would be claimable exactly once per process.
+        drop(release_tx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while super::super::session::rip_thread_running(&dev) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker should have exited as soon as its channel closed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            try_claim_active_checked(&dev, false),
+            "once the worker has exited the device must be claimable again, \
+             with no reaping step in between — the liveness gate must not \
+             latch a device shut"
+        );
+        super::super::take_rip_thread(&dev)
+            .expect("the finished handle is still registered")
+            .join()
+            .expect("worker joins cleanly");
+        STATE.lock().unwrap().remove(&dev);
     }
 
     #[test]
