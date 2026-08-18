@@ -63,3 +63,59 @@ fn spawn_rip_thread_registers_handle() {
         "RIP_THREADS entry should be consumed by take_rip_thread"
     );
 }
+
+/// Catches the mutation that restores `spawn_rip_thread`'s old spawn-then-check
+/// ordering (or removes the registration gate the worker parks on).
+///
+/// The old order spawned the worker and only THEN asked `register_rip_thread`
+/// whether it was allowed to exist. For the "rip" role that closure is
+/// `handle_rip_request` — an entire multi-hour disc rip — so a duplicate spawn
+/// ran the whole thing against the incumbent's staging dir before the rejection
+/// was noticed and the `join()` reaped it. The observable damage was the HTTP
+/// worker thread blocking for the length of the rip, plus a
+/// `rollback_failed_spawn` + HTTP 500 for a rip that had actually completed.
+///
+/// The assertion is the one that matters: the rejected duplicate must not
+/// execute a single line of its closure.
+#[test]
+fn a_rejected_duplicate_spawn_never_runs_its_closure() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let device = "test-sg-duplicate-spawn";
+    let _ = ripper::take_rip_thread(device);
+
+    // The incumbent: parked until we release it, so it is unambiguously
+    // *running* when the duplicate spawn is attempted.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    ripper::spawn_rip_thread(device, "rip", move || {
+        let _ = release_rx.recv();
+    })
+    .expect("the first spawn owns the device");
+
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_in_worker = Arc::clone(&ran);
+    let err = ripper::spawn_rip_thread(device, "rip", move || {
+        ran_in_worker.store(true, Ordering::SeqCst);
+    })
+    .expect_err("a second spawn for a device with a live worker must fail");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::AlreadyExists,
+        "the rejection must be reported as AlreadyExists so the caller's \
+         spawn-failure path runs"
+    );
+    assert!(
+        !ran.load(Ordering::SeqCst),
+        "the rejected duplicate must be reaped BEFORE it runs any of its work \
+         closure — running it means a second rip against the incumbent's \
+         staging dir and an HTTP handler blocked for the length of it"
+    );
+
+    // The incumbent is untouched by the rejection and still drains normally.
+    drop(release_tx);
+    ripper::take_rip_thread(device)
+        .expect("the incumbent keeps the registration slot")
+        .join()
+        .expect("incumbent joins cleanly");
+}

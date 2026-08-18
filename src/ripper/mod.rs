@@ -590,7 +590,7 @@ struct InsertTick {
 /// physically ejects and reinserts.
 ///
 /// So: latch only what was dispatched, or what was already latched.
-/// `POLL_INTERVAL_SECS` (5) equals `STOP_COOLDOWN_SECS` (5), so at most one
+/// `POLL_INTERVAL_SECS` (5) equals `STOP_COOLDOWN` (5s), so at most one
 /// tick is deferred this way before the cooldown expires and the disc is
 /// picked up normally.
 fn insert_tick(is_new_insert: bool, in_cooldown: bool) -> InsertTick {
