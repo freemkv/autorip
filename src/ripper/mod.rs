@@ -554,9 +554,19 @@ fn forget_removed_device(device: &str) -> bool {
         return false;
     }
     drop_session(device);
-    if let Ok(mut s) = STATE.lock() {
-        s.remove(device);
-    }
+    // Recover-and-proceed on poison, like every other STATE/HALTS/RIP_THREADS
+    // site in this crate. `if let Ok(..)` silently skipped the removal on a
+    // poisoned lock — and a poisoned STATE means some worker panicked WHILE
+    // HOLDING it, which is exactly when a drive is most likely to disappear
+    // from enumeration. The row for a device that is physically gone then
+    // survives for the container's lifetime (phantom drive in the UI, and
+    // `is_busy`/`try_claim_active` keep answering from it), while this function
+    // still returned `true` — the teardown reported success and left the state
+    // behind, with not one log line to say so.
+    STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(device);
     // No eject/scan boundary fires here, so the device's in-memory log
     // ring would otherwise linger for the container's lifetime. Evict it
     // like archive_device_log does on the planned-eject path.
@@ -872,17 +882,20 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         continue;
                     }
 
-                    // Atomically claim the device under one STATE lock, exactly
-                    // like the /api/scan and /api/rip web handlers. The old
+                    // Claim the device exactly like the /api/scan and /api/rip
+                    // web handlers do: thread liveness read outside the STATE
+                    // lock, then the busy-check and the status-set folded into
+                    // one STATE lock (the two registries are never held at the
+                    // same time — see `try_claim_active_checked`). The old
                     // `!is_busy(&device)` gate plus a separate `update_state`
                     // and `register_halt` was a TOCTOU: a concurrent /api/rip
                     // could claim between the check and the spawn, yielding two
                     // rip threads on one drive, an orphaned Halt, and a dropped
                     // JoinHandle. If the claim loses, another path already owns
                     // the device — skip the spawn.
-                    if !try_claim_active(&device) {
+                    let Some(claim_gen) = try_claim_active(&device) else {
                         continue;
-                    }
+                    };
 
                     tracing::info!(
                         device = %device,
@@ -982,7 +995,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         // already ran. A bare warn here leaks the Halt and
                         // wedges the device in "scanning" forever. Mirror the
                         // web handlers' rollback.
-                        rollback_failed_spawn(&device);
+                        rollback_failed_spawn(&device, claim_gen);
                     }
                 } else if !is_new_insert
                     && !is_busy(&device)
@@ -2028,11 +2041,23 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
 /// True if `seg` is safe to use as a single staging-directory path
 /// segment. Rejects values that could escape the staging root or
 /// resolve to it: empty, all-dots (`.`, `..`, `...`), anything
-/// containing a path separator, and absolute paths. `display_name`
-/// derives from untrusted disc bytes / TMDB JSON, and the sanitizer
-/// (`util::sanitize_path_compact`) keeps `.` and does not reject these,
-/// so a disc label of `..` would otherwise make
-/// `join("..")` + `remove_dir_all` delete the PARENT of staging.
+/// containing a path separator, and absolute paths.
+///
+/// `display_name` derives from untrusted disc bytes / TMDB JSON, and the
+/// consequence of getting this wrong is `join("..")` + `remove_dir_all`
+/// deleting the PARENT of staging.
+///
+/// This is deliberately an INDEPENDENT check, not a restatement of the
+/// sanitizer's. `util::sanitize_path_compact` does keep `.` as a character,
+/// but it finishes with `util::ensure_safe_segment`, which already collapses
+/// empty / all-dots results to `SAFE_FALLBACK` ("untitled") — so a segment
+/// that really came through the sanitizer cannot be `..`. (An earlier version
+/// of this comment claimed the sanitizer "does not reject these", which stopped
+/// being true when `ensure_safe_segment` was added and made this guard look
+/// like the only thing standing between a hostile disc label and the parent
+/// directory.) The guard stays because it is cheap and because it must also
+/// hold for segments assembled from other sources — config, marker files,
+/// re-derived names — that never passed through the sanitizer at all.
 fn is_safe_staging_segment(seg: &str) -> bool {
     !seg.is_empty()
         && !seg.chars().all(|c| c == '.')
@@ -5574,11 +5599,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // real in-title loss (`final_lost_secs`) instead. Multipass
             // keeps the snapshot's whole-disc value, which is genuinely
             // computed from the mapfile's per-range durations.
-            total_lost_ms: if !uses_multipass(cfg_read.max_retries) {
-                final_lost_secs * MILLIS_PER_SEC
-            } else {
-                sweep_damage_snapshot.total_lost_ms + done_demux_extra_ms
-            },
+            total_lost_ms: done_card_lost_ms(
+                uses_multipass(cfg_read.max_retries),
+                final_lost_secs,
+                sweep_damage_snapshot.total_lost_ms,
+                done_demux_extra_ms,
+            ),
             // Single-pass mode has no mapfile, so `sweep_damage_snapshot` is
             // the all-zero Default and its `main_lost_ms` is always 0.0 —
             // leaving the done card showing "(0s in main movie)" even when the
@@ -5586,11 +5612,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // in-title loss for single-pass (the demux-skip estimate), so mirror
             // the `total_lost_ms` branch above. Multipass keeps the snapshot's
             // value, which is derived from the mapfile's in-title bad ranges.
-            main_lost_ms: if !uses_multipass(cfg_read.max_retries) {
-                final_lost_secs * MILLIS_PER_SEC
-            } else {
-                sweep_damage_snapshot.main_lost_ms + done_demux_extra_ms
-            },
+            main_lost_ms: done_card_lost_ms(
+                uses_multipass(cfg_read.max_retries),
+                final_lost_secs,
+                sweep_damage_snapshot.main_lost_ms,
+                done_demux_extra_ms,
+            ),
             bad_ranges: sweep_damage_snapshot.bad_ranges.clone(),
             num_bad_ranges: sweep_damage_snapshot.num_bad_ranges,
             bad_ranges_truncated: sweep_damage_snapshot.bad_ranges_truncated,
@@ -5885,6 +5912,35 @@ fn mux_loss_aborts(
 /// (rule 1).
 pub(crate) fn uses_multipass(max_retries: u8) -> bool {
     max_retries > 0
+}
+
+/// The done card's `total_lost_ms` / `main_lost_ms`, in ONE place.
+///
+/// Single-pass mode (`max_retries == 0`) has NO mapfile, so
+/// `sweep_damage_snapshot` is the all-zero `Default`. Publishing its `0.0`
+/// starves the ms-branch of `classify_damage`: a rip that skipped a handful of
+/// sectors but lost >1 s of low-bitrate video is rated "cosmetic" (10 < the 51
+/// sector threshold) instead of "moderate" — a damaged rip filed as clean.
+/// `final_lost_secs` IS the in-title loss for single-pass (the demux-skip
+/// estimate), so that is what the card must carry. Multipass keeps the
+/// snapshot's value, which is genuinely computed from the mapfile's per-range
+/// durations, plus any demux-time extra.
+///
+/// This lived twice as an inline `if !uses_multipass(...)` inside a 40-field
+/// `RipState` literal, and the test that claimed to guard it only called
+/// `damage_severity_for` with two literals — so reintroducing the starved
+/// value left the suite green. One function, one test.
+pub(super) fn done_card_lost_ms(
+    multipass: bool,
+    final_lost_secs: f64,
+    snapshot_lost_ms: f64,
+    demux_extra_ms: f64,
+) -> f64 {
+    if multipass {
+        snapshot_lost_ms + demux_extra_ms
+    } else {
+        final_lost_secs * crate::util::MILLIS_PER_SEC
+    }
 }
 
 /// Is the resolved title trustworthy enough to auto-file the finished rip into
@@ -9057,7 +9113,7 @@ mod tests {
     fn config_lock_poisoned_marks_error_not_stuck_scanning() {
         let device = "sg_config_poison_test";
         // Simulate the pre-spawn claim: tile is already "scanning".
-        assert!(super::try_claim_active(device));
+        assert!(super::try_claim_active(device).is_some());
         let claimed = super::STATE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -10869,6 +10925,50 @@ mod insert_tick_tests {
         assert!(
             t.latch,
             "and it stays latched so it keeps not re-triggering"
+        );
+    }
+}
+
+#[cfg(test)]
+mod teardown_poison_tests {
+    /// Catches the mutation that puts `if let Ok(mut s) = STATE.lock()` back
+    /// into `forget_removed_device`.
+    ///
+    /// On a poisoned STATE that spelling SILENTLY SKIPPED the removal — and
+    /// still returned `true`, so the teardown reported success and left the row
+    /// behind, with not one log line to say so. A poisoned STATE means a worker
+    /// panicked while holding it, which is exactly when a drive is most likely
+    /// to have vanished from enumeration. The stale row then outlives the
+    /// device for the container's lifetime: a phantom drive in the dashboard,
+    /// and `is_busy` / `try_claim_active` still answering from it. Every other
+    /// STATE / HALTS / RIP_THREADS site in this crate recovers the guard with
+    /// `unwrap_or_else(|e| e.into_inner())`; divergence here is the defect.
+    ///
+    /// Proven structurally: poisoning the process-global STATE inside the test
+    /// binary would break every other test that shares it.
+    #[test]
+    fn forget_removed_device_recovers_a_poisoned_state_lock() {
+        let src = crate::util::source_lf(include_str!("mod.rs"));
+        let start = src
+            .find("fn forget_removed_device(device: &str) -> bool {")
+            .expect("forget_removed_device must exist");
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("function must end");
+        let body: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("if let Ok("),
+            "forget_removed_device must not skip its teardown on a poisoned \
+             lock — recover the guard (`unwrap_or_else(|e| e.into_inner())`) \
+             like every other lock site in this crate"
+        );
+        assert!(
+            body.contains("unwrap_or_else(|e| e.into_inner())"),
+            "the STATE removal must poison-recover, or a panicked worker leaves \
+             a phantom drive row that nothing ever clears"
         );
     }
 }

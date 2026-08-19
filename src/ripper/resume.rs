@@ -673,6 +673,30 @@ fn resume_title_confident(
     )
 }
 
+/// The loss threshold a resumed rip is judged against — for EVERY loss gate in
+/// [`resume_remux`], which is the whole point of it being a function.
+///
+/// `.accept-loss` raises the threshold to unlimited: the operator has looked at
+/// the recorded damage and chosen to deliver this rip as-is.
+///
+/// A resume has two loss gates — the sweep gate (§3, mapfile Unreadable
+/// sectors) and the mux gate (§4, decrypt/codec loss, judged against
+/// sweep + demux loss combined). They used to be written independently, and
+/// only the first honoured the override: the second RECOMPUTED the threshold
+/// from raw config, so any non-zero `demux_lost_secs` re-armed
+/// `mux_loss_aborts` against a total that ALREADY INCLUDED the sweep loss the
+/// operator had just accepted, and quarantined the dir to `.aborted-loss`. The
+/// one-shot marker was consumed before either gate ran, so the consent was
+/// gone: press Accept again, get the same answer again. One override, one
+/// threshold, both gates.
+fn resume_effective_abort(accept_loss: bool, output_format: &str, configured: u64) -> u64 {
+    if accept_loss {
+        u64::MAX
+    } else {
+        super::effective_abort_secs(output_format, configured)
+    }
+}
+
 pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: ResumeClass) {
     let ResumeClass::Remux {
         iso_path,
@@ -717,11 +741,21 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // One-shot operator override: if `.accept-loss` is present the operator
     // chose to deliver this rip despite over-threshold main-movie damage. The
     // abort gates below then treat the threshold as unlimited, so the EXISTING
-    // ISO is re-muxed and delivered (no wasteful full re-sweep). Consumed here
-    // so a later resume doesn't silently re-accept.
+    // ISO is re-muxed and delivered (no wasteful full re-sweep).
+    //
+    // The marker is READ here and CONSUMED only where the override is actually
+    // SPENT — at the successful hand-off, next to `write_completed_marker`.
+    // Consuming it at entry (what this did before) discarded the operator's
+    // consent on ANY unrelated transient failure between here and delivery: a
+    // poisoned config lock, an ISO open/scan error, a key resolution failure, a
+    // mux that didn't complete, a failed fsync. Each of those returns early
+    // having already deleted `.accept-loss`, so the automatic retry on the next
+    // disc-insert / container restart runs with the raw threshold, aborts on
+    // the very loss the operator accepted, and bumps `.restart_count` — enough
+    // retries and the dir walks to `.failed` with the operator's explicit
+    // consent silently thrown away every lap.
     let accept_loss = staging::accept_loss_requested(&staging_dir);
     if accept_loss {
-        staging::clear_accept_loss_marker(&staging_dir);
         crate::log::device_log(
             device,
             "Operator accepted the recorded loss — delivering the existing rip despite over-threshold damage.",
@@ -909,11 +943,11 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // tolerance is ignored (forced to 0), matching the fresh-rip gate.
         // `.accept-loss` raises the effective threshold to unlimited so the
         // operator override delivers despite over-threshold damage.
-        let effective_abort = if accept_loss {
-            u64::MAX
-        } else {
-            super::effective_abort_secs(&cfg_read.output_format, cfg_read.abort_on_lost_secs)
-        };
+        let effective_abort = resume_effective_abort(
+            accept_loss,
+            &cfg_read.output_format,
+            cfg_read.abort_on_lost_secs,
+        );
         // BYTE-AWARE gate, identical to the fresh-rip path (`loss_aborts` in
         // mod.rs): with `abort_on_lost_secs == 0`, "0 means ZERO" is byte-exact, so
         // a zero-bitrate title (whose `lost_ms` rounds to 0) that still has real
@@ -1520,8 +1554,20 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // quarantine to a RESUMABLE `.aborted-loss` (a keydb refresh + re-mux can
     // complete it). ISO output is exempt (whole-disc, gated by 100% elsewhere).
     {
+        // HONOUR `.accept-loss` HERE TOO. This gate used to RECOMPUTE the
+        // threshold from raw config while the sweep gate above (§3) used
+        // `if accept_loss { u64::MAX }` — so one run applied the operator's
+        // override at one gate and ignored it at the other. Concretely: an
+        // operator presses "Accept & deliver", the sweep gate passes on the
+        // override, the mux completes, and then this gate re-arms the raw
+        // `abort_on_lost_secs` against `done_lost_video_secs` — which ALREADY
+        // INCLUDES the sweep loss the operator just accepted — and quarantines
+        // the rip to `.aborted-loss`. The marker is one-shot and was consumed
+        // before any of this, so the consent is gone: the operator has to press
+        // Accept again, and gets the same answer again. Same override, same
+        // run, both gates.
         let effective_abort =
-            super::effective_abort_secs(&output_format, cfg_read.abort_on_lost_secs);
+            resume_effective_abort(accept_loss, &output_format, cfg_read.abort_on_lost_secs);
         // Route through the SAME `mux_loss_aborts` the fresh-rip path
         // (`rip_disc` in mod.rs) uses — its doc comment calls it out as "the
         // SOLE enforcement point for mux-time loss" precisely because an
@@ -1669,6 +1715,14 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     }
     staging::write_completed_marker(&staging_dir);
     staging::clear_restart_count(&staging_dir);
+    if accept_loss {
+        // The override is one-shot and it has now been SPENT: this run reached
+        // the hand-off, so the accepted-loss output is on its way to the mover.
+        // This is the only place it may be cleared — see the read site at the
+        // top of this function for why consuming it earlier threw the
+        // operator's consent away on unrelated transient failures.
+        staging::clear_accept_loss_marker(&staging_dir);
+    }
     if !title_confident {
         crate::log::device_log(
             device,
@@ -3420,6 +3474,119 @@ mod resume_lock_and_fsync_tests {
             staging::restart_count(&d),
             0,
             ".restart_count cleared after quarantine"
+        );
+    }
+}
+
+#[cfg(test)]
+mod accept_loss_override_tests {
+    use super::resume_effective_abort;
+
+    /// Catches the mutation that recomputes the abort threshold from raw
+    /// config at one of `resume_remux`'s loss gates while the other honours
+    /// `.accept-loss` — the two-gates-one-run disagreement.
+    ///
+    /// A resume has a sweep gate (§3) and a mux gate (§4). The mux gate used to
+    /// call `effective_abort_secs` directly, so an operator's "Accept &
+    /// deliver" passed §3 and was then quarantined by §4 against a total that
+    /// already contained the very loss they had accepted. The marker is
+    /// one-shot and had already been consumed, so the consent was gone with it.
+    #[test]
+    fn the_accept_loss_override_raises_the_threshold_for_every_resume_gate() {
+        assert_eq!(
+            resume_effective_abort(true, "mkv", 5),
+            u64::MAX,
+            "with the override armed no loss gate may abort"
+        );
+        assert_eq!(
+            resume_effective_abort(true, "iso", 0),
+            u64::MAX,
+            "the override outranks even the ISO byte-complete rule — the \
+             operator is looking at the recorded damage when they press it"
+        );
+        assert_eq!(
+            resume_effective_abort(false, "mkv", 5),
+            super::super::effective_abort_secs("mkv", 5),
+            "without the override the threshold is exactly the configured one"
+        );
+        assert_eq!(
+            resume_effective_abort(false, "iso", 30),
+            0,
+            "without the override ISO still forces byte-complete"
+        );
+    }
+
+    /// Catches the mutation that re-introduces a SECOND, hand-rolled threshold
+    /// computation in this file — the shape the defect had.
+    ///
+    /// Every loss gate in `resume_remux` must route through
+    /// `resume_effective_abort`, so `super::effective_abort_secs` may be named
+    /// exactly once here: inside that function. Comment lines are stripped
+    /// first so the explanation above cannot satisfy (or break) the pin.
+    #[test]
+    fn resume_has_exactly_one_threshold_computation() {
+        let src = crate::util::source_lf(include_str!("resume.rs"));
+        // Production code only: the test modules below name these same
+        // functions, and counting them would make this pin count itself.
+        let src = &src[..src.find("#[cfg(test)]").expect("this file has tests")];
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| !l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let direct = code.matches("super::effective_abort_secs(").count();
+        assert_eq!(
+            direct, 1,
+            "the resume path must compute its abort threshold in ONE place \
+             (resume_effective_abort); found {direct} direct calls to \
+             effective_abort_secs, which is how the sweep gate and the mux gate \
+             came to disagree about `.accept-loss` in the same run"
+        );
+    }
+
+    /// Catches the mutation that moves the `.accept-loss` consumption back to
+    /// `resume_remux`'s ENTRY.
+    ///
+    /// The marker must be read at entry but CLEARED only where the override is
+    /// spent — at the hand-off, beside `write_completed_marker`. Clearing it up
+    /// front threw the operator's consent away on any unrelated transient
+    /// failure in between (poisoned config lock, ISO scan error, key failure,
+    /// incomplete mux, failed fsync); the automatic retry then ran with the raw
+    /// threshold, aborted on the very loss that had been accepted, and bumped
+    /// `.restart_count` — enough laps and the dir walks to `.failed`.
+    #[test]
+    fn the_accept_loss_marker_is_consumed_only_once_the_rip_is_delivered() {
+        let src = crate::util::source_lf(include_str!("resume.rs"));
+        // Production code only: the test modules below name these same
+        // functions, and counting them would make this pin count itself.
+        let src = &src[..src.find("#[cfg(test)]").expect("this file has tests")];
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| !l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let read_at = code
+            .find("staging::accept_loss_requested(")
+            .expect("resume_remux must read the marker");
+        let delivered_at = code
+            .find("staging::write_completed_marker(")
+            .expect("resume_remux must write the completion marker");
+        let cleared: Vec<usize> = code
+            .match_indices("staging::clear_accept_loss_marker(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            cleared.len(),
+            1,
+            "the override must be consumed in exactly one place"
+        );
+        assert!(
+            cleared[0] > read_at && cleared[0] > delivered_at,
+            "`.accept-loss` must be cleared only AFTER the rip has been \
+             delivered (after write_completed_marker), never at entry — an \
+             unrelated transient failure must not spend the operator's consent"
         );
     }
 }
