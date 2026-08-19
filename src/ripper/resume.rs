@@ -2114,6 +2114,11 @@ mod find_iso_tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed),
             ));
+        // Wipe any stale contents first: `target/test-scratch` persists across
+        // runs and a CI pid can be reused between the debug and release test
+        // binaries, so a leftover `subdir` would make `create_dir` here fail
+        // with AlreadyExists. (`create_dir_all` alone is content-blind.)
+        let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
     }
@@ -2465,6 +2470,9 @@ mod completion_detection_tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed),
             ));
+        // See the note in the find-iso `tmpdir`: clear stale contents so a
+        // reused scratch path (persistent dir + CI pid reuse) starts empty.
+        let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -3387,6 +3395,9 @@ mod resume_lock_and_fsync_tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed),
             ));
+        // See the note in the find-iso `tmpdir`: clear stale contents so a
+        // reused scratch path (persistent dir + CI pid reuse) starts empty.
+        let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
     }
