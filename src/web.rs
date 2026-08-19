@@ -172,6 +172,35 @@ function toggleTheme(){document.body.classList.toggle('dark');localStorage.setIt
 /* ---- Util ---- */
 function esc(s){if(s==null)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function upd(id,html){const el=document.getElementById(id);if(el&&el._last!==html){el.innerHTML=html;el._last=html}}
+/* Every device action button goes through this, and none of them may be
+   fire-and-forget. The drive-card buttons used to call fetch() bare, with no
+   .then and no .catch: the server's answer was DISCARDED. Two of them are
+   rendered exactly in the window where the server now answers 409 — Eject
+   renders on discIn && !active, and "Accept & deliver" renders on
+   lossAborted && !active — and both of those windows can overlap a worker that
+   is still unwinding, which the claim refuses. So the operator clicked Eject
+   and the disc stayed in the drive; or clicked "Accept & deliver", watched the
+   button grey out (it set this.disabled=true first, which READS as success),
+   and no `.accept-loss` marker was ever written. A 409 rendered as a success.
+   Report the failure, and put the button back the way it was. */
+function apiPost(u,btn,label){
+  if(btn)btn.disabled=true;
+  return fetch(u,{method:'POST'}).then(function(r){
+    if(r.ok)return null;
+    return r.text().then(function(t){
+      let msg='';
+      try{const j=JSON.parse(t);if(j&&j.error)msg=j.error}catch(e){}
+      throw new Error(msg||('HTTP '+r.status));
+    });
+  }).catch(function(e){
+    alert((label||'Request')+' failed: '+e.message);
+  }).then(function(){
+    /* Re-enable even on success: the poll re-renders the card from server
+       state a moment later, and a button left disabled after a failure is
+       exactly the "it looked like it worked" bug. */
+    if(btn)btn.disabled=false;
+  });
+}
 
 /* ---- Navigation ---- */
 document.querySelectorAll('.nav[data-tab]').forEach(btn=>{
@@ -623,7 +652,7 @@ function renderCurrent(){
        keeps digits a fixed pixel width (no per-second jitter); text-align:right
        + a min-width wide enough for the "1h 02m 34s" form keeps it stable. */
     btns='<span id="rip-elapsed-'+dev+'" data-started="'+(s.started_epoch_secs||0)+'" style="margin-right:10px;font-size:.78rem;color:var(--text2);align-self:center;font-variant-numeric:tabular-nums;min-width:95px;text-align:right;display:inline-block"></span>';
-    btns+='<button class="btn btn-stop" onclick="if(confirm(\'Stop?\')){this.disabled=true;fetch(\'/api/stop/'+dev+'\',{method:\'POST\'})}">Stop</button>';
+    btns+='<button class="btn btn-stop" onclick="if(confirm(\'Stop?\')){apiPost(\'/api/stop/'+dev+'\',this,\'Stop\')}">Stop</button>';
   }else if(scanned){
     /* Keys resolved at scan time. If they're missing (and the operator
        hasn't opted into capture-without-keys), don't offer Rip at all —
@@ -631,7 +660,7 @@ function renderCurrent(){
        or a corrected key source can be re-checked without a page reload. */
     const notReady=(s.key_status||'').indexOf('Missing')===0;
     if(notReady){
-      btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan again</button>';
+      btns='<button class="btn" onclick="apiPost(\'/api/scan/'+dev+'\',this,\'Scan\')">Scan again</button>';
     }else if(s.resumable){
       /* A resumable partial exists. Design: the PRIMARY action (Resume —
          continue where it left off) is the filled accent button and comes
@@ -640,13 +669,13 @@ function renderCurrent(){
          (not a green fill that competed with the primary) and confirmed. For
          "remux" Resume just re-muxes the staged ISO. */
       const rl=s.resumable==='remux'?'Resume (re-mux)':'Resume';
-      btns='<button class="btn" style="background:var(--accent);color:#fff;border-color:var(--accent)" onclick="fetch(\'/api/rip/'+dev+'?resume=yes\',{method:\'POST\'})">'+rl+'</button>';
-      btns+='<button class="btn" style="background:transparent;color:var(--red);border-color:var(--red)" onclick="if(confirm(\'Start over from scratch? This discards the resumable partial for this disc and re-rips the whole disc.\')){fetch(\'/api/rip/'+dev+'?resume=no\',{method:\'POST\'})}">Start over</button>';
+      btns='<button class="btn" style="background:var(--accent);color:#fff;border-color:var(--accent)" onclick="apiPost(\'/api/rip/'+dev+'?resume=yes\',this,\'Resume\')">'+rl+'</button>';
+      btns+='<button class="btn" style="background:transparent;color:var(--red);border-color:var(--red)" onclick="if(confirm(\'Start over from scratch? This discards the resumable partial for this disc and re-rips the whole disc.\')){apiPost(\'/api/rip/'+dev+'?resume=no\',this,\'Start over\')}">Start over</button>';
     }else{
-      btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="fetch(\'/api/rip/'+dev+'?resume=no\',{method:\'POST\'})">Rip</button>';
+      btns='<button class="btn" style="background:var(--green);color:#fff;border-color:var(--green)" onclick="apiPost(\'/api/rip/'+dev+'?resume=no\',this,\'Rip\')">Rip</button>';
     }
   }else if(discIn){
-    btns='<button class="btn" onclick="fetch(\'/api/scan/'+dev+'\',{method:\'POST\'})">Scan</button>';
+    btns='<button class="btn" onclick="apiPost(\'/api/scan/'+dev+'\',this,\'Scan\')">Scan</button>';
   }
   /* Loss-aborted off-ramp: the rip aborted because main-movie loss exceeded the
      threshold, but the COMPLETE ISO is staged on disk. Offer exactly TWO clear
@@ -662,10 +691,10 @@ function renderCurrent(){
      text on it was unreadable — Resume is accent/white, Accept is amber-outlined.) */
   const lossAborted=s.loss_aborted||(s.last_error||'').indexOf('lost in main movie')>=0||(s.last_error||'').indexOf('lost at mux')>=0;
   if(lossAborted&&!active){
-    btns='<button class="btn" style="background:var(--accent);color:#fff;border-color:var(--accent)" onclick="fetch(\'/api/rip/'+dev+'?resume=yes\',{method:\'POST\'})">Run one more pass</button>';
-    btns+='<button class="btn" style="background:transparent;color:var(--yellow);border-color:var(--yellow);font-weight:500" onclick="if(confirm(\'Accept the recorded main-movie damage and deliver this rip as-is? The unreadable section will be missing, but the rest is intact.\')){this.disabled=true;fetch(\'/api/accept-loss/\'+dev,{method:\'POST\'})}">Accept &amp; deliver</button>';
+    btns='<button class="btn" style="background:var(--accent);color:#fff;border-color:var(--accent)" onclick="apiPost(\'/api/rip/'+dev+'?resume=yes\',this,\'Run one more pass\')">Run one more pass</button>';
+    btns+='<button class="btn" style="background:transparent;color:var(--yellow);border-color:var(--yellow);font-weight:500" onclick="if(confirm(\'Accept the recorded main-movie damage and deliver this rip as-is? The unreadable section will be missing, but the rest is intact.\')){apiPost(\'/api/accept-loss/\'+dev,this,\'Accept &amp; deliver\')}">Accept &amp; deliver</button>';
   }
-  if(discIn&&!active)btns+='<button class="btn btn-eject" onclick="fetch(\'/api/eject/'+dev+'\',{method:\'POST\'})">Eject</button>';
+  if(discIn&&!active)btns+='<button class="btn btn-eject" onclick="apiPost(\'/api/eject/'+dev+'\',this,\'Eject\')">Eject</button>';
 
   const dot=active?'var(--green)':scanned?'var(--accent)':discIn?'var(--yellow)':'var(--text3)';
   const pulse=active?'animation:p 1.5s infinite;':'';
@@ -6948,12 +6977,20 @@ fn handle_sse(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 }
 
 fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
-    // Atomic check-and-claim under one STATE lock — closes the TOCTOU where two
-    // concurrent POSTs both pass a separate busy-check and both start a scan.
-    if !ripper::try_claim_active_checked(device, false) {
+    // Check-and-claim. It takes TWO facts, and only one of them is a STATE
+    // fact: `try_claim_active_checked` reads the device's thread liveness
+    // FIRST and OUTSIDE the STATE lock, then folds the status-check and the
+    // status-set into a single STATE lock — which is what closes the TOCTOU
+    // where two concurrent POSTs both pass a separate busy-check and both
+    // start a scan. The two registries are deliberately never held at the same
+    // time; that is the whole no-lock-inversion argument, and calling this
+    // "atomic under one STATE lock" (as this comment used to) misdescribes the
+    // very ordering that argument rests on. The claim hands back the
+    // generation identifying it, which is what a failed spawn rolls back.
+    let Some(claim_gen) = ripper::try_claim_active_checked(device, false) else {
         json_response(request, 409, r#"{"ok":false,"error":"busy"}"#);
         return;
-    }
+    };
 
     let dev = device.to_string();
     let dev_path = format!("/dev/{}", device);
@@ -6969,14 +7006,37 @@ fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     );
     let dev_for_register = dev.clone();
     if let Err(e) = ripper::spawn_rip_thread(&dev_for_register, "scan", move || {
-        ripper::scan_disc(&cfg, &dev, &dev_path);
+        // Catch the panic, exactly as the rip spawn site and the poll loop do.
+        // Without this a panic in `scan_disc` unwinds past every state write and
+        // leaves the claim standing: `status="scanning"` with no thread, so
+        // `is_busy` answers true forever and scan/rip/eject/accept-loss all 409
+        // for the rest of the container's life. The claim is set BEFORE the
+        // spawn, so whoever takes it owns clearing it on every exit path — and
+        // an unwind is an exit path.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ripper::scan_disc(&cfg, &dev, &dev_path);
+        }))
+        .is_err()
+        {
+            crate::log::device_log(&dev, "Scan thread panicked");
+            ripper::update_state(
+                &dev,
+                ripper::RipState {
+                    device: dev.clone(),
+                    status: "error".to_string(),
+                    disc_present: true,
+                    last_error: "Internal error (panic)".to_string(),
+                    ..Default::default()
+                },
+            );
+        }
     }) {
         tracing::error!(device = %dev_for_register, error = %e, "failed to spawn scan thread");
         // Roll the device state back to idle so a failed spawn doesn't
         // wedge the busy-check at "scanning" forever (409 on every
         // future scan/rip until restart). Shared helper so poll loop +
         // both web handlers can't drift.
-        ripper::rollback_failed_spawn(&dev_for_register);
+        ripper::rollback_failed_spawn(&dev_for_register, claim_gen);
         json_response(
             request,
             500,
@@ -7006,18 +7066,20 @@ fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
 fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str, query: &str) {
     let resume_mode = parse_resume_param(query);
 
-    // Atomic check-and-claim under one STATE lock — closes the TOCTOU where two
-    // concurrent POSTs both pass a separate busy-check and both launch a rip on
-    // the same device (orphaned halt token + concurrent writes to one staging
-    // dir). The claim also marks the device "scanning": the resume decision is
+    // Check-and-claim — see `handle_scan` for the ordering. The liveness half
+    // is read outside the STATE lock; the status-check and status-set are one
+    // STATE lock, which closes the TOCTOU where two concurrent POSTs both pass
+    // a separate busy-check and both launch a rip on the same device (orphaned
+    // halt token + concurrent writes to one staging dir).
+    // The claim also marks the device "scanning": the resume decision is
     // delegated to the worker thread (it scans the disc, cheap, then picks
     // resume_remux vs rip_disc based on the staging dir), keeping scan logic in
     // one place.
-    if !ripper::try_claim_active_checked(device, false) {
+    let Some(claim_gen) = ripper::try_claim_active_checked(device, false) else {
         json_response(request, 409, r#"{"ok":false,"error":"already ripping"}"#);
         return;
-    }
-    spawn_rip_after_claim(request, cfg, device, resume_mode);
+    };
+    let _ = spawn_rip_after_claim(request, cfg, device, resume_mode, claim_gen);
 }
 
 /// Spawn the rip worker thread for `device`, assuming the caller has ALREADY
@@ -7025,12 +7087,18 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
 /// (claims for itself) and [`handle_accept_loss`] (must claim BEFORE writing
 /// any staging markers, so a losing claim leaves the on-disk override
 /// unarmed — see the comment there).
+/// Returns `true` if the worker was spawned. The response has already been
+/// sent either way; the boolean exists so a caller that armed on-disk state
+/// BEFORE calling (only [`handle_accept_loss`], which writes `.accept-loss`)
+/// can disarm it when no worker will ever consume it.
+#[must_use]
 fn spawn_rip_after_claim(
     request: tiny_http::Request,
     cfg: &Arc<RwLock<Config>>,
     device: &str,
     resume_mode: ResumeMode,
-) {
+    claim_gen: u64,
+) -> bool {
     let dev = device.to_string();
     let dev_path = format!("/dev/{}", device);
     let cfg = Arc::clone(cfg);
@@ -7061,16 +7129,17 @@ fn spawn_rip_after_claim(
         // wedge the busy-check at "scanning" forever (409 on every
         // future scan/rip until restart). Shared helper so poll loop +
         // both web handlers can't drift.
-        ripper::rollback_failed_spawn(&dev_for_register);
+        ripper::rollback_failed_spawn(&dev_for_register, claim_gen);
         json_response(
             request,
             500,
             r#"{"ok":false,"error":"thread spawn failed"}"#,
         );
-        return;
+        return false;
     }
 
     json_response(request, 200, r#"{"ok":true}"#);
+    true
 }
 
 /// POST `/api/accept-loss/{device}` — operator override.
@@ -7122,10 +7191,10 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
     // the stale override and mux a rip whose loss was never actually
     // accepted for that run — a damaged rip filed as finished with no
     // operator confirmation for that abort.
-    if !ripper::try_claim_active_checked(device, false) {
+    let Some(claim_gen) = ripper::try_claim_active_checked(device, false) else {
         json_response(request, 409, r#"{"ok":false,"error":"already ripping"}"#);
         return;
-    }
+    };
     // Arm the one-shot override and clear the terminal/abort markers so the dir
     // resumes (re-mux) instead of being refused as failed.
     ripper::staging::write_accept_loss_marker(dir);
@@ -7139,7 +7208,19 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
     // Delegate to the already-claimed spawn path (resume_remux consumes
     // `.accept-loss`); do NOT go through handle_rip, which would try to
     // claim a second time and always lose against the claim just above.
-    spawn_rip_after_claim(request, cfg, device, ResumeMode::Require);
+    if !spawn_rip_after_claim(request, cfg, device, ResumeMode::Require, claim_gen) {
+        // The OS refused the thread, so NOTHING will consume the override we
+        // just armed. Leaving `.accept-loss` on disk after a 500 is the same
+        // stale-override hazard the claim-before-write ordering above exists to
+        // prevent, just reached by the other door: the next legitimate
+        // rip/resume of this disc would silently pick it up and deliver a rip
+        // whose loss was never accepted FOR THAT RUN. Disarm, and say so.
+        ripper::staging::clear_accept_loss_marker(dir);
+        crate::log::device_log(
+            device,
+            "Accept-damage override disarmed: the rip thread could not be spawned, so no run will consume it.",
+        );
+    }
 }
 
 /// Resume-mode chosen by the caller of `/api/rip`. The dispatch logic
@@ -7172,6 +7253,196 @@ fn parse_resume_param(query: &str) -> ResumeMode {
         }
     }
     ResumeMode::Default
+}
+
+#[cfg(test)]
+mod stop_report_tests {
+    use super::stop_report;
+
+    /// Catches the mutation that makes a timed-out Stop report the clean-stop
+    /// answer (status "idle" + `{"ok":true}`) — a failure rendered as a
+    /// success, which is the highest-value defect class in this crate.
+    ///
+    /// `handle_stop` used to reset the row to "idle" and answer `{"ok":true}`
+    /// whether or not the rip thread drained. When it had NOT drained the
+    /// worker was still running, still holding the drive and the staging dir,
+    /// and still making the claim's liveness half refuse every later
+    /// scan/rip/eject on that device — so the operator saw an idle, quiet card
+    /// and a 409 on the next click, with no explanation anywhere but a WARN in
+    /// the server log.
+    #[test]
+    fn a_stop_that_did_not_drain_is_not_reported_as_a_clean_stop() {
+        let clean = stop_report(true);
+        assert_eq!(
+            clean.status, "idle",
+            "a drained stop leaves the device idle"
+        );
+        assert!(clean.last_error.is_empty(), "no error on the clean path");
+        assert!(
+            clean.body.contains(r#""ok":true"#),
+            "a drained stop answers ok:true; got {}",
+            clean.body
+        );
+
+        let timed_out = stop_report(false);
+        assert_ne!(
+            timed_out.status, "idle",
+            "a stop whose worker is still running must NOT publish idle — the \
+             device is still held and every route will refuse it"
+        );
+        assert!(
+            !timed_out.last_error.is_empty(),
+            "the reason the device is still busy must reach the state row the \
+             dashboard renders, not just the server log"
+        );
+        assert!(
+            timed_out.body.contains(r#""ok":false"#),
+            "a stop that stopped nothing must not answer ok:true; got {}",
+            timed_out.body
+        );
+    }
+}
+
+#[cfg(test)]
+mod worker_panic_tests {
+    /// Catches the mutation that removes the `catch_unwind` from ANY worker
+    /// spawn site.
+    ///
+    /// The claim is taken before the spawn (`status="scanning"`), so the worker
+    /// owns clearing it on every exit path — and an unwind is an exit path. The
+    /// scan spawn site had no `catch_unwind` while the rip site and the poll
+    /// loop both did: a panic anywhere in `scan_disc` therefore left the device
+    /// claimed with no thread behind the claim, `is_busy` true forever, and
+    /// every route on that device answering 409 until the container restarted.
+    /// `forget_removed_device` will not evict a busy row and the poll loop
+    /// skips busy devices, so nothing self-heals it.
+    #[test]
+    fn every_worker_spawn_site_catches_its_panic() {
+        let src = crate::util::source_lf(include_str!("web.rs"));
+        // Match the production call shape only. (This file's test modules are
+        // interleaved with production code, so a bare name match would also
+        // count this test's own string literals.)
+        const SITE: &str = "if let Err(e) = ripper::spawn_rip_thread(";
+        let mut sites = 0;
+        for (idx, _) in src.match_indices(SITE) {
+            sites += 1;
+            // The closure body follows the call; a spawn site's panic handling
+            // must appear before the next spawn site (or the end of the file).
+            let rest = &src[idx..];
+            let window_end = rest[1..].find(SITE).map(|i| i + 1).unwrap_or(rest.len());
+            assert!(
+                rest[..window_end].contains("catch_unwind"),
+                "a worker spawn site with no catch_unwind leaves the device's \
+                 claim set forever if the worker panics; site {sites}"
+            );
+        }
+        assert!(sites >= 2, "expected both web spawn sites; found {sites}");
+    }
+}
+
+#[cfg(test)]
+mod accept_loss_spawn_failure_tests {
+    /// Catches the mutation that drops the disarm branch from
+    /// `handle_accept_loss` when `spawn_rip_after_claim` fails.
+    ///
+    /// The handler arms `.accept-loss` on disk BEFORE it spawns, deliberately:
+    /// a rejected (409) accept must leave the staging dir untouched, so the
+    /// claim is taken first. But if the OS then refuses the thread, the handler
+    /// answers 500 and NOTHING will ever consume the marker it just wrote. The
+    /// next legitimate rip or resume of that disc picks the stale override up
+    /// and delivers a rip whose loss was never accepted for that run — a
+    /// damaged rip filed as finished with no operator confirmation, which is
+    /// exactly the hazard the claim-before-write ordering exists to prevent,
+    /// reached through the other door.
+    ///
+    /// Proven structurally: making a real `thread::Builder::spawn` fail inside
+    /// the test binary means exhausting the process's thread limit.
+    #[test]
+    fn a_failed_spawn_disarms_the_accept_loss_override() {
+        let src = crate::util::source_lf(include_str!("web.rs"));
+        let start = src
+            .find("fn handle_accept_loss(")
+            .expect("handle_accept_loss must exist");
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("function must end");
+        let body: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("if !spawn_rip_after_claim("),
+            "handle_accept_loss must CHECK whether the spawn succeeded — a \
+             fire-and-forget call cannot disarm the override it armed"
+        );
+        assert!(
+            body.contains("clear_accept_loss_marker("),
+            "a spawn failure must disarm `.accept-loss`, or the override sits \
+             on disk with no run to consume it and the NEXT rip of this disc \
+             silently inherits the operator's consent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dashboard_button_tests {
+    /// Catches the mutation that puts a bare `fetch(...)` back into any
+    /// device-action button's `onclick`.
+    ///
+    /// The drive-card buttons were fire-and-forget: `fetch()` with no `.then`
+    /// and no `.catch`, so the server's answer was discarded entirely. Eject
+    /// renders on `discIn && !active` and "Accept & deliver" on
+    /// `lossAborted && !active` — both of those overlap the window in which the
+    /// claim refuses with 409 because a worker is still unwinding. The operator
+    /// clicked Eject and the disc stayed in the drive with no message; clicked
+    /// "Accept & deliver" and watched it grey out (it set `this.disabled=true`
+    /// FIRST, which reads as success) while no `.accept-loss` marker was ever
+    /// written and the override was never armed. A 409 rendered as success.
+    ///
+    /// Comment lines are stripped before matching so this pin cannot be
+    /// satisfied by its own explanation.
+    #[test]
+    fn no_device_action_button_discards_the_servers_answer() {
+        let src = crate::util::source_lf(include_str!("web.rs"));
+        let code: Vec<&str> = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| !l.trim_start().starts_with('*'))
+            .collect();
+        let mut checked = 0;
+        for line in code {
+            let is_device_action = [
+                "/api/scan/",
+                "/api/rip/",
+                "/api/eject/",
+                "/api/stop/",
+                "/api/accept-loss/",
+            ]
+            .iter()
+            .any(|ep| line.contains(ep));
+            if !line.contains("onclick=") || !is_device_action {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                !line.contains("fetch("),
+                "a device-action button must not call fetch() directly — it \
+                 discards the status code, so a 409 renders as a success. Use \
+                 apiPost(url, this, label). Offending line:\n{line}"
+            );
+            assert!(
+                line.contains("apiPost("),
+                "every device-action button must go through apiPost, which \
+                 surfaces the failure and re-enables the button. Offending \
+                 line:\n{line}"
+            );
+        }
+        assert!(
+            checked >= 8,
+            "expected to inspect the whole drive-card button set; only found \
+             {checked} — the matcher has drifted away from the buttons"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7468,15 +7739,18 @@ fn handle_eject(request: tiny_http::Request, device: &str) {
     // consent. The UI hides the eject button while active, but POST
     // /api/eject/<dev> is unauthenticated and reachable from any LAN
     // client — so the server must enforce the gate, not just the JS.
-    // Atomically claim the device before ejecting. A separate busy-check then
-    // eject left a TOCTOU window in which a rip could start (its own
-    // `try_claim_active`) between the check and the eject — ejecting a
-    // just-started rip on this irreversible slot-loading drive. `try_claim_active`
-    // folds the busy-check and the status-set into one STATE lock: it rejects if
-    // the device is already scanning/ripping, and once it has claimed the device
-    // (status="scanning") any concurrent rip-start's claim fails for the duration
-    // of the eject. The idle reset below releases the claim.
-    if !ripper::try_claim_active_checked(device, false) {
+    // Claim the device before ejecting. A separate busy-check then eject left a
+    // TOCTOU window in which a rip could start (its own `try_claim_active`)
+    // between the check and the eject — ejecting a just-started rip on this
+    // irreversible slot-loading drive. The claim closes it: the liveness half
+    // is read outside the STATE lock, and the busy-check and the status-set are
+    // folded into ONE STATE lock, so it rejects a device that is already
+    // scanning/ripping (or whose worker thread is still alive) and, once it has
+    // claimed the device (status="scanning"), any concurrent rip-start's claim
+    // fails for the duration of the eject. The idle reset below releases the
+    // claim. NB: the two registries are never held simultaneously — this is not
+    // "one lock over both facts", and the no-inversion argument depends on that.
+    if ripper::try_claim_active_checked(device, false).is_none() {
         return json_response(
             request,
             409,
@@ -7525,37 +7799,99 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
 
     // Cancel the per-device halt and drain the rip thread (the core
     // stop→drain contract; see ripper::stop_and_drain).
-    if !ripper::stop_and_drain(device, std::time::Duration::from_secs(60)) {
-        tracing::warn!(
+    //
+    // A drain that TIMES OUT is not a stop. The worker is still running: it
+    // still owns the drive, the staging dir and (until it returns) the
+    // device's registration, so every later scan/rip/eject/accept-loss on this
+    // device is refused by the claim's liveness half — for as long as the
+    // worker takes, which for one wedged in `Drive::open`/`eject()` is the
+    // container's lifetime. There is no safe way to take the device back: the
+    // thread cannot be killed, and re-admitting a rip while it runs is the
+    // duplicate-writer bug this whole subsystem is built to prevent.
+    //
+    // What CAN be fixed is the reporting. This used to reset the row to "idle"
+    // and answer `{"ok":true}` either way — a failure rendered as a success:
+    // the card went quiet and idle while a worker was still mid-write, and the
+    // operator's next click came back 409 with nothing anywhere to explain it.
+    // Say what actually happened instead, in the log, in the device log, and
+    // in the state row the UI renders.
+    let drained = ripper::stop_and_drain(device, std::time::Duration::from_secs(60));
+    if !drained {
+        tracing::error!(
             device = %device,
-            "rip thread did not drain within 60s of stop"
+            "rip thread did not drain within 60s of stop — the worker is still \
+             running and this device stays held until it exits (a worker wedged \
+             in a blocking drive ioctl needs a container restart)"
+        );
+        crate::log::device_log(
+            device,
+            "Stop: the rip thread did not exit within 60s. It is still running, so \
+             this drive stays busy until it does — scan/rip/eject will be refused. \
+             If it never exits, restart the container.",
         );
     }
 
-    let existed = ripper::STATE
-        .lock()
-        .map(|mut s| {
-            if let Some(rs) = s.get_mut(device) {
-                // Full reset: keep device id + disc_present, drop everything else.
-                let disc_still_in = rs.disc_present;
-                *rs = ripper::RipState {
-                    device: device.to_string(),
-                    status: "idle".to_string(),
-                    disc_present: disc_still_in,
-                    ..Default::default()
-                };
-                true
-            } else {
-                false
-            }
+    // Recover-and-proceed on poison (house convention): a poisoned STATE must
+    // not turn a Stop into a silent 404.
+    let mut state = ripper::STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let report = stop_report(drained);
+    let existed = state
+        .get_mut(device)
+        .map(|rs| {
+            // Full reset: keep device id + disc_present, drop everything else.
+            let disc_still_in = rs.disc_present;
+            *rs = ripper::RipState {
+                device: device.to_string(),
+                status: report.status.to_string(),
+                disc_present: disc_still_in,
+                last_error: report.last_error.to_string(),
+                ..Default::default()
+            };
+            true
         })
         .unwrap_or(false);
+    drop(state);
 
-    if existed {
-        ripper::set_stop_cooldown(device);
-        json_response(request, 200, r#"{"ok":true}"#);
-    } else {
+    if !existed {
         json_response(request, 404, r#"{"ok":false,"error":"drive not found"}"#);
+        return;
+    }
+    ripper::set_stop_cooldown(device);
+    json_response(request, 200, report.body);
+}
+
+/// What a Stop reports, as a function of whether the rip thread ACTUALLY
+/// drained. Split out of [`handle_stop`] so the "a stop that did not stop
+/// anything must not render as success" rule is testable without waiting out
+/// the real 60 s drain budget.
+struct StopReport {
+    /// `RipState::status` to publish.
+    status: &'static str,
+    /// `RipState::last_error` to publish (empty on the clean path).
+    last_error: &'static str,
+    /// The JSON response body. Always HTTP 200: the Stop WAS delivered (the
+    /// `Halt` is cancelled either way) and the UI must not spin — but `ok` is
+    /// false when the worker is still running, so a client that checks the
+    /// field cannot read a timed-out drain as a completed stop.
+    body: &'static str,
+}
+
+fn stop_report(drained: bool) -> StopReport {
+    if drained {
+        StopReport {
+            status: "idle",
+            last_error: "",
+            body: r#"{"ok":true}"#,
+        }
+    } else {
+        StopReport {
+            // NOT idle: the device is still held by a live worker. "error" is
+            // the status the dashboard renders together with `last_error`, so
+            // the reason lands on the card instead of only in the log.
+            status: "error",
+            last_error: "Stop timed out: the rip thread is still running; the drive stays busy until it exits",
+            body: r#"{"ok":false,"error":"stop timed out: the rip thread is still running"}"#,
+        }
     }
 }
 
