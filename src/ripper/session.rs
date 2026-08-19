@@ -216,74 +216,96 @@ where
 /// exit eventually. The timeout just bounds how long the HTTP
 /// response (or shutdown sequence) blocks.
 ///
-/// Implementation: poll `JoinHandle::is_finished()` every 25 ms
-/// until it returns true or the deadline passes. Polling avoids the
-/// extra channel plumbing of a one-shot signal and keeps the
-/// registration API simple (test code can register a synthetic
-/// thread without producing a paired Receiver).
+/// # The handle is POLLED IN PLACE — it never leaves `RIP_THREADS`
+///
+/// This used to open with `take_rip_thread`, poll the handle it had removed,
+/// and stash it back on timeout or self-join. That REMOVED THE DEVICE'S ONLY
+/// LIVENESS FACT for the whole drain — up to 60 s for `/api/stop` — while the
+/// worker was still running, and every gate that asks
+/// [`rip_thread_running`] read `false` for that window:
+///
+/// * `POST /api/stop/sr0` lands on a worker in its terminal tail (it has
+///   written `status = "done"` and is still inside auto-eject). `is_busy` is
+///   already false. `handle_stop` takes the handle and starts polling.
+/// * A concurrent `POST /api/rip/sr0` — unauthenticated, this server binds
+///   `0.0.0.0` — now sees NEITHER fact: `is_busy` false, `rip_thread_running`
+///   false. It wins `try_claim_active_checked`, `register_halt` clobbers the
+///   incumbent's `Halt` (so the incumbent's trailing `unregister_halt` deletes
+///   the NEW rip's token and `/api/stop` can no longer cancel it),
+///   `register_rip_thread` finds the slot EMPTY because we took the handle,
+///   and a full duplicate rip runs against the incumbent's staging dir.
+///
+/// Round 1's TOCTOU argument (see `try_claim_active_checked`) only covered a
+/// handle APPEARING between the liveness read and the `STATE` lock. It never
+/// covered one DISAPPEARING out from under a live worker, which is what the
+/// drain itself was doing.
+///
+/// Polling in place also removes the re-stash entirely, and with it the
+/// separate defect where the timeout path `insert`ed unconditionally and
+/// could REPLACE a newer live handle with the stale one it was holding —
+/// making the live rip unjoinable, so the next stop reported a clean drain
+/// while that worker was still mid-write.
+///
+/// Implementation: every 25 ms, take `RIP_THREADS` briefly, look at the entry
+/// for `device`, and drop the lock again. Nothing is ever held across the
+/// sleep or across `join()`. `join()` runs only once `is_finished()` is true,
+/// so it cannot block.
 #[allow(clippy::result_unit_err)]
 pub fn join_rip_thread(device: &str, timeout: Duration) -> Result<(), ()> {
-    let handle = match take_rip_thread(device) {
-        Some(h) => h,
-        None => return Ok(()),
-    };
-    // Self-join guard: if we are *on* the registered rip thread (e.g.
-    // `eject_drive` called from the rip's own auto-eject path at the end
-    // of `rip_disc`), `handle.is_finished()` can never become true while
-    // we sit here, so the poll loop below would spin the full `timeout`
-    // (60s), log a spurious "did not drain" warning, stash the handle
-    // back, and only then proceed. Detect that case and return
-    // immediately — the thread is by definition still running (it's us)
-    // and will exit as soon as we return up the stack. We stash the
-    // handle back so a later off-thread caller (or the shutdown drain)
-    // can still reap it once we've actually exited.
-    if handle.thread().id() == std::thread::current().id() {
-        // Mirror the timeout path: on a poisoned mutex recover the guard and
-        // re-stash so join_all_rip_threads can still reap the handle (the
-        // no-silently-dropped-handle invariant this module documents).
-        match RIP_THREADS.lock() {
-            Ok(mut t) => {
-                t.insert(device.to_string(), handle);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().insert(device.to_string(), handle);
-                tracing::error!(
-                    device = %device,
-                    "RIP_THREADS poisoned on self-join; recovered guard to re-stash handle"
-                );
-            }
-        }
-        return Ok(());
-    }
     let deadline = std::time::Instant::now() + timeout;
-    while !handle.is_finished() {
-        if std::time::Instant::now() >= deadline {
-            // Stash the handle back so a later caller (or shutdown)
-            // can reap it; the thread is still running. `take_rip_thread`
-            // already removed it, so on a poisoned mutex the handle would
-            // otherwise be dropped here and could never be reaped at
-            // shutdown — recover the poisoned guard and re-stash so the
-            // leak doesn't go silent.
-            match RIP_THREADS.lock() {
-                Ok(mut t) => {
-                    t.insert(device.to_string(), handle);
-                }
-                Err(poisoned) => {
-                    poisoned.into_inner().insert(device.to_string(), handle);
-                    tracing::error!(
-                        device = %device,
-                        "RIP_THREADS poisoned on join timeout; recovered guard to re-stash handle"
-                    );
-                }
-            }
-            return Err(());
+    loop {
+        // One short lock per poll. `Observed` is computed under the lock and
+        // the guard is dropped before we sleep, join, or return.
+        enum Observed {
+            /// No handle registered — nothing to drain.
+            Absent,
+            /// The registered handle is THIS thread (see the self-join note).
+            SelfJoin,
+            Finished,
+            Running,
         }
-        std::thread::sleep(Duration::from_millis(25));
+        let observed = {
+            // Recover from poison: a poisoned RIP_THREADS means a rip worker
+            // panicked, which is exactly when the stop path must still drain
+            // before staging is touched. Same convention as everywhere else in
+            // this module.
+            let t = RIP_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            match t.get(device) {
+                None => Observed::Absent,
+                Some(h) if h.thread().id() == std::thread::current().id() => Observed::SelfJoin,
+                Some(h) if h.is_finished() => Observed::Finished,
+                Some(_) => Observed::Running,
+            }
+        };
+        match observed {
+            Observed::Absent => return Ok(()),
+            // Self-join: we are *on* the registered rip thread (e.g.
+            // `eject_drive` called from the rip's own auto-eject path at the
+            // end of `rip_disc`). `is_finished()` can never become true while
+            // we sit here, so polling would burn the whole timeout and log a
+            // spurious "did not drain". The thread is by definition still
+            // running (it's us) and will exit as soon as we return up the
+            // stack. The handle stays registered — which is also what keeps
+            // the device's liveness fact true for the rest of our tail.
+            Observed::SelfJoin => return Ok(()),
+            Observed::Finished => break,
+            Observed::Running => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
     }
-    // join() returns Err(payload) if the thread panicked. The thread
-    // DID finish (so we return Ok), but surface the panic so stop /
-    // eject / shutdown don't treat a panicked rip as a clean exit.
-    if let Err(e) = handle.join() {
+    // Finished: remove and reap. A concurrent joiner may have got there first,
+    // in which case the entry is gone and there is nothing left to do.
+    // `is_finished() == true` guarantees `join()` returns without blocking.
+    if let Some(handle) = take_rip_thread(device)
+        && let Err(e) = handle.join()
+    {
+        // join() returns Err(payload) if the thread panicked. The thread DID
+        // finish (so we return Ok), but surface the panic so stop / eject /
+        // shutdown don't treat a panicked rip as a clean exit.
         tracing::error!(device = %device, "rip thread panicked: {:?}", e);
     }
     Ok(())
@@ -414,32 +436,59 @@ pub fn unregister_halt(device: &str) {
     halts.remove(device);
 }
 
-/// Roll a device back to idle after a failed `spawn_rip_thread`.
+/// Roll a device back to idle after a failed `spawn_rip_thread`, undoing the
+/// claim identified by `claim_gen` — the value the caller's own
+/// [`super::try_claim_active_checked`] returned — and nothing else.
 ///
-/// A spawn failure after the device has been claimed (`try_claim_active`
-/// set status="scanning") and a `Halt` token registered would otherwise
-/// wedge the device in "scanning" forever (409 on every future scan/rip)
-/// and leak the Halt. This is the single rollback used by BOTH web
-/// handlers (`/api/scan`, `/api/rip`) and the disc-insert poll loop so
-/// they can't drift. The disc is assumed still present.
-pub fn rollback_failed_spawn(device: &str) {
-    // Never roll back a device whose worker is still alive. A spawn can fail
-    // for two very different reasons: the OS refused the thread (nothing is
-    // registered for this device — the case this function exists for), or
-    // `spawn_rip_thread` refused to displace a still-running incumbent. In the
-    // second case the "failure" belongs to the duplicate, and rolling back
-    // would vandalise the WINNER: `unregister_halt` deletes the token
-    // `/api/stop` needs to cancel the live rip, and the idle push overwrites a
-    // running (or just-completed) rip's state with `idle`. Liveness, not
-    // status, is the right question here for the usual reason — a worker
-    // writes its terminal status and then keeps unwinding.
-    if rip_thread_running(device) {
-        tracing::warn!(
-            device = %device,
-            "declining spawn rollback: a worker still owns this device (the spawn that \
-             failed was the duplicate, not the incumbent)"
-        );
-        return;
+/// A spawn failure after the device has been claimed (the claim set
+/// `status="scanning"`) and a `Halt` token registered would otherwise wedge the
+/// device in "scanning" forever (409 on every future scan/rip) and leak the
+/// Halt. This is the single rollback used by BOTH web handlers (`/api/scan`,
+/// `/api/rip`) and the disc-insert poll loop so they can't drift. The disc is
+/// assumed still present.
+///
+/// # Why the generation, and not a liveness check
+///
+/// A spawn can fail for two very different reasons: the OS refused the thread
+/// (nothing is registered for this device — the case this function exists
+/// for), or `spawn_rip_thread` refused to displace a still-running incumbent.
+/// In the second case the "failure" belongs to the duplicate, and an
+/// unconditional rollback would vandalise the WINNER: `unregister_halt`
+/// deletes the token `/api/stop` needs to cancel the live rip, and the idle
+/// push overwrites a running rip's state.
+///
+/// The previous guard answered that with *liveness* — "is any worker thread
+/// running for this device?" — and returned early if so. That is the wrong
+/// question, and it introduced a wedge of its own: the early return left the
+/// LOSER's claim standing. No thread, no Halt, `status == "scanning"`,
+/// `is_busy()` true forever if the incumbent never writes state again (which
+/// is precisely the case in the incumbent's terminal tail, the window this
+/// whole race lives in). All four device routes then answer 409 indefinitely
+/// and only `/api/stop` can recover the device.
+///
+/// The generation answers the *right* question — "is the claim I made still
+/// the claim in force?" — and it is exactly what `RipState::claim_gen` was
+/// added for. It is correct under every interleaving with no liveness read at
+/// all: the loser always clears its own claim, and can never clear the
+/// winner's, because a winner's claim necessarily bumped the generation past
+/// the loser's. `update_state` carries the generation forward, so an ordinary
+/// progress write does not look like a re-claim.
+pub fn rollback_failed_spawn(device: &str, claim_gen: u64) {
+    {
+        // Recover-and-proceed on poison (module convention). Guard is dropped
+        // before `unregister_halt` / `update_state` so no two locks are held.
+        let s = super::STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let current = s.get(device).map(|r| r.claim_gen);
+        if current != Some(claim_gen) {
+            tracing::warn!(
+                device = %device,
+                rolling_back = claim_gen,
+                in_force = ?current,
+                "declining spawn rollback: the device has been re-claimed since \
+                 (the spawn that failed was the duplicate, not the incumbent)"
+            );
+            return;
+        }
     }
     super::unregister_halt(device);
     super::update_state(
@@ -853,60 +902,89 @@ mod rollback_tests {
         );
     }
 
-    /// Catches the mutation that deletes the `rip_thread_running` guard from
-    /// `rollback_failed_spawn` (or weakens it to `is_busy`).
+    /// Catches the mutation that drops the generation check from
+    /// `rollback_failed_spawn` (making it roll back unconditionally), and the
+    /// mutation that restores the round-1 `rip_thread_running` early return
+    /// (which left the loser's own claim standing forever).
     ///
     /// A spawn can fail for two unrelated reasons, and only one of them means
-    /// "this device has no owner". When `spawn_rip_thread` refuses to displace
-    /// a still-running incumbent, the loser's caller runs this same rollback —
-    /// and an unguarded rollback then vandalises the WINNER: it unregisters the
-    /// `Halt` that `/api/stop` needs to cancel the live rip, and overwrites the
-    /// running rip's state with `idle`, which also re-opens the device to the
-    /// next claim. Status is not the right question (a worker writes its
-    /// terminal status and keeps unwinding); liveness is.
+    /// "the claim I made is still the claim in force". When `spawn_rip_thread`
+    /// refuses to displace a still-running incumbent, the loser's caller runs
+    /// this same rollback. It must do BOTH of these, and the round-1 guard did
+    /// only the first:
+    ///
+    /// * not vandalise the WINNER — no unregistering the `Halt` that
+    ///   `/api/stop` needs to cancel the live rip, no idling a running rip's
+    ///   state row;
+    /// * still clear the LOSER's own claim, or the device sits at
+    ///   `status="scanning"` with no thread and no Halt, `is_busy()` true, and
+    ///   every route answering 409 until someone POSTs `/api/stop`.
     #[test]
-    fn rollback_failed_spawn_declines_while_a_worker_still_owns_the_device() {
+    fn rollback_scoped_to_its_own_claim_spares_the_winner_and_clears_the_loser() {
         let dev = format!("rollback-live-worker-test-{}", std::process::id());
         let _ = super::take_rip_thread(&dev);
-        assert!(super::super::try_claim_active(&dev), "claim must succeed");
-        super::super::register_halt(&dev, Halt::new());
+        let winner_gen = super::super::try_claim_active(&dev).expect("claim must succeed");
+        let winner_halt = Halt::new();
+        super::super::register_halt(&dev, winner_halt);
 
-        // A worker that is still on the CPU — the incumbent.
+        // A worker that is still on the CPU — the incumbent/winner.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         super::spawn_rip_thread(&dev, "rip", move || {
             let _ = release_rx.recv();
         })
         .expect("the first spawn owns the device");
 
-        super::rollback_failed_spawn(&dev);
-
+        // The loser rolls back a claim that is NO LONGER in force (the winner's
+        // generation is the current one). Nothing of the winner's may move.
+        let stale_gen = winner_gen.saturating_sub(1);
+        super::rollback_failed_spawn(&dev, stale_gen);
         assert!(
             super::super::device_halt(&dev).is_some(),
-            "rollback must NOT unregister the live worker's Halt — /api/stop \
-             would then have no token with which to cancel the running rip"
+            "a rollback for a superseded claim must NOT unregister the live \
+             worker's Halt — /api/stop would then have no token with which to \
+             cancel the running rip"
         );
-        let snap = super::super::STATE
-            .lock()
-            .unwrap()
-            .get(&dev)
-            .cloned()
-            .expect("state entry exists");
         assert_eq!(
-            snap.status, "scanning",
-            "rollback must NOT idle a device whose worker is still running"
+            super::super::STATE
+                .lock()
+                .unwrap()
+                .get(&dev)
+                .map(|r| r.status.clone()),
+            Some("scanning".to_string()),
+            "a rollback for a superseded claim must NOT idle the winner"
         );
 
-        // Let the incumbent finish, then confirm the ordinary rollback still
-        // works once nothing owns the device (the guard must not be a
-        // permanent refusal).
-        drop(release_tx);
-        let _ = super::join_rip_thread(&dev, std::time::Duration::from_secs(10));
-        super::rollback_failed_spawn(&dev);
+        // Now the H2 wedge itself: the claim that IS in force is rolled back
+        // while a worker thread is still alive for this device. That is the
+        // shape of a losing `/api/rip` whose `spawn_rip_thread` came back
+        // `PriorThreadRunning` — it claimed (bumping the generation to the one
+        // in force) and registered its own Halt before the spawn was refused.
+        // Round 1 returned early here because a thread was running, leaving
+        // "scanning" set with nothing left that would ever clear it.
+        super::super::register_halt(&dev, Halt::new());
+        super::rollback_failed_spawn(&dev, winner_gen);
         assert!(
             super::super::device_halt(&dev).is_none(),
-            "with no live worker the rollback must behave exactly as before"
+            "rolling back the claim in force must also release the Halt that \
+             claim registered, or the next rip inherits a stale token"
         );
+        assert_eq!(
+            super::super::STATE
+                .lock()
+                .unwrap()
+                .get(&dev)
+                .map(|r| r.status.clone()),
+            Some("idle".to_string()),
+            "rolling back the claim that is in force must clear it — leaving it \
+             set wedges every route on this device at 409 with no thread and no \
+             Halt to recover from"
+        );
+
+        drop(release_tx);
+        let _ = super::join_rip_thread(&dev, std::time::Duration::from_secs(10));
         super::super::STATE.lock().unwrap().remove(&dev);
+        let _ = super::take_rip_thread(&dev);
+        super::super::unregister_halt(&dev);
     }
 
     #[test]
@@ -914,11 +992,11 @@ mod rollback_tests {
         let dev = format!("rollback-test-{}", std::process::id());
         // Simulate the pre-spawn state: claim (sets status=scanning) +
         // register a Halt, exactly as the poll loop / web handlers do.
-        assert!(super::super::try_claim_active(&dev), "claim must succeed");
+        let claim_gen = super::super::try_claim_active(&dev).expect("claim must succeed");
         super::super::register_halt(&dev, Halt::new());
         assert!(super::super::device_halt(&dev).is_some(), "halt registered");
 
-        super::super::rollback_failed_spawn(&dev);
+        super::super::rollback_failed_spawn(&dev, claim_gen);
 
         // Halt is gone (no leak) and the device is idle with the disc still
         // present, so a future scan/rip is not wedged at 409.
@@ -1174,5 +1252,54 @@ mod rollback_tests {
             "take_session on poisoned lock returns None for an absent device, not panic"
         );
         drop_session(&dev); // must not panic
+    }
+
+    /// Catches the mutation that deletes `join_rip_thread`'s self-join branch
+    /// (or turns it into an ordinary poll), and the mutation that has it
+    /// UNREGISTER the handle on the way out.
+    ///
+    /// `eject_drive` is called from the rip's own auto-eject tail, so
+    /// `join_rip_thread` regularly runs ON the thread it is being asked to
+    /// join. `is_finished()` can never become true from there, so an ordinary
+    /// poll burns the entire 60 s stop budget inside a rip that is doing
+    /// nothing wrong and then logs "did not drain". And the handle must stay
+    /// registered while we sit in that tail: it is the fact that keeps a
+    /// concurrent `/api/rip` from claiming a device whose worker is still
+    /// holding the drive.
+    #[test]
+    fn join_rip_thread_called_on_its_own_thread_returns_at_once() {
+        let dev = format!("self-join-test-{}", std::process::id());
+        let _ = super::take_rip_thread(&dev);
+        let (tx, rx) = std::sync::mpsc::channel::<(std::time::Duration, bool, bool)>();
+        let dev_inner = dev.clone();
+        super::spawn_rip_thread(&dev, "rip", move || {
+            let t0 = std::time::Instant::now();
+            // A budget far longer than any test may block for: if the
+            // self-join branch is gone this sleeps for all 30 s.
+            let outcome = super::join_rip_thread(&dev_inner, std::time::Duration::from_secs(30));
+            let still_registered = super::rip_thread_running(&dev_inner);
+            let _ = tx.send((t0.elapsed(), outcome.is_ok(), still_registered));
+        })
+        .expect("spawn");
+
+        let (elapsed, ok, still_registered) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a self-join must return immediately, not sit out its timeout");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "self-join returned after {elapsed:?} — it must not poll its own thread"
+        );
+        assert!(ok, "a self-join is not a drain failure");
+        assert!(
+            still_registered,
+            "a self-join must leave the handle registered — it is what keeps the \
+             device unclaimable for the rest of the worker's tail"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while super::rip_thread_running(&dev) {
+            assert!(std::time::Instant::now() < deadline, "worker should exit");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = super::join_rip_thread(&dev, std::time::Duration::from_secs(5));
     }
 }

@@ -532,7 +532,7 @@ pub fn update_state_with<F: FnOnce(&mut RipState)>(device: &str, f: F) {
 /// identical behaviour. See `try_claim_active_checked`'s doc for why a
 /// caller that has NOT independently verified the device is a real,
 /// enumerated drive must use that function instead.
-pub fn try_claim_active(device: &str) -> bool {
+pub fn try_claim_active(device: &str) -> Option<u64> {
     try_claim_active_checked(device, true)
 }
 
@@ -606,7 +606,7 @@ pub fn try_claim_active(device: &str) -> bool {
 /// a worker that hangs forever keeps its device unclaimable. A finished
 /// handle reads as not-running, so an ordinary completed rip frees the device
 /// the instant the thread exits, with no reaping required first.
-pub fn try_claim_active_checked(device: &str, known: bool) -> bool {
+pub fn try_claim_active_checked(device: &str, known: bool) -> Option<u64> {
     // Liveness first, and OUTSIDE the STATE lock (see the doc above for both
     // the why and the ordering argument).
     if super::session::rip_thread_running(device) {
@@ -615,17 +615,17 @@ pub fn try_claim_active_checked(device: &str, known: bool) -> bool {
             "refusing claim: a worker thread for this device is still running \
              (its status is already terminal, but it has not exited yet)"
         );
-        return false;
+        return None;
     }
     let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if s.get(device)
         .map(|r| r.status == "scanning" || r.status == "ripping")
         .unwrap_or(false)
     {
-        return false;
+        return None;
     }
     if !known && !s.contains_key(device) {
-        return false;
+        return None;
     }
     let entry = s.entry(device.to_string()).or_insert_with(|| RipState {
         device: device.to_string(),
@@ -638,7 +638,10 @@ pub fn try_claim_active_checked(device: &str, known: bool) -> bool {
     // reset it to idle. Monotonic per device; saturating so it never wraps to
     // an old value mid-process.
     entry.claim_gen = entry.claim_gen.saturating_add(1);
-    true
+    // The generation IS the claim's identity, and it is returned so the caller
+    // can hand it to `rollback_failed_spawn` and undo THIS claim and no other.
+    // See that function for the wedge that a device-only rollback produced.
+    Some(entry.claim_gen)
 }
 
 /// Shared context for the progress callbacks of a multi-pass rip. Built once
@@ -1192,36 +1195,74 @@ mod tests {
         (dir, map)
     }
 
-    /// Regression guard: the single-pass done card must feed the real
-    /// in-title loss (lost_video_secs * 1000) into the damage classifier,
-    /// not the all-zero `sweep_damage_snapshot.total_lost_ms` (which is the
-    /// Default in direct mode, since single-pass has no mapfile).
+    /// Catches the mutation that feeds the done card the STARVED
+    /// `sweep_damage_snapshot.total_lost_ms` (0.0 in single-pass, which has no
+    /// mapfile) instead of the real in-title loss — a damaged rip filed as
+    /// clean.
     ///
-    /// A rip that skipped only a handful of sectors but each covered a
-    /// large unit at low bitrate can lose >1s of video. With total_lost_ms
-    /// starved to 0.0, classify_damage's ms-branch never fires and the rip
-    /// is mis-rated "cosmetic" (10 < 51 sector threshold) when it should be
-    /// "moderate" (>=1000 ms lost).
+    /// The previous version of this test only called `damage_severity_for`
+    /// with two literals. That pins the classifier, which was never the thing
+    /// at risk: the wiring lives in `rip_disc`, and reintroducing the bug there
+    /// left this test green. The decision now lives in one function
+    /// (`super::super::done_card_lost_ms`) and this drives it, then pushes the
+    /// result through the REAL `update_state` — which is where
+    /// `damage_severity` is actually computed for the card.
     #[test]
     fn single_pass_done_card_total_lost_ms_drives_severity() {
         // 10 skipped sectors -> below the 51-sector Moderate threshold, so
         // severity is decided purely by the ms-branch.
         let errors: u32 = 10;
-        let lost_video_secs: f64 = 1.5; // 1500 ms lost
+        let final_lost_secs: f64 = 1.5; // 1500 ms of in-title loss
 
-        // Buggy behavior: total_lost_ms starved to 0.0 -> Cosmetic.
+        // The wiring: single-pass must carry the real in-title loss.
+        let single_pass = super::super::done_card_lost_ms(false, final_lost_secs, 0.0, 0.0);
+        assert_eq!(
+            single_pass,
+            final_lost_secs * MILLIS_PER_SEC,
+            "single-pass must derive the done card's lost-ms from the real \
+             in-title loss, not from the mapfile snapshot it does not have"
+        );
+
+        // End to end, exactly as `rip_disc` publishes it.
+        let dev = format!("sg_done_card_severity_{}", std::process::id());
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "done".to_string(),
+                errors,
+                total_lost_ms: single_pass,
+                ..Default::default()
+            },
+        );
+        let snap = STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&dev)
+            .cloned()
+            .expect("state entry exists");
+        assert_eq!(
+            snap.damage_severity, "moderate",
+            "a >1s in-title loss must reach the done card as moderate damage"
+        );
+
+        // And the bug, spelled out: the starved value classifies the same rip
+        // as cosmetic, so the two must not be interchangeable.
         assert_eq!(
             damage_severity_for(errors, 0.0),
             "cosmetic",
-            "starved total_lost_ms under-classifies a >1s loss"
+            "starved total_lost_ms under-classifies a >1s loss — this is the \
+             value the wiring must NOT pick in single-pass mode"
         );
 
-        // Fixed behavior: feed the real loss -> Moderate.
+        // Multipass keeps the mapfile-derived value, plus the demux extra.
         assert_eq!(
-            damage_severity_for(errors, lost_video_secs * MILLIS_PER_SEC),
-            "moderate",
-            "single-pass done card must derive total_lost_ms from lost_video_secs"
+            super::super::done_card_lost_ms(true, final_lost_secs, 4000.0, 100.0),
+            4100.0,
+            "multipass must keep the snapshot's mapfile-derived loss"
         );
+
+        STATE.lock().unwrap_or_else(|e| e.into_inner()).remove(&dev);
     }
 
     fn minimal_title() -> libfreemkv::DiscTitle {
@@ -1267,22 +1308,49 @@ mod tests {
     #[test]
     fn the_stop_cooldown_is_not_measured_on_the_wall_clock() {
         let src = crate::util::source_lf(include_str!("state.rs"));
+        // Start at the STATIC, not at `set_stop_cooldown`: the stored TYPE is
+        // half the guarantee (an `Instant` map cannot hold a wall-clock
+        // deadline at all), and it is declared above the setter.
         let start = src
-            .find("pub fn set_stop_cooldown(")
-            .expect("set_stop_cooldown must exist");
+            .find("pub(super) static STOP_COOLDOWNS")
+            .expect("the cooldown map must exist");
         let end = src
             .find("/// Drop the auxiliary per-device state on hot-unplug")
             .expect("forget_device_state's doc must follow the cooldown fns");
-        let region = &src[start..end];
+        // Strip comment lines before matching. Without this the pin can be
+        // satisfied — or broken — by its own prose: the doc comment on
+        // STOP_COOLDOWNS names `epoch_secs()` while explaining why it must not
+        // be used.
+        let region: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Not "no `epoch_secs()`" — that pins ONE spelling, and the wall clock
+        // has several. Any of these reads the clock that can step backwards.
+        for spelling in [
+            "epoch_secs",
+            "SystemTime",
+            "UNIX_EPOCH",
+            "duration_since",
+            "chrono",
+        ] {
+            assert!(
+                !region.contains(spelling),
+                "the stop cooldown must not be derived from the wall clock \
+                 (found `{spelling}`) — a backward NTP step, host clock reset \
+                 or VM snapshot resume wedges the device out of auto-dispatch \
+                 for as long as the clock is behind"
+            );
+        }
         assert!(
-            !region.contains("epoch_secs()"),
-            "the stop cooldown must not be derived from the wall clock — a \
-             backward NTP step wedges the device out of auto-dispatch for as \
-             long as the clock is behind"
+            region.contains("std::time::Instant>"),
+            "the cooldown deadline must be STORED as a monotonic Instant, so a \
+             wall-clock value cannot be put in the map at all"
         );
         assert!(
             region.contains("Instant::now()"),
-            "the cooldown deadline must be monotonic (Instant)"
+            "the cooldown deadline must be computed from the monotonic clock"
         );
     }
 
@@ -1763,7 +1831,7 @@ mod tests {
         );
 
         assert!(
-            !try_claim_active_checked(&dev, false),
+            try_claim_active_checked(&dev, false).is_none(),
             "an unknown device must not be claimable"
         );
         assert!(
@@ -1774,7 +1842,7 @@ mod tests {
 
         // Looping the same forged name must not eventually succeed either.
         for _ in 0..5 {
-            assert!(!try_claim_active_checked(&dev, false));
+            assert!(try_claim_active_checked(&dev, false).is_none());
         }
         assert!(
             STATE.lock().unwrap().get(&dev).is_none(),
@@ -1788,7 +1856,7 @@ mod tests {
         // the poll loop's own trusted, just-enumerated device list) — must
         // still create a fresh entry and succeed.
         let dev = format!("test-known-new-{}", std::process::id());
-        assert!(try_claim_active_checked(&dev, true));
+        assert!(try_claim_active_checked(&dev, true).is_some());
         let snap = STATE.lock().unwrap().get(&dev).cloned().unwrap();
         assert_eq!(snap.status, "scanning");
         // The map key and the RipState.device field are independent — the
@@ -1819,7 +1887,7 @@ mod tests {
             },
         );
         assert!(
-            try_claim_active_checked(&dev, false),
+            try_claim_active_checked(&dev, false).is_some(),
             "a device already present in STATE must remain claimable even \
              when the caller couldn't independently verify it"
         );
@@ -1868,12 +1936,12 @@ mod tests {
              otherwise this test cannot distinguish the two facts"
         );
         assert!(
-            !try_claim_active_checked(&dev, false),
+            try_claim_active_checked(&dev, false).is_none(),
             "a claim must be refused while the device's worker thread is still \
              running, even though its status is terminal"
         );
         assert!(
-            !try_claim_active(&dev),
+            try_claim_active(&dev).is_none(),
             "the known=true wrapper must refuse on the same grounds"
         );
 
@@ -1891,7 +1959,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            try_claim_active_checked(&dev, false),
+            try_claim_active_checked(&dev, false).is_some(),
             "once the worker has exited the device must be claimable again, \
              with no reaping step in between — the liveness gate must not \
              latch a device shut"
@@ -1900,6 +1968,92 @@ mod tests {
             .expect("the finished handle is still registered")
             .join()
             .expect("worker joins cleanly");
+        STATE.lock().unwrap().remove(&dev);
+    }
+
+    /// Catches the mutation that puts `take_rip_thread` back at the top of
+    /// `join_rip_thread` (i.e. drains by REMOVING the handle and stashing it
+    /// back afterwards) — the H1 duplicate-rip window.
+    ///
+    /// The drain is what `POST /api/stop/{device}` does, for up to 60 s. While
+    /// it ran, the handle was OUT of `RIP_THREADS`, so the device's only
+    /// liveness fact read `false`. Land that on a worker in its terminal tail
+    /// (status already "done", so `is_busy` is false too) and a concurrent
+    /// `POST /api/rip/{device}` — unauthenticated, this server binds 0.0.0.0 —
+    /// wins the claim, clobbers the incumbent's `Halt`, finds an empty
+    /// registration slot and runs a full duplicate rip on the same drive and
+    /// the same staging dir.
+    ///
+    /// So: a claim must be refused for the WHOLE life of the worker thread,
+    /// including while another thread is draining it.
+    #[test]
+    fn a_drain_in_flight_never_makes_a_live_worker_claimable() {
+        let dev = format!("sg_claim_during_drain_test_{}", std::process::id());
+        let _ = super::super::take_rip_thread(&dev);
+        // The terminal tail: the worker has published "done" and is still
+        // running. The status half of the gate is already open.
+        update_state(
+            &dev,
+            RipState {
+                device: dev.clone(),
+                status: "done".to_string(),
+                disc_present: true,
+                ..Default::default()
+            },
+        );
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        super::super::session::spawn_rip_thread(&dev, "rip", move || {
+            let _ = release_rx.recv();
+        })
+        .expect("the worker owns the device");
+        assert!(!is_busy(&dev), "test setup: the status half must read free");
+
+        // `/api/stop` arrives and drains. The worker is blocked, so this
+        // occupies the full budget and then reports a timeout.
+        let drain_dev = dev.clone();
+        let drain = std::thread::spawn(move || {
+            super::super::session::join_rip_thread(
+                &drain_dev,
+                std::time::Duration::from_millis(600),
+            )
+        });
+
+        // Hammer the claim for the whole drain window. Every one must lose.
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        let mut attempts = 0u32;
+        while std::time::Instant::now() < until {
+            assert!(
+                try_claim_active_checked(&dev, false).is_none(),
+                "a claim must be refused while the device's worker is alive, \
+                 even while a concurrent /api/stop drain is polling it"
+            );
+            attempts += 1;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            attempts > 5,
+            "test setup: the drain window was never sampled"
+        );
+
+        assert!(
+            drain.join().expect("drain thread joins").is_err(),
+            "test setup: the drain must have timed out against the blocked \
+             worker, which is the window this test is about"
+        );
+        // And the handle must still be registered after that timeout — a drain
+        // that loses the handle also loses the ability to reap the thread.
+        assert!(
+            super::super::session::rip_thread_running(&dev),
+            "a timed-out drain must leave the live worker's handle registered"
+        );
+
+        drop(release_tx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while super::super::session::rip_thread_running(&dev) {
+            assert!(std::time::Instant::now() < deadline, "worker should exit");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = super::super::session::join_rip_thread(&dev, std::time::Duration::from_secs(5));
         STATE.lock().unwrap().remove(&dev);
     }
 
@@ -1914,11 +2068,11 @@ mod tests {
         // disabling the whole guard.
         let dev = format!("test-doubleclaim-{}", std::process::id());
         assert!(
-            try_claim_active(&dev),
+            try_claim_active(&dev).is_some(),
             "first claim on a fresh device must succeed"
         );
         assert!(
-            !try_claim_active(&dev),
+            try_claim_active(&dev).is_none(),
             "a second claim on an already-scanning device must be refused"
         );
     }
@@ -1932,7 +2086,10 @@ mod tests {
         // claim_gen to 0, defeating the stale-worker-detach guard the
         // generation exists for.
         let dev = format!("test-claimgen-carry-{}", std::process::id());
-        assert!(try_claim_active(&dev), "claim bumps claim_gen to 1");
+        assert!(
+            try_claim_active(&dev).is_some(),
+            "claim bumps claim_gen to 1"
+        );
         // A normal mid-rip push, exactly as push_pass_state/set_pass_progress
         // build it: claim_gen defaults to 0 via ..Default::default().
         update_state(
@@ -1957,7 +2114,7 @@ mod tests {
         // have that value stored verbatim, not overwritten by the
         // previous push's generation.
         let dev = format!("test-claimgen-explicit-{}", std::process::id());
-        assert!(try_claim_active(&dev)); // claim_gen -> 1
+        assert!(try_claim_active(&dev).is_some()); // claim_gen -> 1
         update_state(
             &dev,
             RipState {
