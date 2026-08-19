@@ -828,7 +828,9 @@ function reviewResolve(idx,action,extra){
   const it=_REV[idx]; if(!it)return;
   const body=Object.assign({dir:it.dir,action:action},extra||{});
   fetch('/api/review/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(r=>r.json()).then(()=>loadReview()).catch(()=>{});
+    .then(r=>r.json().then(j=>({ok:r.ok,j:j})))
+    .then(({ok,j})=>{if(!ok||(j&&j.ok===false)){alert('Resolve failed: '+((j&&j.error)||'server error'));}loadReview();})
+    .catch(()=>{alert('Resolve failed: could not reach the server');loadReview();});
 }
 function reviewSearch(idx){
   const q=(document.getElementById('rvq-'+idx)||{}).value; if(!q||!q.trim())return;

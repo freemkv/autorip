@@ -4266,6 +4266,10 @@ mod tests {
         // the dest already exists identically. This must be treated as the
         // idempotent path (Skipped/Moved), NOT a collision, and staging
         // must clean up.
+        // Hold the shared lock, like every other MOVE_ERRORS-touching test: this
+        // one asserts on the process-global MOVE_ERRORS map, so without the guard
+        // a concurrent sibling's key could satisfy or break the assertion.
+        let _g = errors_guard();
         let dir = scratch_dir("idempotent");
         let staging = dir.join("staging");
         let movie_dir = dir.join("output/Movies");

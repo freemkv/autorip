@@ -1983,6 +1983,14 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
             if stats.bytes_pending != 0 {
                 continue;
             }
+            // Same truncation guard `classify_resume` applies (resume.rs): a
+            // mapfile can read fully-swept (bytes_pending == 0) while its ISO was
+            // truncated on disk afterwards by a crash/OOM-kill/disk-full. Muxing
+            // that shorter-than-bytes_total image would silently drop its tail, so
+            // refuse and let the disc re-sweep fresh rather than resume onto it.
+            if std::fs::metadata(&iso_path).is_ok_and(|m| m.len() < stats.bytes_total) {
+                continue;
+            }
             // Pre-filter loss estimate. Two cases:
             //
             // abort_on_lost_secs == 0 ("perfect rip required"): the
@@ -2583,10 +2591,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Cloned for use in the finalize block (history record) — after multipass
     // we drop `session` to release the drive, so we can't borrow session.tmdb
     // at the tail of this function.
+    // No TMDB result → the EMPTY string, which is the mover's documented
+    // no-match sentinel: `routing_media_type` coalesces "" to the movie root and
+    // the mover/muxer tests assert exactly that ("" routes as a movie). A literal
+    // "unknown" here is neither empty nor "movie"/"tv", so it fell through to the
+    // output-root dump — a no-TMDB-key rip (a supported mode) never reached the
+    // movie library.
     let tmdb_media_type = tmdb
         .as_ref()
         .map(|t| t.media_type.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_default();
 
     let display_name = if tmdb_title.is_empty() {
         disc_name.clone()
