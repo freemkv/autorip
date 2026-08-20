@@ -1158,13 +1158,14 @@ function renderSettings(s){
          in multi-pass — sweep always skips by design, retries always retry, and the
          post-retry abort decision is governed by abort_on_lost_secs (time-based). */
       {key:'max_retries',label:'Retry Passes',type:'number',hint:'How many retry passes to run on bad sectors. Each pass uses smaller blocks (60→30→15→7→1 sectors) and alternates direction. Default 5 covers most recoverable damage.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
-      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Promote the disc ISO into the library alongside the muxed title. Off by default to reclaim disk.',indent:true,showIf:{key:'rip_mode',value:'multi'}},
+      {key:'keep_iso',label:'Keep Intermediate ISO',type:'bool',hint:'Keep the intermediate disc ISO after muxing. Off by default to reclaim disk. Filed beside the muxed title unless you set an ISO Folder (under Output).',indent:true,showIf:{key:'rip_mode',value:'multi'}},
     ]},
     {title:'Output',fields:[
       {key:'staging_dir',label:'Staging Directory',type:'text',hint:'Where rips are written before being moved to the final destination. Use a fast local disk for performance; the finished MKV is moved to the output directory on completion.'},
       {key:'output_dir',label:'Output Directory',type:'text',hint:'Where all ripped files go by default'},
       {key:'movie_dir',label:'Movies',type:'text',hint:'',indent:true,placeholder:'Same as output directory'},
       {key:'tv_dir',label:'TV Series',type:'text',hint:'',indent:true,placeholder:'Same as output directory'},
+      {key:'iso_dir',label:'ISO Folder',type:'text',hint:'Where kept ISOs are stored (applies when Keep Intermediate ISO is on, or Output Format is ISO). Relative (e.g. isos) sits under the Output Directory; an absolute path (e.g. /mnt/archive/isos) targets another disk. Blank = beside the muxed title.',indent:true,placeholder:'Beside the muxed title'},
     ]},
     {title:'API Keys',fields:[
       {key:'tmdb_api_key',label:'TMDB API Key',type:'text',hint:'v3 API key from themoviedb.org'},
@@ -6632,7 +6633,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     // defaults are the relative "movies" / "tv"). Relative is the norm; only
     // reject `..` so they can't escape the output root. An absolute override is
     // also permitted.
-    for field in ["movie_dir", "tv_dir"] {
+    for field in ["movie_dir", "tv_dir", "iso_dir"] {
         if let Some(v) = patch.get(field).and_then(|v| v.as_str()) {
             if v.is_empty() {
                 continue;
@@ -6716,6 +6717,9 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         }
         if let Some(v) = patch.get("tv_dir").and_then(|v| v.as_str()) {
             c.tv_dir = v.to_string();
+        }
+        if let Some(v) = patch.get("iso_dir").and_then(|v| v.as_str()) {
+            c.iso_dir = v.to_string();
         }
         if let Some(v) = patch.get("tmdb_api_key").and_then(|v| v.as_str()) {
             // Ignore the redaction sentinel so a round-trip of the GET

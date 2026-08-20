@@ -1004,13 +1004,31 @@ fn check_and_move(cfg: &Config) {
 
         // FAIL-LOUD destination-root validation (Mercy incident hardening).
         // Before creating ANY per-title subdir, confirm the configured root
-        // (the mount point: movie_dir / tv_dir / output_dir) ALREADY EXISTS,
-        // is a directory, is absolute, and is writable. If the mount has
-        // vanished, ERROR and PRESERVE the output in staging — never
+        // (the mount point: movie_dir / tv_dir / iso_dir / output_dir) ALREADY
+        // EXISTS, is a directory, is absolute, and is writable. If the mount
+        // has vanished, ERROR and PRESERVE the output in staging — never
         // `create_dir_all` a fresh tree (which would resolve into the
         // container's writable overlay and silently swallow an 80 GB rip).
-        let dest_root = destination_root(cfg, &tmdb_result);
-        if let Err(reason) = validate_destination_root(&dest_root) {
+        //
+        // A single move can span MORE THAN ONE root: a `keep_iso` delivery
+        // files the MKV under the movie/tv root and its companion ISO under
+        // `iso_dir`. Validate every DISTINCT root involved, not just the movie
+        // root, so a missing/again-unwritable ISO mount is caught with the same
+        // fail-loud guarantee rather than silently landing in the overlay.
+        let mut dest_roots: Vec<String> = Vec::new();
+        for (src, _dest) in &planned_moves {
+            let fname = src.file_name().unwrap_or_default().to_string_lossy();
+            let r = destination_root_for(cfg, &tmdb_result, &fname);
+            if !dest_roots.iter().any(|existing| existing == &r) {
+                dest_roots.push(r);
+            }
+        }
+        let blocked_root = dest_roots.iter().find_map(|r| {
+            validate_destination_root(r)
+                .err()
+                .map(|reason| (r.clone(), reason))
+        });
+        if let Some((dest_root, reason)) = blocked_root {
             record_error(
                 &dir_str,
                 &format!(
@@ -1536,7 +1554,44 @@ fn dest_claim(src: &Path, dest: &str) -> DestClaim {
     }
 }
 
+/// True when `filename` is a disc image (`.iso`, case-insensitive). Governs
+/// whether a delivered file is routed to the configured `iso_dir` archive.
+fn is_iso_file(filename: &str) -> bool {
+    Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
+}
+
 fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
+    // Kept/output disc images archive to their own FLAT folder when `iso_dir`
+    // is configured — a sibling of the movie/tv library (e.g.
+    // /mnt/media/isos), not beside the muxed title. `iso_dir` resolves under
+    // `output_dir` with the same relative-joins / absolute-wins semantics as
+    // movie_dir/tv_dir (see `resolve_media_root`). FLAT means one file per
+    // title at `<iso_root>/<Title (Year)>.iso` with NO per-title subfolder (an
+    // ISO archive is a dump, not a Plex tree). Empty `iso_dir` (default) falls
+    // through to the legacy movie/tv "alongside" routing below. The
+    // `.iso.mapfile` is staging-only and never promoted, so only the image
+    // itself reaches here.
+    if is_iso_file(filename) && !cfg.iso_dir.is_empty() {
+        let root = resolve_media_root(&cfg.output_dir, &cfg.iso_dir);
+        let leaf = match tmdb {
+            Some(result) => {
+                let safe_title = crate::util::sanitize_path_display(&result.title);
+                let year_str = if result.year > 0 {
+                    format!(" ({})", result.year)
+                } else {
+                    String::new()
+                };
+                format!("{safe_title}{year_str}.iso")
+            }
+            // No TMDB match: keep the (sanitized) source filename, mirroring the
+            // no-tmdb fall-through the movie/tv branches use.
+            None => crate::util::sanitize_path_display(filename),
+        };
+        return format!("{root}/{leaf}");
+    }
     // Source extension wins. Pre-0.25.7 this hardcoded ".mkv" for the
     // movie branch, which collided when keep_iso=true left both the
     // mux output and the source ISO in staging — both planned to the
@@ -1672,6 +1727,20 @@ fn destination_root(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>) -> String {
         }
     }
     cfg.output_dir.clone()
+}
+
+/// The configured root a given output FILE lands under. A `.iso` image uses
+/// `iso_dir` (resolved under `output_dir`) when it is set; every other file
+/// uses the movie/tv/output root from [`destination_root`]. Extension-aware
+/// because one `keep_iso` delivery files the MKV under the movie/tv root AND
+/// its companion ISO under `iso_dir` — two DISTINCT roots that must BOTH clear
+/// the Mercy-incident writability guard before any bytes move. Stays in
+/// lock-step with the ISO branch of [`build_destination`].
+fn destination_root_for(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
+    if is_iso_file(filename) && !cfg.iso_dir.is_empty() {
+        return resolve_media_root(&cfg.output_dir, &cfg.iso_dir);
+    }
+    destination_root(cfg, tmdb)
 }
 
 /// Fail-loud destination-root validation: the configured root must ALREADY
@@ -2631,6 +2700,69 @@ mod tests {
         let tmdb = Some(tmdb_movie("Movie", 2024));
         let dest = build_destination(&cfg, &tmdb, "00800.m2ts");
         assert_eq!(dest, "/out/Movies/Movie (2024)/Movie (2024).m2ts");
+    }
+
+    #[test]
+    fn iso_dir_routes_iso_flat_to_its_own_root_relative() {
+        // A RELATIVE iso_dir joins under output_dir (like movie_dir/tv_dir).
+        // The ISO lands FLAT — one file per title, no per-title subfolder —
+        // while the MKV companion still files into the movie tree. The two
+        // must not collide.
+        let mut cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
+        cfg.iso_dir = "isos".into();
+        let tmdb = Some(tmdb_movie("Lumina", 2023));
+        let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso");
+        let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv");
+        assert_eq!(dest_iso, "/out/isos/Lumina (2023).iso");
+        assert_eq!(dest_mkv, "/out/Movies/Lumina (2023)/Lumina (2023).mkv");
+    }
+
+    #[test]
+    fn iso_dir_absolute_targets_another_disk() {
+        // An ABSOLUTE iso_dir wins via Path::join (own disk / share).
+        let mut cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
+        cfg.iso_dir = "/mnt/archive/isos".into();
+        let tmdb = Some(tmdb_movie("Lumina", 2023));
+        assert_eq!(
+            build_destination(&cfg, &tmdb, "Lumina.iso"),
+            "/mnt/archive/isos/Lumina (2023).iso"
+        );
+    }
+
+    #[test]
+    fn iso_dir_empty_keeps_legacy_alongside_routing() {
+        // Default (empty) iso_dir must not change behaviour: the ISO stays
+        // beside the muxed title, matching build_destination_movie_preserves_iso_extension.
+        let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
+        assert!(cfg.iso_dir.is_empty());
+        let tmdb = Some(tmdb_movie("Lumina", 2023));
+        assert_eq!(
+            build_destination(&cfg, &tmdb, "Lumina.iso"),
+            "/out/Movies/Lumina (2023)/Lumina (2023).iso"
+        );
+    }
+
+    #[test]
+    fn destination_root_for_selects_iso_root_only_for_iso_files() {
+        // The move loop validates the DISTINCT set of roots; with iso_dir set a
+        // keep_iso delivery spans the movie root AND the iso root, and both must
+        // be validated. destination_root_for is the per-file selector that makes
+        // that split visible.
+        let mut cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
+        cfg.iso_dir = "isos".into();
+        let tmdb = Some(tmdb_movie("Lumina", 2023));
+        assert_eq!(
+            destination_root_for(&cfg, &tmdb, "Lumina.iso"),
+            "/out/isos",
+            "iso files route to the iso root"
+        );
+        assert_eq!(
+            destination_root_for(&cfg, &tmdb, "Lumina.mkv"),
+            destination_root(&cfg, &tmdb),
+            "non-iso files keep the movie/tv root"
+        );
+        // Case-insensitive extension match.
+        assert_eq!(destination_root_for(&cfg, &tmdb, "Lumina.ISO"), "/out/isos");
     }
 
     fn noop_progress(_: u8, _: f64, _: f64, _: f64) {}
