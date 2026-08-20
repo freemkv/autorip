@@ -65,6 +65,7 @@ body { font-family:-apple-system,system-ui,"Segoe UI",Roboto,sans-serif; backgro
 .headerbar { display:flex; align-items:center; gap:8px 12px; padding:12px 16px; flex-wrap:wrap; border-bottom:1px solid var(--border); background:var(--card); position:sticky; top:0; z-index:10; }
 .nav { text-decoration:none; font-size:.85rem; color:var(--text3); padding:4px 0; border-bottom:2px solid transparent; cursor:pointer; background:none; border-top:none; border-left:none; border-right:none; }
 .nav:hover { color:var(--text); } .nav.active { color:var(--text); border-bottom-color:var(--accent); font-weight:500; }
+.brand { font-size:1.1rem; color:var(--text3); font-weight:400; letter-spacing:3px; text-transform:uppercase; }
 /* Now Playing card */
 .np { display:flex; align-items:flex-start; gap:20px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; margin-bottom:16px; min-height:180px; }
 .poster { width:120px; height:180px; border-radius:8px; background:var(--poster-bg); flex-shrink:0; align-self:flex-start; object-fit:cover; box-shadow:0 2px 8px rgba(0,0,0,.1); }
@@ -108,13 +109,41 @@ tr:hover { background:var(--chip); }
 #settings-form .card { margin-bottom:12px; }
 #settings-form .card h2 { margin-bottom:14px; }
 .section { display:none; } .section.active { display:flex; flex-direction:column; flex:1; }
-@media(max-width:600px){ .c{padding:10px} .np{flex-direction:column;gap:12px} .poster,.ph{width:100%;min-height:auto;max-height:200px} .mt{font-size:1.2rem} }
+/* ── Mobile / narrow viewports ─────────────────────────────────────────
+   Additive: these rules only take effect below the breakpoints, so the
+   desktop layout above is untouched. Keep the Now-Playing card a COMPACT
+   horizontal row (small poster + info) rather than a full-width stacked
+   poster, tighten the sticky header so the wordmark stops crowding the
+   nav, wrap the action buttons, and enlarge tap targets for touch. */
+@media(max-width:600px){
+  .c{padding:10px 10px 20px}
+  .headerbar{padding:10px 12px;gap:6px 10px}
+  .brand{font-size:.95rem;letter-spacing:2px}
+  .nav{font-size:.9rem;padding:7px 0}
+  .card{padding:13px;margin-bottom:12px}
+  .np{gap:14px;padding:14px;min-height:0}
+  .poster,.ph{width:84px;height:126px;min-height:0;max-height:none}
+  .ph svg{width:28px;height:28px}
+  .mt{font-size:1.2rem}
+  .mo{-webkit-line-clamp:4}
+  .actions{flex-wrap:wrap}
+  .btn{padding:7px 12px}
+  .log{font-size:.72rem;padding:10px}
+  table{font-size:.75rem}
+  th,td{padding:6px 8px}
+  .dtab{padding:6px 12px}
+}
+@media(max-width:400px){
+  .brand{display:none}
+  .mt{font-size:1.12rem}
+  .poster,.ph{width:72px;height:108px}
+}
 </style>
 </head>
 <body>
 <div class="c">
 <div class="headerbar">
-  <span style="font-size:1.1rem;color:var(--text3);font-weight:400;letter-spacing:3px;text-transform:uppercase">AUTORIP</span>
+  <span class="brand">AUTORIP</span>
   <button class="nav active" data-tab="ripper">Ripper</button>
   <button class="nav" data-tab="system">System</button>
   <button class="nav" data-tab="settings">Settings</button>
