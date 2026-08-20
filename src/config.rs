@@ -62,6 +62,16 @@ pub struct Config {
     /// pruned once the title is finalized. The disc mapfile is staging-only and
     /// never promoted.
     pub keep_iso: bool,
+    /// Where a kept/output disc image (`.iso`) is filed. Resolved UNDER
+    /// `output_dir` exactly like `movie_dir`/`tv_dir`: a RELATIVE value
+    /// ("isos") joins onto `output_dir` (→ `/mnt/media/isos`); an ABSOLUTE
+    /// value ("/mnt/archive/isos") targets another disk. EMPTY (default)
+    /// keeps the legacy behaviour — the ISO is filed beside the muxed title.
+    /// ISOs land FLAT in this folder (`<root>/<Title (Year)>.iso`), never a
+    /// per-title subtree. Applies to both the `keep_iso` companion and a
+    /// whole-disc `output_format = "iso"` rip.
+    #[serde(default)]
+    pub iso_dir: String,
     /// Abort rip if main-movie loss exceeds N seconds after retries.
     /// 0 = perfect rip required (abort on any remaining main-movie loss).
     pub abort_on_lost_secs: u64,
@@ -129,6 +139,7 @@ impl std::fmt::Debug for Config {
             .field("on_read_error", &self.on_read_error)
             .field("max_retries", &self.max_retries)
             .field("keep_iso", &self.keep_iso)
+            .field("iso_dir", &self.iso_dir)
             .field("abort_on_lost_secs", &self.abort_on_lost_secs)
             .field("capture_without_keys", &self.capture_without_keys)
             .field("max_rip_duration_secs", &self.max_rip_duration_secs)
@@ -183,6 +194,7 @@ impl Default for Config {
             on_read_error: "stop".into(),
             max_retries: 1,
             keep_iso: false,
+            iso_dir: String::new(),
             abort_on_lost_secs: 0,
             capture_without_keys: false,
             max_rip_duration_secs: 28_800, // 8h cap for UHD with heavy recovery
@@ -434,6 +446,9 @@ fn load_saved(mut cfg: Config) -> Config {
     }
     if let Some(v) = saved.get("tv_dir").and_then(|v| v.as_str()) {
         cfg.tv_dir = v.to_string();
+    }
+    if let Some(v) = saved.get("iso_dir").and_then(|v| v.as_str()) {
+        cfg.iso_dir = v.to_string();
     }
     if let Some(v) = saved.get("tmdb_api_key").and_then(|v| v.as_str()) {
         cfg.tmdb_api_key = v.to_string();
