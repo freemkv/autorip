@@ -3253,8 +3253,14 @@ mod web_tests {
     #[test]
     fn queue_view_cache_reader_not_blocked_by_in_flight_scan() {
         use std::time::{Duration, Instant};
-        const SCAN_MS: u64 = 1500;
-        const READER_BOUND_MS: u128 = 250;
+        const SCAN_MS: u64 = 2000;
+        // The reader serves the cached (stale) view — about a millisecond of
+        // work — so any measurable delay means it BLOCKED behind the in-flight
+        // scan (~SCAN_MS). Bound at HALF the scan: comfortably above a loaded CI
+        // runner's scheduling jitter for a cache hit, yet a genuine block
+        // (~SCAN_MS) still trips it by a 2× margin. The old fixed 250 ms bound
+        // flaked on the macOS leg under parallel-test load.
+        const READER_BOUND_MS: u128 = (SCAN_MS / 2) as u128;
 
         let tmp = tempfile::TempDir::new().unwrap();
         // Unique fixture path (tempdir) so the process-global probe/cache
