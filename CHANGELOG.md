@@ -1,5 +1,124 @@
 # Changelog
 
+## [1.6.5] — 2026-08-20
+
+### Added
+
+- **Kept and whole-disc ISO images can be filed in a folder of their
+  own.** A new `iso_dir` setting collects `keep_iso` intermediates and
+  `output_format=iso` rips into one flat folder — named `Title (Year).iso`,
+  no per-title subfolder — instead of dropping them beside the muxed title.
+  It resolves under the output directory with the same relative-join /
+  absolute-wins rules as the Movies and TV folders, so it can point at a
+  separate archive volume, which is the usual home for images that run
+  25–56 GB. Left empty (the default), images stay alongside the title as
+  before. The field appears on the dashboard under Output Directory.
+
+- **The dashboard is usable on a phone.** The Now-Playing card becomes a
+  compact horizontal card — a small poster beside the title and info —
+  rather than stacking into a full-width giant poster, tap targets and the
+  action row are sized for touch, and the wordmark shrinks (and steps out
+  of the way under 400px) so the nav tabs get their room back. The desktop
+  layout is unchanged.
+
+### Fixed
+
+- **A rip done without a TMDB key landed in the output root instead of the
+  movie library.** A no-match rip wrote `unknown` as its media type, but
+  the mover treats the empty string as the no-match sentinel that routes to
+  Movies — so `unknown`, being neither empty nor movie/tv, fell through to
+  a dump at the output root. Running without a TMDB key is a supported
+  mode; it now writes the empty string the mover expects and reaches the
+  movie library.
+
+- **An operator resume could mux a title short.** The manual resume path
+  checked only that no bytes were still pending, not that the staged ISO
+  was still as long as the mapfile's recorded total. A crash, OOM-kill or
+  full disk that truncated an otherwise fully-swept image would then be
+  muxed short. Resume now applies the same length check the automatic guard
+  already does and re-sweeps rather than resume onto a truncated image.
+
+- **A failed review action looked like it worked.** The review
+  Proceed / Cancel / Retitle buttons read the server's reply but never
+  checked whether it succeeded, so a failed resolve just silently refreshed
+  the list. The error is now surfaced, matching the search box.
+
+- **A drive still finishing up would wrongly accept new work — and could
+  run a duplicate rip.** A rip worker publishes its final status ("done" /
+  "error") and then keeps running on the same thread to eject, flush logs
+  and drop its guards; for that whole window the device read as free. Since
+  the server listens on the LAN with no authentication, a request landing
+  in that window won the claim and — worse — could start a second full rip
+  into the first one's staging directory while clobbering its Stop token.
+  Claiming a device now consults the worker's liveness, not just its
+  status; registration is decided before any disk work happens; and the
+  loser of a spawn race can no longer clear the winner's claim or idle its
+  state. This is the same class of defect closed across the mover, the
+  hot-unplug teardown and the poll loop.
+
+- **A Stop that timed out reported success while a worker kept writing.** A
+  drain that timed out still reset the drive card to "idle" and answered
+  `ok:true`, so the card went quiet mid-write and the operator's next click
+  came back 409 with nothing to explain it. A timed-out Stop now says so —
+  in the log, on the device card, and in its reply. A crashed scan or a
+  poisoned lock during teardown could likewise leave a claim or a phantom
+  drive row standing forever with no log line; those now recover and are
+  reported.
+
+- **A blank dashboard could never recover on its own.** `GET /api/state`
+  was the one status reader that gave up on a poisoned lock and returned
+  `{}` with HTTP 200 — a blank dashboard whose healthcheck stays green
+  forever, so the container never restarts out of it. The map is perfectly
+  readable on poison; it is now served.
+
+- **A degraded share reported "no jobs queued" when it simply could not be
+  read.** The mux queue swallowed a failed directory read and every
+  per-entry error, so an NFS mount that was down or had lost permissions
+  rendered as an empty queue with nothing to say the list was a guess. The
+  failure is now logged so an empty queue is attributable.
+
+- **The mover could delete files it never delivered, and mislabel what was
+  left behind.** A single failed directory entry was skipped with a bare
+  `continue`, and the pass still ran its destructive cleanup — removing a
+  file it had never enumerated — while logging "Move complete". The cleanup
+  is now gated on a complete listing: deliver what enumerated, withhold the
+  destructive half, retry next tick. A pre-existing destination is no
+  longer deleted, and "left behind" rows are cleared by a later successful
+  move and recorded only when something genuinely remains.
+
+- **Consent to accept a lossy rip could be spent by an unrelated hiccup, or
+  ignored outright.** Accepting loss on a resumed rip was honoured by the
+  sweep gate but re-armed against by the mux gate in the same run, so the
+  rip was quarantined with the one-shot consent already gone. The consent
+  marker was also consumed too early — any transient failure spent it — and
+  an accept-loss request that armed on disk but then failed to spawn left
+  the override armed for the next disc. Both gates now share one threshold,
+  the consent is cleared only where it is actually spent, and a failed
+  accept-loss disarms and says so.
+
+- **A resumed boxset disc muxed a stray second copy.** Cold resume derived
+  the title from the staging directory, which carries a boxset's `_2`
+  suffix that the files inside do not, so it muxed a second MKV and the
+  mover delivered both. An unreadable ISO is now reported as a named fault
+  rather than looking like a disc with no encryption.
+
+### Security
+
+- **Disc-supplied text can no longer smuggle control characters into the
+  log.** Volume IDs at the rediscovery sites and the on-disc title in the
+  mux worker — which falls back to the raw disc label whenever TMDB finds
+  nothing — are now sanitised before they are logged. Also closed: a u32
+  overflow on disc-supplied extents, a percent-decoder that accepted a sign
+  as a hex digit, an unauthenticated LAN route that took the media type
+  unclamped, and the TMDB client following a redirect with the API key
+  still in the query string.
+
+### Changed
+
+- One deliberate behaviour change: a scan, rip, eject or accept-loss
+  request that arrives while a worker is still unwinding now answers 409
+  rather than being admitted. Automatic ripping is otherwise unchanged.
+
 ## [1.6.4] — 2026-08-15
 
 ### Fixed
