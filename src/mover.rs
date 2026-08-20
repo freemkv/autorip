@@ -1665,42 +1665,40 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
 }
 
 /// Resolve a media subdirectory (`movie_dir` / `tv_dir` / `iso_dir`) UNDER the
-/// base `output_dir`, ALWAYS producing a forward-slash Unix path:
-///   - a RELATIVE `sub` ("movies") joins under `output_dir`
+/// base `output_dir` using `Path::join` semantics:
+///   - a RELATIVE `sub` ("movies") is joined onto `output_dir`
 ///     ("/mnt/media/" + "movies" → "/mnt/media/movies").
-///   - an ABSOLUTE `sub` ("/srv/movies") REPLACES `output_dir` entirely,
-///     preserving back-compat for operators who configured an absolute dir.
+///   - an ABSOLUTE `sub` ("/srv/movies") REPLACES `output_dir` entirely
+///     (Path::join semantics) — preserving back-compat for operators who
+///     configured an absolute movie/tv dir.
 ///   - an EMPTY `sub` yields `output_dir` unchanged (the empty-dir
 ///     fall-through; callers only reach here with a non-empty `sub`).
 ///
-/// The join is by hand with an explicit `/`, NOT `std::path::Path::join`, and
-/// that is the whole point. autorip files onto Linux / NFS mounts, so every
-/// destination it builds is a forward-slash Unix path — but `Path::join`
-/// renders with the HOST separator, so the SAME config produced a different
-/// string on a Windows box than on Linux ("/out" + "isos" → "/out\\isos"),
-/// which is invisible in a Linux container yet fails the moment the build or
-/// the test suite runs on the Windows CI leg. Joining explicitly makes the
-/// result byte-identical on every OS, so a destination can never depend on
-/// where the code was compiled.
+/// `Path::join` is deliberate: this joins a real base directory (in the move
+/// path, a live filesystem root) with a subdir, so it must respect the host FS
+/// — the integration tests below drive genuine `create_dir_all` + rename
+/// against tempdir roots on every CI OS. autorip only ever runs on Linux, where
+/// join yields forward slashes, so production destinations are always Unix
+/// paths regardless. Callers that ASSERT the string on the Windows CI leg must
+/// therefore normalise the separator, exactly as the surrounding tests do (a
+/// bare-string assertion with a non-trailing-slash Unix base is the one thing
+/// that is NOT portable — that was the iso_dir test bug).
 ///
-/// This is also the core of the 2026-06 "Mercy" fix: previously the branches
-/// used `cfg.movie_dir` / `cfg.tv_dir` STANDALONE, so a relative "movies"
-/// resolved against the container root `/` → `/movies` (the ephemeral overlay)
-/// instead of under the NFS mount at `output_dir`.
+/// This is the core of the 2026-06 "Mercy" fix: previously the movie/tv
+/// branches used `cfg.movie_dir` / `cfg.tv_dir` STANDALONE, so a relative
+/// "movies" resolved against the container root `/` → `/movies` (the
+/// ephemeral overlay) instead of under the NFS mount at output_dir.
 ///
-/// A trailing slash on `output_dir` and a leading slash on `sub` are both
-/// trimmed at the join so the separator is never doubled.
+/// Returns a clean, slash-joined string (no trailing slash from a
+/// trailing-slash `output_dir`, since Path::join normalizes that).
 fn resolve_media_root(output_dir: &str, sub: &str) -> String {
     if sub.is_empty() {
         return output_dir.to_string();
     }
-    // An absolute `sub` overrides `output_dir` entirely (the prior Path::join
-    // back-compat). autorip's dirs are Unix paths, so "absolute" is a leading
-    // '/'; it never configures a Windows drive-letter root.
-    if sub.starts_with('/') {
-        return sub.to_string();
-    }
-    format!("{}/{}", output_dir.trim_end_matches('/'), sub)
+    Path::new(output_dir)
+        .join(sub)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// The configured destination ROOT directory that governs a planned move,
@@ -2445,36 +2443,42 @@ mod tests {
         assert_eq!(destination_root(&cfg, &tmdb), "/srv/library/movies");
     }
 
-    /// `resolve_media_root` joins with a forward slash on EVERY OS — the result
-    /// must never depend on the host separator. autorip's destinations are Unix
-    /// paths onto Linux/NFS mounts, but the build and this suite also run on the
-    /// Windows CI leg; the old implementation used `Path::join`, which rendered
-    /// a backslash there and split an otherwise-Unix path ("/out" + "isos" →
-    /// "/out\\isos"). The absolute-wins case is the load-bearing one: it keeps a
-    /// configured absolute library path from being buried under `output_dir`
-    /// (the "Mercy" incident was the relative half of the same rule).
+    /// The media-root rules on NATIVE paths, so Windows exercises this logic
+    /// instead of skipping it. The absolute-wins case is the load-bearing one:
+    /// it is what keeps a configured absolute library path from being buried
+    /// under `output_dir` (the "Mercy" incident was the relative half of the
+    /// same rule). Because the join is native, the assertions compare against
+    /// `Path::join`'s own output rather than a hard-coded separator.
     #[test]
-    fn resolve_media_root_joins_with_forward_slash_on_every_os() {
-        // A relative sub joins UNDER the base with a single '/', identically on
-        // every OS — no trailing-slash crutch, never a backslash.
-        assert_eq!(
-            resolve_media_root("/mnt/media", "movies"),
-            "/mnt/media/movies"
+    fn resolve_media_root_joins_natively() {
+        let base = if cfg!(windows) {
+            r"D:\media"
+        } else {
+            "/mnt/media"
+        };
+        let elsewhere = if cfg!(windows) {
+            r"E:\library\movies"
+        } else {
+            "/srv/movies"
+        };
+
+        // A relative sub joins UNDER the base.
+        let joined = resolve_media_root(base, "movies");
+        assert_eq!(joined, Path::new(base).join("movies").to_string_lossy());
+        assert!(
+            Path::new(&joined).starts_with(base),
+            "a relative sub must stay under output_dir: {joined}"
         );
-        assert_eq!(resolve_media_root("/out", "isos"), "/out/isos");
-        // A trailing slash on the base does not double the separator.
+
+        // An absolute sub WINS outright — it must not be joined under base.
         assert_eq!(
-            resolve_media_root("/mnt/media/", "movies"),
-            "/mnt/media/movies"
-        );
-        // An absolute (leading-'/') sub WINS outright — not joined under base.
-        assert_eq!(
-            resolve_media_root("/mnt/media", "/srv/movies"),
-            "/srv/movies",
+            resolve_media_root(base, elsewhere),
+            elsewhere,
             "an absolute media dir must override output_dir"
         );
+
         // An empty sub yields output_dir verbatim.
-        assert_eq!(resolve_media_root("/mnt/media", ""), "/mnt/media");
+        assert_eq!(resolve_media_root(base, ""), base);
     }
 
     /// `absolute_for_log`'s actual invariant, on every platform: whatever goes
@@ -2714,12 +2718,14 @@ mod tests {
         // A RELATIVE iso_dir joins under output_dir (like movie_dir/tv_dir).
         // The ISO lands FLAT — one file per title, no per-title subfolder —
         // while the MKV companion still files into the movie tree. The two
-        // must not collide.
+        // must not collide. `resolve_media_root` uses native Path::join, so a
+        // relative sub yields a backslash on the Windows CI leg; normalise the
+        // separator before asserting the (always-Unix-in-production) path.
         let mut cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         cfg.iso_dir = "isos".into();
         let tmdb = Some(tmdb_movie("Lumina", 2023));
-        let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso");
-        let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv");
+        let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso").replace('\\', "/");
+        let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv").replace('\\', "/");
         assert_eq!(dest_iso, "/out/isos/Lumina (2023).iso");
         assert_eq!(dest_mkv, "/out/Movies/Lumina (2023)/Lumina (2023).mkv");
     }
@@ -2758,8 +2764,10 @@ mod tests {
         let mut cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         cfg.iso_dir = "isos".into();
         let tmdb = Some(tmdb_movie("Lumina", 2023));
+        // Native Path::join → normalise the separator for the Windows CI leg
+        // (production is always Linux/forward-slash).
         assert_eq!(
-            destination_root_for(&cfg, &tmdb, "Lumina.iso"),
+            destination_root_for(&cfg, &tmdb, "Lumina.iso").replace('\\', "/"),
             "/out/isos",
             "iso files route to the iso root"
         );
@@ -2769,7 +2777,10 @@ mod tests {
             "non-iso files keep the movie/tv root"
         );
         // Case-insensitive extension match.
-        assert_eq!(destination_root_for(&cfg, &tmdb, "Lumina.ISO"), "/out/isos");
+        assert_eq!(
+            destination_root_for(&cfg, &tmdb, "Lumina.ISO").replace('\\', "/"),
+            "/out/isos"
+        );
     }
 
     fn noop_progress(_: u8, _: f64, _: f64, _: f64) {}
