@@ -2336,6 +2336,61 @@ fn abort_post_mux_preserving_staging(device: &str, log_line: &str, last_error: &
     });
 }
 
+/// Fire the drive-free `rip_complete` webhook: the disc read is finished and
+/// the drive is free — the operator can load the next disc while any mux runs
+/// on a separate worker. This is the FIRST of the three pipeline-stage hooks
+/// (rip → mux → move) and is deliberately distinct from `mux_complete` (the
+/// `.mkv` is produced) and `move_complete` (it lands in the library).
+///
+/// Called at each point `rip_disc` decides whether to auto-eject — that
+/// decision point IS "rip done", whether or not the physical eject actually
+/// happens (auto_eject may be off). Damage figures (`errors`, main-feature
+/// loss) are read live from `STATE`; `size_gb` is the staged ISO's size. The
+/// read-side elapsed/throughput aren't tracked at the eject point (the mux
+/// worker re-derives its own), so they're reported as 0 — same as the
+/// `.ripped` marker's `rip_elapsed_secs`.
+#[allow(clippy::too_many_arguments)]
+fn fire_rip_complete_webhook(
+    cfg: &Config,
+    device: &str,
+    display_name: &str,
+    disc_format: &str,
+    tmdb_poster: &str,
+    tmdb_year: u16,
+    duration: &str,
+    codecs: &str,
+    iso_path_str: &str,
+) {
+    let (errors, lost_video_secs) = {
+        let s = state::STATE.lock().unwrap_or_else(|e| e.into_inner());
+        s.get(device)
+            .map(|rs| (rs.errors, rs.main_lost_ms / MILLIS_PER_SEC))
+            .unwrap_or((0, 0.0))
+    };
+    let size_gb = std::fs::metadata(iso_path_str)
+        .map(|m| m.len() as f64 / BYTES_PER_GIB)
+        .unwrap_or(0.0);
+    crate::webhook::send_rich(
+        cfg,
+        crate::webhook::WebhookEvent::Rip,
+        &crate::webhook::RipEvent {
+            event: "rip_complete",
+            title: display_name,
+            year: tmdb_year,
+            format: disc_format,
+            poster_url: tmdb_poster,
+            duration,
+            codecs,
+            size_gb,
+            speed_mbs: 0.0,
+            elapsed_secs: 0.0,
+            output_path: iso_path_str,
+            errors,
+            lost_video_secs,
+        },
+    );
+}
+
 /// Rip a disc. Reuses the existing drive session from scan_disc.
 /// If no session exists, opens fresh (for on_insert=rip).
 ///
@@ -4585,6 +4640,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 s.status = "done".to_string();
                 s.output_file = iso_filename.clone();
             });
+            // Rip stage done (ISO delivery — no mux stage follows; the ISO is
+            // the deliverable and the mover fires move_complete later). Fire
+            // the drive-free hook at the eject decision point.
+            fire_rip_complete_webhook(
+                &cfg_read,
+                device,
+                &display_name,
+                &disc_format,
+                &tmdb_poster,
+                tmdb_year,
+                &duration,
+                &codecs,
+                &iso_path_str,
+            );
             if should_auto_eject(cfg_read.auto_eject, device) {
                 if let Some(h) = device_halt(device) {
                     h.cancel();
@@ -4763,6 +4832,21 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     ..Default::default()
                 },
             );
+            // Rip stage done: the disc read finished, the ISO is staged and
+            // handed off to the mux worker, and the drive is now free for the
+            // next disc. Fire the drive-free hook here — at the eject decision
+            // point — BEFORE the separate mux worker later fires mux_complete.
+            fire_rip_complete_webhook(
+                &cfg_read,
+                device,
+                &display_name,
+                &disc_format,
+                &tmdb_poster,
+                tmdb_year,
+                &duration,
+                &codecs,
+                &iso_path_str,
+            );
             if should_auto_eject(cfg_read.auto_eject, device) {
                 // eject_drive handles drain + drop_session + unregister_halt
                 // internally. Cancel the halt first so any in-flight work
@@ -4782,6 +4866,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // Fallback inline-mux path (only reached if the marker write
         // above failed). Closes drive, opens ISO, runs mux as before.
         crate::log::device_log(device, "Drive released; muxing ISO → MKV.");
+        // Rip stage done even on the fallback path: the drive is released here,
+        // before the inline mux runs, so fire the drive-free hook now (the
+        // inline mux fires mux_complete when the .mkv is written, below).
+        fire_rip_complete_webhook(
+            &cfg_read,
+            device,
+            &display_name,
+            &disc_format,
+            &tmdb_poster,
+            tmdb_year,
+            &duration,
+            &codecs,
+            &iso_path_str,
+        );
         drop(session);
 
         // Open the ISO for the mux pipeline.
@@ -5651,11 +5749,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         retain_intermediate_iso(cfg_read.keep_iso, &cfg_read.output_format),
     );
 
-    crate::log::device_log(device, "Rip complete");
+    crate::log::device_log(device, "Mux complete");
+    // Mux stage: the `.mkv` now exists. In this inline-fallback path the rip
+    // (drive-free) webhook already fired before the mux began; this is the
+    // separate mux_complete notification.
     crate::webhook::send_rich(
         &cfg_read,
+        crate::webhook::WebhookEvent::Mux,
         &crate::webhook::RipEvent {
-            event: "rip_complete",
+            event: "mux_complete",
             title: &display_name,
             year: tmdb_year,
             format: &disc_format,
@@ -10788,17 +10890,17 @@ mod tests {
             .expect("should_auto_eject must still be documented below the tail");
         let tail = &src[start..end];
         let log_line = tail
-            .find(r#"crate::log::device_log(device, "Rip complete");"#)
-            .expect("the fresh-rip completion tail must log \"Rip complete\"");
+            .find(r#"crate::log::device_log(device, "Mux complete");"#)
+            .expect("the inline-mux completion tail must log \"Mux complete\"");
         let webhook = tail
             .find("crate::webhook::send_rich(")
-            .expect("the completion tail must fire the rip_complete webhook");
+            .expect("the completion tail must fire the mux_complete webhook");
         let eject = tail
             .find("eject_drive(device_path);")
             .expect("the completion tail must still auto-eject");
         assert!(
             log_line < eject && webhook < eject,
-            "\"Rip complete\" and the completion webhook must be emitted \
+            "\"Mux complete\" and the completion webhook must be emitted \
              BEFORE eject_drive — it archives the device log, so anything \
              after it is lost from this rip's archived log"
         );

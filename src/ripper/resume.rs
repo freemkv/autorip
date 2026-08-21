@@ -1802,17 +1802,20 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     );
     crate::log::device_log(device, "Auto-resume complete");
 
-    // Fire the completion webhook, mirroring rip_disc's terminal
+    // Fire the mux-stage webhook, mirroring rip_disc's terminal
     // branch. Both the cold auto-resume (`?resume=yes`) path and the
     // `_mux` worker `.ripped` hand-off reach success here; without this
     // an operator configured for completion notifications (Discord,
-    // Plex, etc.) silently received nothing when a rip finished via
+    // Plex, etc.) silently received nothing when a mux finished via
     // resume or the mux worker — only inline rip_disc completions
-    // notified. Metadata is the same set rip_disc sends.
+    // notified. Metadata is the same set rip_disc sends. The drive-free
+    // rip_complete webhook fired earlier, on the sweep worker at
+    // `.ripped` hand-off — this is the distinct mux_complete stage.
     crate::webhook::send_rich(
         &cfg_read,
+        crate::webhook::WebhookEvent::Mux,
         &crate::webhook::RipEvent {
-            event: "rip_complete",
+            event: "mux_complete",
             title: &display_name,
             year: tmdb_year,
             format: &disc_format,
@@ -2702,14 +2705,15 @@ mod resume_remux_webhook_tests {
         let region = &src[start..end];
         assert!(
             region.contains("crate::webhook::send_rich"),
-            "resume_remux success path must fire send_rich (the rip_complete \
+            "resume_remux success path must fire send_rich (the mux_complete \
              webhook), matching rip_disc; none found between \"Auto-resume \
              complete\" and the auto_eject branch"
         );
         assert!(
-            region.contains("event: \"rip_complete\""),
-            "the resume completion webhook must use the rip_complete event \
-             name, matching rip_disc"
+            region.contains("event: \"mux_complete\""),
+            "the resume completion webhook is the mux stage, so it must use the \
+             mux_complete event name (the drive-free rip_complete fires earlier, \
+             on the sweep worker)"
         );
     }
 }
