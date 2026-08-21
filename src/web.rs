@@ -23,11 +23,29 @@ pub fn debug_enabled() -> bool {
 }
 
 /// Embedded single-page HTML dashboard — full parity with Python autorip web UI.
+// The freemkv brand favicon, shared verbatim with the marketing site
+// (freemkv.org's public/favicon.svg). Served at /favicon.svg so the dashboard
+// tab shows the same icon as the website.
+const FAVICON_SVG: &str = r##"<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+<g transform="translate(128, 128)">
+<circle cx="0" cy="0" r="120" fill="#0D9488" />
+<circle cx="0" cy="0" r="95" fill="#0F766E" />
+<circle cx="0" cy="0" r="70" fill="#0D9488" />
+<circle cx="0" cy="0" r="28" fill="#F0FDFA" />
+<circle cx="0" cy="0" r="15" fill="#0D9488" />
+<path d="M0,-120 A120,120 0 0,1 103.9,60 L77.9,45 A90,90 0 0,0 0,-90 Z" fill="#14B8A6" opacity="0.6"/>
+<path d="M-15,-10 L-2,-10 L-2,10 L-15,10 Z" fill="#F0FDFA" opacity="0.9" transform="translate(55, 0)"/>
+<path d="M0,-9 L16,0 L0,9 Z" fill="#F0FDFA" opacity="0.9" transform="translate(58, 0)"/>
+</g>
+</svg>
+"##;
+
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>AutoRip</title>
 <style>
 :root {
@@ -1575,6 +1593,8 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 
     if is_get && (url == "/" || url == "/index.html") {
         serve_html(request);
+    } else if is_get && url == "/favicon.svg" {
+        serve_favicon(request);
     } else if is_get && url == "/api/state" {
         let staging_dir = cfg
             .read()
@@ -1897,6 +1917,18 @@ fn serve_html(request: tiny_http::Request) {
         )
         .unwrap(),
     );
+    let _ = request.respond(response);
+}
+
+fn serve_favicon(request: tiny_http::Request) {
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"image/svg+xml"[..]).unwrap();
+    // Unlike the app shell, the icon is immutable brand art — let the browser
+    // cache it so the tab icon doesn't refetch on every poll/load.
+    let response = Response::from_string(FAVICON_SVG)
+        .with_header(header)
+        .with_header(
+            Header::from_bytes(&b"Cache-Control"[..], &b"public, max-age=86400"[..]).unwrap(),
+        );
     let _ = request.respond(response);
 }
 
