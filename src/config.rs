@@ -7,6 +7,99 @@ use std::sync::{Arc, RwLock};
 pub(crate) const OUTPUT_FORMAT_ISO: &str = "iso";
 pub(crate) const OUTPUT_FORMAT_NETWORK: &str = "network";
 
+/// `#[serde(default)]` helper: a webhook with an unspecified `post_rip` /
+/// `post_move` flag fires on that event. This is the backward-compat default —
+/// before per-event selection existed every webhook fired on both rip and
+/// move complete, so an entry that omits a flag (a legacy config, or a client
+/// that doesn't send it) must keep firing on both.
+fn default_true() -> bool {
+    true
+}
+
+/// One configured webhook: the destination URL plus which completion events
+/// it fires on. Before 1.6.7 a webhook was a bare URL string that always fired
+/// on both rip-complete and move-complete; per-event selection is opt-out, so
+/// both flags default to `true` and a legacy bare-string entry maps to
+/// "fire on both" (see the custom `Deserialize` below).
+#[derive(Clone, Serialize, PartialEq, Eq, Debug)]
+pub struct WebhookEntry {
+    pub url: String,
+    /// Fire this webhook when a rip finishes (the `rip_complete` payload).
+    pub post_rip: bool,
+    /// Fire this webhook when a moved file lands in its final library
+    /// location (the `move_complete` payload).
+    pub post_move: bool,
+}
+
+impl WebhookEntry {
+    /// A URL entry that fires on both events — the pre-1.6.7 behaviour and the
+    /// shape a bare legacy string migrates to.
+    fn both(url: String) -> Self {
+        Self {
+            url,
+            post_rip: true,
+            post_move: true,
+        }
+    }
+
+    /// Parse one entry from a settings.json array element, accepting BOTH the
+    /// legacy bare string (`"https://…"`) and the object form
+    /// (`{"url":"…","post_rip":true,"post_move":false}`). A missing flag on the
+    /// object form defaults to `true` (fire) to match the bare-string default.
+    /// Returns `None` for a malformed element or a blank/whitespace URL so the
+    /// caller drops it, exactly as the old string-only loader did.
+    fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let entry = if let Some(s) = v.as_str() {
+            Self::both(s.to_string())
+        } else {
+            let obj = v.as_object()?;
+            let url = obj.get("url").and_then(|u| u.as_str())?.to_string();
+            let flag = |k: &str| obj.get(k).and_then(|b| b.as_bool()).unwrap_or(true);
+            Self {
+                url,
+                post_rip: flag("post_rip"),
+                post_move: flag("post_move"),
+            }
+        };
+        (!entry.url.trim().is_empty()).then_some(entry)
+    }
+}
+
+/// Custom `Deserialize` accepting the legacy bare string or the modern object,
+/// so a settings.json (or `Config`) that predates per-event webhooks still
+/// loads. Serialization always emits the object form (derived `Serialize`).
+impl<'de> Deserialize<'de> for WebhookEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Url(String),
+            Obj {
+                url: String,
+                #[serde(default = "default_true")]
+                post_rip: bool,
+                #[serde(default = "default_true")]
+                post_move: bool,
+            },
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Url(url) => WebhookEntry::both(url),
+            Raw::Obj {
+                url,
+                post_rip,
+                post_move,
+            } => WebhookEntry {
+                url,
+                post_rip,
+                post_move,
+            },
+        })
+    }
+}
+
 /// Runtime config. Single source of truth is `settings.json` on disk;
 /// the UI POSTs updates to it via `/api/settings`.
 ///
@@ -95,7 +188,11 @@ pub struct Config {
     pub keyserver_url: String,
     /// Optional bearer token for the key service. Empty = none.
     pub keyserver_secret: String,
-    pub webhook_urls: Vec<String>,
+    /// Configured webhooks. Each carries its destination URL and which
+    /// completion events it fires on (see [`WebhookEntry`]). Kept as
+    /// `webhook_urls` for on-disk/serde compatibility with pre-1.6.7
+    /// settings.json files, which stored a bare array of URL strings.
+    pub webhook_urls: Vec<WebhookEntry>,
     pub autorip_dir: String,
 
     /// Number of threads for AACS decryption. 0 = auto (all available
@@ -574,11 +671,10 @@ fn load_saved(mut cfg: Config) -> Config {
         }
     }
     if let Some(arr) = saved.get("webhook_urls").and_then(|v| v.as_array()) {
-        cfg.webhook_urls = arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .filter(|s| !s.is_empty())
-            .collect();
+        // Accept both the legacy bare-string form and the modern
+        // {url, post_rip, post_move} object form; a bare string (or an object
+        // missing a flag) fires on both events, preserving pre-1.6.7 behaviour.
+        cfg.webhook_urls = arr.iter().filter_map(WebhookEntry::from_json).collect();
     }
     cfg
 }
@@ -985,14 +1081,100 @@ mod tests {
         assert_eq!(cfg.decrypt_threads, 4);
         assert_eq!(cfg.log_retention_days, 14);
         // The empty webhook URL in the fixture array must be filtered out.
+        // The fixture stores bare legacy strings, which must load as
+        // "fire on both events" (pre-1.6.7 behaviour).
         assert_eq!(
             cfg.webhook_urls,
             vec![
-                "https://discord.com/api/webhooks/1/abc".to_string(),
-                "https://jellyfin.example.org/hook".to_string()
+                WebhookEntry {
+                    url: "https://discord.com/api/webhooks/1/abc".to_string(),
+                    post_rip: true,
+                    post_move: true,
+                },
+                WebhookEntry {
+                    url: "https://jellyfin.example.org/hook".to_string(),
+                    post_rip: true,
+                    post_move: true,
+                },
             ],
-            "empty webhook URLs must be dropped on load"
+            "empty webhook URLs must be dropped on load; bare strings fire on both"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The modern object form `{url, post_rip, post_move}` loads with its
+    /// per-event flags, a bare string still loads as fire-on-both, an object
+    /// missing a flag defaults that flag to true, and a blank/urlless entry is
+    /// dropped — all in one mixed array, since a real settings.json may carry
+    /// any mixture after an upgrade.
+    #[test]
+    fn webhook_entries_load_mixed_string_and_object_forms() {
+        let d = scratch("webhook-forms");
+        let json = r#"{
+            "webhook_urls": [
+                "https://legacy.example/hook",
+                {"url": "https://both.example/hook"},
+                {"url": "https://rip-only.example/hook", "post_rip": true, "post_move": false},
+                {"url": "https://move-only.example/hook", "post_rip": false, "post_move": true},
+                {"url": "   "},
+                {"post_rip": true},
+                "  "
+            ]
+        }"#;
+        std::fs::write(d.join("settings.json"), json).unwrap();
+        let cfg = load_saved(cfg_in(&d));
+        assert_eq!(
+            cfg.webhook_urls,
+            vec![
+                WebhookEntry {
+                    url: "https://legacy.example/hook".into(),
+                    post_rip: true,
+                    post_move: true,
+                },
+                WebhookEntry {
+                    url: "https://both.example/hook".into(),
+                    post_rip: true,
+                    post_move: true,
+                },
+                WebhookEntry {
+                    url: "https://rip-only.example/hook".into(),
+                    post_rip: true,
+                    post_move: false,
+                },
+                WebhookEntry {
+                    url: "https://move-only.example/hook".into(),
+                    post_rip: false,
+                    post_move: true,
+                },
+            ],
+            "object flags load verbatim; bare string and missing flags default to fire-on-both; blank/urlless entries drop"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A `Config` whose `webhook_urls` carry per-event flags must round-trip
+    /// through `save`'s serializer and back through `load_saved` unchanged —
+    /// the object form is what gets persisted, so a saved "move only" hook must
+    /// still be "move only" on the next boot.
+    #[test]
+    fn webhook_entries_survive_save_load_round_trip() {
+        let d = scratch("webhook-roundtrip");
+        let mut cfg = cfg_in(&d);
+        cfg.webhook_urls = vec![
+            WebhookEntry {
+                url: "https://both.example/hook".into(),
+                post_rip: true,
+                post_move: true,
+            },
+            WebhookEntry {
+                url: "https://move-only.example/hook".into(),
+                post_rip: false,
+                post_move: true,
+            },
+        ];
+        save(&cfg).expect("save");
+        let reloaded = load_saved(cfg_in(&d));
+        assert_eq!(reloaded.webhook_urls, cfg.webhook_urls);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1135,8 +1317,16 @@ mod tests {
             keyserver_url: "https://keys.example.org/decode".into(),
             keyserver_secret: "keyserver-bearer-token-xyz789".into(),
             webhook_urls: vec![
-                "https://discord.com/api/webhooks/1/DISCORD_SECRET_TOKEN".into(),
-                "https://hooks.example.com?token=WEBHOOK_SECRET".into(),
+                WebhookEntry {
+                    url: "https://discord.com/api/webhooks/1/DISCORD_SECRET_TOKEN".into(),
+                    post_rip: true,
+                    post_move: true,
+                },
+                WebhookEntry {
+                    url: "https://hooks.example.com?token=WEBHOOK_SECRET".into(),
+                    post_rip: true,
+                    post_move: false,
+                },
             ],
             ..Config::default()
         };

@@ -1,4 +1,4 @@
-use crate::config::{self, Config};
+use crate::config::{self, Config, WebhookEntry};
 use crate::ripper;
 use once_cell::sync::Lazy;
 use std::io::{Read as _, Write as _};
@@ -1016,29 +1016,34 @@ function renderMoves(){
   const el=document.getElementById('moves');
   if(!el)return;
   const data=window._stateData||{};
-  const mv=data._move;
+  /* `_move` is an ARRAY of per-artifact bars (the movie file and, with
+     keep_iso, its companion ISO \u2014 one bar each). Tolerate the legacy single
+     object shape for safety across a rolling deploy. */
+  const moves=Array.isArray(data._move)?data._move:(data._move&&data._move.name?[data._move]:[]);
   let html='';
   let hasContent=false;
-  /* Active move from dedicated move state */
-  if(mv&&mv.name){
+  /* Active move: one progress bar per artifact, labelled "Title (iso)" /
+     "Title (mkv)" so the two legs of a keep_iso move read distinctly. */
+  moves.forEach(mv=>{
+    if(!mv||!mv.name)return;
     hasContent=true;
     const pct=mv.progress_pct||0;
     const spdStr=mv.speed_mbs>=1?mv.speed_mbs.toFixed(1)+' MB/s':mv.speed_mbs>0?(mv.speed_mbs*1024).toFixed(0)+' KB/s':'';
     const etaStr=mv.eta?mv.eta+' remaining':'';
     const label=[pct+'%',spdStr,etaStr].filter(x=>x).join(' \u00b7 ');
-    html+='<div style="padding:6px 0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);animation:p 1.5s infinite;flex-shrink:0"></span><span style="font-size:.85rem;font-weight:500">'+esc(mv.name)+'</span></div>';
+    const title=esc(mv.name)+(mv.artifact?' ('+esc(mv.artifact)+')':'');
+    html+='<div style="padding:6px 0"><div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);animation:p 1.5s infinite;flex-shrink:0"></span><span style="font-size:.85rem;font-weight:500">'+title+'</span></div>';
     html+='<div style="display:flex;align-items:center;gap:8px">';
     if(pct>0)html+='<div style="flex:1;background:var(--chip);border-radius:3px;height:3px;overflow:hidden"><div style="background:var(--green);height:100%;width:'+pct+'%;transition:width 1s"></div></div>';
     html+='<span style="font-size:.75rem;color:var(--text2)">'+label+'</span></div></div>';
-  }
+  });
   /* Pending queue items — from the live state payload (_move_queue),
-     refreshed every SSE tick (falls back to the /api/system _moveQueue
-     only if absent). The active move (_move) is rendered above with its
-     progress bar; skip its matching queue entry so it isn't listed twice. */
+     refreshed every SSE tick (falls back to the /api/system _moveQueue only
+     if absent). The server already excludes the actively-moving dir from this
+     list (it's shown as the bars above), so no client-side de-dup is needed. */
   const moveQ=(data._move_queue!=null)?data._move_queue:window._moveQueue;
   if(moveQ){
     moveQ.forEach(m=>{
-      if(mv&&mv.name&&m.replace(/ \(moving\)/,'').replace(/ /g,'_').includes(mv.name.replace(/ /g,'_')))return;
       hasContent=true;
       html+='<div style="padding:4px 0;font-size:.8rem"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--yellow);margin-right:8px;vertical-align:middle"></span>'+esc(m)+'</div>';
     });
@@ -1209,15 +1214,18 @@ function renderSettings(s){
     html+='</div>';
     /* Insert webhooks card after Output */
     if(g.title==='Output'){
-      const hooks=(s.webhook_urls||[]).filter(u=>u);
+      /* Each webhook is now {url, post_rip, post_move}; tolerate a legacy
+         bare string (older payload) by coercing it to an object that fires on
+         both events. */
+      const hooks=(s.webhook_urls||[])
+        .map(h=>typeof h==='string'?{url:h,post_rip:true,post_move:true}:h)
+        .filter(h=>h&&h.url);
       html+='<div class="card"><h2>Webhooks</h2>';
       html+='<div id="webhook-list">';
-      hooks.forEach((u,i)=>{
-        html+='<div style="display:flex;gap:6px;margin-bottom:6px;align-items:center"><input type="text" data-webhook="'+i+'" value="'+esc(u)+'" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--log-bg);color:var(--text);font-size:13px;font-family:inherit"><button class="btn" onclick="this.parentElement.remove()" style="padding:5px 8px;font-size:.75rem">X</button></div>';
-      });
+      hooks.forEach((h,i)=>{ html+=webhookRow(i,h.url,h.post_rip!==false,h.post_move!==false); });
       html+='</div>';
       html+='<button class="btn" onclick="addWebhook()" style="font-size:.75rem;margin-top:4px">+ Add Webhook</button>';
-      html+='<div style="font-size:12px;color:var(--text3);margin-top:8px;line-height:1.4">POST JSON on rip and move complete. Works with Discord, Jellyfin, n8n, or any HTTP endpoint.</div>';
+      html+='<div style="font-size:12px;color:var(--text3);margin-top:8px;line-height:1.4">POST JSON to each endpoint. Choose per hook whether it fires on rip complete, move complete, or both. Works with Discord, Jellyfin, n8n, or any HTTP endpoint.</div>';
       html+='</div>';
     }
   });
@@ -1243,14 +1251,28 @@ function toggleConditional(){
   });
 }
 
+/* One webhook row: URL input + a "Rip" and a "Move" checkbox (which
+   completion events fire this hook) + a remove button. `postRip`/`postMove`
+   seed the checkboxes; new hooks default both to true. The checkbox
+   data-attributes are read back per-row in saveSettings(). */
+function webhookRow(i,url,postRip,postMove){
+  const cb=(attr,on,label)=>'<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text2);cursor:pointer;white-space:nowrap"><input type="checkbox" '+attr+' '+(on?'checked':'')+' style="width:14px;height:14px;margin:0;accent-color:var(--accent)">'+label+'</label>';
+  return '<div class="webhook-row" style="display:flex;gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap">'
+    +'<input type="text" data-webhook="'+i+'" value="'+esc(url||'')+'" placeholder="https://discord.com/api/webhooks/..." style="flex:1;min-width:180px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--log-bg);color:var(--text);font-size:13px;font-family:inherit">'
+    +cb('data-webhook-rip','undefined'==typeof postRip?true:postRip,'Rip')
+    +cb('data-webhook-move','undefined'==typeof postMove?true:postMove,'Move')
+    +'<button class="btn" onclick="this.parentElement.remove()" style="padding:5px 8px;font-size:.75rem">X</button>'
+    +'</div>';
+}
+
 function addWebhook(){
   const list=document.getElementById('webhook-list');
   const i=list.children.length;
-  const div=document.createElement('div');
-  div.style='display:flex;gap:6px;margin-bottom:6px;align-items:center';
-  div.innerHTML='<input type="text" data-webhook="'+i+'" placeholder="https://discord.com/api/webhooks/..." style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--log-bg);color:var(--text);font-size:13px;font-family:inherit"><button class="btn" onclick="this.parentElement.remove()" style="padding:5px 8px;font-size:.75rem">X</button>';
+  const tmp=document.createElement('div');
+  tmp.innerHTML=webhookRow(i,'',true,true);
+  const div=tmp.firstChild;
   list.appendChild(div);
-  div.querySelector('input').focus();
+  div.querySelector('input[type="text"]').focus();
 }
 
 function saveSettings(){
@@ -1262,11 +1284,16 @@ function saveSettings(){
     else if(el.type==='number')s[el.dataset.key]=parseInt(el.value)||0;
     else s[el.dataset.key]=el.value;
   });
-  /* Collect webhook URLs */
+  /* Collect webhooks as {url, post_rip, post_move}. Read each flag from the
+     row's own checkboxes so a URL only fires on the events the operator chose. */
   const hooks=[];
-  document.querySelectorAll('#webhook-list input[data-webhook]').forEach(el=>{
-    const v=el.value.trim();
-    if(v)hooks.push(v);
+  document.querySelectorAll('#webhook-list .webhook-row').forEach(row=>{
+    const urlEl=row.querySelector('input[data-webhook]');
+    const v=(urlEl&&urlEl.value||'').trim();
+    if(!v)return;
+    const rip=row.querySelector('input[data-webhook-rip]');
+    const mov=row.querySelector('input[data-webhook-move]');
+    hooks.push({url:v,post_rip:rip?rip.checked:true,post_move:mov?mov.checked:true});
   });
   s.webhook_urls=hooks;
  /* v0.13.19: translate the virtual `rip_mode` selector back to the backend
@@ -1954,30 +1981,42 @@ fn is_masked_webhook(s: &str) -> bool {
     false
 }
 
+/// One webhook as it arrives on POST /api/settings: a (possibly masked) URL
+/// plus the two per-event flags the UI collected from its checkboxes.
+/// [`resolve_webhook_entries`] turns a slice of these into stored
+/// [`WebhookEntry`]s, unmasking the URL while carrying the flags through.
+struct IncomingWebhook {
+    /// May be a real URL (newly entered) or a masked placeholder to resolve.
+    url: String,
+    post_rip: bool,
+    post_move: bool,
+}
+
 /// Resolve an incoming `webhook_urls` array against the currently-stored
-/// URLs, replacing redacted placeholders with their real (token-bearing)
-/// values. Matching is BY ORIGIN PREFIX (via [`mask_webhook_url`]), never by
+/// entries, replacing each redacted URL placeholder with its real
+/// (token-bearing) value while preserving the per-entry `post_rip`/`post_move`
+/// flags the client sent. Only the URL is ever masked, so the flags always
+/// come straight from `incoming`.
+///
+/// URL matching is BY STABLE `#idx` (falling back to origin prefix), never by
 /// array position: the UI can delete or reorder rows between GET and POST, so
 /// a positional match would bind a masked entry to a different stored secret.
-///
-/// A masked entry whose masked-origin matches exactly one stored URL resolves
-/// to that URL. A non-masked entry is taken verbatim (a newly-entered secret).
-/// `Err(prefix)` is returned when a masked entry is ambiguous — it matches 0
-/// stored entries (the row it referred to was deleted) or >1 (two stored hooks
-/// share an origin) — so the caller can reject the save instead of guessing.
-/// Empty/whitespace entries are dropped.
-fn resolve_webhook_urls(incoming: &[&str], existing: &[String]) -> Result<Vec<String>, String> {
-    let mut resolved: Vec<String> = Vec::with_capacity(incoming.len());
-    for s in incoming {
-        // Same predicate the SSRF filter uses (`is_masked_webhook`), and it
-        // has to be: with `contains` here, a genuine URL that merely EMBEDS
-        // the sentinel mid-path was validated as real by the filter and then
-        // treated as a placeholder here — resolving against nothing and
-        // failing the whole save with "ambiguous masked webhook entry", an
-        // error about a masking that never happened, with no way to enter
-        // that URL at all. Two predicates for one question is the defect;
-        // there is now one.
-        if is_masked_webhook(s) {
+/// A masked URL whose `#idx` (or, for older clients, origin) resolves to
+/// exactly one stored entry takes that entry's real URL. A non-masked URL is
+/// taken verbatim (a newly-entered secret). `Err(url)` is returned when a
+/// masked URL is ambiguous — it matches 0 stored entries (the row it referred
+/// to was deleted) or >1 (two stored hooks share an origin) — so the caller
+/// can reject the save instead of guessing. Entries with a blank/whitespace
+/// URL are dropped.
+fn resolve_webhook_entries(
+    incoming: &[IncomingWebhook],
+    existing: &[WebhookEntry],
+) -> Result<Vec<WebhookEntry>, String> {
+    let mut resolved: Vec<WebhookEntry> = Vec::with_capacity(incoming.len());
+    for hook in incoming {
+        let s = hook.url.as_str();
+        // Resolve the URL only; the flags are always taken from `incoming`.
+        let url = if is_masked_webhook(s) {
             // Preferred path: the masked form carries a stable `#<idx>`
             // identifier (see mask_webhook_url_indexed). Resolve by that index
             // so two same-origin webhooks round-trip unambiguously. The index
@@ -1987,33 +2026,38 @@ fn resolve_webhook_urls(incoming: &[&str], existing: &[String]) -> Result<Vec<St
                 && let Ok(idx) = idx_str.parse::<usize>()
             {
                 match existing.get(idx) {
-                    Some(stored) if mask_webhook_url(stored) == origin_mask => {
-                        resolved.push(stored.clone());
-                        continue;
+                    Some(stored) if mask_webhook_url(&stored.url) == origin_mask => {
+                        stored.url.clone()
                     }
                     // Index stale (row deleted/reordered) — reject rather
                     // than guess.
-                    _ => return Err((*s).to_string()),
+                    _ => return Err(s.to_string()),
+                }
+            } else {
+                // Fallback: no embedded index (older client). Match by origin;
+                // only unambiguous when exactly one stored URL shares the origin.
+                let matches: Vec<&WebhookEntry> = existing
+                    .iter()
+                    .filter(|stored| mask_webhook_url(&stored.url) == s)
+                    .collect();
+                match matches.as_slice() {
+                    [one] => one.url.clone(),
+                    _ => return Err(s.to_string()),
                 }
             }
-            // Fallback: no embedded index (older client). Match by origin; only
-            // unambiguous when exactly one stored URL shares the origin.
-            let matches: Vec<&String> = existing
-                .iter()
-                .filter(|stored| mask_webhook_url(stored) == *s)
-                .collect();
-            match matches.as_slice() {
-                [one] => resolved.push((*one).clone()),
-                _ => return Err((*s).to_string()),
-            }
         } else {
-            resolved.push((*s).to_string());
+            s.to_string()
+        };
+        if url.trim().is_empty() {
+            continue;
         }
+        resolved.push(WebhookEntry {
+            url,
+            post_rip: hook.post_rip,
+            post_move: hook.post_move,
+        });
     }
-    Ok(resolved
-        .into_iter()
-        .filter(|s| !s.trim().is_empty())
-        .collect())
+    Ok(resolved)
 }
 
 /// Serialize Config for GET /api/settings with credential fields redacted.
@@ -2056,12 +2100,16 @@ fn settings_json_redacted(c: &Config) -> String {
             .unwrap_or_default();
         v["keydb_path"] = serde_json::json!(name);
     }
+    // Each entry serializes as {url, post_rip, post_move}. Mask the token in
+    // `url` (keeping the origin + stable `#idx` for round-trip resolution) and
+    // pass the boolean flags through untouched.
     if let Some(arr) = v.get_mut("webhook_urls").and_then(|x| x.as_array_mut()) {
         for (idx, entry) in arr.iter_mut().enumerate() {
-            if let Some(s) = entry.as_str()
-                && !s.is_empty()
+            if let Some(u) = entry.get("url").and_then(|x| x.as_str())
+                && !u.is_empty()
             {
-                *entry = serde_json::json!(mask_webhook_url_indexed(s, idx));
+                let masked = mask_webhook_url_indexed(u, idx);
+                entry["url"] = serde_json::json!(masked);
             }
         }
     }
@@ -2502,8 +2550,20 @@ impl ureq::unversioned::resolver::Resolver for PinnedResolver {
 pub(crate) fn ureq_error_kind(e: &ureq::Error) -> String {
     match e {
         ureq::Error::StatusCode(code) => format!("HTTP {code}"),
-        // `io::ErrorKind`'s Display is a fixed description, never the URL.
-        ureq::Error::Io(io) => format!("io: {}", io.kind()),
+        ureq::Error::Io(io) => match io.raw_os_error() {
+            // An OS-generated error (has an errno): its Display is the
+            // syscall's own message — "Connection reset by peer (os error 54)",
+            // "Broken pipe (os error 32)" — which is derived purely from the
+            // errno and cannot embed the URL. Surface it: this turns the
+            // useless "io: uncategorized error" (what `io.kind()` alone prints
+            // for the ErrorKind::Uncategorized that a reset/refused socket maps
+            // to) into an actionable line an operator can act on.
+            Some(_) => format!("io: {io}"),
+            // No errno — a ureq/std-synthesized io error whose payload we do
+            // NOT trust to be URL-free. Fall back to the ErrorKind's fixed
+            // description, which is a constant string and never the URL.
+            None => format!("io: {}", io.kind()),
+        },
         ureq::Error::Timeout(_) => "timeout".to_string(),
         ureq::Error::HostNotFound => "host not found".to_string(),
         ureq::Error::ConnectionFailed => "connection failed".to_string(),
@@ -2844,6 +2904,62 @@ mod web_tests {
         assert!(mux.is_empty());
         assert_eq!(mv.len(), 1);
         assert!(!both_contain(&mux, &mv));
+    }
+
+    /// Regression for the double-render bug: the staging dir currently being
+    /// moved keeps its `.done` marker throughout the copy, so it appears in the
+    /// Move-queue scan — but it is ALSO shown as its live per-artifact progress
+    /// bars. `build_queue_views` must exclude the dir named in
+    /// `ACTIVE_MOVE_DIR` so it is listed exactly once (as bars, not a queue
+    /// row). The old client-side de-dup matched on a punctuation-stripped title
+    /// and silently failed for any title containing `:` `/` `*`, etc.; this
+    /// exclusion is by exact on-disk basename and so is punctuation-proof.
+    #[test]
+    fn build_queue_views_excludes_the_actively_moving_dir() {
+        use std::fs;
+        // Serialize against every test that touches the global move statics.
+        let _g = crate::mover::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let staging = tmp.path().to_string_lossy().to_string();
+        // Two pending moves. On disk the title's colon has been sanitized away
+        // (`X-Men: Apocalypse` → `X-Men_Apocalypse`), which is exactly what
+        // used to defeat the client-side title match.
+        let active = tmp.path().join("X-Men_Apocalypse");
+        let other = tmp.path().join("Interstellar");
+        fs::create_dir_all(&active).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(active.join(".done"), b"{}").unwrap();
+        fs::write(other.join(".done"), b"{}").unwrap();
+
+        // Nothing moving yet: both dirs are queued.
+        *crate::mover::ACTIVE_MOVE_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        let (_, mv, _, _) = build_queue_views(&staging);
+        assert_eq!(mv.len(), 2, "with nothing moving, both .done dirs queue");
+
+        // Mark X-Men as the actively-moving dir (by its on-disk basename).
+        *crate::mover::ACTIVE_MOVE_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some("X-Men_Apocalypse".to_string());
+        let (_, mv, _, full) = build_queue_views(&staging);
+        assert_eq!(
+            mv,
+            vec!["Interstellar (moving)".to_string()],
+            "the actively-moving dir must be excluded from the queue (shown as bars instead)"
+        );
+        assert_eq!(
+            full, 1,
+            "the uncapped count must also exclude the active dir"
+        );
+
+        // Clear so no other test observes a stale active dir.
+        *crate::mover::ACTIVE_MOVE_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     // ===================================================================
@@ -3763,6 +3879,33 @@ mod web_tests {
     // (it drives the real handle_settings_post via a live server + config::save,
     // not an inline re-implementation of the guard).
 
+    /// A stored webhook entry that fires on both events — the common case in
+    /// these tests, which predate per-event flags and care only about URL
+    /// masking/resolution.
+    fn we(url: &str) -> WebhookEntry {
+        WebhookEntry {
+            url: url.to_string(),
+            post_rip: true,
+            post_move: true,
+        }
+    }
+
+    /// An incoming (POST-side) webhook with both flags set — mirrors what the
+    /// UI sends for a fire-on-both hook.
+    fn inc(url: &str) -> IncomingWebhook {
+        IncomingWebhook {
+            url: url.to_string(),
+            post_rip: true,
+            post_move: true,
+        }
+    }
+
+    /// Just the resolved URLs, for asserting URL resolution independently of
+    /// the flags (which these tests carry through unchanged).
+    fn urls(entries: &[WebhookEntry]) -> Vec<String> {
+        entries.iter().map(|e| e.url.clone()).collect()
+    }
+
     #[test]
     fn settings_get_masks_webhook_token_keeps_origin() {
         // Webhook URLs embed bearer tokens (Discord/Slack/Jellyfin) in the
@@ -3770,23 +3913,26 @@ mod web_tests {
         // the operator can tell which hook is which.
         let c = Config {
             webhook_urls: vec![
-                "https://discord.com/api/webhooks/123/secrettoken".into(),
-                "".into(),
-                "https://hooks.slack.com/services/AAA/BBB/cccsecret".into(),
+                we("https://discord.com/api/webhooks/123/secrettoken"),
+                we(""),
+                we("https://hooks.slack.com/services/AAA/BBB/cccsecret"),
             ],
             ..Config::default()
         };
         let json: serde_json::Value = serde_json::from_str(&settings_json_redacted(&c)).unwrap();
         let arr = json["webhook_urls"].as_array().unwrap();
-        // Masked form now carries a stable per-entry index (#<pos>) so two
-        // same-origin hooks round-trip unambiguously (#8).
-        assert_eq!(arr[0], "https://discord.com/********#0");
+        // Each entry serializes as an object; only the `url` is masked and it
+        // carries a stable per-entry index (#<pos>) so two same-origin hooks
+        // round-trip unambiguously (#8). The flags pass through untouched.
+        assert_eq!(arr[0]["url"], "https://discord.com/********#0");
+        assert_eq!(arr[0]["post_rip"], true);
+        assert_eq!(arr[0]["post_move"], true);
         // Empty entry stays empty (no sentinel) so the UI shows a blank row.
-        assert_eq!(arr[1], "");
-        assert_eq!(arr[2], "https://hooks.slack.com/********#2");
+        assert_eq!(arr[1]["url"], "");
+        assert_eq!(arr[2]["url"], "https://hooks.slack.com/********#2");
         // The masked form must NOT leak the token.
-        assert!(!arr[0].as_str().unwrap().contains("secrettoken"));
-        assert!(!arr[2].as_str().unwrap().contains("cccsecret"));
+        assert!(!arr[0]["url"].as_str().unwrap().contains("secrettoken"));
+        assert!(!arr[2]["url"].as_str().unwrap().contains("cccsecret"));
     }
 
     #[test]
@@ -3947,11 +4093,11 @@ mod web_tests {
             "fixture must be a NON-masked URL for this test to mean anything"
         );
 
-        let existing: Vec<String> = vec!["https://discord.com/api/webhooks/1/aaa".into()];
-        let resolved = resolve_webhook_urls(&[embedded.as_str()], &existing)
+        let existing = vec![we("https://discord.com/api/webhooks/1/aaa")];
+        let resolved = resolve_webhook_entries(&[inc(&embedded)], &existing)
             .expect("a genuine URL must not be rejected as an ambiguous placeholder");
         assert_eq!(
-            resolved,
+            urls(&resolved),
             vec![embedded],
             "a non-masked entry is taken verbatim"
         );
@@ -3962,18 +4108,18 @@ mod web_tests {
         // A GET→POST round-trip of the redacted form must NOT wipe the
         // token-bearing stored URL. A masked placeholder resolves back to its
         // stored secret by origin; a real entry replaces; an empty entry drops.
-        let existing: Vec<String> = vec![
-            "https://discord.com/api/webhooks/1/aaa".into(),
-            "https://hooks.slack.com/services/x/y/zzz".into(),
+        let existing = vec![
+            we("https://discord.com/api/webhooks/1/aaa"),
+            we("https://hooks.slack.com/services/x/y/zzz"),
         ];
         let incoming = [
-            "https://discord.com/********", // masked → keep discord secret
-            "https://example.com/new-hook", // changed → replace
+            inc("https://discord.com/********"), // masked → keep discord secret
+            inc("https://example.com/new-hook"), // changed → replace
         ];
-        let resolved = resolve_webhook_urls(&incoming, &existing).unwrap();
+        let resolved = resolve_webhook_entries(&incoming, &existing).unwrap();
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0], "https://discord.com/api/webhooks/1/aaa");
-        assert_eq!(resolved[1], "https://example.com/new-hook");
+        assert_eq!(resolved[0].url, "https://discord.com/api/webhooks/1/aaa");
+        assert_eq!(resolved[1].url, "https://example.com/new-hook");
     }
 
     #[test]
@@ -3983,18 +4129,18 @@ mod web_tests {
         // BY POSITION would bind slack's row to discord's secret and vice
         // versa — a silent secret-confusion bug. By origin, each masked entry
         // must resolve to ITS OWN stored secret regardless of order.
-        let existing: Vec<String> = vec![
-            "https://discord.com/api/webhooks/1/secretA".into(),
-            "https://hooks.slack.com/services/x/y/secretB".into(),
+        let existing = vec![
+            we("https://discord.com/api/webhooks/1/secretA"),
+            we("https://hooks.slack.com/services/x/y/secretB"),
         ];
         // Reordered: slack first, discord second (each still masked).
         let reordered = [
-            "https://hooks.slack.com/********",
-            "https://discord.com/********",
+            inc("https://hooks.slack.com/********"),
+            inc("https://discord.com/********"),
         ];
-        let resolved = resolve_webhook_urls(&reordered, &existing).unwrap();
+        let resolved = resolve_webhook_entries(&reordered, &existing).unwrap();
         assert_eq!(
-            resolved,
+            urls(&resolved),
             vec![
                 "https://hooks.slack.com/services/x/y/secretB".to_string(),
                 "https://discord.com/api/webhooks/1/secretA".to_string(),
@@ -4004,10 +4150,10 @@ mod web_tests {
 
         // Deleting the discord row and keeping only the (masked) slack row must
         // still resolve slack correctly — never to discord's secret.
-        let only_slack = ["https://hooks.slack.com/********"];
-        let resolved = resolve_webhook_urls(&only_slack, &existing).unwrap();
+        let only_slack = [inc("https://hooks.slack.com/********")];
+        let resolved = resolve_webhook_entries(&only_slack, &existing).unwrap();
         assert_eq!(
-            resolved,
+            urls(&resolved),
             vec!["https://hooks.slack.com/services/x/y/secretB".to_string()]
         );
     }
@@ -4017,19 +4163,19 @@ mod web_tests {
         // A masked entry whose origin matches NO stored URL (the referenced row
         // was deleted) is ambiguous — reject rather than guess. Likewise when
         // two stored hooks share an origin (>1 match).
-        let existing: Vec<String> = vec!["https://discord.com/api/webhooks/1/aaa".into()];
+        let existing = vec![we("https://discord.com/api/webhooks/1/aaa")];
         // Masked slack origin has no stored counterpart → Err.
-        let orphan = ["https://hooks.slack.com/********"];
-        assert!(resolve_webhook_urls(&orphan, &existing).is_err());
+        let orphan = [inc("https://hooks.slack.com/********")];
+        assert!(resolve_webhook_entries(&orphan, &existing).is_err());
 
         // Two stored discord hooks share an origin → a masked discord entry is
         // ambiguous (>1 match) → Err.
-        let two_discord: Vec<String> = vec![
-            "https://discord.com/api/webhooks/1/aaa".into(),
-            "https://discord.com/api/webhooks/2/bbb".into(),
+        let two_discord = vec![
+            we("https://discord.com/api/webhooks/1/aaa"),
+            we("https://discord.com/api/webhooks/2/bbb"),
         ];
-        let masked = ["https://discord.com/********"];
-        assert!(resolve_webhook_urls(&masked, &two_discord).is_err());
+        let masked = [inc("https://discord.com/********")];
+        assert!(resolve_webhook_entries(&masked, &two_discord).is_err());
     }
 
     #[test]
@@ -4038,19 +4184,19 @@ mod web_tests {
         // SAME placeholder, so a GET→POST round-trip was ambiguous (>1 origin
         // match) and the save was permanently rejected. With a stable per-entry
         // index embedded in the mask, each resolves to its OWN stored secret.
-        let existing: Vec<String> = vec![
-            "https://discord.com/api/webhooks/1/secretA".into(),
-            "https://discord.com/api/webhooks/2/secretB".into(),
+        let existing = vec![
+            we("https://discord.com/api/webhooks/1/secretA"),
+            we("https://discord.com/api/webhooks/2/secretB"),
         ];
         // Exactly what GET /api/settings now emits.
-        let masked0 = mask_webhook_url_indexed(&existing[0], 0);
-        let masked1 = mask_webhook_url_indexed(&existing[1], 1);
+        let masked0 = mask_webhook_url_indexed(&existing[0].url, 0);
+        let masked1 = mask_webhook_url_indexed(&existing[1].url, 1);
         assert_ne!(masked0, masked1, "same-origin masks must differ by index");
 
-        let incoming = [masked0.as_str(), masked1.as_str()];
-        let resolved = resolve_webhook_urls(&incoming, &existing).unwrap();
+        let incoming = [inc(&masked0), inc(&masked1)];
+        let resolved = resolve_webhook_entries(&incoming, &existing).unwrap();
         assert_eq!(
-            resolved,
+            urls(&resolved),
             vec![
                 "https://discord.com/api/webhooks/1/secretA".to_string(),
                 "https://discord.com/api/webhooks/2/secretB".to_string(),
@@ -4060,9 +4206,38 @@ mod web_tests {
 
         // A stale index whose origin mask no longer matches must be rejected,
         // not silently bound to the wrong secret.
-        let stale = [mask_webhook_url_indexed("https://discord.com/x", 5)];
-        let stale = [stale[0].as_str()];
-        assert!(resolve_webhook_urls(&stale, &existing).is_err());
+        let stale = [inc(&mask_webhook_url_indexed("https://discord.com/x", 5))];
+        assert!(resolve_webhook_entries(&stale, &existing).is_err());
+    }
+
+    #[test]
+    fn resolve_webhook_entries_carries_flags_through_masking() {
+        // The per-event flags come from the INCOMING request, never from the
+        // stored entry — resolving a masked URL back to its stored secret must
+        // NOT also restore the stored entry's old flags. Here the stored hook
+        // fired on both; the client re-saves it (masked URL) as move-only, and
+        // that new intent must win while the secret URL is preserved.
+        let existing = vec![WebhookEntry {
+            url: "https://discord.com/api/webhooks/1/secretA".into(),
+            post_rip: true,
+            post_move: true,
+        }];
+        let masked = mask_webhook_url_indexed(&existing[0].url, 0);
+        let incoming = [IncomingWebhook {
+            url: masked,
+            post_rip: false,
+            post_move: true,
+        }];
+        let resolved = resolve_webhook_entries(&incoming, &existing).unwrap();
+        assert_eq!(
+            resolved,
+            vec![WebhookEntry {
+                url: "https://discord.com/api/webhooks/1/secretA".into(),
+                post_rip: false,
+                post_move: true,
+            }],
+            "URL resolves to the stored secret but the flags follow the new request"
+        );
     }
 
     #[test]
@@ -4746,6 +4921,36 @@ mod web_tests {
             );
         }
         assert_eq!(ureq_error_kind(&ureq::Error::StatusCode(404)), "HTTP 404");
+    }
+
+    /// An OS-generated transport error (a real errno, e.g. ECONNRESET from a
+    /// receiver that RSTs the socket instead of answering) must surface its
+    /// descriptive syscall message, not collapse to the useless
+    /// "io: uncategorized error" that `io.kind()` alone prints when the kind is
+    /// `Uncategorized`. Regression for a webhook that logged only
+    /// "io: uncategorized error" with nothing an operator could act on.
+    #[test]
+    fn ureq_error_kind_surfaces_os_error_detail() {
+        // ECONNRESET (54 on macOS/BSD, 104 on Linux) — its io::ErrorKind is
+        // ConnectionReset here, but an errno the OS doesn't map to a named
+        // ErrorKind arrives as Uncategorized, whose kind-Display is the
+        // unhelpful string this change fixes. Build via from_raw_os_error so
+        // raw_os_error() is Some and the descriptive Display is used.
+        let econnreset = if cfg!(target_os = "linux") { 104 } else { 54 };
+        let e = ureq::Error::Io(std::io::Error::from_raw_os_error(econnreset));
+        let summary = ureq_error_kind(&e);
+        assert!(
+            summary.contains(&format!("os error {econnreset}")),
+            "the errno detail must be surfaced, got: {summary}"
+        );
+        // Still URL-free — the whole point of routing through this function.
+        assert!(!summary.contains("://"));
+
+        // An io error WITHOUT an errno (constructed from a bare ErrorKind, as
+        // ureq/std synthesize) falls back to the fixed kind description.
+        let synthetic =
+            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(ureq_error_kind(&synthetic), "io: connection refused");
     }
 
     /// The fourth ureq log site. Round 1 routed three failures through
@@ -6024,17 +6229,20 @@ fn get_state_json(staging_dir: &str) -> String {
     // like success is exactly the class this project refuses to ship: the
     // poisoned map's contents are still perfectly readable, so serve them.
     let state = ripper::STATE.lock().unwrap_or_else(|e| e.into_inner());
+    // `_move` is now an ARRAY of per-artifact bars (movie file + companion ISO
+    // get one each), so clone the whole Vec; empty means nothing is moving.
     let move_state = crate::mover::MOVE_STATE
         .lock()
         .ok()
-        .and_then(|ms| ms.clone());
+        .map(|ms| ms.clone())
+        .unwrap_or_default();
     // Mux progress rides on the synthetic `_mux` device key in STATE (a
     // RipState seeded by the mux worker — see the dashboard JS at the
     // `_mux` field), serialized below as part of `state`. There is no
     // separate live MuxState struct.
     let mut obj = serde_json::to_value(&*state).unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(ms) = move_state {
-        obj["_move"] = serde_json::to_value(&ms).unwrap_or_default();
+    if !move_state.is_empty() {
+        obj["_move"] = serde_json::to_value(&move_state).unwrap_or_default();
     }
     // Release the STATE lock before the staging-dir scan below. `build_queue_views`
     // does filesystem I/O (read_dir + per-dir stat); holding STATE across it would
@@ -6080,14 +6288,29 @@ const QUEUE_DISPLAY_CAP: usize = 100;
 /// queue scans for `.done`, and `crate::muxer::pending_queue` (the Mux
 /// queue) skips any dir carrying `.done`/`.review`/`.muxing`/`.completed`/
 /// `.failed`. So a given staging dir lands in at most one of the two lists.
+///
+/// The Move queue additionally excludes the staging dir currently being moved
+/// (`crate::mover::ACTIVE_MOVE_DIR`): that dir keeps its `.done` throughout the
+/// copy and is already shown as its live per-artifact progress bars (`_move`),
+/// so listing it here as a "(moving)" row too is the double-render bug. The
+/// exclusion is by exact on-disk basename, so it holds regardless of any title
+/// punctuation the filesystem sanitizer drops.
 fn build_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usize) {
-    // Move queue: staging dirs with a `.done` marker (pending moves).
+    let active_move_dir = crate::mover::ACTIVE_MOVE_DIR
+        .lock()
+        .ok()
+        .and_then(|d| d.clone());
+    // Move queue: staging dirs with a `.done` marker (pending moves), minus the
+    // one actively being moved (shown as live bars, not a queue row).
     let mut move_queue: Vec<String> = std::fs::read_dir(staging_dir)
         .ok()
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().is_dir() && e.path().join(".done").exists())
+                .filter(|e| {
+                    active_move_dir.as_deref() != Some(e.file_name().to_string_lossy().as_ref())
+                })
                 .map(|e| {
                     let name = e.file_name().to_string_lossy().replace('_', " ");
                     format!("{} (moving)", name)
@@ -6534,10 +6757,35 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     // guard). It cannot bind a masked entry to a WRONG secret: resolution
     // still only succeeds when the origin (or index) unambiguously matches
     // one entry in whichever snapshot was read.
-    let webhook_urls_resolved: Option<Vec<String>> = if let Some(arr) =
+    let webhook_urls_resolved: Option<Vec<WebhookEntry>> = if let Some(arr) =
         patch.get("webhook_urls").and_then(|v| v.as_array())
     {
-        let incoming: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        // Each element is the modern object `{url, post_rip, post_move}`; a
+        // bare string (legacy client) is accepted too and treated as
+        // fire-on-both. A missing flag defaults to true (fire), matching the
+        // config loader's backward-compat rule.
+        let incoming: Vec<IncomingWebhook> = arr
+            .iter()
+            .filter_map(|v| {
+                if let Some(s) = v.as_str() {
+                    Some(IncomingWebhook {
+                        url: s.to_string(),
+                        post_rip: true,
+                        post_move: true,
+                    })
+                } else if let Some(obj) = v.as_object() {
+                    let url = obj.get("url").and_then(|u| u.as_str())?.to_string();
+                    let flag = |k: &str| obj.get(k).and_then(|b| b.as_bool()).unwrap_or(true);
+                    Some(IncomingWebhook {
+                        url,
+                        post_rip: flag("post_rip"),
+                        post_move: flag("post_move"),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
         let existing = match cfg.read() {
             Ok(c) => c.webhook_urls.clone(),
             Err(_) => {
@@ -6548,7 +6796,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
                 );
             }
         };
-        match resolve_webhook_urls(&incoming, &existing) {
+        match resolve_webhook_entries(&incoming, &existing) {
             Ok(urls) => Some(urls),
             Err(_) => {
                 // A masked entry's origin matched 0 (deleted row) or >1

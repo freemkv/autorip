@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.6.7] — 2026-08-21
+
+### Added
+
+- **Each webhook chooses which events fire it.** Every webhook row now has a
+  **Rip** and a **Move** checkbox, so one hook can post only on rip complete,
+  another only on move complete, and a third on both — instead of every hook
+  firing on both events. New hooks default to both checked (the prior
+  behaviour). Existing configurations are read unchanged: a webhook stored as
+  a bare URL still fires on both events. Delivery is unchanged — an HTTP
+  `POST` of the same JSON payload per event.
+
+- **The Move card shows one progress bar per artifact.** A rip that keeps its
+  ISO moves two files — the muxed title and its companion image — and each now
+  gets its own labelled bar (`Title (mkv)` and `Title (iso)`) rather than a
+  single combined bar. Moves run one at a time, so the active file's bar
+  climbs while the other reads 0% until its turn, then 100%.
+
+### Fixed
+
+- **A title being moved no longer appears twice in the Move card.** The
+  actively-moving job was shown both as its live progress and as a second
+  "(moving)" queue row, because the queue was de-duplicated against the title
+  by a client-side string match that broke whenever the title contained a
+  character the filesystem strips (a colon, slash, etc. — e.g.
+  `X-Men: Apocalypse`). The active job is now excluded from the queue on the
+  server by its exact on-disk name, so it is listed exactly once regardless of
+  punctuation. (Surfaced by the 1.6.6 move-state change, which made the queue
+  refresh in lockstep with the active move.)
+
+- **A failed webhook delivery reports the real reason.** A socket-level
+  failure (a receiver that resets or refuses the connection) logged the
+  useless `Webhook failed <host>: io: uncategorized error`. When the OS
+  supplies an error code the log now carries its description —
+  `Webhook failed <host>: io: Connection reset by peer (os error 54)` — while
+  still never including the token-bearing URL.
+
 ## [1.6.6] — 2026-08-20
 
 ### Changed
