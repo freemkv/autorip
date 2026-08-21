@@ -1,5 +1,38 @@
 # Changelog
 
+## [1.6.8] — 2026-08-21
+
+### Added
+
+- **Webhooks now fire per pipeline stage: Rip, Mux, Move.** A rip goes through
+  three stages — the disc is read (**Rip**: the drive is now free), the ISO is
+  muxed to an `.mkv` (**Mux**), and the file is moved into the library
+  (**Move**). Each webhook row now has a checkbox for each stage, in any
+  combination, so you can (for example) get a **Rip** notification the moment a
+  drive frees up to load the next disc, while a library scanner fires only on
+  **Move**. New hooks default to all three checked. Existing configurations are
+  read unchanged and gain the new **Mux** stage enabled by default, so a hook
+  that previously notified on completion keeps doing so. The payload adds a
+  `"mux_complete"` event name alongside `"rip_complete"` and `"move_complete"`.
+
+### Fixed
+
+- **The Rip webhook now fires when the drive is free, not when the mux
+  finishes.** Previously the "rip complete" notification was sent at the end of
+  the *mux* — up to 20+ minutes after the disc had actually finished reading —
+  so it was useless for the one thing it should signal: that the drive is free
+  and you can load the next disc. It now fires at the point the read completes
+  and the disc is ejected, on the drive worker, decoupled from the mux that
+  continues on a separate worker. The end-of-mux notification is still sent, now
+  as the distinct **Mux** stage.
+
+- **The Ripper tab's activity banner now shows during moves, too.** The banner
+  that tells you a previous rip is still muxing/moving in the background (when
+  the drive tile itself reads idle) only lit up for muxes — it silently missed
+  moves, because it still checked the pre-1.6.7 single-object move shape after
+  the move state became an array of per-artifact bars. A move in progress now
+  shows the banner just like a mux does.
+
 ## [1.6.7] — 2026-08-21
 
 ### Added

@@ -615,8 +615,12 @@ function renderMuxBanner(data){
   const mx=data._mux;
   const muxActive=!!(mx&&mx.status==='ripping'&&mx.disc_name);
   const muxQ=!!(data._mux_queue&&data._mux_queue.length);
+  /* `_move` is an ARRAY of per-artifact bars (1.6.7+); tolerate the legacy
+     single-object shape. An active move is any bar carrying a name. The old
+     `mv.name` check silently missed the array form, so the banner never lit
+     up while a move was running — mux showed, move didn't. */
   const mv=data._move;
-  const moveActive=!!(mv&&mv.name);
+  const moveActive=Array.isArray(mv)?mv.some(m=>m&&m.name):!!(mv&&mv.name);
   const moveQ=!!(data._move_queue&&data._move_queue.length);
   const muxing=muxActive||muxQ, moving=moveActive||moveQ;
   if(!muxing&&!moving){el.innerHTML='';return;}
@@ -1214,18 +1218,19 @@ function renderSettings(s){
     html+='</div>';
     /* Insert webhooks card after Output */
     if(g.title==='Output'){
-      /* Each webhook is now {url, post_rip, post_move}; tolerate a legacy
-         bare string (older payload) by coercing it to an object that fires on
-         both events. */
+      /* Each webhook is now {url, post_rip, post_mux, post_move}; tolerate a
+         legacy bare string (older payload) by coercing it to an object that
+         fires on every stage. A pre-1.6.8 object with no post_mux defaults it
+         to true (post_mux!==false below), matching the config loader. */
       const hooks=(s.webhook_urls||[])
-        .map(h=>typeof h==='string'?{url:h,post_rip:true,post_move:true}:h)
+        .map(h=>typeof h==='string'?{url:h,post_rip:true,post_mux:true,post_move:true}:h)
         .filter(h=>h&&h.url);
       html+='<div class="card"><h2>Webhooks</h2>';
       html+='<div id="webhook-list">';
-      hooks.forEach((h,i)=>{ html+=webhookRow(i,h.url,h.post_rip!==false,h.post_move!==false); });
+      hooks.forEach((h,i)=>{ html+=webhookRow(i,h.url,h.post_rip!==false,h.post_mux!==false,h.post_move!==false); });
       html+='</div>';
       html+='<button class="btn" onclick="addWebhook()" style="font-size:.75rem;margin-top:4px">+ Add Webhook</button>';
-      html+='<div style="font-size:12px;color:var(--text3);margin-top:8px;line-height:1.4">POST JSON to each endpoint. Choose per hook whether it fires on rip complete, move complete, or both. Works with Discord, Jellyfin, n8n, or any HTTP endpoint.</div>';
+      html+='<div style="font-size:12px;color:var(--text3);margin-top:8px;line-height:1.4">POST JSON to each endpoint. Choose per hook which stage fires it — Rip (disc read done, drive free), Mux (.mkv produced), Move (in library) — in any combination. Works with Discord, Jellyfin, n8n, or any HTTP endpoint.</div>';
       html+='</div>';
     }
   });
@@ -1251,15 +1256,18 @@ function toggleConditional(){
   });
 }
 
-/* One webhook row: URL input + a "Rip" and a "Move" checkbox (which
-   completion events fire this hook) + a remove button. `postRip`/`postMove`
-   seed the checkboxes; new hooks default both to true. The checkbox
-   data-attributes are read back per-row in saveSettings(). */
-function webhookRow(i,url,postRip,postMove){
+/* One webhook row: URL input + a "Rip", "Mux" and "Move" checkbox (which
+   pipeline stage fires this hook) + a remove button. Rip = disc read done /
+   drive free; Mux = .mkv produced; Move = landed in the library.
+   `postRip`/`postMux`/`postMove` seed the checkboxes; new hooks default all
+   three to true. The checkbox data-attributes are read back per-row in
+   saveSettings(). */
+function webhookRow(i,url,postRip,postMux,postMove){
   const cb=(attr,on,label)=>'<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text2);cursor:pointer;white-space:nowrap"><input type="checkbox" '+attr+' '+(on?'checked':'')+' style="width:14px;height:14px;margin:0;accent-color:var(--accent)">'+label+'</label>';
   return '<div class="webhook-row" style="display:flex;gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap">'
     +'<input type="text" data-webhook="'+i+'" value="'+esc(url||'')+'" placeholder="https://discord.com/api/webhooks/..." style="flex:1;min-width:180px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--log-bg);color:var(--text);font-size:13px;font-family:inherit">'
     +cb('data-webhook-rip','undefined'==typeof postRip?true:postRip,'Rip')
+    +cb('data-webhook-mux','undefined'==typeof postMux?true:postMux,'Mux')
     +cb('data-webhook-move','undefined'==typeof postMove?true:postMove,'Move')
     +'<button class="btn" onclick="this.parentElement.remove()" style="padding:5px 8px;font-size:.75rem">X</button>'
     +'</div>';
@@ -1269,7 +1277,7 @@ function addWebhook(){
   const list=document.getElementById('webhook-list');
   const i=list.children.length;
   const tmp=document.createElement('div');
-  tmp.innerHTML=webhookRow(i,'',true,true);
+  tmp.innerHTML=webhookRow(i,'',true,true,true);
   const div=tmp.firstChild;
   list.appendChild(div);
   div.querySelector('input[type="text"]').focus();
@@ -1284,16 +1292,18 @@ function saveSettings(){
     else if(el.type==='number')s[el.dataset.key]=parseInt(el.value)||0;
     else s[el.dataset.key]=el.value;
   });
-  /* Collect webhooks as {url, post_rip, post_move}. Read each flag from the
-     row's own checkboxes so a URL only fires on the events the operator chose. */
+  /* Collect webhooks as {url, post_rip, post_mux, post_move}. Read each flag
+     from the row's own checkboxes so a URL only fires on the stages the
+     operator chose. */
   const hooks=[];
   document.querySelectorAll('#webhook-list .webhook-row').forEach(row=>{
     const urlEl=row.querySelector('input[data-webhook]');
     const v=(urlEl&&urlEl.value||'').trim();
     if(!v)return;
     const rip=row.querySelector('input[data-webhook-rip]');
+    const mux=row.querySelector('input[data-webhook-mux]');
     const mov=row.querySelector('input[data-webhook-move]');
-    hooks.push({url:v,post_rip:rip?rip.checked:true,post_move:mov?mov.checked:true});
+    hooks.push({url:v,post_rip:rip?rip.checked:true,post_mux:mux?mux.checked:true,post_move:mov?mov.checked:true});
   });
   s.webhook_urls=hooks;
  /* v0.13.19: translate the virtual `rip_mode` selector back to the backend
@@ -1989,12 +1999,13 @@ struct IncomingWebhook {
     /// May be a real URL (newly entered) or a masked placeholder to resolve.
     url: String,
     post_rip: bool,
+    post_mux: bool,
     post_move: bool,
 }
 
 /// Resolve an incoming `webhook_urls` array against the currently-stored
 /// entries, replacing each redacted URL placeholder with its real
-/// (token-bearing) value while preserving the per-entry `post_rip`/`post_move`
+/// (token-bearing) value while preserving the per-entry `post_rip`/`post_mux`/`post_move`
 /// flags the client sent. Only the URL is ever masked, so the flags always
 /// come straight from `incoming`.
 ///
@@ -2054,6 +2065,7 @@ fn resolve_webhook_entries(
         resolved.push(WebhookEntry {
             url,
             post_rip: hook.post_rip,
+            post_mux: hook.post_mux,
             post_move: hook.post_move,
         });
     }
@@ -2100,7 +2112,7 @@ fn settings_json_redacted(c: &Config) -> String {
             .unwrap_or_default();
         v["keydb_path"] = serde_json::json!(name);
     }
-    // Each entry serializes as {url, post_rip, post_move}. Mask the token in
+    // Each entry serializes as {url, post_rip, post_mux, post_move}. Mask the token in
     // `url` (keeping the origin + stable `#idx` for round-trip resolution) and
     // pass the boolean flags through untouched.
     if let Some(arr) = v.get_mut("webhook_urls").and_then(|x| x.as_array_mut()) {
@@ -3879,23 +3891,25 @@ mod web_tests {
     // (it drives the real handle_settings_post via a live server + config::save,
     // not an inline re-implementation of the guard).
 
-    /// A stored webhook entry that fires on both events — the common case in
-    /// these tests, which predate per-event flags and care only about URL
+    /// A stored webhook entry that fires on every stage — the common case in
+    /// these tests, which predate per-stage flags and care only about URL
     /// masking/resolution.
     fn we(url: &str) -> WebhookEntry {
         WebhookEntry {
             url: url.to_string(),
             post_rip: true,
+            post_mux: true,
             post_move: true,
         }
     }
 
-    /// An incoming (POST-side) webhook with both flags set — mirrors what the
-    /// UI sends for a fire-on-both hook.
+    /// An incoming (POST-side) webhook with all flags set — mirrors what the
+    /// UI sends for a fire-on-every-stage hook.
     fn inc(url: &str) -> IncomingWebhook {
         IncomingWebhook {
             url: url.to_string(),
             post_rip: true,
+            post_mux: true,
             post_move: true,
         }
     }
@@ -3926,6 +3940,7 @@ mod web_tests {
         // round-trip unambiguously (#8). The flags pass through untouched.
         assert_eq!(arr[0]["url"], "https://discord.com/********#0");
         assert_eq!(arr[0]["post_rip"], true);
+        assert_eq!(arr[0]["post_mux"], true);
         assert_eq!(arr[0]["post_move"], true);
         // Empty entry stays empty (no sentinel) so the UI shows a blank row.
         assert_eq!(arr[1]["url"], "");
@@ -4220,12 +4235,14 @@ mod web_tests {
         let existing = vec![WebhookEntry {
             url: "https://discord.com/api/webhooks/1/secretA".into(),
             post_rip: true,
+            post_mux: true,
             post_move: true,
         }];
         let masked = mask_webhook_url_indexed(&existing[0].url, 0);
         let incoming = [IncomingWebhook {
             url: masked,
             post_rip: false,
+            post_mux: false,
             post_move: true,
         }];
         let resolved = resolve_webhook_entries(&incoming, &existing).unwrap();
@@ -4234,6 +4251,7 @@ mod web_tests {
             vec![WebhookEntry {
                 url: "https://discord.com/api/webhooks/1/secretA".into(),
                 post_rip: false,
+                post_mux: false,
                 post_move: true,
             }],
             "URL resolves to the stored secret but the flags follow the new request"
@@ -6760,7 +6778,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     let webhook_urls_resolved: Option<Vec<WebhookEntry>> = if let Some(arr) =
         patch.get("webhook_urls").and_then(|v| v.as_array())
     {
-        // Each element is the modern object `{url, post_rip, post_move}`; a
+        // Each element is the modern object `{url, post_rip, post_mux, post_move}`; a
         // bare string (legacy client) is accepted too and treated as
         // fire-on-both. A missing flag defaults to true (fire), matching the
         // config loader's backward-compat rule.
@@ -6771,6 +6789,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
                     Some(IncomingWebhook {
                         url: s.to_string(),
                         post_rip: true,
+                        post_mux: true,
                         post_move: true,
                     })
                 } else if let Some(obj) = v.as_object() {
@@ -6779,6 +6798,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
                     Some(IncomingWebhook {
                         url,
                         post_rip: flag("post_rip"),
+                        post_mux: flag("post_mux"),
                         post_move: flag("post_move"),
                     })
                 } else {
