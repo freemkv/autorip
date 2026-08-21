@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.6.6] — UNRELEASED
+
+### Changed
+
+- **Webhooks may now point at private / LAN addresses.** The SSRF guard that
+  rejected any webhook URL resolving to RFC1918, loopback, or link-local
+  space (`webhook URL rejected: refusing to connect to non-public address …
+  (SSRF guard)`) has been removed for webhooks. A webhook is a blind
+  fire-and-forget notification with no response channel, and pointing one at
+  a LAN service — Home Assistant, a NAS, an internal automation endpoint — is
+  the intended use, which the guard actively prevented. Delivery now uses an
+  un-pinned agent with the standard resolver (redirects still blocked,
+  timeouts unchanged). The `keydb`, `keyserver`, and raw network-output
+  targets stay fully SSRF-guarded: those POST key material, stream decrypted
+  disc content, and read responses back, so their private-address block and
+  DNS pinning are unchanged.
+
 ## [1.6.5] — 2026-08-20
 
 ### Added
