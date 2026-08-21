@@ -1,11 +1,14 @@
 use crate::config::{Config, WebhookEntry};
 
-/// Which completion event a dispatch is for. Each configured [`WebhookEntry`]
-/// opts in to rip- and/or move-complete independently, so `fire` filters the
-/// destination list by the event it is delivering.
+/// Which pipeline stage a dispatch is for. Each configured [`WebhookEntry`]
+/// opts in to the rip-, mux-, and move-complete stages independently, so
+/// `fire` filters the destination list by the stage it is delivering.
 #[derive(Clone, Copy)]
-pub(crate) enum WebhookEvent {
+pub enum WebhookEvent {
+    /// Disc read finished, drive is free (`rip_complete`).
     Rip,
+    /// `.mkv` produced from the staged ISO (`mux_complete`).
+    Mux,
     Move,
 }
 
@@ -51,8 +54,11 @@ pub struct RipEvent<'a> {
     pub lost_video_secs: f64,
 }
 
-/// Rich payload with full metadata — used for rip_complete.
-pub fn send_rich(cfg: &Config, ev: &RipEvent) {
+/// Rich payload with full metadata — used for the `rip_complete` (drive-free)
+/// and `mux_complete` (mkv-produced) stages. The caller passes the matching
+/// [`WebhookEvent`] so `fire` filters to the hooks that opted in to that stage;
+/// `ev.event` sets the `"event"` field receivers see.
+pub fn send_rich(cfg: &Config, event: WebhookEvent, ev: &RipEvent) {
     let payload = serde_json::json!({
         "event": ev.event,
         "title": ev.title,
@@ -69,7 +75,7 @@ pub fn send_rich(cfg: &Config, ev: &RipEvent) {
         "lost_video_secs": (ev.lost_video_secs * crate::util::MILLIS_PER_SEC).round()
             / crate::util::MILLIS_PER_SEC,
     });
-    fire(cfg, &payload, WebhookEvent::Rip);
+    fire(cfg, &payload, event);
 }
 
 /// Return only the `scheme://host[:port]` portion of `url`, dropping any
@@ -120,6 +126,7 @@ pub(crate) fn active_urls(entries: &[WebhookEntry], event: WebhookEvent) -> Vec<
         .iter()
         .filter(|e| match event {
             WebhookEvent::Rip => e.post_rip,
+            WebhookEvent::Mux => e.post_mux,
             WebhookEvent::Move => e.post_move,
         })
         .map(|e| e.url.clone())
@@ -594,13 +601,14 @@ mod tests {
         assert!(!origin.contains('@'));
     }
 
-    /// Build a "fires on both events" entry — the common case and the
-    /// pre-1.6.7 default — so these tests read as tersely as the old
+    /// Build a "fires on every stage" entry — the common case and the
+    /// pre-1.6.8 default — so these tests read as tersely as the old
     /// bare-string vectors they replaced.
     fn both(url: &str) -> WebhookEntry {
         WebhookEntry {
             url: url.to_string(),
             post_rip: true,
+            post_mux: true,
             post_move: true,
         }
     }
@@ -615,7 +623,7 @@ mod tests {
             both("https://second.example/hook"),
         ];
         // Blank filtering is independent of the event.
-        for event in [WebhookEvent::Rip, WebhookEvent::Move] {
+        for event in [WebhookEvent::Rip, WebhookEvent::Mux, WebhookEvent::Move] {
             assert_eq!(
                 active_urls(&entries, event),
                 vec![
@@ -630,55 +638,73 @@ mod tests {
     fn active_urls_all_blank_yields_empty() {
         let entries = vec![both(""), both("  ")];
         assert!(active_urls(&entries, WebhookEvent::Rip).is_empty());
+        assert!(active_urls(&entries, WebhookEvent::Mux).is_empty());
         assert!(active_urls(&entries, WebhookEvent::Move).is_empty());
     }
 
-    /// Per-event opt-in is the whole point of the flags: a rip-only hook must
-    /// never appear in the move dispatch list, and vice versa, while a
-    /// both-events hook appears in both.
+    /// Per-stage opt-in is the whole point of the flags: a rip-only hook must
+    /// never appear in the mux or move dispatch list, a mux-only hook only in
+    /// the mux list, and so on, while an every-stage hook appears in all three.
     #[test]
     fn active_urls_selects_by_event_flag() {
         let entries = vec![
             WebhookEntry {
                 url: "https://rip-only.example/hook".to_string(),
                 post_rip: true,
+                post_mux: false,
+                post_move: false,
+            },
+            WebhookEntry {
+                url: "https://mux-only.example/hook".to_string(),
+                post_rip: false,
+                post_mux: true,
                 post_move: false,
             },
             WebhookEntry {
                 url: "https://move-only.example/hook".to_string(),
                 post_rip: false,
+                post_mux: false,
                 post_move: true,
             },
-            both("https://both.example/hook"),
+            both("https://all.example/hook"),
         ];
 
         assert_eq!(
             active_urls(&entries, WebhookEvent::Rip),
             vec![
                 "https://rip-only.example/hook".to_string(),
-                "https://both.example/hook".to_string(),
+                "https://all.example/hook".to_string(),
+            ]
+        );
+        assert_eq!(
+            active_urls(&entries, WebhookEvent::Mux),
+            vec![
+                "https://mux-only.example/hook".to_string(),
+                "https://all.example/hook".to_string(),
             ]
         );
         assert_eq!(
             active_urls(&entries, WebhookEvent::Move),
             vec![
                 "https://move-only.example/hook".to_string(),
-                "https://both.example/hook".to_string(),
+                "https://all.example/hook".to_string(),
             ]
         );
     }
 
-    /// A hook that opted OUT of both events is inert — it never dispatches,
-    /// even though its URL is non-blank. (The UI defaults new hooks to both
+    /// A hook that opted OUT of every stage is inert — it never dispatches,
+    /// even though its URL is non-blank. (The UI defaults new hooks to all
     /// checked, but a raw config could carry this.)
     #[test]
     fn active_urls_entry_opted_out_of_both_never_fires() {
         let entries = vec![WebhookEntry {
             url: "https://silent.example/hook".to_string(),
             post_rip: false,
+            post_mux: false,
             post_move: false,
         }];
         assert!(active_urls(&entries, WebhookEvent::Rip).is_empty());
+        assert!(active_urls(&entries, WebhookEvent::Mux).is_empty());
         assert!(active_urls(&entries, WebhookEvent::Move).is_empty());
     }
 

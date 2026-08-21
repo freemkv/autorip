@@ -8,46 +8,62 @@ pub(crate) const OUTPUT_FORMAT_ISO: &str = "iso";
 pub(crate) const OUTPUT_FORMAT_NETWORK: &str = "network";
 
 /// `#[serde(default)]` helper: a webhook with an unspecified `post_rip` /
-/// `post_move` flag fires on that event. This is the backward-compat default —
-/// before per-event selection existed every webhook fired on both rip and
-/// move complete, so an entry that omits a flag (a legacy config, or a client
-/// that doesn't send it) must keep firing on both.
+/// `post_mux` / `post_move` flag fires on that stage. This is the
+/// backward-compat default — before per-stage selection existed every webhook
+/// fired on completion, so an entry that omits a flag (a legacy config, or a
+/// client that doesn't send it) must keep firing. A pre-1.6.8 config that only
+/// carries `post_rip`/`post_move` therefore gains `post_mux = true` on load, so
+/// the mux-stage notification (which used to ride the single `rip_complete`
+/// event) is never silently dropped.
 fn default_true() -> bool {
     true
 }
 
-/// One configured webhook: the destination URL plus which completion events
-/// it fires on. Before 1.6.7 a webhook was a bare URL string that always fired
-/// on both rip-complete and move-complete; per-event selection is opt-out, so
-/// both flags default to `true` and a legacy bare-string entry maps to
-/// "fire on both" (see the custom `Deserialize` below).
+/// One configured webhook: the destination URL plus which of the three
+/// pipeline stages (rip → mux → move) it fires on. The stages are distinct
+/// events:
+/// - `post_rip`: the disc read is done and the drive is free (sweep + patch
+///   complete, `.ripped` handed off, disc ejected) — you can load the next
+///   disc while the mux runs on a separate worker.
+/// - `post_mux`: the `.mkv` has been produced from the staged ISO.
+/// - `post_move`: the finished file has landed in its final library location.
+///
+/// Before 1.6.8 a webhook fired only once, at end-of-mux, under the name
+/// `post_rip`; per-stage selection is opt-out, so all three flags default to
+/// `true` and a legacy bare-string entry maps to "fire on every stage" (see the
+/// custom `Deserialize` below).
 #[derive(Clone, Serialize, PartialEq, Eq, Debug)]
 pub struct WebhookEntry {
     pub url: String,
-    /// Fire this webhook when a rip finishes (the `rip_complete` payload).
+    /// Fire when the disc read finishes and the drive is free (the
+    /// `rip_complete` payload).
     pub post_rip: bool,
+    /// Fire when the mux produces the `.mkv` (the `mux_complete` payload).
+    pub post_mux: bool,
     /// Fire this webhook when a moved file lands in its final library
     /// location (the `move_complete` payload).
     pub post_move: bool,
 }
 
 impl WebhookEntry {
-    /// A URL entry that fires on both events — the pre-1.6.7 behaviour and the
-    /// shape a bare legacy string migrates to.
+    /// A URL entry that fires on every stage — the pre-1.6.8 "notify on
+    /// completion" behaviour and the shape a bare legacy string migrates to.
     fn both(url: String) -> Self {
         Self {
             url,
             post_rip: true,
+            post_mux: true,
             post_move: true,
         }
     }
 
     /// Parse one entry from a settings.json array element, accepting BOTH the
     /// legacy bare string (`"https://…"`) and the object form
-    /// (`{"url":"…","post_rip":true,"post_move":false}`). A missing flag on the
-    /// object form defaults to `true` (fire) to match the bare-string default.
-    /// Returns `None` for a malformed element or a blank/whitespace URL so the
-    /// caller drops it, exactly as the old string-only loader did.
+    /// (`{"url":"…","post_rip":true,"post_mux":true,"post_move":false}`). A
+    /// missing flag on the object form defaults to `true` (fire) to match the
+    /// bare-string default. Returns `None` for a malformed element or a
+    /// blank/whitespace URL so the caller drops it, exactly as the old
+    /// string-only loader did.
     fn from_json(v: &serde_json::Value) -> Option<Self> {
         let entry = if let Some(s) = v.as_str() {
             Self::both(s.to_string())
@@ -58,6 +74,7 @@ impl WebhookEntry {
             Self {
                 url,
                 post_rip: flag("post_rip"),
+                post_mux: flag("post_mux"),
                 post_move: flag("post_move"),
             }
         };
@@ -82,6 +99,8 @@ impl<'de> Deserialize<'de> for WebhookEntry {
                 #[serde(default = "default_true")]
                 post_rip: bool,
                 #[serde(default = "default_true")]
+                post_mux: bool,
+                #[serde(default = "default_true")]
                 post_move: bool,
             },
         }
@@ -90,10 +109,12 @@ impl<'de> Deserialize<'de> for WebhookEntry {
             Raw::Obj {
                 url,
                 post_rip,
+                post_mux,
                 post_move,
             } => WebhookEntry {
                 url,
                 post_rip,
+                post_mux,
                 post_move,
             },
         })
@@ -672,7 +693,7 @@ fn load_saved(mut cfg: Config) -> Config {
     }
     if let Some(arr) = saved.get("webhook_urls").and_then(|v| v.as_array()) {
         // Accept both the legacy bare-string form and the modern
-        // {url, post_rip, post_move} object form; a bare string (or an object
+        // {url, post_rip, post_mux, post_move} object form; a bare string (or an object
         // missing a flag) fires on both events, preserving pre-1.6.7 behaviour.
         cfg.webhook_urls = arr.iter().filter_map(WebhookEntry::from_json).collect();
     }
@@ -1082,29 +1103,32 @@ mod tests {
         assert_eq!(cfg.log_retention_days, 14);
         // The empty webhook URL in the fixture array must be filtered out.
         // The fixture stores bare legacy strings, which must load as
-        // "fire on both events" (pre-1.6.7 behaviour).
+        // "fire on every stage" (pre-1.6.8 behaviour).
         assert_eq!(
             cfg.webhook_urls,
             vec![
                 WebhookEntry {
                     url: "https://discord.com/api/webhooks/1/abc".to_string(),
                     post_rip: true,
+                    post_mux: true,
                     post_move: true,
                 },
                 WebhookEntry {
                     url: "https://jellyfin.example.org/hook".to_string(),
                     post_rip: true,
+                    post_mux: true,
                     post_move: true,
                 },
             ],
-            "empty webhook URLs must be dropped on load; bare strings fire on both"
+            "empty webhook URLs must be dropped on load; bare strings fire on every stage"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The modern object form `{url, post_rip, post_move}` loads with its
-    /// per-event flags, a bare string still loads as fire-on-both, an object
-    /// missing a flag defaults that flag to true, and a blank/urlless entry is
+    /// The modern object form `{url, post_rip, post_mux, post_move}` loads with
+    /// its per-stage flags, a bare string still loads as fire-on-every-stage, an
+    /// object missing a flag defaults that flag to true (so a pre-1.6.8 config
+    /// with no `post_mux` gains `post_mux = true`), and a blank/urlless entry is
     /// dropped — all in one mixed array, since a real settings.json may carry
     /// any mixture after an upgrade.
     #[test]
@@ -1114,8 +1138,9 @@ mod tests {
             "webhook_urls": [
                 "https://legacy.example/hook",
                 {"url": "https://both.example/hook"},
-                {"url": "https://rip-only.example/hook", "post_rip": true, "post_move": false},
-                {"url": "https://move-only.example/hook", "post_rip": false, "post_move": true},
+                {"url": "https://rip-only.example/hook", "post_rip": true, "post_mux": false, "post_move": false},
+                {"url": "https://move-only.example/hook", "post_rip": false, "post_mux": false, "post_move": true},
+                {"url": "https://legacy-flags.example/hook", "post_rip": false, "post_move": true},
                 {"url": "   "},
                 {"post_rip": true},
                 "  "
@@ -1129,25 +1154,38 @@ mod tests {
                 WebhookEntry {
                     url: "https://legacy.example/hook".into(),
                     post_rip: true,
+                    post_mux: true,
                     post_move: true,
                 },
                 WebhookEntry {
                     url: "https://both.example/hook".into(),
                     post_rip: true,
+                    post_mux: true,
                     post_move: true,
                 },
                 WebhookEntry {
                     url: "https://rip-only.example/hook".into(),
                     post_rip: true,
+                    post_mux: false,
                     post_move: false,
                 },
                 WebhookEntry {
                     url: "https://move-only.example/hook".into(),
                     post_rip: false,
+                    post_mux: false,
+                    post_move: true,
+                },
+                // A pre-1.6.8 object with no post_mux key: the mux stage
+                // defaults ON so the upgrade never silently drops the
+                // completion notification that used to ride post_rip.
+                WebhookEntry {
+                    url: "https://legacy-flags.example/hook".into(),
+                    post_rip: false,
+                    post_mux: true,
                     post_move: true,
                 },
             ],
-            "object flags load verbatim; bare string and missing flags default to fire-on-both; blank/urlless entries drop"
+            "object flags load verbatim; bare string and missing flags default to fire-on-every-stage; blank/urlless entries drop"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1164,11 +1202,13 @@ mod tests {
             WebhookEntry {
                 url: "https://both.example/hook".into(),
                 post_rip: true,
+                post_mux: true,
                 post_move: true,
             },
             WebhookEntry {
                 url: "https://move-only.example/hook".into(),
                 post_rip: false,
+                post_mux: false,
                 post_move: true,
             },
         ];
@@ -1320,11 +1360,13 @@ mod tests {
                 WebhookEntry {
                     url: "https://discord.com/api/webhooks/1/DISCORD_SECRET_TOKEN".into(),
                     post_rip: true,
+                    post_mux: true,
                     post_move: true,
                 },
                 WebhookEntry {
                     url: "https://hooks.example.com?token=WEBHOOK_SECRET".into(),
                     post_rip: true,
+                    post_mux: true,
                     post_move: false,
                 },
             ],
