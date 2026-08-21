@@ -1,4 +1,13 @@
-use crate::config::Config;
+use crate::config::{Config, WebhookEntry};
+
+/// Which completion event a dispatch is for. Each configured [`WebhookEntry`]
+/// opts in to rip- and/or move-complete independently, so `fire` filters the
+/// destination list by the event it is delivering.
+#[derive(Clone, Copy)]
+pub(crate) enum WebhookEvent {
+    Rip,
+    Move,
+}
 
 /// Notify that a file was moved to its final destination.
 pub fn send_move(cfg: &Config, title: &str, dest_path: &str) {
@@ -7,7 +16,7 @@ pub fn send_move(cfg: &Config, title: &str, dest_path: &str) {
         "title": title,
         "output_path": dest_path,
     });
-    fire(cfg, &payload);
+    fire(cfg, &payload, WebhookEvent::Move);
 }
 
 /// Payload for a `rip_complete` webhook notification. String fields are
@@ -60,7 +69,7 @@ pub fn send_rich(cfg: &Config, ev: &RipEvent) {
         "lost_video_secs": (ev.lost_video_secs * crate::util::MILLIS_PER_SEC).round()
             / crate::util::MILLIS_PER_SEC,
     });
-    fire(cfg, &payload);
+    fire(cfg, &payload, WebhookEvent::Rip);
 }
 
 /// Return only the `scheme://host[:port]` portion of `url`, dropping any
@@ -99,14 +108,22 @@ pub(crate) fn webhook_url_origin(url: &str) -> String {
     "<redacted>".to_string()
 }
 
-/// Return only the non-blank webhook URLs, in order. Pulled out of [`fire`]
-/// as a pure, directly-testable predicate — a blank/whitespace-only entry
-/// (e.g. an unconfigured slot in the settings array) must never be treated
-/// as a real destination to dispatch.
-pub(crate) fn active_urls(urls: &[String]) -> Vec<String> {
-    urls.iter()
+/// Return the non-blank webhook URLs that opted in to `event`, in order.
+/// Pulled out of [`fire`] as a pure, directly-testable predicate — a
+/// blank/whitespace-only entry (e.g. an unconfigured slot in the settings
+/// array) must never be treated as a real destination to dispatch, and an
+/// entry whose `post_rip`/`post_move` flag is false for this event is
+/// deliberately skipped so a "move only" hook never receives a rip payload
+/// (and vice versa).
+pub(crate) fn active_urls(entries: &[WebhookEntry], event: WebhookEvent) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| match event {
+            WebhookEvent::Rip => e.post_rip,
+            WebhookEvent::Move => e.post_move,
+        })
+        .map(|e| e.url.clone())
         .filter(|u| !u.trim().is_empty())
-        .cloned()
         .collect()
 }
 
@@ -150,8 +167,8 @@ impl Drop for InflightGuard {
     }
 }
 
-fn fire(cfg: &Config, payload: &serde_json::Value) {
-    let urls = active_urls(&cfg.webhook_urls);
+fn fire(cfg: &Config, payload: &serde_json::Value, event: WebhookEvent) {
+    let urls = active_urls(&cfg.webhook_urls, event);
     if urls.is_empty() {
         return;
     }
@@ -577,29 +594,92 @@ mod tests {
         assert!(!origin.contains('@'));
     }
 
+    /// Build a "fires on both events" entry — the common case and the
+    /// pre-1.6.7 default — so these tests read as tersely as the old
+    /// bare-string vectors they replaced.
+    fn both(url: &str) -> WebhookEntry {
+        WebhookEntry {
+            url: url.to_string(),
+            post_rip: true,
+            post_move: true,
+        }
+    }
+
     #[test]
     fn active_urls_filters_blank_and_whitespace_entries() {
-        let urls = vec![
-            "".to_string(),
-            "   ".to_string(),
-            "https://real.example/hook".to_string(),
-            "\t\n".to_string(),
-            "https://second.example/hook".to_string(),
+        let entries = vec![
+            both(""),
+            both("   "),
+            both("https://real.example/hook"),
+            both("\t\n"),
+            both("https://second.example/hook"),
         ];
-        let filtered = active_urls(&urls);
-        assert_eq!(
-            filtered,
-            vec![
-                "https://real.example/hook".to_string(),
-                "https://second.example/hook".to_string(),
-            ]
-        );
+        // Blank filtering is independent of the event.
+        for event in [WebhookEvent::Rip, WebhookEvent::Move] {
+            assert_eq!(
+                active_urls(&entries, event),
+                vec![
+                    "https://real.example/hook".to_string(),
+                    "https://second.example/hook".to_string(),
+                ]
+            );
+        }
     }
 
     #[test]
     fn active_urls_all_blank_yields_empty() {
-        let urls = vec!["".to_string(), "  ".to_string()];
-        assert!(active_urls(&urls).is_empty());
+        let entries = vec![both(""), both("  ")];
+        assert!(active_urls(&entries, WebhookEvent::Rip).is_empty());
+        assert!(active_urls(&entries, WebhookEvent::Move).is_empty());
+    }
+
+    /// Per-event opt-in is the whole point of the flags: a rip-only hook must
+    /// never appear in the move dispatch list, and vice versa, while a
+    /// both-events hook appears in both.
+    #[test]
+    fn active_urls_selects_by_event_flag() {
+        let entries = vec![
+            WebhookEntry {
+                url: "https://rip-only.example/hook".to_string(),
+                post_rip: true,
+                post_move: false,
+            },
+            WebhookEntry {
+                url: "https://move-only.example/hook".to_string(),
+                post_rip: false,
+                post_move: true,
+            },
+            both("https://both.example/hook"),
+        ];
+
+        assert_eq!(
+            active_urls(&entries, WebhookEvent::Rip),
+            vec![
+                "https://rip-only.example/hook".to_string(),
+                "https://both.example/hook".to_string(),
+            ]
+        );
+        assert_eq!(
+            active_urls(&entries, WebhookEvent::Move),
+            vec![
+                "https://move-only.example/hook".to_string(),
+                "https://both.example/hook".to_string(),
+            ]
+        );
+    }
+
+    /// A hook that opted OUT of both events is inert — it never dispatches,
+    /// even though its URL is non-blank. (The UI defaults new hooks to both
+    /// checked, but a raw config could carry this.)
+    #[test]
+    fn active_urls_entry_opted_out_of_both_never_fires() {
+        let entries = vec![WebhookEntry {
+            url: "https://silent.example/hook".to_string(),
+            post_rip: false,
+            post_move: false,
+        }];
+        assert!(active_urls(&entries, WebhookEvent::Rip).is_empty());
+        assert!(active_urls(&entries, WebhookEvent::Move).is_empty());
     }
 
     /// Drives `try_acquire_slot`/`release_slot` directly against a private

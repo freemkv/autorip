@@ -4,11 +4,21 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
-/// Move progress — separate from device/rip state.
-/// Read by the System page's renderMoves() via SSE.
+/// Progress for ONE artifact being moved (e.g. the `.mkv` movie, or its
+/// companion `.iso`). Read by the System page's renderMoves() via SSE.
+///
+/// A single completed rip can move more than one artifact from one staging
+/// dir — a movie file and, when `keep_iso` is on, its ISO — so [`MOVE_STATE`]
+/// holds a Vec of these, one per planned file, and the UI draws one progress
+/// bar per entry (`X-Men: Apocalypse (mkv)` and `X-Men: Apocalypse (iso)`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MoveState {
+    /// The title (raw TMDB title, unsanitized — e.g. `X-Men: Apocalypse`).
     pub name: String,
+    /// Which artifact this bar tracks: `"iso"`, `"mkv"`, `"m2ts"`, … — derived
+    /// from the source file extension. Empty if unknown. The UI labels the bar
+    /// `"{name} ({artifact})"`.
+    pub artifact: String,
     pub progress_pct: u8,
     pub progress_gb: f64,
     pub total_gb: f64,
@@ -16,29 +26,73 @@ pub struct MoveState {
     pub eta: String,
 }
 
-pub static MOVE_STATE: once_cell::sync::Lazy<Mutex<Option<MoveState>>> =
+/// Live per-artifact move bars for the staging dir currently being moved.
+/// Empty when nothing is moving. One entry per planned file, in move order;
+/// because moves within a dir are sequential, at any instant one entry climbs
+/// while later ones sit at 0% and earlier ones read 100%.
+pub static MOVE_STATE: once_cell::sync::Lazy<Mutex<Vec<MoveState>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(Vec::new()));
+
+/// The on-disk basename of the staging dir currently being moved, or `None`.
+/// The Move queue (`build_queue_views`) scans for `.done` markers, and the
+/// actively-moving dir still carries its `.done` for the duration of the copy —
+/// so without this it would appear BOTH as its live progress bars (`_move`) and
+/// as a "(moving)" queue row (`_move_queue`), i.e. listed twice. The queue scan
+/// reads this and skips the active dir, so the exclusion is by exact on-disk
+/// name (robust to any title punctuation the filesystem sanitizer drops) rather
+/// than a fragile client-side string match.
+pub static ACTIVE_MOVE_DIR: once_cell::sync::Lazy<Mutex<Option<String>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
-/// Clears [`MOVE_STATE`] when the per-directory pass leaves scope, **by any
-/// path**: normal completion, one of the four failure `continue`s, or an
-/// unwind.
+/// Serializes tests that mutate/observe the process-global move statics
+/// (`MOVE_STATE`, `ACTIVE_MOVE_DIR`, `MOVE_ERRORS`). `pub(crate)` and
+/// crate-level (not nested in a `tests` module) so tests in BOTH this module
+/// and `web.rs` (which reads `ACTIVE_MOVE_DIR` in `build_queue_views`) lock the
+/// SAME mutex and cannot race each other. `#[cfg(test)]` keeps it out of the
+/// shipping binary (where nothing references it).
+#[cfg(test)]
+pub(crate) static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Clears [`MOVE_STATE`] and [`ACTIVE_MOVE_DIR`] when the per-directory pass
+/// leaves scope, **by any path**: normal completion, one of the four failure
+/// `continue`s, or an unwind.
 ///
 /// The clear used to be the last statement of the loop body. Every failure
 /// branch (`any_collision`, `any_size_mismatch`, `any_post_copy_invalid`,
-/// `any_failed`) `continue`s past it, and the progress bar had already been
+/// `any_failed`) `continue`s past it, and the progress bars had already been
 /// published by the copy's `on_progress` callback — so a blocked delivery
-/// left "60%, ETA 1:23" on the System page forever. Nothing else writes
-/// `None`: the only other writer is `on_progress` itself, and it only ever
-/// writes `Some`. An RAII guard is used rather than a clear on each branch
-/// so a new early exit cannot reintroduce the leak.
+/// left "60%, ETA 1:23" on the System page forever. An RAII guard is used
+/// rather than a clear on each branch so a new early exit cannot reintroduce
+/// the leak.
 struct MoveStateGuard;
+
+impl MoveStateGuard {
+    /// Arm the guard and mark `dir_basename` as the actively-moving staging dir
+    /// (so the Move queue excludes it). The returned guard clears both statics
+    /// on drop.
+    fn arm(dir_basename: String) -> Self {
+        *ACTIVE_MOVE_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir_basename);
+        MoveStateGuard
+    }
+}
 
 impl Drop for MoveStateGuard {
     fn drop(&mut self) {
         // Recover-and-proceed on poison: skipping the clear is exactly the
         // stuck-bar-for-the-process-lifetime failure this guard prevents.
-        *MOVE_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        MOVE_STATE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *ACTIVE_MOVE_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
+}
+
+/// The artifact tag for a source file, from its extension: `"iso"`, `"mkv"`,
+/// `"m2ts"`, `"mk3d"`, …. Empty when there is no extension. Used to label each
+/// per-artifact move bar so the operator can tell the movie file from its
+/// companion ISO.
+fn artifact_label(src: &Path) -> String {
+    src.extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// Per-staging-dir error surfaced to the System page so the user can act
@@ -923,8 +977,15 @@ fn check_and_move(cfg: &Config) {
         // From here on the pass can publish move progress, and can leave by
         // four different `continue`s. Arm the RAII clear before the first of
         // them. (Placed after the not-ready skips above, which return before
-        // any progress is published.)
-        let _move_state = MoveStateGuard;
+        // any progress is published.) Arming also marks this dir's on-disk
+        // basename as the actively-moving one so the Move queue excludes it
+        // (it still carries `.done` throughout the copy).
+        let active_dir_name = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let _move_state = MoveStateGuard::arm(active_dir_name);
 
         // Build destination paths
         let mut planned_moves: Vec<(std::path::PathBuf, String)> = Vec::new();
@@ -1072,53 +1133,52 @@ fn check_and_move(cfg: &Config) {
             continue;
         }
 
-        // Move files. Progress is reported as ONE aggregate bar across ALL files
-        // in this move (MKV + companion ISO when keep_iso), not per-file — so a
-        // 2-file move shows a single 0→100% (the MKV filling e.g. 0→45%, the ISO
-        // 45→100% by byte share), never two separate 0→100% runs. `total_all_gb`
-        // is the byte sum of every planned source; `moved_base_gb` accumulates the
-        // fully-moved prior files so each file's per-file progress is offset onto
-        // the aggregate.
-        let total_all_gb: f64 = planned_moves
-            .iter()
-            .map(|(src, _)| {
-                fresh_metadata(src).map(|m| m.len()).unwrap_or(0) as f64
-                    / crate::util::BYTES_PER_GIB
-            })
-            .sum();
-        let mut moved_base_gb: f64 = 0.0;
+        // Move files. Each artifact (the movie file and, with keep_iso, its
+        // companion ISO) gets its OWN progress bar — one 0→100% per file,
+        // labelled by artifact type ("X-Men: Apocalypse (mkv)" /
+        // "X-Men: Apocalypse (iso)") — rather than one aggregate bar across all
+        // of them. Moves within a dir are sequential, so at any instant one bar
+        // climbs while later ones sit at 0% and completed ones read 100%.
+        //
+        // Seed one MOVE_STATE entry per planned file up front (all at 0%,
+        // carrying each file's own size) so every bar appears immediately; then
+        // each file's on_progress updates its OWN entry, by index.
+        {
+            let seeded: Vec<MoveState> = planned_moves
+                .iter()
+                .map(|(src, _)| MoveState {
+                    name: display_name.clone(),
+                    artifact: artifact_label(src),
+                    progress_pct: 0,
+                    progress_gb: 0.0,
+                    total_gb: fresh_metadata(src).map(|m| m.len()).unwrap_or(0) as f64
+                        / crate::util::BYTES_PER_GIB,
+                    speed_mbs: 0.0,
+                    eta: String::new(),
+                })
+                .collect();
+            *MOVE_STATE.lock().unwrap_or_else(|e| e.into_inner()) = seeded;
+        }
         let mut outcomes: Vec<MoveOutcome> = Vec::new();
         let mut announced_moving = false;
-        for (src, dest) in &planned_moves {
-            let name_for_progress = display_name.clone();
-            let src_size_gb = fresh_metadata(src).map(|m| m.len()).unwrap_or(0) as f64
-                / crate::util::BYTES_PER_GIB;
-            let base_gb = moved_base_gb;
-            let on_progress = move |_pct: u8, gb: f64, _total_gb: f64, speed: f64| {
-                // Fold the per-file (gb / total_gb) into the whole-move aggregate.
-                let agg_gb = base_gb + gb;
-                let agg_pct = if total_all_gb > 0.0 {
-                    ((agg_gb / total_all_gb) * 100.0).clamp(0.0, 100.0) as u8
-                } else {
-                    _pct
-                };
-                let eta = if speed > 1.0 && total_all_gb > agg_gb {
-                    let secs = ((total_all_gb - agg_gb) * 1024.0 / speed) as u32;
-                    let m = secs / 60;
-                    let s = secs % 60;
-                    format!("{}:{:02}", m, s)
+        for (i, (src, dest)) in planned_moves.iter().enumerate() {
+            let on_progress = move |pct: u8, gb: f64, total_gb: f64, speed: f64| {
+                // Per-file ETA from THIS file's own remaining bytes (not an
+                // aggregate) — the bar and its ETA describe one artifact.
+                let eta = if speed > 1.0 && total_gb > gb {
+                    let secs = ((total_gb - gb) * 1024.0 / speed) as u32;
+                    format!("{}:{:02}", secs / 60, secs % 60)
                 } else {
                     String::new()
                 };
-                if let Ok(mut ms) = MOVE_STATE.lock() {
-                    *ms = Some(MoveState {
-                        name: name_for_progress.clone(),
-                        progress_pct: agg_pct,
-                        progress_gb: agg_gb,
-                        total_gb: total_all_gb,
-                        speed_mbs: speed,
-                        eta,
-                    });
+                if let Ok(mut ms) = MOVE_STATE.lock()
+                    && let Some(entry) = ms.get_mut(i)
+                {
+                    entry.progress_pct = pct;
+                    entry.progress_gb = gb;
+                    entry.total_gb = total_gb;
+                    entry.speed_mbs = speed;
+                    entry.eta = eta;
                 }
             };
             // Overwrite guard: never clobber an existing destination that is
@@ -1215,9 +1275,22 @@ fn check_and_move(cfg: &Config) {
             }
             let outcome = move_file(src, Path::new(dest), &on_progress);
             outcomes.push(outcome);
-            // Advance the aggregate base so the NEXT file's progress continues
-            // from where this one ended (one bar across all files, not a reset).
-            moved_base_gb += src_size_gb;
+            // Peg this artifact's bar to 100% on any successful outcome. A
+            // Skipped (idempotent re-move — already in the library) reports no
+            // progress at all, so without this its bar would sit at the 0% it
+            // was seeded with; Moved/MovedDirty may have stopped a tick short of
+            // 100. Failed/Collision leave the bar where it stalled.
+            if matches!(
+                outcome,
+                MoveOutcome::Moved | MoveOutcome::MovedDirty | MoveOutcome::Skipped
+            ) && let Ok(mut ms) = MOVE_STATE.lock()
+                && let Some(entry) = ms.get_mut(i)
+            {
+                entry.progress_pct = 100;
+                entry.progress_gb = entry.total_gb;
+                entry.speed_mbs = 0.0;
+                entry.eta = String::new();
+            }
             match outcome {
                 MoveOutcome::Collision => {}
                 MoveOutcome::Skipped => {
@@ -2274,8 +2347,22 @@ mod tests {
     /// that clear it wholesale) serialize on this so a parallel test thread
     /// can't wipe or observe another's entries mid-assertion.
     fn errors_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        // The one shared lock (see `TEST_STATE_LOCK`) so web.rs's queue-view
+        // test, which also mutates ACTIVE_MOVE_DIR, serializes against these.
+        super::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn artifact_label_from_extension() {
+        assert_eq!(artifact_label(Path::new("/s/Title (2024).iso")), "iso");
+        assert_eq!(artifact_label(Path::new("/s/Title (2024).mkv")), "mkv");
+        assert_eq!(artifact_label(Path::new("/s/Title (2024).m2ts")), "m2ts");
+        // Case-folded so the label is stable regardless of on-disk casing.
+        assert_eq!(artifact_label(Path::new("/s/Title.MKV")), "mkv");
+        // No extension → empty (the UI then omits the "(…)" suffix).
+        assert_eq!(artifact_label(Path::new("/s/Title")), "");
     }
 
     /// Read one `MOVE_ERRORS` entry and release the lock immediately, so a
@@ -4496,15 +4583,16 @@ mod tests {
         )
         .unwrap();
 
-        // The bar an earlier dir's copy left published.
-        *MOVE_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(MoveState {
+        // The bars an earlier dir's copy left published.
+        *MOVE_STATE.lock().unwrap_or_else(|e| e.into_inner()) = vec![MoveState {
             name: "MoveBarDisc".to_string(),
+            artifact: "mkv".to_string(),
             progress_pct: 60,
             progress_gb: 1.2,
             total_gb: 2.0,
             speed_mbs: 30.0,
             eta: "1:23".to_string(),
-        });
+        }];
 
         check_and_move(&cfg);
 
@@ -4523,12 +4611,23 @@ mod tests {
         let bar = MOVE_STATE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        // The active-move marker must be cleared too, so the Move queue no
+        // longer excludes this dir once the pass has ended.
+        let active_cleared = crate::mover::ACTIVE_MOVE_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .is_none();
         clear_error(&key);
         assert!(
             bar,
-            "a blocked pass must clear the move progress bar, not leave a \
+            "a blocked pass must clear the move progress bars, not leave a \
              stale one on the System page forever"
+        );
+        assert!(
+            active_cleared,
+            "a blocked pass must clear ACTIVE_MOVE_DIR so the Move queue stops \
+             excluding the dir"
         );
     }
 
