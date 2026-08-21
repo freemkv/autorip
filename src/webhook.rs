@@ -174,25 +174,14 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
         .spawn(move || {
             let _guard = guard;
             for url in &urls {
-                // SSRF guard at fire time (defence-in-depth; the URL is also
-                // validated at store time in handle_settings_post). Resolve +
-                // validate once and pin the connection to those IPs so DNS
-                // rebinding can't redirect this POST to an internal/metadata
-                // host, and so a permitted public URL can't 30x-redirect there
-                // either (guarded_agent uses redirects(0)).
-                let pinned = match crate::web::validate_fetch_url(url) {
-                    Ok(addrs) => addrs,
-                    Err(e) => {
-                        // Log only the origin — the path may contain a secret token.
-                        crate::log::syslog(&format!(
-                            "Webhook blocked {}: {}",
-                            webhook_url_origin(url),
-                            e
-                        ));
-                        continue;
-                    }
-                };
-                let _ = deliver(pinned, url, &body);
+                // Webhooks are deliberately NOT SSRF-guarded: a webhook is a
+                // blind notification POST with no response channel, and aiming
+                // one at a LAN service (Home Assistant, a NAS) is the intended
+                // use. Delivery goes through the un-pinned `web::webhook_agent`
+                // (default resolver, no private-address block); see its doc
+                // comment. `redirects(0)` is still set there, so `deliver`
+                // still refuses to count a 3xx as a delivery.
+                let _ = deliver(url, &body);
             }
         });
     if spawned.is_err() {
@@ -203,34 +192,34 @@ fn fire(cfg: &Config, payload: &serde_json::Value) {
     }
 }
 
-/// POST one payload to one already-validated URL.
+/// POST one payload to one URL.
 ///
-/// Split out of [`fire`] so it can be TESTED. `fire` resolves and validates
-/// every URL through `web::validate_fetch_url`, which rejects loopback by
-/// design, so no test can point `fire` itself at a local listener — and until
+/// Split out of [`fire`] so it can be TESTED against a loopback stub — until
 /// this seam existed, the only HTTP call in this module (the one carrying the
 /// user's rip-complete event) had no test at all. A mistake in it — a header
 /// that stopped being sent, a body that never reached the wire — would compile,
 /// pass every test, and be discovered by an operator whose Discord webhook
 /// silently stopped arriving.
 ///
-/// `pinned` is what validation resolved to, so this function never consults
-/// DNS: the connection goes to the address that was checked, which is also
-/// what makes it testable against a loopback stub.
-fn deliver(pinned: Vec<std::net::SocketAddr>, url: &str, body: &str) -> bool {
-    let agent = crate::web::guarded_agent(pinned);
+/// Uses `web::webhook_agent` (default resolver, redirects blocked, no SSRF
+/// pinning): a webhook is a blind notification POST and is intended to be
+/// able to reach LAN hosts. Tests drive it against a loopback stub by
+/// pointing the URL straight at the listener's `127.0.0.1:<port>` address,
+/// which the default resolver connects to directly.
+fn deliver(url: &str, body: &str) -> bool {
+    let agent = crate::web::webhook_agent();
     match agent
         .post(url)
         .header("Content-Type", "application/json")
         .send(body)
     {
-        // NOT every `Ok` is a delivery. `guarded_agent` sets
+        // NOT every `Ok` is a delivery. `webhook_agent` sets
         // `max_redirects(0)`, and at zero ureq's `max_redirects_do_error` is
-        // false, so a 3xx comes back as `Ok` rather than an error — and
-        // `validate_fetch_url` accepts `http://`, so an http webhook URL that
-        // its receiver redirects to https logged "Webhook sent" forever while
-        // nothing was ever delivered. A 4xx/5xx already arrives as `Err`; this
-        // closes the redirect gap and anything else non-2xx with it.
+        // false, so a 3xx comes back as `Ok` rather than an error — so an
+        // http webhook URL that its receiver redirects to https logged
+        // "Webhook sent" forever while nothing was ever delivered. A 4xx/5xx
+        // already arrives as `Err`; this closes the redirect gap and anything
+        // else non-2xx with it.
         Ok(r) if r.status().is_success() => {
             // Log only the origin — the path may contain a secret token.
             crate::log::syslog(&format!("Webhook sent to {}", webhook_url_origin(url)));
@@ -266,12 +255,11 @@ fn deliver(pinned: Vec<std::net::SocketAddr>, url: &str, body: &str) -> bool {
 mod tests {
     /// A redirect is NOT a delivery.
     ///
-    /// `guarded_agent` sets `max_redirects(0)`, and at zero ureq's
+    /// `webhook_agent` sets `max_redirects(0)`, and at zero ureq's
     /// `max_redirects_do_error` is false — so a 3xx comes back as `Ok`, and
-    /// `deliver` logged "Webhook sent". `validate_fetch_url` accepts
-    /// `http://`, so an http webhook URL whose receiver redirects to https
-    /// reported success forever while nothing was ever delivered, with nothing
-    /// in the log to say otherwise.
+    /// `deliver` logged "Webhook sent". An http webhook URL whose receiver
+    /// redirects to https reported success forever while nothing was ever
+    /// delivered, with nothing in the log to say otherwise.
     #[test]
     fn a_redirect_is_not_reported_as_a_delivered_webhook() {
         use std::io::{Read as _, Write as _};
@@ -314,8 +302,7 @@ mod tests {
         });
 
         let delivered = super::deliver(
-            vec![pinned],
-            "http://hooks.test/services/T000/B000/xxxx",
+            &format!("http://{pinned}/services/T000/B000/xxxx"),
             r#"{"event":"rip_complete"}"#,
         );
         assert!(
@@ -334,11 +321,12 @@ mod tests {
     /// test, and a mistake there — wrong header, a body that never reached the
     /// wire — compiles and passes everything.
     ///
-    /// Pinned at a loopback listener with an RFC 6761 `.test` host that cannot
-    /// resolve, the same technique `web::guarded_agent_connects_to_the_pinned_address_not_dns`
-    /// uses. Asserts the request line, the content type and the body, and
-    /// nothing else — header order and `User-Agent` are ureq's business and
-    /// would make this brittle across a version bump.
+    /// Driven against a loopback listener by pointing the webhook URL straight
+    /// at its `127.0.0.1:<port>` address, which the default resolver connects
+    /// to directly (webhook delivery is intentionally un-pinned). Asserts the
+    /// request line, the content type and the body, and nothing else — header
+    /// order and `User-Agent` are ureq's business and would make this brittle
+    /// across a version bump.
     #[test]
     fn deliver_posts_json_with_the_content_type_header() {
         use std::io::{Read as _, Write as _};
@@ -377,8 +365,7 @@ mod tests {
         });
 
         let delivered = super::deliver(
-            vec![pinned],
-            "http://hooks.test/services/T000/B000/xxxx",
+            &format!("http://{pinned}/services/T000/B000/xxxx"),
             r#"{"event":"rip_complete"}"#,
         );
         assert!(delivered, "a 204 is a delivery");
