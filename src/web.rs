@@ -2521,26 +2521,15 @@ pub(crate) fn ureq_error_kind(e: &ureq::Error) -> String {
 /// transfer without putting a ceiling on a slow-but-progressing one.
 pub(crate) const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-pub(crate) fn guarded_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
-    // ureq sets NO default connect/read timeout. Without one a peer that
-    // accepts the connection but never responds would block the caller's
-    // thread (and hold its socket) forever — for webhooks a fresh thread
-    // spawns on every move/rip-complete, so a dead receiver would leak
-    // threads and sockets without bound. Bound them alongside the SSRF
-    // pinning (resolver) and redirect block.
-    guarded_agent_with_timeouts(
-        pinned,
-        std::time::Duration::from_secs(5),
-        std::time::Duration::from_secs(30),
-        STALL_TIMEOUT,
-    )
-}
-
-/// [`guarded_agent`] with caller-chosen timeouts, for the key-service
-/// reachability probe — which wants to give up much sooner than a webhook or a
-/// keydb download. Identical hardening otherwise; kept as the ONE place the
-/// pinned agent is constructed so a second call site can't quietly drop the
-/// resolver.
+/// Build a DNS-pinned, redirect-blocking ureq agent with caller-chosen
+/// timeouts. The ONE place the pinned agent is constructed, so no call site
+/// can quietly drop the resolver.
+///
+/// ureq sets NO default connect/read timeout. Without one a peer that
+/// accepts the connection but never responds would block the caller's
+/// thread (and hold its socket) forever, so every caller must pass bounds.
+/// The key-service reachability probe wants to give up much sooner than a
+/// keydb download; the caller picks.
 ///
 /// `response` is NOT just a header timeout, despite ureq naming it
 /// `timeout_recv_response`. In ureq 3 the body read also checks its preceding
@@ -2570,6 +2559,32 @@ pub(crate) fn guarded_agent_with_timeouts(
         ureq::unversioned::transport::DefaultConnector::new(),
         PinnedResolver(pinned),
     )
+}
+
+/// Agent for webhook delivery — a plain outbound POST with the standard
+/// resolver, deliberately NOT SSRF-guarded.
+///
+/// Unlike `keydb_url` / `keyserver_url` / `network_target`, a webhook is a
+/// blind fire-and-forget notification: autorip POSTs a rip/move event and
+/// never reads the response body back to any caller, so there is no
+/// disc-key or plaintext-exfiltration channel to protect — and the
+/// operator who sets a webhook is on the same LAN as any host it targets.
+/// Aiming a webhook at a LAN service (Home Assistant, a NAS, an internal
+/// automation endpoint) is the *intended* use, which the pinned-resolver
+/// guard on the other URL classes actively prevents. So this agent uses
+/// the DEFAULT resolver (`new_with_config`) — no private-address block, no
+/// DNS pinning — while keeping the two properties that are about
+/// robustness rather than SSRF: bounded timeouts (a dead receiver must not
+/// wedge the per-delivery thread) and `max_redirects(0)` (a 3xx is not a
+/// delivery — see `webhook::deliver`).
+pub(crate) fn webhook_agent() -> ureq::Agent {
+    let config = ureq::config::Config::builder()
+        .max_redirects(0)
+        .timeout_connect(Some(std::time::Duration::from_secs(5)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_body(Some(STALL_TIMEOUT))
+        .build();
+    ureq::Agent::new_with_config(config)
 }
 
 /// SSRF-guarded HTTP GET. Runs [`validate_fetch_url`] (scheme + resolved-IP
@@ -4429,15 +4444,15 @@ mod web_tests {
 
     /// The tests above prove which addresses `validate_fetch_url` REJECTS.
     /// None of them makes a connection, so every one still passes if
-    /// `guarded_agent` ignores the pinned addresses and resolves through live
-    /// DNS instead — which is exactly how the rebinding TOCTOU gets back in,
-    /// with no visible symptom. This is the test that notices.
+    /// `guarded_agent_with_timeouts` ignores the pinned addresses and resolves
+    /// through live DNS instead — which is exactly how the rebinding TOCTOU
+    /// gets back in, with no visible symptom. This is the test that notices.
     ///
     /// Pin the agent at a loopback listener this test owns, then ask for a
     /// host that cannot resolve (`.test`, reserved by RFC 6761). Only a
     /// consulted resolver can turn that name into a connection. Touches no
-    /// network, and drives `guarded_agent` directly, since `guarded_get`'s
-    /// guard blocks loopback by design.
+    /// network, and drives `guarded_agent_with_timeouts` directly, since
+    /// `guarded_get`'s guard blocks loopback by design.
     #[test]
     fn guarded_agent_connects_to_the_pinned_address_not_dns() {
         use std::io::{Read as _, Write as _};
@@ -4466,9 +4481,14 @@ mod web_tests {
             head
         });
 
-        let sent = guarded_agent(vec![pinned])
-            .get("http://keydb-mirror.test/keydb.zip")
-            .call();
+        let sent = guarded_agent_with_timeouts(
+            vec![pinned],
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
+            STALL_TIMEOUT,
+        )
+        .get("http://keydb-mirror.test/keydb.zip")
+        .call();
 
         rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
             "guarded_agent never connected to the pinned address — the custom \
@@ -6484,32 +6504,14 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             );
         }
     }
-    if let Some(arr) = patch.get("webhook_urls").and_then(|v| v.as_array()) {
-        // SSRF guard: webhook.rs fire() POSTs each of these to deliver
-        // rip/move events. Validate every one at store time so a LAN client
-        // can't make autorip beacon to internal/metadata hosts. A sentinel
-        // entry is a redacted "unchanged" placeholder (resolved to the
-        // stored URL just below, still before the write guard), so skip it
-        // here — the stored value was already validated when it was first
-        // saved.
-        for u in arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty() && !is_masked_webhook(s))
-        {
-            if let Err(e) = validate_fetch_url(u) {
-                return json_response(
-                    request,
-                    400,
-                    &serde_json::json!({
-                        "ok": false,
-                        "error": format!("webhook URL rejected: {e}")
-                    })
-                    .to_string(),
-                );
-            }
-        }
-    }
+    // NOTE: webhook_urls are intentionally NOT SSRF-validated here (unlike
+    // keydb_url / keyserver_url / network_target above). A webhook is a
+    // blind fire-and-forget notification with no response channel, and
+    // pointing one at a LAN service (Home Assistant, a NAS) is the intended
+    // use — the private-address guard only got in the way of that. Delivery
+    // uses the un-pinned `web::webhook_agent`; see its doc comment for the
+    // full rationale.
+    //
     // Resolve masked webhook_urls placeholders BEFORE the write guard, same
     // trust-boundary rationale as `port` below: resolve_webhook_urls used to
     // run INSIDE cfg.write(), so an ambiguous/orphaned masked entry returned
