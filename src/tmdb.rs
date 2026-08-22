@@ -842,6 +842,98 @@ fn runtime_plausible(secs: f64, ep_min: u16) -> bool {
     (title_min - ep_min as f64).abs() <= tol
 }
 
+/// Choose the starting episode number for a disc by aligning its title runtimes
+/// against the TMDB season's episode runtimes, instead of *counting* an offset.
+///
+/// A multi-disc season never tells a single disc how many episodes the *earlier*
+/// discs held, so a disc can't count where it starts. The caller's uniform-split
+/// guess (`fallback = (disc-1)*count + 1`) is right for the common even boxset
+/// but wrong when discs carry different episode counts (e.g. 6 + 4), which
+/// collides disc 2's numbers with disc 1's.
+///
+/// This finds the offset rather than counting it: slide this disc's runtime
+/// sequence along the season's episode runtimes and pick the start whose
+/// runtimes fit best. A disc holding *any* distinctively-timed episode (a
+/// double-length finale, a short clip show) is pinned to its true position
+/// regardless of disc order or how the earlier discs split. When the runtimes
+/// carry no distinguishing signal — every episode ~the same length, so every
+/// offset fits equally — the result ties and we return `fallback`, which is
+/// exactly the case (a uniform season) where the uniform-split guess is right.
+///
+/// Deliberately conservative: it returns `fallback` on any absence of signal
+/// (no episodes, no known runtimes, a disc that can't fit the season, or a
+/// tie), so it never numbers *worse* than today — it only ever repairs a case
+/// today gets wrong. Its known soft spot is partial TMDB runtime data (some
+/// episodes known, some not); that path is scored on the average per-pair
+/// distance and is the first thing to revisit if this misbehaves — the whole
+/// function is pure and isolated so a future fix stays local.
+///
+/// `title_secs` are this disc's selected episode runtimes (seconds), in disc
+/// order. `episodes` is the TMDB season listing, any order. `fallback` is the
+/// start the caller would otherwise use.
+pub fn align_disc_offset(title_secs: &[f64], episodes: &[Episode], fallback: u16) -> u16 {
+    let count = title_secs.len();
+    if count == 0 || episodes.is_empty() {
+        return fallback;
+    }
+    // The disc has to fit inside the season's episode numbering, or there is no
+    // honest position to align to.
+    let min_ep = episodes.iter().map(|e| e.number).min().unwrap_or(1).max(1);
+    let max_ep = episodes.iter().map(|e| e.number).max().unwrap_or(0);
+    let Some(last_start) = max_ep.checked_sub(count as u16 - 1) else {
+        return fallback;
+    };
+    if last_start < min_ep {
+        return fallback;
+    }
+    let runtime_of = |n: u16| {
+        episodes
+            .iter()
+            .find(|e| e.number == n)
+            .map(|e| e.runtime_min)
+    };
+
+    // Best = smallest average runtime distance over the pairs that actually have
+    // a runtime to compare; ties break toward `fallback`. An offset with no
+    // comparable pair contributes no evidence and is skipped, so a season with
+    // no runtime data leaves `best_signal == 0` → `fallback`.
+    let mut best_start = fallback;
+    let mut best_avg = f64::INFINITY;
+    let mut best_signal = 0u32;
+    for start in min_ep..=last_start {
+        let mut dist = 0.0f64;
+        let mut signal = 0u32;
+        for (i, &secs) in title_secs.iter().enumerate() {
+            if secs <= 0.0 {
+                continue;
+            }
+            if let Some(ep_min) = runtime_of(start + i as u16)
+                && ep_min > 0
+            {
+                dist += (secs / 60.0 - ep_min as f64).abs();
+                signal += 1;
+            }
+        }
+        if signal == 0 {
+            continue;
+        }
+        let avg = dist / signal as f64;
+        let closer =
+            (start as i32 - fallback as i32).abs() < (best_start as i32 - fallback as i32).abs();
+        let better =
+            best_signal == 0 || avg < best_avg - 1e-9 || ((avg - best_avg).abs() <= 1e-9 && closer);
+        if better {
+            best_start = start;
+            best_avg = avg;
+            best_signal = signal;
+        }
+    }
+    if best_signal == 0 {
+        return fallback;
+    }
+    best_start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1552,6 +1644,79 @@ mod tests {
         assert!(runtime_plausible(46.0 * 60.0, 45)); // within tolerance
         assert!(runtime_plausible(60.0 * 60.0, 0)); // unknown ep runtime never rejects
         assert!(!runtime_plausible(180.0 * 60.0, 45)); // play-all vs episode
+    }
+
+    // A season whose episodes each run `mins[i]` minutes, numbered from 1.
+    fn season(mins: &[u16]) -> Vec<Episode> {
+        mins.iter()
+            .enumerate()
+            .map(|(i, &m)| Episode {
+                number: (i + 1) as u16,
+                name: format!("E{:02}", i + 1),
+                runtime_min: m,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn align_repairs_uneven_split_via_distinctive_finale() {
+        // 10-ep season, 90-min finale (E10). Disc 1 held 6 (E01–06), disc 2 the
+        // remaining 4 (E07–10). The uniform-split guess for disc 2 is
+        // (2-1)*4 + 1 = 5, which is WRONG — the alignment must pin it to 7 by
+        // matching the 90-min finale to E10.
+        let eps = season(&[45, 45, 45, 45, 45, 45, 45, 45, 45, 90]);
+        let disc2 = [45.0 * 60.0, 45.0 * 60.0, 45.0 * 60.0, 90.0 * 60.0];
+        assert_eq!(align_disc_offset(&disc2, &eps, 5), 7);
+    }
+
+    #[test]
+    fn align_falls_back_when_runtimes_are_uniform() {
+        // No distinguishing signal: every episode ~45 min. Every offset fits
+        // equally, so the tie must resolve to the caller's fallback (which is the
+        // correct answer for a genuinely uniform-split season anyway).
+        let eps = season(&[45, 45, 45, 45, 45, 45, 45, 45, 45, 45]);
+        let disc2 = [45.0 * 60.0, 45.0 * 60.0, 45.0 * 60.0, 45.0 * 60.0];
+        assert_eq!(align_disc_offset(&disc2, &eps, 5), 5);
+    }
+
+    #[test]
+    fn align_returns_fallback_without_tmdb_data() {
+        // No episode list at all → nothing to align against → fallback verbatim.
+        assert_eq!(align_disc_offset(&[2700.0, 2700.0], &[], 5), 5);
+        // Episodes present but all runtimes unknown (0) → no signal → fallback.
+        let eps = season(&[0, 0, 0, 0, 0, 0]);
+        assert_eq!(align_disc_offset(&[2700.0, 2700.0], &eps, 3), 3);
+    }
+
+    #[test]
+    fn align_pins_first_disc_from_a_distinctive_pilot() {
+        // Feature-length pilot (E01, 75 min), the rest 45. Disc 1's fallback is 1
+        // and alignment agrees; a stray guess of 3 would still be corrected to 1.
+        let eps = season(&[75, 45, 45, 45, 45, 45]);
+        let disc1 = [75.0 * 60.0, 45.0 * 60.0, 45.0 * 60.0];
+        assert_eq!(align_disc_offset(&disc1, &eps, 1), 1);
+        assert_eq!(align_disc_offset(&disc1, &eps, 3), 1);
+    }
+
+    #[test]
+    fn align_returns_fallback_when_disc_cannot_fit_the_season() {
+        // A 4-title disc against a 3-episode season can't align honestly.
+        let eps = season(&[45, 45, 45]);
+        let disc = [2700.0, 2700.0, 2700.0, 2700.0];
+        assert_eq!(align_disc_offset(&disc, &eps, 1), 1);
+    }
+
+    #[test]
+    fn align_tie_breaks_to_the_fallback_not_the_lowest_number() {
+        // Two equally-good positions for a distinctive pair (a 45/60 shape that
+        // repeats): the one nearest the fallback must win, so a disc-2 guess is
+        // not yanked back to the season's start.
+        let eps = season(&[45, 60, 45, 60, 45, 60]);
+        let disc = [45.0 * 60.0, 60.0 * 60.0];
+        // Fallback 3 sits on the [45,60] at E03/E04 — keep it there.
+        assert_eq!(align_disc_offset(&disc, &eps, 3), 3);
+        // Fallback 1 sits on E01/E02 — keep it there.
+        assert_eq!(align_disc_offset(&disc, &eps, 1), 1);
     }
 
     #[test]
