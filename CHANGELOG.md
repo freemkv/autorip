@@ -4,6 +4,12 @@
 
 ### Added
 
+- **Manual Rename.** The title editor (the disc card's *change* and the
+  needs-review picker) now has a **Manual Rename** button beside *Search TMDB*:
+  type any exact name and file under it, no TMDB pick required. This handles a
+  variant TMDB doesn't list as its own entry — e.g. ripping *Deadpool 2 (Super
+  Duper Cut)* alongside an already-ripped *Deadpool 2* without the two colliding.
+  A trailing `(YYYY)` in the text is taken as the year. The textbox is wider.
 - **Automatic per-episode TV ripping.** Insert a TV disc and every episode comes
   out as its own `Show S{NN}E{MM} - Name.mkv` under `TV/Show (Year)/Season NN/`,
   fully automatically — no operator step. The disc's whole-title list is clustered
@@ -38,6 +44,18 @@
 
 ### Fixed
 
+- **TV fan-out now delivers only durable episodes.** In the per-episode mux
+  loop, an episode that failed to mux or fsync is dropped (its partial file
+  deleted) and excluded from the hand-off, instead of being filed as complete —
+  a failed/undurable episode is never handed to the mover. The primary episode
+  already had this durability gate; the extras now match it.
+- **Multi-disc TV seasons no longer collide on episode numbers.** Disc 2 of a
+  season is numbered from where disc 1 left off (best-effort uniform split)
+  instead of restarting at E01, so its episodes don't overwrite disc 1's.
+- **A finished, not-yet-moved rip can no longer be re-muxed out from under the
+  mover** when `keep_iso` retained its ISO — a manual resume now treats a
+  completed staging dir as blocked (previously it could delete the delivered MKV
+  and re-mux it).
 - **TV rips no longer lose their season on the common (MKV) path.** The season and
   TMDB id only reached the ISO-output hand-off marker; the muxed-MKV completion
   paths dropped them, so every MKV TV rip silently filed under `Season 01`. With
