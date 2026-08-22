@@ -512,6 +512,198 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// Build a `state.json` in `Review` state with a few multi-episode
+    /// outputs, so the unified branches in `resolve` actually run (rather
+    /// than the legacy `.review`-file path).
+    fn write_review_state(dir: &Path, media_type: &str) {
+        use crate::ripper::staging::{DiscState, Output, StagingState};
+        std::fs::create_dir_all(dir).unwrap();
+        let mut st = DiscState::new(StagingState::Review);
+        st.title = "Guess".into();
+        st.media_type = media_type.into();
+        st.season = Some(5);
+        st.outputs = vec![
+            Output {
+                filename: "ep1.mkv".into(),
+                title_index: 0,
+                episode: Some(1),
+                episode_name: String::new(),
+                moved: false,
+            },
+            Output {
+                filename: "ep2.mkv".into(),
+                title_index: 1,
+                episode: Some(2),
+                episode_name: String::new(),
+                moved: false,
+            },
+            Output {
+                filename: "ep3.mkv".into(),
+                title_index: 2,
+                episode: Some(3),
+                episode_name: String::new(),
+                moved: false,
+            },
+        ];
+        crate::ripper::staging::write_state(dir, &st);
+    }
+
+    #[test]
+    fn unified_proceed_transitions_review_to_done() {
+        use crate::ripper::staging::{StagingState, read_state};
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-unified-proceed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let held = tmp.join("Show S05");
+        write_review_state(&held, "tv");
+
+        // Confirm we're really exercising the unified (state.json) branch.
+        let before = read_state(&held).expect("state.json must exist before resolve");
+        assert_eq!(before.state, StagingState::Review);
+        assert_eq!(before.outputs.len(), 3);
+
+        resolve(tmp.to_str().unwrap(), "Show S05", Resolve::Proceed).unwrap();
+
+        let after = read_state(&held).expect("state.json must survive Proceed");
+        assert_eq!(after.state, StagingState::Done);
+        assert!(after.title_confident);
+        assert_eq!(after.title, "Guess");
+        assert_eq!(after.season, Some(5));
+        assert_eq!(
+            after.outputs.len(),
+            3,
+            "multi-episode outputs must be preserved across Proceed"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn unified_retitle_sets_title_and_keeps_tv_media_type() {
+        use crate::ripper::staging::{StagingState, read_state};
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-unified-retitle-tv-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let held = tmp.join("Show S05");
+        write_review_state(&held, "tv");
+        assert!(read_state(&held).is_some(), "state.json must exist");
+
+        resolve(
+            tmp.to_str().unwrap(),
+            "Show S05",
+            Resolve::Retitle {
+                title: "Real Show".into(),
+                year: 2012,
+            },
+        )
+        .unwrap();
+
+        let after = read_state(&held).expect("state.json must survive Retitle");
+        assert_eq!(after.state, StagingState::Done);
+        assert_eq!(after.title, "Real Show");
+        assert_eq!(after.year, 2012);
+        assert_eq!(
+            after.media_type, "tv",
+            "a non-empty media_type must not be overwritten to movie"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn unified_retitle_defaults_empty_media_type_to_movie() {
+        use crate::ripper::staging::read_state;
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-unified-retitle-empty-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let held = tmp.join("Some Movie");
+        write_review_state(&held, "");
+        assert!(read_state(&held).is_some(), "state.json must exist");
+
+        resolve(
+            tmp.to_str().unwrap(),
+            "Some Movie",
+            Resolve::Retitle {
+                title: "Sample Movie".into(),
+                year: 2024,
+            },
+        )
+        .unwrap();
+
+        let after = read_state(&held).unwrap();
+        assert_eq!(after.media_type, "movie");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn unified_cancel_transitions_review_to_failed() {
+        use crate::ripper::staging::{StagingState, read_state};
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-unified-cancel-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let held = tmp.join("Show S05");
+        write_review_state(&held, "tv");
+        assert!(read_state(&held).is_some(), "state.json must exist");
+
+        resolve(tmp.to_str().unwrap(), "Show S05", Resolve::Cancel).unwrap();
+
+        let after = read_state(&held).expect("state.json must survive Cancel");
+        assert_eq!(after.state, StagingState::Failed);
+        assert_eq!(
+            after.failure_reason.as_deref(),
+            Some("cancelled by operator")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn unified_retitle_rejects_blank_title() {
+        use crate::ripper::staging::{StagingState, read_state};
+        let tmp = std::env::temp_dir().join(format!(
+            "autorip-review-unified-retitle-blank-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let held = tmp.join("Show S05");
+        write_review_state(&held, "tv");
+        assert!(read_state(&held).is_some(), "state.json must exist");
+
+        let err = resolve(
+            tmp.to_str().unwrap(),
+            "Show S05",
+            Resolve::Retitle {
+                title: "  ".into(),
+                year: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(!err.is_empty());
+
+        let after = read_state(&held).expect("state.json must still exist");
+        assert_eq!(
+            after.state,
+            StagingState::Review,
+            "a rejected retitle must not mutate the held state"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn retitle_preserves_non_movie_media_type() {
         let tmp =

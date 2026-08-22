@@ -893,6 +893,21 @@ function reviewSearch(idx){
   }).catch(()=>{if(box)box.textContent='search failed'});
 }
 function reviewPick(idx,j){const c=(_RC[idx]||[])[j]; if(c)reviewResolve(idx,'retitle',{title:c.title,year:c.year||0});}
+/* Manual entry: file under exactly the typed text (no TMDB pick needed). Lets
+   the operator disambiguate a variant TMDB doesn't list as its own entry —
+   e.g. "Deadpool 2 (Super Duper Cut)" alongside an already-ripped "Deadpool 2".
+   A trailing "(YYYY)" in the text is used as the year; otherwise the held
+   item's year is kept. */
+function reviewManual(idx){
+  const it=_REV[idx]; if(!it)return;
+  const raw=((document.getElementById('rvq-'+idx)||{}).value||'').trim();
+  if(!raw){alert('Type a name first');return}
+  const m=raw.match(/^(.*?)\s*\((\d{4})\)\s*$/);
+  const title=m?m[1].trim():raw;
+  const year=m?parseInt(m[2],10):(it.year||0);
+  if(!title){alert('Type a name first');return}
+  reviewResolve(idx,'retitle',{title:title,year:year});
+}
 function loadReview(){
   fetch('/api/review').then(r=>r.json()).then(items=>{
     const el=document.getElementById('review'); if(!el)return;
@@ -906,7 +921,8 @@ function loadReview(){
       h+='<div><strong>'+t+'</strong> <span style="color:var(--text3);font-size:.8rem">'+esc(it.reason||'')+'</span></div>';
       h+='<div style="color:var(--text3);font-size:.75rem">'+esc(it.file||'')+'</div>';
       h+='<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">';
-      h+='<input id="rvq-'+idx+'" placeholder="correct title…" value="'+esc(it.title||'')+'" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px">';
+      h+='<input id="rvq-'+idx+'" placeholder="type an exact name, or a search term…" value="'+esc(it.title||'')+'" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px;width:24rem;max-width:100%">';
+      h+='<button class="btn" onclick="reviewManual('+idx+')">Manual Rename</button>';
       h+='<button class="btn" onclick="reviewSearch('+idx+')">Search TMDB</button>';
       h+='<button class="btn" onclick="reviewResolve('+idx+',\'proceed\')">Proceed as-is</button>';
       h+='<button class="btn" onclick="if(confirm(\'Discard this rip?\'))reviewResolve('+idx+',\'cancel\')">Cancel</button>';
@@ -924,7 +940,7 @@ function titleEdit(dev){
   const el=document.getElementById('tedit-'+dev); if(!el)return;
   if(el.style.display!=='none'){el.style.display='none';return}
   el.style.display='block';
-  el.innerHTML='<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><input id="tq-'+dev+'" placeholder="search a different title…" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px"><button class="btn" onclick="titleSearch(\''+dev+'\')">Search TMDB</button></div><div id="tr-'+dev+'" style="margin-top:6px"></div>';
+  el.innerHTML='<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><input id="tq-'+dev+'" placeholder="type an exact name, or a search term…" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px;width:24rem;max-width:100%"><button class="btn" onclick="titleSearch(\''+dev+'\')">Search TMDB</button><button class="btn" onclick="titleManual(\''+dev+'\')">Manual Rename</button></div><div id="tr-'+dev+'" style="margin-top:6px"></div>';
   const i=document.getElementById('tq-'+dev); if(i)i.focus();
 }
 function titleSearch(dev){
@@ -940,6 +956,23 @@ function titlePick(dev,j){
   const c=(_TC[dev]||[])[j]; if(!c)return;
   fetch('/api/title/'+dev,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)})
     .then(r=>r.json()).then(()=>{const el=document.getElementById('tedit-'+dev);if(el)el.style.display='none';}).catch(()=>{});
+}
+/* Manual rename: file the active disc under exactly the typed text, no TMDB
+   pick — for a variant TMDB doesn't list separately (e.g. "Deadpool 2 (Super
+   Duper Cut)"). A trailing "(YYYY)" becomes the year; tmdb_id 0 marks it a
+   free-form override (handle_title_override already accepts this). */
+function titleManual(dev){
+  const i=document.getElementById('tq-'+dev); const raw=i?i.value.trim():'';
+  if(!raw){alert('Type a name first');return}
+  const m=raw.match(/^(.*?)\s*\((\d{4})\)\s*$/);
+  const title=m?m[1].trim():raw; const year=m?parseInt(m[2],10):0;
+  if(!title){alert('Type a name first');return}
+  fetch('/api/title/'+dev,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({title:title,year:year,media_type:'movie',tmdb_id:0})})
+    .then(r=>r.json().then(j=>({ok:r.ok,j:j})))
+    .then(({ok,j})=>{if(!ok||(j&&j.ok===false)){alert('Rename failed: '+((j&&j.error)||'server error'));return}
+      const el=document.getElementById('tedit-'+dev);if(el)el.style.display='none';})
+    .catch(()=>alert('Rename failed: could not reach the server'));
 }
 
 function updateKeydb(stId){
@@ -5811,6 +5844,91 @@ mod web_tests {
                 "a rejected accept-loss must leave the existing .failed marker intact"
             );
         }
+
+        #[test]
+        fn accept_loss_transition_reopens_aborted_dir() {
+            // Full-HTTP invocation of a *successful* handle_accept_loss races the
+            // real rip worker thread it spawns (spawn_rip_after_claim →
+            // ripper::handle_rip_request) against this test's own read of
+            // state.json, so there's no way to observe the transition
+            // deterministically that way — no existing test in this file drives
+            // a 200 accept-loss end to end for that reason. Instead this test
+            // drives the EXACT read-modify-write closure handle_accept_loss
+            // passes to `mutate_state_if_present` (see the block around
+            // `ripper::staging::write_accept_loss_marker(dir)` in
+            // `handle_accept_loss`), so a regression to the wrong StagingState
+            // variant, or a change that stops clearing failure_reason /
+            // restart_count, fails this test the same way it would fail the
+            // real handler.
+            use ripper::staging::{DiscState, StagingState, read_state, write_state};
+
+            // AbortedLoss + a recorded failure reason + a nonzero restart count
+            // — exactly what a real over-threshold abort leaves behind — must
+            // reopen to Ripped with both annotations cleared.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let aborted_dir = tmp.path().join("aborted");
+            std::fs::create_dir_all(&aborted_dir).unwrap();
+            let mut st = DiscState::new(StagingState::AbortedLoss);
+            st.failure_reason = Some("main movie: 42s lost over threshold".to_string());
+            st.restart_count = 2;
+            write_state(&aborted_dir, &st);
+
+            let mut aborted_after = read_state(&aborted_dir).unwrap();
+            accept_loss_closure_apply(&mut aborted_after);
+            write_state(&aborted_dir, &aborted_after);
+
+            let after = read_state(&aborted_dir).unwrap();
+            assert_eq!(
+                after.state,
+                StagingState::Ripped,
+                "an AbortedLoss dir must reopen to Ripped so the resume re-mux \
+                 (not the abort gate) picks it up"
+            );
+            assert_eq!(
+                after.failure_reason, None,
+                "accept-loss must clear the recorded failure reason"
+            );
+            assert_eq!(
+                after.restart_count, 0,
+                "accept-loss must reset the restart counter"
+            );
+
+            // A Done dir (already muxed, nothing to reopen) must NOT be pulled
+            // back into Ripped by the same closure — guards against a wrong
+            // match-arm regression that reopens every terminal state instead of
+            // just the abort/failed ones.
+            let done_dir = tmp.path().join("done");
+            std::fs::create_dir_all(&done_dir).unwrap();
+            let mut done_st = DiscState::new(StagingState::Done);
+            done_st.restart_count = 1;
+            write_state(&done_dir, &done_st);
+
+            let mut done_after = read_state(&done_dir).unwrap();
+            accept_loss_closure_apply(&mut done_after);
+            write_state(&done_dir, &done_after);
+            let done_after = read_state(&done_dir).unwrap();
+
+            assert_eq!(
+                done_after.state,
+                StagingState::Done,
+                "a Done dir must NOT be reopened by the accept-loss transition"
+            );
+        }
+
+        /// Standalone copy of the closure `handle_accept_loss` passes to
+        /// `ripper::staging::mutate_state_if_present` — kept as a free function
+        /// (rather than inlined per-call) so both branches of
+        /// `accept_loss_transition_reopens_aborted_dir` run the identical logic.
+        fn accept_loss_closure_apply(s: &mut ripper::staging::DiscState) {
+            if matches!(
+                s.state,
+                ripper::staging::StagingState::AbortedLoss | ripper::staging::StagingState::Failed
+            ) {
+                s.state = ripper::staging::StagingState::Ripped;
+            }
+            s.failure_reason = None;
+            s.restart_count = 0;
+        }
     }
 }
 
@@ -6339,9 +6457,11 @@ const QUEUE_DISPLAY_CAP: usize = 100;
 /// overflow count that always matches the displayed lists (one snapshot, no
 /// TOCTOU between count and list).
 ///
-/// Mutual exclusion is guaranteed by the markers themselves: the Move
-/// queue scans for `.done`, and `crate::muxer::pending_queue` (the Mux
-/// queue) skips any dir carrying `.done`/`.review`/`.muxing`/`.completed`/
+/// Mutual exclusion is guaranteed by the unified `state.json` itself: the Move
+/// queue selects dirs in `StagingState::Done` (legacy `.done` file as fallback),
+/// and `crate::muxer::pending_queue` (the Mux queue) skips any dir that is not a
+/// clean `Ripped` hand-off — i.e. muxing, terminal, or already handed to the
+/// mover (`.done`/`.review`/`.muxing`/`.completed`/
 /// `.failed`. So a given staging dir lands in at most one of the two lists.
 ///
 /// The Move queue additionally excludes the staging dir currently being moved

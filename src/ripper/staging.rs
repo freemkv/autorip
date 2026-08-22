@@ -1,24 +1,21 @@
-//! Staging-directory bookkeeping: free-space probe + marker files
-//! (`.done`, `.completed`, `.failed`, `.restart_count`).
+//! Staging-directory bookkeeping: free-space probe + the unified per-disc
+//! lifecycle state.
 //!
-//! Marker files live at the per-disc subdirectory level
-//! (`<staging_dir>/<disc_name>/<marker>`):
+//! Since 1.6.9 the per-disc lifecycle is ONE atomic `state.json` (a
+//! [`StagingState`] enum + data + an `outputs[]` plan), NOT the old marker
+//! FILES — see the "Unified per-disc state" section below, which is the source
+//! of truth. The old marker names (`.done`/`.completed`/`.failed`/`.ripped`/…)
+//! survive only as `StagingState` values, as the marker-name constants used by
+//! the one-time legacy-upgrade read-fallback, and in tests. Steady-state writes
+//! never create those files; they go through the `mark_*` / `write_*` /
+//! `mutate_state` transition helpers, each doing a single crash-atomic
+//! `tmp → fsync → rename → dir-fsync` rewrite of `state.json`.
 //!
-//! - `.done` — hand-off marker for the mover thread (set on successful
-//!   rip). The mover relocates the dir to its final destination.
-//! - `.completed` — process-level "this rip finished cleanly" marker.
-//!   Independent of `.done`; consumed by the 0.20.7 restart-loop
-//!   detector so the orchestrator can skip already-finished discs on
-//!   startup without depending on the mover's `.done` semantics.
-//! - `.failed` — `{"reason": "...", "timestamp": "..."}` written when
-//!   the restart-loop detector gives up on a disc after `RESTART_LIMIT`
-//!   process restarts. Surfaces in the UI as a "failed" status with
-//!   the reason in `last_error`.
-//! - `.restart_count` — single ASCII u64. Bumped on every startup that
-//!   sees partial state and no completion/failed marker; cleared on
-//!   either success (`.completed`) or terminal failure (`.failed`).
-//!   Three-strike gate against an infinite container restart loop
-//!   caused by a deterministic post-startup crash.
+//! Lifecycle at a glance: `Sweeping` (owned, sweeping) → `Ripped` (handed to the
+//! mux worker) → `Done`/`Review` (handed to the mover) → `Completed`; terminal
+//! `Failed`; resumable `AbortedLoss`. `muxing` / `accept_loss` / `restart_count`
+//! are orthogonal fields. `restart_count` is the three-strike gate against an
+//! infinite container restart loop from a deterministic post-startup crash.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -304,6 +301,32 @@ pub fn read_state(staging_disc_dir: &Path) -> Option<DiscState> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Like [`read_state`], but when the file EXISTS yet fails to parse, log a loud
+/// error before returning `None`. Used by the read-modify-write transition
+/// helpers, whose `unwrap_or_else(DiscState::new)` fallback would otherwise
+/// SILENTLY discard all accumulated data (title, season, `outputs[]`, …) if a
+/// present `state.json` were ever unreadable (external corruption / bit-rot —
+/// our own writes are atomic, so this is not reachable from a torn write). A
+/// legitimately absent file (the first write) logs nothing.
+fn read_state_or_warn_corrupt(staging_disc_dir: &Path) -> Option<DiscState> {
+    let p = state_path(staging_disc_dir);
+    let Ok(bytes) = std::fs::read(&p) else {
+        return None; // absent — the normal first-write case.
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(st) => Some(st),
+        Err(e) => {
+            tracing::error!(
+                path = %p.display(),
+                error = %e,
+                "state.json exists but is unparseable — a transition is starting from empty state, \
+                 which drops accumulated title/season/outputs metadata for this dir"
+            );
+            None
+        }
+    }
+}
+
 /// Durably (over)write `state.json` for a staging dir: one atomic
 /// `tmp → fsync → rename → dir-fsync`. Best-effort — logs on failure like the
 /// other marker writers, since callers are on paths with nothing useful to do
@@ -339,7 +362,8 @@ pub fn mutate_state(
     default_state: StagingState,
     f: impl FnOnce(&mut DiscState),
 ) {
-    let mut st = read_state(staging_disc_dir).unwrap_or_else(|| DiscState::new(default_state));
+    let mut st = read_state_or_warn_corrupt(staging_disc_dir)
+        .unwrap_or_else(|| DiscState::new(default_state));
     f(&mut st);
     write_state(staging_disc_dir, &st);
 }
@@ -919,7 +943,8 @@ pub fn mark_handoff(
     } else {
         StagingState::Review
     };
-    let mut st = read_state(staging_disc_dir).unwrap_or_else(|| DiscState::new(state));
+    let mut st =
+        read_state_or_warn_corrupt(staging_disc_dir).unwrap_or_else(|| DiscState::new(state));
     st.state = state;
     st.title_confident = title_confident;
     if st.date.is_empty() {
@@ -2376,6 +2401,130 @@ mod tests {
         // Data preserved for the operator/mover.
         assert!(disc.join("MyDisc.mkv").exists());
         assert_eq!(read_state(&disc).unwrap().state, StagingState::Review);
+    }
+
+    /// The legacy-upgrade path (`upgrade_legacy_to_state` /
+    /// `apply_legacy_handoff_body`) must fold every field of a real (non-empty)
+    /// `.done` body into the fresh `state.json`, AND remove the legacy `.done`
+    /// file so the reader's fallback can never contradict the unified store
+    /// afterwards. Earlier tests only ever wrote `b"{}"` bodies, so the
+    /// field-folding itself — and the "legacy file removed" invariant — were
+    /// untested.
+    #[test]
+    fn legacy_done_body_migrates_metadata_into_state() {
+        let root = tmpdir();
+        let disc = root.join("Endeavour_S5_D2");
+        fs::create_dir_all(&disc).unwrap();
+        let body = serde_json::json!({
+            "title": "Endeavour",
+            "disc_name": "ENDEAVOUR_S5_D2",
+            "format": "bluray",
+            "year": 2012,
+            "media_type": "tv",
+            "tmdb_id": 44264,
+            "season": 5,
+            "disc": 2,
+            "poster_url": "http://x/p.jpg",
+            "overview": "A young detective in 1960s Oxford.",
+            "date": "2026-08-22",
+        });
+        fs::write(disc.join(DONE_MARKER), body.to_string()).unwrap();
+
+        let snap = snapshot_staging_disc(&disc);
+        assert!(snap.is_some(), "a real .done body must still snapshot");
+
+        let st = read_state(&disc).expect("state.json must exist after migration");
+        assert_eq!(st.state, StagingState::Done);
+        assert_eq!(st.title, "Endeavour");
+        assert_eq!(st.disc_name, "ENDEAVOUR_S5_D2");
+        assert_eq!(st.disc_format, "bluray");
+        assert_eq!(st.year, 2012);
+        assert_eq!(st.media_type, "tv");
+        assert_eq!(st.tmdb_id, 44264);
+        assert_eq!(st.season, Some(5));
+        assert_eq!(st.disc_number, Some(2));
+        assert!(
+            !st.tmdb_poster.is_empty(),
+            "poster_url must fold into tmdb_poster"
+        );
+        assert_eq!(st.tmdb_poster, "http://x/p.jpg");
+        assert_eq!(st.tmdb_overview, "A young detective in 1960s Oxford.");
+        assert_eq!(st.date, "2026-08-22");
+
+        assert!(
+            !disc.join(DONE_MARKER).exists(),
+            "the legacy .done file must be removed once migrated to state.json"
+        );
+    }
+
+    /// Same migration, but for the `.review` hand-off (unconfident-title path):
+    /// the folded state must land in `StagingState::Review`, and the legacy
+    /// `.review` file must be gone afterwards.
+    #[test]
+    fn legacy_review_body_migrates_to_review_state() {
+        let root = tmpdir();
+        let disc = root.join("SomeShow_S1_D1");
+        fs::create_dir_all(&disc).unwrap();
+        let body = serde_json::json!({
+            "title": "Some Show",
+            "disc_name": "SOMESHOW_S1_D1",
+            "format": "dvd",
+            "year": 2005,
+            "media_type": "tv",
+            "tmdb_id": 9999,
+            "season": 1,
+            "disc": 1,
+            "poster_url": "http://x/q.jpg",
+            "overview": "overview text",
+            "date": "2026-08-20",
+        });
+        fs::write(disc.join(REVIEW_MARKER), body.to_string()).unwrap();
+
+        let snap = snapshot_staging_disc(&disc);
+        assert!(snap.is_some());
+
+        let st = read_state(&disc).expect("state.json must exist after migration");
+        assert_eq!(st.state, StagingState::Review);
+        assert_eq!(st.title, "Some Show");
+        assert_eq!(st.disc_name, "SOMESHOW_S1_D1");
+        assert_eq!(st.disc_format, "dvd");
+        assert_eq!(st.year, 2005);
+        assert_eq!(st.media_type, "tv");
+        assert_eq!(st.tmdb_id, 9999);
+        assert_eq!(st.season, Some(1));
+        assert_eq!(st.disc_number, Some(1));
+        assert_eq!(st.tmdb_poster, "http://x/q.jpg");
+        assert_eq!(st.tmdb_overview, "overview text");
+
+        assert!(
+            !disc.join(REVIEW_MARKER).exists(),
+            "the legacy .review file must be removed once migrated to state.json"
+        );
+    }
+
+    /// A legacy `.failed` marker migrates its `reason` into
+    /// `DiscState::failure_reason` via `upgrade_legacy_to_state` (NOT
+    /// `apply_legacy_handoff_body`, which only reads `.done`/`.review`), and
+    /// the legacy `.failed` file must be removed afterwards.
+    #[test]
+    fn legacy_failed_migrates_and_removes_file() {
+        let root = tmpdir();
+        let disc = root.join("BadDisc");
+        fs::create_dir_all(&disc).unwrap();
+        let body = serde_json::json!({ "reason": "boom" });
+        fs::write(disc.join(FAILED_MARKER), body.to_string()).unwrap();
+
+        let snap = snapshot_staging_disc(&disc);
+        assert!(snap.is_some());
+
+        let st = read_state(&disc).expect("state.json must exist after migration");
+        assert_eq!(st.state, StagingState::Failed);
+        assert_eq!(st.failure_reason.as_deref(), Some("boom"));
+
+        assert!(
+            !disc.join(FAILED_MARKER).exists(),
+            "the legacy .failed file must be removed once migrated to state.json"
+        );
     }
 
     #[test]

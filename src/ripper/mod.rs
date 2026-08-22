@@ -1829,7 +1829,15 @@ fn staging_disc_owned_by_worker(staging_root: &std::path::Path, sanitized: &str)
 ///   explicitly Wipe + re-rip. Keyed on PRESENCE (`has_failed`) so a non-JSON
 ///   `.failed` body is still honoured (M3).
 fn resumable_dir_blocked(snap: &staging::StagingSnapshot) -> bool {
-    snap.has_ripped || snap.has_muxing || snap.has_review || snap.has_failed
+    // `completed` also blocks: a FINISHED rip (state Done/Review/Completed) must
+    // never be drive-resumed. The design relied on the intermediate ISO being
+    // pruned after completion (so `has_iso` is false and the ISO guard skips it),
+    // but with `keep_iso = true` the ISO survives — so a manual
+    // `ResumeMode::Require` on a just-finished, not-yet-moved dir would otherwise
+    // pass this gate, and `resume_remux`'s `delete_partial_output` would destroy
+    // the delivered MKV before re-muxing it. Keying on `completed` closes that
+    // race independent of the prune.
+    snap.has_ripped || snap.has_muxing || snap.has_review || snap.has_failed || snap.completed
 }
 
 /// The end-of-recovery loss figure in milliseconds, and whether it is
@@ -6152,10 +6160,23 @@ fn plan_mux_outputs(
         return one_output();
     }
     let season_num = season.unwrap_or(1);
+    // Multi-disc offset: disc 2 of a season starts where disc 1 left off. We
+    // don't know the season's per-disc split for certain, so assume this disc's
+    // episode count is uniform across earlier discs — the common boxset layout —
+    // giving `start = (disc-1)*count + 1`. This is strictly better than always
+    // numbering from E01 (which collided disc 2's episodes with disc 1's); an
+    // unusual split still degrades to a wrong-but-sequential guess, never a
+    // collision within one disc. Disc 1 (or an unmarked label) starts at E01.
+    let disc_num = crate::tmdb::disc_from_label(disc_name).unwrap_or(1).max(1);
+    let start = 1u16.saturating_add(
+        disc_num
+            .saturating_sub(1)
+            .saturating_mul(indices.len() as u16),
+    );
     // TMDB episode names, best-effort (empty on any failure → sequential).
     let episodes = crate::tmdb::season_episodes(tmdb_id, season_num, &cfg.tmdb_api_key);
     let title_secs: Vec<f64> = indices.iter().map(|&i| titles[i].duration_secs).collect();
-    let assignments = crate::tmdb::map_episodes(&title_secs, &episodes, 1);
+    let assignments = crate::tmdb::map_episodes(&title_secs, &episodes, start);
     // Staging leaves derive from the movie leaf's stem + extension so they share
     // the output format and stay unique per episode. The mover renames each to
     // `Show S{NN}E{MM}[ - Name].ext` at file time (see `mover::tv_episode_leaf`).
@@ -11267,6 +11288,35 @@ mod tv_plan_tests {
             plan.iter().map(|o| o.title_index).collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5, 6]
         );
+    }
+
+    // Disc 2 of a multi-disc season starts numbering where disc 1 left off
+    // (best-effort uniform split), so its episodes don't collide with disc 1's.
+    #[test]
+    fn multi_disc_season_offsets_episode_numbers() {
+        let cfg = Config::default();
+        let ep = 44.0 * 60.0;
+        // 4 episode titles on disc 2 (label carries "Disc 2").
+        let titles: Vec<_> = (0..4)
+            .map(|k| title(ep + k as f64, 1000 + k * 100))
+            .collect();
+        let plan = plan_mux_outputs(
+            &titles,
+            &cfg,
+            "tv",
+            "Endeavour Season 5 Disc 2",
+            44264,
+            "Endeavour.mkv",
+        );
+        assert_eq!(plan.len(), 4);
+        // disc 2, 4 eps/disc → start at E05.
+        assert_eq!(
+            plan.iter().map(|o| o.episode.unwrap()).collect::<Vec<_>>(),
+            vec![5, 6, 7, 8],
+            "disc 2 numbers from E05, not colliding with disc 1's E01..E04"
+        );
+        assert_eq!(plan[0].filename, "Endeavour_S05E05.mkv");
+        assert_eq!(plan[3].filename, "Endeavour_S05E08.mkv");
     }
 
     // tv_auto=false holds a TV disc on the single-output path (no auto fan-out).

@@ -54,7 +54,7 @@ cargo build --release
 - **Multi-pass recovery** -- damaged discs rip via `disc → ISO → patch → MKV` with a ddrescue-format mapfile; retry only bad ranges, not the whole disc
 - **Bad-range visualization** -- progress bar overlays red ticks at unreadable regions; collapsible list shows LBA / sector count / ms of video lost / chapter
 - **TMDB integration** -- automatic title lookup, poster, year, organized output
-- **File organization** -- Movies/Title (Year)/Title.mkv
+- **File organization** -- Movies/Title (Year)/Title (Year).mkv; TV/Show (Year)/Season NN/Show S{NN}E{MM} - Name.mkv
 - **Webhooks** -- push notifications on rip complete/fail
 - **Docker** -- single container with udev, cron, web UI
 

@@ -86,7 +86,8 @@ pub enum ResumeClass {
     /// via libfreemkv's sweep_opts.resume on the next Pass 1).
     NotEligible,
     /// Hint was `AlreadyCompleted` — nothing to do. The mover (if
-    /// configured) will pick the staged output up via `.done`.
+    /// configured) will pick the staged output up when its state.json is in
+    /// `StagingState::Done` (a legacy `.done` file is the fallback).
     AlreadyCompleted,
     /// Hint was `AlreadyFailed` / `RestartLoopFailed` — leave it for
     /// the operator. `reason` is forwarded for surfacing in the UI.
@@ -1252,10 +1253,10 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // marker rather than relying on the reader's fallback.
     let media_type = resolve_media_type(&tmdb_media_type);
 
-    // Title-confidence gate — routes through the SAME `title_is_confident` /
-    // `handoff_marker_name` (mod.rs) the fresh-rip completion path uses, so
-    // the two routes can't drift on whether a guessed title is trustworthy
-    // enough to auto-file.
+    // Title-confidence gate — routes through the SAME `title_is_confident`
+    // (mod.rs) the fresh-rip completion path uses (the Done/Review hand-off is
+    // then written via `staging::mark_handoff`), so the two routes can't drift
+    // on whether a guessed title is trustworthy enough to auto-file.
     // Auto-resume previously wrote `.done` unconditionally, auto-filing a
     // resumed rip into the library under a possibly-guessed title and
     // bypassing the operator-review hold the fresh-rip path enforces.
@@ -1683,19 +1684,32 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // TV fan-out: the primary episode is muxed + durable above. Now mux the
     // REMAINING episodes from the same ISO, one file each, reusing the disc's
     // title table + decrypt keys. Best-guess/auto: a per-episode mux failure is
-    // logged and skipped (the mover files whatever landed) rather than failing
-    // the whole disc. No-op for movies (`is_fanout` false → empty slice).
+    // logged and the episode is DROPPED from the delivered set (its partial file
+    // deleted), rather than failing the whole disc — but a dropped/undurable
+    // episode is NEVER handed to the mover as complete. `delivered` is the honest
+    // list of episodes that muxed AND fsync'd; it seeds from the primary (already
+    // durable above) and becomes the hand-off `outputs[]`. No-op for movies.
+    let mut delivered: Vec<staging::Output> = plan_outputs.first().cloned().into_iter().collect();
     if is_fanout {
         for extra in plan_outputs.iter().skip(1) {
-            let Some(ep_title) = disc.titles.get(extra.title_index).cloned() else {
+            let ep_output_path = format!("{staging_str}/{}", extra.filename);
+            // Best-effort delete of any partial/undurable output for this episode,
+            // so a failed episode is never left on disk for the mover to file.
+            let drop_partial = |reason: &str| {
+                let _ = std::fs::remove_file(&ep_output_path);
                 crate::log::device_log(
                     device,
                     &format!(
-                        "TV episode E{:02}: title index {} not present on the disc — skipped",
-                        extra.episode.unwrap_or(0),
-                        extra.title_index
+                        "TV episode E{:02} {reason} — dropped (best-guess auto)",
+                        extra.episode.unwrap_or(0)
                     ),
                 );
+            };
+            let Some(ep_title) = disc.titles.get(extra.title_index).cloned() else {
+                drop_partial(&format!(
+                    "title index {} not present on the disc",
+                    extra.title_index
+                ));
                 continue;
             };
             let ep_bps: f64 = {
@@ -1707,7 +1721,6 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                     FALLBACK_BITRATE_BYTES_PER_SEC
                 }
             };
-            let ep_output_path = format!("{staging_str}/{}", extra.filename);
             let ep_dest_url = format!(
                 "{}://{}",
                 super::output_scheme_for(&output_format),
@@ -1756,30 +1769,27 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             };
             match super::mux::mux_iso(ep_inputs, ep_src, ep_atomics) {
                 Ok(o) if o.output_opened && o.completed => {
-                    let _ = staging::fsync_output_file(std::path::Path::new(&ep_output_path));
-                    crate::log::device_log(
-                        device,
-                        &format!(
-                            "TV episode E{:02} muxed → {}",
-                            extra.episode.unwrap_or(0),
-                            extra.filename
-                        ),
-                    );
+                    // Durability gate, same standard as the primary output: only
+                    // an episode that fsync'd to stable storage is delivered. A
+                    // page-cache-only file dropped by a crash must not be filed as
+                    // complete, so on fsync failure DROP it rather than hand a
+                    // possibly-truncated episode to the mover.
+                    if staging::fsync_output_file(std::path::Path::new(&ep_output_path)) {
+                        delivered.push(extra.clone());
+                        crate::log::device_log(
+                            device,
+                            &format!(
+                                "TV episode E{:02} muxed → {}",
+                                extra.episode.unwrap_or(0),
+                                extra.filename
+                            ),
+                        );
+                    } else {
+                        drop_partial("output not durable (fsync failed)");
+                    }
                 }
-                Ok(_) => crate::log::device_log(
-                    device,
-                    &format!(
-                        "TV episode E{:02} did not complete muxing — skipped (best-guess auto)",
-                        extra.episode.unwrap_or(0)
-                    ),
-                ),
-                Err(e) => crate::log::device_log(
-                    device,
-                    &format!(
-                        "TV episode E{:02} mux failed ({e}) — skipped (best-guess auto)",
-                        extra.episode.unwrap_or(0)
-                    ),
-                ),
+                Ok(_) => drop_partial("did not complete muxing"),
+                Err(e) => drop_partial(&format!("mux failed ({e})")),
             }
         }
     }
@@ -1800,9 +1810,16 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         s.tmdb_poster = tmdb_poster.clone();
         s.tmdb_overview = tmdb_overview.clone();
         s.resumed = true;
-        // Preserve a multi-episode TV plan recorded at rip time; only seed the
-        // single movie output when no plan is present (cold legacy resume).
-        if s.outputs.len() <= 1 {
+        if is_fanout {
+            // Hand off ONLY the episodes that actually muxed durably. A failed /
+            // undurable episode was dropped above (its partial file deleted), so
+            // it must not remain in `outputs[]` — otherwise the mover would look
+            // for a file that isn't there (or, worse, a truncated one). `delivered`
+            // always contains at least the primary episode.
+            s.outputs = delivered;
+        } else if s.outputs.len() <= 1 {
+            // Movie / cold legacy resume: seed the single output when no plan is
+            // present.
             s.outputs = vec![staging::Output {
                 filename: mkv_leaf,
                 ..Default::default()

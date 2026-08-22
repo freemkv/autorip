@@ -4,20 +4,25 @@
 //! - A 10-second tick loop polling the staging dir for hand-off markers.
 //! - A `BTreeMap<String, MuxerError>` for stuck-dir surfacing.
 //!
-//! Hand-off contract (v0.25.3):
+//! Hand-off contract (unified `state.json`, since 1.6.9):
+//!
+//! The staging lifecycle is one `state.json` per disc (a `StagingState` enum +
+//! data), NOT the old marker FILES. The `.ripped`/`.done` names below survive
+//! only as `StagingState` values and as a legacy read-fallback; write paths go
+//! through `crate::ripper::staging` transition helpers.
 //!
 //! 1. The drive thread (`ripper::rip_disc`) finishes sweep + patch.
-//! 2. It writes a `.ripped` JSON marker inside the staging dir with
-//!    everything the mux worker needs to reconstruct a `MuxInputs`
-//!    (TMDB metadata, codec list, byte counts, batch size, etc.) plus
-//!    the ISO filename.
-//! 3. If `cfg.auto_eject` is set, it ejects the drive — the disc is
-//!    no longer needed once `.ripped` is on disk.
+//! 2. It transitions the dir to `state: Ripped` (via `write_marker` →
+//!    `staging::try_write_state`), recording everything the mux worker needs to
+//!    reconstruct a `MuxInputs` (TMDB metadata, byte counts, batch size, ISO
+//!    filename, plus the `outputs[]` plan for a TV disc).
+//! 3. If `cfg.auto_eject` is set, it ejects the drive — the disc is no longer
+//!    needed once the ISO + `state: Ripped` are on disk.
 //! 4. The drive returns to `idle`, ready for the next disc.
-//! 5. This worker polls the staging dir, picks up `.ripped` markers,
-//!    runs the mux against the ISO, writes `.done` (the mover's
-//!    existing hand-off) and deletes `.ripped` on success. On failure
-//!    it records a `MuxerError` and leaves `.ripped` in place for
+//! 5. This worker polls the staging dir, dispatches `state: Ripped` dirs
+//!    (`mux_dispatch_verdict`), muxes against the ISO, then transitions to
+//!    `state: Done`/`Review` (the mover's hand-off) via `staging::mark_handoff`.
+//!    On failure it records a `MuxerError` and leaves the dir in `Ripped` for
 //!    next-tick retry / operator inspection.
 //!
 //! Single-pass live-disc rips (`cfg.max_retries == 0`) stay inline —
