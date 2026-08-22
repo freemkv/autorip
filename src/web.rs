@@ -2932,10 +2932,10 @@ mod web_tests {
         assert!(!both_contain(&mux, &mv));
         crate::ripper::staging::clear_muxing_marker(&disc);
 
-        // Step 3: mux done — `.done` written (mover hand-off), `.completed`
-        // not yet, `.ripped` may linger. THIS is the double-listing bug
+        // Step 3: mux done — hand-off to `state: Done` (mover hand-off),
+        // `.completed` not yet written. THIS is the double-listing bug
         // window: it must be in the Move queue ONLY.
-        fs::write(disc.join(".done"), b"{}").unwrap();
+        crate::ripper::staging::mark_handoff(&disc, true, |_s| {}).unwrap();
         let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(
             mux.is_empty(),
@@ -3131,10 +3131,10 @@ mod web_tests {
         assert_eq!(device_status(device), Some("done".into()));
         crate::ripper::staging::clear_muxing_marker(&disc);
 
-        // --- Stage 3: mux success. `.done` (mover hand-off) written BEFORE
-        // `.completed`; `.ripped` may linger. Disc moves to the Move queue
-        // ONLY — the double-listing bug window.
-        fs::write(disc.join(".done"), b"{}").unwrap();
+        // --- Stage 3: mux success. Hand-off to `state: Done` written BEFORE
+        // `.completed`. Disc moves to the Move queue ONLY — the
+        // double-listing bug window.
+        crate::ripper::staging::mark_handoff(&disc, true, |_s| {}).unwrap();
         let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(
             mux.is_empty(),
@@ -3176,9 +3176,9 @@ mod web_tests {
         let (mux, _, _, _) = build_queue_views(&staging);
         assert_eq!(mux.len(), 1, "fresh .ripped is queued for mux");
 
-        // Low-confidence mux success: `.review` instead of `.done`, then
-        // `.completed`.
-        fs::write(disc.join(".review"), b"{}").unwrap();
+        // Low-confidence mux success: hand-off to `state: Review` instead of
+        // `state: Done`, then `.completed`.
+        crate::ripper::staging::mark_handoff(&disc, false, |_s| {}).unwrap();
         let (mux, mv, _, _) = build_queue_views(&staging);
         assert!(mux.is_empty(), "a .review dir must leave the Mux queue");
         assert!(
@@ -3265,7 +3265,7 @@ mod web_tests {
         let disc_b = tmp.path().join("Beta");
         fs::create_dir_all(&disc_b).unwrap();
         crate::muxer::write_marker(&disc_b, &ripped_marker_for("Beta", dev_b)).unwrap();
-        fs::write(disc_b.join(".done"), b"{}").unwrap();
+        crate::ripper::staging::mark_handoff(&disc_b, true, |_s| {}).unwrap();
         crate::ripper::staging::write_completed_marker(&disc_b);
         crate::ripper::update_state(
             dev_b,
@@ -3328,7 +3328,7 @@ mod web_tests {
             fs::create_dir_all(&d).unwrap();
             crate::muxer::write_marker(&d, &ripped_marker_for(name, "sg0")).unwrap();
             if finished {
-                fs::write(d.join(".done"), b"{}").unwrap();
+                crate::ripper::staging::mark_handoff(&d, true, |_s| {}).unwrap();
                 crate::ripper::staging::write_completed_marker(&d);
             }
         }
@@ -6355,14 +6355,19 @@ fn build_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usi
         .lock()
         .ok()
         .and_then(|d| d.clone());
-    // Move queue: staging dirs with a `.done` marker (pending moves), minus the
-    // one actively being moved (shown as live bars, not a queue row).
+    // Move queue: staging dirs handed off to the mover (`state == Done`),
+    // minus the one actively being moved (shown as live bars, not a queue row).
     let mut move_queue: Vec<String> = std::fs::read_dir(staging_dir)
         .ok()
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir() && e.path().join(".done").exists())
+                .filter(|e| {
+                    e.path().is_dir()
+                        && crate::ripper::staging::read_state(&e.path())
+                            .map(|s| s.state == crate::ripper::staging::StagingState::Done)
+                            .unwrap_or_else(|| e.path().join(".done").exists())
+                })
                 .filter(|e| {
                     active_move_dir.as_deref() != Some(e.file_name().to_string_lossy().as_ref())
                 })
@@ -7543,9 +7548,22 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
         json_response(request, 409, r#"{"ok":false,"error":"already ripping"}"#);
         return;
     };
-    // Arm the one-shot override and clear the terminal/abort markers so the dir
-    // resumes (re-mux) instead of being refused as failed.
+    // Arm the one-shot override and move the dir off its terminal/abort state
+    // back to the re-muxable hand-off state so the resume re-mux proceeds
+    // instead of being refused as failed (mirrors the legacy "remove
+    // `.failed` + `.aborted-loss`, leaving `.ripped`").
     ripper::staging::write_accept_loss_marker(dir);
+    ripper::staging::mutate_state_if_present(dir, |s| {
+        if matches!(
+            s.state,
+            ripper::staging::StagingState::AbortedLoss | ripper::staging::StagingState::Failed
+        ) {
+            s.state = ripper::staging::StagingState::Ripped;
+        }
+        s.failure_reason = None;
+        s.restart_count = 0;
+    });
+    // Legacy pre-migration dirs: strip the marker files the same way.
     let _ = std::fs::remove_file(dir.join(ripper::staging::FAILED_MARKER));
     ripper::staging::clear_aborted_loss_marker(dir);
     ripper::staging::clear_restart_count(dir);

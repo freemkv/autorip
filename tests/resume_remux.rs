@@ -201,9 +201,10 @@ fn resume_remux_writes_completed_marker_on_success() {
     staging::write_completed_marker(&staging);
     staging::clear_restart_count(&staging);
 
-    assert!(
-        staging.join(".completed").exists(),
-        ".completed marker must be present"
+    assert_eq!(
+        staging::read_state(&staging).map(|s| s.state),
+        Some(staging::StagingState::Completed),
+        "state.json must be in the Completed state after write_completed_marker"
     );
     assert_eq!(
         staging::restart_count(&staging),

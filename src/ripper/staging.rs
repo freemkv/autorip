@@ -84,6 +84,359 @@ pub const RESTART_COUNT_FILE: &str = ".restart_count";
 /// staging rather than re-ripping it on upgrade.
 pub const DISC_LABEL_FILE: &str = ".disc-label";
 
+// ===========================================================================
+// Unified per-disc state (`state.json`) — the single source of truth that
+// supersedes the file-presence marker machine (`.sweeping`/`.ripped`/`.done`/
+// `.review`/`.completed`/`.failed`/`.aborted-loss` and the `.muxing`/
+// `.accept-loss` locks + `.restart_count`).
+//
+// One atomic `state.json` rewrite (tmp → fsync → rename → dir-fsync, via
+// `write_marker_durable`) per transition. `snapshot_staging_disc` reads this
+// file and DERIVES the legacy `has_*` booleans from it, so every downstream
+// projection (`mux_dispatch_verdict`, `classify_resume`, `classify_done_absence`)
+// is unchanged. A one-time legacy fallback in the reader upgrades any
+// pre-existing old-marker dir in place.
+// ===========================================================================
+
+/// The single state file in each per-disc staging dir.
+pub const STATE_FILE: &str = "state.json";
+/// `state.json` schema. 2 = first unified schema (RippedMarker was schema 1).
+pub const DISC_STATE_SCHEMA: u32 = 2;
+
+/// Lifecycle state of a staging dir. Replaces the lifecycle marker files.
+/// `muxing` / `accept_loss` / `restart_count` are orthogonal fields on
+/// [`DiscState`], not states (a dir can be `Ripped` AND `muxing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagingState {
+    /// was `.sweeping` — owned by the ripper, sweep+patch running/crashed.
+    Sweeping,
+    /// was `.ripped` — handed off; the mux worker should pick it up.
+    Ripped,
+    /// was `.done` — muxed, title confident, ready for the mover.
+    Done,
+    /// was `.review` — muxed, held for operator confirmation.
+    Review,
+    /// was `.completed` — mover finished / process-level clean completion.
+    Completed,
+    /// was `.failed` — terminal.
+    Failed,
+    /// was `.aborted-loss` — resumable failure (loss over threshold).
+    AbortedLoss,
+}
+
+/// One deliverable in a staging dir. Movies have exactly one; a TV disc has one
+/// per selected episode title. The mover files each in disc/`outputs` order.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Output {
+    /// On-disk filename in the staging dir (the muxed `.mkv`/`.m2ts`, or the
+    /// promoted `.iso`).
+    pub filename: String,
+    /// Index into the disc's full `titles[]` this output was muxed from.
+    #[serde(default)]
+    pub title_index: usize,
+    /// Episode number for a TV output (`None` for a movie / single feature).
+    #[serde(default)]
+    pub episode: Option<u16>,
+    /// TMDB episode name, empty when unknown (degraded/sequential).
+    #[serde(default)]
+    pub episode_name: String,
+    /// Set once the mover has filed this output to the library.
+    #[serde(default)]
+    pub moved: bool,
+}
+
+/// Rip/sweep telemetry carried across the hand-off (was the `RippedMarker`
+/// `rip_*` / `sweep_*` fields). Every field is `#[serde(default)]` so a marker
+/// written by an older/leaner path still parses.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RipStats {
+    #[serde(default)]
+    pub elapsed_secs: f64,
+    #[serde(default)]
+    pub errors: u32,
+    #[serde(default)]
+    pub lost_video_secs: f64,
+    #[serde(default)]
+    pub last_sector: u64,
+    #[serde(default)]
+    pub sweep_errors: u32,
+    #[serde(default)]
+    pub sweep_total_lost_ms: f64,
+    #[serde(default)]
+    pub sweep_main_lost_ms: f64,
+    #[serde(default)]
+    pub sweep_num_bad_ranges: u32,
+    #[serde(default)]
+    pub sweep_largest_gap_ms: f64,
+}
+
+/// The unified per-disc state — one JSON, carrying lifecycle `state` plus all
+/// the data that used to live spread across the marker payloads (RippedMarker,
+/// the `.done`/`.review` metadata body, the `.failed`/`.aborted-loss` reasons,
+/// `.restart_count`, and the `.disc-label`).
+///
+/// Every non-`state`/`schema` field is `#[serde(default)]` so partially-written
+/// or migrated files parse, and so adding a field never breaks an on-disk file.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DiscState {
+    pub schema: u32,
+    pub state: StagingState,
+
+    // --- orthogonal lifecycle annotations ---------------------------------
+    #[serde(default)]
+    pub restart_count: u64,
+    /// `.muxing` exclusion lock: the mux worker owns this dir right now.
+    #[serde(default)]
+    pub muxing: bool,
+    /// `.accept-loss` one-shot: operator chose to deliver despite the loss.
+    #[serde(default)]
+    pub accept_loss: bool,
+    /// Terminal `.failed` reason (None for a non-JSON/operator-cancel failure).
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+    /// Count of abort-on-loss outcomes (informational; the dir stays resumable).
+    #[serde(default)]
+    pub aborted_loss_attempt: u64,
+
+    // --- identity / routing (was the `.disc-label` file + done body) -------
+    /// Raw volume label — the same value the `.disc-label` file held; used by
+    /// `dir_is_same_disc` to tell boxset discs apart.
+    #[serde(default)]
+    pub disc_label: String,
+    /// The disc's own label as displayed (distinct from the resolved `title`).
+    #[serde(default)]
+    pub disc_name: String,
+    #[serde(default)]
+    pub disc_format: String,
+    /// Resolved display title (TMDB or disc-derived).
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub year: u16,
+    /// "movie" | "tv" (empty ⇒ the mover defaults it to "movie").
+    #[serde(default)]
+    pub media_type: String,
+    #[serde(default)]
+    pub tmdb_id: u64,
+    #[serde(default)]
+    pub tmdb_poster: String,
+    #[serde(default)]
+    pub tmdb_overview: String,
+    #[serde(default)]
+    pub season: Option<u16>,
+    #[serde(default)]
+    pub disc_number: Option<u16>,
+    #[serde(default)]
+    pub title_confident: bool,
+
+    // --- capture handles + mux-reconstruction knobs (was RippedMarker) -----
+    #[serde(default)]
+    pub iso_path: String,
+    #[serde(default)]
+    pub mapfile_path: String,
+    #[serde(default)]
+    pub max_retries: u8,
+    #[serde(default)]
+    pub abort_on_lost_secs: u32,
+    #[serde(default)]
+    pub origin_device: String,
+    #[serde(default)]
+    pub rip: RipStats,
+
+    // --- deliverables ------------------------------------------------------
+    /// One entry per output. Movies = 1; TV = N episodes. The mover files each.
+    #[serde(default)]
+    pub outputs: Vec<Output>,
+
+    #[serde(default)]
+    pub date: String,
+    #[serde(default)]
+    pub resumed: bool,
+}
+
+impl DiscState {
+    /// A minimal `DiscState` in the given lifecycle state — every data field
+    /// default. Used by transition helpers that seed a fresh file and by tests.
+    pub fn new(state: StagingState) -> Self {
+        DiscState {
+            schema: DISC_STATE_SCHEMA,
+            state,
+            restart_count: 0,
+            muxing: false,
+            accept_loss: false,
+            failure_reason: None,
+            aborted_loss_attempt: 0,
+            disc_label: String::new(),
+            disc_name: String::new(),
+            disc_format: String::new(),
+            title: String::new(),
+            year: 0,
+            media_type: String::new(),
+            tmdb_id: 0,
+            tmdb_poster: String::new(),
+            tmdb_overview: String::new(),
+            season: None,
+            disc_number: None,
+            title_confident: false,
+            iso_path: String::new(),
+            mapfile_path: String::new(),
+            max_retries: 0,
+            abort_on_lost_secs: 0,
+            origin_device: String::new(),
+            rip: RipStats::default(),
+            outputs: Vec::new(),
+            date: String::new(),
+            resumed: false,
+        }
+    }
+}
+
+/// Path of the `state.json` in a staging dir.
+fn state_path(staging_disc_dir: &Path) -> PathBuf {
+    staging_disc_dir.join(STATE_FILE)
+}
+
+/// Read and parse `state.json`. `None` when absent or unparseable — callers
+/// treat `None` as "no unified state yet" and fall back to the legacy scan.
+pub fn read_state(staging_disc_dir: &Path) -> Option<DiscState> {
+    let bytes = std::fs::read(state_path(staging_disc_dir)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Durably (over)write `state.json` for a staging dir: one atomic
+/// `tmp → fsync → rename → dir-fsync`. Best-effort — logs on failure like the
+/// other marker writers, since callers are on paths with nothing useful to do
+/// with a write error.
+pub fn write_state(staging_disc_dir: &Path, st: &DiscState) {
+    if let Err(e) = try_write_state(staging_disc_dir, st) {
+        tracing::warn!(path = %state_path(staging_disc_dir).display(), error = %e, "failed to write state.json");
+    }
+}
+
+/// Fallible durable `state.json` write — same bytes as [`write_state`] but
+/// propagates the I/O error so callers that must gate a follow-on action (e.g.
+/// the fresh-rip hand-off gating auto-eject on a durable marker) can refuse to
+/// proceed when the write did not land.
+pub fn try_write_state(staging_disc_dir: &Path, st: &DiscState) -> io::Result<()> {
+    let p = state_path(staging_disc_dir);
+    let serialized = serde_json::to_string_pretty(st).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("serialise state.json: {e}"),
+        )
+    })?;
+    write_marker_durable(&p, serialized.as_bytes())
+}
+
+/// Read-modify-write `state.json`: apply `f` to the current state (or a fresh
+/// `new(default_state)` when the file is absent) and durably rewrite it. This is
+/// the single transition primitive; a transition mutates fields, it never blows
+/// away accumulated data. Safe because one writer owns a staging dir at a time
+/// (the sweeping/muxing ownership rules, now fields).
+pub fn mutate_state(
+    staging_disc_dir: &Path,
+    default_state: StagingState,
+    f: impl FnOnce(&mut DiscState),
+) {
+    let mut st = read_state(staging_disc_dir).unwrap_or_else(|| DiscState::new(default_state));
+    f(&mut st);
+    write_state(staging_disc_dir, &st);
+}
+
+/// Read-modify-write `state.json` ONLY if it already exists — a no-op when
+/// absent. Used by lock-clearing / one-shot-consuming helpers that must not
+/// conjure a state file for a dir that has none (e.g. clearing `.muxing` on a
+/// legacy dir, consuming `.accept-loss`).
+pub fn mutate_state_if_present(staging_disc_dir: &Path, f: impl FnOnce(&mut DiscState)) {
+    if let Some(mut st) = read_state(staging_disc_dir) {
+        f(&mut st);
+        write_state(staging_disc_dir, &st);
+    }
+}
+
+impl DiscState {
+    /// Reconstruct the mux worker's [`crate::muxer::RippedMarker`] from this
+    /// state so the mux/resume path can keep dealing in `RippedMarker` while the
+    /// persistence layer is unified `state.json`. `mkv_filename` comes from the
+    /// first output (movies have exactly one; TV outputs are muxed per entry).
+    pub fn to_ripped_marker(&self) -> crate::muxer::RippedMarker {
+        crate::muxer::RippedMarker {
+            schema_version: crate::muxer::RIPPED_MARKER_SCHEMA,
+            iso_path: self.iso_path.clone(),
+            mapfile_path: self.mapfile_path.clone(),
+            display_name: self.title.clone(),
+            disc_format: self.disc_format.clone(),
+            mkv_filename: self
+                .outputs
+                .first()
+                .map(|o| o.filename.clone())
+                .unwrap_or_default(),
+            tmdb_title: self.title.clone(),
+            tmdb_year: self.year,
+            tmdb_poster: self.tmdb_poster.clone(),
+            tmdb_overview: self.tmdb_overview.clone(),
+            tmdb_media_type: self.media_type.clone(),
+            max_retries: self.max_retries,
+            abort_on_lost_secs: self.abort_on_lost_secs,
+            rip_elapsed_secs: self.rip.elapsed_secs,
+            rip_errors: self.rip.errors,
+            rip_lost_video_secs: self.rip.lost_video_secs,
+            rip_last_sector: self.rip.last_sector,
+            origin_device: self.origin_device.clone(),
+            sweep_errors: self.rip.sweep_errors,
+            sweep_total_lost_ms: self.rip.sweep_total_lost_ms,
+            sweep_main_lost_ms: self.rip.sweep_main_lost_ms,
+            sweep_num_bad_ranges: self.rip.sweep_num_bad_ranges,
+            sweep_largest_gap_ms: self.rip.sweep_largest_gap_ms,
+            title_confident: self.title_confident,
+        }
+    }
+
+    /// Fold a [`crate::muxer::RippedMarker`]'s fields into this state (used when
+    /// the fresh-rip hand-off writes `state: Ripped`). Leaves lifecycle
+    /// annotations (`restart_count`, `muxing`, …) untouched; the caller sets
+    /// `state`.
+    pub fn apply_ripped(&mut self, m: &crate::muxer::RippedMarker) {
+        self.iso_path = m.iso_path.clone();
+        self.mapfile_path = m.mapfile_path.clone();
+        self.disc_format = m.disc_format.clone();
+        self.title = m.tmdb_title.clone();
+        self.year = m.tmdb_year;
+        self.tmdb_poster = m.tmdb_poster.clone();
+        self.tmdb_overview = m.tmdb_overview.clone();
+        self.media_type = m.tmdb_media_type.clone();
+        self.max_retries = m.max_retries;
+        self.abort_on_lost_secs = m.abort_on_lost_secs;
+        self.origin_device = m.origin_device.clone();
+        self.title_confident = m.title_confident;
+        self.rip = RipStats {
+            elapsed_secs: m.rip_elapsed_secs,
+            errors: m.rip_errors,
+            lost_video_secs: m.rip_lost_video_secs,
+            last_sector: m.rip_last_sector,
+            sweep_errors: m.sweep_errors,
+            sweep_total_lost_ms: m.sweep_total_lost_ms,
+            sweep_main_lost_ms: m.sweep_main_lost_ms,
+            sweep_num_bad_ranges: m.sweep_num_bad_ranges,
+            sweep_largest_gap_ms: m.sweep_largest_gap_ms,
+        };
+        // The display_name is the mover-facing title; keep it if tmdb_title was
+        // empty (the two are the same at the fresh-rip call site).
+        if self.title.is_empty() {
+            self.title = m.display_name.clone();
+        }
+        // Seed the single movie output from the marker's mkv_filename when the
+        // caller hasn't populated outputs (TV callers set outputs themselves).
+        if self.outputs.is_empty() && !m.mkv_filename.is_empty() {
+            self.outputs.push(Output {
+                filename: m.mkv_filename.clone(),
+                ..Default::default()
+            });
+        }
+    }
+}
+
 /// Available bytes at the given path's filesystem, via `statvfs(3)`.
 /// Returns None on any error (path missing, not POSIX, syscall failure).
 /// Used by the pre-flight check in `rip_disc` to refuse rips that would
@@ -165,6 +518,11 @@ pub(super) fn staging_free_bytes(_path: &str) -> Option<u64> {
 /// counter must NOT cause the loop detector to trip, because that would
 /// flip the dir to `.failed` on a single stray byte in the file.
 pub fn restart_count(staging_disc_dir: &Path) -> u64 {
+    // Unified store wins. Fall back to the legacy `.restart_count` file for
+    // dirs written before the state.json migration.
+    if let Some(st) = read_state(staging_disc_dir) {
+        return st.restart_count;
+    }
     let p = staging_disc_dir.join(RESTART_COUNT_FILE);
     match std::fs::read_to_string(&p) {
         Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
@@ -176,6 +534,17 @@ pub fn restart_count(staging_disc_dir: &Path) -> u64 {
 /// goes (read → +1 → write). Creates the file on first call with value
 /// `1`. Returns the new value on success.
 pub fn increment_restart_count(staging_disc_dir: &Path) -> io::Result<u64> {
+    // Unified store: bump the field in place, preserving state + all data.
+    if read_state(staging_disc_dir).is_some() {
+        let mut next = 0;
+        mutate_state_if_present(staging_disc_dir, |s| {
+            s.restart_count = s.restart_count.saturating_add(1);
+            next = s.restart_count;
+        });
+        return Ok(next);
+    }
+    // Legacy fallback: bump the bare `.restart_count` file (a dir not yet
+    // migrated to state.json).
     let next = restart_count(staging_disc_dir).saturating_add(1);
     let p = staging_disc_dir.join(RESTART_COUNT_FILE);
     // Atomic write: a crash between create()-truncate and the writeln would
@@ -244,10 +613,11 @@ pub(crate) fn write_marker_durable(path: &Path, contents: &[u8]) -> io::Result<(
 /// Best-effort delete of `.restart_count`. Not finding the file is not
 /// an error — the goal is "after this call, the file is absent".
 pub fn clear_restart_count(staging_disc_dir: &Path) {
+    // Zero the unified field (if any) and remove the legacy file. Both, so a
+    // half-migrated dir can't keep a stale count on either side.
+    mutate_state_if_present(staging_disc_dir, |s| s.restart_count = 0);
     let p = staging_disc_dir.join(RESTART_COUNT_FILE);
-    match std::fs::remove_file(&p) {
-        Ok(_) | Err(_) => {}
-    }
+    let _ = std::fs::remove_file(&p);
 }
 
 /// Write the `.failed` marker with a structured reason. Best-effort —
@@ -255,35 +625,38 @@ pub fn clear_restart_count(staging_disc_dir: &Path) {
 /// the giving-up path where there's nothing useful to do with a write
 /// failure.
 pub fn write_failed_marker(staging_disc_dir: &Path, reason: &str) {
-    let p = staging_disc_dir.join(FAILED_MARKER);
-    let body = serde_json::json!({
-        "reason": reason,
-        "timestamp": crate::util::format_iso_datetime(),
+    // Terminal transition → `state: Failed`, carrying the reason. This one
+    // atomic rewrite supersedes any in-progress ownership (the `.sweeping`
+    // state / `.muxing` lock): `state != Sweeping` means `has_sweeping` reads
+    // false, and clearing `muxing` releases the lock so `disc_owned_by_worker`
+    // can't stay true on a now-terminal dir.
+    mutate_state(staging_disc_dir, StagingState::Failed, |s| {
+        s.state = StagingState::Failed;
+        s.failure_reason = Some(reason.to_string());
+        s.muxing = false;
     });
-    // `to_string_pretty` on a `json!`-constructed Value is effectively
-    // infallible; `.expect` makes the invariant explicit so a real
-    // serialization failure surfaces as a panic rather than silently
-    // writing an empty `.failed` marker that `read_failed_reason` would
-    // then parse as `None`, masking the failure reason.
-    let serialized =
-        serde_json::to_string_pretty(&body).expect("json! value is always serialisable");
-    if let Err(e) = write_marker_durable(&p, serialized.as_bytes()) {
-        tracing::warn!(path = %p.display(), error = %e, "failed to write .failed marker");
-    }
-    // A `.failed` terminal supersedes any in-progress `.sweeping` marker; clear
-    // it so a quarantined dir isn't also mis-read as an active sweep.
-    clear_sweeping_marker(staging_disc_dir);
-    // It supersedes the `.muxing` exclusion lock too — same reasoning as
-    // `write_completed_marker`. A terminal write must reliably release the
-    // in-progress lock regardless of which path (worker guard, cold operator
-    // resume, or startup quarantine) reaches it, so a stale `.muxing` can't keep
-    // `disc_owned_by_worker` true on a now-terminal dir.
-    clear_muxing_marker(staging_disc_dir);
+    // Best-effort removal of any leftover LEGACY marker files (a dir migrated
+    // mid-life). The unified state above is authoritative; these keep a
+    // half-migrated dir from reading terminal on one side and in-progress on the
+    // other via the reader's legacy fallback.
+    remove_legacy_marker(staging_disc_dir, SWEEPING_MARKER);
+    remove_legacy_marker(staging_disc_dir, MUXING_MARKER);
+}
+
+/// Best-effort removal of a named legacy marker file. Used by the unified
+/// writers to clean up any pre-migration marker so the reader's legacy fallback
+/// never contradicts `state.json`.
+fn remove_legacy_marker(staging_disc_dir: &Path, name: &str) {
+    let _ = std::fs::remove_file(staging_disc_dir.join(name));
 }
 
 /// Read the `.failed` marker's reason string. Returns None if missing
 /// or unparseable.
 pub fn read_failed_reason(staging_disc_dir: &Path) -> Option<String> {
+    if let Some(st) = read_state(staging_disc_dir) {
+        return st.failure_reason;
+    }
+    // Legacy fallback.
     let p = staging_disc_dir.join(FAILED_MARKER);
     let body = std::fs::read_to_string(&p).ok()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
@@ -295,29 +668,26 @@ pub fn read_failed_reason(staging_disc_dir: &Path) -> Option<String> {
 /// the end-of-run state for this attempt, so it supersedes the in-progress
 /// `.sweeping`/`.muxing` markers (clear them). Best-effort.
 pub fn write_aborted_loss_marker(staging_disc_dir: &Path, reason: &str, attempt: u64) {
-    let p = staging_disc_dir.join(ABORTED_LOSS_MARKER);
-    let body = serde_json::json!({
-        "reason": reason,
-        "attempt": attempt,
-        "timestamp": crate::util::format_iso_datetime(),
+    // Resumable-failure transition → `state: AbortedLoss`. The reason text
+    // reuses `failure_reason`; `aborted_loss_attempt` carries the count. The run
+    // that produced this loss has ended, so release the in-progress ownership
+    // exactly as a terminal `.failed` would.
+    mutate_state(staging_disc_dir, StagingState::AbortedLoss, |s| {
+        s.state = StagingState::AbortedLoss;
+        s.failure_reason = Some(reason.to_string());
+        s.aborted_loss_attempt = attempt;
+        s.muxing = false;
     });
-    let serialized =
-        serde_json::to_string_pretty(&body).expect("json! value is always serialisable");
-    if let Err(e) = write_marker_durable(&p, serialized.as_bytes()) {
-        tracing::warn!(path = %p.display(), error = %e, "failed to write .aborted-loss marker");
-    }
-    // The run that produced this loss has ended; release the in-progress
-    // ownership markers exactly as a terminal `.failed` would.
-    clear_sweeping_marker(staging_disc_dir);
-    clear_muxing_marker(staging_disc_dir);
+    remove_legacy_marker(staging_disc_dir, SWEEPING_MARKER);
+    remove_legacy_marker(staging_disc_dir, MUXING_MARKER);
 }
 
-/// Best-effort delete of the `.aborted-loss` marker. Used when the dir is
-/// promoted to a terminal `.failed` (attempts exhausted) so the two markers
-/// can't coexist.
+/// Best-effort clear of the aborted-loss state. Used when the dir is promoted to
+/// a terminal `.failed` (the subsequent `write_failed_marker` sets the terminal
+/// state; this only strips any leftover legacy `.aborted-loss` file so the
+/// reader's fallback can't contradict it).
 pub fn clear_aborted_loss_marker(staging_disc_dir: &Path) {
-    let p = staging_disc_dir.join(ABORTED_LOSS_MARKER);
-    let _ = std::fs::remove_file(&p);
+    remove_legacy_marker(staging_disc_dir, ABORTED_LOSS_MARKER);
 }
 
 /// `.accept-loss` — the operator has chosen to **accept** the recorded
@@ -327,22 +697,32 @@ pub fn clear_aborted_loss_marker(staging_disc_dir: &Path) {
 /// proceeds), then clears it — a one-shot override, not a permanent setting.
 pub const ACCEPT_LOSS_MARKER: &str = ".accept-loss";
 
-/// Write the one-shot `.accept-loss` override marker. Best-effort.
+/// Set the one-shot accept-loss override. Best-effort. Records in `state.json`
+/// when the dir has one (the common case — the operator acts on an existing
+/// aborted dir), else writes the legacy file as a safety net.
 pub fn write_accept_loss_marker(staging_disc_dir: &Path) {
+    if read_state(staging_disc_dir).is_some() {
+        mutate_state_if_present(staging_disc_dir, |s| s.accept_loss = true);
+        return;
+    }
     let p = staging_disc_dir.join(ACCEPT_LOSS_MARKER);
     if let Err(e) = write_marker_durable(&p, b"{}") {
         tracing::warn!(path = %p.display(), error = %e, "failed to write .accept-loss marker");
     }
 }
 
-/// Best-effort delete of the `.accept-loss` marker (one-shot: cleared once the
-/// accepted re-mux has consumed it).
+/// Best-effort clear of the accept-loss override (one-shot: cleared once the
+/// accepted re-mux has consumed it). Clears both stores.
 pub fn clear_accept_loss_marker(staging_disc_dir: &Path) {
+    mutate_state_if_present(staging_disc_dir, |s| s.accept_loss = false);
     let _ = std::fs::remove_file(staging_disc_dir.join(ACCEPT_LOSS_MARKER));
 }
 
 /// Whether the operator has requested accepting the loss for this staging dir.
 pub fn accept_loss_requested(staging_disc_dir: &Path) -> bool {
+    if let Some(st) = read_state(staging_disc_dir) {
+        return st.accept_loss;
+    }
     staging_disc_dir.join(ACCEPT_LOSS_MARKER).exists()
 }
 
@@ -350,6 +730,17 @@ pub fn accept_loss_requested(staging_disc_dir: &Path) -> bool {
 /// marker is missing or unparseable; a present-but-attemptless body reads back
 /// as attempt 0 (the conservative "no prior attempts recorded" value).
 pub fn read_aborted_loss(staging_disc_dir: &Path) -> Option<(String, u64)> {
+    if let Some(st) = read_state(staging_disc_dir) {
+        if st.state != StagingState::AbortedLoss {
+            return None;
+        }
+        let reason = st
+            .failure_reason
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| "aborted on loss".to_string());
+        return Some((reason, st.aborted_loss_attempt));
+    }
+    // Legacy fallback.
     let p = staging_disc_dir.join(ABORTED_LOSS_MARKER);
     let body = std::fs::read_to_string(&p).ok()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
@@ -398,16 +789,11 @@ pub fn mark_aborted_on_loss(staging_disc_dir: &Path, reason: &str) -> bool {
 /// missing `.sweeping` just degrades to the pre-fix markerless-window
 /// behaviour, it never corrupts state.
 pub fn write_sweeping_marker(staging_disc_dir: &Path) {
-    let p = staging_disc_dir.join(SWEEPING_MARKER);
-    let body = serde_json::json!({
-        "started": crate::util::epoch_secs(),
-        "heartbeat": crate::util::epoch_secs(),
+    // Owned-in-progress transition → `state: Sweeping`. Seeds `state.json` at
+    // staging-dir creation (preserving any data from a prior resume attempt).
+    mutate_state(staging_disc_dir, StagingState::Sweeping, |s| {
+        s.state = StagingState::Sweeping;
     });
-    let serialized = serde_json::to_string_pretty(&body)
-        .unwrap_or_else(|_| "{\"started\":0,\"heartbeat\":0}".to_string());
-    if let Err(e) = write_marker_durable(&p, serialized.as_bytes()) {
-        tracing::warn!(path = %p.display(), error = %e, "failed to write .sweeping marker");
-    }
 }
 
 /// Write the `.muxing` exclusion lock durably. Called by the mux worker when
@@ -415,36 +801,40 @@ pub fn write_sweeping_marker(staging_disc_dir: &Path) {
 /// Carries a JSON `started` epoch-secs timestamp for observability. Best-effort
 /// — a missing `.muxing` only loses the exclusion, it never corrupts state.
 pub fn write_muxing_marker(staging_disc_dir: &Path) {
-    let p = staging_disc_dir.join(MUXING_MARKER);
-    let body = serde_json::json!({ "started": crate::util::epoch_secs() });
-    let serialized =
-        serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{\"started\":0}".to_string());
-    if let Err(e) = write_marker_durable(&p, serialized.as_bytes()) {
-        tracing::warn!(path = %p.display(), error = %e, "failed to write .muxing marker");
-    }
+    // The mux-worker ownership lock is a field, set on the existing (Ripped)
+    // state. Best-effort: if the dir has no state.json the lock is simply not
+    // taken — same as a legacy best-effort write failing.
+    mutate_state_if_present(staging_disc_dir, |s| s.muxing = true);
 }
 
-/// Best-effort delete of the `.muxing` exclusion lock. Called when the mux
-/// worker finishes (or aborts) a dir. Not finding the file is not an error.
+/// Release the `.muxing` exclusion lock (a field). Called when the mux worker
+/// finishes (or aborts) a dir. Leaves the lifecycle `state` (typically `Ripped`)
+/// intact so the dir is re-dispatchable next tick, mirroring the legacy
+/// "remove `.muxing`, keep `.ripped`" behaviour.
 pub fn clear_muxing_marker(staging_disc_dir: &Path) {
-    let p = staging_disc_dir.join(MUXING_MARKER);
-    if let Err(e) = std::fs::remove_file(&p)
-        && e.kind() != io::ErrorKind::NotFound
-    {
-        tracing::warn!(path = %p.display(), error = %e, "failed to clear .muxing marker");
-    }
+    mutate_state_if_present(staging_disc_dir, |s| s.muxing = false);
+    remove_legacy_marker(staging_disc_dir, MUXING_MARKER);
 }
 
-/// Best-effort delete of the `.sweeping` in-progress marker. Called by
-/// `rip_disc` right before it writes the terminal `.ripped` (or `.failed`)
-/// marker for this dir. Not finding the file is not an error.
+/// Release the `.sweeping` ownership. Called on a graceful stop / rip-thread
+/// cancel (the `SweepingGuard` drop and `clear_inprogress_markers`) and,
+/// vestigially, by paths that supersede a sweep.
+///
+/// A graceful stop is NOT a crash, so an interrupted sweep must become plain
+/// resumable partial state that the startup classifier does NOT restart-count
+/// (the exact "don't walk a healthy rip to `.failed`" invariant). The faithful
+/// unified representation of "resumable, not owned, no marker" is the ABSENCE of
+/// `state.json` (the legacy model literally had no marker here) — so when the
+/// dir is still `Sweeping`, remove `state.json`, leaving the ISO/mapfile
+/// artifacts. Once the sweep has already advanced (`Ripped`/terminal), this is a
+/// no-op, so it is safe to call unconditionally.
 pub fn clear_sweeping_marker(staging_disc_dir: &Path) {
-    let p = staging_disc_dir.join(SWEEPING_MARKER);
-    if let Err(e) = std::fs::remove_file(&p)
-        && e.kind() != io::ErrorKind::NotFound
+    if let Some(st) = read_state(staging_disc_dir)
+        && st.state == StagingState::Sweeping
     {
-        tracing::warn!(path = %p.display(), error = %e, "failed to clear .sweeping marker");
+        let _ = std::fs::remove_file(state_path(staging_disc_dir));
     }
+    remove_legacy_marker(staging_disc_dir, SWEEPING_MARKER);
 }
 
 /// Clear every `.sweeping` / `.muxing` in-progress marker under `staging_root`.
@@ -475,22 +865,27 @@ pub fn clear_inprogress_markers(staging_root: &Path) {
 /// Write the `.completed` marker. Empty file — its existence is the
 /// signal. Best-effort; logs on failure.
 pub fn write_completed_marker(staging_disc_dir: &Path) {
-    let p = staging_disc_dir.join(COMPLETED_MARKER);
-    if let Err(e) = write_marker_durable(&p, b"") {
-        tracing::warn!(path = %p.display(), error = %e, "failed to write .completed marker");
-    }
-    // `.completed` is terminal-clean; clear any leftover in-progress `.sweeping`
-    // marker (the inline-mux success path writes `.completed` directly without
-    // going through `.ripped`).
-    clear_sweeping_marker(staging_disc_dir);
-    // A terminal write supersedes the `.muxing` exclusion lock too. The worker's
-    // MuxingGuard normally clears it, but the cold operator-resume path
-    // (`resume::resume_remux`) writes `.completed` WITHOUT going through the
-    // guard. If a `.muxing` marker was left on the dir (e.g. a prior worker mux
-    // the hard-watchdog exit(1)'d without clearing), it would persist and make
-    // `disc_owned_by_worker` return true forever on a dir that is actually
-    // `.completed`, silently blocking the unattended re-insert path.
-    clear_muxing_marker(staging_disc_dir);
+    // Process-level clean-completion → `state: Completed`, releasing the
+    // `.muxing` lock (a terminal write must reliably release ownership so
+    // `disc_owned_by_worker` can't stay true on a completed dir, even via the
+    // cold operator-resume path that doesn't go through the MuxingGuard).
+    //
+    // In the legacy file model `.completed` COEXISTED with `.done`/`.review`
+    // (a finished ISO rip wrote the hand-off marker THEN `.completed`). With one
+    // `state` field they can't both be true, and `snap.completed` already covers
+    // `Done`/`Review` (see `snapshot_staging_disc`), so this must NOT downgrade a
+    // hand-off state — that would clear `has_done` and the mover would never file
+    // the dir. It only advances an as-yet-uncompleted dir to the terminal-clean
+    // `Completed`. The many `write_completed_marker` calls that follow a hand-off
+    // write thus stay correct (they become a lock-release no-op on `state`).
+    mutate_state(staging_disc_dir, StagingState::Completed, |s| {
+        if !matches!(s.state, StagingState::Done | StagingState::Review) {
+            s.state = StagingState::Completed;
+        }
+        s.muxing = false;
+    });
+    remove_legacy_marker(staging_disc_dir, SWEEPING_MARKER);
+    remove_legacy_marker(staging_disc_dir, MUXING_MARKER);
 }
 
 /// Durably write a hand-off/review marker (`.done` / `.review`) containing
@@ -500,6 +895,57 @@ pub fn write_completed_marker(staging_disc_dir: &Path) {
 /// leaves an empty/torn marker the mover would mis-handle.
 pub fn write_handoff_marker(marker_path: &Path, contents: &[u8]) -> io::Result<()> {
     write_marker_durable(marker_path, contents)
+}
+
+/// Hand-off transition: a completed mux moves the dir to `state: Done` (title
+/// confident → the mover auto-files it) or `state: Review` (held for operator
+/// confirmation). `apply` populates the mover-facing metadata + `outputs`
+/// (title, year, media_type, tmdb_id, season, poster, overview, …). This is the
+/// single hand-off writer; every completion path (ISO, MKV-resume, inline-mux)
+/// routes through it, so the `season`/`tmdb_id` propagation is identical on
+/// every path (the pre-unification bug where only the ISO path carried them).
+///
+/// Returns whether the durable write appeared to succeed — mirrors the old
+/// `write_handoff_marker` `io::Result` at the call sites, but always `Ok` here
+/// since the underlying write is best-effort-logged; kept infallible so callers
+/// that gated on the write result now gate on `true`.
+pub fn mark_handoff(
+    staging_disc_dir: &Path,
+    title_confident: bool,
+    apply: impl FnOnce(&mut DiscState),
+) -> io::Result<()> {
+    let state = if title_confident {
+        StagingState::Done
+    } else {
+        StagingState::Review
+    };
+    let mut st = read_state(staging_disc_dir).unwrap_or_else(|| DiscState::new(state));
+    st.state = state;
+    st.title_confident = title_confident;
+    if st.date.is_empty() {
+        st.date = crate::util::format_date();
+    }
+    apply(&mut st);
+    // Propagate the write error so a completion path can refuse to declare the
+    // rip handed-off (and preserve staging for retry) when the durable write did
+    // not land — the old `write_handoff_marker` `io::Result` gate.
+    try_write_state(staging_disc_dir, &st)?;
+    // A hand-off supersedes any in-progress ownership markers from a migrated
+    // legacy dir.
+    remove_legacy_marker(staging_disc_dir, SWEEPING_MARKER);
+    remove_legacy_marker(staging_disc_dir, MUXING_MARKER);
+    Ok(())
+}
+
+/// The marker name a hand-off would use, for logging (`.done`/`.review`).
+/// The on-disk representation is `state.json`; this is purely for human-facing
+/// messages that referred to the old file name.
+pub fn handoff_label(title_confident: bool) -> &'static str {
+    if title_confident {
+        DONE_MARKER
+    } else {
+        REVIEW_MARKER
+    }
 }
 
 /// Force the just-muxed output file to durable storage before any
@@ -664,6 +1110,10 @@ impl StagingSnapshot {
 /// having to provoke real per-entry NFS I/O errors from the filesystem.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanObservations {
+    /// A `state.json` (unified store) was seen in the primed listing. When set,
+    /// the lifecycle observations below are IGNORED and re-derived from the
+    /// parsed state — the legacy marker names are only a migration fallback.
+    has_state_file: bool,
     has_done: bool,
     has_review: bool,
     has_ripped: bool,
@@ -687,7 +1137,8 @@ impl ScanObservations {
     /// True iff no marker and no artifact was observed — nothing we can
     /// act on.
     fn observed_nothing(&self) -> bool {
-        !self.has_done
+        !self.has_state_file
+            && !self.has_done
             && !self.has_review
             && !self.has_ripped
             && !self.has_sweeping
@@ -714,6 +1165,261 @@ impl ScanObservations {
     fn contents_unknown(&self) -> bool {
         !self.saw_read_ok || (self.had_entry_error && self.observed_nothing())
     }
+
+    /// True iff any LEGACY lifecycle marker file was observed (used to decide
+    /// whether to upgrade a pre-migration dir to `state.json`). Excludes the
+    /// artifact files and the `state.json` itself.
+    fn has_any_lifecycle_marker(&self) -> bool {
+        self.has_done
+            || self.has_review
+            || self.has_ripped
+            || self.has_sweeping
+            || self.has_muxing
+            || self.has_completed
+            || self.has_failed
+            || self.has_aborted_loss
+    }
+}
+
+/// The lifecycle projection that fills a [`StagingSnapshot`]'s marker bits.
+/// Sourced from `state.json` when present, else derived from legacy marker
+/// files. Artifact bits (`has_iso`/`has_mapfile`/`has_mkv`) are NOT here — they
+/// always come straight from the directory scan.
+#[derive(Default)]
+struct Lifecycle {
+    completed: bool,
+    has_failed: bool,
+    failed_reason: Option<String>,
+    has_aborted_loss: bool,
+    aborted_loss_reason: Option<String>,
+    aborted_loss_attempt: u64,
+    has_done: bool,
+    has_review: bool,
+    has_ripped: bool,
+    has_sweeping: bool,
+    has_muxing: bool,
+}
+
+impl Lifecycle {
+    /// Derive the projection from a parsed unified [`DiscState`].
+    fn from_state(st: &DiscState) -> Lifecycle {
+        use StagingState::*;
+        let is_failed = st.state == Failed;
+        let is_aborted = st.state == AbortedLoss;
+        Lifecycle {
+            // A finished rip (`Done`/`Review`) is "completed" for the resume /
+            // already-completed checks, exactly as the legacy `.completed`
+            // coexisted with `.done`/`.review`.
+            completed: matches!(st.state, Done | Review | Completed),
+            has_failed: is_failed,
+            failed_reason: if is_failed {
+                st.failure_reason.clone()
+            } else {
+                None
+            },
+            has_aborted_loss: is_aborted,
+            aborted_loss_reason: if is_aborted {
+                st.failure_reason.clone()
+            } else {
+                None
+            },
+            aborted_loss_attempt: if is_aborted {
+                st.aborted_loss_attempt
+            } else {
+                0
+            },
+            has_done: st.state == Done,
+            has_review: st.state == Review,
+            has_ripped: st.state == Ripped,
+            has_sweeping: st.state == Sweeping,
+            has_muxing: st.muxing,
+        }
+    }
+
+    /// Derive the projection from the observed legacy marker files, reading the
+    /// `.failed`/`.aborted-loss` bodies only when their marker was seen (the
+    /// same consistency rule the reader always used).
+    fn from_legacy(dir: &Path, obs: &ScanObservations) -> Lifecycle {
+        let failed_reason = if obs.has_failed {
+            read_legacy_failed_reason(dir)
+        } else {
+            None
+        };
+        let (aborted_loss_reason, aborted_loss_attempt) = if obs.has_aborted_loss {
+            match read_legacy_aborted_loss(dir) {
+                Some((reason, attempt)) => (Some(reason), attempt),
+                None => (None, 0),
+            }
+        } else {
+            (None, 0)
+        };
+        Lifecycle {
+            completed: obs.has_completed,
+            has_failed: obs.has_failed,
+            failed_reason,
+            has_aborted_loss: obs.has_aborted_loss,
+            aborted_loss_reason,
+            aborted_loss_attempt,
+            has_done: obs.has_done,
+            has_review: obs.has_review,
+            has_ripped: obs.has_ripped,
+            has_sweeping: obs.has_sweeping,
+            has_muxing: obs.has_muxing,
+        }
+    }
+
+    /// The single lifecycle [`StagingState`] a legacy dir maps to, by strongest
+    /// signal. `None` when no lifecycle marker is present (pure partial state —
+    /// represented by the ABSENCE of `state.json`, so it is NOT upgraded).
+    fn legacy_state(obs: &ScanObservations) -> Option<StagingState> {
+        use StagingState::*;
+        if obs.has_failed {
+            Some(Failed)
+        } else if obs.has_done {
+            Some(Done)
+        } else if obs.has_review {
+            Some(Review)
+        } else if obs.has_aborted_loss {
+            Some(AbortedLoss)
+        } else if obs.has_ripped {
+            Some(Ripped)
+        } else if obs.has_sweeping {
+            Some(Sweeping)
+        } else if obs.has_completed {
+            Some(Completed)
+        } else {
+            None
+        }
+    }
+}
+
+/// Read a LEGACY `.failed` marker's reason (the state.json-preferring
+/// `read_failed_reason` would loop back through the reader). Direct file read.
+fn read_legacy_failed_reason(dir: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(dir.join(FAILED_MARKER)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    v.get("reason")?.as_str().map(|s| s.to_string())
+}
+
+/// Read a LEGACY `.aborted-loss` marker's `(reason, attempt)`. Direct file read.
+fn read_legacy_aborted_loss(dir: &Path) -> Option<(String, u64)> {
+    let body = std::fs::read_to_string(dir.join(ABORTED_LOSS_MARKER)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let reason = v
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or("aborted on loss")
+        .to_string();
+    let attempt = v.get("attempt").and_then(|a| a.as_u64()).unwrap_or(0);
+    Some((reason, attempt))
+}
+
+/// Upgrade a pre-migration staging dir to `state.json` in place: build a
+/// full-fidelity [`DiscState`] from the legacy marker payloads (lifecycle state,
+/// `.ripped` `RippedMarker`, `.done`/`.review` metadata body, restart count,
+/// locks, reasons), write it durably, then remove the legacy marker files so the
+/// reader's fallback can never contradict the unified store. Best-effort — a
+/// write failure just leaves the dir on the legacy path for the next scan.
+///
+/// Called only when a lifecycle marker was observed (`legacy_state` is `Some`);
+/// a pure partial-state dir (artifacts, no marker) is deliberately left with NO
+/// `state.json`, mirroring the legacy "resumable, not owned" representation.
+fn upgrade_legacy_to_state(dir: &Path, obs: &ScanObservations) {
+    let Some(state) = Lifecycle::legacy_state(obs) else {
+        return;
+    };
+    let mut st = DiscState::new(state);
+    st.muxing = obs.has_muxing;
+    st.accept_loss = dir.join(ACCEPT_LOSS_MARKER).exists();
+    // Restart count from the legacy file (state.json doesn't exist yet).
+    st.restart_count = match std::fs::read_to_string(dir.join(RESTART_COUNT_FILE)) {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
+        Err(_) => 0,
+    };
+    if state == StagingState::Failed {
+        st.failure_reason = read_legacy_failed_reason(dir);
+    }
+    if state == StagingState::AbortedLoss
+        && let Some((reason, attempt)) = read_legacy_aborted_loss(dir)
+    {
+        st.failure_reason = Some(reason);
+        st.aborted_loss_attempt = attempt;
+    }
+    // Rich metadata: the `.ripped` RippedMarker (mux inputs) then the
+    // `.done`/`.review` body (mover metadata) — the latter wins where both
+    // carry a field, matching the legacy read precedence.
+    if let Ok(m) = crate::muxer::read_marker(dir) {
+        st.apply_ripped(&m);
+    }
+    apply_legacy_handoff_body(dir, &mut st);
+    if let Some(label) = read_disc_label(dir) {
+        st.disc_label = label;
+    }
+
+    write_state(dir, &st);
+
+    // Strip the now-superseded legacy marker files (keep `.disc-label`; it is
+    // identity, not lifecycle state, and stays its own file).
+    for name in [
+        DONE_MARKER,
+        REVIEW_MARKER,
+        COMPLETED_MARKER,
+        FAILED_MARKER,
+        ABORTED_LOSS_MARKER,
+        RIPPED_MARKER,
+        SWEEPING_MARKER,
+        MUXING_MARKER,
+        ACCEPT_LOSS_MARKER,
+        RESTART_COUNT_FILE,
+    ] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+}
+
+/// Fold a legacy `.done`/`.review` JSON body's mover metadata into `st`.
+fn apply_legacy_handoff_body(dir: &Path, st: &mut DiscState) {
+    let body = std::fs::read_to_string(dir.join(DONE_MARKER))
+        .or_else(|_| std::fs::read_to_string(dir.join(REVIEW_MARKER)));
+    let Ok(body) = body else { return };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return;
+    };
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|x| x.to_string());
+    if let Some(t) = s("title").filter(|x| !x.is_empty()) {
+        st.title = t;
+    }
+    if let Some(d) = s("disc_name") {
+        st.disc_name = d;
+    }
+    if let Some(f) = s("format").filter(|x| !x.is_empty()) {
+        st.disc_format = f;
+    }
+    if let Some(m) = s("media_type").filter(|x| !x.is_empty()) {
+        st.media_type = m;
+    }
+    if let Some(p) = s("poster_url") {
+        st.tmdb_poster = p;
+    }
+    if let Some(o) = s("overview") {
+        st.tmdb_overview = o;
+    }
+    if let Some(d) = s("date") {
+        st.date = d;
+    }
+    if let Some(y) = v.get("year").and_then(|x| x.as_u64()) {
+        st.year = y.min(9999) as u16;
+    }
+    if let Some(id) = v.get("tmdb_id").and_then(|x| x.as_u64()) {
+        st.tmdb_id = id;
+    }
+    st.season = v
+        .get("season")
+        .and_then(|x| x.as_u64())
+        .and_then(|n| u16::try_from(n).ok());
+    st.disc_number = v
+        .get("disc")
+        .and_then(|x| x.as_u64())
+        .and_then(|n| u16::try_from(n).ok());
 }
 
 /// Record the disc's raw volume label in its staging dir. Best-effort: a
@@ -864,7 +1570,9 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
                 obs.saw_any_entries = true;
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name == DONE_MARKER {
+                if name == STATE_FILE {
+                    obs.has_state_file = true;
+                } else if name == DONE_MARKER {
                     obs.has_done = true;
                 } else if name == REVIEW_MARKER {
                     obs.has_review = true;
@@ -923,38 +1631,43 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
         );
     }
 
-    // Only read the `.failed` reason file when the primed scan actually
-    // saw the marker, so the content read is consistent with the
-    // presence check above.
-    let failed_reason = if obs.has_failed {
-        read_failed_reason(dir)
-    } else {
-        None
-    };
-    // Same consistency rule as `.failed`: only read the marker body when the
-    // primed scan actually saw it.
-    let (aborted_loss_reason, aborted_loss_attempt) = if obs.has_aborted_loss {
-        match read_aborted_loss(dir) {
-            Some((reason, attempt)) => (Some(reason), attempt),
-            None => (None, 0),
+    // Lifecycle projection: the unified `state.json` wins; legacy markers are
+    // a one-time migration fallback. Artifact bits below always come from the
+    // scan. `state.json` was read from the SAME primed listing (`has_state_file`
+    // set in the retry loop), so a cold-cache miss can't race it to "absent"
+    // while the loop surfaces the ISO/mapfile.
+    let life = if obs.has_state_file {
+        // A corrupt/torn `state.json` (parse fails) falls back to the legacy
+        // view rather than crashing — safe, since a torn write reads as the
+        // prior on-disk markers.
+        match read_state(dir) {
+            Some(st) => Lifecycle::from_state(&st),
+            None => Lifecycle::from_legacy(dir, &obs),
         }
+    } else if obs.has_any_lifecycle_marker() {
+        // Legacy dir: derive the view now, then upgrade it in place so every
+        // subsequent writer/reader uses `state.json`.
+        let life = Lifecycle::from_legacy(dir, &obs);
+        upgrade_legacy_to_state(dir, &obs);
+        life
     } else {
-        (None, 0)
+        // No unified store and no lifecycle marker — pure partial/empty state.
+        Lifecycle::default()
     };
 
     Some(StagingSnapshot {
         dir: dir.to_path_buf(),
-        completed: obs.has_completed,
-        has_failed: obs.has_failed,
-        failed_reason,
-        has_aborted_loss: obs.has_aborted_loss,
-        aborted_loss_reason,
-        aborted_loss_attempt,
-        has_done: obs.has_done,
-        has_review: obs.has_review,
-        has_ripped: obs.has_ripped,
-        has_sweeping: obs.has_sweeping,
-        has_muxing: obs.has_muxing,
+        completed: life.completed,
+        has_failed: life.has_failed,
+        failed_reason: life.failed_reason,
+        has_aborted_loss: life.has_aborted_loss,
+        aborted_loss_reason: life.aborted_loss_reason,
+        aborted_loss_attempt: life.aborted_loss_attempt,
+        has_done: life.has_done,
+        has_review: life.has_review,
+        has_ripped: life.has_ripped,
+        has_sweeping: life.has_sweeping,
+        has_muxing: life.has_muxing,
         has_iso: obs.has_iso,
         has_mapfile: obs.has_mapfile,
         has_mkv: obs.has_mkv,
@@ -1516,18 +2229,20 @@ mod tests {
         fs::create_dir_all(&disc_a).unwrap();
         fs::create_dir_all(&disc_b).unwrap();
         write_sweeping_marker(&disc_a);
-        write_muxing_marker(&disc_b);
-        assert!(disc_a.join(SWEEPING_MARKER).exists());
-        assert!(disc_b.join(MUXING_MARKER).exists());
+        let mut st = DiscState::new(StagingState::Ripped);
+        st.muxing = true;
+        write_state(&disc_b, &st);
+        assert_eq!(read_state(&disc_a).unwrap().state, StagingState::Sweeping);
+        assert!(read_state(&disc_b).unwrap().muxing);
 
         clear_inprogress_markers(&root);
 
         assert!(
-            !disc_a.join(SWEEPING_MARKER).exists(),
+            read_state(&disc_a).is_none(),
             ".sweeping must be cleared on graceful shutdown"
         );
         assert!(
-            !disc_b.join(MUXING_MARKER).exists(),
+            !read_state(&disc_b).unwrap().muxing,
             ".muxing must be cleared on graceful shutdown"
         );
     }
@@ -1552,7 +2267,7 @@ mod tests {
             hints[0].action,
             ResumeAction::RestartLoopFailed { .. }
         ));
-        assert!(disc.join(FAILED_MARKER).exists());
+        assert_eq!(read_state(&disc).unwrap().state, StagingState::Failed);
         // Counter cleared after promotion to .failed.
         assert_eq!(restart_count(&disc), 0);
     }
@@ -1598,7 +2313,7 @@ mod tests {
         assert_eq!(hints.len(), 1);
         assert!(matches!(hints[0].action, ResumeAction::AlreadyCompleted));
         // Marker must still be there afterwards.
-        assert!(disc.join(COMPLETED_MARKER).exists());
+        assert!(snapshot_staging_disc(&disc).unwrap().completed);
         // MKV must still be there afterwards.
         assert!(disc.join("foo.mkv").exists());
     }
@@ -1628,7 +2343,7 @@ mod tests {
         assert!(!disc.join(FAILED_MARKER).exists());
         // Data preserved for the mover.
         assert!(disc.join("foo.iso").exists());
-        assert!(disc.join(DONE_MARKER).exists());
+        assert_eq!(read_state(&disc).unwrap().state, StagingState::Done);
     }
 
     #[test]
@@ -1660,7 +2375,7 @@ mod tests {
         assert!(!disc.join(FAILED_MARKER).exists());
         // Data preserved for the operator/mover.
         assert!(disc.join("MyDisc.mkv").exists());
-        assert!(disc.join(REVIEW_MARKER).exists());
+        assert_eq!(read_state(&disc).unwrap().state, StagingState::Review);
     }
 
     #[test]
@@ -1836,8 +2551,9 @@ mod tests {
             other => panic!("expected ResumeAbortedLoss, got {other:?}"),
         }
         assert!(disc.join("foo.iso").exists());
-        assert!(
-            disc.join(ABORTED_LOSS_MARKER).exists(),
+        assert_eq!(
+            read_state(&disc).unwrap().state,
+            StagingState::AbortedLoss,
             "marker left intact for retry"
         );
         assert!(
@@ -1873,8 +2589,9 @@ mod tests {
             !disc.join(FAILED_MARKER).exists(),
             "a loss-abort must never be promoted to terminal .failed"
         );
-        assert!(
-            disc.join(ABORTED_LOSS_MARKER).exists(),
+        assert_eq!(
+            read_state(&disc).unwrap().state,
+            StagingState::AbortedLoss,
             ".aborted-loss must remain for the operator"
         );
     }
@@ -1976,11 +2693,7 @@ mod tests {
         fs::create_dir_all(&disc).unwrap();
         fs::write(disc.join("foo.iso"), b"x").unwrap();
         write_sweeping_marker(&disc);
-        fs::write(
-            disc.join(RESTART_COUNT_FILE),
-            format!("{}\n", RESTART_LIMIT).as_bytes(),
-        )
-        .unwrap();
+        mutate_state_if_present(&disc, |s| s.restart_count = RESTART_LIMIT);
 
         let hints = resume_or_quarantine_staging(root.to_str().unwrap());
         assert_eq!(hints.len(), 1);
@@ -1989,9 +2702,9 @@ mod tests {
             "got {:?}",
             hints[0].action
         );
-        assert!(disc.join(FAILED_MARKER).exists());
+        assert_eq!(read_state(&disc).unwrap().state, StagingState::Failed);
         // The in-progress marker is cleared on promotion.
-        assert!(!disc.join(SWEEPING_MARKER).exists());
+        assert_ne!(read_state(&disc).unwrap().state, StagingState::Sweeping);
         assert_eq!(restart_count(&disc), 0);
     }
 
@@ -2004,21 +2717,25 @@ mod tests {
     fn terminal_writers_clear_muxing_lock() {
         // .completed clears .muxing.
         let d1 = tmpdir();
-        write_muxing_marker(&d1);
-        assert!(d1.join(MUXING_MARKER).exists());
+        let mut st1 = DiscState::new(StagingState::Ripped);
+        st1.muxing = true;
+        write_state(&d1, &st1);
+        assert!(read_state(&d1).unwrap().muxing);
         write_completed_marker(&d1);
         assert!(
-            !d1.join(MUXING_MARKER).exists(),
+            !read_state(&d1).unwrap().muxing,
             ".completed must clear a leftover .muxing lock"
         );
 
         // .failed clears .muxing.
         let d2 = tmpdir();
-        write_muxing_marker(&d2);
-        assert!(d2.join(MUXING_MARKER).exists());
+        let mut st2 = DiscState::new(StagingState::Ripped);
+        st2.muxing = true;
+        write_state(&d2, &st2);
+        assert!(read_state(&d2).unwrap().muxing);
         write_failed_marker(&d2, "terminal");
         assert!(
-            !d2.join(MUXING_MARKER).exists(),
+            !read_state(&d2).unwrap().muxing,
             ".failed must clear a leftover .muxing lock"
         );
     }
@@ -2402,12 +3119,13 @@ mod tests {
     }
     #[test]
     fn resume_completed_plus_failed_conflict_is_terminal() {
-        // .completed is checked first, so the verdict is Completed — but the
-        // key property is that it is NEVER re-ripped. Pin Completed.
+        // Writing both .completed and .failed migrates to a single state; the
+        // migration priority makes Failed win. Either way the dir is terminal —
+        // the key property is that it is NEVER re-ripped. Pin Failed.
         assert_eq!(
             resume_verdict(&[Mk::Completed, Mk::Failed]),
-            Verdict::Completed,
-            ".completed precedes .failed in the scan; both are terminal so the dir is never re-ripped"
+            Verdict::Failed,
+            "a conflicting .completed + .failed pair collapses to a single terminal state (Failed wins); never re-ripped"
         );
     }
     #[test]
@@ -2455,7 +3173,7 @@ mod tests {
         assert!(!disc.join(FAILED_MARKER).exists());
         // Artifacts + marker preserved for the resuming rip.
         assert!(disc.join("MyDisc.iso").exists());
-        assert!(disc.join(SWEEPING_MARKER).exists());
+        assert_eq!(read_state(&disc).unwrap().state, StagingState::Sweeping);
     }
 
     /// Convergence M (findings 3 & 4): a STRUCTURAL mux failure in the inline
@@ -2483,8 +3201,8 @@ mod tests {
         clear_restart_count(&disc);
 
         // `.sweeping` superseded by `.failed`.
-        assert!(!disc.join(SWEEPING_MARKER).exists());
-        assert!(disc.join(FAILED_MARKER).exists());
+        assert_ne!(read_state(&disc).unwrap().state, StagingState::Sweeping);
+        assert_eq!(read_state(&disc).unwrap().state, StagingState::Failed);
 
         let hints = resume_or_quarantine_staging(root.to_str().unwrap());
         assert_eq!(hints.len(), 1);
@@ -2507,13 +3225,15 @@ mod tests {
         fs::create_dir_all(&disc).unwrap();
         fs::write(disc.join("MyDisc.iso"), b"x").unwrap();
         fs::write(disc.join("MyDisc.iso.mapfile"), b"x").unwrap();
-        write_muxing_marker(&disc);
+        let mut st = DiscState::new(StagingState::Ripped);
+        st.muxing = true;
+        write_state(&disc, &st);
 
         let hints = resume_or_quarantine_staging(root.to_str().unwrap());
         assert_eq!(hints.len(), 1);
         assert!(matches!(hints[0].action, ResumeAction::InProgress));
         assert_eq!(restart_count(&disc), 1);
-        assert!(!disc.join(FAILED_MARKER).exists());
+        assert_ne!(read_state(&disc).unwrap().state, StagingState::Failed);
     }
 
     /// Convergence R2 finding 1 regression: a deterministically-wedging mux
@@ -2531,13 +3251,12 @@ mod tests {
         fs::create_dir_all(&disc).unwrap();
         fs::write(disc.join("MyDisc.iso"), b"x").unwrap();
         fs::write(disc.join("MyDisc.iso.mapfile"), b"x").unwrap();
-        write_muxing_marker(&disc);
-        // Watchdog has crashed RESTART_LIMIT times; count is on disk.
-        fs::write(
-            disc.join(RESTART_COUNT_FILE),
-            format!("{}\n", RESTART_LIMIT).as_bytes(),
-        )
-        .unwrap();
+        // Watchdog has crashed RESTART_LIMIT times; the mux worker owns the dir
+        // (muxing lock) and the count is on disk.
+        let mut st = DiscState::new(StagingState::Ripped);
+        st.muxing = true;
+        st.restart_count = RESTART_LIMIT;
+        write_state(&disc, &st);
 
         let hints = resume_or_quarantine_staging(root.to_str().unwrap());
         assert_eq!(hints.len(), 1);
@@ -2546,9 +3265,9 @@ mod tests {
             "wedging .muxing at the restart limit must be promoted to .failed, got {:?}",
             hints[0].action
         );
-        assert!(disc.join(FAILED_MARKER).exists());
+        assert_eq!(read_state(&disc).unwrap().state, StagingState::Failed);
         // The lock is cleared so the dir reads terminal, not owned, next pass.
-        assert!(!disc.join(MUXING_MARKER).exists());
+        assert!(!read_state(&disc).unwrap().muxing);
         // Count cleared so a manual re-queue starts fresh.
         assert_eq!(restart_count(&disc), 0);
     }
@@ -2564,11 +3283,7 @@ mod tests {
         fs::write(disc.join("MyDisc.iso"), b"x").unwrap();
         fs::write(disc.join("MyDisc.iso.mapfile"), b"x").unwrap();
         write_sweeping_marker(&disc);
-        fs::write(
-            disc.join(RESTART_COUNT_FILE),
-            format!("{}\n", RESTART_LIMIT).as_bytes(),
-        )
-        .unwrap();
+        mutate_state_if_present(&disc, |s| s.restart_count = RESTART_LIMIT);
 
         let hints = resume_or_quarantine_staging(root.to_str().unwrap());
         assert_eq!(hints.len(), 1);
@@ -2577,8 +3292,8 @@ mod tests {
             "wedging .sweeping at the restart limit must be promoted to .failed, got {:?}",
             hints[0].action
         );
-        assert!(disc.join(FAILED_MARKER).exists());
-        assert!(!disc.join(SWEEPING_MARKER).exists());
+        assert_eq!(read_state(&disc).unwrap().state, StagingState::Failed);
+        assert_ne!(read_state(&disc).unwrap().state, StagingState::Sweeping);
         assert_eq!(restart_count(&disc), 0);
     }
 
@@ -2596,12 +3311,10 @@ mod tests {
         fs::create_dir_all(&disc).unwrap();
         fs::write(disc.join("MyDisc.iso"), b"x").unwrap();
         fs::write(disc.join("MyDisc.iso.mapfile"), b"x").unwrap();
-        write_muxing_marker(&disc);
-        fs::write(
-            disc.join(RESTART_COUNT_FILE),
-            format!("{}\n", RESTART_LIMIT - 1).as_bytes(),
-        )
-        .unwrap();
+        let mut st = DiscState::new(StagingState::Ripped);
+        st.muxing = true;
+        st.restart_count = RESTART_LIMIT - 1;
+        write_state(&disc, &st);
 
         let hints = resume_or_quarantine_staging(root.to_str().unwrap());
         assert_eq!(hints.len(), 1);
@@ -2610,8 +3323,8 @@ mod tests {
             "below-limit .muxing must stay InProgress, got {:?}",
             hints[0].action
         );
-        assert!(!disc.join(FAILED_MARKER).exists());
-        assert!(disc.join(MUXING_MARKER).exists());
+        assert_ne!(read_state(&disc).unwrap().state, StagingState::Failed);
+        assert!(read_state(&disc).unwrap().muxing);
         // R3 finding 2: the scan bumps the counter on the InProgress skip — the
         // dir advances to the limit and fails on the next restart.
         assert_eq!(restart_count(&disc), RESTART_LIMIT);
@@ -2625,25 +3338,28 @@ mod tests {
     fn sweeping_marker_cleared_by_terminal_writes() {
         let d = tmpdir();
         write_sweeping_marker(&d);
-        assert!(d.join(SWEEPING_MARKER).exists());
+        assert_eq!(read_state(&d).unwrap().state, StagingState::Sweeping);
         write_completed_marker(&d);
-        assert!(
-            !d.join(SWEEPING_MARKER).exists(),
+        assert_ne!(
+            read_state(&d).unwrap().state,
+            StagingState::Sweeping,
             ".completed must clear .sweeping"
         );
 
         let d2 = tmpdir();
         write_sweeping_marker(&d2);
         write_failed_marker(&d2, "boom");
-        assert!(
-            !d2.join(SWEEPING_MARKER).exists(),
+        assert_ne!(
+            read_state(&d2).unwrap().state,
+            StagingState::Sweeping,
             ".failed must clear .sweeping"
         );
 
         let d3 = tmpdir();
         write_sweeping_marker(&d3);
         clear_sweeping_marker(&d3);
-        assert!(!d3.join(SWEEPING_MARKER).exists());
+        // Clearing a Sweeping dir removes state.json entirely (resumable, not owned).
+        assert!(read_state(&d3).is_none());
         // Idempotent: clearing an already-gone marker must not panic/error.
         clear_sweeping_marker(&d3);
     }

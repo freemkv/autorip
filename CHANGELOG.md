@@ -4,6 +4,27 @@
 
 ### Added
 
+- **Automatic per-episode TV ripping.** Insert a TV disc and every episode comes
+  out as its own `Show S{NN}E{MM} - Name.mkv` under `TV/Show (Year)/Season NN/`,
+  fully automatically — no operator step. The disc's whole-title list is clustered
+  to the episode set (the "play all" sum-title, extras/menus and duplicate angles
+  are dropped), each episode is matched to TMDB by disc order + runtime and named
+  `S{NN}E{MM}`, and all episodes mux out of the one captured ISO. Missing/mismatched
+  TMDB data degrades to plain sequential numbering (`E01…`) rather than blocking;
+  only a hard failure (no title match, read loss) goes to review, exactly as movies
+  do. Governed by the new `tv_auto` setting (default **on** — it's *auto*rip); turn
+  it off to hold TV discs for review first. Movies are unchanged.
+- **Unified staging state (`state.json`).** Each staging directory's lifecycle —
+  previously encoded as the presence/absence of up to ten marker files
+  (`.sweeping`, `.ripped`, `.done`, `.review`, `.completed`, `.failed`,
+  `.aborted-loss`, `.muxing`, `.accept-loss`, `.restart_count`) — is now one atomic
+  `state.json` carrying the `state` plus all data (including the per-disc
+  `outputs[]` list that makes N-episode fan-out a data structure, not N files).
+  Every reader asks the state machine instead of sniffing filenames; the durable
+  `tmp → fsync → rename → dir-fsync` transition and all crash-recovery / NFS
+  cold-cache invariants are preserved, and pre-existing staging dirs are migrated
+  in place on the first scan after upgrade.
+
 - **Proper TV support.** A series disc now resolves to the show itself and files
   into the Jellyfin/Plex layout `TV/Show (Year)/Season NN/`. The season number is
   read from the disc label (`Endeavour Season 5 Disc 2`, `GOT_S3_DISC1`, …), the
@@ -16,6 +37,12 @@
   without re-searching.
 
 ### Fixed
+
+- **TV rips no longer lose their season on the common (MKV) path.** The season and
+  TMDB id only reached the ISO-output hand-off marker; the muxed-MKV completion
+  paths dropped them, so every MKV TV rip silently filed under `Season 01`. With
+  the unified `state.json` all completion paths carry the same metadata, so a
+  season-labelled disc folders under the right `Season NN` whichever way it's muxed.
 
 - **A season-labelled disc now resolves to the show, not a same-named film.** When
   the disc label carries a season marker, the title match prefers the TV series

@@ -762,6 +762,18 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         );
     }
 
+    // The deliverable plan the rip recorded in `state.json` (movie = 1 output;
+    // TV = one per episode title). `is_fanout` (len > 1) is the ONLY thing that
+    // switches this function into TV mode: the primary title/filename come from
+    // `plan[0]` and the extra episodes are muxed in a loop just before the
+    // hand-off. When there is no multi-output plan (movies, cold legacy resume)
+    // every `is_fanout` branch takes its original path, so that flow is
+    // unchanged.
+    let plan_outputs: Vec<staging::Output> = staging::read_state(&staging_dir)
+        .map(|s| s.outputs)
+        .unwrap_or_default();
+    let is_fanout = plan_outputs.len() > 1;
+
     crate::log::device_log(
         device,
         &format!(
@@ -863,7 +875,15 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // that re-scans could leave it empty — index-into-empty would panic
     // the rip thread. The earlier `title_ok` guard ran on the *pre-key*
     // binding, so it doesn't cover this one.
-    let title = match disc.titles.first() {
+    // The primary title: for a TV fan-out, the first planned episode's title
+    // index; otherwise the main title (movies — unchanged). `.get` guards a
+    // stale/out-of-range index (a truncated re-scan) exactly like `.first`.
+    let primary_index = if is_fanout {
+        plan_outputs[0].title_index
+    } else {
+        0
+    };
+    let title = match disc.titles.get(primary_index) {
         Some(t) => t.clone(),
         None => {
             crate::log::device_log(device, "Auto-resume aborted: no title after key resolution");
@@ -1032,7 +1052,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
 
     let output_format = cfg_read.output_format.clone();
     let ext = super::output_extension_for(&output_format, &disc);
-    let filename = format!("{}.{}", display_name, ext);
+    // TV fan-out: the primary episode's staging leaf comes from the plan; movies
+    // keep the `{display_name}.{ext}` name (unchanged).
+    let filename = if is_fanout {
+        plan_outputs[0].filename.clone()
+    } else {
+        format!("{}.{}", display_name, ext)
+    };
     let staging_str = staging_dir.to_string_lossy().into_owned();
     let output_path = format!("{}/{}", staging_str, filename);
     let dest_url = if staging::is_network_output(&output_format, &cfg_read.network_target) {
@@ -1310,37 +1336,34 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             super::unregister_halt(device);
             return;
         }
-        let marker_name = super::handoff_marker_name(title_confident);
-        // Mirror the fresh-rip ISO marker (mod.rs) field-for-field so the
-        // mover gets identical metadata on a resume: `disc_name` (the disc's
-        // own label, distinct from the resolved `title`), `media_type` (mover
-        // routing — TV vs movie), `poster_url`, and `overview`. Omitting these
-        // surfaced empty poster/overview in Plex and filed TV resumes as movies.
-        let done_marker = serde_json::json!({
-            "title": display_name,
-            "disc_name": disc_label,
-            "format": disc_format,
-            "year": tmdb_year,
-            "media_type": media_type,
-            "poster_url": tmdb_poster,
-            "overview": tmdb_overview,
-            "date": crate::util::format_date(),
-            "resumed": true,
-        });
-        // `to_string_pretty` on a `json!`-constructed Value is effectively
-        // infallible; `.expect` makes the invariant explicit (mirrors
-        // staging::write_failed_marker) so a real serialization failure
-        // surfaces as a panic rather than silently writing an empty marker
-        // that the mover skips, stranding the output in staging forever.
-        let marker_body =
-            serde_json::to_string_pretty(&done_marker).expect("json! value is always serialisable");
-        if let Err(e) =
-            staging::write_handoff_marker(&staging_dir.join(marker_name), marker_body.as_bytes())
-        {
+        let marker_name = staging::handoff_label(title_confident);
+        // One `state.json` hand-off transition. The metadata mirrors the
+        // fresh-rip ISO path field-for-field; `season`/`tmdb_id`/`disc` are NOT
+        // set here so they are PRESERVED from the `state: Ripped` the sweep wrote
+        // (mark_handoff read-modify-writes the existing state) — a resume must
+        // not drop the TV routing the fresh rip recorded.
+        let iso_leaf = iso_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Err(e) = staging::mark_handoff(&staging_dir, title_confident, |s| {
+            s.title = display_name.clone();
+            s.disc_name = disc_label.clone();
+            s.disc_format = disc_format.clone();
+            s.year = tmdb_year;
+            s.media_type = media_type.clone();
+            s.tmdb_poster = tmdb_poster.clone();
+            s.tmdb_overview = tmdb_overview.clone();
+            s.resumed = true;
+            s.outputs = vec![staging::Output {
+                filename: iso_leaf,
+                ..Default::default()
+            }];
+        }) {
             crate::log::device_log(
                 device,
                 &format!(
-                    "Auto-resume: {} marker write failed ({}). Preserving staging for retry.",
+                    "Auto-resume: {} state write failed ({}). Preserving staging for retry.",
                     marker_name, e
                 ),
             );
@@ -1657,35 +1680,135 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         );
         return;
     }
-    let marker_name = super::handoff_marker_name(title_confident);
-    // Mirror the fresh-rip MKV marker (mod.rs) field-for-field: `disc_name`,
-    // `media_type`, `poster_url`, `overview`. Without them a resume completion
-    // handed the mover impoverished metadata vs a fresh rip of the same disc
-    // (empty poster/overview, TV shows misfiled as movies).
-    let done_marker = serde_json::json!({
-        "title": display_name,
-        "disc_name": disc_label,
-        "format": disc_format,
-        "year": tmdb_year,
-        "media_type": media_type,
-        "poster_url": tmdb_poster,
-        "overview": tmdb_overview,
-        "date": crate::util::format_date(),
-        "resumed": true,
-    });
-    let done_path = staging_dir.join(marker_name);
-    // Durable, atomic marker write (tmp + fsync + rename + staging-dir fsync).
-    // The dir-fsync is the crash barrier: it guarantees this hand-off marker
-    // is observed on disk before the later `.completed` write, so a crash can
-    // never strand `.completed` (terminal) without a durable `.done`.
-    // `to_string_pretty` on a `json!`-constructed Value is effectively
-    // infallible; `.expect` makes the invariant explicit (mirrors
-    // staging::write_failed_marker) so a real serialization failure surfaces
-    // as a panic rather than silently writing an empty marker that the mover
-    // skips, stranding the output in staging forever.
-    let marker_body =
-        serde_json::to_string_pretty(&done_marker).expect("json! value is always serialisable");
-    if let Err(e) = staging::write_handoff_marker(&done_path, marker_body.as_bytes()) {
+    // TV fan-out: the primary episode is muxed + durable above. Now mux the
+    // REMAINING episodes from the same ISO, one file each, reusing the disc's
+    // title table + decrypt keys. Best-guess/auto: a per-episode mux failure is
+    // logged and skipped (the mover files whatever landed) rather than failing
+    // the whole disc. No-op for movies (`is_fanout` false → empty slice).
+    if is_fanout {
+        for extra in plan_outputs.iter().skip(1) {
+            let Some(ep_title) = disc.titles.get(extra.title_index).cloned() else {
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "TV episode E{:02}: title index {} not present on the disc — skipped",
+                        extra.episode.unwrap_or(0),
+                        extra.title_index
+                    ),
+                );
+                continue;
+            };
+            let ep_bps: f64 = {
+                let b = ep_title.size_bytes as f64;
+                let d = ep_title.duration_secs;
+                if b > 0.0 && d > 0.0 {
+                    b / d
+                } else {
+                    FALLBACK_BITRATE_BYTES_PER_SEC
+                }
+            };
+            let ep_output_path = format!("{staging_str}/{}", extra.filename);
+            let ep_dest_url = format!(
+                "{}://{}",
+                super::output_scheme_for(&output_format),
+                ep_output_path
+            );
+            let ep_inputs = super::mux::MuxInputs {
+                device,
+                display_name: display_name.clone(),
+                disc_format: disc_format.clone(),
+                tmdb_title: tmdb_title.clone(),
+                tmdb_year,
+                tmdb_poster: tmdb_poster.clone(),
+                tmdb_overview: tmdb_overview.clone(),
+                duration: crate::util::format_duration_hm(ep_title.duration_secs),
+                codecs: state_codecs.clone(),
+                filename: extra.filename.clone(),
+                total_bytes,
+                title_bytes_per_sec: ep_bps,
+                total_passes: cfg_read.max_retries.saturating_add(2),
+                bytes_total_disc: disc.capacity_bytes,
+                max_retries: cfg_read.max_retries,
+                bytes_unreadable_at_mux: map.stats().bytes_unreadable,
+                dest_url: ep_dest_url,
+                batch,
+                staging_disc_dir: staging_dir.clone(),
+                // Extra episodes share the disc's captured ISO; per-title sweep
+                // damage isn't separately tracked (auto/best-guess).
+                sweep_damage: super::mux::SweepDamageSnapshot::default(),
+            };
+            let ep_src = super::mux::IsoMuxSource {
+                iso_path: iso_path.clone(),
+                title: ep_title,
+                format: disc.content_format,
+                keys: disc.decrypt_keys(),
+                key_fetch: crate::keysource::build_iso_key_fetch(&cfg_read, &iso_path),
+                raw: false,
+                skip_errors: false,
+            };
+            let ep_atomics = super::mux::MuxAtomics {
+                latest_bytes_read: Arc::new(AtomicU64::new(0)),
+                rip_last_lba: Arc::new(AtomicU64::new(0)),
+                rip_current_batch: Arc::new(AtomicU16::new(batch)),
+                wd_last_frame: Arc::new(AtomicU64::new(crate::util::epoch_secs())),
+                wd_bytes: Arc::new(AtomicU64::new(0)),
+                input_errors: Arc::new(AtomicU32::new(0)),
+            };
+            match super::mux::mux_iso(ep_inputs, ep_src, ep_atomics) {
+                Ok(o) if o.output_opened && o.completed => {
+                    let _ = staging::fsync_output_file(std::path::Path::new(&ep_output_path));
+                    crate::log::device_log(
+                        device,
+                        &format!(
+                            "TV episode E{:02} muxed → {}",
+                            extra.episode.unwrap_or(0),
+                            extra.filename
+                        ),
+                    );
+                }
+                Ok(_) => crate::log::device_log(
+                    device,
+                    &format!(
+                        "TV episode E{:02} did not complete muxing — skipped (best-guess auto)",
+                        extra.episode.unwrap_or(0)
+                    ),
+                ),
+                Err(e) => crate::log::device_log(
+                    device,
+                    &format!(
+                        "TV episode E{:02} mux failed ({e}) — skipped (best-guess auto)",
+                        extra.episode.unwrap_or(0)
+                    ),
+                ),
+            }
+        }
+    }
+
+    let marker_name = staging::handoff_label(title_confident);
+    // One `state.json` hand-off transition — the dir-fsync inside it is the
+    // crash barrier (the durable hand-off is observed before the later
+    // `.completed`). Metadata mirrors the fresh-rip MKV path; `season`/`tmdb_id`/
+    // `disc` are intentionally NOT set so they are preserved from the
+    // `state: Ripped` the sweep recorded (a resume must not drop TV routing).
+    let mkv_leaf = filename.clone();
+    if let Err(e) = staging::mark_handoff(&staging_dir, title_confident, |s| {
+        s.title = display_name.clone();
+        s.disc_name = disc_label.clone();
+        s.disc_format = disc_format.clone();
+        s.year = tmdb_year;
+        s.media_type = media_type.clone();
+        s.tmdb_poster = tmdb_poster.clone();
+        s.tmdb_overview = tmdb_overview.clone();
+        s.resumed = true;
+        // Preserve a multi-episode TV plan recorded at rip time; only seed the
+        // single movie output when no plan is present (cold legacy resume).
+        if s.outputs.len() <= 1 {
+            s.outputs = vec![staging::Output {
+                filename: mkv_leaf,
+                ..Default::default()
+            }];
+        }
+    }) {
         // The hand-off marker is what the mover / review UI keys on. If it
         // fails to write (NFS / perms), do NOT write .completed or clear
         // .restart_count — leaving the partial state intact means the
@@ -1696,11 +1819,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         crate::log::device_log(
             device,
             &format!(
-                "Auto-resume: {} marker write failed ({}): {}. \
+                "Auto-resume: {} state write failed ({}). \
                  Preserving staging for next-restart retry.",
-                marker_name,
-                done_path.display(),
-                e
+                marker_name, e
             ),
         );
         reset_status_after_ripping(
@@ -2443,8 +2564,8 @@ mod title_confidence_routing_tests {
             .expect("resume.rs should have the mux-time-loss note after the ISO branch");
         let region = &src[start..end];
         assert!(
-            region.contains("handoff_marker_name(title_confident)"),
-            "the ISO completion branch must hand off via handoff_marker_name, not a duplicated ternary"
+            region.contains("mark_handoff("),
+            "the ISO completion branch must hand off via staging::mark_handoff, not a duplicated ternary"
         );
     }
 }
@@ -3054,16 +3175,16 @@ mod post_mux_loss_reporting_tests {
             region.contains("demux_lost_secs"),
             "completed-mux success region must report demux-time loss"
         );
-        // (b) Within threshold it hands off via a `.done`/`.review` marker,
-        // routed through the shared `handoff_marker_name` policy (mod.rs) so
-        // this completion route can't drift from the fresh-rip one.
+        // (b) Within threshold it hands off to Done/Review, routed through the
+        // shared `handoff_label` title-confidence policy (staging) so this
+        // completion route can't drift from the fresh-rip one.
         assert!(
-            region.contains("handoff_marker_name(title_confident)"),
+            region.contains("handoff_label(title_confident)"),
             "completed mux must hand off to .done (confident) or .review (not)"
         );
         assert!(
-            region.contains("write_handoff_marker"),
-            "completed mux must write a hand-off marker so the mover/operator picks it up"
+            region.contains("mark_handoff("),
+            "completed mux must write the unified hand-off state so the mover/operator picks it up"
         );
         // (c) A loss is a loss: mux-time loss OVER abort_on_lost_secs quarantines
         //     to a RESUMABLE .aborted-loss, gated on the threshold.
@@ -3413,12 +3534,15 @@ mod resume_lock_and_fsync_tests {
     #[test]
     fn cold_resume_guard_writes_and_clears_muxing() {
         let d = tmpdir();
-        assert!(!d.join(".muxing").exists());
+        // The muxing lock is a field set on the existing (Ripped) state, so seed
+        // a Ripped state.json for the guard to attach the lock to.
+        staging::write_state(&d, &staging::DiscState::new(staging::StagingState::Ripped));
+        assert!(!staging::read_state(&d).map(|s| s.muxing).unwrap_or(false));
         {
             let _g = ResumeMuxingGuard::acquire("sg0", &d);
             assert!(
-                d.join(".muxing").exists(),
-                "cold-resume guard must write .muxing while the mux is in flight"
+                staging::read_state(&d).expect("state").muxing,
+                "cold-resume guard must set the muxing lock while the mux is in flight"
             );
             // While held, the snapshot the ownership/blocked checks consult
             // reports the dir as owned.
@@ -3426,8 +3550,8 @@ mod resume_lock_and_fsync_tests {
             assert!(snap.has_muxing);
         }
         assert!(
-            !d.join(".muxing").exists(),
-            ".muxing must be cleared on guard drop (covers early-return / panic)"
+            !staging::read_state(&d).expect("state").muxing,
+            "the muxing lock must be cleared on guard drop (covers early-return / panic)"
         );
     }
 
@@ -3438,16 +3562,21 @@ mod resume_lock_and_fsync_tests {
     #[test]
     fn worker_mux_device_does_not_double_manage_muxing() {
         let d = tmpdir();
-        // Simulate the worker having written .muxing before dispatch.
+        // Simulate the worker having set the muxing lock before dispatch. The
+        // lock is a field on the Ripped state, so seed that state first.
+        staging::write_state(&d, &staging::DiscState::new(staging::StagingState::Ripped));
         staging::write_muxing_marker(&d);
-        assert!(d.join(".muxing").exists());
+        assert!(staging::read_state(&d).expect("state").muxing);
         {
             let _g = ResumeMuxingGuard::acquire("_mux", &d);
-            assert!(d.join(".muxing").exists(), "worker's lock stays put");
+            assert!(
+                staging::read_state(&d).expect("state").muxing,
+                "worker's lock stays put"
+            );
         }
         assert!(
-            d.join(".muxing").exists(),
-            "the `_mux` guard must leave the worker's .muxing intact on drop"
+            staging::read_state(&d).expect("state").muxing,
+            "the `_mux` guard must leave the worker's muxing lock intact on drop"
         );
     }
 
@@ -3480,10 +3609,15 @@ mod resume_lock_and_fsync_tests {
         .unwrap();
         let quarantined = handle_resume_fsync_failure("_mux", &d, "mux output");
         assert!(quarantined, "reaching RESTART_LIMIT must quarantine");
-        assert!(d.join(".failed").exists(), ".failed written (terminal)");
+        let snap = staging::snapshot_staging_disc(&d).expect("snapshot");
+        assert!(snap.has_failed, "state Failed written (terminal)");
         assert!(
             !d.join(".ripped").exists(),
             ".ripped dropped so the worker can't re-queue the terminal dir"
+        );
+        assert!(
+            !snap.has_ripped,
+            "state is no longer Ripped so the worker can't re-queue the terminal dir"
         );
         assert_eq!(
             staging::restart_count(&d),
