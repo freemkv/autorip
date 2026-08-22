@@ -6160,22 +6160,23 @@ fn plan_mux_outputs(
         return one_output();
     }
     let season_num = season.unwrap_or(1);
-    // Multi-disc offset: disc 2 of a season starts where disc 1 left off. We
-    // don't know the season's per-disc split for certain, so assume this disc's
-    // episode count is uniform across earlier discs — the common boxset layout —
-    // giving `start = (disc-1)*count + 1`. This is strictly better than always
-    // numbering from E01 (which collided disc 2's episodes with disc 1's); an
-    // unusual split still degrades to a wrong-but-sequential guess, never a
-    // collision within one disc. Disc 1 (or an unmarked label) starts at E01.
+    let title_secs: Vec<f64> = indices.iter().map(|&i| titles[i].duration_secs).collect();
+    // Multi-disc offset. A disc can't count the episodes on the discs *before*
+    // it, so start from the uniform-split guess — `(disc-1)*count + 1`, correct
+    // for the common even boxset — then let `align_disc_offset` repair uneven
+    // splits (6+4, etc.) when the runtimes carry enough signal to pin the true
+    // position. With no signal (uniform season, or no TMDB data) the alignment
+    // ties and returns this same fallback, so we never number worse than the
+    // guess. Disc 1 (or an unmarked label) falls back to E01.
     let disc_num = crate::tmdb::disc_from_label(disc_name).unwrap_or(1).max(1);
-    let start = 1u16.saturating_add(
+    let fallback_start = 1u16.saturating_add(
         disc_num
             .saturating_sub(1)
             .saturating_mul(indices.len() as u16),
     );
-    // TMDB episode names, best-effort (empty on any failure → sequential).
+    // TMDB episode list, best-effort (empty on any failure → sequential naming).
     let episodes = crate::tmdb::season_episodes(tmdb_id, season_num, &cfg.tmdb_api_key);
-    let title_secs: Vec<f64> = indices.iter().map(|&i| titles[i].duration_secs).collect();
+    let start = crate::tmdb::align_disc_offset(&title_secs, &episodes, fallback_start);
     let assignments = crate::tmdb::map_episodes(&title_secs, &episodes, start);
     // Staging leaves derive from the movie leaf's stem + extension so they share
     // the output format and stay unique per episode. The mover renames each to
