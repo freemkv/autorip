@@ -1126,7 +1126,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     crate::log::device_log(device, &format!("Disc: {}", id_name));
 
     // TMDB lookup — fast, user sees poster while full scan runs
-    let tmdb = crate::tmdb::lookup(&crate::tmdb::clean_title(&id_name), &cfg_read.tmdb_api_key);
+    let tmdb = crate::tmdb::lookup(&id_name, &cfg_read.tmdb_api_key);
     let display_name = tmdb
         .as_ref()
         .map(|t| t.title.clone())
@@ -2561,10 +2561,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 .unwrap_or(&disc.volume_id)
                 .to_string();
 
-            let tmdb = crate::tmdb::lookup(
-                &crate::tmdb::clean_title(&disc_name),
-                &cfg_read.tmdb_api_key,
-            );
+            let tmdb = crate::tmdb::lookup(&disc_name, &cfg_read.tmdb_api_key);
 
             DriveSession {
                 drive,
@@ -2656,6 +2653,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         .as_ref()
         .map(|t| t.media_type.clone())
         .unwrap_or_default();
+    // TMDB numeric id (0 = no match). Persisted in the hand-off marker so a
+    // consumer can enrich metadata by id later; the mover reads it back.
+    let tmdb_id = tmdb.as_ref().map(|t| t.tmdb_id).unwrap_or(0);
 
     let display_name = if tmdb_title.is_empty() {
         disc_name.clone()
@@ -4597,6 +4597,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 "format": disc_format,
                 "year": tmdb_year,
                 "media_type": tmdb_media_type,
+                "tmdb_id": tmdb_id,
+                // TV structuring metadata parsed from the raw disc label — the
+                // mover places a series rip under `Show (Year)/Season NN/`.
+                // Null for a movie or an unmarked label.
+                "season": crate::tmdb::season_from_label(&disc_name),
+                "disc": crate::tmdb::disc_from_label(&disc_name),
                 "poster_url": tmdb_poster,
                 "overview": tmdb_overview,
                 "date": crate::util::format_date(),
@@ -6086,11 +6092,7 @@ fn title_is_confident(
 ) -> bool {
     tmdb_api_key.trim().is_empty()
         || overridden
-        || crate::tmdb::is_confident_match(
-            &crate::tmdb::clean_title(disc_name),
-            display_name,
-            tmdb_year,
-        )
+        || crate::tmdb::is_confident_match(disc_name, display_name, tmdb_year)
 }
 
 /// The hand-off marker a finished rip writes: `.done` hands the output to the
