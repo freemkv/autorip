@@ -368,6 +368,20 @@ pub fn mutate_state(
     write_state(staging_disc_dir, &st);
 }
 
+/// The one-shot accept-loss REOPEN transition: move a terminal/abort dir back to
+/// the re-muxable `Ripped` hand-off state and clear the failure bookkeeping, so
+/// the operator's "Accept damage" re-muxes the existing ISO instead of being
+/// refused. A dir in any other state is left untouched (so a `Done`/`Completed`
+/// dir is never wrongly reopened). Shared by the web `handle_accept_loss` handler
+/// and its test so the two can't drift.
+pub fn apply_accept_loss_reopen(s: &mut DiscState) {
+    if matches!(s.state, StagingState::AbortedLoss | StagingState::Failed) {
+        s.state = StagingState::Ripped;
+    }
+    s.failure_reason = None;
+    s.restart_count = 0;
+}
+
 /// Read-modify-write `state.json` ONLY if it already exists — a no-op when
 /// absent. Used by lock-clearing / one-shot-consuming helpers that must not
 /// conjure a state file for a dir that has none (e.g. clearing `.muxing` on a
