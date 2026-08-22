@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-autorip"
-version = "1.6.8"
+version = "1.6.9"
 dependencies = [
  "freemkv-engine",
  "freemkv-i18n",

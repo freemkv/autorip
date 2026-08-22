@@ -1787,6 +1787,10 @@ fn handle_title_override(request: tiny_http::Request, device: &str) {
     let poster = clamp_chars(poster_raw, 1000);
     let overview = clamp_chars(v["overview"].as_str().unwrap_or(""), 2000);
     let media_type = normalize_media_type(v["media_type"].as_str().unwrap_or("movie"));
+    // The picker posts back the chosen result's TMDB id (0 if the operator
+    // typed a free-form title with no pick); carry it so the override matches
+    // what a `lookup` match would have provided.
+    let tmdb_id = v["tmdb_id"].as_u64().unwrap_or(0);
     ripper::set_title_override(
         device,
         crate::tmdb::TmdbResult {
@@ -1795,6 +1799,7 @@ fn handle_title_override(request: tiny_http::Request, device: &str) {
             poster_url: poster.clone(),
             overview: overview.clone(),
             media_type,
+            tmdb_id,
         },
     );
     // Reflect on the live card right away.
