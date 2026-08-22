@@ -789,7 +789,9 @@ fn classify_done_absence(err_kind: std::io::ErrorKind, dir: &Path) -> DoneAbsenc
 }
 
 fn check_and_move(cfg: &Config) {
-    // Scan staging directory for completed rips (directories with .done marker)
+    // Scan staging directory for completed rips (dirs whose state.json is in
+    // StagingState::Done; a legacy `.done` file is the fallback for un-migrated
+    // dirs — see the per-dir readiness check below).
     let staging_root = &cfg.staging_dir;
     let entries = match std::fs::read_dir(staging_root) {
         Ok(e) => e,
@@ -2432,6 +2434,88 @@ mod tests {
             media_type: "tv".into(),
             tmdb_id: 0,
         }
+    }
+
+    use crate::ripper::staging::Output;
+
+    fn ep_output(filename: &str, episode: Option<u16>, episode_name: &str) -> Output {
+        Output {
+            filename: filename.into(),
+            title_index: 0,
+            episode,
+            episode_name: episode_name.into(),
+            moved: false,
+        }
+    }
+
+    #[test]
+    fn tv_episode_leaf_basic() {
+        let tmdb = Some(tmdb_tv("Endeavour", 2012));
+        let outputs = vec![ep_output("Endeavour_S05E01.mkv", Some(1), "")];
+        assert_eq!(
+            tv_episode_leaf(&tmdb, &outputs, "Endeavour_S05E01.mkv", Some(5)),
+            Some("Endeavour S05E01.mkv".to_string())
+        );
+    }
+
+    #[test]
+    fn tv_episode_leaf_includes_episode_name_when_present() {
+        let tmdb = Some(tmdb_tv("Endeavour", 2012));
+        let outputs = vec![ep_output("Endeavour_S05E01.mkv", Some(1), "Muse")];
+        assert_eq!(
+            tv_episode_leaf(&tmdb, &outputs, "Endeavour_S05E01.mkv", Some(5)),
+            Some("Endeavour S05E01 - Muse.mkv".to_string())
+        );
+    }
+
+    #[test]
+    fn tv_episode_leaf_none_for_movie_media_type() {
+        let tmdb = Some(tmdb_movie("Endeavour", 2012));
+        let outputs = vec![ep_output("Endeavour_S05E01.mkv", Some(1), "")];
+        assert_eq!(
+            tv_episode_leaf(&tmdb, &outputs, "Endeavour_S05E01.mkv", Some(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn tv_episode_leaf_none_when_filename_not_in_outputs() {
+        let tmdb = Some(tmdb_tv("Endeavour", 2012));
+        let outputs = vec![ep_output("Endeavour_S05E01.mkv", Some(1), "")];
+        assert_eq!(
+            tv_episode_leaf(&tmdb, &outputs, "Somewhere_Else.mkv", Some(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn tv_episode_leaf_none_when_output_has_no_episode() {
+        let tmdb = Some(tmdb_tv("Endeavour", 2012));
+        let outputs = vec![ep_output("Endeavour_S05E01.mkv", None, "")];
+        assert_eq!(
+            tv_episode_leaf(&tmdb, &outputs, "Endeavour_S05E01.mkv", Some(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn tv_episode_leaf_defaults_season_to_one_when_none() {
+        let tmdb = Some(tmdb_tv("Firefly", 2002));
+        let outputs = vec![ep_output("Firefly_E03.mkv", Some(3), "")];
+        assert_eq!(
+            tv_episode_leaf(&tmdb, &outputs, "Firefly_E03.mkv", None),
+            Some("Firefly S01E03.mkv".to_string())
+        );
+    }
+
+    #[test]
+    fn tv_episode_leaf_sanitizes_title_path_separator() {
+        let tmdb = Some(tmdb_tv("Rogue/One", 2016));
+        let outputs = vec![ep_output("Rogue.mkv", Some(2), "")];
+        let leaf = tv_episode_leaf(&tmdb, &outputs, "Rogue.mkv", Some(1))
+            .expect("expected a TV episode leaf");
+        assert!(!leaf.contains('/'), "leaf must not contain '/': {leaf}");
+        assert_eq!(leaf, "RogueOne S01E02.mkv");
     }
 
     /// `MOVE_ERRORS` is process-global. Tests that assert on its contents (or
