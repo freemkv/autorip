@@ -34,8 +34,8 @@ pub static MOVE_STATE: once_cell::sync::Lazy<Mutex<Vec<MoveState>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(Vec::new()));
 
 /// The on-disk basename of the staging dir currently being moved, or `None`.
-/// The Move queue (`build_queue_views`) scans for `.done` markers, and the
-/// actively-moving dir still carries its `.done` for the duration of the copy —
+/// The Move queue (`build_queue_views`) selects dirs in `StagingState::Done`,
+/// and the actively-moving dir stays in `Done` for the duration of the copy —
 /// so without this it would appear BOTH as its live progress bars (`_move`) and
 /// as a "(moving)" queue row (`_move_queue`), i.e. listed twice. The queue scan
 /// reads this and skips the active dir, so the exclusion is by exact on-disk
@@ -955,7 +955,7 @@ fn check_and_move(cfg: &Config) {
         // IS the deliverable (the ripper skipped the title mux), so the
         // staging dir holds no `.mkv` — only the `.iso` to promote.
         let move_iso = cfg.keep_iso || crate::ripper::output_is_iso_image(&cfg.output_format);
-        let (ripped_files, listing_complete): (Vec<std::path::PathBuf>, bool) =
+        let (mut ripped_files, listing_complete): (Vec<std::path::PathBuf>, bool) =
             match std::fs::read_dir(&dir) {
                 Ok(entries) => {
                     collect_ripped_files(entries.map(|r| r.map(|e| e.path())), move_iso, &dir)
@@ -975,11 +975,31 @@ fn check_and_move(cfg: &Config) {
                 }
             };
 
+        // For a TV rip, `state_outputs` (from state.json) is the AUTHORITATIVE
+        // deliverable list — file exactly those episodes and nothing else. The
+        // directory scan (`collect_ripped_files`) can also surface a leftover
+        // partial from an episode whose mux/fsync failed and whose delete didn't
+        // land (the fan-out excludes it from `outputs[]` but a swallowed unlink
+        // could leave the file on disk); without this filter that truncated file
+        // would be promoted under its raw name as if it were a complete episode.
+        // Movies / legacy dirs (no episode-bearing plan) keep the scan-and-file
+        // behaviour byte-for-byte.
+        let is_tv_plan = state_outputs.iter().any(|o| o.episode.is_some());
+        if is_tv_plan {
+            let allowed: std::collections::HashSet<&str> =
+                state_outputs.iter().map(|o| o.filename.as_str()).collect();
+            ripped_files.retain(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| allowed.contains(n))
+                    .unwrap_or(false)
+            });
+        }
+
         if ripped_files.is_empty() {
             // Nothing the mover should promote. Skip; the dir's lifetime
-            // is governed by the ripper (which writes the .done marker
-            // and is responsible for its own ISO-prune in the
-            // keep_iso=false multipass path).
+            // is governed by the ripper (which owns the state.json transition
+            // and its own ISO-prune in the keep_iso=false multipass path).
             continue;
         }
 
@@ -3841,6 +3861,106 @@ mod tests {
             first,
             "disc 1's delivered file must be untouched"
         );
+    }
+
+    /// Regression: `state.json`'s `outputs[]` is the AUTHORITATIVE deliverable
+    /// list for a TV rip (`is_tv_plan`, see the "AUTHORITATIVE deliverable
+    /// list" comment in `check_and_move`). A leftover partial episode whose
+    /// mux/fsync failed and whose delete was swallowed can still be sitting on
+    /// disk under its raw name; without the `ripped_files.retain(...)` filter
+    /// it would be promoted into the library as if it were a complete episode.
+    /// Here the staging dir holds two *planned* episodes (S05E01, S05E02) plus
+    /// a leftover `S05E03` that never made it into `outputs[]`: only the two
+    /// planned episodes may reach the output tree.
+    #[test]
+    fn check_and_move_files_only_outputs_for_a_tv_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(output_dir.join("TV")).unwrap();
+
+        let cfg = Config {
+            staging_dir: staging.to_string_lossy().to_string(),
+            output_dir: output_dir.to_string_lossy().to_string(),
+            movie_dir: String::new(),
+            tv_dir: "TV".to_string(),
+            ..Config::default()
+        };
+
+        let disc_dir = staging.join("Endeavour_S05");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+
+        let mut st =
+            crate::ripper::staging::DiscState::new(crate::ripper::staging::StagingState::Done);
+        st.title = "Endeavour".to_string();
+        st.disc_name = "Endeavour".to_string();
+        st.year = 2012;
+        st.media_type = "tv".to_string();
+        st.tmdb_id = 12345;
+        st.season = Some(5);
+        st.outputs = vec![
+            ep_output("Endeavour_S05E01.mkv", Some(1), "Muse"),
+            ep_output("Endeavour_S05E02.mkv", Some(2), "Cartouche"),
+        ];
+        crate::ripper::staging::write_state(&disc_dir, &st);
+
+        // Two planned episodes, plus a leftover partial NOT in outputs[].
+        std::fs::write(disc_dir.join("Endeavour_S05E01.mkv"), vec![0x11u8; 4096]).unwrap();
+        std::fs::write(disc_dir.join("Endeavour_S05E02.mkv"), vec![0x22u8; 4096]).unwrap();
+        std::fs::write(disc_dir.join("Endeavour_S05E03.mkv"), vec![0x33u8; 4096]).unwrap();
+
+        check_and_move(&cfg);
+
+        let series_dir = output_dir
+            .join("TV")
+            .join("Endeavour (2012)")
+            .join("Season 05");
+        assert!(
+            series_dir.join("Endeavour S05E01 - Muse.mkv").exists(),
+            "planned episode 1 (in outputs[]) must be filed"
+        );
+        assert!(
+            series_dir.join("Endeavour S05E02 - Cartouche.mkv").exists(),
+            "planned episode 2 (in outputs[]) must be filed"
+        );
+
+        // The leftover partial must not appear ANYWHERE in the output tree,
+        // neither under its raw staging name nor any S05E03 leaf.
+        let mut found_leftover = false;
+        for entry in walkdir_files(&output_dir) {
+            let name = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "Endeavour_S05E03.mkv" || name.contains("S05E03") {
+                found_leftover = true;
+            }
+        }
+        assert!(
+            !found_leftover,
+            "the leftover S05E03 partial is not in outputs[] and must NOT be \
+             promoted into the library"
+        );
+    }
+
+    /// Minimal recursive file walk used only by
+    /// `check_and_move_files_only_outputs_for_a_tv_dir` to scan the whole
+    /// output tree for a leaked leftover file.
+    fn walkdir_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 
     /// POSIX-only: `with_file_name` re-renders the parent with the platform
