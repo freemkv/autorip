@@ -834,68 +834,70 @@ fn check_and_move(cfg: &Config) {
         seen_dirs.insert(dir.to_string_lossy().to_string());
 
         let marker_path = dir.join(".done");
-        // No pre-flight exists() check: it races with the read below (a `.done`
-        // can be created or removed in the window between the two syscalls).
-        // The read_to_string Err arm is the single atomic gate — a NotFound is
-        // handled there (skip) exactly like any other read failure.
 
-        // Read marker for TMDB metadata
-        let marker: serde_json::Value = match std::fs::read_to_string(&marker_path) {
-            Ok(data) => match serde_json::from_str(&data) {
-                Ok(v) => v,
-                Err(e) => {
-                    // An empty or torn `.done` (e.g. a crash mid-write before
-                    // the durable-marker fix landed, or a partial NFS write)
-                    // parses as an error. Treat it as NOT READY: skip — do NOT
-                    // `unwrap_or_default()` into a `null` marker, which would
-                    // give empty title+disc_name and blind-move the file to the
-                    // output root under a garbage name. Leaving the dir in
-                    // staging lets the next pass (or a rewritten marker) recover.
-                    tracing::warn!(
-                        marker = %marker_path.display(),
-                        error = %e,
-                        "mover: .done marker is empty/unparsable; skipping staging dir (not ready)"
-                    );
-                    continue;
+        // Readiness + metadata come from the unified `state.json` when present:
+        // a dir is the mover's to file iff `state == Done` (confident hand-off).
+        // Every other state (sweeping/ripped/review/completed/failed/…) is "not
+        // mine yet", handled quietly. Legacy dirs with no `state.json` fall back
+        // to the `.done` file exactly as before. `state_outputs` carries the
+        // per-file episode map for a TV rip (empty for a movie / legacy dir).
+        let (marker, state_outputs): (serde_json::Value, Vec<crate::ripper::staging::Output>) =
+            match crate::ripper::staging::read_state(&dir) {
+                Some(st) => {
+                    if st.state != crate::ripper::staging::StagingState::Done {
+                        // Not handed off to the mover (in progress, held for
+                        // review, terminal, or already completed). This is the
+                        // by-design "not ready" case for the whole rip+mux phase,
+                        // so keep it quiet — no per-tick WARN spam.
+                        tracing::debug!(
+                            dir = %dir.display(),
+                            state = ?st.state,
+                            "mover: staging dir not in Done state; skipping"
+                        );
+                        continue;
+                    }
+                    (mover_marker_value(&st), st.outputs.clone())
                 }
-            },
-            Err(e) => {
-                // A `.done` that is simply ABSENT is the EXPECTED state for any
-                // staging dir the ripper/mux worker still governs — the mover
-                // is not the dir's hand-off until `.done` lands. The lifecycle
-                // is: `.sweeping` (sweep+patch in progress) → `.ripped` (awaiting
-                // mux) → mux runs (`.muxing`) → `.done`/`.review` + `.completed`.
-                // For the whole rip+mux phase (which for a long disc is many
-                // minutes — the sweep alone can be hours, i.e. thousands of 10s
-                // ticks) the dir has a
-                // `.sweeping`/`.muxing`/`.ripped`/`.completed`/`.failed`/`.review`
-                // marker but no `.done`. WARNing every tick on that absence is
-                // misleading spam that looks like the mover is broken (seen
-                // live: 182 warns for one in-progress disc that ultimately
-                // ripped and moved cleanly). Treat NotFound while a governing
-                // marker is present as the by-design "not ready yet" state:
-                // quiet debug, skip. Only a `.done` NotFound on a dir with NO
-                // governing marker (truly stranded) — or any non-NotFound read
-                // error (NFS ESTALE, EACCES) — is a real fault worth a WARN.
-                if classify_done_absence(e.kind(), &dir) == DoneAbsence::InProgress {
-                    tracing::debug!(
-                        dir = %dir.display(),
-                        "mover: staging dir in progress (no .done yet); skipping"
-                    );
-                    continue;
+                None => {
+                    // Legacy `.done` file path. No pre-flight exists() check: it
+                    // races with the read (the file can appear/disappear between
+                    // syscalls); the read arms are the atomic gate.
+                    match std::fs::read_to_string(&marker_path) {
+                        Ok(data) => match serde_json::from_str(&data) {
+                            Ok(v) => (v, Vec::new()),
+                            Err(e) => {
+                                // Empty/torn `.done` → NOT READY: skip rather than
+                                // blind-move under a garbage name.
+                                tracing::warn!(
+                                    marker = %marker_path.display(),
+                                    error = %e,
+                                    "mover: .done marker is empty/unparsable; skipping staging dir (not ready)"
+                                );
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            // An ABSENT `.done` on a governed dir is the expected
+                            // in-progress state — quiet debug, skip (the 182-warn
+                            // spam bug). Only a stranded/unreadable dir is a
+                            // fault worth a WARN.
+                            if classify_done_absence(e.kind(), &dir) == DoneAbsence::InProgress {
+                                tracing::debug!(
+                                    dir = %dir.display(),
+                                    "mover: staging dir in progress (no .done yet); skipping"
+                                );
+                                continue;
+                            }
+                            tracing::warn!(
+                                marker = %marker_path.display(),
+                                error = %e,
+                                "mover: failed to read .done marker; skipping staging dir"
+                            );
+                            continue;
+                        }
+                    }
                 }
-                // A genuine .done read failure (NFS ESTALE, permission denied,
-                // or NotFound on a stranded dir with no governing marker) leaves
-                // the dir in staging looking healthy from the mover's view until
-                // the handle recovers; surface it.
-                tracing::warn!(
-                    marker = %marker_path.display(),
-                    error = %e,
-                    "mover: failed to read .done marker; skipping staging dir"
-                );
-                continue;
-            }
-        };
+            };
 
         let disc_name = marker["disc_name"].as_str().unwrap_or("").to_string();
         let display_name = marker["title"].as_str().unwrap_or(&disc_name).to_string();
@@ -994,7 +996,12 @@ fn check_and_move(cfg: &Config) {
             .to_string();
         let _move_state = MoveStateGuard::arm(active_dir_name);
 
-        // Build destination paths
+        // Build destination paths. For a TV rip, `state_outputs` maps each
+        // staging file to its episode number/name; the mover renames the leaf to
+        // `Show S{NN}E{MM}[ - Name].ext` before foldering it under
+        // `Show (Year)/Season NN/`. A movie (or legacy dir) has no episode
+        // outputs, so the leaf is unchanged — the movie path is byte-for-byte
+        // identical to before.
         let mut planned_moves: Vec<(std::path::PathBuf, String)> = Vec::new();
         for file_path in &ripped_files {
             let filename = file_path
@@ -1002,7 +1009,9 @@ fn check_and_move(cfg: &Config) {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let dest = build_destination(cfg, &tmdb_result, &filename, season);
+            let episode_leaf = tv_episode_leaf(&tmdb_result, &state_outputs, &filename, season);
+            let leaf = episode_leaf.as_deref().unwrap_or(&filename);
+            let dest = build_destination(cfg, &tmdb_result, leaf, season);
             planned_moves.push((file_path.clone(), dest));
         }
 
@@ -1641,6 +1650,59 @@ fn is_iso_file(filename: &str) -> bool {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
+}
+
+/// Build the legacy-shaped mover metadata `Value` from a unified [`DiscState`],
+/// so the rest of `check_and_move` reads `marker["title"]`/`["season"]`/… exactly
+/// as it did from the old `.done` JSON body.
+fn mover_marker_value(st: &crate::ripper::staging::DiscState) -> serde_json::Value {
+    serde_json::json!({
+        "title": st.title,
+        "disc_name": st.disc_name,
+        "format": st.disc_format,
+        "year": st.year,
+        "media_type": st.media_type,
+        "tmdb_id": st.tmdb_id,
+        "season": st.season,
+        "disc": st.disc_number,
+        "poster_url": st.tmdb_poster,
+        "overview": st.tmdb_overview,
+        "date": st.date,
+    })
+}
+
+/// The TV-episode leaf name for a staging `filename`, or `None` when this is not
+/// a TV episode output (movie, legacy dir, or an output with no episode number).
+///
+/// Names as `Show S{NN}E{MM}[ - Episode Name].ext` — the mover folders it under
+/// `Show (Year)/Season NN/` via [`build_destination`], which sanitises the leaf.
+/// Returns `None` for movies so the movie move path is unchanged.
+fn tv_episode_leaf(
+    tmdb: &Option<tmdb::TmdbResult>,
+    outputs: &[crate::ripper::staging::Output],
+    filename: &str,
+    season: Option<u16>,
+) -> Option<String> {
+    let result = tmdb.as_ref()?;
+    if routing_media_type(result) != "tv" {
+        return None;
+    }
+    let out = outputs.iter().find(|o| o.filename == filename)?;
+    let episode = out.episode?;
+    let season = season.unwrap_or(1);
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mkv");
+    let safe_title = crate::util::sanitize_path_display(&result.title);
+    if out.episode_name.is_empty() {
+        Some(format!("{safe_title} S{season:02}E{episode:02}.{ext}"))
+    } else {
+        Some(format!(
+            "{safe_title} S{season:02}E{episode:02} - {}.{ext}",
+            out.episode_name
+        ))
+    }
 }
 
 fn build_destination(

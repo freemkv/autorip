@@ -24,11 +24,30 @@ pub struct HeldRip {
     pub reason: String,
 }
 
+/// Display metadata for a held rip, from the unified `state.json` when present,
+/// else the legacy `.review` JSON body.
 fn read_marker(dir: &Path) -> serde_json::Value {
+    if let Some(st) = crate::ripper::staging::read_state(dir) {
+        return serde_json::json!({
+            "title": st.title,
+            "year": st.year,
+            "media_type": st.media_type,
+            "disc_name": st.disc_name,
+        });
+    }
     std::fs::read_to_string(dir.join(".review"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::Value::Null)
+}
+
+/// Is `dir` a held-for-review rip? `state == Review` in the unified store, or a
+/// legacy `.review` marker with no `.done`.
+fn is_held(dir: &Path) -> bool {
+    if let Some(st) = crate::ripper::staging::read_state(dir) {
+        return st.state == crate::ripper::staging::StagingState::Review;
+    }
+    dir.join(".review").exists() && !dir.join(".done").exists()
 }
 
 fn media_file(dir: &Path) -> Option<String> {
@@ -62,7 +81,7 @@ pub fn list_held(staging_root: &str) -> Vec<HeldRip> {
     };
     for e in entries.flatten() {
         let dir = e.path();
-        if !dir.is_dir() || !dir.join(".review").exists() || dir.join(".done").exists() {
+        if !dir.is_dir() || !is_held(&dir) {
             continue;
         }
         let m = read_marker(&dir);
@@ -122,84 +141,99 @@ pub fn resolve(staging_root: &str, dir: &str, action: Resolve) -> Result<(), Str
     }
     let d: PathBuf = Path::new(staging_root).join(dir);
     let review = d.join(".review");
-    if !d.is_dir() || !review.exists() {
+    if !d.is_dir() || !is_held(&d) {
         return Err("not a held rip".into());
     }
+    // Unified store when present; else operate on the legacy marker files.
+    let unified = crate::ripper::staging::read_state(&d).is_some();
     match action {
         Resolve::Proceed => {
-            // Carry the marker's JSON forward into a DURABLE `.done` rather than
-            // a bare rename (rename alone doesn't fsync the new dirent — a crash
-            // can lose it, leaving the rip invisible to the mover). Write `.done`
-            // durably, then remove `.review`.
-            // Read the override marker BEFORE writing `.done` / removing
-            // `.review`. A swallowed read error (e.g. a transient NFS failure)
-            // would otherwise write an EMPTY `.done` and delete `.review` —
-            // permanent loss of the user's override. Short-circuit instead.
-            let body = std::fs::read(&review).map_err(|e| e.to_string())?;
-            crate::ripper::staging::write_handoff_marker(&d.join(".done"), &body)
-                .map_err(|e| e.to_string())?;
-            std::fs::remove_file(&review).map_err(|e| e.to_string())?;
+            // Promote the held rip to the mover-facing state, carrying the
+            // existing metadata forward (a durable transition — no bare rename,
+            // which wouldn't fsync the dirent).
+            if unified {
+                let mut ok = false;
+                crate::ripper::staging::mutate_state_if_present(&d, |s| {
+                    s.state = crate::ripper::staging::StagingState::Done;
+                    s.title_confident = true;
+                    ok = true;
+                });
+                if !ok {
+                    return Err("state.json vanished".into());
+                }
+            } else {
+                let body = std::fs::read(&review).map_err(|e| e.to_string())?;
+                crate::ripper::staging::write_handoff_marker(&d.join(".done"), &body)
+                    .map_err(|e| e.to_string())?;
+                std::fs::remove_file(&review).map_err(|e| e.to_string())?;
+            }
         }
         Resolve::Retitle { title, year } => {
-            // Reject a blank title at the library boundary: `resolve` is a
-            // pub fn and an empty/whitespace title would write a `.done` the
-            // mover promotes with no name. The web caller already guards
-            // this, but a future/non-web caller must not be able to.
             if title.trim().is_empty() {
                 return Err("title required".into());
             }
-            let mut m = read_marker(&d);
-            if !m.is_object() {
-                m = serde_json::json!({});
-            }
-            m["title"] = serde_json::json!(title);
-            m["year"] = serde_json::json!(year);
-            // Only default media_type to "movie" when absent — a non-movie
-            // marker (e.g. a TV title) must survive a retitle. An
-            // unconditional set here would silently rewrite every retitled
-            // title as a movie.
-            if m.get("media_type").and_then(|v| v.as_str()).is_none() {
-                m["media_type"] = serde_json::json!("movie");
-            }
-            // Propagate a serialization failure instead of writing an empty
-            // `.done` that the mover would promote with a blank title.
-            let serialized = serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?;
-            // Write `.done` before removing `.review` (crash-atomic: a
-            // lingering `.review` is harmless since `list_held` excludes
-            // dirs that have `.done`), and propagate the removal error so a
-            // failed cleanup is visible instead of silently leaving both.
-            crate::ripper::staging::write_handoff_marker(&d.join(".done"), serialized.as_bytes())
+            if unified {
+                let mut ok = false;
+                crate::ripper::staging::mutate_state_if_present(&d, |s| {
+                    s.title = title.clone();
+                    s.year = year;
+                    // A non-movie (TV) media_type must survive a retitle; only
+                    // default to "movie" when the rip has no media_type at all.
+                    if s.media_type.is_empty() {
+                        s.media_type = "movie".into();
+                    }
+                    s.state = crate::ripper::staging::StagingState::Done;
+                    s.title_confident = true;
+                    ok = true;
+                });
+                if !ok {
+                    return Err("state.json vanished".into());
+                }
+            } else {
+                let mut m = read_marker(&d);
+                if !m.is_object() {
+                    m = serde_json::json!({});
+                }
+                m["title"] = serde_json::json!(title);
+                m["year"] = serde_json::json!(year);
+                if m.get("media_type").and_then(|v| v.as_str()).is_none() {
+                    m["media_type"] = serde_json::json!("movie");
+                }
+                let serialized = serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?;
+                crate::ripper::staging::write_handoff_marker(
+                    &d.join(".done"),
+                    serialized.as_bytes(),
+                )
                 .map_err(|e| e.to_string())?;
-            std::fs::remove_file(&review).map_err(|e| e.to_string())?;
+                std::fs::remove_file(&review).map_err(|e| e.to_string())?;
+            }
         }
         Resolve::Cancel => {
-            // Write `.failed` BEFORE removing `.review`, and propagate any
-            // IO error. The previous order (remove then write, both errors
-            // discarded) could leave the dir with no `.review`/`.done`/
-            // `.failed` marker at all — invisible to the mover, the UI, and
-            // the re-rip guard — while still reporting success to the
-            // operator.
-            //
-            // Write `.failed` as structured JSON `{"reason":...}` rather than a
-            // raw non-JSON body. `read_failed_reason` only parses JSON, so the
-            // old plain "cancelled by operator\n" body returned None and any
-            // terminal-ness check keying on a parseable reason wouldn't fire
-            // (M2). We go through `write_handoff_marker` (the durable
-            // tmp+fsync+rename writer) rather than `write_failed_marker` because
-            // that helper is best-effort/non-propagating, and the contract here
-            // requires surfacing a write failure (and preserving `.review`) so a
-            // failed cancel isn't reported as success. The JSON shape matches
-            // `write_failed_marker`'s so `read_failed_reason` recovers the
-            // reason; presence-based checks recognise it regardless.
-            let failed_body = serde_json::json!({
-                "reason": "cancelled by operator",
-                "timestamp": crate::util::format_iso_datetime(),
-            });
-            let failed_str =
-                serde_json::to_string_pretty(&failed_body).map_err(|e| e.to_string())?;
-            crate::ripper::staging::write_handoff_marker(&d.join(".failed"), failed_str.as_bytes())
+            // Terminal `.failed` (so it isn't retried). The contract requires
+            // propagating a write error and preserving the held state on failure,
+            // so use the fallible transition rather than the best-effort
+            // `write_failed_marker`.
+            if unified {
+                let mut st = crate::ripper::staging::read_state(&d)
+                    .ok_or_else(|| "state.json vanished".to_string())?;
+                st.state = crate::ripper::staging::StagingState::Failed;
+                st.failure_reason = Some("cancelled by operator".to_string());
+                st.muxing = false;
+                crate::ripper::staging::try_write_state(&d, &st).map_err(|e| e.to_string())?;
+            } else {
+                let failed_body = serde_json::json!({
+                    "reason": "cancelled by operator",
+                    "timestamp": crate::util::format_iso_datetime(),
+                });
+                let failed_str =
+                    serde_json::to_string_pretty(&failed_body).map_err(|e| e.to_string())?;
+                crate::ripper::staging::write_handoff_marker(
+                    &d.join(".failed"),
+                    failed_str.as_bytes(),
+                )
                 .map_err(|e| e.to_string())?;
-            std::fs::remove_file(&review).map_err(|e| e.to_string())?;
+                std::fs::remove_file(&review).map_err(|e| e.to_string())?;
+            }
         }
     }
     Ok(())

@@ -97,24 +97,32 @@ pub const RIPPED_MARKER_NAME: &str = ".ripped";
 pub const RIPPED_MARKER_SCHEMA: u32 = 1;
 
 pub fn write_marker(staging_dir: &Path, marker: &RippedMarker) -> std::io::Result<()> {
-    let path = staging_dir.join(RIPPED_MARKER_NAME);
-    let json = serde_json::to_string_pretty(marker)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    // Durable write (tmp + sync_all + rename + parent-dir fsync) via the same
-    // primitive the rest of autorip's markers use. A plain `fs::write` here
-    // could leave a torn/empty `.ripped` on a crash mid-write, which the mux
-    // worker would then fail to parse — losing the hand-off.
-    crate::ripper::staging::write_marker_durable(&path, json.as_bytes())?;
-    // The `.ripped` hand-off supersedes the in-progress `.sweeping` marker
-    // `rip_disc` wrote at staging-dir creation. Clear it only after `.ripped`
-    // is durably on disk, so a crash between the two never leaves the dir with
-    // neither marker (which the resume scan would treat as orphaned partial
-    // state and restart-count).
+    // The `.ripped` hand-off is now `state: Ripped` in the unified `state.json`.
+    // Fold the marker's fields in (preserving any accumulated data / a
+    // TV caller's pre-seeded `outputs`), then durably persist. Propagates the
+    // I/O error so the fresh-rip path can refuse to eject on a failed hand-off,
+    // exactly as the old torn-`.ripped` guard did.
+    let mut st = crate::ripper::staging::read_state(staging_dir)
+        .unwrap_or_else(|| crate::ripper::staging::DiscState::new(RIPPED_STATE));
+    st.state = RIPPED_STATE;
+    st.apply_ripped(marker);
+    crate::ripper::staging::try_write_state(staging_dir, &st)?;
+    // The hand-off supersedes the in-progress `.sweeping` state; clearing is a
+    // no-op on `state.json` now that `state == Ripped`, but it strips any legacy
+    // `.sweeping` file on a migrated dir.
     crate::ripper::staging::clear_sweeping_marker(staging_dir);
     Ok(())
 }
 
+const RIPPED_STATE: crate::ripper::staging::StagingState =
+    crate::ripper::staging::StagingState::Ripped;
+
 pub fn read_marker(staging_dir: &Path) -> std::io::Result<RippedMarker> {
+    // Unified store wins: reconstruct the `RippedMarker` the mux path deals in.
+    if let Some(st) = crate::ripper::staging::read_state(staging_dir) {
+        return Ok(st.to_ripped_marker());
+    }
+    // Legacy fallback: a pre-migration `.ripped` file.
     let path = staging_dir.join(RIPPED_MARKER_NAME);
     let bytes = std::fs::read(path)?;
     let marker: RippedMarker = serde_json::from_slice(&bytes)
@@ -131,6 +139,10 @@ pub fn read_marker(staging_dir: &Path) -> std::io::Result<RippedMarker> {
     Ok(marker)
 }
 
+/// Formerly removed the `.ripped` file on mux success. The lifecycle transition
+/// (`Ripped` → `Done`/`Review` → `Completed`) now supersedes it in `state.json`,
+/// so this only strips any lingering legacy `.ripped` file. Kept (and infallible
+/// `Ok`) so existing call sites are unchanged.
 pub fn delete_marker(staging_dir: &Path) -> std::io::Result<()> {
     let path = staging_dir.join(RIPPED_MARKER_NAME);
     match std::fs::remove_file(&path) {
@@ -748,7 +760,23 @@ pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
         if !dir.is_dir() {
             continue;
         }
-        if !dir.join(RIPPED_MARKER_NAME).exists() {
+        // Route the queue-membership decision through the unified state snapshot
+        // instead of bare `.exists()` marker sniffing. A dir is "(queued)" iff it
+        // is in the hand-off `Ripped` state, not being muxed, and not terminal /
+        // handed to the mover. (`snap.completed` covers `Done`/`Review`/
+        // `Completed`; the explicit `has_done`/`has_review` also catch the legacy
+        // crash-window where `.done` was written but `.completed` had not landed.)
+        let Some(snap) = crate::ripper::staging::snapshot_staging_disc(&dir) else {
+            continue;
+        };
+        if !snap.has_ripped
+            || snap.has_muxing
+            || snap.completed
+            || snap.has_failed
+            || snap.has_done
+            || snap.has_review
+            || snap.has_aborted_loss
+        {
             continue;
         }
         // A successful mux can leave `.ripped` alongside `.completed`
@@ -777,17 +805,7 @@ pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
         // (`mux_dispatch_verdict` → `SkipAbortedLoss`) will never dispatch it —
         // it's a resumable, operator-resolved state surfaced via its own error
         // card. Listing it as "(queued)" would promise a mux that never comes.
-        if dir.join(crate::ripper::staging::COMPLETED_MARKER).exists()
-            || dir.join(crate::ripper::staging::FAILED_MARKER).exists()
-            || dir.join(crate::ripper::staging::DONE_MARKER).exists()
-            || dir.join(crate::ripper::staging::REVIEW_MARKER).exists()
-            || dir.join(crate::ripper::staging::MUXING_MARKER).exists()
-            || dir
-                .join(crate::ripper::staging::ABORTED_LOSS_MARKER)
-                .exists()
-        {
-            continue;
-        }
+        // (All of the above are handled by the `snap` gate above.)
         if let Ok(m) = read_marker(&dir) {
             out.push(format!("{} (queued)", m.display_name));
         } else {
@@ -896,10 +914,20 @@ mod tests {
 
     #[test]
     fn read_marker_rejects_wrong_schema() {
+        // `write_marker` now always writes the CURRENT schema into
+        // `state.json`, so a bad schema_version can no longer be round-tripped
+        // through it. Exercise the LEGACY fallback instead: a pre-migration
+        // `.ripped` file with no `state.json` present. `read_marker` must
+        // still reject a wrong schema on that path.
         let tmp = TempDir::new().unwrap();
         let mut marker = sample_marker();
         marker.schema_version = 9999;
-        write_marker(tmp.path(), &marker).unwrap();
+        let json = serde_json::to_vec(&marker).unwrap();
+        std::fs::write(tmp.path().join(RIPPED_MARKER_NAME), json).unwrap();
+        assert!(
+            crate::ripper::staging::read_state(tmp.path()).is_none(),
+            "no state.json must exist for this to exercise the legacy fallback"
+        );
         let err = read_marker(tmp.path()).unwrap_err();
         assert!(format!("{err}").contains("schema_version"));
     }
@@ -1015,7 +1043,7 @@ mod tests {
         // The mover hand-off marker is present but `.completed` is NOT yet
         // (the gap between the two durable writes). This dir is in the Move
         // queue; it must be absent from the Mux queue.
-        std::fs::write(movie.join(".done"), b"{}").unwrap();
+        crate::ripper::staging::mark_handoff(&movie, true, |_s| {}).unwrap();
 
         let q = pending_queue(tmp.path());
         assert!(
@@ -1033,7 +1061,7 @@ mod tests {
         let movie = tmp.path().join("Border_Town");
         std::fs::create_dir_all(&movie).unwrap();
         write_marker(&movie, &sample_marker()).unwrap();
-        std::fs::write(movie.join(".review"), b"{}").unwrap();
+        crate::ripper::staging::mark_handoff(&movie, false, |_s| {}).unwrap();
 
         let q = pending_queue(tmp.path());
         assert!(q.is_empty(), "a .review dir must be skipped, got {q:?}");
@@ -1342,7 +1370,23 @@ mod tests {
                 M::Completed => crate::ripper::staging::write_completed_marker(&dir),
                 M::Failed => crate::ripper::staging::write_failed_marker(&dir, "test failure"),
                 M::FailedNonJson => {
-                    std::fs::write(dir.join(".failed"), b"cancelled by operator\n").unwrap()
+                    // Legacy review.rs wrote a non-JSON `.failed` body
+                    // ("cancelled by operator") whose reason didn't parse.
+                    // Under the unified store the terminal transition always
+                    // goes through `state.json`; reproduce the "no parseable
+                    // reason" case by leaving `failure_reason` unset rather
+                    // than writing a raw legacy file (which `snapshot_staging_disc`
+                    // would ignore once `state.json` already exists from a
+                    // prior `M::Ripped` write in this same row).
+                    crate::ripper::staging::mutate_state(
+                        &dir,
+                        crate::ripper::staging::StagingState::Failed,
+                        |s| {
+                            s.state = crate::ripper::staging::StagingState::Failed;
+                            s.failure_reason = None;
+                            s.muxing = false;
+                        },
+                    );
                 }
                 M::Done => std::fs::write(dir.join(".done"), b"{}").unwrap(),
                 M::Review => std::fs::write(dir.join(".review"), b"{}").unwrap(),
@@ -1474,12 +1518,20 @@ mod tests {
                 ".aborted-loss alone: resumable, operator-resolved — never auto-dispatch",
             ),
             (
-                &[Ripped, Completed, AbortedLoss],
+                // Unified `state.json` holds a single `state` field, so the
+                // LAST writer applied determines the on-disk state; order the
+                // markers so `.completed` lands last, matching the intended
+                // "a finished dir stays terminal even after an aborted-loss"
+                // scenario (in the legacy multi-file model these bits could
+                // coexist regardless of write order).
+                &[Ripped, AbortedLoss, Completed],
                 MuxVerdict::SkipTerminal,
                 ".completed wins over .aborted-loss: a finished dir stays terminal",
             ),
             (
-                &[Ripped, Failed, AbortedLoss],
+                // Same reordering rationale: `.failed` must be the last write
+                // so the resulting `state.json` ends in `Failed`.
+                &[Ripped, AbortedLoss, Failed],
                 MuxVerdict::SkipTerminal,
                 ".failed wins over .aborted-loss: a quarantined dir stays terminal",
             ),

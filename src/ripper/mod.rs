@@ -14,6 +14,7 @@ pub mod resume;
 mod session;
 pub mod staging;
 pub mod state;
+pub mod tv;
 
 // Re-export every symbol the rest of the crate (and integration tests)
 // addresses as `crate::ripper::*`. Names that aren't reached for
@@ -4591,46 +4592,39 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 return;
             }
             let staging_path = std::path::Path::new(&staging);
-            let marker = serde_json::json!({
-                "title": display_name,
-                "disc_name": disc_name,
-                "format": disc_format,
-                "year": tmdb_year,
-                "media_type": tmdb_media_type,
-                "tmdb_id": tmdb_id,
-                // TV structuring metadata parsed from the raw disc label — the
-                // mover places a series rip under `Show (Year)/Season NN/`.
-                // Null for a movie or an unmarked label.
-                "season": crate::tmdb::season_from_label(&disc_name),
-                "disc": crate::tmdb::disc_from_label(&disc_name),
-                "poster_url": tmdb_poster,
-                "overview": tmdb_overview,
-                "date": crate::util::format_date(),
-            });
-            // Confident match → `.done` (mover files it); otherwise `.review`
-            // (operator confirms the title before it leaves staging). Mirrors
-            // the MKV completion path's marker selection.
-            let marker_name = handoff_marker_name(title_confident);
-            // `to_string_pretty` on a `json!`-constructed Value is effectively
-            // infallible; `.expect` makes the invariant explicit (mirrors
-            // staging::write_failed_marker) so a real serialization failure
-            // surfaces as a panic rather than silently writing an empty marker
-            // that the mover skips, stranding the output in staging forever.
-            let marker_body =
-                serde_json::to_string_pretty(&marker).expect("json! value is always serialisable");
-            if let Err(e) = staging::write_handoff_marker(
-                &staging_path.join(marker_name),
-                marker_body.as_bytes(),
-            ) {
+            // Confident match → `state: Done` (mover files it); otherwise
+            // `state: Review` (operator confirms the title before it leaves
+            // staging). One `state.json` transition carries the mover metadata +
+            // the single ISO output. TV structuring metadata (`season`/`disc`)
+            // is parsed from the raw disc label; `tmdb_id` threads through so the
+            // mover can fold the rip under `Show (Year)/Season NN/`.
+            let marker_name = staging::handoff_label(title_confident);
+            let iso_leaf = iso_filename.clone();
+            if let Err(e) = staging::mark_handoff(staging_path, title_confident, |s| {
+                s.title = display_name.clone();
+                s.disc_name = disc_name.clone();
+                s.disc_format = disc_format.clone();
+                s.year = tmdb_year;
+                s.media_type = tmdb_media_type.clone();
+                s.tmdb_id = tmdb_id;
+                s.tmdb_poster = tmdb_poster.clone();
+                s.tmdb_overview = tmdb_overview.clone();
+                s.season = crate::tmdb::season_from_label(&disc_name);
+                s.disc_number = crate::tmdb::disc_from_label(&disc_name);
+                s.outputs = vec![staging::Output {
+                    filename: iso_leaf,
+                    ..Default::default()
+                }];
+            }) {
                 crate::log::device_log(
                     device,
                     &format!(
-                        "{marker_name} marker write failed ({e}); ISO is staged but the mover cannot pick it up"
+                        "{marker_name} state write failed ({e}); ISO is staged but the mover cannot pick it up"
                     ),
                 );
                 update_state_with(device, |s| {
                     if s.last_error.is_empty() {
-                        s.last_error = format!("{marker_name} marker write failed: {e}");
+                        s.last_error = format!("{marker_name} state write failed: {e}");
                     }
                 });
                 unregister_halt(device);
@@ -4751,6 +4745,29 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 &format!(".ripped marker write failed ({e}); falling back to inline mux"),
             );
         } else {
+            // Record the TV-routing metadata the `RippedMarker` does not carry
+            // (`tmdb_id`, parsed `season`/`disc`, raw `disc_name`) and the
+            // deliverable PLAN (`outputs[]`) onto the just-written `state: Ripped`
+            // so it propagates through the mux/resume hand-off into the mover.
+            // For a movie the plan is one output (byte-identical); for a TV disc
+            // under `tv_auto` it is one per episode. The mux worker fans out over
+            // this list; the mover files each. Recording it here also fixes TV
+            // MKV rips previously losing their season on every non-ISO path.
+            let plan = plan_mux_outputs(
+                &disc.titles,
+                &cfg_read,
+                &tmdb_media_type,
+                &disc_name,
+                tmdb_id,
+                &filename,
+            );
+            staging::mutate_state_if_present(staging_path, |s| {
+                s.tmdb_id = tmdb_id;
+                s.disc_name = disc_name.clone();
+                s.season = crate::tmdb::season_from_label(&disc_name);
+                s.disc_number = crate::tmdb::disc_from_label(&disc_name);
+                s.outputs = plan;
+            });
             crate::log::device_log(
                 device,
                 "Sweep + patch complete; handed off to mux worker via .ripped marker.",
@@ -5471,16 +5488,6 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // used to be written here was removed in 0.30.1 — the History tab was
     // unmaintained and didn't work; see web.rs.)
     {
-        let marker = serde_json::json!({
-            "title": display_name,
-            "disc_name": disc_name,
-            "format": disc_format,
-            "year": tmdb_year,
-            "media_type": tmdb_media_type,
-            "poster_url": tmdb_poster,
-            "overview": tmdb_overview,
-            "date": crate::util::format_date(),
-        });
         if completed {
             // Durability gate: fsync the finished MKV/M2TS before any
             // success marker so a crash/power-loss can't leave a "done"
@@ -5514,24 +5521,32 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // right title → promotes to .done, or proceed as-is). "Better to
             // pause; worst case the operator clicks proceed." A would-overwrite
             // collision is still caught later by the mover's own guard.
-            let marker_name = handoff_marker_name(title_confident);
-            let marker_path = format!("{}/{}", staging, marker_name);
-            // Durable, atomic marker write (tmp + fsync + rename + dir-fsync).
-            // The single staging-dir fsync inside this helper is the crash
-            // barrier: it guarantees `.done` is observed on disk before the
-            // later `.completed` write / ISO prune, so a crash can never leave
-            // `.completed` (or a pruned ISO) without a durable `.done`.
-            // `to_string_pretty` on a `json!`-constructed Value is effectively
-            // infallible; `.expect` makes the invariant explicit (mirrors
-            // staging::write_failed_marker) so a real serialization failure
-            // surfaces as a panic rather than silently writing an empty marker
-            // that the mover skips, stranding the output in staging forever.
-            let marker_body =
-                serde_json::to_string_pretty(&marker).expect("json! value is always serialisable");
-            if let Err(e) = staging::write_handoff_marker(
-                std::path::Path::new(&marker_path),
-                marker_body.as_bytes(),
-            ) {
+            let marker_name = staging::handoff_label(title_confident);
+            // One durable `state.json` transition (tmp + fsync + rename +
+            // dir-fsync). The staging-dir fsync is the crash barrier: `state:
+            // Done` is observed on disk before the later `.completed`/ISO-prune,
+            // so a crash can never leave a completed/pruned dir without a durable
+            // hand-off. Carries the mover metadata + the single MKV output, plus
+            // the `season`/`tmdb_id`/`disc` the pre-unification MKV path dropped
+            // (the bug that filed every TV MKV rip under `Season 01`).
+            let staging_disc_path = std::path::Path::new(&staging);
+            let mkv_leaf = filename.clone();
+            if let Err(e) = staging::mark_handoff(staging_disc_path, title_confident, |s| {
+                s.title = display_name.clone();
+                s.disc_name = disc_name.clone();
+                s.disc_format = disc_format.clone();
+                s.year = tmdb_year;
+                s.media_type = tmdb_media_type.clone();
+                s.tmdb_id = tmdb_id;
+                s.tmdb_poster = tmdb_poster.clone();
+                s.tmdb_overview = tmdb_overview.clone();
+                s.season = crate::tmdb::season_from_label(&disc_name);
+                s.disc_number = crate::tmdb::disc_from_label(&disc_name);
+                s.outputs = vec![staging::Output {
+                    filename: mkv_leaf,
+                    ..Default::default()
+                }];
+            }) {
                 // The mux finished and the MKV is in staging, but the
                 // mover keys off this marker — without it the file sits
                 // in staging forever with no signal. Surface it so the
@@ -5561,14 +5576,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     ),
                 );
             }
-            // 0.20.7: also write `.completed` (and clear `.restart_count`)
-            // so the resume-on-startup detector knows this disc finished
-            // cleanly even if the mover hasn't run yet. `.done` and
-            // `.completed` are independent: `.done` is the mover's
-            // hand-off marker (consumed when the file is relocated);
-            // `.completed` is the process-level success marker (stays
-            // put so post-restart the dir is recognised as terminal).
-            let staging_disc_path = std::path::Path::new(&staging);
+            // Advance to process-level clean completion. `write_completed_marker`
+            // does NOT downgrade the `Done`/`Review` hand-off state (the resume
+            // detector's "finished" check covers both); it only releases the
+            // in-progress lock and clears the restart counter.
             staging::write_completed_marker(staging_disc_path);
             staging::clear_restart_count(staging_disc_path);
         } else if let Some(reason) = finalize_error.as_ref() {
@@ -6095,12 +6106,73 @@ fn title_is_confident(
         || crate::tmdb::is_confident_match(disc_name, display_name, tmdb_year)
 }
 
-/// The hand-off marker a finished rip writes: `.done` hands the output to the
-/// mover (which files it into the library); `.review` holds it in staging until
-/// the operator confirms the title. Shared by the MKV and ISO completion paths
-/// so the two can't drift.
+/// The legacy hand-off marker name (`.done`/`.review`). The completion paths now
+/// transition `state.json` via [`staging::mark_handoff`] / [`staging::handoff_label`];
+/// this is retained only for the tests that pin the `.done`/`.review` vocabulary.
+#[cfg(test)]
 fn handoff_marker_name(title_confident: bool) -> &'static str {
     if title_confident { ".done" } else { ".review" }
+}
+
+/// Decide the deliverables a captured disc produces: the list of titles to mux
+/// out of the ISO and the staging filename of each. This is the single "what do
+/// we extract?" decision — a movie yields exactly one output (the main title,
+/// keeping the movie path byte-identical), a TV disc under `tv_auto` yields one
+/// per selected episode title, numbered `S{NN}E{MM}` from TMDB (degrading to
+/// plain sequential numbering when TMDB has no data).
+///
+/// `movie_filename` is the single-title staging leaf the movie path already
+/// derives; it is reused verbatim for the movie/one-title case so nothing about
+/// that path changes. `title_confident` gates the TMDB episode lookup: an
+/// unconfident title has no trustworthy `tmdb_id`, so we number sequentially.
+fn plan_mux_outputs(
+    titles: &[libfreemkv::DiscTitle],
+    cfg: &Config,
+    media_type: &str,
+    disc_name: &str,
+    tmdb_id: u64,
+    movie_filename: &str,
+) -> Vec<staging::Output> {
+    let one_output = || {
+        vec![staging::Output {
+            filename: movie_filename.to_string(),
+            ..Default::default()
+        }]
+    };
+    let season = crate::tmdb::season_from_label(disc_name);
+    let is_tv = media_type == "tv" || season.is_some();
+    if !cfg.tv_auto || !is_tv {
+        return one_output();
+    }
+    // The episode cluster: drops the play-all sum-title, extras/menus, dupes.
+    let indices = tv::select_episode_titles(titles, cfg.min_length_secs);
+    if indices.len() <= 1 {
+        // A single feature that merely carries a TV media_type / season label
+        // (e.g. a TV movie) — one output, movie-identical naming.
+        return one_output();
+    }
+    let season_num = season.unwrap_or(1);
+    // TMDB episode names, best-effort (empty on any failure → sequential).
+    let episodes = crate::tmdb::season_episodes(tmdb_id, season_num, &cfg.tmdb_api_key);
+    let title_secs: Vec<f64> = indices.iter().map(|&i| titles[i].duration_secs).collect();
+    let assignments = crate::tmdb::map_episodes(&title_secs, &episodes, 1);
+    // Staging leaves derive from the movie leaf's stem + extension so they share
+    // the output format and stay unique per episode. The mover renames each to
+    // `Show S{NN}E{MM}[ - Name].ext` at file time (see `mover::tv_episode_leaf`).
+    let path = std::path::Path::new(movie_filename);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("title");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("mkv");
+    indices
+        .iter()
+        .zip(assignments)
+        .map(|(&idx, a)| staging::Output {
+            filename: format!("{stem}_S{season_num:02}E{:02}.{ext}", a.episode),
+            title_index: idx,
+            episode: Some(a.episode),
+            episode_name: a.name,
+            moved: false,
+        })
+        .collect()
 }
 
 /// Whether the rip's deliverable is the whole-disc ISO itself rather than a
@@ -7305,9 +7377,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         staging::write_sweeping_marker(&dir);
-        assert!(
-            dir.join(staging::SWEEPING_MARKER).exists(),
-            "marker should be present before the guard drops"
+        assert_eq!(
+            staging::read_state(&dir).map(|s| s.state),
+            Some(staging::StagingState::Sweeping),
+            "Sweeping state should be present before the guard drops"
         );
         {
             let _guard = SweepingGuard {
@@ -7315,13 +7388,16 @@ mod tests {
             };
             // Still present inside the guard's scope (mirrors the live
             // sweep+patch window).
-            assert!(dir.join(staging::SWEEPING_MARKER).exists());
+            assert_eq!(
+                staging::read_state(&dir).map(|s| s.state),
+                Some(staging::StagingState::Sweeping)
+            );
         }
-        // Guard dropped at scope end (the early-return / panic case) — marker
-        // gone, so the restart scan won't strand this dir `InProgress`.
+        // Guard dropped at scope end (the early-return / panic case) — Sweeping
+        // state gone, so the restart scan won't strand this dir `InProgress`.
         assert!(
-            !dir.join(staging::SWEEPING_MARKER).exists(),
-            ".sweeping must be cleared when SweepingGuard drops"
+            staging::read_state(&dir).map(|s| s.state) != Some(staging::StagingState::Sweeping),
+            "Sweeping state must be cleared when SweepingGuard drops"
         );
     }
 
@@ -7338,16 +7414,20 @@ mod tests {
             let _guard = SweepingGuard {
                 staging: dir.clone(),
             };
-            // Terminal write (e.g. `.failed`) clears `.sweeping` first, as on
+            // Terminal write (e.g. `.failed`) supersedes `Sweeping` first, as on
             // the real quarantine paths.
             staging::write_failed_marker(&dir, "boom");
-            assert!(!dir.join(staging::SWEEPING_MARKER).exists());
+            assert_eq!(
+                staging::read_state(&dir).map(|s| s.state),
+                Some(staging::StagingState::Failed)
+            );
         }
-        // Guard drop is a no-op: `.sweeping` stays gone and `.failed` survives.
-        assert!(!dir.join(staging::SWEEPING_MARKER).exists());
-        assert!(
-            dir.join(staging::FAILED_MARKER).exists(),
-            "guard drop must not remove the terminal .failed marker"
+        // Guard drop is a no-op: the terminal `Failed` state survives (the
+        // guard's clear only fires when state == Sweeping).
+        assert_eq!(
+            staging::read_state(&dir).map(|s| s.state),
+            Some(staging::StagingState::Failed),
+            "guard drop must not remove the terminal Failed state"
         );
     }
 
@@ -9660,17 +9740,20 @@ mod tests {
     fn staging_disc_completed_excludes_held_for_review() {
         let tmp = tempfile::TempDir::new().unwrap();
         let san = "Held_Movie";
+        let dir = tmp.path().join(san);
+        std::fs::create_dir_all(&dir).unwrap();
         // .completed alone → already ripped.
-        staging_disc_with_markers(tmp.path(), san, &[".completed"]);
+        staging::write_completed_marker(&dir);
         assert!(
             staging_disc_completed(tmp.path(), san),
             ".completed alone must count as already-ripped"
         );
-        // Add .review (held) → NO longer "already ripped".
-        std::fs::write(tmp.path().join(san).join(".review"), b"{}").unwrap();
+        // Hold for review → NO longer "already ripped" (state becomes Review,
+        // which still counts as `completed` but is excluded by `!has_review`).
+        staging::mark_handoff(&dir, false, |_| {}).unwrap();
         assert!(
             !staging_disc_completed(tmp.path(), san),
-            ".completed + .review (held) must NOT count as already-ripped (M4)"
+            ".completed + review-hold must NOT count as already-ripped (M4)"
         );
     }
 
@@ -9741,20 +9824,45 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let san = "Owned";
         // Nothing yet → not owned.
-        staging_disc_with_markers(tmp.path(), san, &["Owned.iso", "Owned.iso.mapfile"]);
+        let dir = staging_disc_with_markers(tmp.path(), san, &["Owned.iso", "Owned.iso.mapfile"]);
         assert!(!staging_disc_owned_by_worker(tmp.path(), san));
-        // .ripped → owned.
-        std::fs::write(tmp.path().join(san).join(".ripped"), b"{}").unwrap();
+        // Ripped → owned.
+        let marker = crate::muxer::RippedMarker {
+            schema_version: crate::muxer::RIPPED_MARKER_SCHEMA,
+            iso_path: dir.join("Owned.iso").to_string_lossy().into_owned(),
+            mapfile_path: dir.join("Owned.iso.mapfile").to_string_lossy().into_owned(),
+            display_name: "Owned".into(),
+            disc_format: "bd".into(),
+            mkv_filename: "Owned.mkv".into(),
+            tmdb_title: "Owned".into(),
+            tmdb_year: 0,
+            tmdb_poster: String::new(),
+            tmdb_overview: String::new(),
+            tmdb_media_type: String::new(),
+            max_retries: 1,
+            abort_on_lost_secs: 0,
+            rip_elapsed_secs: 0.0,
+            rip_errors: 0,
+            rip_lost_video_secs: 0.0,
+            rip_last_sector: 0,
+            origin_device: "sr0".into(),
+            sweep_errors: 0,
+            sweep_total_lost_ms: 0.0,
+            sweep_main_lost_ms: 0.0,
+            sweep_num_bad_ranges: 0,
+            sweep_largest_gap_ms: 0.0,
+            title_confident: false,
+        };
+        crate::muxer::write_marker(&dir, &marker).unwrap();
         assert!(
             staging_disc_owned_by_worker(tmp.path(), san),
-            ".ripped must mark the dir owned by the mux worker"
+            "Ripped state must mark the dir owned by the mux worker"
         );
-        // Swap .ripped for .muxing → still owned.
-        std::fs::remove_file(tmp.path().join(san).join(".ripped")).unwrap();
-        std::fs::write(tmp.path().join(san).join(".muxing"), b"{}").unwrap();
+        // Ripped + muxing lock held → still owned.
+        staging::write_muxing_marker(&dir);
         assert!(
             staging_disc_owned_by_worker(tmp.path(), san),
-            ".muxing must mark the dir owned by the mux worker"
+            "muxing lock must mark the dir owned by the mux worker"
         );
     }
 
@@ -10744,15 +10852,16 @@ mod tests {
             "an untouched disc is not already completed"
         );
 
-        staging_disc_with_markers(tmp.path(), &sanitized, &[".completed"]);
+        let disc_dir = staging_disc_with_markers(tmp.path(), &sanitized, &[]);
+        staging::write_completed_marker(&disc_dir);
         assert!(
             super::disc_already_completed(&cfg, device),
             "a .completed staging dir must stop the unattended path re-ripping it"
         );
 
-        // Held for review: `.completed` is written for a held rip too, but the
+        // Held for review: a hand-off is written for a held rip too, but the
         // operator hasn't confirmed the title — the disc is NOT finished.
-        std::fs::write(tmp.path().join(&sanitized).join(".review"), b"{}").unwrap();
+        staging::mark_handoff(&disc_dir, false, |_| {}).unwrap();
         assert!(
             !super::disc_already_completed(&cfg, device),
             "a held-for-review dir is awaiting the operator, not finished"
@@ -11088,5 +11197,96 @@ mod teardown_poison_tests {
             "the STATE removal must poison-recover, or a panicked worker leaves \
              a phantom drive row that nothing ever clears"
         );
+    }
+}
+
+#[cfg(test)]
+mod tv_plan_tests {
+    use super::*;
+    use libfreemkv::disc::{ContentFormat, Extent};
+
+    fn title(dur_secs: f64, start_lba: u32) -> libfreemkv::DiscTitle {
+        libfreemkv::DiscTitle {
+            playlist: String::new(),
+            playlist_id: 0,
+            duration_secs: dur_secs,
+            size_bytes: (dur_secs as u64) * 1_000_000,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: vec![Extent {
+                start_lba,
+                sector_count: 1000,
+            }],
+            content_format: ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        }
+    }
+
+    // A movie disc yields exactly one output — the main-title staging leaf,
+    // untouched — so the movie path stays byte-identical.
+    #[test]
+    fn movie_yields_a_single_untouched_output() {
+        let cfg = Config::default();
+        let titles = vec![title(6000.0, 100), title(120.0, 5)];
+        let plan = plan_mux_outputs(&titles, &cfg, "movie", "The Matrix", 0, "The Matrix.mkv");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].filename, "The Matrix.mkv");
+        assert_eq!(plan[0].title_index, 0);
+        assert!(plan[0].episode.is_none());
+    }
+
+    // A season-labelled TV disc fans out to one output per episode title, in disc
+    // order, numbered sequentially from E01 (no TMDB key configured → sequential),
+    // keeping the source stem + extension and dropping the play-all/extra.
+    #[test]
+    fn tv_disc_fans_out_one_output_per_episode() {
+        let cfg = Config::default(); // tv_auto = true, empty tmdb key
+        let ep = 44.0 * 60.0;
+        let mut titles = vec![title(ep * 6.0, 100)]; // play-all sum-title
+        for k in 0..6 {
+            titles.push(title(ep + k as f64, 1000 + k * 100)); // 6 episodes
+        }
+        titles.push(title(90.0, 5)); // extra
+        let plan = plan_mux_outputs(
+            &titles,
+            &cfg,
+            "tv",
+            "Endeavour Season 5",
+            44264,
+            "Endeavour.mkv",
+        );
+        assert_eq!(plan.len(), 6, "one output per episode title");
+        let episodes: Vec<u16> = plan.iter().map(|o| o.episode.unwrap()).collect();
+        assert_eq!(episodes, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(plan[0].filename, "Endeavour_S05E01.mkv");
+        assert_eq!(plan[5].filename, "Endeavour_S05E06.mkv");
+        // The title indices are the episode cluster (1..=6), not the play-all(0)
+        // or the extra(7).
+        assert_eq!(
+            plan.iter().map(|o| o.title_index).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    // tv_auto=false holds a TV disc on the single-output path (no auto fan-out).
+    #[test]
+    fn tv_auto_off_does_not_fan_out() {
+        let cfg = Config {
+            tv_auto: false,
+            ..Config::default()
+        };
+        let ep = 44.0 * 60.0;
+        let titles = vec![title(ep, 1000), title(ep, 2000), title(ep, 3000)];
+        let plan = plan_mux_outputs(
+            &titles,
+            &cfg,
+            "tv",
+            "Endeavour Season 5",
+            44264,
+            "Endeavour.mkv",
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].filename, "Endeavour.mkv");
     }
 }

@@ -724,6 +724,124 @@ fn urlencoded(s: &str) -> String {
         .collect()
 }
 
+// ---- TV episode resolution ------------------------------------------------
+
+/// One episode from a TMDB season listing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Episode {
+    pub number: u16,
+    pub name: String,
+    /// Runtime in minutes (0 = unknown), used to sanity-check the order-based
+    /// title→episode pairing.
+    pub runtime_min: u16,
+}
+
+/// The episode a ripped title is assigned to, for `Show S{NN}E{MM}` naming.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EpisodeAssignment {
+    pub episode: u16,
+    /// TMDB episode name, or "" when unknown (degraded / low-confidence).
+    pub name: String,
+}
+
+/// Fetch a TV season's episode list from TMDB (`GET /3/tv/{id}/season/{n}`).
+///
+/// Uses the same shared timeout-bounded [`AGENT`], size-capped JSON read, and
+/// no-redirect policy as [`fetch_multi`]. Returns an empty vec on ANY failure
+/// (bad id, no season, network, non-JSON) — the TV auto-naming path degrades to
+/// plain sequential numbering rather than blocking.
+pub fn season_episodes(tv_id: u64, season: u16, api_key: &str) -> Vec<Episode> {
+    if api_key.is_empty() || tv_id == 0 {
+        return Vec::new();
+    }
+    let url = format!(
+        "https://api.themoviedb.org/3/tv/{tv_id}/season/{season}?api_key={}",
+        urlencoded(api_key)
+    );
+    match AGENT.get(&url).call() {
+        Ok(resp) => match read_capped_json(resp) {
+            Ok(json) => parse_episodes(&json),
+            Err(e) => {
+                tracing::warn!(tv_id, season, error = %e, "tmdb: season response was not valid JSON");
+                Vec::new()
+            }
+        },
+        Err(ureq::Error::StatusCode(401)) => {
+            warn_bad_key_throttled();
+            Vec::new()
+        }
+        Err(e) => {
+            let error_kind = crate::web::ureq_error_kind(&e);
+            tracing::warn!(tv_id, season, error_kind = %error_kind, "tmdb: season fetch failed");
+            Vec::new()
+        }
+    }
+}
+
+/// Parse the `episodes` array of a `/tv/{id}/season/{n}` response.
+fn parse_episodes(json: &serde_json::Value) -> Vec<Episode> {
+    let Some(arr) = json["episodes"].as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|e| {
+            let number = u16::try_from(e["episode_number"].as_u64()?).ok()?;
+            Some(Episode {
+                number,
+                name: e["name"].as_str().unwrap_or("").to_string(),
+                runtime_min: e["runtime"]
+                    .as_u64()
+                    .and_then(|r| u16::try_from(r).ok())
+                    .unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+/// Assign ripped titles to episodes for `Show S{NN}E{MM}` naming.
+///
+/// The i-th selected title (in disc order) maps to episode `start + i`. When a
+/// TMDB episode of that number exists AND its runtime is plausibly the same as
+/// the ripped title's, its name is attached; otherwise the assignment is still
+/// numbered but nameless (degraded). `start` defaults to 1 at the call site.
+///
+/// Order-based by design: disc title order is broadcast order in practice, and
+/// the runtime check flags gross violations without over-fitting. `title_secs`
+/// is each selected title's duration in seconds, in disc order.
+pub fn map_episodes(
+    title_secs: &[f64],
+    episodes: &[Episode],
+    start: u16,
+) -> Vec<EpisodeAssignment> {
+    title_secs
+        .iter()
+        .enumerate()
+        .map(|(i, &secs)| {
+            let episode = start.saturating_add(i as u16);
+            let name = episodes
+                .iter()
+                .find(|e| e.number == episode)
+                .filter(|e| runtime_plausible(secs, e.runtime_min))
+                .map(|e| e.name.clone())
+                .unwrap_or_default();
+            EpisodeAssignment { episode, name }
+        })
+        .collect()
+}
+
+/// Is a ripped title's `secs` runtime plausibly the TMDB episode's `ep_min`
+/// minutes? Unknown episode runtime (0) never rejects. Tolerance is the larger
+/// of 5 minutes and 25% — generous, because DVD/broadcast runtimes and TMDB's
+/// listed runtime routinely differ by a few minutes (ad breaks, PAL speed-up).
+fn runtime_plausible(secs: f64, ep_min: u16) -> bool {
+    if ep_min == 0 {
+        return true;
+    }
+    let title_min = secs / 60.0;
+    let tol = (ep_min as f64 * 0.25).max(5.0);
+    (title_min - ep_min as f64).abs() <= tol
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1339,6 +1457,101 @@ mod tests {
         assert_eq!(disc_from_label("GOT_S3_D4"), Some(4));
         assert_eq!(disc_from_label("BATMAN_BD1"), Some(1));
         assert_eq!(disc_from_label("THE MATRIX"), None);
+    }
+
+    #[test]
+    fn parse_episodes_reads_number_name_runtime() {
+        let json = serde_json::json!({
+            "episodes": [
+                {"episode_number": 1, "name": "Muse", "runtime": 89},
+                {"episode_number": 2, "name": "Cartouche", "runtime": 89},
+                {"episode_number": 3, "name": "Passenger"} // runtime absent -> 0
+            ]
+        });
+        let eps = parse_episodes(&json);
+        assert_eq!(eps.len(), 3);
+        assert_eq!(
+            eps[0],
+            Episode {
+                number: 1,
+                name: "Muse".into(),
+                runtime_min: 89
+            }
+        );
+        assert_eq!(eps[2].runtime_min, 0);
+    }
+
+    #[test]
+    fn parse_episodes_empty_on_missing_array() {
+        assert!(parse_episodes(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn map_episodes_orders_from_start_and_names_when_runtime_matches() {
+        let eps = vec![
+            Episode {
+                number: 1,
+                name: "Muse".into(),
+                runtime_min: 89,
+            },
+            Episode {
+                number: 2,
+                name: "Cartouche".into(),
+                runtime_min: 89,
+            },
+        ];
+        // Two ripped titles ~89 min, season 5 disc 1 → start at E01.
+        let got = map_episodes(&[89.0 * 60.0, 88.0 * 60.0], &eps, 1);
+        assert_eq!(
+            got,
+            vec![
+                EpisodeAssignment {
+                    episode: 1,
+                    name: "Muse".into()
+                },
+                EpisodeAssignment {
+                    episode: 2,
+                    name: "Cartouche".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn map_episodes_numbers_but_drops_name_on_runtime_mismatch() {
+        // A "play all" style 180-min title paired with a 45-min episode: keep the
+        // sequential number but refuse the (wrong) name.
+        let eps = vec![Episode {
+            number: 3,
+            name: "Real Ep".into(),
+            runtime_min: 45,
+        }];
+        let got = map_episodes(&[180.0 * 60.0], &eps, 3);
+        assert_eq!(
+            got,
+            vec![EpisodeAssignment {
+                episode: 3,
+                name: String::new()
+            }]
+        );
+    }
+
+    #[test]
+    fn map_episodes_degrades_to_sequential_without_tmdb_data() {
+        let got = map_episodes(&[1400.0, 1400.0, 1400.0], &[], 7);
+        assert_eq!(
+            got.iter().map(|a| a.episode).collect::<Vec<_>>(),
+            vec![7, 8, 9]
+        );
+        assert!(got.iter().all(|a| a.name.is_empty()));
+    }
+
+    #[test]
+    fn runtime_plausible_tolerates_broadcast_drift_but_rejects_gross() {
+        assert!(runtime_plausible(89.0 * 60.0, 89)); // exact
+        assert!(runtime_plausible(46.0 * 60.0, 45)); // within tolerance
+        assert!(runtime_plausible(60.0 * 60.0, 0)); // unknown ep runtime never rejects
+        assert!(!runtime_plausible(180.0 * 60.0, 45)); // play-all vs episode
     }
 
     #[test]
