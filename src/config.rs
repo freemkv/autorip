@@ -161,6 +161,13 @@ pub struct Config {
     pub tv_dir: String,
     pub min_length_secs: u64,
     pub main_feature: bool,
+    /// Fully-automatic TV: when a disc resolves as a series, rip every episode
+    /// title (not just the main feature), auto-number them `S{NN}E{MM}` from
+    /// TMDB, and file into `Show (Year)/Season NN/` — no operator step. Default
+    /// true (it's *auto*rip). When false, a TV disc is held for review so the
+    /// operator confirms selection/season/episodes before filing.
+    #[serde(default = "default_true")]
+    pub tv_auto: bool,
     pub auto_eject: bool,
     pub on_insert: String,      // "nothing", "scan", "rip"
     pub output_format: String,  // "mkv", "m2ts", "iso"
@@ -305,6 +312,7 @@ impl Default for Config {
             tv_dir: String::new(),
             min_length_secs: 600,
             main_feature: true,
+            tv_auto: true,
             auto_eject: true,
             on_insert: "scan".into(),
             output_format: "mkv".into(),
@@ -603,6 +611,9 @@ fn load_saved(mut cfg: Config) -> Config {
     }
     if let Some(v) = saved.get("main_feature").and_then(|v| v.as_bool()) {
         cfg.main_feature = v;
+    }
+    if let Some(v) = saved.get("tv_auto").and_then(|v| v.as_bool()) {
+        cfg.tv_auto = v;
     }
     if let Some(v) = saved.get("auto_eject").and_then(|v| v.as_bool()) {
         cfg.auto_eject = v;
