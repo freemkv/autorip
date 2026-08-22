@@ -893,20 +893,24 @@ function reviewSearch(idx){
   }).catch(()=>{if(box)box.textContent='search failed'});
 }
 function reviewPick(idx,j){const c=(_RC[idx]||[])[j]; if(c)reviewResolve(idx,'retitle',{title:c.title,year:c.year||0});}
-/* Manual entry: file under exactly the typed text (no TMDB pick needed). Lets
-   the operator disambiguate a variant TMDB doesn't list as its own entry —
-   e.g. "Deadpool 2 (Super Duper Cut)" alongside an already-ripped "Deadpool 2".
-   A trailing "(YYYY)" in the text is used as the year; otherwise the held
-   item's year is kept. */
-function reviewManual(idx){
-  const it=_REV[idx]; if(!it)return;
-  const raw=((document.getElementById('rvq-'+idx)||{}).value||'').trim();
-  if(!raw){alert('Type a name first');return}
+/* Split typed manual-rename text into {title, year}: a trailing "(YYYY)" is
+   pulled out as the year, else `fallbackYear`. Shared by reviewManual and
+   titleManual so the two entry points can't drift. Returns null on empty. */
+function parseManualName(raw,fallbackYear){
+  raw=(raw||'').trim(); if(!raw)return null;
   const m=raw.match(/^(.*?)\s*\((\d{4})\)\s*$/);
   const title=m?m[1].trim():raw;
-  const year=m?parseInt(m[2],10):(it.year||0);
-  if(!title){alert('Type a name first');return}
-  reviewResolve(idx,'retitle',{title:title,year:year});
+  if(!title)return null;
+  return {title:title,year:m?parseInt(m[2],10):(fallbackYear||0)};
+}
+/* Manual entry: file under exactly the typed text (no TMDB pick needed). Lets
+   the operator disambiguate a variant TMDB doesn't list as its own entry —
+   e.g. "Deadpool 2 (Super Duper Cut)" alongside an already-ripped "Deadpool 2". */
+function reviewManual(idx){
+  const it=_REV[idx]; if(!it)return;
+  const p=parseManualName((document.getElementById('rvq-'+idx)||{}).value,it.year);
+  if(!p){alert('Type a name first');return}
+  reviewResolve(idx,'retitle',{title:p.title,year:p.year});
 }
 function loadReview(){
   fetch('/api/review').then(r=>r.json()).then(items=>{
@@ -962,13 +966,11 @@ function titlePick(dev,j){
    Duper Cut)"). A trailing "(YYYY)" becomes the year; tmdb_id 0 marks it a
    free-form override (handle_title_override already accepts this). */
 function titleManual(dev){
-  const i=document.getElementById('tq-'+dev); const raw=i?i.value.trim():'';
-  if(!raw){alert('Type a name first');return}
-  const m=raw.match(/^(.*?)\s*\((\d{4})\)\s*$/);
-  const title=m?m[1].trim():raw; const year=m?parseInt(m[2],10):0;
-  if(!title){alert('Type a name first');return}
+  const i=document.getElementById('tq-'+dev);
+  const p=parseManualName(i?i.value:'',0);
+  if(!p){alert('Type a name first');return}
   fetch('/api/title/'+dev,{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({title:title,year:year,tmdb_id:0})})
+    body:JSON.stringify({title:p.title,year:p.year,tmdb_id:0})})
     .then(r=>r.json().then(j=>({ok:r.ok,j:j})))
     .then(({ok,j})=>{if(!ok||(j&&j.ok===false)){alert('Rename failed: '+((j&&j.error)||'server error'));return}
       const el=document.getElementById('tedit-'+dev);if(el)el.style.display='none';})
@@ -1827,10 +1829,15 @@ fn handle_title_override(request: tiny_http::Request, device: &str) {
     let media_type = match v["media_type"].as_str().filter(|s| !s.is_empty()) {
         Some(mt) => normalize_media_type(mt),
         None => {
+            // Recover a poisoned lock (`into_inner`) rather than abandoning to
+            // `None` — every other STATE consumer in this file does, and
+            // abandoning here would fall through to the "movie" default this arm
+            // exists to avoid, mis-routing a TV disc on a poisoned lock.
             let current = ripper::STATE
                 .lock()
-                .ok()
-                .and_then(|s| s.get(device).map(|rs| rs.tmdb_media_type.clone()))
+                .unwrap_or_else(|e| e.into_inner())
+                .get(device)
+                .map(|rs| rs.tmdb_media_type.clone())
                 .unwrap_or_default();
             normalize_media_type(if current.is_empty() {
                 "movie"
