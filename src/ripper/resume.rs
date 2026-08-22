@@ -1690,7 +1690,17 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // list of episodes that muxed AND fsync'd; it seeds from the primary (already
     // durable above) and becomes the hand-off `outputs[]`. No-op for movies.
     let mut delivered: Vec<staging::Output> = plan_outputs.first().cloned().into_iter().collect();
-    if is_fanout {
+    // Network output streams to a SINGLE sink — it can't take N distinct episode
+    // files, and there is no mover step to relocate local ones. So don't fan out
+    // for a network target: deliver the primary only (a TV disc muxed to a
+    // network sink is an unusual, essentially single-stream configuration).
+    if is_fanout && is_network {
+        crate::log::device_log(
+            device,
+            "TV disc with network output — delivering the first episode only (a network sink takes a single stream).",
+        );
+    }
+    if is_fanout && !is_network {
         for extra in plan_outputs.iter().skip(1) {
             let ep_output_path = format!("{staging_str}/{}", extra.filename);
             // Best-effort delete of any partial/undurable output for this episode,
@@ -1880,7 +1890,16 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         device,
         &iso_path,
         &mapfile_path,
-        cfg_read.max_retries,
+        // Use the RIP-TIME max_retries the ISO was produced with (from the
+        // hand-off marker), NOT the current config: this dir is being resumed
+        // FROM a staged ISO, so that ISO exists regardless of what the operator
+        // has since changed max_retries to. Passing the current value would let a
+        // routine `max_retries → 0` edit between rip and resume make the prune's
+        // `uses_multipass` guard skip the reclaim, leaking a tens-of-GB ISO.
+        marker_tmdb
+            .as_ref()
+            .map(|m| m.max_retries)
+            .unwrap_or(cfg_read.max_retries),
         super::retain_intermediate_iso(cfg_read.keep_iso, &output_format),
     );
 

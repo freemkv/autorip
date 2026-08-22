@@ -44,6 +44,14 @@
 
 ### Fixed
 
+- **The episode list in `state.json` is authoritative for a TV move.** The mover
+  files exactly the episodes recorded in `outputs[]` and ignores any other file
+  in the staging dir — so a leftover partial from an episode that failed to mux
+  (and whose cleanup didn't land) can never be promoted into the library under a
+  raw filename as if it were a complete episode.
+- **Manual Rename keeps a TV disc a TV disc.** The disc-card Manual Rename no
+  longer forces `media_type=movie`; it preserves the disc's detected type, so
+  renaming a series doesn't collapse all its episodes to a single movie path.
 - **TV fan-out now delivers only durable episodes.** In the per-episode mux
   loop, an episode that failed to mux or fsync is dropped (its partial file
   deleted) and excluded from the hand-off, instead of being filed as complete —

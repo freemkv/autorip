@@ -968,7 +968,7 @@ function titleManual(dev){
   const title=m?m[1].trim():raw; const year=m?parseInt(m[2],10):0;
   if(!title){alert('Type a name first');return}
   fetch('/api/title/'+dev,{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({title:title,year:year,media_type:'movie',tmdb_id:0})})
+    body:JSON.stringify({title:title,year:year,tmdb_id:0})})
     .then(r=>r.json().then(j=>({ok:r.ok,j:j})))
     .then(({ok,j})=>{if(!ok||(j&&j.ok===false)){alert('Rename failed: '+((j&&j.error)||'server error'));return}
       const el=document.getElementById('tedit-'+dev);if(el)el.style.display='none';})
@@ -1819,7 +1819,26 @@ fn handle_title_override(request: tiny_http::Request, device: &str) {
     }
     let poster = clamp_chars(poster_raw, 1000);
     let overview = clamp_chars(v["overview"].as_str().unwrap_or(""), 2000);
-    let media_type = normalize_media_type(v["media_type"].as_str().unwrap_or("movie"));
+    // Preserve the disc's DETECTED media_type when the caller omits one (the
+    // Manual Rename button does): blindly defaulting to "movie" would flip a TV
+    // disc to movie routing, and the mover would then collapse all N episode
+    // outputs to a single `Show (Year).mkv` destination — silently losing every
+    // episode but one. Only fall back to "movie" when nothing is known.
+    let media_type = match v["media_type"].as_str().filter(|s| !s.is_empty()) {
+        Some(mt) => normalize_media_type(mt),
+        None => {
+            let current = ripper::STATE
+                .lock()
+                .ok()
+                .and_then(|s| s.get(device).map(|rs| rs.tmdb_media_type.clone()))
+                .unwrap_or_default();
+            normalize_media_type(if current.is_empty() {
+                "movie"
+            } else {
+                &current
+            })
+        }
+    };
     // The picker posts back the chosen result's TMDB id (0 if the operator
     // typed a free-form title with no pick); carry it so the override matches
     // what a `lookup` match would have provided.
@@ -5874,7 +5893,7 @@ mod web_tests {
             write_state(&aborted_dir, &st);
 
             let mut aborted_after = read_state(&aborted_dir).unwrap();
-            accept_loss_closure_apply(&mut aborted_after);
+            ripper::staging::apply_accept_loss_reopen(&mut aborted_after);
             write_state(&aborted_dir, &aborted_after);
 
             let after = read_state(&aborted_dir).unwrap();
@@ -5904,7 +5923,7 @@ mod web_tests {
             write_state(&done_dir, &done_st);
 
             let mut done_after = read_state(&done_dir).unwrap();
-            accept_loss_closure_apply(&mut done_after);
+            ripper::staging::apply_accept_loss_reopen(&mut done_after);
             write_state(&done_dir, &done_after);
             let done_after = read_state(&done_dir).unwrap();
 
@@ -5913,21 +5932,6 @@ mod web_tests {
                 StagingState::Done,
                 "a Done dir must NOT be reopened by the accept-loss transition"
             );
-        }
-
-        /// Standalone copy of the closure `handle_accept_loss` passes to
-        /// `ripper::staging::mutate_state_if_present` — kept as a free function
-        /// (rather than inlined per-call) so both branches of
-        /// `accept_loss_transition_reopens_aborted_dir` run the identical logic.
-        fn accept_loss_closure_apply(s: &mut ripper::staging::DiscState) {
-            if matches!(
-                s.state,
-                ripper::staging::StagingState::AbortedLoss | ripper::staging::StagingState::Failed
-            ) {
-                s.state = ripper::staging::StagingState::Ripped;
-            }
-            s.failure_reason = None;
-            s.restart_count = 0;
         }
     }
 }
@@ -7673,16 +7677,7 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
     // instead of being refused as failed (mirrors the legacy "remove
     // `.failed` + `.aborted-loss`, leaving `.ripped`").
     ripper::staging::write_accept_loss_marker(dir);
-    ripper::staging::mutate_state_if_present(dir, |s| {
-        if matches!(
-            s.state,
-            ripper::staging::StagingState::AbortedLoss | ripper::staging::StagingState::Failed
-        ) {
-            s.state = ripper::staging::StagingState::Ripped;
-        }
-        s.failure_reason = None;
-        s.restart_count = 0;
-    });
+    ripper::staging::mutate_state_if_present(dir, ripper::staging::apply_accept_loss_reopen);
     // Legacy pre-migration dirs: strip the marker files the same way.
     let _ = std::fs::remove_file(dir.join(ripper::staging::FAILED_MARKER));
     ripper::staging::clear_aborted_loss_marker(dir);

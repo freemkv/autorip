@@ -257,6 +257,7 @@ impl std::fmt::Debug for Config {
             .field("tv_dir", &self.tv_dir)
             .field("min_length_secs", &self.min_length_secs)
             .field("main_feature", &self.main_feature)
+            .field("tv_auto", &self.tv_auto)
             .field("auto_eject", &self.auto_eject)
             .field("on_insert", &self.on_insert)
             .field("output_format", &self.output_format)
