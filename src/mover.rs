@@ -989,10 +989,14 @@ fn check_and_move(cfg: &Config) {
             let allowed: std::collections::HashSet<&str> =
                 state_outputs.iter().map(|o| o.filename.as_str()).collect();
             ripped_files.retain(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| allowed.contains(n))
-                    .unwrap_or(false)
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                // Keep the intermediate ISO: `outputs[]` lists only the muxed
+                // episodes, never the ISO, but a `keep_iso` rip legitimately
+                // promotes the ISO to the archive (it reached here via `move_iso`)
+                // — dropping it would leave it un-moved and the staging teardown
+                // would then destroy the very image the operator asked to keep.
+                // The filter only screens out stray/partial EPISODE files.
+                is_iso_file(name) || allowed.contains(name)
             });
         }
 
@@ -3938,6 +3942,70 @@ mod tests {
             !found_leftover,
             "the leftover S05E03 partial is not in outputs[] and must NOT be \
              promoted into the library"
+        );
+    }
+
+    /// Regression: the TV filter (`is_tv_plan`, see the comment above the
+    /// `ripped_files.retain(...)` in `check_and_move`) restricts promoted
+    /// files to those named in `outputs[]` — but `outputs[]` never lists the
+    /// intermediate `.iso`, only the muxed episodes. Before the
+    /// `is_iso_file(name) ||` clause was added, a `keep_iso=true` TV rip's
+    /// ISO was silently dropped by this filter, then destroyed by the
+    /// staging-dir teardown that follows a successful move — even though the
+    /// operator explicitly asked to keep it. Here the staging dir holds one
+    /// planned episode plus an intermediate ISO with `keep_iso=true`: both
+    /// must survive — the episode filed into the TV library, the ISO
+    /// promoted alongside it — not just the episode.
+    #[test]
+    fn check_and_move_keeps_iso_for_a_tv_dir_with_keep_iso() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(output_dir.join("TV")).unwrap();
+
+        let cfg = Config {
+            staging_dir: staging.to_string_lossy().to_string(),
+            output_dir: output_dir.to_string_lossy().to_string(),
+            movie_dir: String::new(),
+            tv_dir: "TV".to_string(),
+            keep_iso: true,
+            ..Config::default()
+        };
+
+        let disc_dir = staging.join("Endeavour_S05");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+
+        let mut st =
+            crate::ripper::staging::DiscState::new(crate::ripper::staging::StagingState::Done);
+        st.title = "Endeavour".to_string();
+        st.disc_name = "Endeavour".to_string();
+        st.year = 2012;
+        st.media_type = "tv".to_string();
+        st.tmdb_id = 12345;
+        st.season = Some(5);
+        st.outputs = vec![ep_output("Endeavour_S05E01.mkv", Some(1), "Muse")];
+        crate::ripper::staging::write_state(&disc_dir, &st);
+
+        // The planned episode, plus the intermediate ISO (kept via keep_iso,
+        // never listed in outputs[]).
+        std::fs::write(disc_dir.join("Endeavour_S05E01.mkv"), vec![0x11u8; 4096]).unwrap();
+        std::fs::write(disc_dir.join("Endeavour.iso"), vec![0x22u8; 512]).unwrap();
+
+        check_and_move(&cfg);
+
+        let series_dir = output_dir
+            .join("TV")
+            .join("Endeavour (2012)")
+            .join("Season 05");
+        assert!(
+            series_dir.join("Endeavour S05E01 - Muse.mkv").exists(),
+            "the planned episode must be filed"
+        );
+        assert!(
+            series_dir.join("Endeavour.iso").exists(),
+            "keep_iso=true must promote the intermediate ISO alongside the \
+             episode, not drop it to be destroyed by staging teardown"
         );
     }
 

@@ -5933,6 +5933,117 @@ mod web_tests {
                 "a Done dir must NOT be reopened by the accept-loss transition"
             );
         }
+
+        // ── handle_title_override: omitted media_type preserves detection ──
+        //
+        // The Manual Rename button POSTs a title override with NO
+        // `media_type` field. `handle_title_override` must fall back to the
+        // disc's DETECTED `tmdb_media_type` from STATE, not blindly default
+        // to "movie" — forcing "movie" on a TV disc collapses every episode
+        // output to one `Show (Year).mkv` destination downstream. Each test
+        // uses a device name unique to it (pure alphanumeric, per
+        // `is_valid_device_name`) so it can't race the process-global STATE
+        // / TITLE_OVERRIDES with sibling tests running concurrently.
+
+        #[test]
+        fn title_override_omitted_media_type_preserves_detected_tv() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let device = "sgtitleovrtvpreserve1";
+            ripper::update_state(
+                device,
+                ripper::RipState {
+                    device: device.to_string(),
+                    tmdb_media_type: "tv".to_string(),
+                    ..Default::default()
+                },
+            );
+
+            let (code, _) = roundtrip(
+                &cfg,
+                "POST",
+                &format!("/api/title/{device}"),
+                Some(r#"{"title":"Endeavour","tmdb_id":0}"#),
+                &[],
+            );
+            assert_eq!(code, 200, "a known device must accept the override");
+
+            let stored = ripper::take_title_override(device)
+                .expect("handle_title_override must record an override");
+            assert_eq!(
+                stored.media_type, "tv",
+                "omitting media_type must preserve the disc's detected \
+                 tmdb_media_type (tv), not fall back to movie"
+            );
+
+            crate::ripper::STATE.lock().unwrap().remove(device);
+        }
+
+        #[test]
+        fn title_override_omitted_media_type_defaults_movie_when_unknown() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let device = "sgtitleovrnodetect2";
+            ripper::update_state(
+                device,
+                ripper::RipState {
+                    device: device.to_string(),
+                    // tmdb_media_type left empty: nothing detected yet.
+                    ..Default::default()
+                },
+            );
+
+            let (code, _) = roundtrip(
+                &cfg,
+                "POST",
+                &format!("/api/title/{device}"),
+                Some(r#"{"title":"X","tmdb_id":0}"#),
+                &[],
+            );
+            assert_eq!(code, 200, "a known device must accept the override");
+
+            let stored = ripper::take_title_override(device)
+                .expect("handle_title_override must record an override");
+            assert_eq!(
+                stored.media_type, "movie",
+                "with no detected media_type, omission must fall back to movie"
+            );
+
+            crate::ripper::STATE.lock().unwrap().remove(device);
+        }
+
+        #[test]
+        fn title_override_explicit_media_type_is_honored() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let device = "sgtitleovrexplicit3";
+            // Detected as movie, but the operator explicitly overrides to tv:
+            // the explicit field must win over whatever STATE says.
+            ripper::update_state(
+                device,
+                ripper::RipState {
+                    device: device.to_string(),
+                    tmdb_media_type: "movie".to_string(),
+                    ..Default::default()
+                },
+            );
+
+            let (code, _) = roundtrip(
+                &cfg,
+                "POST",
+                &format!("/api/title/{device}"),
+                Some(r#"{"title":"X","media_type":"tv","tmdb_id":0}"#),
+                &[],
+            );
+            assert_eq!(code, 200, "a known device must accept the override");
+
+            let stored = ripper::take_title_override(device)
+                .expect("handle_title_override must record an override");
+            assert_eq!(
+                stored.media_type, "tv",
+                "an explicit media_type in the request body must be honored \
+                 over the detected tmdb_media_type"
+            );
+
+            crate::ripper::STATE.lock().unwrap().remove(device);
+        }
     }
 }
 
