@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.6.9] — 2026-08-22
+
+### Added
+
+- **Proper TV support.** A series disc now resolves to the show itself and files
+  into the Jellyfin/Plex layout `TV/Show (Year)/Season NN/`. The season number is
+  read from the disc label (`Endeavour Season 5 Disc 2`, `GOT_S3_DISC1`, …), the
+  series folder carries the year, and the season subfolder is zero-padded
+  (`Season 05`). Previously every TV disc was dumped into a hardcoded `Season 1`
+  folder with no year — so seasons collided and scrapers mis-matched. A disc with
+  no season marker still defaults to `Season 01` rather than landing loose.
+- **TMDB id on every match.** A resolved title now carries its TMDB numeric id, so
+  downstream tooling can fetch anything else it needs straight from TMDB by id
+  without re-searching.
+
+### Fixed
+
+- **A season-labelled disc now resolves to the show, not a same-named film.** When
+  the disc label carries a season marker, the title match prefers the TV series
+  over a film of the same name (e.g. the ITV series *Endeavour* rather than a
+  film called *Endeavour*), so the disc files as TV instead of being mis-filed as
+  a movie. The preference is a tie-break only — an exact film match still wins
+  over a fuzzy series one.
+
+- **Discs that returned *no* TMDB match now resolve.** The title lookup used to
+  send the disc label to TMDB as-is, and a single stray token would zero out the
+  entire search — e.g. `Batman v Superman: Dawn of Justice: UE` (Ultimate Edition)
+  matched nothing and dropped to the needs-review queue. The lookup now cleans the
+  label and, if the full title finds nothing, progressively peels trailing
+  junk-shaped tokens (edition/region/packaging codes like `UE`, `SE`, `UPT1`,
+  `3D`) and retries — while never trimming a real sequel marker, so `Alien 3` and
+  `Rocky II` are untouched. The auto-file confidence check uses the same logic, so
+  a title the lookup can resolve no longer gets parked in review.
+
 ## [1.6.8] — 2026-08-21
 
 ### Added

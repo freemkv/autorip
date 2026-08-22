@@ -923,10 +923,17 @@ fn check_and_move(cfg: &Config) {
                 poster_url: marker["poster_url"].as_str().unwrap_or("").to_string(),
                 overview: marker["overview"].as_str().unwrap_or("").to_string(),
                 media_type: marker["media_type"].as_str().unwrap_or("movie").to_string(),
+                tmdb_id: marker["tmdb_id"].as_u64().unwrap_or(0),
             })
         } else {
             None
         };
+        // Season number parsed from the disc label at rip time (null for movies
+        // / unmarked labels). The TV branch of `build_destination` uses it to
+        // place the rip under `Show (Year)/Season NN/`.
+        let season = marker["season"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok());
 
         // Find ripped files. `keep_iso=false` means the operator does not
         // want the intermediate ISO promoted to the output library — only
@@ -995,7 +1002,7 @@ fn check_and_move(cfg: &Config) {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let dest = build_destination(cfg, &tmdb_result, &filename);
+            let dest = build_destination(cfg, &tmdb_result, &filename, season);
             planned_moves.push((file_path.clone(), dest));
         }
 
@@ -1636,7 +1643,12 @@ fn is_iso_file(filename: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
 }
 
-fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
+fn build_destination(
+    cfg: &Config,
+    tmdb: &Option<tmdb::TmdbResult>,
+    filename: &str,
+    season: Option<u16>,
+) -> String {
     // Kept/output disc images archive to their own FLAT folder when `iso_dir`
     // is configured — a sibling of the movie/tv library (e.g.
     // /mnt/media/isos), not beside the muxed title. `iso_dir` resolves under
@@ -1707,7 +1719,22 @@ fn build_destination(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &s
                 // Same join fix as the movie branch: `tv_dir` resolved under
                 // `output_dir` (relative joins, absolute wins).
                 let root = resolve_media_root(&cfg.output_dir, &cfg.tv_dir);
-                let dir = format!("{root}/{safe_title}/Season 1");
+                // Jellyfin/Plex TV layout: `Show (Year)/Season NN/`. The series
+                // folder carries the year (matching the movie branch and aiding
+                // the scrapers' series match); the season subfolder is
+                // zero-padded. Season parsed from the disc label at rip time;
+                // when the label carried none, default to 1 (a series disc with
+                // no season marker is treated as season 1 rather than dumped
+                // loose under the show).
+                let year_str = if result.year > 0 {
+                    format!(" ({})", result.year)
+                } else {
+                    String::new()
+                };
+                let dir = format!(
+                    "{root}/{safe_title}{year_str}/Season {:02}",
+                    season.unwrap_or(1)
+                );
                 // Sanitize the leaf too — the movie branch already derives
                 // its leaf from a sanitized title, but this branch used the
                 // RAW source filename, so a filename carrying a path
@@ -2330,6 +2357,7 @@ mod tests {
             poster_url: String::new(),
             overview: String::new(),
             media_type: "movie".into(),
+            tmdb_id: 0,
         }
     }
 
@@ -2340,6 +2368,7 @@ mod tests {
             poster_url: String::new(),
             overview: String::new(),
             media_type: "tv".into(),
+            tmdb_id: 0,
         }
     }
 
@@ -2417,7 +2446,7 @@ mod tests {
     fn build_destination_movie_with_year() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Aurora Drift Two", 2024));
-        let dest = build_destination(&cfg, &tmdb, "disc.mkv");
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None);
         assert_eq!(
             dest,
             "/out/Movies/Aurora Drift Two (2024)/Aurora Drift Two (2024).mkv"
@@ -2442,8 +2471,9 @@ mod tests {
             poster_url: String::new(),
             overview: String::new(),
             media_type: String::new(),
+            tmdb_id: 0,
         });
-        let dest = build_destination(&cfg, &tmdb, "Drive (2011) - 4K Ultra HD.mkv");
+        let dest = build_destination(&cfg, &tmdb, "Drive (2011) - 4K Ultra HD.mkv", None);
         // Files under the movie library in a per-title folder. (sanitize_path_display
         // strips the parens from the disc-label title — same reason the mis-filed
         // name lacked them — so the leaf is "Drive 2011 - 4K Ultra HD".)
@@ -2478,7 +2508,7 @@ mod tests {
         // Reproduces the Mercy incident config (relative movie_dir, NFS output_dir).
         let cfg = cfg_with_dirs("movies", "", "/mnt/media/");
         let tmdb = Some(tmdb_movie("Mercy", 2023));
-        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv");
+        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv", None);
         assert_eq!(
             dest, "/mnt/media/movies/Mercy (2023)/Mercy (2023).mkv",
             "a relative movie_dir must resolve UNDER output_dir on the NFS mount"
@@ -2509,9 +2539,20 @@ mod tests {
             poster_url: String::new(),
             overview: String::new(),
             media_type: "tv".into(),
+            tmdb_id: 0,
         });
-        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv");
-        assert_eq!(dest, "/mnt/media/tv/Severance/Season 1/sev_s01e01.mkv");
+        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv", None);
+        // No season parsed → default Season 01; series folder carries the year.
+        assert_eq!(
+            dest,
+            "/mnt/media/tv/Severance (2022)/Season 01/sev_s01e01.mkv"
+        );
+        // A parsed season lands in the matching zero-padded subfolder.
+        let dest5 = build_destination(&cfg, &tmdb, "sev_s05e02.mkv", Some(5));
+        assert_eq!(
+            dest5,
+            "/mnt/media/tv/Severance (2022)/Season 05/sev_s05e02.mkv"
+        );
         assert!(!dest.starts_with("/tv/"));
     }
 
@@ -2522,7 +2563,7 @@ mod tests {
     fn build_destination_absolute_movie_dir_overrides_output_dir() {
         let cfg = cfg_with_dirs("/srv/library/movies", "", "/mnt/media/");
         let tmdb = Some(tmdb_movie("Mercy", 2023));
-        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv");
+        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv", None);
         assert_eq!(
             dest, "/srv/library/movies/Mercy (2023)/Mercy (2023).mkv",
             "an absolute movie_dir must override output_dir (Path::join semantics)"
@@ -2661,7 +2702,7 @@ mod tests {
     fn build_destination_movie_without_year_falls_through() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Unknown Year", 0));
-        let dest = build_destination(&cfg, &tmdb, "disc.mkv");
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None);
         // year=0 skips the "(YEAR)" suffix; mkv name derived from cleaned title.
         assert_eq!(dest, "/out/Movies/Unknown Year/Unknown Year.mkv");
     }
@@ -2675,15 +2716,16 @@ mod tests {
             poster_url: String::new(),
             overview: String::new(),
             media_type: "tv".into(),
+            tmdb_id: 0,
         });
-        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv");
-        assert_eq!(dest, "/out/TV/Severance/Season 1/sev_s01e01.mkv");
+        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv", None);
+        assert_eq!(dest, "/out/TV/Severance (2022)/Season 01/sev_s01e01.mkv");
     }
 
     #[test]
     fn build_destination_no_tmdb_falls_to_output_dir() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
-        let dest = build_destination(&cfg, &None, "disc.mkv");
+        let dest = build_destination(&cfg, &None, "disc.mkv", None);
         assert_eq!(dest, "/out/disc.mkv");
     }
 
@@ -2691,7 +2733,7 @@ mod tests {
     fn build_destination_empty_movie_dir_falls_to_output_dir() {
         let cfg = cfg_with_dirs("", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Movie", 2020));
-        let dest = build_destination(&cfg, &tmdb, "disc.mkv");
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None);
         // movie_dir empty → fall-through to output_dir + filename.
         assert_eq!(dest, "/out/disc.mkv");
     }
@@ -2710,7 +2752,7 @@ mod tests {
     fn build_destination_empty_tv_dir_falls_to_output_dir() {
         let cfg = cfg_with_dirs("/out/Movies", "", "/out");
         let tv = tmdb_tv("Severance", 2022);
-        let dest = build_destination(&cfg, &Some(tv.clone()), "sev_s01e01.mkv");
+        let dest = build_destination(&cfg, &Some(tv.clone()), "sev_s01e01.mkv", None);
         assert_eq!(
             dest, "/out/sev_s01e01.mkv",
             "an empty tv_dir must fall through to the output root, not \
@@ -2744,7 +2786,7 @@ mod tests {
                 let mut r = tmdb_movie("Some Title", 2024);
                 r.media_type = media_type.to_string();
                 let root = destination_root(&cfg, &Some(r.clone()));
-                let dest = build_destination(&cfg, &Some(r), "Disc.mkv");
+                let dest = build_destination(&cfg, &Some(r), "Disc.mkv", None);
                 assert!(
                     dest.starts_with(&format!("{root}/")),
                     "dest {dest} must live under the validated root {root} \
@@ -2782,8 +2824,8 @@ mod tests {
         // the other in alternating ticks. Source extension must win.
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Lumina", 2023));
-        let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso");
-        let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv");
+        let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso", None);
+        let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv", None);
         assert_eq!(dest_iso, "/out/Movies/Lumina (2023)/Lumina (2023).iso");
         assert_eq!(dest_mkv, "/out/Movies/Lumina (2023)/Lumina (2023).mkv");
         assert_ne!(
@@ -2796,7 +2838,7 @@ mod tests {
     fn build_destination_movie_preserves_m2ts_extension() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Movie", 2024));
-        let dest = build_destination(&cfg, &tmdb, "00800.m2ts");
+        let dest = build_destination(&cfg, &tmdb, "00800.m2ts", None);
         assert_eq!(dest, "/out/Movies/Movie (2024)/Movie (2024).m2ts");
     }
 
@@ -2811,8 +2853,8 @@ mod tests {
         let mut cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         cfg.iso_dir = "isos".into();
         let tmdb = Some(tmdb_movie("Lumina", 2023));
-        let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso").replace('\\', "/");
-        let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv").replace('\\', "/");
+        let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso", None).replace('\\', "/");
+        let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv", None).replace('\\', "/");
         assert_eq!(dest_iso, "/out/isos/Lumina (2023).iso");
         assert_eq!(dest_mkv, "/out/Movies/Lumina (2023)/Lumina (2023).mkv");
     }
@@ -2824,7 +2866,7 @@ mod tests {
         cfg.iso_dir = "/mnt/archive/isos".into();
         let tmdb = Some(tmdb_movie("Lumina", 2023));
         assert_eq!(
-            build_destination(&cfg, &tmdb, "Lumina.iso"),
+            build_destination(&cfg, &tmdb, "Lumina.iso", None),
             "/mnt/archive/isos/Lumina (2023).iso"
         );
     }
@@ -2837,7 +2879,7 @@ mod tests {
         assert!(cfg.iso_dir.is_empty());
         let tmdb = Some(tmdb_movie("Lumina", 2023));
         assert_eq!(
-            build_destination(&cfg, &tmdb, "Lumina.iso"),
+            build_destination(&cfg, &tmdb, "Lumina.iso", None),
             "/out/Movies/Lumina (2023)/Lumina (2023).iso"
         );
     }
@@ -5209,6 +5251,7 @@ mod tests {
             poster_url: String::new(),
             overview: String::new(),
             media_type: "tv".into(),
+            tmdb_id: 0,
         };
         assert_eq!(destination_root(&cfg, &Some(tv)), "/mnt/tv");
         // no tmdb → output_dir

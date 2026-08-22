@@ -1783,6 +1783,7 @@ mod tests {
                 poster_url: String::new(),
                 overview: String::new(),
                 media_type: "movie".to_string(),
+                tmdb_id: 0,
             },
         );
         set_stop_cooldown(dev);
@@ -2147,6 +2148,7 @@ mod tests {
             poster_url: String::new(),
             overview: String::new(),
             media_type: "movie".to_string(),
+            tmdb_id: 0,
         };
         set_title_override(&dev, picked.clone());
         let taken = take_title_override(&dev).expect("override must be present after set");

@@ -5,6 +5,13 @@ pub struct TmdbResult {
     pub poster_url: String,
     pub overview: String,
     pub media_type: String, // "movie" or "tv"
+    /// TMDB numeric id for this match (0 = unknown). Carried so a consumer —
+    /// autorip's own metadata enrichment, or kdb resolving a volume id via
+    /// [`lookup`] — can fetch anything else it wants straight from TMDB by id,
+    /// without re-searching. `serde(default)` so markers written before this
+    /// field existed still deserialize.
+    #[serde(default)]
+    pub tmdb_id: u64,
 }
 
 /// Shared agent for all TMDB calls. ureq sets NO connect/read timeout by
@@ -146,19 +153,58 @@ fn warn_bad_key_throttled() {
     }
 }
 
-pub fn lookup(query: &str, api_key: &str) -> Option<TmdbResult> {
+/// Resolve a disc `label` to a TMDB movie/TV entry.
+///
+/// Takes the RAW disc volume label (not a pre-cleaned string): cleaning and the
+/// progressive-fallback trimming both live here so the lookup and the auto-file
+/// gate ([`is_confident_match`]) can never disagree about what was searched.
+///
+/// TMDB's `search/multi` text search zeroes out on a single unparseable trailing
+/// token — the disc "Batman v Superman: Dawn of Justice: UE" returns ZERO hits,
+/// but dropping the "UE" (Ultimate Edition) returns the exact 2016 film. Disc
+/// labels carry an un-enumerable tail of edition/region/packaging codes (UE, SE,
+/// UPT1, G51, BD3, 3D, …), so instead of an ever-growing blocklist we query the
+/// cleaned label, and on no *confident* match peel junk-shaped trailing tokens
+/// one at a time and re-query ([`query_variants`]). Pure numbers and roman
+/// numerals are NEVER peeled — they are sequel markers ("Alien 3", "Rocky II"),
+/// and trimming them would mis-file a sequel as the original film.
+///
+/// Returns the first confident match (exact normalized title + a year) across
+/// the variants; failing that, the best non-exact guess from the earliest
+/// variant that returned anything, so the needs-review card still shows a
+/// suggestion. The confidence bar itself is unchanged — only recall improves.
+pub fn lookup(label: &str, api_key: &str) -> Option<TmdbResult> {
     if api_key.is_empty() {
         return None;
     }
-    // Mirror `search`'s guard: a separator-only volume label that
-    // clean_title reduces to "" would otherwise fire a query=&... request
-    // that TMDB answers with HTTP 422 and a spurious per-insert warning.
-    if query.trim().is_empty() {
-        return None;
+    // A separator-only volume label reduces to no query variants; short-circuit
+    // rather than firing a `query=&...` request that TMDB answers with HTTP 422.
+    //
+    // A season marker in the label ("… Season 5") means the disc is TV — bias
+    // the pick toward the series so a same-named film can't outrank the show.
+    let prefer_tv = season_from_label(label).is_some();
+    let mut fallback: Option<TmdbResult> = None;
+    for variant in query_variants(label) {
+        if variant.trim().is_empty() {
+            continue;
+        }
+        let Some(resp) = fetch_multi(&variant, api_key) else {
+            continue;
+        };
+        let Some(results) = resp["results"].as_array() else {
+            continue;
+        };
+        if let Some(best) = pick_best(&variant, results, prefer_tv) {
+            // Confident = exact normalized title match on THIS variant + a year.
+            if best.year > 0 && norm(&best.title) == norm(&variant) {
+                return Some(best);
+            }
+            if fallback.is_none() {
+                fallback = Some(best);
+            }
+        }
     }
-    let resp = fetch_multi(query, api_key)?;
-    let results = resp["results"].as_array()?;
-    pick_best(query, results)
+    fallback
 }
 
 /// Normalize a title for comparison: lowercase, every run of non-alphanumerics
@@ -181,12 +227,20 @@ fn norm(s: &str) -> String {
     out.trim_end().to_string()
 }
 
-/// Is the resolved `title`/`year` a CONFIDENT match for the disc label `query`?
-/// An exact normalized-title match that also carries a year. Rips whose match is
-/// NOT confident (or that would overwrite an existing file) are held for operator
-/// review rather than auto-filed into the library under a guessed name.
-pub fn is_confident_match(query: &str, title: &str, year: u16) -> bool {
-    year > 0 && norm(title) == norm(query)
+/// Is the resolved `title`/`year` a CONFIDENT match for the disc `label`?
+///
+/// Confident = the title carries a year AND exactly matches (normalized) the
+/// cleaned label OR any of the same progressively-trimmed variants that
+/// [`lookup`] searches. Sharing [`query_variants`] is what keeps this auto-file
+/// gate in lockstep with the fallback lookup: without it, a title resolved by
+/// peeling "UE" off the label would be found by `lookup` but then REJECTED here
+/// (the full label never exact-matches), parking every edition disc in review.
+///
+/// Takes the RAW label (cleaning happens inside), matching `lookup`. Rips whose
+/// match is NOT confident (or that would overwrite an existing file) are held
+/// for operator review rather than auto-filed under a guessed name.
+pub fn is_confident_match(label: &str, title: &str, year: u16) -> bool {
+    year > 0 && query_variants(label).iter().any(|v| norm(v) == norm(title))
 }
 
 /// Return up to `limit` candidate matches for `query`, best first (exact dated
@@ -245,40 +299,57 @@ fn rank_search_results(
 ///
 /// We keep only movie/TV entries, prefer ones that actually carry a
 /// release year, and break ties on TMDB popularity.
-fn pick_best(query: &str, results: &[serde_json::Value]) -> Option<TmdbResult> {
+fn pick_best(query: &str, results: &[serde_json::Value], prefer_tv: bool) -> Option<TmdbResult> {
     let want = norm(query);
-    // (result, popularity, exact). `exact` = the candidate's title matches the
-    // disc label exactly (normalized) AND it has a year. An exact dated match
-    // beats popularity — without this, a generic disc label like "Civil War"
-    // matches the most POPULAR "Civil War" (Captain America: Civil War, 2016)
-    // instead of the actual disc (the 2024 film whose title IS exactly "Civil
-    // War"). Same class as "Top Gun Maverick" vs the more popular "Top Gun".
-    let mut best: Option<(TmdbResult, f64, bool)> = None;
+    // Ranking key per candidate, compared lexicographically, highest wins:
+    //   (exact, dated, tv_preferred, popularity)
+    // - `exact` (dated + normalized-title match) beats popularity — else a
+    //   generic label like "Civil War" matches the most POPULAR "Civil War"
+    //   (Captain America, 2016) instead of the 2024 film whose title IS "Civil
+    //   War". Same class as "Top Gun Maverick" vs the more popular "Top Gun".
+    // - `dated` beats undated (a yearless entry yields a yearless folder).
+    // - `tv_preferred` is set ONLY when the disc label carried a season marker
+    //   (`prefer_tv`) and this candidate is a series: it breaks a tie between a
+    //   show and a same-named film ("Endeavour" the ITV series vs the film) in
+    //   favour of the series. Placed BELOW exact/dated so it only decides
+    //   otherwise-equal candidates — an exact film match still beats a fuzzy
+    //   series one.
+    let key = |cand: &TmdbResult, pop: f64| {
+        let exact = cand.year > 0 && !want.is_empty() && norm(&cand.title) == want;
+        (
+            exact,
+            cand.year > 0,
+            prefer_tv && cand.media_type == "tv",
+            pop,
+        )
+    };
+    let mut best: Option<(TmdbResult, (bool, bool, bool, f64))> = None;
     for v in results {
         let Some((cand, popularity)) = parse_result(v) else {
             continue;
         };
-        let exact = cand.year > 0 && !want.is_empty() && norm(&cand.title) == want;
-        let better = match &best {
-            None => true,
-            Some((cur, cur_pop, cur_exact)) => match (exact, *cur_exact) {
-                // An exact dated-title match wins over any non-exact result.
-                (true, false) => true,
-                (false, true) => false,
-                // Otherwise: a dated result beats an undated one; among results
-                // of equal dated-ness (and equal exactness), popularity wins.
-                _ => match (cand.year > 0, cur.year > 0) {
-                    (true, false) => true,
-                    (false, true) => false,
-                    _ => popularity > *cur_pop,
-                },
-            },
-        };
+        let k = key(&cand, popularity);
+        let better = best.as_ref().is_none_or(|(_, bk)| key_gt(k, *bk));
         if better {
-            best = Some((cand, popularity, exact));
+            best = Some((cand, k));
         }
     }
-    best.map(|(r, _, _)| r)
+    best.map(|(r, _)| r)
+}
+
+/// Lexicographic "is `a` a better rank than `b`" for [`pick_best`]'s key. Hand
+/// rolled because the key ends in an `f64` (popularity), which is not `Ord`.
+fn key_gt(a: (bool, bool, bool, f64), b: (bool, bool, bool, f64)) -> bool {
+    if a.0 != b.0 {
+        return a.0;
+    }
+    if a.1 != b.1 {
+        return a.1;
+    }
+    if a.2 != b.2 {
+        return a.2;
+    }
+    a.3 > b.3
 }
 
 /// Parse one `search/multi` result into a `TmdbResult` + its popularity.
@@ -316,6 +387,7 @@ fn parse_result(v: &serde_json::Value) -> Option<(TmdbResult, f64)> {
         .map(|p| format!("https://image.tmdb.org/t/p/w300{p}"))
         .unwrap_or_default();
     let overview = v["overview"].as_str().unwrap_or("").to_string();
+    let tmdb_id = v["id"].as_u64().unwrap_or(0);
     Some((
         TmdbResult {
             title,
@@ -323,6 +395,7 @@ fn parse_result(v: &serde_json::Value) -> Option<(TmdbResult, f64)> {
             poster_url: poster,
             overview,
             media_type: media_type.to_string(),
+            tmdb_id,
         },
         v["popularity"].as_f64().unwrap_or(0.0),
     ))
@@ -410,6 +483,13 @@ pub fn clean_title(label: &str) -> String {
                 break;
             }
         }
+        // Also peel a trailing TV season marker ("Season 5", "Series 2") so a
+        // series disc resolves to the base show title. Only when no format
+        // suffix matched this round, so the two peels interleave across the
+        // loop ("… Season 5 Disc 2" -> drop "Disc 2" -> drop "Season 5").
+        if next.is_none() {
+            next = strip_trailing_season(trimmed);
+        }
         match next {
             Some(rest) => clipped = rest,
             None => {
@@ -431,6 +511,207 @@ pub fn clean_title(label: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Unambiguous TV season markers. A trailing "<word> <number>" of one of these
+/// is peeled by [`clean_title`] so a series disc ("Endeavour Season 5 Disc 2")
+/// resolves to the base show title ("Endeavour").
+///
+/// Deliberately EXCLUDES "Volume"/"Vol"/"Part": those ARE part of real film
+/// titles ("Kill Bill: Vol. 2", "Guardians of the Galaxy Vol. 2", "Dune: Part
+/// Two") and peeling them would mis-resolve the movie.
+const SEASON_WORDS: &[&str] = &["season", "series", "saison", "staffel", "seizoen"];
+
+/// If `s` (already lowercased, trailing-junk-trimmed) ends with a season marker
+/// like "season 5" / "series 2", return `s` with that marker removed; else None.
+/// The number is required — a bare trailing "season" is left alone (it could be
+/// a real title word, e.g. "Silly Season").
+fn strip_trailing_season(s: &str) -> Option<&str> {
+    let digits_start = s.trim_end_matches(|c: char| c.is_ascii_digit());
+    if digits_start.len() == s.len() {
+        return None; // no trailing digits
+    }
+    let head = digits_start.trim_end(); // strip the space(s) before the number
+    for word in SEASON_WORDS {
+        if let Some(pos) = head.rfind(word)
+            && pos + word.len() == head.len()
+            // Must be a whole word: start of string or a non-alphanumeric before it.
+            && (pos == 0 || !head[..pos].ends_with(|c: char| c.is_alphanumeric()))
+        {
+            return Some(head[..pos].trim_end());
+        }
+    }
+    None
+}
+
+/// Parse a TV season number from a disc `label`: "Endeavour Season 5 Disc 2"
+/// → 5, "GAMEOFTHRONES_S3_DISC1" → 3. Returns 1..=99, else `None`.
+///
+/// A season marker is the signal that a disc is TV rather than a film, and the
+/// number is what the mover uses to place the rip under `Show (Year)/Season NN/`.
+/// Recognizes the spelled-out [`SEASON_WORDS`] followed by a number, or a
+/// compact `S<n>` token.
+pub fn season_from_label(label: &str) -> Option<u16> {
+    number_after_word(label, SEASON_WORDS).or_else(|| compact_token_number(label, &["s"]))
+}
+
+/// Parse a disc number from a `label`: "… Disc 2" → 2, "GOT_S3_D4" → 4,
+/// "BD1" → 1. Returns 1..=99, else `None`. Used to sequence a multi-disc set.
+pub fn disc_from_label(label: &str) -> Option<u16> {
+    number_after_word(label, &["disc", "disk"])
+        .or_else(|| compact_token_number(label, &["disc", "disk", "bd", "d"]))
+}
+
+/// The number immediately following any of `words` in `s` (case-insensitive,
+/// tolerating `_ - . :` separators): "Season 5" → 5, "series2" → 2. 1..=99.
+fn number_after_word(s: &str, words: &[&str]) -> Option<u16> {
+    let low = s.to_lowercase();
+    for word in words {
+        let mut from = 0;
+        while let Some(rel) = low[from..].find(word) {
+            let pos = from + rel;
+            let digits: String = low[pos + word.len()..]
+                .trim_start_matches([' ', '_', '-', '.', ':'])
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<u16>()
+                && (1..=99).contains(&n)
+            {
+                return Some(n);
+            }
+            from = pos + word.len();
+        }
+    }
+    None
+}
+
+/// A compact standalone token `<prefix><digits>` — "S3", "D2", "BD1", "DISC1".
+fn compact_token_number(s: &str, prefixes: &[&str]) -> Option<u16> {
+    for tok in s.split([' ', '_', '-', '.', ':']) {
+        let low = tok.to_lowercase();
+        for pfx in prefixes {
+            if let Some(rest) = low.strip_prefix(pfx)
+                && !rest.is_empty()
+                && rest.chars().all(|c| c.is_ascii_digit())
+                && let Ok(n) = rest.parse::<u16>()
+                && (1..=99).contains(&n)
+            {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Edition / release qualifiers that annotate a cut but are not part of the
+/// film's TMDB title ("Ultimate Edition", "Director's Cut", "Extended"). Peeled
+/// only when TRAILING (see [`is_trailing_junk`]) so an interior word is never
+/// removed. Lowercased; apostrophes are already gone by the time we test tokens.
+const EDITION_WORDS: &[&str] = &[
+    "ultimate",
+    "extended",
+    "theatrical",
+    "director",
+    "directors",
+    "special",
+    "collector",
+    "collectors",
+    "anniversary",
+    "final",
+    "unrated",
+    "remastered",
+    "limited",
+    "deluxe",
+    "steelbook",
+    "edition",
+    "cut",
+    "version",
+];
+
+/// Region / market codes that retail volume labels append.
+const REGION_WORDS: &[&str] = &["uk", "usa", "us", "eu", "na", "ww", "aus", "region"];
+
+/// Disc-format words. `clean_title` already strips multi-word variants
+/// ("4k ultra hd", "blu ray"); these single tokens are what a trailing-token
+/// peel sees ("BD", "UHD", "3D"-style tokens are caught by the alnum rule).
+const FORMAT_WORDS: &[&str] = &[
+    "bd", "bdrom", "uhd", "4k", "hd", "sd", "dvd", "bluray", "video",
+];
+
+/// Is `s` (lowercased) composed only of roman-numeral letters? Used only to
+/// PREVENT trimming a trailing roman numeral ("Rocky II"): a false positive on
+/// a real word like "mix" merely keeps that token, which is always safe.
+fn is_roman_numeral(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| matches!(c, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'))
+}
+
+/// May this TRAILING token be safely peeled off a disc label to recover the
+/// title? Edition/region/format words and obvious codes — but NEVER a bare
+/// number or a roman numeral, which are sequel markers ("Alien 3", "Rocky II"):
+/// peeling those would resolve a sequel to the original film. The full label is
+/// always queried first and the exact-match gate guards every variant, so this
+/// only needs to avoid that one class of meaningful-token collision.
+fn is_trailing_junk(tok: &str) -> bool {
+    if tok.is_empty() {
+        return false;
+    }
+    // Sequel markers are meaningful — never peel.
+    if tok.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let low = tok.to_lowercase();
+    if is_roman_numeral(&low) {
+        return false;
+    }
+    if EDITION_WORDS.contains(&low.as_str())
+        || REGION_WORDS.contains(&low.as_str())
+        || FORMAT_WORDS.contains(&low.as_str())
+    {
+        return true;
+    }
+    // Mixed-alphanumeric packaging/format code: BD3, UPT1, G51, D2, 3D, 4K.
+    let has_alpha = tok.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = tok.chars().any(|c| c.is_ascii_digit());
+    if has_alpha && has_digit {
+        return true;
+    }
+    // Short all-caps abbreviation (not a roman numeral): UE, SE, EDC, WW.
+    // Case is preserved here because variants are peeled from the RAW label
+    // BEFORE `clean_title` title-cases — so "UE" (junk) stays distinguishable
+    // from "Us" (a real one-word title, which is not all-caps in a label like
+    // "US_2019" and is protected by being queried in full first regardless).
+    tok.len() <= 4 && tok.chars().all(|c| c.is_ascii_uppercase())
+}
+
+/// Progressively-trimmed TMDB query variants for a disc `label`, most specific
+/// first. Variant 0 is `clean_title(label)`; each subsequent variant peels one
+/// more junk-shaped trailing token (see [`is_trailing_junk`]). Peeling is done
+/// on the RAW label so [`is_trailing_junk`] sees original case, then each
+/// surviving prefix is run through [`clean_title`]. Deduped and capped so a
+/// pathological label can't fan out into an unbounded burst of TMDB requests.
+fn query_variants(label: &str) -> Vec<String> {
+    const MAX_QUERY_VARIANTS: usize = 5;
+    // Same separator/year normalization clean_title applies, but WITHOUT the
+    // case folding, so junk detection keeps the label's original casing.
+    let base = label.replace(['_', '-'], " ");
+    let base = strip_paren_year(&base);
+    let toks: Vec<&str> = base.split_whitespace().collect();
+    let mut variants: Vec<String> = Vec::new();
+    let mut end = toks.len();
+    loop {
+        let q = clean_title(&toks[..end].join(" "));
+        if !q.is_empty() && !variants.iter().any(|v| v == &q) {
+            variants.push(q);
+        }
+        if variants.len() >= MAX_QUERY_VARIANTS || end <= 1 || !is_trailing_junk(toks[end - 1]) {
+            break;
+        }
+        end -= 1;
+    }
+    variants
 }
 
 fn urlencoded(s: &str) -> String {
@@ -629,7 +910,7 @@ mod tests {
             {"media_type": "movie", "title": "Dune: Part Two",
              "release_date": "2024-02-27", "popularity": 120.0}
         ]);
-        let r = pick_best("", results.as_array().unwrap()).expect("must pick the film");
+        let r = pick_best("", results.as_array().unwrap(), false).expect("must pick the film");
         assert_eq!(r.title, "Dune: Part Two");
         assert_eq!(r.year, 2024);
     }
@@ -644,7 +925,7 @@ mod tests {
             {"media_type": "movie", "title": "Dune: Part Two",
              "release_date": "2024-02-27", "popularity": 10.0}
         ]);
-        let r = pick_best("", results.as_array().unwrap()).unwrap();
+        let r = pick_best("", results.as_array().unwrap(), false).unwrap();
         assert_eq!(r.year, 2024);
     }
 
@@ -654,8 +935,43 @@ mod tests {
             {"media_type": "movie", "title": "Low", "release_date": "2010-01-01", "popularity": 5.0},
             {"media_type": "movie", "title": "High", "release_date": "2011-01-01", "popularity": 99.0}
         ]);
-        let r = pick_best("", results.as_array().unwrap()).unwrap();
+        let r = pick_best("", results.as_array().unwrap(), false).unwrap();
         assert_eq!(r.title, "High");
+    }
+
+    #[test]
+    fn pick_best_prefers_tv_over_a_more_popular_film_namesake_when_flagged() {
+        // A season-marked disc ("Endeavour Season 5") sets prefer_tv. Both a
+        // far more popular FILM and the SERIES match the cleaned title exactly
+        // and are dated — the series must win so the disc files as TV.
+        let results = serde_json::json!([
+            {"media_type": "movie", "title": "Endeavour",
+             "release_date": "2003-01-01", "popularity": 500.0},
+            {"media_type": "tv", "name": "Endeavour",
+             "first_air_date": "2012-01-08", "popularity": 30.0}
+        ]);
+        let r = pick_best("Endeavour", results.as_array().unwrap(), true).unwrap();
+        assert_eq!(r.media_type, "tv");
+        assert_eq!(r.year, 2012);
+        // Without the flag, popularity wins (the film) — proving the flag, not
+        // some incidental ordering, is what selects the series.
+        let r2 = pick_best("Endeavour", results.as_array().unwrap(), false).unwrap();
+        assert_eq!(r2.media_type, "movie");
+    }
+
+    #[test]
+    fn pick_best_prefer_tv_does_not_override_an_exact_film_over_a_fuzzy_series() {
+        // prefer_tv is only a tie-break BELOW exactness: an exact-dated FILM
+        // still beats a non-exact (undated) series, so a stray season marker on
+        // a film disc can't drag it to an unrelated show.
+        let results = serde_json::json!([
+            {"media_type": "movie", "title": "Heat",
+             "release_date": "1995-12-15", "popularity": 40.0},
+            {"media_type": "tv", "name": "Heat", "first_air_date": "", "popularity": 90.0}
+        ]);
+        let r = pick_best("Heat", results.as_array().unwrap(), true).unwrap();
+        assert_eq!(r.media_type, "movie");
+        assert_eq!(r.year, 1995);
     }
 
     #[test]
@@ -664,7 +980,7 @@ mod tests {
             {"media_type": "person", "name": "Denis Villeneuve", "popularity": 80.0},
             {"media_type": "movie", "title": "Arrival", "release_date": "2016-11-11", "popularity": 40.0}
         ]);
-        let r = pick_best("", results.as_array().unwrap()).unwrap();
+        let r = pick_best("", results.as_array().unwrap(), false).unwrap();
         assert_eq!(r.title, "Arrival");
     }
 
@@ -674,7 +990,7 @@ mod tests {
             {"media_type": "person", "name": "Someone", "popularity": 80.0},
             {"media_type": "collection", "name": "Some Collection", "popularity": 50.0}
         ]);
-        assert!(pick_best("", results.as_array().unwrap()).is_none());
+        assert!(pick_best("", results.as_array().unwrap(), false).is_none());
     }
 
     #[test]
@@ -682,7 +998,7 @@ mod tests {
         let results = serde_json::json!([
             {"media_type": "tv", "name": "Severance", "first_air_date": "2022-02-18", "popularity": 60.0}
         ]);
-        let r = pick_best("", results.as_array().unwrap()).unwrap();
+        let r = pick_best("", results.as_array().unwrap(), false).unwrap();
         assert_eq!(r.title, "Severance");
         assert_eq!(r.year, 2022);
         assert_eq!(r.media_type, "tv");
@@ -699,7 +1015,7 @@ mod tests {
             {"media_type": "movie", "title": "Civil War",
              "release_date": "2024-04-10", "popularity": 30.0}
         ]);
-        let r = pick_best("Civil War", results.as_array().unwrap()).unwrap();
+        let r = pick_best("Civil War", results.as_array().unwrap(), false).unwrap();
         assert_eq!(r.title, "Civil War");
         assert_eq!(r.year, 2024);
     }
@@ -714,7 +1030,7 @@ mod tests {
             {"media_type": "movie", "title": "Top Gun: Maverick",
              "release_date": "2022-05-24", "popularity": 50.0}
         ]);
-        let r = pick_best("Top Gun Maverick", results.as_array().unwrap()).unwrap();
+        let r = pick_best("Top Gun Maverick", results.as_array().unwrap(), false).unwrap();
         assert_eq!(r.title, "Top Gun: Maverick");
         assert_eq!(r.year, 2022);
     }
@@ -734,7 +1050,7 @@ mod tests {
             {"media_type": "movie", "title": "Captain America: Civil War",
              "release_date": "2016-04-27", "popularity": 200.0}
         ]);
-        let r = pick_best("Civil War", results.as_array().unwrap()).unwrap();
+        let r = pick_best("Civil War", results.as_array().unwrap(), false).unwrap();
         assert_eq!(
             r.title, "Civil War",
             "an already-exact, dated best must not be displaced by a later, \
@@ -754,7 +1070,7 @@ mod tests {
             {"media_type": "movie", "title": "Dune Part Two",
              "release_date": "", "popularity": 500.0}
         ]);
-        let r = pick_best("", results.as_array().unwrap()).unwrap();
+        let r = pick_best("", results.as_array().unwrap(), false).unwrap();
         assert_eq!(
             r.year, 2024,
             "a dated best found first must not be displaced by a later, \
@@ -980,5 +1296,149 @@ mod tests {
         // `query=&...` request that TMDB answers with HTTP 422.
         assert!(lookup("", "some_api_key").is_none());
         assert!(lookup("   ", "some_api_key").is_none());
+    }
+
+    // --- TV season-marker stripping ------------------------------------------
+
+    #[test]
+    fn clean_title_strips_trailing_tv_season_markers() {
+        // A series disc must resolve to the base show title.
+        assert_eq!(clean_title("ENDEAVOUR_SEASON_5_DISC_2"), "Endeavour");
+        assert_eq!(clean_title("VICTORIA SERIES 2 DISC 2"), "Victoria");
+        assert_eq!(clean_title("Turn - Staffel 3 - Disc 2"), "Turn");
+        assert_eq!(clean_title("Les Revenants Saison 1"), "Les Revenants");
+    }
+
+    #[test]
+    fn clean_title_keeps_volume_and_part_which_are_real_film_titles() {
+        // "Vol."/"Volume"/"Part" are NOT season markers — they belong to real
+        // movie titles and must never be peeled.
+        assert_eq!(clean_title("KILL_BILL_VOL_2"), "Kill Bill Vol 2");
+        assert_eq!(
+            clean_title("GUARDIANS_OF_THE_GALAXY_VOL_2"),
+            "Guardians Of The Galaxy Vol 2"
+        );
+        assert_eq!(clean_title("DUNE_PART_TWO"), "Dune Part Two");
+    }
+
+    #[test]
+    fn clean_title_keeps_bare_season_word_without_a_number() {
+        // "Season" as an actual title word (no trailing number) is preserved.
+        assert_eq!(clean_title("SILLY_SEASON"), "Silly Season");
+        assert_eq!(clean_title("OPEN_SEASON"), "Open Season");
+    }
+
+    #[test]
+    fn season_and_disc_from_label() {
+        assert_eq!(season_from_label("ENDEAVOUR SEASON 5 DISC 2"), Some(5));
+        assert_eq!(season_from_label("VICTORIA SERIES 2 DISC 2"), Some(2));
+        assert_eq!(season_from_label("GAMEOFTHRONES_S3_DISC1"), Some(3));
+        assert_eq!(season_from_label("Turn - Staffel 3 - Disc 2"), Some(3));
+        assert_eq!(season_from_label("THE MATRIX"), None);
+        assert_eq!(disc_from_label("ENDEAVOUR SEASON 5 DISC 2"), Some(2));
+        assert_eq!(disc_from_label("GOT_S3_D4"), Some(4));
+        assert_eq!(disc_from_label("BATMAN_BD1"), Some(1));
+        assert_eq!(disc_from_label("THE MATRIX"), None);
+    }
+
+    #[test]
+    fn strip_trailing_season_unit() {
+        assert_eq!(
+            strip_trailing_season("endeavour season 5"),
+            Some("endeavour")
+        );
+        assert_eq!(strip_trailing_season("victoria series 2"), Some("victoria"));
+        assert_eq!(strip_trailing_season("open season"), None); // no number
+        assert_eq!(strip_trailing_season("kill bill vol 2"), None); // vol not a marker
+        assert_eq!(strip_trailing_season("blade runner 2049"), None); // no marker word
+    }
+
+    // --- progressive fallback: query_variants + is_trailing_junk -------------
+
+    #[test]
+    fn trailing_junk_peels_edition_region_format_and_codes() {
+        for j in [
+            "UE", "SE", "Ultimate", "Edition", "Cut", "UK", "NA", "BD", "UHD",
+        ] {
+            assert!(is_trailing_junk(j), "{j} should be peelable junk");
+        }
+        for code in ["UPT1", "G51", "BD3", "3D", "4K", "D2"] {
+            assert!(is_trailing_junk(code), "{code} (alnum code) should be junk");
+        }
+    }
+
+    #[test]
+    fn trailing_junk_never_peels_sequel_markers() {
+        // Pure numbers and roman numerals are sequel markers, not junk —
+        // peeling them would resolve a sequel to the original film.
+        for keep in ["3", "2049", "II", "III", "IV", "X", "1917"] {
+            assert!(
+                !is_trailing_junk(keep),
+                "{keep} is a sequel/title marker and must be kept"
+            );
+        }
+    }
+
+    #[test]
+    fn query_variants_peels_the_ue_that_zeroes_out_tmdb() {
+        // The live bug: "Batman v Superman: Dawn of Justice: UE" returns ZERO
+        // TMDB hits until the trailing "UE" is peeled. The variant list must
+        // include the clean full label first, then the peeled title.
+        let v = query_variants("Batman v Superman: Dawn of Justice: UE");
+        assert_eq!(v[0], clean_title("Batman v Superman: Dawn of Justice: UE"));
+        assert!(
+            v.iter()
+                .any(|q| norm(q) == norm("Batman v Superman Dawn of Justice")),
+            "must produce the UE-stripped title as a fallback variant: {v:?}"
+        );
+    }
+
+    #[test]
+    fn query_variants_stops_at_a_sequel_number() {
+        // "ALIEN 3" must NOT fan out to "ALIEN": the trailing 3 is meaningful.
+        let v = query_variants("ALIEN_3");
+        assert_eq!(v, vec!["Alien 3".to_string()]);
+        // Same for a roman-numeral sequel.
+        let v = query_variants("ROCKY_II");
+        assert_eq!(v, vec!["Rocky Ii".to_string()]);
+    }
+
+    #[test]
+    fn query_variants_peels_multiple_trailing_codes() {
+        // Chained trailing codes peel one at a time, most-specific first.
+        let v = query_variants("MINIONS_UPT1");
+        assert!(v.contains(&"Minions".to_string()), "{v:?}");
+        let v = query_variants("TITANIC_3D");
+        assert!(v.contains(&"Titanic".to_string()), "{v:?}");
+    }
+
+    #[test]
+    fn is_confident_match_agrees_with_a_fallback_resolved_title() {
+        // The gate must accept a title that `lookup` could only reach via a
+        // peeled variant — otherwise every edition disc parks in review even
+        // though the lookup found it. Uses the RAW label (not pre-cleaned).
+        assert!(
+            is_confident_match(
+                "Batman v Superman: Dawn of Justice: UE",
+                "Batman v Superman: Dawn of Justice",
+                2016
+            ),
+            "a UE-suffixed label must confidently match the un-suffixed film"
+        );
+    }
+
+    #[test]
+    fn is_confident_match_still_requires_a_year() {
+        assert!(!is_confident_match("Some Film UE", "Some Film", 0));
+    }
+
+    #[test]
+    fn is_confident_match_does_not_accept_a_peeled_sequel_collision() {
+        // "ALIEN 3" must NOT be confidently matched to "Alien" (1979): the 3 is
+        // never peeled, so no variant equals "Alien".
+        assert!(
+            !is_confident_match("ALIEN_3", "Alien", 1979),
+            "a sequel label must never confidently resolve to the original film"
+        );
     }
 }
