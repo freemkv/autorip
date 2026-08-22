@@ -15,7 +15,12 @@
   fully automatically — no operator step. The disc's whole-title list is clustered
   to the episode set (the "play all" sum-title, extras/menus and duplicate angles
   are dropped), each episode is matched to TMDB by disc order + runtime and named
-  `S{NN}E{MM}`, and all episodes mux out of the one captured ISO. Missing/mismatched
+  `S{NN}E{MM}`, and all episodes mux out of the one captured ISO. Multi-disc seasons
+  are numbered by *aligning* the disc's episode runtimes against the TMDB season
+  rather than assuming an even per-disc split, so an uneven split (e.g. 6 + 4) that
+  carries a distinctively-timed episode is pinned to its true numbers regardless of
+  the order the discs are ripped; a uniform season with no such signal falls back to
+  sequential offset. Missing/mismatched
   TMDB data degrades to plain sequential numbering (`E01…`) rather than blocking;
   only a hard failure (no title match, read loss) goes to review, exactly as movies
   do. Governed by the new `tv_auto` setting (default **on** — it's *auto*rip); turn
