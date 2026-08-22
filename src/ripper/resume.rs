@@ -1896,10 +1896,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // has since changed max_retries to. Passing the current value would let a
         // routine `max_retries → 0` edit between rip and resume make the prune's
         // `uses_multipass` guard skip the reclaim, leaking a tens-of-GB ISO.
-        marker_tmdb
-            .as_ref()
-            .map(|m| m.max_retries)
-            .unwrap_or(cfg_read.max_retries),
+        // Rip-time max_retries from the hand-off marker when present. On a COLD
+        // resume (no marker) there is STILL a staged ISO by definition — this is
+        // the remux-from-ISO path — so fall back to `1` (multipass semantics),
+        // NOT the current config: a `max_retries=0` config would otherwise make
+        // the prune's `uses_multipass` guard skip reclaiming a tens-of-GB ISO
+        // that plainly exists. `keep_iso` still protects an ISO the operator kept.
+        marker_tmdb.as_ref().map(|m| m.max_retries).unwrap_or(1),
         super::retain_intermediate_iso(cfg_read.keep_iso, &output_format),
     );
 
