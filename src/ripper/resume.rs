@@ -1537,9 +1537,25 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                 "Auto-resume mux did not complete ({log_prefix}) — preserving partial state for next restart",
             ),
         );
+        // A finalize error is TERMINAL (structural — e.g. E6008, no muxable
+        // frames / unseekable output), unlike a read_error (resumable, MKV just
+        // truncated) or a clean operator halt (both None). Transition the
+        // unified state → Failed so the mux worker's dispatch stops re-muxing
+        // this dir on every container restart (the resume path previously wrote
+        // no terminal state, so a structurally-impossible mux resumed forever).
+        // A read_error leaves staging resumable exactly as before.
+        if let Some(finalize) = mux_outcome.finalize_error.as_deref() {
+            staging::write_failed_marker(&staging_dir, finalize);
+            crate::log::device_log(
+                device,
+                &format!(
+                    "Auto-resume mux finalize failed ({finalize}) — quarantined (state → Failed); staging preserved for inspection",
+                ),
+            );
+        }
         // Reset from "ripping" → the verdict status so the next /api/rip isn't
-        // blocked by the "already ripping" gate. Staging is preserved either
-        // way (no `.failed` written here) so the next restart can resume.
+        // blocked by the "already ripping" gate. On a read_error / halt staging
+        // stays resumable; a finalize error was just quarantined above.
         reset_status_after_ripping(
             device,
             &ui_status,
