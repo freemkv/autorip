@@ -414,6 +414,22 @@ impl Drop for MuxingGuard<'_> {
 /// tick). v0.25.3 ships with a single shared worker; concurrent
 /// muxes are explicitly out of scope (RAM/CPU thrash with no real
 /// win on a single-host setup).
+/// Whether a mux-worker failure is TERMINAL — the staging dir should be
+/// quarantined (`state → Failed`) so `mux_dispatch_verdict` stops re-Dispatching
+/// it every tick — vs left resumable. Pure projection so the decision is
+/// unit-testable without a real mux pipeline. Terminal iff a hard finalize
+/// failure surfaced (`has_worker_reason`) that is NOT retryable. NOT terminal
+/// for: an aborted-loss (owns its own resumable state), a retryable keyless
+/// deferral (re-muxes once keys arrive), or a no-reason failure (can't tell
+/// transient from terminal — don't risk quarantining a recoverable dir).
+fn mux_failure_is_terminal(
+    aborted_loss: bool,
+    has_worker_reason: bool,
+    failure_retryable: bool,
+) -> bool {
+    !aborted_loss && has_worker_reason && !failure_retryable
+}
+
 fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
     // Recover from a poisoned config lock rather than returning (which,
     // combined with the per-tick loop, would silently wedge the worker
@@ -667,10 +683,11 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             // keys/finalize dispatch) so the card carries the loss reason + the
             // loss hint, not a misleading "re-run the mux" — and so it matches
             // the SkipAbortedLoss card every subsequent tick shows.
-            let (reason, hint) = if let Some((r, _)) =
-                crate::ripper::staging::read_aborted_loss(&dir)
-            {
-                (r, ABORTED_LOSS_HINT.to_string())
+            // Read the aborted-loss marker ONCE; reused for both the operator
+            // card reason and the terminal-vs-resumable quarantine decision.
+            let aborted_loss = crate::ripper::staging::read_aborted_loss(&dir);
+            let (reason, hint) = if let Some((r, _)) = &aborted_loss {
+                (r.clone(), ABORTED_LOSS_HINT.to_string())
             } else if let Some(r) = outcome.failure_reason.clone() {
                 let hint = if outcome.failure_retryable {
                     // Keyless deferral: retryable, no operator action needed
@@ -683,14 +700,11 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                 (r, hint.to_string())
             } else {
                 // Defensive fallback (no reason came back from the worker):
-                // read the staging markers as before. `read_aborted_loss` is
-                // itself defensive — a rip-phase loss abort writes
-                // `.aborted-loss` BEFORE muxing (it skips the mux), so it
-                // normally never reaches this worker.
-                let reason = crate::ripper::staging::read_aborted_loss(&dir)
-                    .map(|(r, _)| r)
-                    .or_else(|| crate::ripper::staging::read_failed_reason(&dir))
-                    .unwrap_or_else(|| {
+                // read the staging markers as before. `aborted_loss` is None
+                // here (else-arm), so this falls through to `read_failed_reason`
+                // or a generic message.
+                let reason =
+                    crate::ripper::staging::read_failed_reason(&dir).unwrap_or_else(|| {
                         "mux worker dispatch did not complete (see _mux device log)".to_string()
                     });
                 (
@@ -698,6 +712,20 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                     "the mux failed to finalize/write the output — staging is preserved; check the _mux device log for the failure detail and re-run the mux".to_string(),
                 )
             };
+            if mux_failure_is_terminal(
+                aborted_loss.is_some(),
+                outcome.failure_reason.is_some(),
+                outcome.failure_retryable,
+            ) {
+                // TERMINAL mux failure (structural finalize error — e.g. E6008,
+                // no muxable frames). Without this, `state` stays `Ripped` and
+                // `mux_dispatch_verdict` re-Dispatches this dir every ~10s tick
+                // forever (a full UHD re-mux each time). Transition the unified
+                // state → Failed so the next verdict is `SkipTerminal`. Mirrors
+                // the fresh-rip quarantine path (`mod.rs`); `write_failed_marker`
+                // also clears the `muxing` lock and strips legacy markers.
+                crate::ripper::staging::write_failed_marker(&dir, &reason);
+            }
             record_error(&path_str, &reason, &hint);
         }
     }
@@ -1580,6 +1608,64 @@ mod tests {
     #[test]
     fn mux_dispatch_nothing_present_is_noop() {
         assert_eq!(verdict_for(&[]), MuxVerdict::SkipNoMarker);
+    }
+
+    /// The quarantine decision the mux worker's failure branch now makes: only a
+    /// non-retryable hard finalize failure (a worker reason present) is terminal
+    /// → `state → Failed`. This predicate is what stops the re-mux-forever loop;
+    /// the three non-terminal rows are the cases that MUST stay resumable.
+    #[test]
+    fn mux_failure_is_terminal_truth_table() {
+        assert!(
+            mux_failure_is_terminal(false, true, false),
+            "non-retryable hard finalize failure (E6008) MUST quarantine — this was the loop bug"
+        );
+        assert!(
+            !mux_failure_is_terminal(false, true, true),
+            "a retryable keyless deferral must keep re-muxing, not quarantine"
+        );
+        assert!(
+            !mux_failure_is_terminal(true, true, false),
+            "an aborted-loss owns its own resumable state — never quarantine here"
+        );
+        assert!(
+            !mux_failure_is_terminal(false, false, false),
+            "no worker reason: can't tell transient from terminal — don't quarantine"
+        );
+    }
+
+    /// End-to-end mechanism the fix relies on: a Ripped dir dispatches; after the
+    /// worker's failure branch writes the terminal state (as it now does on a
+    /// non-retryable finalize error), the verdict flips to SkipTerminal so the
+    /// dir is never re-dispatched — the Spider-Man 3 / E6008 loop, fixed.
+    #[test]
+    fn terminal_finalize_quarantine_stops_redispatch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("Spider-Man_3");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_marker(&dir, &sample_marker()).unwrap();
+        std::fs::write(dir.join("Spider-Man_3.iso"), b"x").unwrap();
+
+        let s1 = crate::ripper::staging::snapshot_staging_disc(&dir);
+        assert_eq!(
+            mux_dispatch_verdict(s1.as_ref()),
+            MuxVerdict::Dispatch,
+            "a fresh Ripped hand-off must dispatch"
+        );
+
+        // Exactly the transition the failure branch performs when
+        // `mux_failure_is_terminal` returns true.
+        crate::ripper::staging::write_failed_marker(
+            &dir,
+            "mux produced no frames (empty/undecryptable output)",
+        );
+
+        let s2 = crate::ripper::staging::snapshot_staging_disc(&dir);
+        assert_eq!(
+            mux_dispatch_verdict(s2.as_ref()),
+            MuxVerdict::SkipTerminal,
+            "after the terminal-finalize quarantine the dir must never re-dispatch"
+        );
     }
 
     /// TRANSITION: ripped → mux success → completed → (mover takes over).

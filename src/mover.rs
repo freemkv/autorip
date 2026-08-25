@@ -718,6 +718,17 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
     tracing::info!("mover loop stopping");
 }
 
+/// Staging dirs already surfaced as stranded (a `Fault` from
+/// `classify_done_absence`: no `state.json`, no `.done`, no governing marker).
+/// The mover rescans every ~10s, so without de-duping, one stranded dir — a
+/// pre-1.6.9 leftover or an emptied-but-not-removed dir — re-WARNs on every
+/// tick (380+ identical warns per dir were observed live for four such dirs).
+/// Track the ones already warned so each is reported ONCE (further ticks log at
+/// debug). A re-created dir keeps its membership — acceptable: the fault is
+/// still visible via the one-time warn and the per-tick debug line.
+static STRANDED_WARNED: once_cell::sync::Lazy<Mutex<std::collections::HashSet<String>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
 /// How the mover should treat a failed `.done` read on a staging dir.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoneAbsence {
@@ -890,11 +901,27 @@ fn check_and_move(cfg: &Config) {
                                 );
                                 continue;
                             }
-                            tracing::warn!(
-                                marker = %marker_path.display(),
-                                error = %e,
-                                "mover: failed to read .done marker; skipping staging dir"
-                            );
+                            // Stranded/unreadable dir (Fault). WARN ONCE per dir
+                            // — the mover rescans every ~10s and would otherwise
+                            // re-WARN this same dir on every tick forever. First
+                            // sighting → WARN; thereafter → debug.
+                            let first = STRANDED_WARNED
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(dir.to_string_lossy().to_string());
+                            if first {
+                                tracing::warn!(
+                                    marker = %marker_path.display(),
+                                    error = %e,
+                                    "mover: failed to read .done marker; skipping staging dir (stranded: no state.json/.done; further per-tick warns for this dir suppressed)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    marker = %marker_path.display(),
+                                    error = %e,
+                                    "mover: stranded staging dir (no state.json/.done); still skipping"
+                                );
+                            }
                             continue;
                         }
                     }
