@@ -85,7 +85,7 @@ jobs:
   # Tests run as a PARALLEL TRIPWIRE: they fail the run if they fail, but the
   # build/docker jobs do NOT `needs:` this job, so artifact build starts
   # immediately rather than serializing behind the test suite. The tag decision
-  # was already gated by the local precommit (same Rust 1.97 this workflow
+  # was already gated by the local precommit (same Rust 1.98 this workflow
   # pins below and in `build`, same commit) — CI
   # tests here are a safety net, not the gate.
   test:
@@ -93,7 +93,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
@@ -138,7 +138,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: ${{ matrix.target }}
       # Cache cargo registry + target/ across release runs. The

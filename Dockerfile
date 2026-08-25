@@ -5,10 +5,10 @@
 # file is for developers who want to `docker build` against the
 # current working tree without an upstream artifact.
 
-# Must be >= Cargo.toml's `rust-version` (1.97) and match the toolchain CI
-# pins (dtolnay/rust-toolchain@1.97.0 in ci.yml / release.yml). An older
+# Must be >= Cargo.toml's `rust-version` (1.98) and match the toolchain CI
+# pins (dtolnay/rust-toolchain@1.98.0 in ci.yml / release.yml). An older
 # image fails resolution outright with an MSRV error.
-FROM rust:1.97-alpine AS builder
+FROM rust:1.98-alpine AS builder
 # musl-dev + gcc + make + cmake for mimalloc-sys C build.
 RUN apk add --no-cache musl-dev gcc make cmake
 WORKDIR /build

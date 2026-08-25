@@ -2,7 +2,7 @@
 name = "freemkv-autorip"
 version = "1.6.9"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 license = "MIT"
 description = "Automatic disc ripper — insert a disc, get an MKV"
 repository = "https://github.com/freemkv/autorip"

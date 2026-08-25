@@ -11,10 +11,10 @@
 ## Quick Reference
 
 ```bash
-# 1. Pre-commit (run locally, Rust 1.97 — matches CI)
+# 1. Pre-commit (run locally, Rust 1.98 — matches CI)
 # --all-targets because ci.yml lints test code too; a warning reachable only
 # from a #[cfg(test)] module passes without it and fails on push.
-cargo +1.97 fmt --check && cargo +1.97 clippy --all-targets -- -D warnings && cargo +1.97 test
+cargo +1.98 fmt --check && cargo +1.98 clippy --all-targets -- -D warnings && cargo +1.98 test
 
 # 2. Tag and push a RELEASE tag. NOT an -rc tag: release.yml filters those
 #    out ("!v*-rc*"), so pushing v1.0.0-rc.1 by hand triggers nothing at all.
@@ -37,11 +37,11 @@ docker compose pull && docker compose up -d
 Run lint + tests before pushing:
 
 ```bash
-# Whole workspace (Rust 1.97 — matches CI)
-cargo +1.97 fmt --check && cargo +1.97 clippy --all-targets -- -D warnings && cargo +1.97 test
+# Whole workspace (Rust 1.98 — matches CI)
+cargo +1.98 fmt --check && cargo +1.98 clippy --all-targets -- -D warnings && cargo +1.98 test
 
 # Single crate
-cargo +1.97 clippy -p freemkv-autorip --all-targets -- -D warnings && cargo +1.97 test -p freemkv-autorip
+cargo +1.98 clippy -p freemkv-autorip --all-targets -- -D warnings && cargo +1.98 test -p freemkv-autorip
 ```
 
 This runs:
