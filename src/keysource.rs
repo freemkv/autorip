@@ -223,15 +223,15 @@ pub fn save_keydb(
 /// ScanOptions for a **live-drive** structure scan. Lookup-free (the library
 /// resolves no keys), plus the AACS host credentials for the authenticated
 /// handshake — sourced from the keydb, *independent of `key_source`* (a locked
-/// drive needs the cert even in online mode; an unlocked / LibreDrive drive
-/// takes the OEM Volume-ID path and ignores them).
+/// drive needs the cert even in online mode; an unlocked / firmware-unlocked
+/// drive takes the OEM Volume-ID path and ignores them).
 pub fn drive_scan_opts(cfg: &Config) -> libfreemkv::ScanOptions {
     drive_scan_opts_for_keydb(&keydb_path(cfg))
 }
 
 /// Live-drive [`ScanOptions`](libfreemkv::ScanOptions) with host credentials
 /// sourced from a specific keydb path — the handshake's only keydb dependency
-/// (an unlocked / LibreDrive drive ignores them).
+/// (an unlocked / firmware-unlocked drive ignores them).
 pub fn drive_scan_opts_for_keydb(keydb: &Path) -> libfreemkv::ScanOptions {
     let host_certs = KeydbSource::new(keydb).host_certs();
     let credentials =
