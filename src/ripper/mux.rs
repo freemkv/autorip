@@ -2154,9 +2154,7 @@ mod tests {
     #[test]
     fn the_undelivered_streams_note_has_a_single_emitter() {
         let mux_src = crate::util::source_lf(include_str!("mux.rs"));
-        // `rip_disc` was lifted into the sibling `rip.rs`; scan that source for
-        // the duplicate-note guard, not `mod.rs` (which no longer holds it).
-        let mod_src = crate::util::source_lf(include_str!("rip.rs"));
+        let mod_src = crate::util::source_lf(include_str!("mod.rs"));
         assert!(
             mux_src.contains("fn undelivered_streams_note("),
             "the note's wording must live in one shared function"

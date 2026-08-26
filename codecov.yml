@@ -2,15 +2,15 @@ coverage:
   status:
     project:
       default:
-        # Autorip is a release candidate mid-QA. The excluded files below are
-        # the live-drive / live-mux orchestration that hardcodes physical
-        # libfreemkv sessions or spawns worker threads and cannot run in CI
-        # (rip_disc, the mux highway), plus the privileged bootstrap and
-        # tracing init. `target` is the honest measured floor over the
-        # remaining unit-tested surface; `informational` keeps this a signal,
-        # never a merge blocker.
-        target: 82%
-        threshold: 1%
+        # The excluded files below are the live-mux orchestration (worker-thread
+        # split against a live libfreemkv mux session), plus the privileged
+        # bootstrap and tracing init — none reachable from unit tests. The
+        # live-drive rip path (rip_disc) stays IN the denominator and is
+        # validated by the qa real-disc cli-matrix, not by unit coverage, so
+        # this number honestly reflects only the unit-testable surface.
+        # `informational` keeps this a signal, never a merge blocker.
+        target: 70%
+        threshold: 2%
         informational: true
     patch:
       default:
@@ -30,10 +30,6 @@ ignore:
   - "**/src/main.rs"
   # tracing/subscriber init — process-global side effects, no testable logic.
   - "**/src/observe.rs"
-  # Live-drive orchestration: hardcodes a physical libfreemkv::Drive session,
-  # unreachable in CI. Lifted here verbatim from mod.rs precisely so it can be
-  # excluded without hiding the tested helpers that stayed in mod.rs.
-  - "**/src/ripper/rip.rs"
   # Live-mux "highway": spawn_mux_worker + the producer/consumer thread split
   # drive a real libfreemkv mux session; the pure helpers here (outcome
   # mapping, queue building) ARE unit-tested, but the thread orchestration
