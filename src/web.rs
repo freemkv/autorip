@@ -2922,6 +2922,32 @@ impl Drop for ConnGuard {
 mod web_tests {
     use super::*;
 
+    /// FIX-5 production wiring: `handle_accept_loss` refuses (409) while the mux
+    /// worker owns the dir (`.muxing`), because its lock-free state.json write would
+    /// otherwise clobber the worker's terminal quarantine and silently drop the
+    /// operator's Accept. The guard lives in `accept_loss_entry_verdict`.
+    ///
+    /// Red-before-green: deleting the `.muxing` arm (so entry always proceeds)
+    /// flips the middle assertion from `MuxInProgress` to `Proceed` and fails.
+    #[test]
+    fn accept_loss_entry_verdict_gates_on_muxing() {
+        assert_eq!(
+            accept_loss_entry_verdict(false, false),
+            AcceptLossEntry::NoStagingDir,
+            "no staging dir on disk → 404"
+        );
+        assert_eq!(
+            accept_loss_entry_verdict(true, true),
+            AcceptLossEntry::MuxInProgress,
+            "a dir the worker is actively muxing must be refused (409), not reopened"
+        );
+        assert_eq!(
+            accept_loss_entry_verdict(true, false),
+            AcceptLossEntry::Proceed,
+            "a present, unowned dir proceeds to arm the override"
+        );
+    }
+
     // Regression (bug #3): the Mux queue and Move queue must be mutually
     // exclusive within a single state snapshot — a disc can never appear in
     // both at once. `build_queue_views` is the single source both
@@ -7773,6 +7799,33 @@ fn spawn_rip_after_claim(
     true
 }
 
+/// Entry verdict for [`handle_accept_loss`]'s ownership gates, factored out of the
+/// handler so they are unit-testable without a live `tiny_http::Request`. Reverting
+/// the `.muxing` 409 guard flips the `MuxInProgress` arm and fails
+/// `accept_loss_entry_verdict_gates_on_muxing` — the coverage the inline guard
+/// lacked (the whole suite stayed green when the guard was deleted).
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptLossEntry {
+    /// No staging dir on disk for this device — 404.
+    NoStagingDir,
+    /// The mux worker owns the dir (`.muxing`). Refuse (409): this handler's
+    /// lock-free state.json write would otherwise clobber the worker's terminal
+    /// quarantine, silently dropping the operator's Accept.
+    MuxInProgress,
+    /// Present and unowned — proceed to arm the override.
+    Proceed,
+}
+
+fn accept_loss_entry_verdict(dir_exists: bool, is_muxing: bool) -> AcceptLossEntry {
+    if !dir_exists {
+        AcceptLossEntry::NoStagingDir
+    } else if is_muxing {
+        AcceptLossEntry::MuxInProgress
+    } else {
+        AcceptLossEntry::Proceed
+    }
+}
+
 /// POST `/api/accept-loss/{device}` — operator override.
 ///
 /// Accept the recorded over-threshold main-movie loss and deliver the existing
@@ -7805,14 +7858,10 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
         }
     };
     let dir = std::path::Path::new(&staging);
-    if !dir.exists() {
-        json_response(
-            request,
-            404,
-            r#"{"ok":false,"error":"no staging dir to accept"}"#,
-        );
-        return;
-    }
+    // Entry ownership gates (dir-present 404, `.muxing` 409), factored into the
+    // pure `accept_loss_entry_verdict` so they are unit-testable without a live
+    // `tiny_http::Request` (which has no public constructor). `is_muxing` on an
+    // absent dir is side-effect-free and reads false.
     // Respect the `.muxing` ownership marker — the ONE advisory lock the staging
     // lifecycle already relies on for "one writer owns a dir at a time". The mux
     // worker sets it for the duration of a mux and does not hold the physical
@@ -7830,13 +7879,24 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
     // once the in-flight mux finishes. Probe the marker directly rather than via
     // `snapshot_staging_disc`, which would migrate a legacy dir to state.json as
     // a side effect on this otherwise read-only request path.
-    if crate::ripper::staging::is_muxing(dir) {
-        json_response(
-            request,
-            409,
-            r#"{"ok":false,"error":"mux in progress; retry after it finishes"}"#,
-        );
-        return;
+    match accept_loss_entry_verdict(dir.exists(), crate::ripper::staging::is_muxing(dir)) {
+        AcceptLossEntry::NoStagingDir => {
+            json_response(
+                request,
+                404,
+                r#"{"ok":false,"error":"no staging dir to accept"}"#,
+            );
+            return;
+        }
+        AcceptLossEntry::MuxInProgress => {
+            json_response(
+                request,
+                409,
+                r#"{"ok":false,"error":"mux in progress; retry after it finishes"}"#,
+            );
+            return;
+        }
+        AcceptLossEntry::Proceed => {}
     }
     // Claim the device BEFORE touching any on-disk marker. A rejected
     // (409) accept must leave the staging dir exactly as it was: if we
