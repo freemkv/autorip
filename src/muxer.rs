@@ -417,17 +417,24 @@ impl Drop for MuxingGuard<'_> {
 /// Whether a mux-worker failure is TERMINAL — the staging dir should be
 /// quarantined (`state → Failed`) so `mux_dispatch_verdict` stops re-Dispatching
 /// it every tick — vs left resumable. Pure projection so the decision is
-/// unit-testable without a real mux pipeline. Terminal iff a hard finalize
-/// failure surfaced (`has_worker_reason`) that is NOT retryable. NOT terminal
-/// for: an aborted-loss (owns its own resumable state), a retryable keyless
-/// deferral (re-muxes once keys arrive), or a no-reason failure (can't tell
-/// transient from terminal — don't risk quarantining a recoverable dir).
-fn mux_failure_is_terminal(
-    aborted_loss: bool,
-    has_worker_reason: bool,
-    failure_retryable: bool,
-) -> bool {
-    !aborted_loss && has_worker_reason && !failure_retryable
+/// unit-testable without a real mux pipeline. Terminal IFF a structural
+/// FINALIZE failure surfaced (`is_finalize` — the MKV could not be finalized,
+/// e.g. E6008 no muxable frames / unseekable output). NOT terminal for:
+/// an aborted-loss (owns its own resumable state), or ANY non-finalize failure.
+///
+/// The prior gate was `!aborted_loss && has_worker_reason && !failure_retryable`
+/// — but `failure_retryable` (`RipState::failure_deferred`) is set true ONLY on
+/// the keyless deferral path. A genuinely RESUMABLE non-deferral failure — a
+/// mid-mux read error (truncated MKV), an fsync failure below RESTART_LIMIT, the
+/// unreadable-mapfile TOCTOU — has `failure_retryable == false`, so that gate
+/// FALSE-QUARANTINED it (state → Failed) even though `resume_remux`'s own gate
+/// leaves it resumable: a lost rip that would have succeeded on retry. Gating on
+/// the SAME finalize-error signal `resume_remux` uses (threaded through as
+/// `MuxHandoffOutcome::failure_finalize`) quarantines ONLY a structural finalize
+/// error. `has_worker_reason` is kept as a defensive precondition (a finalize
+/// always carries a reason).
+fn mux_failure_is_terminal(aborted_loss: bool, has_worker_reason: bool, is_finalize: bool) -> bool {
+    !aborted_loss && has_worker_reason && is_finalize
 }
 
 fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
@@ -715,7 +722,7 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             if mux_failure_is_terminal(
                 aborted_loss.is_some(),
                 outcome.failure_reason.is_some(),
-                outcome.failure_retryable,
+                outcome.failure_finalize,
             ) {
                 // TERMINAL mux failure (structural finalize error — e.g. E6008,
                 // no muxable frames). Without this, `state` stays `Ripped` and
@@ -724,7 +731,25 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                 // state → Failed so the next verdict is `SkipTerminal`. Mirrors
                 // the fresh-rip quarantine path (`mod.rs`); `write_failed_marker`
                 // also clears the `muxing` lock and strips legacy markers.
-                crate::ripper::staging::write_failed_marker(&dir, &reason);
+                //
+                // `resume_remux` already wrote `.failed` on this same finalize
+                // signal, so this is a belt-and-suspenders net; the load-bearing
+                // change is that a RESUMABLE read error (failure_finalize=false)
+                // is NO LONGER quarantined here — it stays re-muxable. If the
+                // terminal state did not land (disk write failed), surface it
+                // LOUD so the stuck quarantine is visible and the dir doesn't
+                // silently re-dispatch forever (see write_failed_marker).
+                if !crate::ripper::staging::write_failed_marker(&dir, &reason) {
+                    crate::log::syslog(&format!(
+                        "Mux quarantine FAILED to persist (state.json write error) — {} will keep re-dispatching until the staging mount recovers",
+                        path_str
+                    ));
+                    record_error(
+                        &path_str,
+                        &reason,
+                        "the terminal quarantine could not be written to state.json (staging mount full / unwritable); the mux will keep retrying until the mount recovers — free space or fix permissions on the staging share",
+                    );
+                }
             }
             record_error(&path_str, &reason, &hint);
         }
@@ -1401,7 +1426,9 @@ mod tests {
                     write_marker(&dir, &sample_marker()).unwrap();
                 }
                 M::Completed => crate::ripper::staging::write_completed_marker(&dir),
-                M::Failed => crate::ripper::staging::write_failed_marker(&dir, "test failure"),
+                M::Failed => {
+                    let _ = crate::ripper::staging::write_failed_marker(&dir, "test failure");
+                }
                 M::FailedNonJson => {
                     // Legacy review.rs wrote a non-JSON `.failed` body
                     // ("cancelled by operator") whose reason didn't parse.
@@ -1610,27 +1637,77 @@ mod tests {
         assert_eq!(verdict_for(&[]), MuxVerdict::SkipNoMarker);
     }
 
-    /// The quarantine decision the mux worker's failure branch now makes: only a
-    /// non-retryable hard finalize failure (a worker reason present) is terminal
-    /// → `state → Failed`. This predicate is what stops the re-mux-forever loop;
-    /// the three non-terminal rows are the cases that MUST stay resumable.
+    /// The quarantine decision the mux worker's failure branch now makes: ONLY a
+    /// structural finalize failure (`is_finalize`) is terminal → `state → Failed`.
+    /// This predicate is what stops the re-mux-forever loop; the non-terminal
+    /// rows are the cases that MUST stay resumable.
     #[test]
     fn mux_failure_is_terminal_truth_table() {
         assert!(
-            mux_failure_is_terminal(false, true, false),
-            "non-retryable hard finalize failure (E6008) MUST quarantine — this was the loop bug"
+            mux_failure_is_terminal(false, true, true),
+            "a structural finalize failure (E6008) MUST quarantine — this was the loop bug"
+        );
+        // The load-bearing FIX-2 row: a resumable, NON-finalize failure (a
+        // mid-mux read error / truncated MKV, an fsync failure below
+        // RESTART_LIMIT, the unreadable-mapfile TOCTOU) is NOT a keyless
+        // deferral, so the old `!failure_retryable` gate quarantined it — a lost
+        // rip that would have succeeded on retry. It must now stay resumable.
+        assert!(
+            !mux_failure_is_terminal(false, true, false),
+            "a resumable non-finalize failure (read error) must NOT be quarantined — the FIX-2 false-terminal"
         );
         assert!(
-            !mux_failure_is_terminal(false, true, true),
-            "a retryable keyless deferral must keep re-muxing, not quarantine"
-        );
-        assert!(
-            !mux_failure_is_terminal(true, true, false),
+            !mux_failure_is_terminal(true, true, true),
             "an aborted-loss owns its own resumable state — never quarantine here"
         );
         assert!(
-            !mux_failure_is_terminal(false, false, false),
-            "no worker reason: can't tell transient from terminal — don't quarantine"
+            !mux_failure_is_terminal(false, false, true),
+            "no worker reason: defensive precondition — don't quarantine"
+        );
+    }
+
+    /// FIX 2 regression: the worker's quarantine gate is fed from the
+    /// `MuxHandoffOutcome` the resume path returns. A resumable, NON-finalize
+    /// worker failure (a mid-mux read error — truncated MKV, resumable) carries
+    /// `failure_finalize == false`, so it must NOT be quarantined; a structural
+    /// finalize failure carries `failure_finalize == true`, so it MUST be. The
+    /// prior gate keyed on `!failure_retryable`, which is false for BOTH — so it
+    /// false-quarantined the read error (a lost rip that would retry-succeed).
+    #[test]
+    fn resumable_worker_failure_not_quarantined_finalize_is() {
+        use crate::ripper::resume::MuxHandoffOutcome;
+        // A mid-mux read error: worker reason present, retryable=false (NOT a
+        // keyless deferral), finalize=false. Resumable — must stay re-muxable.
+        let read_error = MuxHandoffOutcome {
+            success: false,
+            failure_reason: Some("rip stopped: read error — drive I/O".to_string()),
+            failure_retryable: false,
+            failure_finalize: false,
+            ..Default::default()
+        };
+        assert!(
+            !mux_failure_is_terminal(
+                false,
+                read_error.failure_reason.is_some(),
+                read_error.failure_finalize,
+            ),
+            "a resumable mid-mux read error must NOT be quarantined by the worker"
+        );
+        // A structural finalize failure (E6008): terminal — must quarantine.
+        let finalize_error = MuxHandoffOutcome {
+            success: false,
+            failure_reason: Some("mux finalize failed: E6008".to_string()),
+            failure_retryable: false,
+            failure_finalize: true,
+            ..Default::default()
+        };
+        assert!(
+            mux_failure_is_terminal(
+                false,
+                finalize_error.failure_reason.is_some(),
+                finalize_error.failure_finalize,
+            ),
+            "a structural finalize failure MUST be quarantined by the worker"
         );
     }
 

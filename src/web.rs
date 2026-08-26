@@ -5941,6 +5941,42 @@ mod web_tests {
             );
         }
 
+        // ── FIX 5: accept-loss must respect the `.muxing` ownership marker ──
+        //
+        // `handle_accept_loss`'s `apply_accept_loss_reopen` (state → Ripped) and
+        // the mux worker's terminal `write_failed_marker` (state → Failed) are
+        // both lock-free RMWs on the same state.json, and the worker holds no
+        // device claim (it runs on `_mux`), so the handler's claim does not
+        // serialise them. Arming accept-loss mid-mux can clobber the worker's
+        // just-written quarantine. The handler now refuses while `.muxing` is
+        // set — the one advisory ownership marker the lifecycle already relies
+        // on. This pins the exact signal the guard branches on.
+        #[test]
+        fn accept_loss_guard_refuses_while_muxing() {
+            use ripper::staging::{DiscState, StagingState, write_state};
+            let tmp = tempfile::TempDir::new().unwrap();
+
+            // A dir the worker is actively muxing: the guard must see has_muxing.
+            let muxing_dir = tmp.path().join("muxing");
+            std::fs::create_dir_all(&muxing_dir).unwrap();
+            let mut st = DiscState::new(StagingState::Ripped);
+            st.muxing = true;
+            write_state(&muxing_dir, &st);
+            assert!(
+                ripper::staging::is_muxing(&muxing_dir),
+                "an actively-muxing dir must report is_muxing so accept-loss refuses (409)"
+            );
+
+            // A stable terminal dir (mux finished): the guard must let it through.
+            let failed_dir = tmp.path().join("failed");
+            std::fs::create_dir_all(&failed_dir).unwrap();
+            assert!(ripper::staging::write_failed_marker(&failed_dir, "E6008"));
+            assert!(
+                !ripper::staging::is_muxing(&failed_dir),
+                "a settled (non-muxing) dir must NOT report is_muxing; accept-loss proceeds"
+            );
+        }
+
         // ── handle_title_override: omitted media_type preserves detection ──
         //
         // The Manual Rename button POSTs a title override with NO
@@ -7774,6 +7810,31 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
             request,
             404,
             r#"{"ok":false,"error":"no staging dir to accept"}"#,
+        );
+        return;
+    }
+    // Respect the `.muxing` ownership marker — the ONE advisory lock the staging
+    // lifecycle already relies on for "one writer owns a dir at a time". The mux
+    // worker sets it for the duration of a mux and does not hold the physical
+    // device's claim (it runs on the synthetic `_mux` device), so the
+    // claim-before-write below does NOT serialise this handler against an
+    // in-flight worker mux. Both this handler's `apply_accept_loss_reopen`
+    // (state → Ripped) and the worker's terminal `write_failed_marker`
+    // (state → Failed) are lock-free read-modify-writes on the same state.json;
+    // arming accept-loss mid-mux can clobber the worker's just-written
+    // quarantine (leaving `.accept-loss` armed on a `Failed` dir that never
+    // re-dispatches, so the operator's Accept is silently dropped). Refusing
+    // while `.muxing` is set closes that window: the worker clears `.muxing`
+    // atomically with its terminal write, so once it reads false the dir is
+    // stable and this handler has exclusive access. The operator simply retries
+    // once the in-flight mux finishes. Probe the marker directly rather than via
+    // `snapshot_staging_disc`, which would migrate a legacy dir to state.json as
+    // a side effect on this otherwise read-only request path.
+    if crate::ripper::staging::is_muxing(dir) {
+        json_response(
+            request,
+            409,
+            r#"{"ok":false,"error":"mux in progress; retry after it finishes"}"#,
         );
         return;
     }

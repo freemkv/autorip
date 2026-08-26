@@ -729,6 +729,22 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
 static STRANDED_WARNED: once_cell::sync::Lazy<Mutex<std::collections::HashSet<String>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
 
+/// Drop [`STRANDED_WARNED`] entries whose staging dir is gone. Mirrors
+/// [`prune_move_errors`]: the set is inserted-into on every stranded-dir warn
+/// but was never pruned, so it grew unbounded for the daemon's lifetime (every
+/// pre-1.6.9 leftover / emptied dir the operator eventually `rm -rf`s stayed
+/// pinned in memory forever). `seen` is every staging child this pass listed;
+/// an entry is dropped once its dir no longer appears — the operator removed it,
+/// so the one-time-warn dedup no longer needs to remember it.
+///
+/// Reached only after `read_dir(staging_root)` SUCCEEDED (the caller returns
+/// early otherwise), so a dropped staging mount prunes nothing — the same
+/// liveness guarantee `prune_move_errors` relies on.
+fn prune_stranded_warned(seen: &std::collections::HashSet<String>) {
+    let mut m = STRANDED_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    m.retain(|key| seen.contains(key));
+}
+
 /// How the mover should treat a failed `.done` read on a staging dir.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoneAbsence {
@@ -1530,6 +1546,8 @@ fn check_and_move(cfg: &Config) {
     }
 
     prune_move_errors(staging_root, &seen_dirs);
+    // Same unbounded-growth prune for the stranded-dir one-time-warn dedup set.
+    prune_stranded_warned(&seen_dirs);
 }
 
 /// The deliverable files in one staging dir, and whether the listing was
@@ -3154,6 +3172,37 @@ mod tests {
         let outcome = move_file(&src, &dest, &noop_progress);
         assert_eq!(outcome, MoveOutcome::Moved);
         assert_eq!(std::fs::read(&dest).unwrap(), b"new full content");
+    }
+
+    /// FIX 4 — `STRANDED_WARNED` (the one-time-warn dedup set for stranded
+    /// staging dirs) was inserted-into but NEVER pruned, growing unbounded for
+    /// the daemon's lifetime — the same leak its sibling `MOVE_ERRORS` already
+    /// bounds via `prune_move_errors`. `prune_stranded_warned` mirrors that:
+    /// once a dir is gone from the pass's `seen` set (the operator `rm -rf`'d
+    /// it), its dedup entry is dropped; entries still present are retained.
+    #[test]
+    fn prune_stranded_warned_drops_vanished_dirs_keeps_present() {
+        let _g = errors_guard();
+        {
+            let mut m = STRANDED_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+            m.clear();
+            m.insert("/staging/still_here".to_string());
+            m.insert("/staging/removed_by_operator".to_string());
+        }
+        let mut seen = std::collections::HashSet::new();
+        seen.insert("/staging/still_here".to_string());
+
+        prune_stranded_warned(&seen);
+
+        let m = STRANDED_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            m.contains("/staging/still_here"),
+            "a dir still present this pass must keep its one-time-warn entry"
+        );
+        assert!(
+            !m.contains("/staging/removed_by_operator"),
+            "a dir gone from the pass must be pruned so the set can't grow unbounded"
+        );
     }
 
     /// A destination-keyed `MOVE_ERRORS` row must clear itself once a later
