@@ -291,11 +291,11 @@ fn rank_search_results(
 /// Choose the best entry from a TMDB `search/multi` response.
 ///
 /// `search/multi` mixes movies, TV, people, and collections, and does
-/// NOT always rank the obvious film first — e.g. "Dune Part Two" can
+/// NOT always rank the obvious film first — e.g. "Wraithline Part Two" can
 /// surface a dateless franchise/collection entry ahead of the 2024
 /// film. The old `results.first()` path then took that entry and ended
 /// up with `year == 0`, which the mover turns into a yearless library
-/// folder (`Dune Part Two/` instead of `Dune: Part Two (2024)/`).
+/// folder (`Wraithline Part Two/` instead of `Wraithline: Part Two (2024)/`).
 ///
 /// We keep only movie/TV entries, prefer ones that actually carry a
 /// release year, and break ties on TMDB popularity.
@@ -304,13 +304,13 @@ fn pick_best(query: &str, results: &[serde_json::Value], prefer_tv: bool) -> Opt
     // Ranking key per candidate, compared lexicographically, highest wins:
     //   (exact, dated, tv_preferred, popularity)
     // - `exact` (dated + normalized-title match) beats popularity — else a
-    //   generic label like "Civil War" matches the most POPULAR "Civil War"
-    //   (Captain America, 2016) instead of the 2024 film whose title IS "Civil
-    //   War". Same class as "Top Gun Maverick" vs the more popular "Top Gun".
+    //   generic label like "Undertow" matches the most POPULAR "Undertow"
+    //   (Captain Nova, 2016) instead of the 2024 film whose title IS
+    //   "Undertow". Same class as "Skyburner Ace" vs the more popular "Skyburner".
     // - `dated` beats undated (a yearless entry yields a yearless folder).
     // - `tv_preferred` is set ONLY when the disc label carried a season marker
     //   (`prefer_tv`) and this candidate is a series: it breaks a tie between a
-    //   show and a same-named film ("Endeavour" the ITV series vs the film) in
+    //   show and a same-named film ("Longacre" a TV series vs a film of the same name) in
     //   favour of the series. Placed BELOW exact/dated so it only decides
     //   otherwise-equal candidates — an exact film match still beats a fuzzy
     //   series one.
@@ -514,11 +514,11 @@ pub fn clean_title(label: &str) -> String {
 }
 
 /// Unambiguous TV season markers. A trailing "<word> <number>" of one of these
-/// is peeled by [`clean_title`] so a series disc ("Endeavour Season 5 Disc 2")
-/// resolves to the base show title ("Endeavour").
+/// is peeled by [`clean_title`] so a series disc ("Longacre Season 5 Disc 2")
+/// resolves to the base show title ("Longacre").
 ///
 /// Deliberately EXCLUDES "Volume"/"Vol"/"Part": those ARE part of real film
-/// titles ("Kill Bill: Vol. 2", "Guardians of the Galaxy Vol. 2", "Dune: Part
+/// titles ("Neon Reaper: Vol. 2", "Void Marshals Vol. 2", "Wraithline: Part
 /// Two") and peeling them would mis-resolve the movie.
 const SEASON_WORDS: &[&str] = &["season", "series", "saison", "staffel", "seizoen"];
 
@@ -544,7 +544,7 @@ fn strip_trailing_season(s: &str) -> Option<&str> {
     None
 }
 
-/// Parse a TV season number from a disc `label`: "Endeavour Season 5 Disc 2"
+/// Parse a TV season number from a disc `label`: "Longacre Season 5 Disc 2"
 /// → 5, "GAMEOFTHRONES_S3_DISC1" → 3. Returns 1..=99, else `None`.
 ///
 /// A season marker is the signal that a disc is TV rather than a film, and the
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn clean_title_handles_hyphens() {
-        assert_eq!(clean_title("SPIDER-MAN"), "Spider Man");
+        assert_eq!(clean_title("STAR-RANGER"), "Star Ranger");
     }
 
     #[test]
@@ -1067,7 +1067,7 @@ mod tests {
         // and TMDB matched nothing. The cleaned title must drop both the suffix
         // and the trailing junk.
         assert_eq!(clean_title("Fight Club - Ultra HD™"), "Fight Club");
-        assert_eq!(clean_title("Dune 4K Ultra HD®"), "Dune");
+        assert_eq!(clean_title("Wraithline 4K Ultra HD®"), "Wraithline");
         assert_eq!(clean_title("The Matrix Blu-ray."), "The Matrix");
         // Embedded format word still protected even with trailing junk.
         assert_eq!(
@@ -1113,15 +1113,15 @@ mod tests {
 
     #[test]
     fn pick_best_skips_dateless_collection_ranked_first() {
-        // The "Dune Part Two" bug: a dateless collection ranks ahead of
+        // The "Wraithline Part Two" bug: a dateless collection ranks ahead of
         // the 2024 film, so the old results.first() path got year == 0.
         let results = serde_json::json!([
-            {"media_type": "collection", "name": "Dune Collection", "popularity": 90.0},
-            {"media_type": "movie", "title": "Dune: Part Two",
+            {"media_type": "collection", "name": "Wraithline Collection", "popularity": 90.0},
+            {"media_type": "movie", "title": "Wraithline: Part Two",
              "release_date": "2024-02-27", "popularity": 120.0}
         ]);
         let r = pick_best("", results.as_array().unwrap(), false).expect("must pick the film");
-        assert_eq!(r.title, "Dune: Part Two");
+        assert_eq!(r.title, "Wraithline: Part Two");
         assert_eq!(r.year, 2024);
     }
 
@@ -1130,9 +1130,9 @@ mod tests {
         // A more popular but dateless movie must lose to the dated one —
         // a year in the library folder matters more than popularity rank.
         let results = serde_json::json!([
-            {"media_type": "movie", "title": "Dune Part Two",
+            {"media_type": "movie", "title": "Wraithline Part Two",
              "release_date": "", "popularity": 200.0},
-            {"media_type": "movie", "title": "Dune: Part Two",
+            {"media_type": "movie", "title": "Wraithline: Part Two",
              "release_date": "2024-02-27", "popularity": 10.0}
         ]);
         let r = pick_best("", results.as_array().unwrap(), false).unwrap();
@@ -1151,21 +1151,21 @@ mod tests {
 
     #[test]
     fn pick_best_prefers_tv_over_a_more_popular_film_namesake_when_flagged() {
-        // A season-marked disc ("Endeavour Season 5") sets prefer_tv. Both a
+        // A season-marked disc ("Longacre Season 5") sets prefer_tv. Both a
         // far more popular FILM and the SERIES match the cleaned title exactly
         // and are dated — the series must win so the disc files as TV.
         let results = serde_json::json!([
-            {"media_type": "movie", "title": "Endeavour",
+            {"media_type": "movie", "title": "Longacre",
              "release_date": "2003-01-01", "popularity": 500.0},
-            {"media_type": "tv", "name": "Endeavour",
+            {"media_type": "tv", "name": "Longacre",
              "first_air_date": "2012-01-08", "popularity": 30.0}
         ]);
-        let r = pick_best("Endeavour", results.as_array().unwrap(), true).unwrap();
+        let r = pick_best("Longacre", results.as_array().unwrap(), true).unwrap();
         assert_eq!(r.media_type, "tv");
         assert_eq!(r.year, 2012);
         // Without the flag, popularity wins (the film) — proving the flag, not
         // some incidental ordering, is what selects the series.
-        let r2 = pick_best("Endeavour", results.as_array().unwrap(), false).unwrap();
+        let r2 = pick_best("Longacre", results.as_array().unwrap(), false).unwrap();
         assert_eq!(r2.media_type, "movie");
     }
 
@@ -1216,32 +1216,33 @@ mod tests {
 
     #[test]
     fn pick_best_exact_title_beats_more_popular() {
-        // The "Civil War" disc (volume label exactly "Civil War" = the 2024 A24
-        // film) must NOT be matched to the far more popular "Captain America:
-        // Civil War" (2016). An exact normalized-title match wins over popularity.
+        // The "Undertow" disc (volume label exactly "Undertow" = the 2024
+        // standalone film) must NOT be matched to the far more popular
+        // "Captain Nova: Undertow" (2016). An exact normalized-title match
+        // wins over popularity.
         let results = serde_json::json!([
-            {"media_type": "movie", "title": "Captain America: Civil War",
+            {"media_type": "movie", "title": "Captain Nova: Undertow",
              "release_date": "2016-04-27", "popularity": 200.0},
-            {"media_type": "movie", "title": "Civil War",
+            {"media_type": "movie", "title": "Undertow",
              "release_date": "2024-04-10", "popularity": 30.0}
         ]);
-        let r = pick_best("Civil War", results.as_array().unwrap(), false).unwrap();
-        assert_eq!(r.title, "Civil War");
+        let r = pick_best("Undertow", results.as_array().unwrap(), false).unwrap();
+        assert_eq!(r.title, "Undertow");
         assert_eq!(r.year, 2024);
     }
 
     #[test]
     fn pick_best_exact_match_ignores_punctuation_and_case() {
-        // Disc label "TOP GUN MAVERICK" (cleaned) must match "Top Gun: Maverick"
+        // Disc label "SKYBURNER ACE" (cleaned) must match "Skyburner: Ace"
         // exactly (punctuation/case-insensitive), beating a more popular near-name.
         let results = serde_json::json!([
-            {"media_type": "movie", "title": "Top Gun",
+            {"media_type": "movie", "title": "Skyburner",
              "release_date": "1986-05-16", "popularity": 90.0},
-            {"media_type": "movie", "title": "Top Gun: Maverick",
+            {"media_type": "movie", "title": "Skyburner: Ace",
              "release_date": "2022-05-24", "popularity": 50.0}
         ]);
-        let r = pick_best("Top Gun Maverick", results.as_array().unwrap(), false).unwrap();
-        assert_eq!(r.title, "Top Gun: Maverick");
+        let r = pick_best("Skyburner Ace", results.as_array().unwrap(), false).unwrap();
+        assert_eq!(r.title, "Skyburner: Ace");
         assert_eq!(r.year, 2022);
     }
 
@@ -1255,14 +1256,14 @@ mod tests {
     #[test]
     fn pick_best_exact_dated_first_survives_a_more_popular_non_exact_later() {
         let results = serde_json::json!([
-            {"media_type": "movie", "title": "Civil War",
+            {"media_type": "movie", "title": "Undertow",
              "release_date": "2024-04-10", "popularity": 30.0},
-            {"media_type": "movie", "title": "Captain America: Civil War",
+            {"media_type": "movie", "title": "Captain Nova: Undertow",
              "release_date": "2016-04-27", "popularity": 200.0}
         ]);
-        let r = pick_best("Civil War", results.as_array().unwrap(), false).unwrap();
+        let r = pick_best("Undertow", results.as_array().unwrap(), false).unwrap();
         assert_eq!(
-            r.title, "Civil War",
+            r.title, "Undertow",
             "an already-exact, dated best must not be displaced by a later, \
              merely more popular non-exact candidate"
         );
@@ -1275,9 +1276,9 @@ mod tests {
     #[test]
     fn pick_best_dated_first_survives_a_more_popular_undated_later() {
         let results = serde_json::json!([
-            {"media_type": "movie", "title": "Dune: Part Two",
+            {"media_type": "movie", "title": "Wraithline: Part Two",
              "release_date": "2024-02-27", "popularity": 10.0},
-            {"media_type": "movie", "title": "Dune Part Two",
+            {"media_type": "movie", "title": "Wraithline Part Two",
              "release_date": "", "popularity": 500.0}
         ]);
         let r = pick_best("", results.as_array().unwrap(), false).unwrap();
@@ -1450,21 +1451,21 @@ mod tests {
         // pick_best), and includes a highly-popular but DATELESS decoy that
         // must sort last despite its popularity.
         let results = serde_json::json!([
-            {"media_type": "movie", "title": "Captain America: Civil War",
+            {"media_type": "movie", "title": "Captain Nova: Undertow",
              "release_date": "2016-04-27", "popularity": 200.0},
-            {"media_type": "movie", "title": "Civil War",
+            {"media_type": "movie", "title": "Undertow",
              "release_date": "2024-04-10", "popularity": 30.0},
-            {"media_type": "movie", "title": "Some Undated Civil War Thing",
+            {"media_type": "movie", "title": "Some Undated Undertow Thing",
              "release_date": "", "popularity": 500.0}
         ]);
-        let ranked = rank_search_results("Civil War", results.as_array().unwrap(), 10);
+        let ranked = rank_search_results("Undertow", results.as_array().unwrap(), 10);
         let titles: Vec<&str> = ranked.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(
             titles,
             vec![
-                "Civil War",                    // exact + dated: wins outright
-                "Captain America: Civil War",   // dated, non-exact
-                "Some Undated Civil War Thing", // undated, even though most popular
+                "Undertow",                    // exact + dated: wins outright
+                "Captain Nova: Undertow",      // dated, non-exact
+                "Some Undated Undertow Thing", // undated, even though most popular
             ]
         );
     }
@@ -1513,7 +1514,7 @@ mod tests {
     #[test]
     fn clean_title_strips_trailing_tv_season_markers() {
         // A series disc must resolve to the base show title.
-        assert_eq!(clean_title("ENDEAVOUR_SEASON_5_DISC_2"), "Endeavour");
+        assert_eq!(clean_title("LONGACRE_SEASON_5_DISC_2"), "Longacre");
         assert_eq!(clean_title("VICTORIA SERIES 2 DISC 2"), "Victoria");
         assert_eq!(clean_title("Turn - Staffel 3 - Disc 2"), "Turn");
         assert_eq!(clean_title("Les Revenants Saison 1"), "Les Revenants");
@@ -1528,7 +1529,7 @@ mod tests {
             clean_title("GUARDIANS_OF_THE_GALAXY_VOL_2"),
             "Guardians Of The Galaxy Vol 2"
         );
-        assert_eq!(clean_title("DUNE_PART_TWO"), "Dune Part Two");
+        assert_eq!(clean_title("WRAITHLINE_PART_TWO"), "Wraithline Part Two");
     }
 
     #[test]
@@ -1784,10 +1785,10 @@ mod tests {
     #[test]
     fn query_variants_peels_multiple_trailing_codes() {
         // Chained trailing codes peel one at a time, most-specific first.
-        let v = query_variants("MINIONS_UPT1");
-        assert!(v.contains(&"Minions".to_string()), "{v:?}");
-        let v = query_variants("TITANIC_3D");
-        assert!(v.contains(&"Titanic".to_string()), "{v:?}");
+        let v = query_variants("SPRITELINGS_UPT1");
+        assert!(v.contains(&"Spritelings".to_string()), "{v:?}");
+        let v = query_variants("NIGHTLINER_3D");
+        assert!(v.contains(&"Nightliner".to_string()), "{v:?}");
     }
 
     #[test]

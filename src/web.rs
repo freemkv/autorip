@@ -905,7 +905,7 @@ function parseManualName(raw,fallbackYear){
 }
 /* Manual entry: file under exactly the typed text (no TMDB pick needed). Lets
    the operator disambiguate a variant TMDB doesn't list as its own entry —
-   e.g. "Deadpool 2 (Super Duper Cut)" alongside an already-ripped "Deadpool 2". */
+   e.g. "Redshift 2 (Extended Cut)" alongside an already-ripped "Redshift 2". */
 function reviewManual(idx){
   const it=_REV[idx]; if(!it)return;
   const p=parseManualName((document.getElementById('rvq-'+idx)||{}).value,it.year);
@@ -962,8 +962,8 @@ function titlePick(dev,j){
     .then(r=>r.json()).then(()=>{const el=document.getElementById('tedit-'+dev);if(el)el.style.display='none';}).catch(()=>{});
 }
 /* Manual rename: file the active disc under exactly the typed text, no TMDB
-   pick — for a variant TMDB doesn't list separately (e.g. "Deadpool 2 (Super
-   Duper Cut)"). A trailing "(YYYY)" becomes the year; tmdb_id 0 marks it a
+   pick — for a variant TMDB doesn't list separately (e.g. "Redshift 2 (Extended
+   Cut)"). A trailing "(YYYY)" becomes the year; tmdb_id 0 marks it a
    free-form override (handle_title_override already accepts this). */
 function titleManual(dev){
   const i=document.getElementById('tq-'+dev);

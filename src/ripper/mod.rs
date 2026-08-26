@@ -1573,8 +1573,8 @@ pub fn handle_rip_request(
 /// sanitized disc name. EXACT equality only: staging dirs are created with
 /// the exact sanitized disc name (no year/suffix), so a prefix match never
 /// legitimately fires — it only invites collisions where a shorter title's
-/// name is a prefix of a longer one with a separator ("Cars" sanitizes to
-/// "Cars", "Cars 2" to "Cars_2"). Exact equality is collision-free. Both
+/// name is a prefix of a longer one with a separator ("Redshift" sanitizes to
+/// "Redshift", "Redshift 2" to "Redshift_2"). Exact equality is collision-free. Both
 /// `disc_already_completed` and `find_resumable_for_disc` route through this
 /// so the rule can't drift apart between the two call sites.
 fn staging_dir_matches_disc(basename: &str, sanitized: &str) -> bool {
@@ -1745,8 +1745,8 @@ fn staging_disc_completed(staging_root: &std::path::Path, sanitized: &str) -> bo
         // EXACT match only. Staging dirs are created with the exact sanitized
         // disc name (no year/suffix), so a prefix match never legitimately
         // fires for the disc's own dir — it only invites collisions where a
-        // shorter title's name is a prefix of a longer one ("Cars" sanitizes
-        // to "Cars", "Cars 2" to "Cars_2"; a word-boundary check still fails
+        // shorter title's name is a prefix of a longer one ("Redshift" sanitizes
+        // to "Redshift", "Redshift 2" to "Redshift_2"; a word-boundary check still fails
         // since `_` is the space separator). Exact equality is collision-free.
         if !staging_dir_matches_disc(&basename, sanitized) {
             continue;
@@ -2171,8 +2171,8 @@ fn resumable_for_disc(cfg: &Config, display_name: &str, disc_label: &str) -> Opt
         let path = staging_root.join(&basename);
         // EXACT match only. Staging dirs are created with the exact sanitized
         // disc name (no year/suffix), so a prefix match never legitimately
-        // fires — it only invites the collision class (`Cars` prefixing
-        // `Cars_2`) fixed in staging_dir_matches_disc.
+        // fires — it only invites the collision class (`Redshift` prefixing
+        // `Redshift_2`) fixed in staging_dir_matches_disc.
         if basename != sanitized {
             continue;
         }
@@ -7525,26 +7525,26 @@ mod tests {
     }
 
     /// Resume / completion matching is EXACT, never prefix. A disc named
-    /// "Cars" (sanitized "Cars") must not match a sibling staging dir
-    /// "Cars_2" (from "Cars 2") — a prefix match there would resume onto a
+    /// "Redshift" (sanitized "Redshift") must not match a sibling staging dir
+    /// "Redshift_2" (from "Redshift 2") — a prefix match there would resume onto a
     /// different title's partial ISO/mapfile. This locks in the already-fixed
     /// HIGH bug; a regression to `starts_with` would fail here.
     #[test]
     fn staging_match_is_exact_not_prefix() {
         // Direct predicate: exact equality only.
-        assert!(staging_dir_matches_disc("Cars", "Cars"));
-        assert!(!staging_dir_matches_disc("Cars_2", "Cars"));
-        assert!(!staging_dir_matches_disc("Cars", "Cars_2"));
-        assert!(!staging_dir_matches_disc("Cars_2_Extras", "Cars_2"));
+        assert!(staging_dir_matches_disc("Redshift", "Redshift"));
+        assert!(!staging_dir_matches_disc("Redshift_2", "Redshift"));
+        assert!(!staging_dir_matches_disc("Redshift", "Redshift_2"));
+        assert!(!staging_dir_matches_disc("Redshift_2_Extras", "Redshift_2"));
 
-        // End-to-end over a real temp staging dir: both "Cars" and "Cars_2"
+        // End-to-end over a real temp staging dir: both "Redshift" and "Redshift_2"
         // exist; scanning with the production predicate must select ONLY the
-        // exact "Cars".
+        // exact "Redshift".
         let tmp = tempfile::TempDir::new().unwrap();
-        for name in ["Cars", "Cars_2"] {
+        for name in ["Redshift", "Redshift_2"] {
             std::fs::create_dir_all(tmp.path().join(name)).unwrap();
         }
-        let sanitized = "Cars";
+        let sanitized = "Redshift";
         let matches: Vec<String> = std::fs::read_dir(tmp.path())
             .unwrap()
             .flatten()
@@ -7557,8 +7557,8 @@ mod tests {
             .collect();
         assert_eq!(
             matches,
-            vec!["Cars".to_string()],
-            "only the exact 'Cars' dir must match, not the 'Cars_2' sibling"
+            vec!["Redshift".to_string()],
+            "only the exact 'Redshift' dir must match, not the 'Redshift_2' sibling"
         );
     }
 
@@ -7722,8 +7722,8 @@ mod tests {
         // Safe: ordinary sanitized title names (dots inside a name are
         // fine as long as the whole segment isn't only dots).
         for ok in [
-            "Dune (2021)",
-            "Blade.Runner (1982)",
+            "Wraithline (2021)",
+            "Redline.Chaser (1982)",
             "untitled",
             "A.Movie.With.Dots",
             "disc",
@@ -9576,13 +9576,13 @@ mod tests {
     #[test]
     fn list_staging_basenames_returns_all_children() {
         let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(tmp.path().join("Cars")).unwrap();
-        std::fs::create_dir(tmp.path().join("Cars_2")).unwrap();
+        std::fs::create_dir(tmp.path().join("Redshift")).unwrap();
+        std::fs::create_dir(tmp.path().join("Redshift_2")).unwrap();
         std::fs::write(tmp.path().join("loose.txt"), b"x").unwrap();
 
         let mut got = list_staging_basenames(tmp.path()).expect("dir exists");
         got.sort();
-        assert_eq!(got, vec!["Cars", "Cars_2", "loose.txt"]);
+        assert_eq!(got, vec!["Redshift", "Redshift_2", "loose.txt"]);
     }
 
     #[test]
@@ -9614,13 +9614,13 @@ mod tests {
     #[test]
     fn list_staging_basenames_union_does_not_duplicate() {
         let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(tmp.path().join("Dune")).unwrap();
-        std::fs::create_dir(tmp.path().join("Dune_Part_Two")).unwrap();
+        std::fs::create_dir(tmp.path().join("Wraithline")).unwrap();
+        std::fs::create_dir(tmp.path().join("Wraithline_Part_Two")).unwrap();
 
         let got = list_staging_basenames(tmp.path()).expect("dir exists");
         assert_eq!(got.len(), 2, "each child appears exactly once: {got:?}");
-        assert!(got.contains(&"Dune".to_string()));
-        assert!(got.contains(&"Dune_Part_Two".to_string()));
+        assert!(got.contains(&"Wraithline".to_string()));
+        assert!(got.contains(&"Wraithline_Part_Two".to_string()));
     }
 
     /// Regression: `resumable_for_disc` (the scan-complete tile's Resume-button
