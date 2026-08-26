@@ -7609,8 +7609,8 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     // scans `staging_dir` with `read_dir`), so a raw POST must not be able to
     // point them at an arbitrary location for directory enumeration. Require an
     // absolute path with no `..` traversal component — that confines them to
-    // real mount points (the legitimate configs are all absolute: /staging-local,
-    // /mnt/media/movies, …) while rejecting relative / climbing paths.
+    // real mount points (the legitimate configs are all absolute paths)
+    // while rejecting relative / climbing paths.
     // Empty string is allowed: it means "unset / inherit default" for the
     // optional movie_dir / tv_dir overrides.
     let has_parent_dir = |p: &std::path::Path| {
