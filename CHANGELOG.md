@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.6.11] — 2026-08-26
+
+### Fixed
+
+- A terminal mux failure now transitions the job to `Failed` instead of being
+  re-dispatched indefinitely.
+- The "stranded directory" warning is now de-duplicated to once per directory,
+  instead of repeating on every scan.
+- Round-2 audit hardening of the mux-quarantine path: an abort on sweep-loss,
+  the muxing-marker race window closed, the restart cap preserved on a failed
+  quarantine write, and the production wiring for all of the above covered
+  by tests.
+
+### Changed
+
+- MSRV 1.98.
+
+### Added
+
+- Substantially expanded unit-test coverage.
+
 ## [1.6.10] — 2026-08-23
 
 ### Changed
