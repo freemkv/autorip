@@ -571,8 +571,8 @@ mod tests {
 
         // Ordinary text — including multibyte UTF-8 — is preserved verbatim.
         assert_eq!(
-            sanitize_log_msg("DUNE_PART_TWO — café 日本語"),
-            "DUNE_PART_TWO — café 日本語",
+            sanitize_log_msg("WRAITHLINE_PART_TWO — café 日本語"),
+            "WRAITHLINE_PART_TWO — café 日本語",
             "printable UTF-8 must pass through unchanged"
         );
         assert_eq!(sanitize_log_msg(""), "");
