@@ -4470,6 +4470,27 @@ mod web_tests {
         ));
     }
 
+    /// Edge branches of the authority normaliser the higher-level cross-origin
+    /// tests don't reach directly: a malformed bracketed IPv6 literal, a
+    /// non-numeric port, and an Origin that normalises to nothing.
+    #[test]
+    fn normalize_authority_and_cross_origin_edge_branches() {
+        use super::normalize_authority;
+        // Malformed IPv6: a `]` followed by junk that is neither empty nor a
+        // `:port` must be rejected outright (defensive `None`).
+        assert_eq!(normalize_authority("[::1]junk", 80), None);
+        // A trailing `:token` whose port is NOT numeric is treated as part of
+        // the host, and the scheme's default port is appended instead of
+        // silently dropping it.
+        assert_eq!(
+            normalize_authority("host:notaport", 80).as_deref(),
+            Some("host:notaport:80")
+        );
+        // An Origin present but normalising to nothing (bare scheme, empty
+        // authority) can't prove cross-origin, so the request is allowed.
+        assert!(!is_cross_origin(Some("http://"), Some("autorip.test:80")));
+    }
+
     // ── SSRF guard ─────────────────────────────────────────────────────
 
     #[test]
