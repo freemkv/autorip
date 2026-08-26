@@ -626,10 +626,13 @@ fn handle_resume_fsync_failure(device: &str, staging_dir: &Path, output_desc: &s
         // clearing the counter would reset the loop bound to zero so the dir
         // re-muxes from a fresh cap forever, and dropping `.ripped` on a dir that
         // never went terminal would strand it. Instead keep the cap (it stays at/
-        // above the limit, so every subsequent tick immediately re-attempts the
-        // cheap terminal write instead of resetting) and surface it the same LOUD
-        // way the muxer worker site does. Return `false` so the caller treats the
-        // dir as preserved-for-retry, which is what it actually is.
+        // above the limit, so this branch runs again on every subsequent tick —
+        // each tick re-runs the FULL mux + fsync durability gate before ever
+        // reaching this function again, so the retry is bounded by however long
+        // a mount-recovery-then-mux-then-fsync cycle takes, not a cheap
+        // marker-only re-attempt) and surface it the same LOUD way the muxer
+        // worker site does. Return `false` so the caller treats the dir as
+        // preserved-for-retry, which is what it actually is.
         if !staging::write_failed_marker(staging_dir, &reason) {
             crate::log::syslog(&format!(
                 "Auto-resume fsync-failure quarantine FAILED to persist (state.json write error) — {} will keep retrying until the staging mount recovers",
@@ -641,6 +644,31 @@ fn handle_resume_fsync_failure(device: &str, staging_dir: &Path, output_desc: &s
                     "Auto-resume: {reason}, but the terminal quarantine could NOT be written (staging unwritable) — restart cap preserved; will retry until the mount recovers."
                 ),
             );
+            // Raise the same operator card the muxer site raises for its own
+            // dropped terminal-write (`persist_terminal_mux_quarantine` in
+            // muxer.rs), so an unwritable staging mount surfaces on the System
+            // page here too — syslog/device_log alone are easy to miss.
+            //
+            // Skip when this call came from the `_mux` worker path
+            // (`remux_from_ripped_marker` → `resume_remux(cfg, "_mux", ..)`):
+            // `check_and_mux` (muxer.rs) already calls `record_error` keyed on
+            // this SAME staging-dir path for every `resume_remux` failure it
+            // dispatches, including this one (via `apply_failure_fields`
+            // carrying `rs.last_error` into `outcome.failure_reason`). Raising
+            // a second card here for that path wouldn't create a visible
+            // duplicate (`MUX_ERRORS` is keyed by path, last write wins), but
+            // it WOULD log a second, immediately-superseded "Mux blocked: ..."
+            // line for the identical failure. The cold operator-resume path
+            // (`ResumeMode::Require` → `resume::resume_remux` in
+            // `ripper/mod.rs`, real `device`) never goes through
+            // `check_and_mux`, so it has no downstream card without this call.
+            if device != "_mux" {
+                crate::muxer::record_error(
+                    &staging_dir.to_string_lossy(),
+                    &reason,
+                    "the terminal quarantine could not be written to state.json (staging mount full / unwritable); auto-resume will keep retrying until the mount recovers — free space or fix permissions on the staging share",
+                );
+            }
             return false;
         }
         staging::clear_restart_count(staging_dir);
@@ -4073,6 +4101,52 @@ mod resume_lock_and_fsync_tests {
             d.join(".ripped").exists(),
             ".ripped must stay so a dir that never went terminal isn't stranded"
         );
+    }
+
+    /// OPERATOR-CARD PARITY: on the cold operator-resume path (a real device,
+    /// NOT `"_mux"`), a dropped terminal write (unwritable staging mount) must
+    /// raise an operator card the same LOUD way `persist_terminal_mux_quarantine`
+    /// does at the muxer site — syslog + device_log alone don't reach the
+    /// System page. `check_and_mux` (muxer.rs) never sees this path (only the
+    /// `"_mux"` worker call routes through it), so without a direct
+    /// `record_error` call here the operator has no visible signal that the
+    /// staging mount is unwritable.
+    ///
+    /// Red-before-green: before the fix, `handle_resume_fsync_failure` never
+    /// calls `crate::muxer::record_error`, so `MUX_ERRORS` has no entry for
+    /// this staging dir and the assertion fails.
+    #[test]
+    fn fsync_dropped_write_raises_operator_card() {
+        let d = tmpdir();
+        std::fs::write(d.join(".ripped"), b"{}").unwrap();
+        // Force the terminal state.json write to fail (a dir can't be renamed
+        // over), same trick as `fsync_failure_at_limit_dropped_write_preserves_cap`.
+        std::fs::create_dir(d.join(staging::STATE_FILE)).unwrap();
+        staging::write_marker_durable(
+            &d.join(".restart_count"),
+            format!("{}\n", staging::RESTART_LIMIT - 1).as_bytes(),
+        )
+        .unwrap();
+        let path_key = d.to_string_lossy().to_string();
+        crate::muxer::clear_error(&path_key);
+
+        // A REAL device (cold operator-resume), not the `"_mux"` worker.
+        let quarantined = handle_resume_fsync_failure("sg0", &d, "mux output");
+
+        assert!(
+            !quarantined,
+            "a dropped terminal write must still report NOT quarantined"
+        );
+        assert!(
+            crate::muxer::MUX_ERRORS
+                .lock()
+                .unwrap()
+                .contains_key(&path_key),
+            "a dropped terminal write on the cold operator-resume path must raise \
+             an operator card (MUX_ERRORS) — syslog/device_log alone are not \
+             visible on the System page"
+        );
+        crate::muxer::clear_error(&path_key);
     }
 }
 
