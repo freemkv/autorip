@@ -1289,11 +1289,12 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
 
     // User-facing unlocker matrix — which registered unlockers actually RAN this
     // rip (did work, not merely "matched the disc kind"), shown for every disc so
-    // an operator can see (and question) a missing one (e.g. "LibreDrive: no" on a
-    // supported drive = the firmware unlock didn't take; "AACS: yes" only when the
-    // host-cert route did the bus removal because LibreDrive didn't). Registry-
-    // driven: names from libfreemkv's unlocker registry, never hardcoded. Kept
-    // byte-identical to the CLI's rendering for consistency across the two apps.
+    // an operator can see (and question) a missing one (e.g. a firmware-unlock
+    // entry reading "no" on a supported drive = the firmware unlock didn't take;
+    // "AACS: yes" only when the host-cert route did the bus removal because the
+    // firmware unlock didn't). Registry-driven: names from libfreemkv's unlocker
+    // registry, never hardcoded. Kept byte-identical to the CLI's rendering for
+    // consistency across the two apps.
     {
         let matrix = disc
             .unlocker_matrix(&drive)
@@ -1536,7 +1537,7 @@ pub fn handle_rip_request(
             // partially-recovered) swept ISO that aborted only on the loss
             // threshold. A fresh sweep here would overwrite that 50+ GB ISO and
             // throw away the recovery progress (the bug that destroyed a swept
-            // Dunkirk ISO). Leave it for the operator to Accept (deliver) or
+            // in-progress ISO). Leave it for the operator to Accept (deliver) or
             // resume (run another recovery pass) — never auto-clobber it.
             if disc_loss_aborted(cfg, device) {
                 crate::log::device_log(
@@ -1961,9 +1962,10 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
         let path = staging_root.join(&basename);
         // Match the disc's own staging dir by EXACT name. Staging dirs are
         // created with the exact sanitized disc name, so a prefix match never
-        // legitimately fires — it only collides ("Cars" is a prefix of
-        // "Cars_2" from "Cars 2"; "Dune" of "Dunkirk"), resuming onto a
-        // different title's partial ISO + mapfile. Exact equality is safe.
+        // legitimately fires — it only collides ("Feature" is a prefix of
+        // "Feature_2" from "Feature 2"; a short title that is a prefix of a
+        // longer one), resuming onto a different title's partial ISO +
+        // mapfile. Exact equality is safe.
         if staging_dir_matches_disc(&basename, &sanitized) {
             // User-initiated resume goes straight to the underlying
             // remux-eligibility check (ISO + mapfile present, mapfile
