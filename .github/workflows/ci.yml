@@ -179,6 +179,76 @@ jobs:
       - run: cargo test --tests
         working-directory: autorip
 
+  # Coverage — additive, NON-REQUIRED. Mirrors the `test` job's sibling
+  # checkouts and generated .cargo/config.toml so the workspace resolves the
+  # freemkv crates from their dev tips exactly as the other jobs do, then runs
+  # cargo-llvm-cov and uploads to Codecov tokenless (public repo). `--locked`
+  # is intentionally omitted for the same reason the rest of this file omits it
+  # (see the header note): the committed Cargo.lock resolves the freemkv crates
+  # as path packages and cannot be satisfied with --locked under this layout.
+  # No `needs:`/aggregator wires this job into a required gate, and Codecov is
+  # configured informational-only (see codecov.yml), so it never blocks a merge
+  # or the release.sh CI gate.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: libfreemkv
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-keysources
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-engine
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-engine
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-i18n
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-i18n
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: autorip
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: autorip
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate coverage (lcov)
+        working-directory: autorip
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: autorip/lcov.info
+          slug: freemkv/autorip
+          fail_ci_if_error: false
+
   # The shipped Linux artifact — and the GHCR image — is a static musl release
   # build, not the gnu dev build the jobs above produce. Static linking is
   # exactly where a new C-linking dependency breaks, and nothing else here
