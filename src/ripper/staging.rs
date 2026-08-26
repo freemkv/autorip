@@ -333,7 +333,12 @@ fn read_state_or_warn_corrupt(staging_disc_dir: &Path) -> Option<DiscState> {
 /// with a write error.
 pub fn write_state(staging_disc_dir: &Path, st: &DiscState) {
     if let Err(e) = try_write_state(staging_disc_dir, st) {
-        tracing::warn!(path = %state_path(staging_disc_dir).display(), error = %e, "failed to write state.json");
+        // ERROR, not WARN: a dropped state.json write is not cosmetic. A
+        // terminal transition (`Failed`/`Done`) that fails to persist leaves the
+        // dir in its prior state — a quarantined-but-still-`Ripped` dir
+        // re-dispatches to the mux worker every ~10s forever. This must be
+        // diagnosable at error level, never buried in a warn.
+        tracing::error!(path = %state_path(staging_disc_dir).display(), error = %e, "failed to write state.json");
     }
 }
 
@@ -357,6 +362,23 @@ pub fn try_write_state(staging_disc_dir: &Path, st: &DiscState) -> io::Result<()
 /// the single transition primitive; a transition mutates fields, it never blows
 /// away accumulated data. Safe because one writer owns a staging dir at a time
 /// (the sweeping/muxing ownership rules, now fields).
+///
+/// RESIDUAL RACE (documented, partially mitigated — needs a follow-up design):
+/// this read-modify-write is lock-free. The "one writer at a time" invariant is
+/// enforced only by the advisory `.muxing`/`.sweeping` ownership markers, and
+/// not every caller honours them. The mux worker's terminal `write_failed_marker`
+/// (state → Failed) and the web `handle_accept_loss` handler's
+/// `apply_accept_loss_reopen` (state → Ripped) both mutate the SAME dir's
+/// state.json with no shared lock, and the worker does not hold the physical
+/// device's claim (it runs on the synthetic `_mux` device), so the device claim
+/// does not serialise them. A fully correct fix is a per-dir advisory lock (or
+/// flock) wrapping the whole read→modify→write in every writer — broad
+/// restructuring, deliberately NOT attempted here. As a minimal mitigation the
+/// primary observed window is closed at the call site: `handle_accept_loss`
+/// refuses (409) while `.muxing` is set, and the worker clears `.muxing`
+/// atomically with its terminal write, so the accept path only proceeds once
+/// the dir is stable. Other lock-free writers on the same dir remain
+/// theoretically racy under concurrent mutation.
 pub fn mutate_state(
     staging_disc_dir: &Path,
     default_state: StagingState,
@@ -658,27 +680,48 @@ pub fn clear_restart_count(staging_disc_dir: &Path) {
     let _ = std::fs::remove_file(&p);
 }
 
-/// Write the `.failed` marker with a structured reason. Best-effort —
-/// logs but does not propagate errors, because the only caller is on
-/// the giving-up path where there's nothing useful to do with a write
-/// failure.
-pub fn write_failed_marker(staging_disc_dir: &Path, reason: &str) {
+/// Write the `.failed` marker with a structured reason. Returns whether the
+/// terminal `state: Failed` actually LANDED on disk (`true`) or the state.json
+/// write failed (`false`).
+///
+/// A dropped write here is the dangerous case: the dir stays in its prior state
+/// (typically `Ripped`), so the mux worker re-Dispatches it every ~10s tick
+/// forever — the exact loop this quarantine exists to break, silently reopened.
+/// The return value lets the quarantine call sites surface a stuck quarantine
+/// LOUDLY (operator signal) instead of swallowing it; the legacy-marker cleanup
+/// stays best-effort. Not `#[must_use]`: the one-shot startup/auto-resume call
+/// sites already get the loud `tracing::error!` above and have nothing to
+/// retry; only the mux worker's per-tick loop consults the return to raise an
+/// operator card.
+pub fn write_failed_marker(staging_disc_dir: &Path, reason: &str) -> bool {
     // Terminal transition → `state: Failed`, carrying the reason. This one
     // atomic rewrite supersedes any in-progress ownership (the `.sweeping`
     // state / `.muxing` lock): `state != Sweeping` means `has_sweeping` reads
     // false, and clearing `muxing` releases the lock so `disc_owned_by_worker`
     // can't stay true on a now-terminal dir.
-    mutate_state(staging_disc_dir, StagingState::Failed, |s| {
-        s.state = StagingState::Failed;
-        s.failure_reason = Some(reason.to_string());
-        s.muxing = false;
-    });
+    let mut st = read_state_or_warn_corrupt(staging_disc_dir)
+        .unwrap_or_else(|| DiscState::new(StagingState::Failed));
+    st.state = StagingState::Failed;
+    st.failure_reason = Some(reason.to_string());
+    st.muxing = false;
+    let landed = match try_write_state(staging_disc_dir, &st) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                path = %state_path(staging_disc_dir).display(),
+                error = %e,
+                "failed to persist terminal .failed quarantine — dir stays in its prior state and will keep re-dispatching to the mux worker until the staging mount recovers"
+            );
+            false
+        }
+    };
     // Best-effort removal of any leftover LEGACY marker files (a dir migrated
     // mid-life). The unified state above is authoritative; these keep a
     // half-migrated dir from reading terminal on one side and in-progress on the
     // other via the reader's legacy fallback.
     remove_legacy_marker(staging_disc_dir, SWEEPING_MARKER);
     remove_legacy_marker(staging_disc_dir, MUXING_MARKER);
+    landed
 }
 
 /// Best-effort removal of a named legacy marker file. Used by the unified
@@ -843,6 +886,19 @@ pub fn write_muxing_marker(staging_disc_dir: &Path) {
     // state. Best-effort: if the dir has no state.json the lock is simply not
     // taken — same as a legacy best-effort write failing.
     mutate_state_if_present(staging_disc_dir, |s| s.muxing = true);
+}
+
+/// Whether the dir is currently held by the mux worker's `.muxing` exclusion
+/// lock. Reads the marker DIRECTLY (state.json `muxing` field, or a legacy
+/// `.muxing` file) without going through `snapshot_staging_disc`, so it does not
+/// migrate a legacy dir as a side effect — safe to call on a read-only request
+/// path (`handle_accept_loss`'s ownership guard). A dir with no state.json and
+/// no legacy marker reads `false`.
+pub fn is_muxing(staging_disc_dir: &Path) -> bool {
+    if let Some(st) = read_state(staging_disc_dir) {
+        return st.muxing;
+    }
+    staging_disc_dir.join(MUXING_MARKER).exists()
 }
 
 /// Release the `.muxing` exclusion lock (a field). Called when the mux worker
@@ -2286,6 +2342,35 @@ mod tests {
         );
     }
 
+    /// FIX 3 — `write_failed_marker` must REPORT whether the terminal state
+    /// actually landed, not silently swallow a write failure. A dropped write at
+    /// quarantine time leaves the dir in its prior state (`Ripped`), so it
+    /// re-dispatches to the mux worker forever; the worker relies on this return
+    /// value to raise a LOUD operator card instead of looping invisibly.
+    #[test]
+    fn write_failed_marker_reports_whether_state_landed() {
+        // Success: a normal dir → terminal state lands, returns true.
+        let root = tmpdir();
+        let disc = root.join("Good");
+        fs::create_dir_all(&disc).unwrap();
+        assert!(
+            write_failed_marker(&disc, "E6008"),
+            "a successful terminal write must report landed=true"
+        );
+        assert_eq!(read_state(&disc).unwrap().state, StagingState::Failed);
+
+        // Failure: point the writer at a path whose parent is a FILE, so the
+        // atomic state.json write cannot create its temp file (ENOTDIR). The
+        // return must be false — the signal the worker surfaces loudly.
+        let not_a_dir = root.join("iam_a_file");
+        fs::write(&not_a_dir, b"x").unwrap();
+        let doomed = not_a_dir.join("child");
+        assert!(
+            !write_failed_marker(&doomed, "E6008"),
+            "a failed terminal write must report landed=false, never swallow it"
+        );
+    }
+
     #[test]
     fn resume_marks_failed_after_limit() {
         // Build a fake staging tree: <root>/<disc>/foo.iso plus
@@ -3037,7 +3122,9 @@ mod tests {
         for m in markers {
             match m {
                 Mk::Completed => write_completed_marker(&disc),
-                Mk::Failed => write_failed_marker(&disc, "prior failure"),
+                Mk::Failed => {
+                    let _ = write_failed_marker(&disc, "prior failure");
+                }
                 Mk::Done => fs::write(disc.join(DONE_MARKER), b"{}").unwrap(),
                 Mk::Review => fs::write(disc.join(REVIEW_MARKER), b"{}").unwrap(),
                 Mk::Ripped => fs::write(disc.join(RIPPED_MARKER), b"{}").unwrap(),

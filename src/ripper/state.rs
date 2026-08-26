@@ -79,6 +79,20 @@ pub struct RipState {
     /// carried forward across state pushes: it describes one terminal push.
     #[serde(skip)]
     pub failure_deferred: bool,
+    /// This device's terminal state is a structural FINALIZE failure (the MKV
+    /// could not be finalized — e.g. E6008 no muxable frames / unseekable
+    /// output), as opposed to a resumable mid-mux read error. Recorded
+    /// explicitly for the same reason as [`RipState::failure_deferred`]: the
+    /// terminal `status` string cannot distinguish a finalize failure
+    /// (terminal) from a read error (resumable) reliably enough for the mux
+    /// worker's quarantine decision, and inferring terminality from
+    /// `!failure_deferred` false-quarantines a resumable read error. Set only
+    /// by the mux-incomplete finalize exit in `resume_remux`.
+    ///
+    /// Server-side bookkeeping only — not serialized. Deliberately NOT
+    /// carried forward across state pushes: it describes one terminal push.
+    #[serde(skip)]
+    pub failure_finalize: bool,
     pub disc_format: String, // "uhd", "bluray", "dvd"
     pub progress_pct: u8,
     pub progress_gb: f64,
@@ -236,6 +250,7 @@ impl Default for RipState {
             disc_name: String::new(),
             disc_label: String::new(),
             failure_deferred: false,
+            failure_finalize: false,
             disc_format: String::new(),
             progress_pct: 0,
             progress_gb: 0.0,
