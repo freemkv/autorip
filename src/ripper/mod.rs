@@ -6520,7 +6520,7 @@ fn keyless_failure_message(disc: &libfreemkv::Disc) -> String {
 /// of a permanent "no keys were found; check the key source in Settings".
 /// A keyserver that is merely DOWN otherwise sends the operator hunting
 /// through Settings for a key source that is actually fine (the exact
-/// confusion seen when cdxhp.com returned 502s during a deferred mux).
+/// confusion seen when the online key service returned 502s during a deferred mux).
 pub(crate) fn deferred_keyless_message(cfg: &Config, disc: &libfreemkv::Disc) -> String {
     if cfg.key_source == "online"
         && let Some(status) =

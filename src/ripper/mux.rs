@@ -1411,7 +1411,7 @@ pub(crate) fn mux_live(
     // Same per-device Halt the orchestrator threaded through sweep/patch and the
     // `/api/stop` handler cancels. Absent-token fallback = never-cancelled. On
     // the live path this is the SAME token the pre-migration `DiscStream::new`
-    // received (covering the CSS crack that runs at construction).
+    // received (covering the CSS key setup that runs at construction).
     let halt_token = device_halt(inputs.device).unwrap_or_default();
 
     // Progress denominator: caller's `total_bytes` (the single-pass extent sum
