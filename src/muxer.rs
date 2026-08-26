@@ -433,8 +433,48 @@ impl Drop for MuxingGuard<'_> {
 /// `MuxHandoffOutcome::failure_finalize`) quarantines ONLY a structural finalize
 /// error. `has_worker_reason` is kept as a defensive precondition (a finalize
 /// always carries a reason).
-fn mux_failure_is_terminal(aborted_loss: bool, has_worker_reason: bool, is_finalize: bool) -> bool {
-    !aborted_loss && has_worker_reason && is_finalize
+///
+/// The three flags are passed as named struct fields rather than positional
+/// bools: they are same-typed and adjacent, so a positional call could transpose
+/// two of them (e.g. `has_worker_reason` and `is_finalize`) and still compile —
+/// silently inverting the terminal-vs-resumable verdict, the highest-stakes bug
+/// class on this path. Named construction makes a transposition a compile error.
+pub(crate) struct MuxFailureClass {
+    /// The mux completed but delivered loss exceeded threshold (`.aborted-loss`).
+    /// It owns its own resumable state and must never be quarantined here.
+    pub(crate) aborted_loss: bool,
+    /// The worker learned a concrete failure reason from the `_mux` device state
+    /// (a finalize always carries one — kept as a defensive precondition).
+    pub(crate) has_worker_reason: bool,
+    /// A structural FINALIZE failure surfaced (`failure_finalize`) — the sole
+    /// terminal signal.
+    pub(crate) is_finalize: bool,
+}
+
+pub(crate) fn mux_failure_is_terminal(class: MuxFailureClass) -> bool {
+    !class.aborted_loss && class.has_worker_reason && class.is_finalize
+}
+
+/// Persist the terminal `.failed` quarantine and, when the state.json write does
+/// NOT land, surface it LOUD (syslog + an operator card) instead of swallowing
+/// it. A dropped terminal write leaves the dir in its prior `Ripped` state, so
+/// the worker re-Dispatches it every tick (a full re-mux each time) — the exact
+/// loop this quarantine exists to break, silently reopened. Returns whether the
+/// terminal state actually landed so the alarm can't be lost by discarding the
+/// `write_failed_marker` return (the round-1 gap this closes).
+pub(crate) fn persist_terminal_mux_quarantine(path_str: &str, dir: &Path, reason: &str) -> bool {
+    let landed = crate::ripper::staging::write_failed_marker(dir, reason);
+    if !landed {
+        crate::log::syslog(&format!(
+            "Mux quarantine FAILED to persist (state.json write error) — {path_str} will keep re-dispatching until the staging mount recovers"
+        ));
+        record_error(
+            path_str,
+            reason,
+            "the terminal quarantine could not be written to state.json (staging mount full / unwritable); the mux will keep retrying until the mount recovers — free space or fix permissions on the staging share",
+        );
+    }
+    landed
 }
 
 fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
@@ -519,7 +559,18 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         // loop (commit da16f00) ship untested.
         let snap = crate::ripper::staging::snapshot_staging_disc(&dir);
         match mux_dispatch_verdict(snap.as_ref()) {
-            MuxVerdict::Dispatch => {}
+            MuxVerdict::Dispatch => {
+                // Stamp `.muxing` the INSTANT the Dispatch verdict commits — before
+                // reading/sanitising the marker below — so the entry-side ownership
+                // guard (`is_muxing`, e.g. `handle_accept_loss`'s 409) sees the lock
+                // across the whole dispatch. Writing it only just before the mux
+                // (after `read_marker` + logging) left a TOCTOU window in which a
+                // concurrent web entry observed `is_muxing == false` and raced the
+                // muxer's read-modify-write of state.json. The guard below clears it
+                // on EVERY exit of this iteration (the marker-read `continue`s, the
+                // mux branches, or a panic).
+                crate::ripper::staging::write_muxing_marker(&dir);
+            }
             MuxVerdict::SkipAbortedLoss => {
                 // The mux completed but the delivered title exceeded the loss
                 // threshold. DON'T re-mux (the loss is deterministic — it would
@@ -538,6 +589,11 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                 continue;
             }
         }
+        // Own the `.muxing` lock (stamped above at verdict-commit) for the rest of
+        // this iteration. Created BEFORE `read_marker` so its Drop clears the lock
+        // on the marker-read `continue` paths too — no stuck `.muxing` if the
+        // marker vanished / is malformed.
+        let _guard = MuxingGuard(&dir);
         let marker = match read_marker(&dir) {
             Ok(m) => m,
             // TOCTOU: the `.exists()` check above and this read race a
@@ -579,10 +635,10 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         // skip any dir carrying `.muxing`, so a disc re-insert can't run a fresh
         // sweep that truncates the ISO this worker is reading, nor double-mux
         // the same output. Cleared on every exit of this iteration (success or
-        // failure) via the `_guard` drop below — the dir is then governed by
-        // `.completed`/`.failed`/`.ripped` instead.
-        crate::ripper::staging::write_muxing_marker(&dir);
-        let _guard = MuxingGuard(&dir);
+        // failure) via the `_guard` drop above — the dir is then governed by
+        // `.completed`/`.failed`/`.ripped` instead. The lock itself was stamped at
+        // verdict-commit (top of this iteration) and is owned by `_guard` from just
+        // before `read_marker`.
         // Clear any error card from a PRIOR attempt the instant this new
         // dispatch begins — otherwise a stale red card (e.g. "no keys" from
         // the last tick, or a leftover "aborted 0.44s") lingers on the System
@@ -719,11 +775,11 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                     "the mux failed to finalize/write the output — staging is preserved; check the _mux device log for the failure detail and re-run the mux".to_string(),
                 )
             };
-            if mux_failure_is_terminal(
-                aborted_loss.is_some(),
-                outcome.failure_reason.is_some(),
-                outcome.failure_finalize,
-            ) {
+            if mux_failure_is_terminal(MuxFailureClass {
+                aborted_loss: aborted_loss.is_some(),
+                has_worker_reason: outcome.failure_reason.is_some(),
+                is_finalize: outcome.failure_finalize,
+            }) {
                 // TERMINAL mux failure (structural finalize error — e.g. E6008,
                 // no muxable frames). Without this, `state` stays `Ripped` and
                 // `mux_dispatch_verdict` re-Dispatches this dir every ~10s tick
@@ -739,17 +795,7 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                 // terminal state did not land (disk write failed), surface it
                 // LOUD so the stuck quarantine is visible and the dir doesn't
                 // silently re-dispatch forever (see write_failed_marker).
-                if !crate::ripper::staging::write_failed_marker(&dir, &reason) {
-                    crate::log::syslog(&format!(
-                        "Mux quarantine FAILED to persist (state.json write error) — {} will keep re-dispatching until the staging mount recovers",
-                        path_str
-                    ));
-                    record_error(
-                        &path_str,
-                        &reason,
-                        "the terminal quarantine could not be written to state.json (staging mount full / unwritable); the mux will keep retrying until the mount recovers — free space or fix permissions on the staging share",
-                    );
-                }
+                persist_terminal_mux_quarantine(&path_str, &dir, &reason);
             }
             record_error(&path_str, &reason, &hint);
         }
@@ -1644,7 +1690,11 @@ mod tests {
     #[test]
     fn mux_failure_is_terminal_truth_table() {
         assert!(
-            mux_failure_is_terminal(false, true, true),
+            mux_failure_is_terminal(MuxFailureClass {
+                aborted_loss: false,
+                has_worker_reason: true,
+                is_finalize: true,
+            }),
             "a structural finalize failure (E6008) MUST quarantine — this was the loop bug"
         );
         // The load-bearing FIX-2 row: a resumable, NON-finalize failure (a
@@ -1653,15 +1703,27 @@ mod tests {
         // deferral, so the old `!failure_retryable` gate quarantined it — a lost
         // rip that would have succeeded on retry. It must now stay resumable.
         assert!(
-            !mux_failure_is_terminal(false, true, false),
+            !mux_failure_is_terminal(MuxFailureClass {
+                aborted_loss: false,
+                has_worker_reason: true,
+                is_finalize: false,
+            }),
             "a resumable non-finalize failure (read error) must NOT be quarantined — the FIX-2 false-terminal"
         );
         assert!(
-            !mux_failure_is_terminal(true, true, true),
+            !mux_failure_is_terminal(MuxFailureClass {
+                aborted_loss: true,
+                has_worker_reason: true,
+                is_finalize: true,
+            }),
             "an aborted-loss owns its own resumable state — never quarantine here"
         );
         assert!(
-            !mux_failure_is_terminal(false, false, true),
+            !mux_failure_is_terminal(MuxFailureClass {
+                aborted_loss: false,
+                has_worker_reason: false,
+                is_finalize: true,
+            }),
             "no worker reason: defensive precondition — don't quarantine"
         );
     }
@@ -1686,11 +1748,11 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !mux_failure_is_terminal(
-                false,
-                read_error.failure_reason.is_some(),
-                read_error.failure_finalize,
-            ),
+            !mux_failure_is_terminal(MuxFailureClass {
+                aborted_loss: false,
+                has_worker_reason: read_error.failure_reason.is_some(),
+                is_finalize: read_error.failure_finalize,
+            }),
             "a resumable mid-mux read error must NOT be quarantined by the worker"
         );
         // A structural finalize failure (E6008): terminal — must quarantine.
@@ -1702,11 +1764,11 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            mux_failure_is_terminal(
-                false,
-                finalize_error.failure_reason.is_some(),
-                finalize_error.failure_finalize,
-            ),
+            mux_failure_is_terminal(MuxFailureClass {
+                aborted_loss: false,
+                has_worker_reason: finalize_error.failure_reason.is_some(),
+                is_finalize: finalize_error.failure_finalize,
+            }),
             "a structural finalize failure MUST be quarantined by the worker"
         );
     }
@@ -1743,6 +1805,94 @@ mod tests {
             MuxVerdict::SkipTerminal,
             "after the terminal-finalize quarantine the dir must never re-dispatch"
         );
+    }
+
+    /// FIX (entry-side TOCTOU): the `.muxing` ownership lock must be stamped the
+    /// INSTANT the Dispatch verdict commits — before `read_marker` + logging — so a
+    /// concurrent web entry's `is_muxing` guard sees the lock across the whole
+    /// dispatch. Stamping it only just before the mux (after `read_marker`) left a
+    /// window where `is_muxing == false` and the entry raced the muxer's state.json
+    /// write. Pins, at source level, that `write_muxing_marker` precedes
+    /// `read_marker(&dir)` in the worker loop.
+    ///
+    /// Red-before-green: the pre-fix order (stamp after `read_marker`) reverses the
+    /// two indices and fails this assertion.
+    #[test]
+    fn muxing_marker_stamped_before_marker_read() {
+        let src = crate::util::source_lf(include_str!("muxer.rs"));
+        let start = src
+            .find("match mux_dispatch_verdict(snap.as_ref())")
+            .expect("muxer.rs should dispatch on the verdict");
+        let end = src[start..]
+            .find("let outcome = crate::ripper::resume::remux_from_ripped_marker")
+            .map(|i| start + i)
+            .expect("muxer.rs should dispatch to remux_from_ripped_marker");
+        let region = &src[start..end];
+        let stamp = region
+            .find("write_muxing_marker")
+            .expect("the worker must stamp the .muxing lock");
+        let read = region
+            .find("read_marker(&dir)")
+            .expect("the worker must read the .ripped marker");
+        assert!(
+            stamp < read,
+            "the .muxing lock must be stamped at verdict-commit, BEFORE read_marker — \
+             else a concurrent entry sees is_muxing==false and races the muxer"
+        );
+    }
+
+    /// FIX-3 production wiring: the mux worker's terminal-quarantine site consumes
+    /// `write_failed_marker`'s return. When the state.json write LANDS, the dir goes
+    /// terminal and no operator card is raised. When it does NOT land (unwritable
+    /// staging), the site must surface a LOUD operator card so the stuck quarantine
+    /// is visible instead of silently re-dispatching forever.
+    ///
+    /// Red-before-green: if the site reverts to discarding the return (no alarm on a
+    /// failed write), the `MUX_ERRORS` assertion below goes RED.
+    #[test]
+    fn persist_terminal_mux_quarantine_alarms_when_write_fails() {
+        // Happy path: a writable dir goes terminal, returns true, raises no card.
+        let ok_tmp = TempDir::new().unwrap();
+        let ok_dir = ok_tmp.path().join("Writable");
+        std::fs::create_dir_all(&ok_dir).unwrap();
+        crate::ripper::staging::write_state(
+            &ok_dir,
+            &crate::ripper::staging::DiscState::new(crate::ripper::staging::StagingState::Ripped),
+        );
+        let ok_path = ok_dir.to_string_lossy().to_string();
+        clear_error(&ok_path);
+        assert!(
+            persist_terminal_mux_quarantine(&ok_path, &ok_dir, "E6008 no muxable frames"),
+            "a writable staging dir must persist the terminal quarantine"
+        );
+        assert_eq!(
+            crate::ripper::staging::read_state(&ok_dir).map(|s| s.state),
+            Some(crate::ripper::staging::StagingState::Failed),
+            "the terminal write must land → state Failed"
+        );
+        assert!(
+            !MUX_ERRORS.lock().unwrap().contains_key(&ok_path),
+            "a landed quarantine must NOT raise an operator card"
+        );
+
+        // Failure path: force `write_failed_marker` to fail by making state.json a
+        // directory (the tmp→final rename can't clobber a dir). The site must raise
+        // a loud operator card and report the write did NOT land.
+        let bad_tmp = TempDir::new().unwrap();
+        let bad_dir = bad_tmp.path().join("Unwritable");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::create_dir_all(bad_dir.join(crate::ripper::staging::STATE_FILE)).unwrap();
+        let bad_path = bad_dir.to_string_lossy().to_string();
+        clear_error(&bad_path);
+        assert!(
+            !persist_terminal_mux_quarantine(&bad_path, &bad_dir, "E6008 no muxable frames"),
+            "a failed terminal write must report it did NOT land"
+        );
+        assert!(
+            MUX_ERRORS.lock().unwrap().contains_key(&bad_path),
+            "a dropped terminal write must raise a LOUD operator card (not silently re-dispatch)"
+        );
+        clear_error(&bad_path);
     }
 
     /// TRANSITION: ripped → mux success → completed → (mover takes over).

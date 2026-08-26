@@ -484,8 +484,17 @@ fn apply_failure_fields(outcome: &mut MuxHandoffOutcome, rs: &super::RipState) {
 ///
 /// A mid-mux READ error (`finalize_error == None`) is left resumable — the MKV
 /// is merely truncated and a retry (fresh keys / a settled drive) can complete
-/// it. Returns whether the terminal transition was performed, so the caller can
-/// record the matching `failure_finalize` bit on the device state.
+/// it.
+///
+/// Returns whether the terminal `.failed` write actually LANDED on disk — NOT
+/// merely whether this was a finalize failure. `None` (a read error, nothing to
+/// write) returns `false`; a finalize failure whose state.json write FAILED
+/// (unwritable staging) also returns `false`, so the caller can tell "quarantined"
+/// from "tried to quarantine but the write was dropped" and surface the dropped
+/// write loudly rather than silently believing the dir is terminal. The caller
+/// records the `failure_finalize` bit from `finalize_error.is_some()`
+/// INDEPENDENTLY of this return (the worker backstop must still fire on a dropped
+/// write), consuming the return only to detect a stuck quarantine.
 ///
 /// Extracted from the mux-incomplete early-return so the terminal-vs-resumable
 /// decision is reachable from a regression test without an ISO + mapfile +
@@ -493,11 +502,10 @@ fn apply_failure_fields(outcome: &mut MuxHandoffOutcome, rs: &super::RipState) {
 /// coverage (a source-substring test was satisfied by an earlier line, so
 /// deleting the quarantine kept it green).
 fn quarantine_incomplete_mux(staging_dir: &Path, finalize_error: Option<&str>) -> bool {
-    if let Some(finalize) = finalize_error {
-        staging::write_failed_marker(staging_dir, finalize);
-        return true;
+    match finalize_error {
+        Some(finalize) => staging::write_failed_marker(staging_dir, finalize),
+        None => false,
     }
-    false
 }
 
 /// [`reset_status_after_ripping`] for the exits that are DEFERRALS rather
@@ -613,7 +621,28 @@ fn handle_resume_fsync_failure(device: &str, staging_dir: &Path, output_desc: &s
             device,
             &format!("Auto-resume: {reason} — quarantining staging (.failed)."),
         );
-        staging::write_failed_marker(staging_dir, &reason);
+        // Consult the terminal-write return. If it did NOT land (unwritable
+        // staging), do NOT tear down the restart cap and do NOT drop `.ripped`:
+        // clearing the counter would reset the loop bound to zero so the dir
+        // re-muxes from a fresh cap forever, and dropping `.ripped` on a dir that
+        // never went terminal would strand it. Instead keep the cap (it stays at/
+        // above the limit, so every subsequent tick immediately re-attempts the
+        // cheap terminal write instead of resetting) and surface it the same LOUD
+        // way the muxer worker site does. Return `false` so the caller treats the
+        // dir as preserved-for-retry, which is what it actually is.
+        if !staging::write_failed_marker(staging_dir, &reason) {
+            crate::log::syslog(&format!(
+                "Auto-resume fsync-failure quarantine FAILED to persist (state.json write error) — {} will keep retrying until the staging mount recovers",
+                staging_dir.display()
+            ));
+            crate::log::device_log(
+                device,
+                &format!(
+                    "Auto-resume: {reason}, but the terminal quarantine could NOT be written (staging unwritable) — restart cap preserved; will retry until the mount recovers."
+                ),
+            );
+            return false;
+        }
         staging::clear_restart_count(staging_dir);
         // Drop the `.ripped` hand-off so the mux worker can't re-queue this
         // now-terminal dir (belt-and-suspenders with the `.failed` guard).
@@ -1025,9 +1054,25 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                     lost_secs, effective_abort
                 ),
             );
+            // Quarantine to a RESUMABLE `.aborted-loss` exactly as the §4 mux-time
+            // loss gate below does. WITHOUT this the sweep gate wrote NO terminal or
+            // aborted marker, so on the `_mux` worker auto-resume path the `.ripped`
+            // hand-off survived and `mux_dispatch_verdict` re-Dispatched the same
+            // doomed dir every ~10s tick forever (a full re-scan/re-mux each time) —
+            // the exact infinite-loop class the quarantine machinery exists to kill,
+            // on the one loss gate round-1 missed. The marker flips the next
+            // verdict to `SkipAbortedLoss` (resumable: an `.accept-loss` override or
+            // a fresh rip can still deliver), mirroring §4.
+            let _ = staging::mark_aborted_on_loss(
+                &staging_dir,
+                &format!(
+                    "aborted: {scope} loss {:.2}s exceeds threshold {}s (sweep)",
+                    lost_secs, effective_abort
+                ),
+            );
             reset_status_after_ripping(
                 device,
-                "idle",
+                "error",
                 &display_name,
                 &disc_format,
                 &duration,
@@ -1575,15 +1620,37 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // this dir on every container restart (the resume path previously wrote
         // no terminal state, so a structurally-impossible mux resumed forever).
         // A read_error leaves staging resumable exactly as before.
-        let quarantined =
-            quarantine_incomplete_mux(&staging_dir, mux_outcome.finalize_error.as_deref());
+        // `is_finalize` is the terminal CLASSIFICATION; `landed` is whether this
+        // path's own `.failed` write actually persisted. They are distinct: on an
+        // unwritable staging mount a finalize failure is still terminal, but the
+        // local write is dropped — we must NOT silently believe the dir was
+        // quarantined.
+        let is_finalize = mux_outcome.finalize_error.is_some();
+        let landed = quarantine_incomplete_mux(&staging_dir, mux_outcome.finalize_error.as_deref());
         if let Some(finalize) = mux_outcome.finalize_error.as_deref() {
-            crate::log::device_log(
-                device,
-                &format!(
-                    "Auto-resume mux finalize failed ({finalize}) — quarantined (state → Failed); staging preserved for inspection",
-                ),
-            );
+            if landed {
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "Auto-resume mux finalize failed ({finalize}) — quarantined (state → Failed); staging preserved for inspection",
+                    ),
+                );
+            } else {
+                // Terminal write dropped (staging full / unwritable). Surface it the
+                // same LOUD way the worker site does so the stuck quarantine is
+                // visible; the dir keeps its prior state and retries until the mount
+                // recovers (on the `_mux` worker path the backstop below re-fires).
+                crate::log::syslog(&format!(
+                    "Auto-resume mux quarantine FAILED to persist (state.json write error) — {} will keep re-dispatching until the staging mount recovers",
+                    staging_dir.display()
+                ));
+                crate::log::device_log(
+                    device,
+                    &format!(
+                        "Auto-resume mux finalize failed ({finalize}) but the terminal quarantine could NOT be written (staging unwritable) — the mux will retry until the mount recovers",
+                    ),
+                );
+            }
         }
         // Reset from "ripping" → the verdict status so the next /api/rip isn't
         // blocked by the "already ripping" gate. On a read_error / halt staging
@@ -1600,8 +1667,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // state AFTER the reset wipes it, mirroring `defer_status_after_ripping`
         // setting `failure_deferred`. `remux_from_ripped_marker` reads this into
         // `MuxHandoffOutcome::failure_finalize` so the worker quarantines ONLY a
-        // finalize failure, never a resumable read error.
-        if quarantined {
+        // finalize failure, never a resumable read error. Gated on the finalize
+        // CLASSIFICATION (`is_finalize`), NOT on whether the local write landed:
+        // if this path's `.failed` write was dropped (unwritable staging), the
+        // worker's backstop (`persist_terminal_mux_quarantine`) must still re-fire
+        // and re-surface — so the bit is set even then.
+        if is_finalize {
             super::update_state_with(device, |s| s.failure_finalize = true);
         }
         return;
@@ -3316,6 +3387,171 @@ mod post_mux_loss_reporting_tests {
         );
     }
 
+    /// FIX-4: `quarantine_incomplete_mux` returns whether the terminal write
+    /// actually LANDED, not merely whether the failure was a finalize. On an
+    /// unwritable staging mount a finalize failure can't persist `.failed`; the
+    /// function must return `false` there so the caller surfaces the dropped write
+    /// instead of silently believing the dir went terminal.
+    ///
+    /// Red-before-green: the prior body `return true` for any `Some(finalize)`
+    /// ignored the write result, so this dropped-write case wrongly returned true.
+    #[test]
+    fn quarantine_incomplete_mux_returns_false_when_write_dropped() {
+        use crate::ripper::staging::{self, StagingState};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("Unwritable");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Force the terminal state.json write to fail (a dir can't be renamed over).
+        std::fs::create_dir_all(dir.join(staging::STATE_FILE)).unwrap();
+
+        let landed = super::quarantine_incomplete_mux(&dir, Some("mux produced no frames (E6008)"));
+        assert!(
+            !landed,
+            "a finalize failure whose terminal write was DROPPED must return false"
+        );
+        // And the dir did NOT reach the terminal Failed state on disk.
+        assert_ne!(
+            staging::read_state(&dir).map(|s| s.state),
+            Some(StagingState::Failed),
+            "a dropped write must not leave a persisted terminal state"
+        );
+    }
+
+    /// FIX-2/FIX-6 production wiring, END TO END through the handoff: a terminal
+    /// finalize failure recorded on `RipState` must thread
+    /// `RipState.failure_finalize → MuxHandoffOutcome.failure_finalize → the
+    /// worker's `mux_failure_is_terminal` gate → a persisted `state: Failed`` that
+    /// stops re-dispatch. The existing `mux_failure_is_terminal` tests construct
+    /// `MuxHandoffOutcome` DIRECTLY, so reverting the `apply_failure_fields`
+    /// threading (`outcome.failure_finalize = rs.failure_finalize`) left the suite
+    /// green — this drives that exact line.
+    ///
+    /// Red-before-green: delete the `failure_finalize` line in `apply_failure_fields`
+    /// and `outcome.failure_finalize` reads false → the gate returns false → the
+    /// `mux_failure_is_terminal` assertion and the SkipTerminal assertion both fail.
+    #[test]
+    fn finalize_finalize_threads_ripstate_to_worker_gate_and_persists_failed() {
+        use crate::muxer::{MuxFailureClass, mux_failure_is_terminal};
+        use crate::muxer::{MuxVerdict, mux_dispatch_verdict};
+        use crate::ripper::staging::{self, DiscState, StagingState, snapshot_staging_disc};
+
+        // 1. A terminal finalize failure as `resume_remux` records it on the `_mux`
+        //    RipState: a real error string + the structural-finalize bit.
+        let rs = crate::ripper::RipState {
+            last_error: "mux finalize failed: E6008 no muxable frames".to_string(),
+            failure_finalize: true,
+            failure_deferred: false,
+            ..crate::ripper::RipState::default()
+        };
+
+        // 2. The handoff builder threads it into the outcome the worker consumes.
+        let mut outcome = super::MuxHandoffOutcome::default();
+        super::apply_failure_fields(&mut outcome, &rs);
+        assert!(
+            outcome.failure_finalize,
+            "the finalize bit must thread RipState → MuxHandoffOutcome (the reverted FIX)"
+        );
+        assert_eq!(
+            outcome.failure_reason.as_deref(),
+            Some("mux finalize failed: E6008 no muxable frames")
+        );
+
+        // 3. The worker's terminal gate, fed from that outcome, says TERMINAL.
+        assert!(
+            mux_failure_is_terminal(MuxFailureClass {
+                aborted_loss: false,
+                has_worker_reason: outcome.failure_reason.is_some(),
+                is_finalize: outcome.failure_finalize,
+            }),
+            "a threaded finalize failure must drive the worker gate to quarantine"
+        );
+
+        // 4. End to end: the transition the gate authorises persists Failed and the
+        //    next dispatch verdict is SkipTerminal — the dir never re-muxes.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("Finalize_E2E");
+        std::fs::create_dir_all(&dir).unwrap();
+        staging::write_state(&dir, &DiscState::new(StagingState::Ripped));
+        assert_eq!(
+            mux_dispatch_verdict(snapshot_staging_disc(&dir).as_ref()),
+            MuxVerdict::Dispatch,
+            "a fresh Ripped hand-off dispatches before the quarantine"
+        );
+        assert!(crate::muxer::persist_terminal_mux_quarantine(
+            &dir.to_string_lossy(),
+            &dir,
+            outcome.failure_reason.as_deref().unwrap(),
+        ));
+        assert_eq!(
+            snapshot_staging_disc(&dir)
+                .and_then(|_| staging::read_state(&dir))
+                .map(|s| s.state),
+            Some(StagingState::Failed),
+            "the threaded terminal finalize must persist state → Failed"
+        );
+        assert_eq!(
+            mux_dispatch_verdict(snapshot_staging_disc(&dir).as_ref()),
+            MuxVerdict::SkipTerminal,
+            "after the quarantine the dir must never re-dispatch"
+        );
+    }
+
+    /// FIX-1: the §3 sweep-loss abort path must quarantine to a RESUMABLE
+    /// `.aborted-loss`, exactly as the §4 mux-time loss gate does. Without a marker
+    /// the `_mux` worker re-Dispatched the same over-threshold dir every tick
+    /// forever (the `.ripped` hand-off survived). This pins, at source level, that
+    /// the sweep-loss abort region now calls `mark_aborted_on_loss`; a companion
+    /// behavioural assertion proves the marker flips the worker verdict to
+    /// SkipAbortedLoss so the re-dispatch loop stops.
+    ///
+    /// Red-before-green: the pre-fix region wrote only `reset_status_after_ripping`
+    /// and `return`, so the `mark_aborted_on_loss` assertion fails.
+    #[test]
+    fn sweep_loss_abort_quarantines_to_resumable_aborted_loss() {
+        // (a) Source-level: the §3 sweep-loss abort block quarantines via the marker.
+        let src = crate::util::source_lf(include_str!("resume.rs"));
+        let start = src
+            .find("\"disc loss\" for raw ISO (whole-disc scope)")
+            .expect("resume.rs should have the §3 sweep-loss scope note");
+        let end = src[start..]
+            .find("4. Build MuxInputs + run mux")
+            .map(|i| start + i)
+            .expect("resume.rs should have the mux-build step after the §3 gate");
+        let region = &src[start..end];
+        // Assert on the CALL form (`staging::mark_aborted_on_loss(`), not the bare
+        // identifier — a prose mention of the symbol in a nearby comment must not
+        // satisfy this (the vacuous-substring trap).
+        assert!(
+            region.contains("staging::mark_aborted_on_loss("),
+            "the §3 sweep-loss abort must quarantine to a resumable .aborted-loss (mirror §4), \
+             else the worker re-dispatches the doomed dir forever"
+        );
+
+        // (b) Behavioural: the marker the §3 path now writes flips the worker's
+        //     dispatch verdict to SkipAbortedLoss, stopping the re-dispatch loop.
+        use crate::muxer::{MuxVerdict, mux_dispatch_verdict};
+        use crate::ripper::staging::{self, DiscState, StagingState, snapshot_staging_disc};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("Sweep_Loss");
+        std::fs::create_dir_all(&dir).unwrap();
+        staging::write_state(&dir, &DiscState::new(StagingState::Ripped));
+        assert_eq!(
+            mux_dispatch_verdict(snapshot_staging_disc(&dir).as_ref()),
+            MuxVerdict::Dispatch,
+            "a fresh Ripped hand-off dispatches before the sweep-loss quarantine"
+        );
+        let _ = staging::mark_aborted_on_loss(
+            &dir,
+            "aborted: disc loss 12.50s exceeds threshold 0s (sweep)",
+        );
+        assert_eq!(
+            mux_dispatch_verdict(snapshot_staging_disc(&dir).as_ref()),
+            MuxVerdict::SkipAbortedLoss,
+            "after the sweep-loss quarantine the dir must not re-dispatch (SkipAbortedLoss)"
+        );
+    }
+
     /// v1.2.0 invariant (restored 2026-07-01, "a loss is a loss"): a COMPLETED
     /// mux carrying mux-time (demux/decrypt) loss is gated on `abort_on_lost_secs`
     /// just like read-time loss — missing data is missing data. Over threshold →
@@ -3795,6 +4031,47 @@ mod resume_lock_and_fsync_tests {
             staging::restart_count(&d),
             0,
             ".restart_count cleared after quarantine"
+        );
+    }
+
+    /// FIX (fsync cap preservation): at `RESTART_LIMIT`, if the terminal `.failed`
+    /// write does NOT land (unwritable staging), `handle_resume_fsync_failure` must
+    /// NOT tear down the restart cap and must NOT report a terminal quarantine.
+    /// Clearing the counter on a dropped write resets the loop bound to zero, so the
+    /// dir re-muxes from a fresh cap forever — defeating the round-1 bound.
+    ///
+    /// Force the write to fail by making `state.json` a directory (the tmp→final
+    /// rename can't clobber a dir); the legacy `.restart_count` file still bumps.
+    ///
+    /// Red-before-green: the unfixed code discards the return, calls
+    /// `clear_restart_count` (→ 0) and `return true`, so BOTH the `!quarantined`
+    /// and the `restart_count == RESTART_LIMIT` assertions fail.
+    #[test]
+    fn fsync_failure_at_limit_dropped_write_preserves_cap() {
+        let d = tmpdir();
+        std::fs::write(d.join(".ripped"), b"{}").unwrap();
+        // Make the terminal state.json write fail: a directory can't be renamed over.
+        std::fs::create_dir(d.join(staging::STATE_FILE)).unwrap();
+        // Legacy counter one below the limit; the next bump trips it (state.json is
+        // a dir, so `read_state` is None and the legacy `.restart_count` path runs).
+        staging::write_marker_durable(
+            &d.join(".restart_count"),
+            format!("{}\n", staging::RESTART_LIMIT - 1).as_bytes(),
+        )
+        .unwrap();
+        let quarantined = handle_resume_fsync_failure("_mux", &d, "mux output");
+        assert!(
+            !quarantined,
+            "a dropped terminal write must NOT report a successful quarantine"
+        );
+        assert_eq!(
+            staging::restart_count(&d),
+            staging::RESTART_LIMIT,
+            "the restart cap must be PRESERVED (not cleared) when the terminal write is dropped"
+        );
+        assert!(
+            d.join(".ripped").exists(),
+            ".ripped must stay so a dir that never went terminal isn't stranded"
         );
     }
 }
