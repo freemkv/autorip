@@ -6113,6 +6113,320 @@ mod web_tests {
 
             crate::ripper::STATE.lock().unwrap().remove(device);
         }
+
+        // ── handle_settings_post: pre-write-guard validation rejections ──
+
+        #[test]
+        fn settings_post_rejects_invalid_output_format_enum() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let before = cfg.read().unwrap().output_format.clone();
+            let (code, body) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"output_format": "garbage"}"#),
+                &[],
+            );
+            assert_eq!(code, 400, "an out-of-vocabulary enum must be rejected");
+            assert!(body.contains("invalid value for output_format"));
+            assert_eq!(
+                cfg.read().unwrap().output_format,
+                before,
+                "a rejected enum must not mutate the live config"
+            );
+        }
+
+        #[test]
+        fn settings_post_rejects_out_of_range_port() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let (code, body) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"port": 70000}"#),
+                &[],
+            );
+            assert_eq!(code, 400, "a port outside 1..=65535 must be rejected");
+            assert!(body.contains("port must be 1..=65535"));
+        }
+
+        #[test]
+        fn settings_post_rejects_relative_output_dir() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let (code, body) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"output_dir": "relative/path"}"#),
+                &[],
+            );
+            assert_eq!(code, 400, "a non-absolute mount root must be rejected");
+            assert!(body.contains("output_dir must be an absolute path"));
+        }
+
+        #[test]
+        fn settings_post_rejects_parent_dir_in_movie_dir() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let (code, body) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"movie_dir": "../escape"}"#),
+                &[],
+            );
+            assert_eq!(code, 400, "a climbing sub-directory name must be rejected");
+            assert!(body.contains("movie_dir must not contain '..'"));
+        }
+
+        #[test]
+        fn settings_post_rejects_keydb_path_without_cfg_extension() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let (code, body) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"keydb_path": "/data/keys.txt"}"#),
+                &[],
+            );
+            assert_eq!(code, 400, "a non-.cfg keydb path must be rejected");
+            assert!(body.contains("keydb_path must be an absolute .cfg path"));
+        }
+
+        // ── handle_settings_post: the write-guard field application ──────
+
+        #[test]
+        fn settings_post_applies_scalar_and_clamped_fields() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let abs_out = tmp.path().join("out");
+            let patch = serde_json::json!({
+                "auto_eject": true,
+                "main_feature": true,
+                "capture_without_keys": true,
+                "keep_iso": true,
+                // Over the ceilings — each must clamp, not persist raw.
+                "max_retries": 99,
+                "min_length_secs": 40 * 24 * 3600u64,
+                "decrypt_threads": 9999,
+                "log_retention_days": 99999u64,
+                "movie_dir": "films",
+                "output_dir": abs_out.to_string_lossy(),
+                "port": 9999,
+                "output_format": "iso",
+            })
+            .to_string();
+            let (code, body) = roundtrip(&cfg, "POST", "/api/settings", Some(&patch), &[]);
+            assert_eq!(code, 200, "a valid multi-field patch must succeed: {body}");
+            let c = cfg.read().unwrap();
+            assert!(c.auto_eject && c.main_feature && c.capture_without_keys && c.keep_iso);
+            assert_eq!(c.max_retries, 10, "max_retries clamps to 10");
+            assert_eq!(
+                c.min_length_secs,
+                30 * 24 * 3600,
+                "min_length_secs clamps to MAX_DURATION_SECS (30 days)"
+            );
+            assert_eq!(c.decrypt_threads, 256, "decrypt_threads clamps to 256");
+            assert_eq!(
+                c.log_retention_days, 3650,
+                "log_retention_days clamps to 10 years"
+            );
+            assert_eq!(c.movie_dir, "films");
+            assert_eq!(c.output_dir, abs_out.to_string_lossy());
+            assert_eq!(c.port, 9999);
+            assert_eq!(c.output_format, "iso");
+        }
+
+        #[test]
+        fn settings_post_tmdb_api_key_sentinel_is_ignored_but_real_value_applied() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            cfg.write().unwrap().tmdb_api_key = "original-secret".to_string();
+
+            // The masked sentinel round-trip must NOT clobber the stored key.
+            let masked = format!(r#"{{"tmdb_api_key": "{SECRET_SENTINEL}"}}"#);
+            let (code, _) = roundtrip(&cfg, "POST", "/api/settings", Some(&masked), &[]);
+            assert_eq!(code, 200);
+            assert_eq!(
+                cfg.read().unwrap().tmdb_api_key,
+                "original-secret",
+                "the redaction sentinel must be ignored, not stored"
+            );
+
+            // A genuine new value replaces it.
+            let (code, _) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"tmdb_api_key": "brand-new-key"}"#),
+                &[],
+            );
+            assert_eq!(code, 200);
+            assert_eq!(cfg.read().unwrap().tmdb_api_key, "brand-new-key");
+        }
+
+        #[test]
+        fn settings_post_rip_mode_single_zeroes_retries_multi_bumps_to_one() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+
+            let (code, _) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"rip_mode": "single", "max_retries": 5}"#),
+                &[],
+            );
+            assert_eq!(code, 200);
+            assert_eq!(
+                cfg.read().unwrap().max_retries,
+                0,
+                "single mode forces zero retries"
+            );
+
+            let (code, _) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"rip_mode": "multi", "max_retries": 0}"#),
+                &[],
+            );
+            assert_eq!(code, 200);
+            assert_eq!(
+                cfg.read().unwrap().max_retries,
+                1,
+                "multi mode with zero retries clamps up to 1"
+            );
+        }
+
+        // ── handle_system_info (GET /api/system) ────────────────────────
+
+        #[test]
+        fn system_info_serves_queues_and_reflects_a_done_staging_dir() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            // Point staging at a real dir holding one settled (`.done`) rip so
+            // build_queue_views emits a Move-queue row.
+            let staging = tmp.path().join("staging");
+            let done_dir = staging.join("Some_Movie_2024");
+            std::fs::create_dir_all(&done_dir).unwrap();
+            std::fs::write(done_dir.join(".done"), b"").unwrap();
+            cfg.write().unwrap().staging_dir = staging.to_string_lossy().to_string();
+
+            let (code, body) = roundtrip(&cfg, "GET", "/api/system", None, &[]);
+            assert_eq!(code, 200, "GET /api/system must be served: {body}");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("system info is JSON");
+            assert!(v.get("move_queue").is_some(), "must carry a move_queue");
+            assert!(v.get("mux_queue").is_some(), "must carry a mux_queue");
+            assert!(
+                v.get("debug_enabled").is_some(),
+                "must report the debug toggle state"
+            );
+            let mq = v["move_queue"].as_array().expect("move_queue is an array");
+            assert!(
+                mq.iter()
+                    .any(|e| e.as_str().unwrap_or("").contains("Some Movie 2024")),
+                "the settled .done dir must show in the move queue, got: {mq:?}"
+            );
+        }
+
+        // ── handle_device_log (GET /api/logs/<device>) ──────────────────
+
+        #[test]
+        fn device_log_route_serves_logged_lines_for_a_valid_device() {
+            // A unique device name so parallel tests can't share the ring.
+            let device = "zzweblogdev01";
+            crate::log::device_log(device, "unit-test-device-log-marker");
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let (code, body) = roundtrip(&cfg, "GET", &format!("/api/logs/{device}"), None, &[]);
+            assert_eq!(code, 200, "a valid device log must be served");
+            assert!(
+                body.contains("unit-test-device-log-marker"),
+                "the served log must carry the logged line, got: {body}"
+            );
+        }
+
+        // ── move/mux error clear endpoints ──────────────────────────────
+
+        #[test]
+        fn error_clear_endpoints_dispatch() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let (c1, b1) = roundtrip(&cfg, "POST", "/api/move-errors/clear-all", None, &[]);
+            assert_eq!(c1, 200);
+            assert!(b1.contains("\"ok\":true"));
+            let (c2, b2) = roundtrip(&cfg, "POST", "/api/mux-errors/clear-all", None, &[]);
+            assert_eq!(c2, 200);
+            assert!(b2.contains("\"ok\":true"));
+            // clear-one with no path= param is a 400.
+            let (c3, b3) = roundtrip(&cfg, "POST", "/api/move-errors/clear?x=1", None, &[]);
+            assert_eq!(c3, 400);
+            assert!(b3.contains("missing path"));
+        }
+
+        // ── SSE first frame (GET /events) ───────────────────────────────
+
+        /// The `/events` stream loops forever, so `roundtrip` (which reads to
+        /// EOF) would hang. Run the production handler on its own thread, read
+        /// exactly the first `data: …\n\n` frame on the client, then drop the
+        /// socket — the handler's next write fails and it returns.
+        #[test]
+        fn sse_emits_a_json_state_first_frame() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            let server = Server::http("127.0.0.1:0").expect("bind loopback server");
+            let addr = server.server_addr().to_ip().expect("ip addr");
+
+            let handler = std::thread::spawn(move || {
+                let request = server.recv().expect("recv request");
+                handle_sse(request, &cfg);
+            });
+
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .write_all(b"GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .expect("write request");
+            stream.flush().ok();
+
+            // Read until we have headers + the first complete SSE frame.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk).expect("read first frame");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let s = String::from_utf8_lossy(&buf);
+                if s.contains("\r\n\r\ndata: ") && s.trim_end().ends_with('}') {
+                    break;
+                }
+            }
+            drop(stream);
+            handler.join().expect("handler thread");
+
+            let raw = String::from_utf8_lossy(&buf);
+            assert!(
+                raw.contains("text/event-stream"),
+                "the response must declare the SSE content type, got: {raw}"
+            );
+            let frame = raw
+                .split("\r\n\r\n")
+                .nth(1)
+                .expect("an SSE body frame must follow the headers");
+            let json = frame
+                .trim_start()
+                .strip_prefix("data: ")
+                .expect("the first frame must be a `data: ` event")
+                .trim();
+            let _: serde_json::Value = serde_json::from_str(json)
+                .expect("the first SSE frame must carry valid state JSON");
+        }
     }
 }
 
@@ -6996,6 +7310,56 @@ mod parse_query_tests {
         assert_eq!(
             map.get("q").map(String::as_str),
             Some("a".repeat(256).as_str())
+        );
+    }
+
+    #[test]
+    fn tail_file_returns_whole_small_file_untruncated() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("log.txt");
+        std::fs::write(&path, b"line1\nline2\nline3\n").unwrap();
+        let out = tail_file(path.to_str().unwrap(), 4096).expect("tail must succeed");
+        assert_eq!(
+            out, "line1\nline2\nline3\n",
+            "a file smaller than the cap is returned whole, no head drop"
+        );
+    }
+
+    #[test]
+    fn tail_file_seeks_from_end_and_drops_partial_head_line() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("log.txt");
+        // 10 lines of "NNNNNNNN\n" (9 bytes each = 90 bytes). Cap the read at 25
+        // bytes so it seeks into the middle of a line — the truncated head line
+        // must be dropped so callers never parse a half record.
+        let mut content = String::new();
+        for i in 0..10 {
+            content.push_str(&format!("{:08}\n", i));
+        }
+        std::fs::write(&path, content.as_bytes()).unwrap();
+        let out = tail_file(path.to_str().unwrap(), 25).expect("tail must succeed");
+        assert!(
+            out.len() <= 25,
+            "the read must be bounded by max_bytes, got {} bytes",
+            out.len()
+        );
+        assert!(
+            !out.starts_with('\n') && out.ends_with("00000009\n"),
+            "the tail must end at the last full line and start after a newline, got: {out:?}"
+        );
+        // Every returned line must be a complete 8-digit record (no partial head).
+        for line in out.lines() {
+            assert_eq!(line.len(), 8, "no partial line may survive, got: {line:?}");
+        }
+    }
+
+    #[test]
+    fn tail_file_missing_file_is_an_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("nope.txt");
+        assert!(
+            tail_file(path.to_str().unwrap(), 4096).is_err(),
+            "a missing file must surface an io error, not empty success"
         );
     }
 }
