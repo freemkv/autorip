@@ -245,6 +245,7 @@ jobs:
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: autorip/lcov.info
           slug: freemkv/autorip
           fail_ci_if_error: false
