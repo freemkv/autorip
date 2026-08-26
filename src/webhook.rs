@@ -277,6 +277,105 @@ fn deliver(url: &str, body: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// `send_rich` end-to-end through `fire`'s real spawn path to a loopback
+    /// stub — the whole rip-complete webhook, the one delivery this module
+    /// exists for, which no prior test drove (`fire` needs a `Config` and
+    /// spawns a thread, so it was only exercised piecemeal). Asserts the
+    /// spawned delivery actually reaches the wire and that `send_rich`'s
+    /// rounding + field mapping produce the JSON receivers see.
+    #[test]
+    fn send_rich_delivers_the_rip_complete_payload_end_to_end() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener =
+            TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
+        let pinned = listener.local_addr().expect("stub listener address");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _server = std::thread::spawn(move || {
+            let (mut sock, _peer) = listener.accept().expect("accept failed");
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                match sock.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => buf.push(byte[0]),
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).to_string();
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("content-length: ")
+                        .or_else(|| l.strip_prefix("Content-Length: "))
+                })
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            let _ = sock.read_exact(&mut body);
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let _ = sock.flush();
+            let _ = tx.send(String::from_utf8_lossy(&body).to_string());
+        });
+
+        let cfg = Config {
+            webhook_urls: vec![both(&format!("http://{pinned}/hook"))],
+            ..Default::default()
+        };
+        let ev = RipEvent {
+            event: "rip_complete",
+            title: "Some Movie",
+            year: 2024,
+            format: "BluRay",
+            poster_url: "",
+            duration: "2h 14m",
+            codecs: "HEVC + TrueHD",
+            size_gb: 33.333,      // must round to 0.1 → 33.3
+            speed_mbs: 12.345,    // must round to 0.1 → 12.3
+            elapsed_secs: 1800.6, // must round to whole → 1801
+            output_path: "/out/Some Movie.mkv",
+            errors: 0,
+            lost_video_secs: 0.0,
+        };
+        super::send_rich(&cfg, WebhookEvent::Rip, &ev);
+
+        // Take the delivery with a DEADLINE: `fire` swallows transport errors,
+        // so a wiring regression must fail the test, never hang the suite in
+        // the stub's `accept`.
+        let body = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("send_rich never delivered to the stub");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON on the wire");
+        assert_eq!(v["event"], "rip_complete");
+        assert_eq!(v["title"], "Some Movie");
+        assert_eq!(v["size_gb"], 33.3, "size_gb must be rounded to 0.1 GB");
+        assert_eq!(
+            v["speed_mbs"], 12.3,
+            "speed_mbs must be rounded to 0.1 MB/s"
+        );
+        assert_eq!(
+            v["elapsed_secs"], 1801,
+            "elapsed_secs must round to whole seconds"
+        );
+    }
+
+    /// `deliver`'s transport-error arm: a connection refused at a dead port
+    /// must return `false` (not a delivery) and never panic — the arm that
+    /// logs the URL-free summary. Closing a freshly-bound listener yields a
+    /// port nothing is listening on.
+    #[test]
+    fn deliver_reports_a_refused_connection_as_undelivered() {
+        use std::net::TcpListener;
+        let addr = {
+            let l = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+            l.local_addr().expect("addr")
+            // `l` drops here — the port is now closed, so a connect is refused.
+        };
+        let delivered = super::deliver(&format!("http://{addr}/hook"), r#"{"event":"x"}"#);
+        assert!(!delivered, "a refused connection is not a delivery");
+    }
+
     /// A redirect is NOT a delivery.
     ///
     /// `webhook_agent` sets `max_redirects(0)`, and at zero ureq's
