@@ -467,6 +467,37 @@ fn apply_failure_fields(outcome: &mut MuxHandoffOutcome, rs: &super::RipState) {
     }
     outcome.failure_reason = Some(rs.last_error.clone());
     outcome.failure_retryable = rs.failure_deferred;
+    // Carry the structural-finalize distinction the worker's quarantine gates
+    // on. `failure_deferred` and `failure_finalize` are mutually exclusive
+    // (a deferral is not a finalize failure); a resumable read error sets
+    // neither, so the worker leaves it re-muxable.
+    outcome.failure_finalize = rs.failure_finalize;
+}
+
+/// Quarantine an incomplete-mux staging dir IFF the mux died on a structural
+/// FINALIZE failure (the MKV could not be finalized — e.g. E6008 no muxable
+/// frames / unseekable output). A finalize failure is terminal: re-muxing the
+/// same ISO reproduces it, so without a terminal transition the mux worker
+/// re-Dispatches the dir every ~10s tick forever (a full UHD re-mux each time).
+/// Transition `state → Failed` so the next `mux_dispatch_verdict` is
+/// `SkipTerminal`.
+///
+/// A mid-mux READ error (`finalize_error == None`) is left resumable — the MKV
+/// is merely truncated and a retry (fresh keys / a settled drive) can complete
+/// it. Returns whether the terminal transition was performed, so the caller can
+/// record the matching `failure_finalize` bit on the device state.
+///
+/// Extracted from the mux-incomplete early-return so the terminal-vs-resumable
+/// decision is reachable from a regression test without an ISO + mapfile +
+/// decrypt + mux pipeline — the prior inline block had ZERO behavioural
+/// coverage (a source-substring test was satisfied by an earlier line, so
+/// deleting the quarantine kept it green).
+fn quarantine_incomplete_mux(staging_dir: &Path, finalize_error: Option<&str>) -> bool {
+    if let Some(finalize) = finalize_error {
+        staging::write_failed_marker(staging_dir, finalize);
+        return true;
+    }
+    false
 }
 
 /// [`reset_status_after_ripping`] for the exits that are DEFERRALS rather
@@ -1544,8 +1575,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // this dir on every container restart (the resume path previously wrote
         // no terminal state, so a structurally-impossible mux resumed forever).
         // A read_error leaves staging resumable exactly as before.
+        let quarantined =
+            quarantine_incomplete_mux(&staging_dir, mux_outcome.finalize_error.as_deref());
         if let Some(finalize) = mux_outcome.finalize_error.as_deref() {
-            staging::write_failed_marker(&staging_dir, finalize);
             crate::log::device_log(
                 device,
                 &format!(
@@ -1564,6 +1596,14 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             &duration,
             ui_failure_reason,
         );
+        // Record the structural-finalize distinction on the (just-reset) `_mux`
+        // state AFTER the reset wipes it, mirroring `defer_status_after_ripping`
+        // setting `failure_deferred`. `remux_from_ripped_marker` reads this into
+        // `MuxHandoffOutcome::failure_finalize` so the worker quarantines ONLY a
+        // finalize failure, never a resumable read error.
+        if quarantined {
+            super::update_state_with(device, |s| s.failure_finalize = true);
+        }
         return;
     }
 
@@ -2081,6 +2121,17 @@ pub(crate) struct MuxHandoffOutcome {
     /// staged and will mux automatically once keys land) rather than a hard
     /// finalize/write failure. Drives which hint the error card shows.
     pub failure_retryable: bool,
+    /// True when the non-success was a STRUCTURAL FINALIZE failure (the MKV
+    /// could not be finalized — E6008 no muxable frames / unseekable output),
+    /// as distinct from a resumable mid-mux read error (truncated MKV) or a
+    /// keyless deferral. This is the ONLY class the mux worker may quarantine
+    /// (`state → Failed`): a read error and a deferral both leave staging
+    /// resumable, so gating the worker's quarantine on `!failure_retryable`
+    /// (the prior code) false-quarantined a recoverable read error — a lost
+    /// rip that would have succeeded on retry. Read off the `_mux` device's
+    /// `failure_finalize` bit, which `resume_remux` sets only on the finalize
+    /// exit.
+    pub failure_finalize: bool,
 }
 
 /// Whether `resume_remux` finished this staging dir cleanly: it wrote
@@ -3192,6 +3243,76 @@ mod post_mux_loss_reporting_tests {
             ),
             "resume mux-incomplete branch must not hardcode idle/None, hiding the \
              read-error cause and aliasing a failure to a clean stop"
+        );
+    }
+
+    /// FIX 1 — the BEHAVIOURAL regression the source-substring test above cannot
+    /// give: the auto-resume terminal-finalize quarantine had ZERO real coverage.
+    /// `resume_incomplete_mux_surfaces_read_error_not_silent_idle` only asserts a
+    /// substring ("mux_outcome.finalize_error.as_deref()") that is ALSO present
+    /// on the earlier `incomplete_mux_status(...)` line, so deleting the
+    /// quarantine block left it green (vacuous). This drives the production
+    /// helper the block now calls (`quarantine_incomplete_mux`) and proves the
+    /// two arms with real staging state + the worker's own dispatch verdict:
+    ///
+    /// * a finalize_error → `state → Failed`, and the next `mux_dispatch_verdict`
+    ///   is `SkipTerminal` (never re-dispatched);
+    /// * a read_error (finalize_error == None) → the dir is LEFT resumable
+    ///   (`state` stays `Ripped`), and the verdict stays `Dispatch`.
+    ///
+    /// Deleting the `write_failed_marker` call inside `quarantine_incomplete_mux`
+    /// flips the finalize arm to `Dispatch` and fails this test — the coverage
+    /// the vacuous test lacked.
+    #[test]
+    fn incomplete_mux_finalize_quarantines_read_error_stays_resumable() {
+        use crate::muxer::{MuxVerdict, mux_dispatch_verdict};
+        use crate::ripper::staging::{self, DiscState, StagingState, snapshot_staging_disc};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Arm 1: a structural finalize failure quarantines to terminal.
+        let finalize_dir = tmp.path().join("Finalize_Fail");
+        std::fs::create_dir_all(&finalize_dir).unwrap();
+        staging::write_state(&finalize_dir, &DiscState::new(StagingState::Ripped));
+        assert_eq!(
+            mux_dispatch_verdict(snapshot_staging_disc(&finalize_dir).as_ref()),
+            MuxVerdict::Dispatch,
+            "a fresh Ripped hand-off must dispatch before the quarantine"
+        );
+        let quarantined =
+            super::quarantine_incomplete_mux(&finalize_dir, Some("mux produced no frames (E6008)"));
+        assert!(
+            quarantined,
+            "a finalize_error must report a terminal quarantine"
+        );
+        assert_eq!(
+            snapshot_staging_disc(&finalize_dir)
+                .and_then(|_| staging::read_state(&finalize_dir))
+                .map(|s| s.state),
+            Some(StagingState::Failed),
+            "a finalize_error must transition state → Failed"
+        );
+        assert_eq!(
+            mux_dispatch_verdict(snapshot_staging_disc(&finalize_dir).as_ref()),
+            MuxVerdict::SkipTerminal,
+            "after the finalize quarantine the dir must never re-dispatch"
+        );
+
+        // Arm 2: a mid-mux read error (finalize_error == None) stays resumable.
+        let read_dir = tmp.path().join("Read_Error");
+        std::fs::create_dir_all(&read_dir).unwrap();
+        staging::write_state(&read_dir, &DiscState::new(StagingState::Ripped));
+        let quarantined = super::quarantine_incomplete_mux(&read_dir, None);
+        assert!(!quarantined, "a read_error must NOT quarantine");
+        assert_eq!(
+            staging::read_state(&read_dir).map(|s| s.state),
+            Some(StagingState::Ripped),
+            "a read_error must leave the dir in the resumable Ripped state"
+        );
+        assert_eq!(
+            mux_dispatch_verdict(snapshot_staging_disc(&read_dir).as_ref()),
+            MuxVerdict::Dispatch,
+            "a read_error dir must stay re-muxable (Dispatch), not be quarantined"
         );
     }
 
