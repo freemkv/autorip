@@ -1776,14 +1776,14 @@ mod tests {
     /// End-to-end mechanism the fix relies on: a Ripped dir dispatches; after the
     /// worker's failure branch writes the terminal state (as it now does on a
     /// non-retryable finalize error), the verdict flips to SkipTerminal so the
-    /// dir is never re-dispatched — the Spider-Man 3 / E6008 loop, fixed.
+    /// dir is never re-dispatched — the Decoy_Feature_3 / E6008 loop, fixed.
     #[test]
     fn terminal_finalize_quarantine_stops_redispatch() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("Spider-Man_3");
+        let dir = tmp.path().join("Decoy_Feature_3");
         std::fs::create_dir_all(&dir).unwrap();
         write_marker(&dir, &sample_marker()).unwrap();
-        std::fs::write(dir.join("Spider-Man_3.iso"), b"x").unwrap();
+        std::fs::write(dir.join("Decoy_Feature_3.iso"), b"x").unwrap();
 
         let s1 = crate::ripper::staging::snapshot_staging_disc(&dir);
         assert_eq!(
