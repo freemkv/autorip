@@ -2,6 +2,13 @@ coverage:
   status:
     project:
       default:
+        # Autorip is a release candidate mid-QA. The large live-drive
+        # orchestration span (rip_disc) is excluded below because it hardcodes
+        # a physical libfreemkv::Drive and cannot run in CI; the rest of the
+        # crate is unit-tested. 85% is a realistic honest floor for what
+        # remains after those exclusions.
+        target: 85%
+        threshold: 1%
         informational: true
     patch:
       default:
@@ -9,7 +16,19 @@ coverage:
 
 comment: false
 
+# Report paths are prefixed with the crate directory (e.g. `autorip/src/...`),
+# so bare globs like `tests` or `src/main.rs` never match. Every ignore MUST be
+# anchored with `**/` so it matches regardless of the leading path segment.
 ignore:
-  - "tests"
   - "**/tests"
-  - "target"
+  - "**/tests/**"
+  - "**/target"
+  # Privileged bootstrap glue: root/mount/chown/setup that only runs as PID-1
+  # inside the container and can't be exercised from unit tests.
+  - "**/src/main.rs"
+  # tracing/subscriber init — process-global side effects, no testable logic.
+  - "**/src/observe.rs"
+  # Live-drive orchestration: hardcodes a physical libfreemkv::Drive session,
+  # unreachable in CI. Lifted here verbatim from mod.rs precisely so it can be
+  # excluded without hiding the tested helpers that stayed in mod.rs.
+  - "**/src/ripper/rip.rs"
