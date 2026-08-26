@@ -1596,4 +1596,117 @@ mod tests {
         let cfg = Config::default();
         assert!(build_iso_key_fetch(&cfg, tmp.path()).is_none());
     }
+
+    /// `render_resolution_trace` is the app-layer's ENTIRE English mapping of
+    /// the library's typed unlock/key trace (the library itself emits no
+    /// prose). It is shown to the operator on every rip, success or failure,
+    /// so a dropped or mis-mapped arm ships a blank or wrong diagnostic. Drive
+    /// every `UnlockOutcome`, every `KeyNode`, and every `KeyOutcome` through it
+    /// and pin the rendered lines — including the `MKBvN` suffix formatting.
+    #[test]
+    fn render_resolution_trace_maps_every_enum_arm() {
+        use libfreemkv::aacs::trace::{
+            KeyNode, KeyOutcome, KeyStep, ResolutionTrace, UnlockOutcome, UnlockStep,
+        };
+
+        let unlock = vec![
+            UnlockStep {
+                who: "u_ok".into(),
+                outcome: UnlockOutcome::Unlocked,
+            },
+            UnlockStep {
+                who: "u_fw".into(),
+                outcome: UnlockOutcome::FirmwareNotUnlockable,
+            },
+            UnlockStep {
+                who: "u_cert".into(),
+                outcome: UnlockOutcome::NoUsableHostCert { mkb: Some(7) },
+            },
+            UnlockStep {
+                who: "u_rev".into(),
+                outcome: UnlockOutcome::CertRevoked { mkb: None },
+            },
+            UnlockStep {
+                who: "u_hs".into(),
+                outcome: UnlockOutcome::HandshakeRejected,
+            },
+            UnlockStep {
+                who: "u_vid".into(),
+                outcome: UnlockOutcome::VidUnavailable,
+            },
+        ];
+        // One key step walking EVERY node, plus one per terminal outcome.
+        let keys = vec![
+            KeyStep {
+                who: "keydb".into(),
+                path: vec![
+                    KeyNode::MatchedDisc,
+                    KeyNode::NoEntry,
+                    KeyNode::FoundUnitKeys,
+                    KeyNode::FoundVuk,
+                    KeyNode::FoundMediaKey,
+                    KeyNode::NeedVid,
+                    KeyNode::VidFromUnlock,
+                    KeyNode::VidFromKeydb,
+                    KeyNode::NoVid,
+                    KeyNode::DerivedVuk,
+                    KeyNode::DerivedUnitKeys,
+                ],
+                outcome: KeyOutcome::Resolved,
+            },
+            KeyStep {
+                who: "online".into(),
+                path: vec![KeyNode::NeedVid],
+                outcome: KeyOutcome::MissingVid,
+            },
+            KeyStep {
+                who: "empty".into(),
+                path: vec![],
+                outcome: KeyOutcome::NoKey,
+            },
+        ];
+        let trace = ResolutionTrace { unlock, keys };
+
+        let lines = render_resolution_trace(&trace);
+        assert_eq!(
+            lines,
+            vec![
+                "unlock: u_ok > UNLOCKED",
+                "unlock: u_fw > firmware not unlockable",
+                "unlock: u_cert > no usable host cert (MKBv7)",
+                "unlock: u_rev > host cert revoked",
+                "unlock: u_hs > handshake rejected",
+                "unlock: u_vid > Volume ID unavailable",
+                "key: keydb > matched disc > no entry > found unit keys > found VUK > \
+                 found media key > need VID > VID from drive > VID from keydb > no VID > \
+                 derived VUK > derived unit keys > RESOLVED",
+                "key: online > need VID > MISSING VID",
+                "key: empty > NO KEY",
+            ]
+        );
+    }
+
+    /// `probe_online_reachability`'s two non-network arms: an EMPTY keyserver
+    /// URL cannot be probed, so the no-key is treated as genuine → `Up`; a URL
+    /// that fails validation permanently (a loopback/private address the SSRF
+    /// guard blocks) is a config verdict, not an outage → also `Up`. Neither
+    /// arm touches the network.
+    #[test]
+    fn probe_online_reachability_unprobeable_urls_report_up() {
+        let empty = Config {
+            keyserver_url: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(probe_online_reachability(&empty), ServiceReachability::Up);
+
+        let blocked = Config {
+            keyserver_url: "http://127.0.0.1:9/keys".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            probe_online_reachability(&blocked),
+            ServiceReachability::Up,
+            "an SSRF-blocked loopback URL is a permanent config verdict, not an outage"
+        );
+    }
 }
