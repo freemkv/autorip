@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.12] — UNRELEASED
+
+### Changed
+
+- Picks up the engine's mid-rip drive-reacquire fix.
+- Comment and documentation cleanup.
+
 ## [1.6.11] — 2026-08-26
 
 ### Fixed
