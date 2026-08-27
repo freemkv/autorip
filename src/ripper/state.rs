@@ -35,13 +35,9 @@ pub enum Resumable {
     Sweep,
 }
 
-// TODO(1.2.0): replace the stringly-typed `status` with two explicit enums —
-// DeviceStage (idle/scanning/sweeping/patching/done) for the drive on the
-// Ripper tab, and PipelineStage (queued/muxing/moving/delivered/blocked) for
-// the disc-in-pipeline on the System tab. Deferred this cycle: the web UI JS
-// hard-depends on these exact status strings (web.rs buildSteps:
-// `s.status==='scanning'` etc.), so the enum cutover must land together with
-// the frontend rework rather than half-wired.
+// TODO(1.2.0): replace the stringly-typed `status` with DeviceStage and
+// PipelineStage enums. Deferred: web.rs buildSteps hard-depends on these
+// exact status strings, so the cutover must land with the frontend rework.
 /// State broadcast for web UI.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RipState {
@@ -419,21 +415,14 @@ pub fn device_known(device: &str) -> bool {
     s.contains_key(device)
 }
 
-// `current_disc_name` lived here: the display name alone, used by the
-// `Accept damage` handler to locate a staging dir. Removed with the boxset
-// fix — the display name is NOT enough to identify a disc (every disc of a set
-// shares one TMDB title), and every staging lookup now goes through
-// `ripper::staging_basename_for_device`, which reads the raw volume label too.
-// Reintroducing a name-only accessor invites the same bug back.
+// `current_disc_name` lived here but was removed with the boxset fix: the
+// display name alone can't identify a disc (every disc of a set shares one
+// TMDB title). Staging lookups now go through `staging_basename_for_device`.
 
 pub fn is_busy(device: &str) -> bool {
-    // Recover the poisoned guard instead of treating poison as "not
-    // busy". This is the double-rip guard: if a panic while holding
-    // STATE poisoned the mutex, swallowing the error would make every
-    // later is_busy() return false, opening the guards in ripper/mod.rs
-    // (rip/scan dispatch) and letting a second rip launch concurrently
-    // on the same drive. Matches the poison-recovery convention in
-    // log.rs (`.lock().unwrap_or_else(|e| e.into_inner())`).
+    // Recover a poisoned guard instead of treating poison as "not busy":
+    // this is the double-rip guard, and swallowing the error would let a
+    // second rip launch concurrently on the same drive. See log.rs convention.
     let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
     s.get(device)
         .map(|r| r.status == "scanning" || r.status == "ripping")
@@ -445,35 +434,19 @@ pub fn update_state(device: &str, mut state: RipState) {
     // every push so the UI badge stays in sync with the latest counters.
     state.damage_severity = damage_severity_for(state.errors, state.total_lost_ms);
 
-    // v0.25.7: maintain `started_epoch_secs` automatically so callers
-    // don't have to remember to thread it through every RipState they
-    // build. Most call sites (rip_disc, scan_disc, watchdog) drop a
-    // fresh RipState into update_state with default zeros — without
-    // this preservation step the UI's live elapsed-time counter
-    // would reset on every state push.
-    // Recover from a poisoned STATE mutex rather than silently dropping
-    // the write — a dropped write freezes the dashboard on stale state
-    // for the rest of the process. Matches `is_busy` / log.rs convention.
+    // v0.25.7: auto-maintain started_epoch_secs so a fresh default-zeroed
+    // RipState from rip_disc/scan_disc/watchdog doesn't reset the UI's
+    // elapsed-time counter. Recover a poisoned mutex like `is_busy` does.
     let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    // Preserve the claim generation across pushes: callers build fresh
-    // RipStates with `..Default::default()` (claim_gen = 0), so without this
-    // carry-forward every state push would reset the generation and defeat the
-    // stale-worker ownership check.
+    // Preserve claim_gen: callers push fresh RipStates via ..Default::default(),
+    // so without this the stale-worker ownership check would keep resetting.
     let prev_claim_gen = s.get(device).map(|p| p.claim_gen).unwrap_or(0);
     if state.claim_gen == 0 {
         state.claim_gen = prev_claim_gen;
     }
-    // Preserve the raw volume label across pushes, for the same reason as
-    // `claim_gen`: nearly every caller drops a fresh `RipState` with
-    // `..Default::default()` into `update_state` and sets only `disc_name`.
-    // Without this carry-forward the label — the ONLY thing distinguishing two
-    // discs of a boxset, which share one TMDB title — would be erased by the
-    // first progress push, and every staging lookup after that would collapse
-    // back onto disc 1's directory.
-    //
-    // Guarded on the display name being unchanged (and non-empty): a state
-    // push for a different disc, or for an empty/ejected drive, must NOT
-    // inherit the previous disc's label and claim its staging dir.
+    // Preserve disc_label like claim_gen (it distinguishes boxset discs
+    // sharing one TMDB title), else it's erased on the first progress push.
+    // Guarded on disc_name unchanged/non-empty so a new disc doesn't inherit it.
     if state.disc_label.is_empty()
         && !state.disc_name.is_empty()
         && let Some(prev) = s.get(device)
@@ -521,11 +494,9 @@ pub fn update_state_with<F: FnOnce(&mut RipState)>(device: &str, f: F) {
         ..Default::default()
     });
     f(entry);
-    // Re-derive damage_severity after the mutation, matching `update_state`.
-    // A closure that bumps `errors` / `total_lost_ms` (the patch-pass and
-    // watchdog callbacks do) would otherwise leave a stale severity badge in
-    // the UI, since this path skipped the re-derivation `update_state` does
-    // on every push.
+    // Re-derive damage_severity after the mutation, matching `update_state`:
+    // closures that bump errors/total_lost_ms (patch-pass, watchdog) would
+    // otherwise leave a stale severity badge, since this path skips that.
     entry.damage_severity = damage_severity_for(entry.errors, entry.total_lost_ms);
 }
 
@@ -648,10 +619,8 @@ pub fn try_claim_active_checked(device: &str, known: bool) -> Option<u64> {
     });
     entry.status = "scanning".to_string();
     entry.disc_present = true;
-    // Bump the claim generation so a previously-detached worker (e.g. a stale
-    // verify) can detect that the device has been re-claimed and decline to
-    // reset it to idle. Monotonic per device; saturating so it never wraps to
-    // an old value mid-process.
+    // Bump claim_gen so a stale detached worker can detect the device was
+    // re-claimed and decline to reset it to idle. Saturating so it never wraps.
     entry.claim_gen = entry.claim_gen.saturating_add(1);
     // The generation IS the claim's identity, and it is returned so the caller
     // can hand it to `rollback_failed_spawn` and undo THIS claim and no other.
@@ -698,12 +667,9 @@ pub(super) struct PassContext {
 pub(super) fn byte_offset_in_title(lba: u32, title: &libfreemkv::DiscTitle) -> Option<u64> {
     let mut cumulative = 0u64;
     for ext in &title.extents {
-        // `start_lba` / `sector_count` are disc-supplied (UDF allocation
-        // descriptors), so their sum is untrusted arithmetic: a corrupt or
-        // hostile image can overflow it, panicking the rip thread in debug and
-        // wrapping the containment test in release. Widen to u64 — an extent
-        // whose end does not fit in u32 simply cannot contain a u32 LBA past
-        // it, and this keeps the comparison honest instead of wrapped.
+        // start_lba/sector_count are disc-supplied and untrusted: a corrupt
+        // image could overflow u32 here. Widen to u64 so the containment
+        // test can't wrap and falsely match.
         let end = ext.start_lba as u64 + ext.sector_count as u64;
         if lba >= ext.start_lba && (lba as u64) < end {
             return Some(cumulative + (lba - ext.start_lba) as u64 * SECTOR_BYTES);
@@ -792,9 +758,7 @@ pub(crate) fn located_ranges(
 }
 
 // `RipProgress` / `from_map` were deleted in the 1.2.0 mapfile-free rework:
-// the live `push_pass_state` now reads the rendered drilldown straight from
-// `PassProgress.located` (computed by libfreemkv), so autorip no longer parses
-// the mapfile on the hot path.
+// `push_pass_state` now reads the drilldown from `PassProgress.located`.
 
 /// Per-pass progress state. The speed/ETA math (windowed display speed +
 /// pass-start ETA rate, and why a sliding window beats an EWMA through a stall)
@@ -866,10 +830,8 @@ pub(super) fn push_pass_state(
     total_passes: u8,
     state: &std::cell::RefCell<PassProgressState>,
 ) {
-    // Buckets + located drilldown come straight from the library's progress
-    // contract (`p`) — autorip no longer reads or parses the mapfile. GOOD =
-    // Finished, MAYBE = retry-eligible (NonTrimmed/NonScraped), LOST = terminal
-    // Unreadable.
+    // Buckets come straight from the library's progress contract `p`.
+    // GOOD = Finished, MAYBE = retry-eligible, LOST = terminal Unreadable.
     let bytes_good = p.bytes_good_total;
     let bytes_maybe = p.bytes_retryable_total;
     let bytes_lost = p.bytes_unreadable_total;
@@ -878,17 +840,13 @@ pub(super) fn push_pass_state(
     } else {
         0.0
     };
-    // The terminal Unreadable-in-main figure is owned by the done-card verdict
-    // (resume.rs); it's structurally 0 mid-rip (Unreadable is promoted only
-    // after the final pass), so the live state reports 0 here and the UI reads
+    // Owned by the done-card verdict (resume.rs); structurally 0 mid-rip since
+    // Unreadable is only promoted after the final pass. UI reads
     // `p.located.main_at_risk_ms` for the honest at-risk time instead.
     let main_lost_ms = 0.0;
-    // Freeze `bytes_unreadable` on this pass's first callback for use as
-    // the total-progress retry-work term. Re-reading it live each
-    // callback let the Pass-1 denominator grow as bad sectors were
-    // discovered, making total_pct stall/regress mid-pass. The red-pill
-    // `bytes_lost` above stays live (terminal-bad truth); only the
-    // total-progress estimate uses this frozen figure.
+    // Freeze bytes_unreadable on this pass's first callback: reading it live
+    // let the Pass-1 denominator grow, stalling total_pct. `bytes_lost` above
+    // stays live; only this frozen figure feeds total-progress.
     let retry_denom_bytes = {
         let mut s = state.borrow_mut();
         *s.frozen_bytes_lost.get_or_insert(bytes_lost)
@@ -907,20 +865,9 @@ pub(super) fn push_pass_state(
     } else {
         0
     };
-    // Total bar: estimate cumulative work done across all passes.
-    //
-    // The retry passes (2..N) only re-read the *bad* set (`bytes_unreadable`),
-    // not everything that was pending at the start of Pass 1. Using
-    // `bytes_pending` here was wrong: at the start of Pass 1 the entire disc
-    // is "pending," so the old formula computed total ≈ 6 × capacity and
-    // the total bar showed Pass 1 as ~16% instead of ~50%.
-    //
-    //   total_work = capacity (Pass 1)
-    //              + max_retries × bytes_unreadable (retry passes, shrinks Pass→Pass)
-    //              + mux_estimate (only when there's an ISO intermediate)
-    //
-    // In single-pass mode (max_retries == 0) there is no ISO, no retry passes,
-    // and no separate mux phase, so total_work simplifies to just capacity.
+    // Total bar: total_work = capacity + max_retries*bytes_unreadable + mux_estimate.
+    // Retry passes only re-read the bad set, not all of bytes_pending; using
+    // bytes_pending made total ≈ 6x capacity, showing Pass 1 as ~16% not ~50%.
     let cfg_max_retries = ctx.max_retries as u64;
     let mux_estimate_bytes = if cfg_max_retries > 0 {
         ctx.bytes_total_disc // mux re-reads the ISO, ~1× capacity worth of I/O
@@ -931,11 +878,8 @@ pub(super) fn push_pass_state(
         .bytes_total_disc
         .saturating_add(cfg_max_retries.saturating_mul(retry_denom_bytes))
         .saturating_add(mux_estimate_bytes);
-    // Cumulative work done across all passes:
-    //   pass 1: total_done = last_pos
-    //   pass>=2 (retry): total_done = capacity + (pass-2) × bytes_lost + last_pos
-    // Numerator uses the same frozen `retry_denom_bytes` as the
-    // denominator so prior-pass retry work and total work stay consistent.
+    // Pass 1: total_done = last_pos. Retry pass: capacity + (pass-2)*bytes_lost
+    // + last_pos. Uses the same frozen retry_denom_bytes as the denominator.
     let total_done: u64 = if pass <= 1 {
         last_pos
     } else {
@@ -952,11 +896,9 @@ pub(super) fn push_pass_state(
     // Legacy field — keep populated for back-compat. Equals pass_pct.
     let pct = pass_pct;
 
-    // Speed = rate of `last_pos` (work_done) advancement, NOT bytes_good.
-    // v0.13.15 had this wrong: speed_mbs tracked bytes_good rate, so during
-    // skip-forward zones (where work_done advances but bytes_good is frozen)
-    // speed read 0 even though the bar was moving. Now speed reflects what
-    // the bar shows.
+    // Speed = rate of last_pos (work_done), NOT bytes_good: v0.13.15 tracked
+    // bytes_good rate, reading 0 during skip-forward zones where work_done
+    // advances but bytes_good is frozen, even though the bar was moving.
     let (speed_mbs, pass_eta_str, total_eta_str) = {
         let mut s = state.borrow_mut();
         let now = std::time::Instant::now();
@@ -964,14 +906,9 @@ pub(super) fn push_pass_state(
         // recovery should read responsively, not be smoothed over a minute.
         s.speed.set_responsive(pass > 1);
         let display_speed = s.speed.observe(now, last_pos);
-        // ETA uses the long-running average (bytes ripped this pass /
-        // elapsed-this-pass), NOT the displayed 10 s window. A transient
-        // 12 s slow region can swing the windowed speed from 15 MB/s to
-        // 1 MB/s; if ETA used that, it would jump from "1:30:00" to
-        // "30:00:00" mid-rip and back. The user wants ETA = "when will
-        // this finish" — that's a question about the whole pass's
-        // average rate. Falls back to display_speed during the first
-        // ETA_WARMUP_SECS while the running average is still noisy.
+        // ETA uses the long-running average, not the windowed display speed,
+        // since a transient slow region can whipsaw the window. Falls back to
+        // display_speed during ETA_WARMUP_SECS while the average is noisy.
         let eta_speed = s.speed.eta_speed_mbs(now, display_speed);
         s.last_update = now;
         let format_secs = |secs: u64| -> String {
@@ -988,16 +925,9 @@ pub(super) fn push_pass_state(
                 format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
             }
         };
-        // ETA floor is 0.1 KB/s (0.0001 MB/s), not the old 10 KB/s (0.01
-        // MB/s). That floor blanked the ETA right at the patch rate (~12
-        // KB/s hovers on the threshold) — exactly when the operator most
-        // wants a number. Any forward motion now yields an ETA.
-        // Cap the displayed ETA. On a dead-media residue the recovery rate is
-        // near zero, so `remaining / rate` explodes to tens of hours and
-        // whipsaws (50 h → 12 h → …) as the rate twitches — a precise-looking
-        // number that is really "unknown / effectively never". Above the cap we
-        // show a steady ">Nh" instead; a real ETA reappears the moment the rate
-        // is high enough to put it back under the cap (i.e. on readable data).
+        // Floor is 0.1 KB/s, not the old 10 KB/s, which blanked the ETA right
+        // at the patch rate (~12 KB/s). Cap avoids a dead-media near-zero rate
+        // making `remaining / rate` explode and whipsaw; shows ">Nh" instead.
         let eta_str = |secs: u64| -> String {
             if secs > ETA_CAP_SECS {
                 format!(">{}h", ETA_CAP_SECS / 3600)
@@ -1032,11 +962,8 @@ pub(super) fn push_pass_state(
             disc_format: ctx.disc_format.clone(),
             progress_pct: pct,
             progress_gb: last_pos as f64 / BYTES_PER_GIB,
-            // Populate the documented last_sector (LBA) during sweep too,
-            // not just mux. `last_pos` is the swept byte offset; dividing by
-            // the sector size yields the equivalent LBA the UI playhead
-            // expects. Previously left at Default (0), so the playhead never
-            // moved during the sweep phase despite the field being documented.
+            // Populate last_sector during sweep too, not just mux: previously
+            // left at Default(0), so the UI playhead never moved during sweep.
             last_sector: last_pos / SECTOR_BYTES,
             speed_mbs,
             eta,
@@ -1087,11 +1014,9 @@ pub(super) fn push_pass_state(
         },
     );
 
-    // Periodic device-log line so a long pass doesn't go silent. Matches the
-    // 60 s cadence the main stream loop uses in direct mode. Reports
-    // SWEPT position (pos) prominently — that's what advances during a
-    // skip-forward bad zone — and shows real-data-recovered (bytes_good)
-    // separately so users can see clean-data progress vs sweep progress.
+    // Periodic device-log line (60s, matching the main stream loop) so a long
+    // pass doesn't go silent. Reports swept position (advances during a
+    // skip-forward bad zone) separately from bytes_good (real recovery).
     {
         let mut s = state.borrow_mut();
         if s.last_log.elapsed().as_secs() >= 60 {
@@ -1142,14 +1067,9 @@ pub(super) fn set_pass_progress(
     } else {
         0
     };
-    // Use update_state_with instead of a full RipState replacement so that
-    // the CUMULATIVE fields (total_progress_*, errors, total_lost_ms,
-    // bad_ranges, etc.) survive the pass boundary — a full RipState with
-    // ..Default::default() would zero them, dropping the *total* bar to 0 at
-    // every pass. The PER-PASS bar (pass_progress_pct) + ETA/speed, by
-    // contrast, ARE reset below: they belong to a single pass, so carrying
-    // pass 1's 99% made pass 2 read "pass 1/7 · 99%" through the settle.
-    // push_pass_state callbacks refill them once the new pass is reading.
+    // update_state_with (not a full RipState) so cumulative fields survive
+    // the pass boundary instead of zeroing. Per-pass fields ARE reset below:
+    // carrying pass 1's 99% made pass 2 read "pass 1/7 · 99%" through settle.
     update_state_with(&ctx.device, |s| {
         s.status = "ripping".to_string();
         s.disc_present = true;
@@ -1173,11 +1093,9 @@ pub(super) fn set_pass_progress(
         s.bytes_total_disc = ctx.bytes_total_disc;
         s.preferred_batch = ctx.batch;
         s.current_batch = ctx.batch;
-        // Reset the PER-PASS bar + its ETA/speed at the pass boundary so a new
-        // pass starts visibly at 0% rather than inheriting the prior pass's
-        // 99% (which made pass 2 read "pass 1/7 · 99% · ETA 0s" through the
-        // 30 s settle). The cumulative `total_progress_pct` is intentionally
-        // left untouched. push_pass_state refills these on its first tick.
+        // Reset per-pass bar/ETA/speed at the pass boundary so a new pass
+        // starts at 0% instead of inheriting the prior pass's 99%.
+        // total_progress_pct is left untouched; push_pass_state refills these.
         s.pass_progress_pct = 0;
         s.pass_eta = String::new();
         s.eta = String::new();
@@ -1297,13 +1215,9 @@ mod tests {
         }
     }
 
-    // The live at-risk / located-drilldown behaviour these tests used to cover
-    // (in-feature pending counts as at-risk; out-of-feature reads 0:00; the live
-    // drilldown shows pending while the terminal verdict hides it) moved into
-    // libfreemkv with `RipProgress::from_map` — it's now exercised by
-    // `locate_ranges` tests in libfreemkv (src/disc/mod.rs). The terminal
-    // `build_bad_ranges` path (still autorip-side, for the done card) keeps its
-    // own coverage below.
+    // Live at-risk/located-drilldown behavior these tests used to cover moved
+    // into libfreemkv (`locate_ranges` tests, src/disc/mod.rs). The terminal
+    // build_bad_ranges path (still autorip-side, done card) keeps coverage below.
 
     /// The post-Stop cooldown is a SHORT INTERVAL, so it must be measured on
     /// the monotonic clock, not the wall clock.
@@ -1332,10 +1246,8 @@ mod tests {
         let end = src
             .find("/// Drop the auxiliary per-device state on hot-unplug")
             .expect("forget_device_state's doc must follow the cooldown fns");
-        // Strip comment lines before matching. Without this the pin can be
-        // satisfied — or broken — by its own prose: the doc comment on
-        // STOP_COOLDOWNS names `epoch_secs()` while explaining why it must not
-        // be used.
+        // Strip comment lines first: otherwise the pin could be satisfied (or
+        // broken) by its own prose, since the doc comment names `epoch_secs()`.
         let region: String = src[start..end]
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
@@ -1439,10 +1351,8 @@ mod tests {
 
     #[test]
     fn build_bad_ranges_excludes_not_yet_tried() {
-        // Regression from v0.11.22: an empty rip (everything NonTried)
-        // was reporting the entire disc as "bad" because bytes_pending
-        // (including NonTried) was summed into bytes_bad. This test
-        // guards the specific invariant: the list of "bad" ranges must
+        // Regression from v0.11.22: an empty rip (all NonTried) reported the
+        // whole disc as "bad" via bytes_pending. Guards that "bad" ranges
         // include only `-` (Unreadable), never `?`/`*`/`/`.
         let (_p, mf) = tmp_map("nontried", 10_000);
         let title = minimal_title();
@@ -1458,10 +1368,8 @@ mod tests {
 
     #[test]
     fn build_bad_ranges_ignores_non_trimmed_and_non_scraped() {
-        // Post pass-1 on a damaged disc: some ranges become NonTrimmed or
-        // NonScraped — meaning "pass 1 failed, pass 2 needs to retry."
-        // Those MUST NOT appear in the UI's bad-range list yet; patch may
-        // still recover them. Only `-` counts as confirmed bad.
+        // NonTrimmed/NonScraped mean "pass 1 failed, pass 2 needs to retry" —
+        // must NOT appear in the UI's bad-range list yet; only `-` is confirmed bad.
         let (_p, mut mf) = tmp_map("trim_scrape", 10_000);
         mf.record(1000, 200, SectorStatus::NonTrimmed).unwrap();
         mf.record(3000, 100, SectorStatus::NonScraped).unwrap();
@@ -1566,10 +1474,9 @@ mod tests {
 
     #[test]
     fn update_state_with_preserves_untouched_fields() {
-        // The whole point of `update_state_with` — fields the closure doesn't
-        // touch must survive. Three regressions in autorip's history were
-        // exactly this class (Default::default() wiping live progress fields
-        // during a watchdog tick).
+        // The whole point of update_state_with: fields the closure doesn't
+        // touch must survive (three past regressions were Default::default()
+        // wiping live progress fields during a watchdog tick).
         let dev = format!("test-preserve-{}", std::process::id());
         update_state_with(&dev, |s| {
             s.errors = 7;
@@ -1596,10 +1503,8 @@ mod tests {
         assert_eq!(snap.preferred_batch, 60, "preferred_batch wiped");
         assert_eq!(snap.progress_pct, 42, "new field not applied");
         assert_eq!(snap.status, "ripping", "new field not applied");
-        // update_state_with's or_insert_with builds `RipState { device:
-        // device.to_string(), ..Default::default() }` for a brand-new entry
-        // — that field is independent of the HashMap key above, so assert
-        // it directly.
+        // device is set independently of the HashMap key by or_insert_with's
+        // `RipState { device: device.to_string(), ..Default::default() }`.
         assert_eq!(snap.device, dev, "device field not set on first insert");
     }
 
@@ -1694,10 +1599,8 @@ mod tests {
             s.bad_ranges = vec![];
             s.num_bad_ranges = 0;
         });
-        // Build a mapfile with some Unreadable sectors (as if promotion
-        // already ran and converted NonTrimmed → Unreadable). Total must
-        // cover the highest byte position we record at: sector 30050 ×
-        // 2048 = 61,542,400 bytes → round up to 100,000 sectors × 2048.
+        // Mapfile with Unreadable sectors (as if promotion already ran).
+        // Total must cover the highest position recorded: sector 30050.
         let total_bytes = 100_000u64 * 2048;
         let (_dir, mut map) = tmp_map("promo-damage", total_bytes);
         // Record two separate Unreadable ranges (by byte position).
@@ -1753,10 +1656,9 @@ mod tests {
 
     #[test]
     fn spawn_failure_reset_to_idle_clears_busy() {
-        // HIGH: handle_scan/handle_rip set status="scanning" BEFORE spawning
-        // the worker. If the spawn fails the handlers now roll the device
-        // back to idle. Pin the contract the rollback relies on: an idle
-        // push clears is_busy so the next scan/rip isn't rejected with 409.
+        // handle_scan/handle_rip set status="scanning" before spawning; on
+        // spawn failure they roll back to idle. Pin that an idle push clears
+        // is_busy so the next scan/rip isn't rejected with 409.
         let dev = format!("test-spawnfail-{}", std::process::id());
         // Pre-state set by the handler before spawn.
         update_state(
@@ -1828,18 +1730,9 @@ mod tests {
 
     #[test]
     fn try_claim_active_checked_refuses_unknown_device_and_state_does_not_grow() {
-        // Security: `/api/scan/{device}`, `/api/rip/{device}`, and
-        // `/api/eject/{device}` are unauthenticated and reachable from any
-        // LAN host; `device` is only shape-checked (3..=64 ASCII
-        // alphanumeric), never checked against the real drive list. Before
-        // this guard, `try_claim_active` unconditionally inserted a brand
-        // new permanent RipState for ANY such name, and nothing ever prunes
-        // an entry for a device that was never actually enumerated (the
-        // hot-unplug sweep only removes devices that were in its own
-        // enumerated list). A caller looping fabricated names could grow
-        // STATE (and, via a successful claim unlocking spawn_rip_thread,
-        // RIP_THREADS) without bound. Pin: an unknown device with
-        // known=false must be refused, and must leave no trace in STATE.
+        // Security: device is shape-checked but unvalidated against real drives;
+        // a caller looping fabricated names could grow STATE unbounded. Pin:
+        // unknown+known=false is refused, leaves no trace.
         let dev = format!("test-forged-device-{}-xyz", std::process::id());
         assert!(
             STATE.lock().unwrap().get(&dev).is_none(),
@@ -1875,10 +1768,8 @@ mod tests {
         assert!(try_claim_active_checked(&dev, true).is_some());
         let snap = STATE.lock().unwrap().get(&dev).cloned().unwrap();
         assert_eq!(snap.status, "scanning");
-        // The map key and the RipState.device field are independent — the
-        // struct literal's `device: device.to_string()` could be deleted
-        // (falling back to Default's "") without affecting the HashMap
-        // lookup above. Assert it explicitly.
+        // Map key and RipState.device are independent — assert device
+        // explicitly since deleting the struct literal's field wouldn't fail above.
         assert_eq!(
             snap.device, dev,
             "device field in the freshly-inserted RipState must match"
@@ -1887,12 +1778,9 @@ mod tests {
 
     #[test]
     fn try_claim_active_checked_allows_unknown_flag_once_device_already_present() {
-        // A real device always has a STATE entry before an operator can act
-        // on it (the poll loop pushes one every tick for every enumerated
-        // drive, and the UI only offers Scan/Rip/Eject for devices
-        // /api/state already reports) — so `known=false` must not block a
-        // second legitimate claim on a device that is already known to
-        // STATE by other means (e.g. idle after a previous rip).
+        // A real device always has a STATE entry before an operator can act on
+        // it (poll loop pushes one per tick), so known=false must not block a
+        // second legitimate claim on a device already known to STATE.
         let dev = format!("test-known-existing-{}", std::process::id());
         update_state(
             &dev,
@@ -1961,10 +1849,8 @@ mod tests {
             "the known=true wrapper must refuse on the same grounds"
         );
 
-        // The worker exits. Its handle is deliberately left REGISTERED and
-        // unreaped — that is the normal state after any completed rip, and the
-        // gate must read a finished handle as "not running" or every device
-        // would be claimable exactly once per process.
+        // Worker exits; handle stays REGISTERED/unreaped (normal post-rip
+        // state). Gate must read a finished handle as "not running".
         drop(release_tx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while super::super::session::rip_thread_running(&dev) {
@@ -2075,13 +1961,9 @@ mod tests {
 
     #[test]
     fn try_claim_active_rejects_second_claim_on_busy_device() {
-        // HIGH (rule 1/2): try_claim_active's whole purpose is to refuse a
-        // second claim on a device that is already scanning/ripping,
-        // closing the double-rip TOCTOU. No existing test calls it twice on
-        // the same device — every test only checks the first call
-        // succeeds. `r.status == "scanning" || r.status == "ripping"`
-        // mutated to `&&` can never be true for one string, silently
-        // disabling the whole guard.
+        // try_claim_active refuses a second claim on an already-busy device,
+        // closing the double-rip TOCTOU; `||` mutated to `&&` would go
+        // undetected since no other test calls it twice.
         let dev = format!("test-doubleclaim-{}", std::process::id());
         assert!(
             try_claim_active(&dev).is_some(),
@@ -2095,12 +1977,9 @@ mod tests {
 
     #[test]
     fn update_state_carries_forward_zero_claim_gen() {
-        // MEDIUM (concurrency): callers build a fresh RipState with
-        // `..Default::default()` (claim_gen = 0) for almost every push; if
-        // update_state didn't carry the real generation forward, every
-        // ordinary state push after try_claim_active would silently reset
-        // claim_gen to 0, defeating the stale-worker-detach guard the
-        // generation exists for.
+        // Callers push fresh RipStates via ..Default::default() (claim_gen=0);
+        // without carry-forward, every push after try_claim_active would
+        // reset claim_gen to 0, defeating the stale-worker-detach guard.
         let dev = format!("test-claimgen-carry-{}", std::process::id());
         assert!(
             try_claim_active(&dev).is_some(),
@@ -2125,10 +2004,8 @@ mod tests {
 
     #[test]
     fn update_state_does_not_clobber_explicit_nonzero_claim_gen() {
-        // Companion to the above: a caller that DOES set a real nonzero
-        // claim_gen explicitly (not the ..Default::default() zero) must
-        // have that value stored verbatim, not overwritten by the
-        // previous push's generation.
+        // Companion to the above: an explicit nonzero claim_gen must be
+        // stored verbatim, not overwritten by the previous push's generation.
         let dev = format!("test-claimgen-explicit-{}", std::process::id());
         assert!(try_claim_active(&dev).is_some()); // claim_gen -> 1
         update_state(
@@ -2149,12 +2026,9 @@ mod tests {
 
     #[test]
     fn take_title_override_returns_and_clears_the_override() {
-        // set_title_override / take_title_override are otherwise only
-        // exercised via forget_device_state's eviction test, which never
-        // calls take_title_override at all — so a `take_title_override` ->
-        // `()` mutant (return type would fail to compile, but a body ->
-        // `None` mutant) or a `set_title_override` -> `()` mutant both pass
-        // the whole suite today.
+        // Otherwise only exercised via forget_device_state's eviction test,
+        // which never calls take_title_override, so a body->None mutant on
+        // either function would pass the whole suite today.
         let dev = format!("/dev/test-override-{}", std::process::id());
         assert!(take_title_override(&dev).is_none(), "no override set yet");
         let picked = crate::tmdb::TmdbResult {
@@ -2274,24 +2148,14 @@ mod tests {
 
     #[test]
     fn push_pass_state_preserves_every_damage_indicator_field() {
-        // HIGH (rule 1) — by far the largest survivor cluster in this file:
-        // push_pass_state builds a ~40-field RipState struct literal ending
-        // in `..Default::default()`. Deleting ANY one named field from that
-        // literal (cargo-mutants' "delete field X from struct expression")
-        // makes the field silently fall back to RipState::default()'s
-        // zero/empty value. No existing test reads push_pass_state's output
-        // back field-by-field, so ~30 of those deletions passed the whole
-        // suite untouched. The fields checked here are exactly the ones the
-        // UI/API use to tell a damaged rip from a clean one: if any of them
-        // regressed to Default, a disc actively losing sectors would
-        // present as if it had none.
+        // push_pass_state's struct literal ends in ..Default::default(), so a
+        // deleted field silently falls back to zero/empty, unnoticed until now.
+        // Checks damage-indicator fields so a lossy disc can't look clean.
         let dev = format!("test-pps-fields-{}", std::process::id());
         let mut ctx = minimal_pass_ctx(&dev);
-        // Give the metadata pass-through fields non-default values too —
-        // `minimal_pass_ctx`'s empty-string/0 defaults are indistinguishable
-        // from `RipState::default()`, so a field-deletion mutant on
-        // tmdb_title/year/poster/overview/media_type/duration/codecs would
-        // be invisible against them.
+        // Non-default values for metadata pass-through fields, since
+        // minimal_pass_ctx's empty/0 defaults are indistinguishable from
+        // RipState::default() and would hide a field-deletion mutant.
         ctx.tmdb_title = "Example Movie".to_string();
         ctx.tmdb_year = 2024;
         ctx.tmdb_poster = "https://example/poster.jpg".to_string();

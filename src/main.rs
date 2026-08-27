@@ -26,11 +26,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 fn main() {
-    // v0.25.7: tiny built-in subcommands so the deployed image doesn't
-    // need curl (HEALTHCHECK) or bash + nfs-utils helpers + a separate
-    // entrypoint script (--bootstrap). Each subcommand exits before
-    // observe::init so they don't spam the tracing sinks on every
-    // 30-second healthcheck.
+    // v0.25.7: tiny built-in subcommands so the image doesn't need curl or a
+    // separate entrypoint script. Each exits before observe::init so they
+    // don't spam the tracing sinks on every 30-second healthcheck.
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
         Some("--healthcheck") => {
@@ -54,20 +52,16 @@ fn main() {
             std::process::exit(0);
         }
         Some("--bootstrap") => {
-            // Bootstrap then fall through to the daemon below. Errors
-            // are logged but non-fatal — the daemon's panic hook will
-            // catch anything genuinely catastrophic later. Container-init
-            // is Linux-only; on macOS/Windows this is a no-op and the
-            // daemon runs directly.
+            // Bootstrap then fall through to the daemon below. Errors are
+            // logged but non-fatal. Container-init is Linux-only; elsewhere
+            // this is a no-op and the daemon runs directly.
             #[cfg(unix)]
             run_bootstrap();
             #[cfg(not(unix))]
             eprintln!("autorip: --bootstrap is Linux-only; running the daemon directly");
         }
-        // Bare run (no Docker): run the daemon WITHOUT the container bootstrap
-        // (no NFS mount, no chown, no /staging). Config/staging/output default
-        // under ~/.config/autorip (see config::default_autorip_dir). `serve`
-        // is an explicit alias for the bare no-arg invocation.
+        // Bare run (no Docker): daemon without container bootstrap, config
+        // defaults under ~/.config/autorip. `serve` is an explicit alias.
         Some("serve") => {}
         Some(other) => {
             eprintln!("autorip: unknown argument '{other}' (try --help)");
@@ -76,12 +70,9 @@ fn main() {
         None => {}
     }
 
-    // Panic hook FIRST — before observe::init, so a panic DURING tracing
-    // setup (bad AUTORIP_LOG_LEVEL filter, unwritable log dir) still hits
-    // the post-mortem path instead of unwinding with only the default Rust
-    // message. The hook's tracing::error! is a best-effort no-op before
-    // init, but log::syslog still records to the per-device file + the
-    // in-memory ring, so it remains useful for these earliest failures.
+    // Panic hook FIRST — before observe::init, so a panic during tracing
+    // setup still hits post-mortem handling. tracing::error! is a no-op
+    // before init, but log::syslog still records, so it's still useful.
     std::panic::set_hook(Box::new(|info| {
         let loc = info
             .location()
@@ -104,9 +95,7 @@ fn main() {
     }));
 
     // Tracing — sets up stderr + autorip.log + autorip.jsonl sinks. Filter
-    // via AUTORIP_LOG_LEVEL env (default `autorip=info,libfreemkv=warn`).
-    // The panic hook above is already installed, so a panic in here is
-    // captured post-mortem.
+    // via AUTORIP_LOG_LEVEL (default `autorip=info,libfreemkv=warn`).
     observe::init();
 
     // Signal handler for graceful shutdown
@@ -140,13 +129,9 @@ fn main() {
     // Load config
     let cfg = config::load();
 
-    // Fail-loud-EARLY destination check (Mercy incident hardening): on
-    // boot, warn loudly if any configured movie/tv/output directory is
-    // missing, not a directory, or not writable — the classic symptom of a
-    // lost bind-mount (e.g. the NAS share didn't come up). Non-blocking: the
-    // service still starts (a mount can come up moments later, and the
-    // mover's per-move guard preserves output in staging meanwhile), but the
-    // operator sees the problem at startup instead of after a multi-hour rip.
+    // Fail-loud-EARLY destination check: warn if a configured movie/tv/output
+    // dir is missing/not writable (e.g. a lost NAS bind-mount). Non-blocking —
+    // finished rips stay in staging meanwhile — but surfaces the problem at boot.
     if let Ok(c) = cfg.read() {
         for (root, reason) in mover::check_configured_destinations(&c) {
             log::syslog(&format!(
@@ -230,12 +215,9 @@ fn main() {
         move || mover::run(&cfg)
     });
 
-    // Start mux worker thread — pipelines mux behind the drive so a
-    // disc can be ripped on one device while a prior title muxes in
-    // the background. Picks up the `.ripped` markers the ripper writes
-    // into staging and muxes each ISO to MKV, writing `.done` on success.
-    // Joined on shutdown (see end of main) so an in-flight mux isn't
-    // killed mid-write, leaving a truncated MKV that looks valid.
+    // Start mux worker thread — pipelines mux behind the drive so a disc can
+    // rip on one device while a prior title muxes in the background. Joined
+    // on shutdown so an in-flight mux isn't killed mid-write (truncated MKV).
     let muxer_handle = std::thread::spawn({
         let cfg = cfg.clone();
         move || muxer::run(&cfg)
@@ -247,10 +229,9 @@ fn main() {
         move || web::run(&cfg)
     });
 
-    // Start KEYDB auto-update thread. Single source of truth for periodic
-    // KEYDB refresh — pre-0.13 there was also a cron entry that spawned a
-    // second `autorip` binary, which raced this thread for /dev/sg* and
-    // port 8080. Cron path was removed; this is now the only daily updater.
+    // Start KEYDB auto-update thread — single source of truth for periodic
+    // refresh. Pre-0.13 a cron entry also spawned a second binary that raced
+    // this thread for /dev/sg* and port 8080; that path was removed.
     let _keydb_handle = std::thread::spawn({
         let cfg2 = cfg.clone();
         move || {
@@ -317,17 +298,9 @@ fn main() {
         }
     });
 
-    // Log prune thread — replaces the v0.25.5 cron-based daily cleanup
-    // (./entrypoint.sh used to drop a line in /etc/cron.d). Moving this
-    // in-process let us drop the cron package + the cron service from
-    // the image (alpine swap in v0.25.6), shrinking the deployed
-    // container by ~5 MB and eliminating a runtime dependency.
-    //
-    // v0.25.7: retention_days now comes from the Settings UI
-    // (`cfg.log_retention_days`) instead of the LOG_RETENTION_DAYS
-    // env var — operator can change it live without redeploying.
-    // Re-read each tick so a saved-settings update takes effect on
-    // the next daily run rather than requiring a restart.
+    // Log prune thread — replaces the v0.25.5 cron-based cleanup. retention_days
+    // comes from the Settings UI and is re-read each tick so a saved update
+    // takes effect on the next run without a restart.
     let _log_prune_handle = std::thread::spawn({
         let cfg = cfg.clone();
         move || {
@@ -358,29 +331,21 @@ fn main() {
     // Main loop: poll drives (checks SHUTDOWN flag internally)
     ripper::drive_poll_loop(&cfg);
 
-    // Graceful shutdown is NOT a failure. Clear every in-progress marker up
-    // front so the next start resumes cleanly instead of counting this stop as a
-    // crash. This is robust even if a rip drain below overruns docker's
-    // stop-grace and the process is SIGKILLed mid-drain — by then the markers
-    // are already gone. (Only a TRUE ungraceful crash, which never reaches this
-    // path, can leave a marker to be counted.)
+    // Graceful shutdown is NOT a failure: clear in-progress markers up front
+    // so the next start resumes cleanly. Robust even if the drain below is
+    // SIGKILLed mid-drain by docker's stop-grace — markers are gone by then.
     if let Ok(c) = cfg.read() {
         ripper::staging::clear_inprogress_markers(std::path::Path::new(&c.staging_dir));
     }
 
-    // Drain any rip threads that are still mid-flight so we don't
-    // exit the process while libfreemkv is holding a SCSI session
-    // and writing into staging. Bounded so a stuck drive can't
+    // Drain any rip threads still mid-flight so we don't exit while
+    // libfreemkv holds a SCSI session. Bounded so a stuck drive can't
     // pin shutdown indefinitely.
     ripper::join_all_rip_threads(std::time::Duration::from_secs(60));
 
-    // Drain the mover and muxer too. Both loop on SHUTDOWN (set by the
-    // signal handler above) and return after the current work unit, so
-    // joining them lets an in-flight file move or mux finish instead of
-    // being killed when the process exits — a truncated OUTPUT_DIR file
-    // or a partial MKV can look valid to downstream consumers. Bounded
-    // (generous deadline, mirroring the rip-thread drain) so a wedged
-    // NFS write or stuck mux can't pin shutdown forever.
+    // Drain the mover and muxer too: both loop on SHUTDOWN and return after
+    // the current unit, so joining avoids a truncated file or partial MKV.
+    // Bounded so a wedged NFS write or stuck mux can't pin shutdown forever.
     join_bounded(mover_handle, "mover", std::time::Duration::from_secs(120));
     join_bounded(muxer_handle, "muxer", std::time::Duration::from_secs(120));
 
@@ -457,10 +422,9 @@ fn run_healthcheck() -> i32 {
         return 1;
     }
 
-    // We only need to see the status line, but a single read() is not
-    // guaranteed to return the full 12-byte status line (a short first TCP
-    // segment would make the probe falsely report unhealthy). Loop until we
-    // have enough bytes to decide, EOF, or the 2 s read timeout fires.
+    // A single read() isn't guaranteed to return the full 12-byte status
+    // line (a short first TCP segment would falsely report unhealthy).
+    // Loop until enough bytes, EOF, or the 2s read timeout fires.
     const STATUS_LEN: usize = "HTTP/1.1 200".len();
     let mut buf = [0u8; 64];
     let mut filled = 0usize;
@@ -513,11 +477,9 @@ fn run_bootstrap() {
     use std::os::unix::fs::symlink;
 
     let autorip_dir = std::env::var("AUTORIP_DIR").unwrap_or_else(|_| "/config".to_string());
-    // RIP_USER is interpolated raw into /etc/passwd, /etc/group and the
-    // KEYDB symlink path. A value containing a newline or colon would
-    // corrupt the account database (inject an extra entry). Validate against
-    // a conservative POSIX-portable username shape; fall back to the default
-    // on anything malformed.
+    // RIP_USER is interpolated raw into /etc/passwd, /etc/group and the KEYDB
+    // symlink path; a newline or colon could corrupt the account database.
+    // Validate against a conservative username shape, else fall back to default.
     let rip_user = match std::env::var("RIP_USER") {
         Ok(u) if is_valid_username(&u) => u,
         Ok(u) => {
@@ -540,10 +502,9 @@ fn run_bootstrap() {
         eprintln!("bootstrap: mkdir /staging: {e}");
     }
 
-    // User creation (no useradd binary — just append to /etc/passwd +
-    // /etc/group). Idempotent: skip if a line already starts with the
-    // username. Only runs when uid == 0; we never demote anyway since
-    // the container needs root for SCSI + mount(2).
+    // User creation (no useradd — append to /etc/passwd + /etc/group).
+    // Idempotent: skip if a line already starts with the username. Only
+    // runs at uid 0; the container needs root for SCSI + mount(2) anyway.
     if unsafe { libc::getuid() } == 0 {
         ensure_user_entry(&rip_user);
         if let Err(e) = chown_recursive(std::path::Path::new("/staging"), &rip_user) {
@@ -567,12 +528,9 @@ fn run_bootstrap() {
         eprintln!("bootstrap: symlink {freemkv_cfg}: {e}");
     }
 
-    // Snapshot env for the udev-triggered rip-on-insert path.
-    // udev-trigger.sh does `. /etc/autorip.env`, so each line is sourced as
-    // a shell assignment. A raw value containing a newline (e.g. a fat-
-    // fingered TMDB_API_KEY) would otherwise become an extra sourced line.
-    // Single-quote every value and escape embedded single quotes so the
-    // value is always a single, inert shell token.
+    // Snapshot env for the udev-triggered rip-on-insert path. udev-trigger.sh
+    // sources this file, so a raw newline in a value (e.g. a bad TMDB_API_KEY)
+    // could inject a line. Single-quote each value, escaping embedded quotes.
     if let Ok(mut f) = std::fs::File::create("/etc/autorip.env") {
         for (k, v) in std::env::vars() {
             if matches!(
@@ -621,13 +579,9 @@ fn run_bootstrap() {
         && !export.is_empty()
         && !mountpoint.is_empty()
     {
-        // Default keeps `hard` (no silent I/O errors once mounted)
-        // but adds `retry=1` so the foreground mount.nfs4 retry
-        // window is short, and we wrap the child in a bounded wait
-        // below. Together an unreachable server at container start
-        // degrades to an empty mountpoint instead of stalling the
-        // daemon's startup for the full retry window. Operators can
-        // still override the whole string via NFS_OPTS.
+        // Default keeps `hard` (no silent I/O errors) but adds `retry=1` and
+        // a bounded wait below, so an unreachable server at startup degrades
+        // to an empty mountpoint instead of stalling. Overridable via NFS_OPTS.
         let opts = std::env::var("NFS_OPTS")
             .unwrap_or_else(|_| "vers=4.1,nconnect=4,nolock,actimeo=3,hard,retry=1,_netdev".into());
         if let Err(e) = std::fs::create_dir_all(&mountpoint) {
@@ -747,11 +701,9 @@ fn chown_recursive(path: &std::path::Path, user: &str) -> std::io::Result<()> {
         // lchown the entry itself (does NOT follow a symlink target — the
         // deliberate choice this fn already made).
         lchown_path(p, uid, gid)?;
-        // Recurse only into REAL directories. entry.file_type() does NOT
-        // follow symlinks, so a symlink-to-directory reports is_dir()==false
-        // (is_symlink()==true) and is treated as a leaf — this stops a
-        // symlink under /staging or $AUTORIP_DIR pointing at an external
-        // tree from steering the walk (and chown) outside the intended tree.
+        // Recurse only into REAL directories: entry.file_type() doesn't follow
+        // symlinks, so a symlink-to-dir is treated as a leaf — this stops a
+        // symlink from steering the walk (and chown) outside the intended tree.
         if let Ok(entries) = std::fs::read_dir(p) {
             for entry in entries.flatten() {
                 let ft = entry.file_type()?;
@@ -801,10 +753,9 @@ fn wait_bounded(
 }
 
 fn is_mountpoint(path: &str) -> bool {
-    // Normalize trailing slashes on both sides: an operator-set
-    // NFS_MOUNTPOINT of "/mnt/nfs/" must still match "/mnt/nfs" in
-    // /proc/mounts, otherwise the check returns false and mount.nfs4 runs
-    // against an already-mounted dir (on a hard mount that can hang).
+    // Normalize trailing slashes: an operator-set NFS_MOUNTPOINT of "/mnt/nfs/"
+    // must still match "/mnt/nfs" in /proc/mounts, else mount.nfs4 runs
+    // against an already-mounted dir (can hang on a hard mount).
     let want = normalize_mount_path(path);
     let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
     mounts
@@ -818,9 +769,8 @@ fn is_mountpoint(path: &str) -> bool {
 /// doesn't need a cron daemon. Single-shot; the caller drives the
 /// daily cadence.
 fn prune_old_logs(log_dir: &str, retention_days: u64) {
-    // `retention_days * 86_400` can overflow u64 for an absurd operator
-    // value (panic in debug → kills the prune thread; silent wraparound in
-    // release → a bogus recent cutoff that could delete fresh logs). Guard
+    // `retention_days * 86_400` can overflow u64 for an absurd value
+    // (silent wraparound in release could delete fresh logs). Guard
     // both the multiply and the subtraction.
     let cutoff = retention_days.checked_mul(86_400).and_then(|secs| {
         std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(secs))
@@ -891,13 +841,9 @@ fn prune_dir_recursive(dir: &std::path::Path, cutoff: std::time::SystemTime) -> 
 mod tests {
     use super::*;
 
-    // ── Log retention has to see the ROLLED files ─────────────────────────
-    //
-    // `tracing-appender`'s daily rotation writes `autorip.log.YYYY-MM-DD`, and
-    // `Path::extension()` on that returns the date. The old `extension() ==
-    // "log"` test therefore skipped every rolled daily, so the operator-visible
-    // `log_retention_days` reclaimed only `device_*.log` and `logs/rips/*.log`
-    // while the central log grew forever and the prune reported 0.
+    // Log retention has to see ROLLED files: `tracing-appender`'s daily
+    // rotation writes `autorip.log.YYYY-MM-DD`, whose `Path::extension()`
+    // is the date, so an `extension() == "log"` check would skip every rolled file.
 
     #[test]
     fn a_rolled_daily_log_is_prunable() {
@@ -977,12 +923,9 @@ mod tests {
         assert_eq!(normalize_mount_path("///"), "/");
     }
 
-    // Backdating a file's mtime needs a platform API, and the one used here
-    // (libc::utimes) comes from a cfg(unix) dependency — libc is not linked on
-    // Windows at all. autorip runs on Linux (disc access is via /dev/sg*), so
-    // the pruning logic is exercised on every OS it actually rips on; the
-    // Windows build only has to compile, and an ungated helper stopped it from
-    // doing even that.
+    // Backdating a file's mtime needs libc::utimes, a cfg(unix)-only dep not
+    // linked on Windows. autorip only rips on Linux, so this is exercised
+    // there; the Windows build just needs to compile.
     #[cfg(unix)]
     #[test]
     fn prune_recurses_into_subdirs_and_only_touches_old_logs() {

@@ -6,7 +6,7 @@
 //! (`local`) or a remote key service (`online`).
 //!
 //! The flow is the same for a live drive and a staged ISO: scan the disc
-//! KEYLESS (structure + AACS inputs, no resolution), build [`DiscInputs`] from
+//! KEYLESS (structure + AACS inputs, no resolution), build [`libfreemkv::DiscInputs`] from
 //! its key files (+ content samples for wrong-key validation), then resolve via
 //! [`resolve_and_apply_traced`] — the first source whose Unit Keys validate
 //! wins. The only drive-vs-ISO difference is the [`DiscKeyAccess`] impl.
@@ -61,12 +61,9 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
 /// gate construction.
 fn validate_keyserver_url(raw: &str) -> Result<(), String> {
     let url = raw.trim();
-    // Log/error-message identifier for `url`: origin only, never the raw
-    // string. `keyserver_url` can carry a bearer token in its path or query
-    // (like a webhook URL), and `build_sources` logs this function's Err at
-    // ERROR level into autorip.jsonl, which unauthenticated GET /api/debug
-    // serves verbatim — so the two error arms below that used to interpolate
-    // `{url}` directly would leak that token to any LAN caller.
+    // Log/error identifier for `url`: origin only, never the raw string.
+    // `keyserver_url` can carry a bearer token (like a webhook URL), and
+    // unauthenticated GET /api/debug serves this fn's ERROR log verbatim.
     let safe_ref = crate::webhook::webhook_url_origin(url);
     let rest = url
         .strip_prefix("https://")
@@ -265,11 +262,8 @@ pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
                 cfg.keyserver_secret.clone(),
             ))),
             // SSRF defense-in-depth: refuse to POST disc-key material to an
-            // internal / metadata address. Drop the online source entirely
-            // (leaving no source) rather than hand `OnlineSource` a URL we
-            // won't trust. The web store-side
-            // guard normally rejects these at save time; this covers a
-            // value that slipped past it or predates that guard.
+            // internal/metadata address; drop the online source entirely
+            // rather than trust it. Covers values that slipped past save-time.
             Err(e) => {
                 tracing::error!(
                     phase = "key_resolve",
@@ -516,11 +510,9 @@ pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
         Ok(addrs) => addrs,
         Err(e) => return reachability_for_unprobeable_url(&e),
     };
-    // Same pinned-resolver hardening as every other operator-supplied-URL
-    // fetch in autorip — `guarded_agent` owns it, including the
-    // `with_parts`-not-`new_with_config` requirement.
-    // The probe keeps its own short idle bound: it must give up fast, and a
-    // longer shared default would defeat the whole point of this call site.
+    // Same pinned-resolver hardening as every operator-URL fetch in autorip
+    // (`guarded_agent` owns it). This probe keeps its own short idle bound —
+    // a longer shared default would defeat the point of this call site.
     let agent = crate::web::guarded_agent_with_timeouts(
         pinned,
         std::time::Duration::from_secs(4),
@@ -530,10 +522,9 @@ pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
     let outcome = match agent.get(url).call() {
         Ok(resp) => ProbeOutcome::Status(resp.status().as_u16()),
         Err(ureq::Error::StatusCode(code)) => ProbeOutcome::Status(code),
-        // ureq 3 fans v2's single `Transport` variant out across `Io`,
-        // `Timeout`, `Tls`, `HostNotFound` and more, and the enum is
-        // non_exhaustive. They all mean the same thing to this probe: the
-        // service never answered.
+        // ureq 3 fans v2's `Transport` out across `Io`, `Timeout`, `Tls`,
+        // `HostNotFound` and more (enum is non_exhaustive). All mean the
+        // same thing to this probe: the service never answered.
         Err(_) => ProbeOutcome::Transport,
     };
     classify_reachability(outcome)
@@ -566,12 +557,9 @@ pub fn resolve_keys<A: DiscKeyAccess>(
     access: &mut A,
     mut disc: libfreemkv::Disc,
 ) -> (libfreemkv::Disc, KeyOutcome) {
-    // ALL AACS inputs (inf, MKB, VID, disc_hash, version, volume_label) come
-    // from the keyless scan via `disc.inputs()` — the single source of truth.
-    // `access` is used ONLY to sample ciphertext, which the scan does not
-    // retain. (Before the libfreemkv MKB-read fix, `disc.inputs()` shipped an
-    // empty MKB, which is why this used to re-read inf+MKB out-of-band via
-    // `access.key_files()`; that whole duplicate read path is gone.)
+    // ALL AACS inputs come from the keyless scan via `disc.inputs()` — the
+    // single source of truth. `access` is used ONLY to sample ciphertext,
+    // which the scan doesn't retain (the old out-of-band re-read is gone).
     let Some(mut inputs) = disc.inputs() else {
         tracing::warn!(phase = "key_resolve", "disc carries no AACS inputs");
         return (disc, KeyOutcome::MissingInputs);
@@ -583,13 +571,9 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         );
     }
 
-    // Read content samples for ciphertext validation, UNCONDITIONALLY. Both
-    // remaining sources need them — the keydb can hand out a per-disc terminal
-    // unit key that `decrypt_with` applies as-is (a hash-matching but wrong UK
-    // is only disproved by descrambling real ciphertext), and the online service
-    // validates server-side. Skipped only when there is NO source at all (e.g.
-    // an SSRF-blocked online URL dropped the only source) — then the disc read
-    // is pure wasted I/O and resolution is `NoKey` regardless of samples.
+    // Read content samples for ciphertext validation, UNCONDITIONALLY — both
+    // remaining sources need them (keydb UKs are only disproved by real
+    // ciphertext; online validates server-side). Skipped only if no source.
     inputs.samples = if sources.is_empty() {
         Vec::new()
     } else {

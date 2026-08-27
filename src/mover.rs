@@ -380,13 +380,9 @@ fn copy_counting_cancellable(
     use std::io::{Read, Write};
     use std::sync::atomic::Ordering;
 
-    // Write to a sibling temp on the DEST filesystem, fsync it, then
-    // rename(2) over the final name (atomic within the dest fs). Writing
-    // directly to the final path would leave a truncated file at the real
-    // name if we're SIGKILLed / OOM-killed / lose power mid-copy — the
-    // mover's post-copy size check would then see a wrong-size file and
-    // wedge the move on a phantom Collision. The temp+rename makes the
-    // final name appear only once the bytes are fully written and durable.
+    // Write to a sibling temp on the DEST filesystem, fsync it, then rename(2)
+    // over the final name. Writing directly risks a truncated file at the
+    // real name if killed mid-copy, wedging the move on a phantom Collision.
     let tmp = {
         let mut name = dest.file_name().unwrap_or_default().to_os_string();
         name.push(format!(".part-{}", std::process::id()));
@@ -395,23 +391,17 @@ fn copy_counting_cancellable(
     // Remove any stale temp from a prior interrupted run before we start.
     let _ = std::fs::remove_file(&tmp);
     // The temp name embeds OUR pid, so the line above only clears our own
-    // exact name. Orphaned `.part-<other-pid>` temps from prior crashed runs
-    // (different pid) would otherwise linger forever. Scan the dest parent for
-    // any `<dest-name>.part-*` and remove them before creating the new temp.
+    // name; orphaned `.part-<other-pid>` temps from prior crashed runs
+    // would otherwise linger. Scan the dest parent and remove any of them.
     if let Some(parent) = dest.parent()
         && let Some(stem) = dest.file_name().and_then(|n| n.to_str())
     {
         let prefix = format!("{stem}.part-");
         if let Ok(entries) = std::fs::read_dir(parent) {
             for entry in entries {
-                // Don't `.flatten()` away per-entry errors: a partial
-                // NFS degradation can error on an individual DirEntry,
-                // skipping a `.part-*` orphan we'd otherwise remove. The
-                // current copy still writes its own fresh `.part-<pid>`,
-                // so correctness is unaffected — but without this WARN a
-                // persistently degraded mount would let orphaned temps
-                // accumulate with no operator signal at all. (Mirrors the
-                // no-`flatten()` rationale in `list_staging_basenames`.)
+                // Don't `.flatten()` away per-entry errors: a partial NFS
+                // degradation can error on a DirEntry, skipping a `.part-*`
+                // orphan; without this WARN, orphans accumulate silently.
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => {
@@ -439,16 +429,9 @@ fn copy_counting_cancellable(
         let mut buf = vec![0u8; 4 * 1024 * 1024];
         let mut total = 0u64;
         loop {
-            // Honour SIGTERM between chunks. `move_file`'s shutdown branch
-            // joins this worker and its comment claims the join is "bounded
-            // to its current chunk write" — that was only true if the loop
-            // itself checks, and it didn't: the join blocked for the whole
-            // remaining multi-GB copy while docker stop's 10 s grace ran out
-            // and SIGKILL landed mid-write. Returning Interrupted here takes
-            // the `Err` arm below, which unlinks the `.part-<pid>` temp, so
-            // an aborted copy leaves nothing behind and the next run starts
-            // clean. The source is untouched — `move_file` only unlinks it
-            // after a successful copy.
+            // Honour SIGTERM between chunks: without this the shutdown join
+            // blocks for the whole remaining copy until docker stop's grace
+            // expires and SIGKILL lands mid-write; Interrupted unlinks the temp.
             if cancel() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
@@ -464,11 +447,9 @@ fn copy_counting_cancellable(
             written.store(total, Ordering::Relaxed);
         }
         writer.flush()?;
-        // fsync the temp's data+metadata before the rename: move_file
-        // unlinks the source once this returns Ok, so the destination must
-        // be durable on stable storage first. On a cross-fs (NFS) move,
-        // flush() on a File is a no-op — without sync_all a server/host
-        // crash in the close-to-commit window would lose the only copy.
+        // fsync the temp before rename: move_file unlinks the source once
+        // this returns Ok, so the dest must be durable first. flush() is a
+        // no-op on NFS; without sync_all a crash here loses the only copy.
         writer.sync_all()?;
         Ok(total)
     };
@@ -483,11 +464,9 @@ fn copy_counting_cancellable(
         }
     };
 
-    // fsync the dest parent dir so the temp's dirent is durable, then
-    // rename(2) over the final name (atomic within the fs), then fsync the
-    // dir again so the rename itself is durable before move_file unlinks
-    // the source. A crash at any point leaves either no final-name file or
-    // the complete one — never a truncated file at the real name.
+    // fsync the dest parent dir so the temp's dirent is durable, rename(2)
+    // over the final name, then fsync again so the rename is durable before
+    // move_file unlinks the source: a crash never leaves a truncated file.
     if let Some(parent) = dest.parent() {
         libfreemkv::io::fsync::dir(parent);
     }
@@ -522,12 +501,9 @@ fn check_post_copy_mkv(dst: &Path) -> Result<(), MoveError> {
         return Err(MoveError::MkvBadHead);
     }
 
-    // Tail: confirm the last 8 bytes are readable (the file isn't
-    // truncated to zero and the kernel is willing to surface the tail).
-    // We do NOT structurally parse EBML here — the mux already validated
-    // the stream when it wrote the file; this gate only catches a cp that
-    // truncated the output. Stronger structural parsing would require
-    // dragging in the EBML reader, which is overkill for the move gate.
+    // Tail: confirm the last 8 bytes are readable (not truncated to zero).
+    // We do NOT structurally parse EBML — the mux already validated the
+    // stream on write; this only catches a cp that truncated the output.
     let size = f
         .metadata()
         .map_err(|e| MoveError::Unreadable(e.to_string()))?
@@ -567,13 +543,9 @@ fn check_post_copy_m2ts(dst: &Path) -> Result<(), MoveError> {
         .metadata()
         .map_err(|e| MoveError::Unreadable(e.to_string()))?
         .len();
-    // Require room for two DISTINCT, non-overlapping sample windows. With
-    // a single window (`PKT * SAMPLE_PACKETS`) a file of 8..16 packets
-    // would have its head window (0..1536) overlap the tail window
-    // (End(-1536)), so the same 8 intact head sync bytes get counted
-    // twice and reach THRESHOLD=6 from a single intact head — a tail-
-    // truncated cp would pass. Demanding 2x the sample size keeps head
-    // and tail strictly disjoint.
+    // Require room for two DISTINCT, non-overlapping sample windows: with a
+    // single window a small file's head and tail windows would overlap, so
+    // one intact head could double-count and let a tail-truncated cp pass.
     if size < PKT * SAMPLE_PACKETS * 2 {
         return Err(MoveError::M2tsBadSync);
     }
@@ -603,10 +575,9 @@ fn check_post_copy_m2ts(dst: &Path) -> Result<(), MoveError> {
         }
     }
 
-    // 6 / 16 sync bytes is loose; gives us cushion for a non-BD-TS
-    // m2ts variant with a slightly different prefix layout, while
-    // still catching a truncated cp where the tail packets are all
-    // garbage.
+    // 6 / 16 sync bytes is loose, giving cushion for a non-BD-TS m2ts
+    // variant with a different prefix layout, while still catching a
+    // truncated cp where the tail packets are all garbage.
     if count < THRESHOLD {
         return Err(MoveError::M2tsBadSync);
     }
@@ -617,12 +588,9 @@ fn check_post_copy_m2ts(dst: &Path) -> Result<(), MoveError> {
 /// bypasses the NFS attribute cache. Used for ISO files (no
 /// lightweight structural check available without parsing UDF).
 fn check_post_copy_size(src: &Path, dst: &Path) -> Result<(), MoveError> {
-    // Do NOT default to 0 on a stat failure. The old `unwrap_or(0)`
-    // turned a failed dst stat into "size 0" — and if the src stat also
-    // failed, 0 == 0 validated a *missing* destination, after which
-    // `move_file` would `remove_file(src)` and destroy the only copy of
-    // the bytes. A post-copy destination must always be readable; a stat
-    // error there is itself a validation failure, not a size.
+    // Do NOT default to 0 on a stat failure: the old `unwrap_or(0)` let a
+    // failed dst stat plus a failed src stat validate as 0 == 0, after
+    // which move_file would remove_file(src) and destroy the only copy.
     let dst_size = fresh_metadata(dst)
         .map_err(|e| MoveError::Unreadable(format!("dst stat failed: {e}")))?
         .len();
@@ -651,14 +619,9 @@ pub(crate) fn check_post_copy(src: &Path, dst: &Path) -> Result<(), MoveError> {
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
-    // The structural checks (EBML head/tail, TS sync) only inspect a
-    // fixed-size head/tail window — a cp truncated to anything above
-    // that window (>= a few KiB) still passes them. That is a DATA-LOSS
-    // hazard: a passing validation lets `move_file` unlink the source,
-    // so a short destination becomes the only (broken) copy. Pair every
-    // structural check with the same fresh-FD src-vs-dst size compare the
-    // ISO path already does — the size cross-check is what actually
-    // guarantees the destination isn't truncated.
+    // Structural checks only inspect a fixed head/tail window, so a cp
+    // truncated beyond it still passes (DATA-LOSS: move_file then unlinks
+    // the source). Always pair with the fresh-FD size compare too.
     match ext.as_deref() {
         // mk3d is byte-identical Matroska — same structural + size checks as mkv.
         Some("mkv") | Some("mk3d") => {
@@ -779,25 +742,9 @@ fn classify_done_absence(err_kind: std::io::ErrorKind, dir: &Path) -> DoneAbsenc
         if !dir.exists() {
             return DoneAbsence::InProgress;
         }
-        // `.sweeping` (multi-hour sweep+patch in progress, before `.ripped`)
-        // and `.muxing` (mux worker owns the dir) join the governed set so a
-        // dir in either phase is the by-design "not ready yet" state, not a
-        // stranded `Fault`. The `.sweeping` window was previously ungoverned:
-        // the mover saw no marker every 10s tick and WARN-flooded (182 warns
-        // for one healthy in-progress disc, see the comment in check_and_move).
-        //
-        // Probe the markers via `snapshot_staging_disc`, NOT bare
-        // `dir.join(m).exists()`. On a cold NFS attribute cache (typical right
-        // after a container restart) a single-shot `exists()` can return false
-        // for a marker that is durably on the server — that false-negative
-        // would classify a healthy in-progress sweep as a `Fault` and WARN
-        // every 10s tick for the whole multi-hour window, the exact 182-warn
-        // bug `.sweeping` was added to kill. The snapshot retries `read_dir`
-        // up to 3x with 500ms gaps (the same defense `disc_owned_by_worker`
-        // and the startup resume scan rely on). A `None` snapshot means the
-        // dir contents are unknown (read_dir errored every retry): treat that
-        // as ungoverned and fall through to `Fault` so a genuinely stranded /
-        // unreadable dir still surfaces a WARN.
+        // `.sweeping`/`.muxing` mean "not ready", not stranded `Fault` (else
+        // a 182-warn flood on one healthy disc). Use retrying
+        // `snapshot_staging_disc`, not bare `exists()`, to dodge cold-NFS false negatives.
         let governed = crate::ripper::staging::snapshot_staging_disc(dir)
             .map(|s| {
                 s.has_sweeping
@@ -836,9 +783,8 @@ fn check_and_move(cfg: &Config) {
     };
 
     // Every staging child this pass listed, for the `MOVE_ERRORS` prune
-    // below. Populated for every directory we see, including the ones we
-    // skip — a dir that is still ripping is present, just not ready, and
-    // must keep any error row it already has.
+    // below, including skipped dirs — a still-ripping dir is present but
+    // not ready, and must keep any error row it already has.
     let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for entry in entries {
@@ -864,20 +810,16 @@ fn check_and_move(cfg: &Config) {
 
         let marker_path = dir.join(".done");
 
-        // Readiness + metadata come from the unified `state.json` when present:
-        // a dir is the mover's to file iff `state == Done` (confident hand-off).
-        // Every other state (sweeping/ripped/review/completed/failed/…) is "not
-        // mine yet", handled quietly. Legacy dirs with no `state.json` fall back
-        // to the `.done` file exactly as before. `state_outputs` carries the
-        // per-file episode map for a TV rip (empty for a movie / legacy dir).
+        // Readiness comes from `state.json` when present: a dir is the
+        // mover's to file iff `state == Done`; every other state is "not
+        // mine yet". Legacy dirs with no `state.json` fall back to `.done`.
         let (marker, state_outputs): (serde_json::Value, Vec<crate::ripper::staging::Output>) =
             match crate::ripper::staging::read_state(&dir) {
                 Some(st) => {
                     if st.state != crate::ripper::staging::StagingState::Done {
                         // Not handed off to the mover (in progress, held for
-                        // review, terminal, or already completed). This is the
-                        // by-design "not ready" case for the whole rip+mux phase,
-                        // so keep it quiet — no per-tick WARN spam.
+                        // review, terminal, or completed) — by-design "not
+                        // ready", so keep it quiet: no per-tick WARN spam.
                         tracing::debug!(
                             dir = %dir.display(),
                             state = ?st.state,
@@ -906,10 +848,9 @@ fn check_and_move(cfg: &Config) {
                             }
                         },
                         Err(e) => {
-                            // An ABSENT `.done` on a governed dir is the expected
-                            // in-progress state — quiet debug, skip (the 182-warn
-                            // spam bug). Only a stranded/unreadable dir is a
-                            // fault worth a WARN.
+                            // An ABSENT `.done` on a governed dir is expected
+                            // in-progress state — quiet debug, skip (the
+                            // 182-warn bug). Only a stranded dir is a fault.
                             if classify_done_absence(e.kind(), &dir) == DoneAbsence::InProgress {
                                 tracing::debug!(
                                     dir = %dir.display(),
@@ -917,10 +858,9 @@ fn check_and_move(cfg: &Config) {
                                 );
                                 continue;
                             }
-                            // Stranded/unreadable dir (Fault). WARN ONCE per dir
-                            // — the mover rescans every ~10s and would otherwise
-                            // re-WARN this same dir on every tick forever. First
-                            // sighting → WARN; thereafter → debug.
+                            // Stranded/unreadable dir (Fault). WARN ONCE per
+                            // dir — the mover rescans every ~10s and would
+                            // otherwise re-WARN forever. First → WARN, then debug.
                             let first = STRANDED_WARNED
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -947,10 +887,9 @@ fn check_and_move(cfg: &Config) {
         let disc_name = marker["disc_name"].as_str().unwrap_or("").to_string();
         let display_name = marker["title"].as_str().unwrap_or(&disc_name).to_string();
 
-        // A parsable-but-content-empty marker (both `title` and `disc_name`
-        // absent/empty) carries no usable destination name. Filing it would
-        // route the MKV to the output root under an empty name. Treat as NOT
-        // READY and skip — never `remove_dir_all` or blind-move on this path.
+        // A parsable-but-content-empty marker carries no usable destination
+        // name; filing it would route the MKV to the output root under an
+        // empty name. Treat as NOT READY and skip — never blind-move.
         if display_name.trim().is_empty() {
             tracing::warn!(
                 marker = %marker_path.display(),
@@ -982,21 +921,9 @@ fn check_and_move(cfg: &Config) {
             .as_u64()
             .and_then(|n| u16::try_from(n).ok());
 
-        // Find ripped files. `keep_iso=false` means the operator does not
-        // want the intermediate ISO promoted to the output library — only
-        // the muxed MKV. Pre-0.25.10 this filter accepted any `.iso` in
-        // staging regardless, so the mover happily moved 90+ GB of ISO
-        // bytes to NFS the moment `.done` appeared (the ripper's own
-        // ISO-prune in `rip_disc` only runs after `.done` is written, so
-        // the mover's 10s scan loop typically wins the race). Hit live
-        // (2026-05-20, a 94 GB ISO copied into the movies library). So we
-        // filter the ISO out at planning time; the staging-cleanup branch
-        // below deletes any leftover .iso from disk before tearing the
-        // dir down so we don't leak intermediate ISOs in /staging.
-        //
-        // `output_format == "iso"` also moves the ISO: there the disc image
-        // IS the deliverable (the ripper skipped the title mux), so the
-        // staging dir holds no `.mkv` — only the `.iso` to promote.
+        // Find ripped files. `keep_iso=false` means don't promote the
+        // intermediate ISO (pre-0.25.10 moved 90+ GB ISOs live); filtered
+        // here, except `output_format == "iso"`, where it IS the deliverable.
         let move_iso = cfg.keep_iso || crate::ripper::output_is_iso_image(&cfg.output_format);
         let (mut ripped_files, listing_complete): (Vec<std::path::PathBuf>, bool) =
             match std::fs::read_dir(&dir) {
@@ -1004,11 +931,9 @@ fn check_and_move(cfg: &Config) {
                     collect_ripped_files(entries.map(|r| r.map(|e| e.path())), move_iso, &dir)
                 }
                 Err(e) => {
-                    // Enumerating the staging dir's contents failed (e.g. a
-                    // transient NFS read_dir error). Without this arm the dir
-                    // would be skipped silently every tick — a `.done` marker
-                    // that never gets acted on, invisible on the System page.
-                    // Surface it like every other error path in this function.
+                    // Enumerating the staging dir failed (e.g. transient NFS
+                    // read_dir error). Without this arm the dir is skipped
+                    // silently forever — a `.done` marker never acted on.
                     record_error(
                         &dir.to_string_lossy(),
                         &format!("cannot list staging directory {}: {}", dir.display(), e),
@@ -1018,27 +943,18 @@ fn check_and_move(cfg: &Config) {
                 }
             };
 
-        // For a TV rip, `state_outputs` (from state.json) is the AUTHORITATIVE
-        // deliverable list — file exactly those episodes and nothing else. The
-        // directory scan (`collect_ripped_files`) can also surface a leftover
-        // partial from an episode whose mux/fsync failed and whose delete didn't
-        // land (the fan-out excludes it from `outputs[]` but a swallowed unlink
-        // could leave the file on disk); without this filter that truncated file
-        // would be promoted under its raw name as if it were a complete episode.
-        // Movies / legacy dirs (no episode-bearing plan) keep the scan-and-file
-        // behaviour byte-for-byte.
+        // For a TV rip, `state_outputs` is the AUTHORITATIVE deliverable
+        // list — file exactly those episodes. The dir scan can also surface a
+        // leftover partial from a failed mux; unfiltered it'd promote as complete.
         let is_tv_plan = state_outputs.iter().any(|o| o.episode.is_some());
         if is_tv_plan {
             let allowed: std::collections::HashSet<&str> =
                 state_outputs.iter().map(|o| o.filename.as_str()).collect();
             ripped_files.retain(|p| {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                // Keep the intermediate ISO: `outputs[]` lists only the muxed
-                // episodes, never the ISO, but a `keep_iso` rip legitimately
-                // promotes the ISO to the archive (it reached here via `move_iso`)
-                // — dropping it would leave it un-moved and the staging teardown
-                // would then destroy the very image the operator asked to keep.
-                // The filter only screens out stray/partial EPISODE files.
+                // Keep the intermediate ISO: `outputs[]` never lists it, but a
+                // `keep_iso` rip legitimately promotes it via `move_iso`;
+                // dropping it here would let staging teardown destroy it.
                 is_iso_file(name) || allowed.contains(name)
             });
         }
@@ -1052,12 +968,9 @@ fn check_and_move(cfg: &Config) {
 
         let dir_str = dir.to_string_lossy().to_string();
 
-        // From here on the pass can publish move progress, and can leave by
-        // four different `continue`s. Arm the RAII clear before the first of
-        // them. (Placed after the not-ready skips above, which return before
-        // any progress is published.) Arming also marks this dir's on-disk
-        // basename as the actively-moving one so the Move queue excludes it
-        // (it still carries `.done` throughout the copy).
+        // From here the pass can publish move progress and leave via several
+        // `continue`s, so arm the RAII clear now. This also marks the dir's
+        // basename as actively-moving so the Move queue excludes it.
         let active_dir_name = dir
             .file_name()
             .unwrap_or_default()
@@ -1065,12 +978,9 @@ fn check_and_move(cfg: &Config) {
             .to_string();
         let _move_state = MoveStateGuard::arm(active_dir_name);
 
-        // Build destination paths. For a TV rip, `state_outputs` maps each
-        // staging file to its episode number/name; the mover renames the leaf to
-        // `Show S{NN}E{MM}[ - Name].ext` before foldering it under
-        // `Show (Year)/Season NN/`. A movie (or legacy dir) has no episode
-        // outputs, so the leaf is unchanged — the movie path is byte-for-byte
-        // identical to before.
+        // Build destination paths. For a TV rip, `state_outputs` maps each file
+        // to its episode; the mover renames the leaf to `Show S{NN}E{MM}[ -
+        // Name].ext` under `Show (Year)/Season NN/`. A movie leaf is unchanged.
         let mut planned_moves: Vec<(std::path::PathBuf, String)> = Vec::new();
         for file_path in &ripped_files {
             let filename = file_path
@@ -1084,29 +994,9 @@ fn check_and_move(cfg: &Config) {
             planned_moves.push((file_path.clone(), dest));
         }
 
-        // Two discs of one boxset resolve to the same TMDB title, so they also
-        // resolve to the same destination FILENAME. Giving each its own staging
-        // dir only moves the problem here: disc 2 finally rips, then the
-        // collision guard (rightly) refuses to overwrite disc 1's file and the
-        // operator's disc is stranded with an error instead of filed. So carry
-        // the staging rule through to delivery — `util::disc_variant`, the same
-        // policy, the same code — and give disc 2 `Title (Year)_2.mkv`.
-        //
-        // ONE variant for the whole set of files, not one per file: a rip can
-        // deliver an MKV and its companion ISO, and they must stay a matched
-        // pair (`Title_2.mkv` + `Title_2.iso`), never `_2` and `_3`. So a
-        // variant is only claimable when EVERY planned destination is.
-        //
-        // Variant 1 is the plain name, so a single-disc title — nearly the
-        // whole library — is byte-for-byte unaffected, and a retried move of
-        // the SAME disc re-claims the name it already wrote (see
-        // `dest_claimable_by`) rather than stepping upward on every attempt.
-        //
-        // A destination we could not STAT aborts the search outright
-        // (`uncertain`). A mount hiccup is not evidence of a second disc, and
-        // answering it with a `_2` would deliver beside a file we never looked
-        // at. Keeping the base name hands the decision to the collision guard,
-        // which defers the move and surfaces it — the pre-suffix behaviour.
+        // Two discs of one boxset share a TMDB title/filename; `disc_variant`
+        // gives disc 2 `Title (Year)_2.mkv` instead of a collision. ONE variant
+        // covers the whole file set (MKV+ISO matched); a STAT failure aborts as `uncertain`.
         let mut uncertain = false;
         let variant = crate::util::disc_variant(|n| {
             if uncertain {
@@ -1135,11 +1025,9 @@ fn check_and_move(cfg: &Config) {
                 // the deferral and retries next tick.
             }
             None => {
-                // Every one of the 64 variants is held by a DIFFERENT file we
-                // cannot account for. Leave the base names in place: the
-                // collision guard below then refuses the move, preserves
-                // staging, and surfaces the operator error — exactly the
-                // behaviour before suffixes existed. Never overwrite.
+                // Every one of the 64 variants is held by a DIFFERENT file.
+                // Leave base names in place: the collision guard below then
+                // refuses the move and surfaces the error. Never overwrite.
                 crate::log::syslog(&format!(
                     "Move blocked ({}): every disc-variant destination name is taken by a \
                      different file — resolve the library conflict manually",
@@ -1148,19 +1036,9 @@ fn check_and_move(cfg: &Config) {
             }
         }
 
-        // FAIL-LOUD destination-root validation (Mercy incident hardening).
-        // Before creating ANY per-title subdir, confirm the configured root
-        // (the mount point: movie_dir / tv_dir / iso_dir / output_dir) ALREADY
-        // EXISTS, is a directory, is absolute, and is writable. If the mount
-        // has vanished, ERROR and PRESERVE the output in staging — never
-        // `create_dir_all` a fresh tree (which would resolve into the
-        // container's writable overlay and silently swallow an 80 GB rip).
-        //
-        // A single move can span MORE THAN ONE root: a `keep_iso` delivery
-        // files the MKV under the movie/tv root and its companion ISO under
-        // `iso_dir`. Validate every DISTINCT root involved, not just the movie
-        // root, so a missing/again-unwritable ISO mount is caught with the same
-        // fail-loud guarantee rather than silently landing in the overlay.
+        // FAIL-LOUD destination-root validation (Mercy incident hardening):
+        // confirm the root exists/is a dir/is writable before creating a
+        // subdir — never `create_dir_all` (swallows a rip into the overlay).
         let mut dest_roots: Vec<String> = Vec::new();
         for (src, _dest) in &planned_moves {
             let fname = src.file_name().unwrap_or_default().to_string_lossy();
@@ -1218,16 +1096,9 @@ fn check_and_move(cfg: &Config) {
             continue;
         }
 
-        // Move files. Each artifact (the movie file and, with keep_iso, its
-        // companion ISO) gets its OWN progress bar — one 0→100% per file,
-        // labelled by artifact type ("X-Men: Apocalypse (mkv)" /
-        // "X-Men: Apocalypse (iso)") — rather than one aggregate bar across all
-        // of them. Moves within a dir are sequential, so at any instant one bar
-        // climbs while later ones sit at 0% and completed ones read 100%.
-        //
-        // Seed one MOVE_STATE entry per planned file up front (all at 0%,
-        // carrying each file's own size) so every bar appears immediately; then
-        // each file's on_progress updates its OWN entry, by index.
+        // Move files. Each artifact (movie file, and with keep_iso its ISO)
+        // gets its OWN progress bar, not one aggregate. Seed one MOVE_STATE
+        // entry per file up front (0%) so all bars appear immediately.
         {
             let seeded: Vec<MoveState> = planned_moves
                 .iter()
@@ -1266,50 +1137,9 @@ fn check_and_move(cfg: &Config) {
                     entry.eta = eta;
                 }
             };
-            // Overwrite guard: never clobber an existing destination that is
-            // a DIFFERENT file. A boxset (or a wrong TMDB match) routes two
-            // discs to the same `Title (Year)/Title (Year).ext` name;
-            // overwriting would destroy a good prior rip.
-            //
-            // The disc-variant resolution above has already moved the ordinary
-            // case out of the way: a destination held by a different disc was
-            // given `_2`, `_3`, ... and this guard sees a free path. What
-            // survives here is defence in depth — variant exhaustion, a
-            // destination that changed between resolution and now, and the
-            // stat-error deferral (which the resolver deliberately declines to
-            // answer). Reaching a Collision therefore means a conflict nothing
-            // upstream could account for, and it is still refused and reported.
-            //
-            // A DIFFERENT-size dest is unambiguously a collision. A SAME-size
-            // dest is the tricky case: it is normally the idempotent re-move
-            // (this rip's output was copied on a prior tick whose unlink
-            // failed — move_file returns Skipped/Moved and staging cleans up).
-            // But two DIFFERENT discs can mux to the same byte length, in
-            // which case a same-size dest is a real collision and the
-            // size-only guard would wave it through to a Skipped, then
-            // remove_dir_all would delete the NEW rip while the library keeps
-            // the OLD wrong file. So when sizes are equal we content-probe
-            // (head+tail) to confirm the dest really is this rip's output
-            // before allowing the idempotent path. We must NOT just require
-            // `d.len() > 0` here — that would flag every legitimate same-size
-            // re-move as a permanent Collision and staging would never clean
-            // up (regressing MovedDirty idempotency).
-            //
-            // Use fresh_metadata (fresh-FD stat) on BOTH sides, consistent
-            // with the rest of mover.rs: a cache-served stat here can
-            // mis-size the dest on NFS — either flagging a spurious
-            // Collision (blocking a legitimate move) or missing a real
-            // different-size dest, which move_file's same-size guard then
-            // also misses, letting copy_counting truncate a good library
-            // file. (Note: a regular file always reports is_file via the
-            // fresh-FD stat; fresh_metadata returns Err for a non-file.)
-            // Stat the destination first. A NotFound error means there is no
-            // dest and the move is safe; ANY other stat error is transient
-            // (NFS ESTALE/EIO, a dropped mount) and we must NOT fall through
-            // to the destructive move_file — a transient stat error could
-            // otherwise let a real collision slip past this guard and have
-            // copy_counting truncate a good library file. Defer this entry to
-            // a later tick instead.
+            // Overwrite guard (defence in depth): never clobber a DIFFERENT dest. Same-size
+            // dest is content-probed (head+tail) to distinguish idempotent re-move from a real
+            // collision; non-NotFound stat errors defer instead of risking move_file.
             let dest_meta = match fresh_metadata(Path::new(dest)) {
                 Ok(d) => Some(d),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1360,11 +1190,9 @@ fn check_and_move(cfg: &Config) {
             }
             let outcome = move_file(src, Path::new(dest), &on_progress);
             outcomes.push(outcome);
-            // Peg this artifact's bar to 100% on any successful outcome. A
-            // Skipped (idempotent re-move — already in the library) reports no
-            // progress at all, so without this its bar would sit at the 0% it
-            // was seeded with; Moved/MovedDirty may have stopped a tick short of
-            // 100. Failed/Collision leave the bar where it stalled.
+            // Peg this artifact's bar to 100% on success. Skipped (idempotent
+            // re-move) reports no progress, so it'd sit at 0% otherwise;
+            // Moved/MovedDirty may stop short of 100. Failed/Collision stay stalled.
             if matches!(
                 outcome,
                 MoveOutcome::Moved | MoveOutcome::MovedDirty | MoveOutcome::Skipped
@@ -1390,10 +1218,9 @@ fn check_and_move(cfg: &Config) {
                         ));
                         announced_moving = true;
                     }
-                    // Log the FULL ABSOLUTE destination (filename → path) so
-                    // the operator can always see exactly where the bytes
-                    // landed — never a cwd-relative "movies/Mercy/..." that
-                    // could hide a wrong-filesystem write (Mercy incident).
+                    // Log the FULL ABSOLUTE destination so the operator can
+                    // see exactly where bytes landed — never a cwd-relative
+                    // path that could hide a wrong-filesystem write (Mercy incident).
                     crate::log::syslog(&format!(
                         "Moved {} → {}",
                         src.file_name().unwrap_or_default().to_string_lossy(),
@@ -1452,10 +1279,9 @@ fn check_and_move(cfg: &Config) {
             .iter()
             .any(|o| matches!(o, MoveOutcome::Moved | MoveOutcome::MovedDirty));
 
-        // Surface size-mismatch distinctly from other failures so the operator
-        // knows the destination is the broken side (src is intact). Checked
-        // before `any_failed` so a mixed batch surfaces the more diagnostic
-        // reason; both lead to "leave dir alone, retry next tick".
+        // Surface size-mismatch distinctly so the operator knows the dest is
+        // the broken side (src is intact). Checked before `any_failed` so a
+        // mixed batch surfaces the more diagnostic reason.
         if any_collision {
             record_error(
                 &dir_str,
@@ -1494,16 +1320,9 @@ fn check_and_move(cfg: &Config) {
             continue;
         }
 
-        // Every file this pass could SEE is accounted for — which is not the
-        // same as every file that is there. A per-entry listing error dropped
-        // an entry that was never planned, never copied and never delivered,
-        // and the teardown below is `remove_dir_all`: it would delete that
-        // file and log "Move complete" over the top of it. The listing being
-        // incomplete is exactly as disqualifying as a failed copy, so it is
-        // handled like one — leave the dir, keep the row `collect_ripped_files`
-        // already recorded (with the specific I/O error in it), retry next
-        // tick. Placed after the moves so the entries that DID enumerate are
-        // still delivered; only the destructive half is withheld.
+        // Every file this pass could SEE is accounted for, not every file that IS there: a
+        // listing error drops an entry the destructive remove_dir_all teardown would then
+        // silently delete. Treat like a failed copy: leave the dir and retry next tick.
         if !listing_complete {
             crate::log::syslog(&format!(
                 "Staging teardown skipped — directory could not be fully listed: {}",
@@ -1723,7 +1542,7 @@ fn is_iso_file(filename: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
 }
 
-/// Build the legacy-shaped mover metadata `Value` from a unified [`DiscState`],
+/// Build the legacy-shaped mover metadata `Value` from a unified [`crate::ripper::staging::DiscState`],
 /// so the rest of `check_and_move` reads `marker["title"]`/`["season"]`/… exactly
 /// as it did from the old `.done` JSON body.
 fn mover_marker_value(st: &crate::ripper::staging::DiscState) -> serde_json::Value {
@@ -1782,16 +1601,9 @@ fn build_destination(
     filename: &str,
     season: Option<u16>,
 ) -> String {
-    // Kept/output disc images archive to their own FLAT folder when `iso_dir`
-    // is configured — a sibling of the movie/tv library (e.g.
-    // /mnt/media/isos), not beside the muxed title. `iso_dir` resolves under
-    // `output_dir` with the same relative-joins / absolute-wins semantics as
-    // movie_dir/tv_dir (see `resolve_media_root`). FLAT means one file per
-    // title at `<iso_root>/<Title (Year)>.iso` with NO per-title subfolder (an
-    // ISO archive is a dump, not a Plex tree). Empty `iso_dir` (default) falls
-    // through to the legacy movie/tv "alongside" routing below. The
-    // `.iso.mapfile` is staging-only and never promoted, so only the image
-    // itself reaches here.
+    // Kept/output disc images archive to their own FLAT folder when `iso_dir` is configured,
+    // sibling to the library, not beside the muxed title — one file per title, no per-title
+    // subfolder. Empty `iso_dir` falls through below.
     if is_iso_file(filename) && !cfg.iso_dir.is_empty() {
         let root = resolve_media_root(&cfg.output_dir, &cfg.iso_dir);
         let leaf = match tmdb {
@@ -1810,15 +1622,9 @@ fn build_destination(
         };
         return format!("{root}/{leaf}");
     }
-    // Source extension wins. Pre-0.25.7 this hardcoded ".mkv" for the
-    // movie branch, which collided when keep_iso=true left both the
-    // mux output and the source ISO in staging — both planned to the
-    // same `Title.mkv` destination path. Successive mover ticks then
-    // alternated overwriting one with the other, ultimately destroying
-    // the MKV (observed 2026-05-20). Preserving the source
-    // extension routes companions to distinct paths
-    // (`Title.mkv`, `Title.iso`) and lets the format-aware post-cp
-    // check correctly validate each.
+    // Source extension wins. Pre-0.25.7 this hardcoded ".mkv", which collided when
+    // keep_iso=true left the mux output and source ISO both planning to the same path,
+    // alternately overwriting each other (2026-05-20).
     let src_ext = Path::new(filename)
         .extension()
         .and_then(|e| e.to_str())
@@ -1832,19 +1638,14 @@ fn build_destination(
                 } else {
                     String::new()
                 };
-                // The movie root is `movie_dir` resolved UNDER `output_dir`
-                // (see `resolve_media_root`): a RELATIVE `movie_dir`
-                // ("movies") is joined onto output_dir → /mnt/.../movies; an
-                // ABSOLUTE `movie_dir` wins via Path::join (back-compat).
-                // Pre-fix this used `cfg.movie_dir` standalone, so a relative
-                // "movies" resolved against the container root `/` → `/movies`
-                // (the overlay), the 2026-06 "Mercy" incident.
+                // The movie root is `movie_dir` resolved UNDER `output_dir`: relative joins
+                // onto output_dir, absolute wins (back-compat). Pre-fix a relative "movies"
+                // resolved against container root / — the 2026-06 "Mercy" incident.
                 let root = resolve_media_root(&cfg.output_dir, &cfg.movie_dir);
                 let dir = format!("{root}/{safe_title}{year_str}");
-                // Filename carries the year too, matching the folder and the
-                // Plex/Jellyfin `Title (Year)/Title (Year).ext` convention
-                // (pre-fix the file was bare `Title.ext` — folder had the year
-                // but the file did not).
+                // Filename carries the year too, matching the folder and the Plex/Jellyfin
+                // `Title (Year)/Title (Year).ext` convention (pre-fix the file was bare
+                // `Title.ext`).
                 let name = format!("{safe_title}{year_str}.{src_ext}");
                 format!("{dir}/{name}")
             }
@@ -1852,13 +1653,9 @@ fn build_destination(
                 // Same join fix as the movie branch: `tv_dir` resolved under
                 // `output_dir` (relative joins, absolute wins).
                 let root = resolve_media_root(&cfg.output_dir, &cfg.tv_dir);
-                // Jellyfin/Plex TV layout: `Show (Year)/Season NN/`. The series
-                // folder carries the year (matching the movie branch and aiding
-                // the scrapers' series match); the season subfolder is
-                // zero-padded. Season parsed from the disc label at rip time;
-                // when the label carried none, default to 1 (a series disc with
-                // no season marker is treated as season 1 rather than dumped
-                // loose under the show).
+                // Jellyfin/Plex TV layout: `Show (Year)/Season NN/`, zero-padded. Season is
+                // parsed from the disc label at rip time; when absent, default to 1 rather
+                // than dumping loose under the show.
                 let year_str = if result.year > 0 {
                     format!(" ({})", result.year)
                 } else {
@@ -1868,12 +1665,9 @@ fn build_destination(
                     "{root}/{safe_title}{year_str}/Season {:02}",
                     season.unwrap_or(1)
                 );
-                // Sanitize the leaf too — the movie branch already derives
-                // its leaf from a sanitized title, but this branch used the
-                // RAW source filename, so a filename carrying a path
-                // separator or traversal sequence could escape tv_dir.
-                // sanitize_path_display drops '/' and '\' (keeps '.' and '_'
-                // so the extension and episode tags survive).
+                // Sanitize the leaf too: the movie branch derives its leaf from a sanitized
+                // title, but this branch used the RAW source filename, so a path separator or
+                // traversal sequence could escape tv_dir.
                 let safe_filename = crate::util::sanitize_path_display(filename);
                 format!("{}/{}", dir, safe_filename)
             }
@@ -2005,17 +1799,15 @@ fn destination_root_for(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename:
 /// still created on demand by the caller.
 fn validate_destination_root(root: &str) -> Result<(), String> {
     if root.is_empty() {
-        // An empty root means "no configured dir"; `build_destination`
-        // only routes here via `output_dir`, which defaults to a non-empty
-        // path. An empty string would `create_dir_all("")` → cwd-relative
-        // writes, exactly the silent-wrong-path failure we're closing.
+        // An empty root means "no configured dir". An empty string would
+        // `create_dir_all("")` → cwd-relative writes, the exact
+        // silent-wrong-path failure this check exists to close.
         return Err("destination root is empty (no output/movie/tv directory configured)".into());
     }
     let root_path = Path::new(root);
-    // 1. The root must be ABSOLUTE. A relative root (e.g. `movies`) resolves
-    //    against the process cwd — which is how the incident produced the
-    //    relative "Moved to movies/Mercy/..." log and wrote inside the
-    //    container. A destination mount is always an absolute path.
+    // 1. The root must be ABSOLUTE. A relative root resolves against the
+    //    process cwd — how the incident wrote inside the container. A
+    //    destination mount is always an absolute path.
     if !root_path.is_absolute() {
         return Err(format!(
             "destination root '{root}' is not an absolute path; \
@@ -2040,9 +1832,8 @@ fn validate_destination_root(root: &str) -> Result<(), String> {
         }
     }
     // 3. The root must be WRITABLE. Probe by creating + removing a unique
-    //    temp marker inside it (honest test of dir write/exec perms, RO
-    //    filesystem, NFS squash). Unique-named so concurrent ticks / a real
-    //    `<root>/.autorip-writable-probe` can't collide.
+    //    temp marker (honest test of dir write/exec perms, RO fs, NFS
+    //    squash); unique-named so concurrent ticks can't collide.
     let probe = root_path.join(format!(
         ".autorip-writable-probe-{}-{}",
         std::process::id(),
@@ -2081,12 +1872,9 @@ fn validate_destination_root(root: &str) -> Result<(), String> {
 /// preserves output in staging. This just surfaces the problem early.
 pub(crate) fn check_configured_destinations(cfg: &Config) -> Vec<(String, String)> {
     let mut problems = Vec::new();
-    // Validate the RESOLVED roots — the same `output_dir`-joined paths the
-    // move actually uses (`resolve_media_root`), not the raw relative
-    // `movie_dir` / `tv_dir`. Without this the early check would flag a
-    // perfectly-valid relative "movies" as "not absolute" even though it
-    // resolves to a present /mnt/.../movies (and conversely would miss a
-    // join that lands somewhere missing).
+    // Validate the RESOLVED roots — the same joined paths the move actually
+    // uses, not the raw relative `movie_dir`/`tv_dir`. Otherwise this would
+    // flag a valid relative "movies" as "not absolute", or miss a bad join.
     let movie_root = if cfg.movie_dir.is_empty() {
         None
     } else {
@@ -2135,43 +1923,36 @@ fn absolute_for_log(dest: &str) -> String {
 /// Move a file with idempotent retry semantics.
 ///
 /// 1. **Pre-flight**: if `dest` is a regular file with the same size as
-///    `src`, treat the move as already done (`Skipped`). This is the
-///    circuit breaker for the "cp succeeded but unlink failed" loop —
-///    on the next tick we re-detect the completed dest and don't
-///    re-copy 50+ GB across the network.
+///    `src`, matching head/tail content, and passing `check_post_copy`,
+///    treat the move as already done (`Skipped`). This is the circuit
+///    breaker for the "cp succeeded but unlink failed" loop — on the next
+///    tick we re-detect the completed dest and don't re-copy 50+ GB across
+///    the network. A same-size dest with different content is a `Collision`;
+///    a same-size dest that fails post-copy validation falls through to a
+///    real copy.
 ///
 /// 2. **Atomic path**: try `rename(2)`. On the same filesystem this is
 ///    instant and unlinks src for free.
 ///
-/// 3. **Cross-fs / fallback**: `std::fs::copy` on a worker thread
-///    (v0.25.7 — pre-0.25.7 this shelled out to `cp -f --`), then try
-///    to unlink src. If unlink fails (typical NFS squash-perm scenario
-///    where the staging dir is owned by an identity the container
-///    can't write into), return `MovedDirty` so the caller can
-///    surface the orphan to the UI.
+/// 3. **Cross-fs / fallback**: `copy_counting` (a buffered chunked copy) on
+///    a worker thread, then try to unlink src. If unlink fails (typical NFS
+///    squash-perm scenario where the staging dir is owned by an identity
+///    the container can't write into), return `MovedDirty` so the caller
+///    can surface the orphan to the UI.
 ///
 /// Worker thread + polling loop here prevents NFS/CIFS stalls from
 /// blocking the main autorip thread. Calls `on_progress(pct, gb_done,
 /// gb_total, speed_mbs)` every 1 s while the copy is running.
 fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -> MoveOutcome {
-    // Fresh-FD stat on both sides (consistent with the rest of mover.rs):
-    // a cache-served stat on NFS can mis-size either side, spuriously
-    // tripping the matching-content Skipped pre-flight or the src-missing
-    // Moved pre-flight below.
+    // Fresh-FD stat on both sides: a cache-served stat on NFS can mis-size
+    // either side, spuriously tripping the Skipped or src-missing Moved
+    // pre-flights below.
     let src_meta = fresh_metadata(src);
     let dest_meta = fresh_metadata(dest);
 
-    // Pre-flight: dest already has matching content. Stops the infinite
-    // re-copy loop when src can't be unlinked.
-    //
-    // Defensive content probe: the move-loop caller already gates this with
-    // `same_head_and_tail` before calling us, but equal LENGTH alone does
-    // not prove equal CONTENT — a wrong title match can route two distinct
-    // discs to the same path with byte-identical mux lengths. If `move_file`
-    // is ever called WITHOUT the caller guard (a future refactor, a new
-    // call site), trusting size-only here would silently keep the wrong file
-    // as "already moved". Re-confirm head+tail so the skip can never clobber
-    // a different file; a mismatch surfaces as a Collision instead.
+    // Pre-flight: dest already matches, stopping the infinite re-copy loop when src can't
+    // unlink. The caller gates this with same_head_and_tail, but equal LENGTH alone doesn't
+    // prove equal CONTENT; re-confirm here so a future caller can't clobber a different file.
     if let (Ok(s), Ok(d)) = (&src_meta, &dest_meta)
         && s.is_file()
         && d.is_file()
@@ -2179,12 +1960,9 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
         && s.len() > 0
     {
         if same_head_and_tail(src, dest) {
-            // Equal length + matching head/tail still isn't proof of a
-            // DURABLE dest: a prior copy that failed post-copy validation
-            // (short/structurally-invalid on NFS) can leave a dest that
-            // happens to match these cheap probes. Run the same fresh-FD
-            // post-copy validation the copy path runs before accepting it
-            // as already-moved; on failure, fall through to a real copy.
+            // Equal length + matching head/tail still isn't proof of a DURABLE dest: a prior
+            // copy that failed post-copy validation can match these cheap probes. Re-run
+            // validation before treating it as already-moved.
             if check_post_copy(src, dest).is_ok() {
                 clear_stale_dest_error(dest);
                 return MoveOutcome::Skipped;
@@ -2202,32 +1980,9 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             return MoveOutcome::Collision;
         }
     }
-    // Pre-flight: src missing but dest present — earlier rename succeeded.
-    //
-    // Must be a genuine NotFound, not a bare `Err(_)`. Any OTHER stat
-    // failure (EACCES from a permission change, EIO from a failing disk,
-    // ESTALE on NFS) means src's fate is UNKNOWN — it may still be present
-    // and be the only good copy, e.g. a `MovedDirty` leftover from a prior
-    // tick whose unlink of src failed after a successful cross-fs copy. A
-    // stale PARTIAL at dest from an unrelated earlier attempt would also
-    // satisfy `is_file() && len() > 0` with no size/content check possible
-    // (src_meta is unavailable), so treating any error as "src is gone" can
-    // report `Moved` for a dest that is actually garbage — the caller then
-    // tears down the staging dir, permanently losing the real src. Matches
-    // the convention already used elsewhere in this file (`:585`, `:707`,
-    // `:717`) of branching on `ErrorKind::NotFound` specifically rather than
-    // treating every stat error alike.
-    //
-    // A non-NotFound error intentionally falls through to the rename/copy
-    // attempt below instead of returning here: that is a deliberate "we
-    // don't know src's state, so try the normal path and let it fail
-    // safely on its own terms" rather than second-guessing it with a new
-    // outcome. That fall-through is safe for dest: if the copy attempt then
-    // fails to even open src (same underlying fault), the failure-cleanup
-    // arms below delete dest ONLY when `dest_absent_before` — a dest that
-    // pre-dates this attempt, as it does here, is left in place. See the
-    // `dest_absent_before` doc below for why "unknown prior state" must not
-    // authorise a delete either.
+    // Pre-flight: src missing but dest present. Must be a genuine NotFound — any OTHER stat
+    // error leaves src's fate UNKNOWN, so treating it as gone could report Moved for garbage
+    // and destroy the real src. Non-NotFound falls through to the copy path instead.
     if let (Err(e), Ok(d)) = (&src_meta, &dest_meta)
         && e.kind() == std::io::ErrorKind::NotFound
         && d.is_file()
@@ -2242,38 +1997,17 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
     }
 
     let dest_str = dest.to_string_lossy().to_string();
-    // Did `dest` positively NOT exist before this attempt started?
-    //
-    // `dest_meta` was taken above, BEFORE any byte was written, so it is the
-    // only evidence of dest's prior state. The failure-cleanup arms below may
-    // only delete `dest` when this is true — anything else at that name
-    // PRE-DATES us and is not ours to remove. It is routinely a complete,
-    // validated copy: a `MovedDirty` leftover (copy ok, unlink of src failed
-    // on an earlier tick). If src then develops a persistent stat/open fault,
-    // an unconditional cleanup would delete the only readable copy while src
-    // sits stuck — unrecoverable loss.
-    //
-    // Only a genuine NotFound counts, matching the convention used by the
-    // src-missing pre-flight above (`:585`, `:707`, `:717`): any OTHER stat
-    // error (EACCES on an existing-but-unreadable dest, ESTALE on NFS) leaves
-    // dest's prior state UNKNOWN, and "unknown" must not authorise a delete.
-    //
-    // Keeping a pre-existing dest cannot wedge the next tick: the Skipped
-    // pre-flight needs equal size AND matching content AND a passing
-    // post-copy validation, so a stale/partial leftover simply falls through
-    // to the rename/copy path and is overwritten (see
-    // `move_file_overwrites_when_dest_size_differs`).
+    // Did `dest` positively NOT exist before this attempt? Failure-cleanup below may only
+    // delete dest when true — anything else pre-dates us, routinely a valid MovedDirty
+    // leftover. Only genuine NotFound counts; any other stat error leaves prior state UNKNOWN.
     let dest_absent_before =
         matches!(&dest_meta, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     let src_size = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let total_gb = src_size as f64 / crate::util::BYTES_PER_GIB;
 
-    // In-process copy on a worker thread: plain buffered read/write loop
-    // (`copy_counting`) counting bytes as written, for live progress. Kernel
-    // fast paths (copy_file_range/sendfile) don't apply here (cross-filesystem).
-    // Progress comes from the byte counter, not NFS stat() — stat on NFS
-    // lags and would pin the bar at 0 % for the whole copy. Post-copy
-    // validation runs before unlink; src stays intact on any failure.
+    // In-process copy on a worker thread (`copy_counting`), counting bytes
+    // for live progress — not NFS stat(), which lags and would pin the bar
+    // at 0%. Post-copy validation runs before unlink; src stays intact on failure.
     let src_owned = src.to_path_buf();
     let dest_owned = dest.to_path_buf();
     let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2289,21 +2023,17 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             Ok(Ok(_bytes)) => {
                 let _ = copy_handle.join();
                 on_progress(100, total_gb, total_gb, 0.0);
-                // Post-copy validation. v0.25.3 made this format-aware
-                // (EBML head+tail for mkv, TS-sync for m2ts, fresh-FD
-                // stat for iso) so NFS attribute cache can't phantom-
-                // fail it. Runs BEFORE the unlink so src bytes stay
-                // intact on any mismatch — the operator can retry.
+                // Post-copy validation is format-aware (EBML head+tail for
+                // mkv, TS-sync for m2ts, fresh-FD stat for iso) so the NFS
+                // attribute cache can't phantom-fail it. Runs before unlink.
                 if let Err(e) = check_post_copy(src, Path::new(&dest_str)) {
                     crate::log::syslog(&format!(
                         "Post-cp validation failed for {}: {}",
                         dest_str, e
                     ));
-                    // Map the failure KIND to the outcome so the operator
-                    // gets an accurate hint. Only a true length disagreement
-                    // is SizeMismatch (ENOSPC / short-write hint); structural
-                    // and readability failures get the generic PostCopyInvalid
-                    // path instead of a misleading size hint.
+                    // Map failure KIND to outcome for an accurate operator
+                    // hint: only a length disagreement is SizeMismatch;
+                    // structural/readability failures get PostCopyInvalid.
                     return match e {
                         MoveError::SizeDoesNotMatch { .. } => MoveOutcome::SizeMismatch,
                         MoveError::MkvBadHead
@@ -2320,41 +2050,15 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
             }
             Ok(Err(e)) => {
                 let _ = copy_handle.join();
-                // Remove the partial/truncated destination so the next tick
-                // retries cleanly instead of seeing a phantom size-mismatch
-                // Collision (which would wedge the move permanently). If the
-                // removal ITSELF fails, the stuck partial silently wedges the
-                // move — surface it so the operator can delete it by hand.
-                //
-                // NotFound is NOT such a failure: `copy_counting` writes to a
-                // sibling `.part-<pid>` and only renames over the final name
-                // once the bytes are durable, so the overwhelmingly common
-                // failed-copy shape (ENOSPC, EACCES, a dropped mount) leaves
-                // NOTHING at `dest`. Recording an error there told the operator
-                // to hand-delete a file that does not exist, and — because that
-                // entry is keyed by the DESTINATION path, which no later tick
-                // ever clears (only the staging-dir key is cleared on a clean
-                // move) — the bogus row stuck on the System page until it was
-                // dismissed by hand. Only a real, still-present leftover is
-                // worth surfacing.
-                //
-                // And it is only OURS to remove when `dest` was positively
-                // absent before this attempt (`dest_absent_before`). A dest
-                // that pre-dates us is a different file — typically a
-                // complete `MovedDirty` copy — and deleting it here destroys
-                // the only good bytes when src is the side that is faulting.
+                // Remove the partial destination so the next tick retries cleanly instead of a
+                // phantom size-mismatch Collision. Only when dest was positively absent before
+                // (dest_absent_before) — else it's typically a valid MovedDirty copy.
                 if dest_absent_before {
                     match std::fs::remove_file(&dest_str) {
                         Ok(()) => {}
-                        // Record ONLY a leftover that is really there. Testing
-                        // the errno is not the same question: `unlink` in a
-                        // directory the container cannot write reports the
-                        // permission failure (EACCES), not ENOENT, even when
-                        // there is no file at that name — which is precisely
-                        // the NFS-squash export this hint is written for. The
-                        // errno filter therefore missed its own scenario and
-                        // told the operator to hand-delete a file that never
-                        // existed. Ask the filesystem what is there instead.
+                        // Record ONLY a leftover that is really there: unlink in a dir the
+                        // container cannot write reports EACCES, not ENOENT, even with no file
+                        // there. Ask the filesystem instead.
                         Err(rm) => {
                             if Path::new(&dest_str).exists() {
                                 record_error(
@@ -2387,23 +2091,14 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
                 return MoveOutcome::Failed;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                // Honor SIGTERM mid-copy: the run() loop's SHUTDOWN-aware
-                // sleep only gates BETWEEN ticks, so without this a multi-GB
-                // cross-fs copy would run to completion ignoring the signal,
-                // and docker stop's 10 s grace would SIGKILL mid-write. Join
-                // the worker and bail. The join is bounded to the worker's
-                // current 4 MiB chunk because `copy_counting`'s loop polls
-                // the SAME flag at the top of every iteration — without that
-                // poll (it was missing until this audit) this join waited out
-                // the entire remaining copy, i.e. exactly the multi-GB stall
-                // the branch exists to avoid.
+                // Honor SIGTERM mid-copy: run()'s shutdown sleep only gates BETWEEN ticks, so
+                // a copy would otherwise run until docker stop's grace expires and SIGKILL
+                // lands mid-write. Join is bounded to one chunk.
                 if crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = copy_handle.join();
-                    // Drop the partial destination (see Ok(Err) arm) so a
-                    // restart's first tick doesn't wedge on a size-mismatch
-                    // Collision against this interrupted copy — but only if
-                    // this attempt could have created it; a pre-existing dest
-                    // is not ours to delete on the way out.
+                    // Drop the partial destination so a restart's first tick doesn't wedge on
+                    // a size-mismatch Collision — but only if this attempt could have created
+                    // it; a pre-existing dest is not ours to delete.
                     if dest_absent_before {
                         let _ = std::fs::remove_file(&dest_str);
                     }
@@ -2668,14 +2363,9 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Drive 4K UHD mis-file (2026-07-22): a disc that rips but gets NO TMDB
-    // match writes `media_type: ""` into its .done marker. That empty string
-    // must route as a movie (the documented absent-default), filing under
-    // movies/Title (Year)/ — NOT fall through to the output_dir ROOT, which
-    // dumped the 53 GB MKV at the bare library root as
-    // `/mnt/media//Drive 2011 - 4K Ultra HD.mkv` (no per-title folder).
-    // ===================================================================
+    // Drive 4K UHD mis-file (2026-07-22): a disc with NO TMDB match writes media_type: "" into
+    // its .done marker, which must route as a movie — not fall through to output_dir ROOT,
+    // which dumped a 53 GB MKV at the bare library root.
     #[test]
     fn build_destination_empty_media_type_files_as_movie() {
         let cfg = cfg_with_dirs("movies", "tv", "/mnt/media/");
@@ -2710,14 +2400,9 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Mercy incident ROOT CAUSE (2026-06): a RELATIVE `movie_dir` must be
-    // joined UNDER `output_dir`, not used standalone. Pre-fix,
-    // build_destination used `cfg.movie_dir` ("movies") directly,
-    // so the dest was "movies/Mercy (2024)/..." → resolved against the
-    // container root `/` → "/movies/..." (the ephemeral overlay), NOT the
-    // NFS mount. The fix joins movie_dir under output_dir.
-    // ===================================================================
+    // Mercy incident ROOT CAUSE (2026-06): a RELATIVE movie_dir must join UNDER output_dir,
+    // not be used standalone. Pre-fix, build_destination used cfg.movie_dir directly,
+    // resolving against the container root / (the ephemeral overlay) instead of the NFS mount.
     #[test]
     fn build_destination_relative_movie_dir_joins_under_output_dir() {
         // Reproduces the Mercy incident config (relative movie_dir, NFS output_dir).
@@ -3033,10 +2718,8 @@ mod tests {
 
     #[test]
     fn build_destination_movie_preserves_iso_extension() {
-        // Bug fix: pre-0.25.7 a keep_iso=true rip left both .mkv and
-        // .iso in staging; build_destination hardcoded ".mkv" so both
-        // planned to the same path and the mover overwrote one with
-        // the other in alternating ticks. Source extension must win.
+        // Bug fix: pre-0.25.7 a keep_iso=true rip left .mkv and .iso both
+        // planning to a hardcoded ".mkv" path, alternately overwritten.
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Lumina", 2023));
         let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso", None);
@@ -3059,12 +2742,9 @@ mod tests {
 
     #[test]
     fn iso_dir_routes_iso_flat_to_its_own_root_relative() {
-        // A RELATIVE iso_dir joins under output_dir (like movie_dir/tv_dir).
-        // The ISO lands FLAT — one file per title, no per-title subfolder —
-        // while the MKV companion still files into the movie tree. The two
-        // must not collide. `resolve_media_root` uses native Path::join, so a
-        // relative sub yields a backslash on the Windows CI leg; normalise the
-        // separator before asserting the (always-Unix-in-production) path.
+        // A RELATIVE iso_dir joins under output_dir; the ISO lands FLAT while
+        // the MKV companion still files into the movie tree — must not
+        // collide. Path::join yields a backslash on Windows CI; normalise.
         let mut cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         cfg.iso_dir = "isos".into();
         let tmdb = Some(tmdb_movie("Lumina", 2023));
@@ -3101,10 +2781,8 @@ mod tests {
 
     #[test]
     fn destination_root_for_selects_iso_root_only_for_iso_files() {
-        // The move loop validates the DISTINCT set of roots; with iso_dir set a
-        // keep_iso delivery spans the movie root AND the iso root, and both must
-        // be validated. destination_root_for is the per-file selector that makes
-        // that split visible.
+        // The move loop validates the DISTINCT set of roots; with iso_dir set,
+        // a keep_iso delivery spans movie root AND iso root, both validated.
         let mut cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         cfg.iso_dir = "isos".into();
         let tmdb = Some(tmdb_movie("Lumina", 2023));
@@ -3269,11 +2947,9 @@ mod tests {
         let src = tmp.path().join("a.mkv");
         std::fs::write(&src, b"source bytes").unwrap();
 
-        // dest sits under a path whose "parent" is a regular FILE, not a
-        // directory. Both rename(2) and File::create(dest) then fail with
-        // ENOTDIR — exercising the copy branch's failure cleanup without a
-        // cross-filesystem mount. No dest can ever be created here, so the
-        // post-condition "no partial dest left" must hold.
+        // dest's "parent" is a regular FILE, so rename(2)/File::create both
+        // fail ENOTDIR — exercises the failure cleanup without needing a
+        // cross-fs mount. No dest can ever be created, so none must remain.
         let not_a_dir = tmp.path().join("blocker");
         std::fs::write(&not_a_dir, b"x").unwrap();
         let dest = not_a_dir.join("b.mkv");
@@ -3287,12 +2963,9 @@ mod tests {
 
     #[test]
     fn move_file_does_not_skip_an_invalid_same_size_dest() {
-        // Regression (finding 9): the Skipped pre-flight accepted a
-        // pre-existing dest on equal length + matching head/tail WITHOUT the
-        // post-copy validation the copy path runs. A dest left undurable by a
-        // prior failed copy (here: structurally invalid — no EBML magic) must
-        // NOT be treated as already-moved. With src present, rename now
-        // overwrites it → Moved, not Skipped.
+        // Regression (finding 9): the Skipped pre-flight accepted a dest on
+        // equal length + matching head/tail WITHOUT post-copy validation. A
+        // structurally invalid dest must not be treated as already-moved.
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("a.mkv");
         let dest = tmp.path().join("b.mkv");
@@ -3381,12 +3054,9 @@ mod tests {
 
     #[test]
     fn move_file_collides_when_dest_same_size_different_content() {
-        // Atomicity/safety contract: when the destination already holds a
-        // DIFFERENT file of the SAME length (a wrong-title match routing two
-        // discs to one path with byte-identical mux lengths), move_file must
-        // NOT clobber it. It returns Collision and leaves BOTH files intact so
-        // the operator can disambiguate — never silently overwriting the
-        // existing title.
+        // Atomicity/safety contract: when the dest already holds a DIFFERENT
+        // file of the SAME length, move_file must NOT clobber it — it
+        // returns Collision and leaves both files intact for the operator.
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("a.mkv");
         let dest = tmp.path().join("b.mkv");
@@ -3514,10 +3184,9 @@ mod tests {
         Some(m.dev())
     }
 
-    // Helpers for the structural checks. Real MKVs are EBML-framed
-    // with the magic [1A 45 DF A3] at offset 0. Real BD-TS .m2ts uses
-    // 192-byte packets with TS sync 0x47 at offset 4 within each
-    // packet.
+    // Helpers for the structural checks: real MKVs are EBML-framed with
+    // magic [1A 45 DF A3] at offset 0; real BD-TS .m2ts uses 192-byte
+    // packets with TS sync 0x47 at offset 4 within each packet.
 
     fn write_minimal_mkv(path: &std::path::Path, payload: &[u8]) {
         let mut bytes = vec![0x1A, 0x45, 0xDF, 0xA3];
@@ -3564,10 +3233,9 @@ mod tests {
         let src = tmp.path().join("src.iso");
         let dst = tmp.path().join("never_created.iso");
         std::fs::write(&src, b"some bytes").unwrap();
-        // A missing destination must surface as an error — never as a
-        // silent pass. Previously fresh_metadata's Err defaulted to 0
-        // for both sides (0 == 0) and validated the missing dst, which
-        // would let move_file unlink the source ISO and lose the bytes.
+        // A missing destination must surface as an error, never a silent
+        // pass: fresh_metadata's Err previously defaulted to 0 on both
+        // sides (0 == 0), letting move_file unlink the source and lose it.
         let err = check_post_copy(&src, &dst).unwrap_err();
         assert!(matches!(err, MoveError::Unreadable(_)), "got {:?}", err);
     }
@@ -3600,10 +3268,8 @@ mod tests {
     #[test]
     fn check_post_copy_mk3d_runs_matroska_structural_check() {
         // mk3d is byte-identical Matroska, so check_post_copy must route it
-        // through the same structural EBML validation as mkv (line-500 arm).
-        // A valid EBML head + tail passes; a bad head is rejected. Mutation
-        // check: drop "mk3d" from that arm and it falls to the size-only
-        // fallback, so the bad-head case would wrongly pass.
+        // through the same structural EBML validation as mkv. Mutation check:
+        // drop "mk3d" from that arm and the bad-head case would wrongly pass.
         let tmp = tempfile::tempdir().unwrap();
 
         // Valid mk3d passes the structural + size check.
@@ -3723,16 +3389,9 @@ mod tests {
 
     #[test]
     fn check_and_move_skips_iso_when_keep_iso_false() {
-        // Regression for 0.25.10: pre-fix, the mover blindly moved ANY
-        // .iso it found in a .done staging dir. Result: a 90+ GB
-        // intermediate ISO landed in the user's movie library
-        // (observed 2026-05-20, an ISO promoted into the movie
-        // library) even though keep_iso=false was set, because the
-        // mover's 10 s scan loop ran before the ripper's post-mux
-        // ISO-prune did. The fix: filter .iso out of the planned-moves
-        // set when keep_iso=false; the existing `remove_dir_all` cleanup
-        // at the end of check_and_move then sweeps the orphan ISO out
-        // of staging when the .mkv move succeeds.
+        // Regression for 0.25.10: pre-fix the mover blindly moved ANY .iso in a .done dir,
+        // landing a 90+ GB ISO in the movie library (2026-05-20) even with keep_iso=false,
+        // since the scan loop beat the ripper's ISO-prune.
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
         let movie_dir = tmp.path().join("output/Movies");
@@ -3778,11 +3437,9 @@ mod tests {
 
     #[test]
     fn check_and_move_delivers_mk3d_main_feature() {
-        // Regression: a Blu-ray 3D rip stages `<title>.mk3d` (byte-identical
-        // Matroska, only the extension differs so players surface it as 3D).
-        // The staging-scan extension whitelist must recognize `mk3d` for
-        // delivery — if it's dropped, a 3D rip silently never leaves staging.
-        // Mutation check: remove "mk3d" from the whitelist and this fails.
+        // Regression: a Blu-ray 3D rip stages <title>.mk3d (byte-identical Matroska). The
+        // staging-scan extension whitelist must recognize mk3d for delivery — if dropped, a 3D
+        // rip silently never leaves staging.
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
         let movie_dir = tmp.path().join("output/Movies");
@@ -3819,12 +3476,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn check_and_move_records_error_when_inner_read_dir_fails() {
-        // Regression: when read_dir on the staging disc dir fails (e.g. a
-        // transient NFS error) after the .done marker is already parsed,
-        // the dir must NOT be skipped silently. Pre-fix the `Err(_) =>
-        // continue` arm dropped the failure with no record_error and no
-        // log, leaving a .done-marked dir that the mover re-evaluated and
-        // re-skipped every tick, invisible on the System page.
+        // Regression: when read_dir on the staging disc dir fails after .done is parsed, the
+        // dir must NOT be skipped silently. Pre-fix this dropped the failure with no
+        // record_error/log, invisible on the System page.
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -3864,11 +3518,9 @@ mod tests {
 
     #[test]
     fn check_and_move_moves_iso_when_keep_iso_true() {
-        // Companion to the regression above: with keep_iso=true the
-        // operator explicitly wants the ISO promoted alongside the
-        // MKV. The 0.25.7 build_destination fix already routes them to
-        // distinct paths (Title.iso vs Title.mkv); this test just
-        // pins the filter behaviour on the cfg flag.
+        // Companion to the regression above: with keep_iso=true the operator explicitly wants
+        // the ISO promoted alongside the MKV. The build_destination fix already routes them to
+        // distinct paths; this pins the filter behaviour.
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
         let movie_dir = tmp.path().join("output/Movies");
@@ -4349,11 +4001,9 @@ mod tests {
 
     #[test]
     fn check_post_copy_mkv_rejects_truncated_above_head_window() {
-        // Load-bearing: a structurally-valid head/tail must NOT pass
-        // when the destination is shorter than the source. Pre-fix the
-        // mkv arm did head+tail only, so a copy truncated to anything
-        // above the 5-byte tail window passed and move_file then unlinked
-        // the only complete copy.
+        // Load-bearing: a structurally-valid head/tail must NOT pass when
+        // dest is shorter than src. Pre-fix the mkv arm did head+tail only,
+        // so a truncated copy passed and move_file unlinked the only copy.
         let dir = scratch_dir("mkv-trunc");
         let src = dir.join("src.mkv");
         let dst = dir.join("dst.mkv");
@@ -4373,10 +4023,9 @@ mod tests {
 
     #[test]
     fn check_post_copy_m2ts_rejects_truncated_above_head_window() {
-        // Load-bearing: same as mkv but for the TS-sync path. A copy
-        // truncated to fewer packets than src — but still enough intact
-        // head+tail sync bytes to clear THRESHOLD — must be rejected by
-        // the size cross-check.
+        // Load-bearing: same as mkv but for the TS-sync path. A copy with
+        // fewer packets than src, yet enough intact sync bytes to clear
+        // THRESHOLD, must still be rejected by the size cross-check.
         let dir = scratch_dir("m2ts-trunc");
         let src = dir.join("src.m2ts");
         let dst = dir.join("dst.m2ts");
@@ -4394,9 +4043,8 @@ mod tests {
     #[test]
     fn check_post_copy_m2ts_rejects_overlapping_window_truncation() {
         // Secondary case: an 8..16-packet m2ts is too small for two disjoint
-        // sample windows; pre-fix the head and tail windows overlapped and
-        // a single intact head was counted twice to clear THRESHOLD. The
-        // size floor (2x sample) now rejects such a file outright.
+        // sample windows; pre-fix, the overlap let a single intact head
+        // count twice to clear THRESHOLD. The 2x size floor now rejects it.
         let dir = scratch_dir("m2ts-overlap");
         let dst = dir.join("dst.m2ts");
         write_minimal_m2ts(&dst, 10); // 1920 bytes — between 1536 and 3072
@@ -4413,14 +4061,9 @@ mod tests {
 
     #[test]
     fn check_post_copy_m2ts_threshold_is_out_of_sixteen_not_eight() {
-        // Regression for the line-390 doc bug: THRESHOLD=6 is counted across
-        // BOTH the head (8) and tail (8) sample windows — 6 out of 16, not
-        // 6 out of 8. Prove it behaviorally: a file with exactly 3 sync bytes
-        // in the head window and 3 in the tail window (6 total, but only 3 in
-        // any single window) must PASS. If the gate were truly "6 of 8 per
-        // window" this would be rejected. Calling the m2ts checker directly
-        // sidesteps check_post_copy's size cross-check so only the sync logic
-        // is under test.
+        // Regression for the line-390 doc bug: THRESHOLD=6 counts across BOTH the head (8) and
+        // tail (8) windows — 6 of 16, not 6 of 8. Prove it: a file with 3 sync bytes in each
+        // window (3 per window) must still PASS.
         const PKT: usize = 192;
         const SYNC_OFFSET: usize = 4;
         const PACKETS: usize = 24; // head=0..8, tail=16..24, disjoint middle gap
@@ -4454,11 +4097,9 @@ mod tests {
 
     #[test]
     fn check_post_copy_mkv_tail_comment_does_not_claim_64kib_ebml_scan() {
-        // Regression for the line-349 doc bug: the MKV tail comment used to
-        // claim it "read the last 64 KiB and confirm at least one well-formed
-        // EBML element close" — neither of which the code does (it reads 8
-        // tail bytes). Source-pin the corrected comment so the false claim
-        // can't creep back in.
+        // Regression for the line-349 doc bug: the MKV tail comment used to claim it reads 64
+        // KiB and confirms a well-formed EBML close — neither is true (it reads 8 tail bytes).
+        // Source-pin the corrected comment.
         let src = crate::util::source_lf(include_str!("mover.rs"));
         let start = src
             .find("fn check_post_copy_mkv")
@@ -4945,15 +4586,9 @@ mod tests {
 
     #[test]
     fn check_and_move_idempotent_same_size_same_content_cleans_up() {
-        // Regression guard: the content-aware collision check must NOT
-        // break the legitimate idempotent re-move. A prior tick copied the
-        // file to the library (same content, same size); on a later tick
-        // the dest already exists identically. This must be treated as the
-        // idempotent path (Skipped/Moved), NOT a collision, and staging
-        // must clean up.
-        // Hold the shared lock, like every other MOVE_ERRORS-touching test: this
-        // one asserts on the process-global MOVE_ERRORS map, so without the guard
-        // a concurrent sibling's key could satisfy or break the assertion.
+        // Regression guard: the content-aware collision check must NOT break the idempotent
+        // re-move — an identical dest later must be Skipped/Moved and cleaned up. Hold the
+        // shared lock like every MOVE_ERRORS test.
         let _g = errors_guard();
         let dir = scratch_dir("idempotent");
         let staging = dir.join("staging");
@@ -5206,16 +4841,9 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // EXHAUSTIVE mover decider matrix (rc4 hardening).
-    //
-    // The mover is the third staging-state decider. It keys ONLY on `.done`
-    // (the mux/resume hand-off): for each staging dir it either moves the
-    // muxed output to the library (and tears the dir down) or leaves the dir
-    // alone. These tests drive the REAL `check_and_move` against a real
-    // staging tree for every meaningful `.done`-state combination and assert
-    // the observable outcome (dest present? staging dir gone?).
-    // ===================================================================
+    // EXHAUSTIVE mover decider matrix (rc4 hardening): the mover is the third staging-state
+    // decider, keying ONLY on .done — it either moves the muxed output and tears the dir down,
+    // or leaves it alone.
 
     /// Outcome of one mover decision, observed from the filesystem.
     #[derive(Debug, PartialEq)]
@@ -5364,12 +4992,9 @@ mod tests {
             "EACCES/ESTALE etc. → WARN regardless of governing marker"
         );
 
-        // Each governing marker turns a .done NotFound into the by-design
-        // in-progress state (quiet skip, no WARN). This is the 182-warn bug:
-        // a long rip sits at .sweeping (sweep), .ripped (awaiting mux),
-        // .muxing (mux running), then .completed/.failed/.review with no .done
-        // for many ticks. `.sweeping` is the load-bearing addition here — the
-        // multi-hour sweep window had no governing marker and WARN-flooded.
+        // Each governing marker turns a .done NotFound into the by-design in-progress state
+        // (quiet skip, no WARN) — this is the 182-warn bug. `.sweeping` is the load-bearing
+        // addition; it had no marker before.
         for m in [
             ".sweeping",
             ".muxing",
@@ -5508,9 +5133,8 @@ mod tests {
         std::fs::write(&a, &base).unwrap();
         std::fs::write(&b, &base).unwrap();
         // c: same length, differs only in the middle (outside both windows)
-        // — head+tail probe treats it as identical (acceptable: a real mux
-        // collision differing only in the interior of a multi-GB file is
-        // not realistic, and the cost of a full compare every tick is not).
+        // — head+tail treats it as identical (acceptable: an interior-only
+        // real collision is unrealistic, and a full compare every tick isn't).
         let mut mid = base.clone();
         let m = mid.len() / 2;
         mid[m] ^= 0xFF;
@@ -5518,10 +5142,9 @@ mod tests {
         assert!(same_head_and_tail(&a, &b), "identical files match");
         assert!(same_head_and_tail(&a, &c), "interior-only diff matches");
 
-        // e: same length, differs ~2 KiB in — INSIDE the 64 KiB head window, so
-        // the probe must see it. This is the size the window is actually load-
-        // bearing at: a much smaller window would call these two identical and
-        // wave a real collision through as an idempotent re-move.
+        // e: same length, differs ~2 KiB in — INSIDE the 64 KiB head window,
+        // where the window is load-bearing: a much smaller window would wave
+        // this real collision through as an idempotent re-move.
         let e = dir.join("e.bin");
         let mut neardiff = base.clone();
         neardiff[2000] ^= 0xFF;
@@ -5540,14 +5163,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ===================================================================
-    // Fail-loud destination validation (Mercy incident hardening).
-    // The mover must ERROR + preserve-in-staging when the configured
-    // destination root is missing/unwritable, and must NEVER silently
-    // create the root (which, with a lost bind-mount, writes into the
-    // container's ephemeral overlay). It must also log FULL ABSOLUTE
-    // destination paths, never a cwd-relative path.
-    // ===================================================================
+    // Fail-loud destination validation (Mercy incident hardening): the mover must ERROR +
+    // preserve-in-staging when the configured root is missing/unwritable, never silently
+    // create it (writing into the container overlay), and must log FULL ABSOLUTE paths.
 
     /// dest root MISSING → error, and the validation must NOT create it
     /// (no silent `create_dir_all` of a dead mount point).

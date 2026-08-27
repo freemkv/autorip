@@ -447,10 +447,8 @@ pub fn load() -> Arc<RwLock<Config>> {
     // else comes from settings.json (or Config::default if it's a
     // first boot with no settings file).
     let autorip_dir = default_autorip_dir();
-    // PORT is bootstrap-only and can't be changed after the server binds,
-    // so a typo'd or out-of-range value must not be silently swallowed —
-    // that would bind 8080 while the operator believes their value took
-    // effect. Warn and fall back so the misconfiguration is diagnosable.
+    // PORT is bootstrap-only; a bad value must not silently bind 8080
+    // while the operator thinks their value took. Warn and fall back.
     let port: u16 = match std::env::var("PORT") {
         Ok(s) => match parse_port_env(&s) {
             Some(p) => p,
@@ -468,24 +466,15 @@ pub fn load() -> Arc<RwLock<Config>> {
     let mut cfg = build_bootstrap_config(port, autorip_dir);
     cfg = load_saved(cfg);
 
-    // Bare-run (no container): when staging/output are still the container
-    // defaults and those root paths aren't writable, relocate them under the
-    // resolved config dir so the downloadable binary runs without /staging and
-    // /output mounts. In Docker (where both exist and are writable) this is a
-    // no-op. Then ensure every dir we use exists (bootstrap normally does this
-    // in the container; bare run has no bootstrap).
-    // Use existence, NOT writability, to detect "no container mount". In Docker
-    // both dirs exist (mounted); a *transient* NFS unwritability at container
-    // start must not relocate staging/output to the config dir — that would
-    // orphan an in-progress ISO and split data across two directories. Bare run
-    // (downloadable binary, no mounts) is the only case where they don't exist.
+    // Bare-run (no container): relocate default staging/output under the config
+    // dir if those root paths don't exist, so the binary runs unmounted. Checks
+    // existence (not writability) so transient NFS issues in Docker don't relocate.
     if should_relocate_bare_run_dir(
         &cfg.staging_dir,
         "/staging",
         std::path::Path::new("/staging").exists(),
     ) {
-        // Native join so the derived path uses the platform separator (clean
-        // `...\config\staging` on Windows, not a mixed-slash `config/staging`).
+        // Native join keeps the platform separator (no mixed-slash path on Windows).
         cfg.staging_dir = std::path::Path::new(&cfg.autorip_dir)
             .join("staging")
             .to_string_lossy()
@@ -527,11 +516,8 @@ pub fn apply_decrypt_threads(n: usize) {
     if n > 0 {
         libfreemkv::decrypt::set_decrypt_threads(n);
     }
-    // If n == 0 we leave the existing setting in place. There's no
-    // libfreemkv "reset to default" hook today; first-call lazy init
-    // already picked up the right default. Setting it to a specific
-    // value here and never back is fine — the operator either tunes
-    // it or doesn't.
+    // n == 0 leaves the existing setting in place; there's no libfreemkv
+    // "reset to default" hook, and lazy init already picked the right default.
 }
 
 fn load_saved(mut cfg: Config) -> Config {
@@ -551,10 +537,9 @@ fn load_saved(mut cfg: Config) -> Config {
     let saved = match serde_json::from_str::<serde_json::Value>(&data) {
         Ok(saved) => saved,
         Err(e) => {
-            // A parse failure (e.g. a partial write from a SIGKILL mid-save,
-            // not theoretical given Watchtower restarts) silently reverts
-            // every persisted field to defaults. Warn so the operator can
-            // see why their settings vanished.
+            // A parse failure (e.g. partial write from a SIGKILL mid-save,
+            // seen with Watchtower restarts) silently reverts all fields
+            // to defaults. Warn so the operator can see why.
             tracing::warn!(path = %path, error = %e, "settings.json failed to parse - all settings reverting to defaults");
             return cfg;
         }
@@ -600,11 +585,8 @@ fn load_saved(mut cfg: Config) -> Config {
         cfg.keyserver_secret = v.to_string();
     }
     // Operator-edited numeric knobs are clamped to sane ceilings at the
-    // settings.json trust boundary, matching max_retries (.min(10)) and
-    // decrypt_threads (.min(256)). A pathological value (e.g.
-    // max_rip_duration_secs near u64::MAX) would otherwise defeat the
-    // "prevents infinite hangs" purpose these knobs exist for. The
-    // ceilings are deliberately generous — well past any real disc.
+    // settings.json trust boundary (like max_retries/decrypt_threads),
+    // so a pathological value can't defeat the "no infinite hangs" purpose.
     const MAX_DURATION_SECS: u64 = 30 * 24 * 3600; // 30 days
     const MAX_RETENTION_DAYS: u64 = 3650; // 10 years
     if let Some(v) = saved.get("min_length_secs").and_then(|v| v.as_u64()) {
@@ -619,11 +601,9 @@ fn load_saved(mut cfg: Config) -> Config {
     if let Some(v) = saved.get("auto_eject").and_then(|v| v.as_bool()) {
         cfg.auto_eject = v;
     }
-    // String-enum fields are validated against their documented allowed
-    // values at this same trust boundary as the numeric clamps below: a
-    // corrupt value (e.g. output_format="garbage") would otherwise load
-    // cleanly and only misbehave downstream depending on each consumer's
-    // match/else. On an unknown value we keep the field's default and warn.
+    // String-enum fields are validated at this same trust boundary as the
+    // numeric clamps: a corrupt value (e.g. output_format="garbage") would
+    // otherwise load and misbehave downstream. Unknown values keep the default.
     if let Some(v) = saved.get("on_insert").and_then(|v| v.as_str()) {
         if matches!(v, "nothing" | "scan" | "rip") {
             cfg.on_insert = v.to_string();
@@ -680,22 +660,16 @@ fn load_saved(mut cfg: Config) -> Config {
         cfg.transport_recovery_delay_secs = v.min(MAX_DURATION_SECS);
     }
     if let Some(v) = saved.get("decrypt_threads").and_then(|v| v.as_u64()) {
-        // Clamp on load for parity with max_retries (line above) and as an
-        // explicit trust-boundary bound on operator-edited settings.json.
-        // libfreemkv caps internally, but the bound is implicit there; make
-        // it explicit so a bogus value can't request an absurd pool size.
+        // Clamp on load, mirroring max_retries above: libfreemkv's internal
+        // cap is implicit, so make the trust-boundary bound explicit here too.
         cfg.decrypt_threads = (v as usize).min(256);
     }
     if let Some(v) = saved.get("log_retention_days").and_then(|v| v.as_u64()) {
         cfg.log_retention_days = v.min(MAX_RETENTION_DAYS);
     }
-    // Migrate the legacy `abort_on_error` bool to the `on_read_error`
-    // string, mirroring web.rs's POST-time migration. Only applied when
-    // the modern `on_read_error` field is absent — an explicit
-    // `on_read_error` always wins so re-saving a migrated settings.json
-    // (which keeps the stale `abort_on_error` key) doesn't flip the
-    // policy back. Both branches are present so `false` migrates to the
-    // looser `skip` instead of silently reverting to the default `stop`.
+    // Migrate legacy `abort_on_error` bool to `on_read_error` string (mirrors
+    // web.rs's POST-time migration), only when `on_read_error` is absent, so
+    // it always wins and a re-saved file with the stale key doesn't flip back.
     if !on_read_error_present {
         match saved.get("abort_on_error").and_then(|v| v.as_bool()) {
             Some(true) => cfg.on_read_error = "stop".to_string(),
@@ -727,27 +701,9 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
         }
     };
-    // Write atomically: a SIGKILL or container OOM mid-`fs::write` would
-    // truncate settings.json to zero or partial bytes; on next start
-    // `load_saved` would silently reset every persisted field
-    // (TMDB key, output dirs, max_retries, abort_on_lost_secs, …) to
-    // env-var defaults. Watchtower restarts the container on every
-    // release, so this isn't theoretical. Write to a sibling temp file,
-    // fsync, then rename — POSIX rename is atomic within a filesystem.
-    //
-    // The fsync MUST succeed before the rename: a `sync_all` failure
-    // (NFS ENOSPC/ESTALE, disk full) means the kernel never guaranteed
-    // the bytes reached stable storage, so publishing them via rename
-    // would defeat the whole crash-safety contract. Keep the writable
-    // fd from the write step (rather than re-opening read-only) so the
-    // sync covers what we just wrote, and bail before the rename on any
-    // error — leaving the prior settings.json untouched.
-    // Unique temp name per call. The web server spawns one thread per
-    // request, so two concurrent settings saves could otherwise both open
-    // the same fixed `{path}.tmp`, interleave their writes, and rename a
-    // mangled file over settings.json. Disambiguate with pid + a process-
-    // local monotonic counter so each save writes to its own sibling temp
-    // and the rename publishes exactly one writer's complete bytes.
+    // Write atomically (temp file + fsync + rename) so a SIGKILL/OOM mid-write
+    // can't truncate settings.json and reset all fields to defaults on restart.
+    // Temp name includes pid + counter so concurrent saves never collide.
     static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = format!(
         "{path}.tmp.{}.{}",
@@ -835,13 +791,9 @@ mod tests {
 
     #[test]
     fn concurrent_saves_never_corrupt_settings_json() {
-        // The web server spawns one thread per request, so two settings
-        // saves can run concurrently. With a fixed `{path}.tmp` they would
-        // interleave writes into the same temp and rename a mangled file
-        // over settings.json. The unique-per-call temp name (pid + counter)
-        // gives each save its own sibling temp, so every rename publishes
-        // one writer's COMPLETE bytes — the final file always parses and the
-        // tmdb_api_key is one of the values that was actually written.
+        // Two settings saves can run concurrently (one thread per request).
+        // The unique-per-call temp name (pid + counter) gives each its own
+        // sibling temp, so every rename publishes one writer's COMPLETE bytes.
         let d = scratch("concurrent");
         const N: usize = 16;
         let handles: Vec<_> = (0..N)
@@ -890,10 +842,8 @@ mod tests {
     #[test]
     fn save_leaves_prior_settings_untouched_when_write_fails() {
         // Failure-mode contract: if the temp write/fsync fails, the rename
-        // must never run, so any pre-existing settings.json is preserved
-        // verbatim. We force the write to fail by pointing autorip_dir at
-        // a path whose parent does not exist (open(2) ENOENT), after
-        // seeding a known-good settings.json one level up.
+        // must never run, so a pre-existing settings.json is preserved.
+        // Force the failure via a path whose parent doesn't exist (ENOENT).
         let d = scratch("save_fail");
         let good = cfg_in(&d);
         // Seed a valid prior file.
@@ -1393,10 +1343,8 @@ mod tests {
         assert!(!debug_output.contains("keyserver-bearer-token-xyz789"));
         assert!(!debug_output.contains("DISCORD_SECRET_TOKEN"));
         assert!(!debug_output.contains("WEBHOOK_SECRET"));
-        // keyserver_url is non-secret-bearing in the field list's own
-        // documented sense (it's masked anyway by this impl) but the token
-        // it might carry as userinfo/query must not leak either; the field
-        // is always redacted here so just confirm the placeholder appears.
+        // keyserver_url may carry a token as userinfo/query, so it's always
+        // redacted too; just confirm the placeholder appears.
 
         // The redaction markers must actually be present (proves the
         // fields were visited and masked, not merely absent from a

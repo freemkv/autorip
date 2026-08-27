@@ -19,10 +19,9 @@ use freemkv_autorip::ripper::{BadRange, RipState};
 
 #[test]
 fn test_state_json_serialization_round_trip() {
-    // Build a RipState with non-default values in every field we
-    // care about, serialize it via serde_json (the same crate
-    // get_state_json uses), parse the JSON back as a Value, and
-    // verify the fields the dashboard reads.
+    // Build a RipState with non-default values in every field we care
+    // about, serialize it via serde_json (same crate get_state_json
+    // uses), parse back as Value, verify the fields the dashboard reads.
     let state = RipState {
         device: "sg4".to_string(),
         status: "ripping".to_string(),

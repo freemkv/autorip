@@ -16,15 +16,9 @@ pub mod staging;
 pub mod state;
 pub mod tv;
 
-// Re-export every symbol the rest of the crate (and integration tests)
-// addresses as `crate::ripper::*`. Names that aren't reached for
-// outside the ripper module (e.g. STOP_COOLDOWNS) stay `pub(super)`
-// in their owning sub-module and don't appear here.
-//
-// `#[allow(unused_imports)]` is retained because the binary build
-// (`mod ripper;` is private in `main.rs`) doesn't itself reach for
-// every re-export — but `pub mod ripper;` in `lib.rs` and the
-// integration tests under `tests/` do, so the re-exports must stay.
+// Re-export every symbol the crate/tests address as `crate::ripper::*`.
+// `#[allow(unused_imports)]` stays: the binary build doesn't use every
+// re-export, but `lib.rs` and `tests/` do.
 #[allow(unused_imports)]
 pub use session::{
     RegisterError, device_halt, join_all_rip_threads, join_rip_thread, register_halt,
@@ -69,7 +63,7 @@ pub(crate) fn scan_opts_for(cfg: &Config) -> libfreemkv::ScanOptions {
 /// phase=X") until the returned guard is dropped (mirrors the rip watchdog and
 /// `mux.rs` watchdog drop-guard design).
 ///
-/// The caller advances the phase via [`ScanWatchdog::set_phase`] so the WARN
+/// The caller advances the phase via [`ScanWatchdog::enter_resolve`] so the WARN
 /// pinpoints whether the time is going into the structure scan or the key
 /// resolve.
 struct ScanWatchdog {
@@ -242,14 +236,9 @@ fn key_readiness(
     if capture_without_keys {
         return "Capture without keys — no decryption".to_string();
     }
-    // Accurate reason, in the SAME vocabulary the CLI speaks: render the
-    // libfreemkv error CODE through the shared `freemkv_i18n` catalog (the very
-    // en.json the CLI renders). PREFER the disc's own AACS-resolution error —
-    // captured by the scan in `disc.aacs_error` — because it is the true cause
-    // (e.g. E7025 "bus key unavailable", E6000 "disc unreadable / dirty"), not
-    // autorip's coarse `KeyOutcome`. This is what turns a wedged bus-auth disc
-    // from the misleading "key files could not be read" into its real condition,
-    // identical to what `freemkv` would print for the same code.
+    // Prefer the disc's own AACS-resolution error (`disc.aacs_error`) over the
+    // coarse `KeyOutcome`: it's the true cause (e.g. E7025 bus key unavailable)
+    // and renders via the shared `freemkv_i18n` catalog, matching the CLI.
     let reason = if let Some(err) = disc.aacs_error.as_ref() {
         freemkv_i18n::error_message(u32::from(err.code()))
     } else {
@@ -340,12 +329,8 @@ fn fmts_gate_plan(gate: FmtsGate) -> FmtsGatePlan {
 }
 
 // ─── Online key service: DOWN vs genuine no-key ─────────────────────────────
-//
-// The online keysource swallows every failure (transport error, 502, timeout)
-// into an empty result, so autorip used to report a transient service outage as
-// a permanent "no keys found". These helpers classify the service's
-// reachability when it yields no key, and bounded-retry a transient outage
-// rather than permanently failing the disc.
+// The online keysource swallows every failure into an empty result, so these
+// helpers classify DOWN vs genuine no-key and bounded-retry a transient outage.
 
 /// How many times online key resolution is re-attempted when the first attempt
 /// yields no key AND the key service classifies as DOWN / rate-limited. Small
@@ -556,14 +541,8 @@ fn forget_removed_device(device: &str) -> bool {
     }
     drop_session(device);
     // Recover-and-proceed on poison, like every other STATE/HALTS/RIP_THREADS
-    // site in this crate. `if let Ok(..)` silently skipped the removal on a
-    // poisoned lock — and a poisoned STATE means some worker panicked WHILE
-    // HOLDING it, which is exactly when a drive is most likely to disappear
-    // from enumeration. The row for a device that is physically gone then
-    // survives for the container's lifetime (phantom drive in the UI, and
-    // `is_busy`/`try_claim_active` keep answering from it), while this function
-    // still returned `true` — the teardown reported success and left the state
-    // behind, with not one log line to say so.
+    // site: `if let Ok(..)` used to silently skip the removal on a poisoned
+    // lock, leaving a phantom drive row for the container's lifetime.
     STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -572,10 +551,8 @@ fn forget_removed_device(device: &str) -> bool {
     // ring would otherwise linger for the container's lifetime. Evict it
     // like archive_device_log does on the planned-eject path.
     crate::log::forget_device(device);
-    // Evict the remaining per-device maps (title override, stop cooldown,
-    // cached disc identity, and the rip-thread handle + halt token once the
-    // thread has exited) so nothing accumulates as device paths churn.
-    // `forget_device_state`'s doc carries the authoritative inventory.
+    // Evict the remaining per-device maps so nothing accumulates as device
+    // paths churn; `forget_device_state`'s doc has the authoritative inventory.
     state::forget_device_state(device);
     true
 }
@@ -630,10 +607,8 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     // Re-enumerate drives every RESCAN_INTERVAL_SECS so a USB unplug+replug
     // (which may rename the device node) is detected without a container restart.
     const RESCAN_INTERVAL_SECS: u64 = 30;
-    // Startup staging scan: quarantine terminally-failed dirs and preserve
-    // resumable ones. Resume is user-gated and recomputed on demand via
-    // `find_resumable_for_disc`; we don't build a classification map here.
-    // See `staging::resume_or_quarantine_staging`.
+    // Startup staging scan: quarantine terminally-failed dirs, preserve
+    // resumable ones. Resume is recomputed on demand via find_resumable_for_disc.
     if let Ok(c) = cfg.read() {
         let hints = staging::resume_or_quarantine_staging(&c.staging_dir);
         tracing::info!(
@@ -714,13 +689,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     );
                 }
             }
-            // Removed: in drive_paths but not in fresh_paths.
-            // `forget_removed_device` refuses to tear down a busy drive.
-            // Those paths are carried over into the new `drive_paths` below
-            // so the NEXT rescan sees them as removed again and retries the
-            // teardown once the rip/scan finishes. Dropping them here instead
-            // would make the device silently disappear from the loop with its
-            // STATE, session and log ring left behind forever.
+            // Removed: in drive_paths but not in fresh_paths. A busy drive's
+            // teardown is deferred by forget_removed_device, so its path is
+            // carried into the new drive_paths for the next rescan to retry.
             let mut deferred_removals: Vec<String> = Vec::new();
             for path in &drive_paths {
                 if !fresh_paths.contains(path) {
@@ -746,17 +717,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
             for path in &drive_paths {
                 let device = device_key(path);
 
-                // Don't touch drives a worker still holds — it has a Drive
-                // instance and sometimes the SCSI bus. Probing them would
-                // conflict. `is_busy` alone misses the worker's tail (it has
-                // written its terminal status but is still inside
-                // `eject_drive`'s `Drive::open`/`eject`), which is precisely
-                // when the drive is being yanked open; it is also the state a
-                // teardown deferred by `forget_removed_device` sits in, and
-                // probing a device that just vanished from enumeration would
-                // overwrite its terminal STATE row with a "drive firmware
-                // unresponsive" error and tell an operator to power-cycle a
-                // drive they unplugged on purpose.
+                // Don't probe drives a worker still holds. `rip_thread_running`
+                // covers eject_drive's tail that `is_busy` alone misses, where
+                // probing would overwrite a terminal STATE row with a bogus error.
                 if is_busy(&device) || rip_thread_running(&device) {
                     current_with_disc.insert(device.clone());
                     continue;
@@ -769,10 +732,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     continue;
                 }
 
-                // The whole hardware probe — discovery, wedge detection,
-                // SCSI reset, USB reset — is one lib call. autorip sees
-                // a `bool` for present/absent, or an `Err` only after
-                // recovery itself failed (drive permanently bricked).
+                // The whole hardware probe (discovery, wedge detection, SCSI/
+                // USB reset) is one lib call; `Err` means recovery itself
+                // failed (drive permanently bricked).
                 let disc_present = match libfreemkv::drive_has_disc(std::path::Path::new(path)) {
                     Ok(p) => {
                         warned_probe_fail.remove(&device);
@@ -786,21 +748,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                                 error = %e,
                                 "drive_has_disc failed — drive firmware unresponsive; physical reconnect or host reboot required"
                             );
-                            // Surface the wedge in the UI. Pre-fix:
-                            // drive_has_disc Err -> continue, no
-                            // update_state, drive never enters STATE
-                            // and /api/state returns {} as if no
-                            // drives existed. The drive was visible
-                            // only as a one-time "drive enumerated"
-                            // INFO log at startup that scrolled away.
-                            // Now: drive appears in STATE with status
-                            // "error" + a last_error explaining the
-                            // wedge and the recovery action. Once
-                            // drive_has_disc starts succeeding again
-                            // (post power-cycle), the warned_probe_fail
-                            // removal at the Ok(_) arm clears the
-                            // state and the idle/disc-present path
-                            // takes over.
+                            // Surface the wedge in the UI (pre-fix this just
+                            // `continue`d, so /api/state looked empty); the
+                            // Ok(_) arm clears it once the drive recovers.
                             update_state(
                                 &device,
                                 RipState {
@@ -844,9 +794,8 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 }
 
                 let is_new_insert = !had_disc.contains(&device);
-                // One `is_in_cooldown` read for both halves of the decision:
-                // asking twice could straddle the expiry and dispatch without
-                // latching, or latch without dispatching.
+                // One is_in_cooldown read for both halves: asking twice could
+                // straddle the expiry and dispatch without latching.
                 let tick = insert_tick(is_new_insert, is_in_cooldown(&device));
 
                 if tick.latch {
@@ -883,17 +832,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         continue;
                     }
 
-                    // Claim the device exactly like the /api/scan and /api/rip
-                    // web handlers do: thread liveness read outside the STATE
-                    // lock, then the busy-check and the status-set folded into
-                    // one STATE lock (the two registries are never held at the
-                    // same time — see `try_claim_active_checked`). The old
-                    // `!is_busy(&device)` gate plus a separate `update_state`
-                    // and `register_halt` was a TOCTOU: a concurrent /api/rip
-                    // could claim between the check and the spawn, yielding two
-                    // rip threads on one drive, an orphaned Halt, and a dropped
-                    // JoinHandle. If the claim loses, another path already owns
-                    // the device — skip the spawn.
+                    // Claim like /api/scan and /api/rip do (try_claim_active_checked):
+                    // the old separate check+set was a TOCTOU letting two rip
+                    // threads claim one drive.
                     let Some(claim_gen) = try_claim_active(&device) else {
                         continue;
                     };
@@ -904,48 +845,21 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         "spawning scan/rip thread"
                     );
 
-                    // NOTE: try_claim_active already set status="scanning" +
-                    // disc_present=true under the STATE lock, so no separate
-                    // update_state is needed here.
+                    // try_claim_active already set status/disc_present under
+                    // the STATE lock, so no separate update_state is needed.
 
                     let cfg = cfg.clone();
                     let dev_path = path.clone();
                     let device_for_thread = device.clone();
 
-                    // Allocate the rip's single `Halt` token at the spawn
-                    // site so the HTTP /api/stop/{device} handler can find
-                    // it via `device_halt(device).cancel()` even before
-                    // `rip_disc` starts (e.g. while `scan_disc` is still
-                    // running). `rip_disc` and the in-thread cleanup paths
-                    // call `unregister_halt(device)` on exit.
+                    // Allocate the rip's Halt token at spawn so /api/stop can
+                    // find it via device_halt even before rip_disc starts;
+                    // rip_disc and the cleanup paths unregister it on exit.
                     register_halt(&device, libfreemkv::Halt::new());
 
-                    // v0.25.7: restore the on_insert=rip auto-rip
-                    // behaviour. The v0.23.0 commit killed it as the
-                    // brute-force fix for "container restart auto-rips
-                    // pathology" (Watchtower deploys / watchdog
-                    // restarts / host reboots all kicking off a fresh
-                    // rip when a disc happened to still be in the
-                    // drive). The v0.25.3 parallel mux pipeline makes
-                    // unattended-rip the killer feature for this whole
-                    // project — insert disc, walk away, come back to
-                    // find it ripped + muxed + queued for the next
-                    // one — so we need the auto-rip back. The
-                    // "restart auto-rips" failure modes are now
-                    // handled by:
-                    //   - is_in_cooldown(device): 5-second STOP
-                    //     cooldown prevents flap-restart loops.
-                    //   - .completed marker check inside rip_disc:
-                    //     a disc that's already been ripped + got
-                    //     `.completed` doesn't get re-ripped on
-                    //     restart.
-                    //   - .restart_count counter promoting to
-                    //     `.failed` after RESTART_LIMIT to break the
-                    //     "container restarts mid-rip every N
-                    //     seconds" loop.
-                    // Operators who don't want auto-rip leave
-                    // on_insert at the default "scan", or set
-                    // "nothing" to skip even the scan.
+                    // v0.25.7: restored on_insert=rip auto-rip; restart
+                    // flapping is now guarded by is_in_cooldown, .completed,
+                    // and .restart_count/RESTART_LIMIT instead.
                     let do_auto_rip = on_insert == "rip";
                     let cfg_for_thread = cfg.clone();
                     let dev_path_for_thread = dev_path.clone();
@@ -992,10 +906,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                             error = %e,
                             "failed to spawn rip thread"
                         );
-                        // The claim (status="scanning") + register_halt above
-                        // already ran. A bare warn here leaks the Halt and
-                        // wedges the device in "scanning" forever. Mirror the
-                        // web handlers' rollback.
+                        // A bare warn here would leak the Halt and wedge the
+                        // device in "scanning" forever; mirror the web
+                        // handlers' rollback instead.
                         rollback_failed_spawn(&device, claim_gen);
                     }
                 } else if !is_new_insert
@@ -1049,10 +962,9 @@ fn mark_config_lock_poisoned(device: &str, op: &str) {
 
 /// Scan a disc — open, init, identify, TMDB, full scan. Stores session for rip.
 pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
-    // Snapshot Config (it's Clone) and drop the read guard immediately —
-    // see rip_disc for the full rationale. Scans can take 10-30s on
-    // damaged discs; that's long enough to noticeably block any
-    // settings POST that races with a scan.
+    // Snapshot Config and drop the read guard immediately (see rip_disc):
+    // scans can take 10-30s on damaged discs, long enough to block a
+    // racing settings POST.
     let cfg_read = match cfg.read() {
         Ok(c) => c.clone(),
         Err(_) => {
@@ -1074,12 +986,9 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     crate::log::archive_device_log(device);
     crate::log::device_log(device, "Opening drive...");
 
-    // Drive open + SCSI bring-up (wait_ready/init/probe_disc — all advisory)
-    // now runs inside `DiscSession::open`; the advisory warns it emitted here
-    // are logged via the library's tracing (semantics unchanged). The owned
-    // `drive` comes back out after the scan (`into_drive`), so the rest of
-    // scan_disc — TMDB, resolve_keys, unlocker matrix, store_session — is
-    // untouched.
+    // Drive open + SCSI bring-up now runs inside DiscSession::open; the owned
+    // drive comes back out after the scan (into_drive), so the rest of
+    // scan_disc is untouched.
     crate::log::device_log(device, "Initializing...");
     let mut session = match libfreemkv::DiscSession::open(
         libfreemkv::DeviceTarget::Path(std::path::PathBuf::from(device_path)),
@@ -1206,20 +1115,9 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     };
     tracing::info!(device = %device, elapsed_ms = scan_t0.elapsed().as_millis() as u64, "scan: structure done");
-    // Sample-based key source: resolve the Unit Key from the disc's files +
-    // on-disc samples and re-scan with it (a no-op for a local source). The
-    // outcome carries WHY a resolve failed, for the readiness message.
-    //
-    // The online path POSTs the MKB + samples to the keyserver, which over a
-    // slow remote link can take a minute or two — tell the user we're waiting on
-    // it so the pause isn't mistaken for a hang. (Online sources are exactly the
-    // ones that `needs_samples()`.)
-    // DVD decryption is CSS — resolved keylessly per title at read/mux time (the
-    // scan does no CSS key work beyond the bus-auth unlock), so there is nothing
-    // to fetch here. The AACS key-resolution path (MKB / Unit_Key_RO.inf / sample
-    // units / keyserver) does not apply to a DVD; running it reads the disc as if
-    // it were AACS/UHD and is pure waste (and was where DVD scans stalled). Skip
-    // it for DVD.
+    // Sample-based key resolve (online path can take a minute or two — status
+    // update avoids that looking like a hang). DVD is CSS not AACS, so skip
+    // resolve entirely or the scan reads it as AACS/UHD and stalls.
     let (disc, key_outcome, key_reach) = if matches!(disc.format, libfreemkv::DiscFormat::Dvd) {
         tracing::info!(device = %device, "resolve_keys: skipped (DVD/CSS — no AACS)");
         (disc, crate::keysource::KeyOutcome::Resolved, None)
@@ -1235,11 +1133,9 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         tracing::info!(device = %device, "resolve_keys: begin");
         let (disc, outcome) = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
         tracing::info!(device = %device, elapsed_ms = resolve_t0.elapsed().as_millis() as u64, "resolve_keys: end");
-        // Down-vs-no-key: if the ONLINE service yielded no key for an encrypted,
-        // still-keyless disc, classify the service's reachability and bounded-
-        // retry on a transient outage rather than reporting a permanent
-        // "no keys found". `key_reach` is `Some(transient)` only when the
-        // service never recovered — that drives the retryable status below.
+        // Down-vs-no-key: bounded-retry a transient online outage rather than
+        // reporting a permanent "no keys found". `key_reach` is `Some` only
+        // when the service never recovered — drives the status below.
         let no_keys =
             disc.encrypted && matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None);
         if crate::keysource::uses_online(&cfg_read)
@@ -1287,14 +1183,9 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         ),
     );
 
-    // User-facing unlocker matrix — which registered unlockers actually RAN this
-    // rip (did work, not merely "matched the disc kind"), shown for every disc so
-    // an operator can see (and question) a missing one (e.g. a firmware-unlock
-    // entry reading "no" on a supported drive = the firmware unlock didn't take;
-    // "AACS: yes" only when the host-cert route did the bus removal because the
-    // firmware unlock didn't). Registry-driven: names from libfreemkv's unlocker
-    // registry, never hardcoded. Kept byte-identical to the CLI's rendering for
-    // consistency across the two apps.
+    // User-facing unlocker matrix — which registered unlockers actually RAN
+    // (not just "matched the disc kind"), so a missing one is visible.
+    // Registry-driven and kept byte-identical to the CLI's rendering.
     {
         let matrix = disc
             .unlocker_matrix(&drive)
@@ -1326,11 +1217,9 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         },
     );
 
-    // 0.20.7: if the resume-on-startup detector flipped this disc's
-    // staging dir to `.failed` (restart loop), surface that here so
-    // the operator sees "failed: restart loop detected" on the
-    // dashboard before triggering a fresh rip. `failure_reason`
-    // overrides the normal idle status when present.
+    // 0.20.7: if resume-on-startup flipped this disc's staging dir to
+    // `.failed` (restart loop), surface it on the dashboard before a fresh
+    // rip; `failure_reason` overrides the normal idle status when present.
     let staging_disc = cfg_read.staging_device_dir(&staging::staging_basename(
         std::path::Path::new(&cfg_read.staging_dir),
         &display_name,
@@ -1392,10 +1281,9 @@ pub fn handle_rip_request(
     device_path: &str,
     mode: crate::web::ResumeMode,
 ) {
-    // Skip the scan when the disc has already been scanned since insertion —
-    // a redundant scan clears the UI poster + title for ~10-30 s and re-runs
-    // TMDB for no benefit. On disc eject + re-insert the poll loop calls
-    // drop_session, so a stale session can't survive a media change.
+    // Skip the scan if already scanned since insertion — a redundant scan
+    // clears the UI poster/title and re-runs TMDB for no benefit. Eject +
+    // re-insert calls drop_session, so a stale session can't survive it.
     if !session_is_scanned(device) {
         scan_disc(cfg, device, device_path);
     } else {
@@ -1413,11 +1301,9 @@ pub fn handle_rip_request(
     match mode {
         crate::web::ResumeMode::Require => {
             if resumable_for_device(cfg, device) == Some(Resumable::Sweep) {
-                // Prefer continuing the sweep whenever there is ANY not-good
-                // data left to recover (pending OR previously-Unreadable):
-                // continue Pass N from the mapfile, re-reading only the
-                // not-good ranges instead of the whole disc. `passes = N` is
-                // the recovery budget; nothing is ever abandoned as "dead".
+                // Continue Pass N from the mapfile, re-reading only not-good
+                // ranges instead of the whole disc; `passes = N` is the
+                // recovery budget, nothing is ever abandoned as "dead".
                 crate::log::device_log(
                     device,
                     "Resume requested: continuing partial sweep from mapfile",
@@ -1449,16 +1335,9 @@ pub fn handle_rip_request(
             }
         }
         crate::web::ResumeMode::Wipe => {
-            // Never wipe a dir the mux worker is actively reading. Wipe
-            // deliberately bypasses `disc_already_completed` (the operator may
-            // legitimately want to re-rip a finished disc), but `remove_dir_all`
-            // under an in-flight mux deletes the ISO out from under the worker:
-            // its read stream fails with ENOENT, the MuxingGuard's clear hits a
-            // NotFound, the snapshot returns None, and the staging dir + ISO are
-            // permanently lost with no retry possible. The MuxingGuard (which the
-            // "deliberately bypasses" comment predates) is exactly what we honour
-            // here. Refuse the wipe and tell the operator to retry once the mux
-            // finishes.
+            // Never wipe a dir the mux worker is actively reading: an
+            // in-flight `remove_dir_all` yanks the ISO out from under it,
+            // permanently losing the staging dir with no retry possible.
             if disc_owned_by_worker(cfg, device) {
                 crate::log::device_log(
                     device,
@@ -1477,14 +1356,9 @@ pub fn handle_rip_request(
             rip_disc(cfg, device, device_path, false);
         }
         crate::web::ResumeMode::Default => {
-            // Unattended auto-rip must not re-rip a disc that already
-            // finished cleanly. On a container restart (Watchtower deploy /
-            // watchdog / host reboot) with the disc still in the drive, the
-            // insert→auto-rip path would otherwise sweep the whole disc again
-            // and overwrite the staged ISO. A `.completed` marker in the
-            // disc's staging dir is the authoritative "already ripped" signal.
-            // User-initiated rips (Wipe / Require) deliberately bypass this —
-            // only the unattended Default path is guarded.
+            // Unattended auto-rip must not re-rip an already-finished disc
+            // (container restart + insert→auto-rip would overwrite the staged
+            // ISO). `.completed` is authoritative; only this path is guarded.
             if disc_already_completed(cfg, device) {
                 crate::log::device_log(
                     device,
@@ -1520,11 +1394,9 @@ pub fn handle_rip_request(
                 drop_session(device);
                 return;
             }
-            // Mutual exclusion with the mux worker. A `.ripped`/`.muxing`
-            // staging dir for this disc is OWNED by the mux worker (sweep+patch
-            // done, mux pending or in flight). Running a fresh sweep here would
-            // truncate the ISO the mux worker is reading. Skip the auto-rip and
-            // leave the worker to finish.
+            // Mutual exclusion with the mux worker: a `.ripped`/`.muxing`
+            // staging dir is owned by it, and a fresh sweep here would
+            // truncate the ISO it's reading. Skip and let it finish.
             if disc_owned_by_worker(cfg, device) {
                 crate::log::device_log(
                     device,
@@ -1533,22 +1405,17 @@ pub fn handle_rip_request(
                 drop_session(device);
                 return;
             }
-            // Anti-clobber: a `.aborted-loss` staging holds a complete (or
-            // partially-recovered) swept ISO that aborted only on the loss
-            // threshold. A fresh sweep here would overwrite that 50+ GB ISO and
-            // throw away the recovery progress (the bug that destroyed a swept
-            // in-progress ISO). Leave it for the operator to Accept (deliver) or
-            // resume (run another recovery pass) — never auto-clobber it.
+            // Anti-clobber: `.aborted-loss` holds a swept ISO that only
+            // aborted on the loss threshold. A fresh sweep would overwrite it
+            // and lose the recovery progress — leave it for the operator.
             if disc_loss_aborted(cfg, device) {
                 crate::log::device_log(
                     device,
                     "Disc has a loss-aborted staged ISO awaiting an operator decision — NOT re-ripping. Use 'Accept damage' to deliver it, or 'Resume' to run another recovery pass.",
                 );
-                // Surface the decision in the live state, else the scan-set
-                // "scanning" status sticks forever with no movement and no
-                // off-ramp (the operator sees a perpetual spinner). Leave the
-                // status NON-active and flag `loss_aborted`: the web UI renders
-                // the Accept-damage / Resume buttons on `loss_aborted && !active`.
+                // Surface the decision in live state, else "scanning" sticks
+                // forever with no off-ramp. Non-active status + loss_aborted
+                // flag: the UI renders Accept/Resume on loss_aborted && !active.
                 update_state_with(device, |s| {
                     s.status = "idle".to_string();
                     s.disc_present = true;
@@ -1627,10 +1494,9 @@ fn list_staging_basenames(staging_dir: &std::path::Path) -> Option<Vec<String>> 
                             }
                         }
                     }
-                    // Don't `.flatten()` away per-entry errors: a partial
-                    // NFS degradation can error on an individual DirEntry
-                    // while the dir is genuinely populated. Retry the whole
-                    // listing rather than trust this undercounted pass.
+                    // Don't `.flatten()` away per-entry errors: a partial NFS
+                    // degradation can error on one DirEntry while the dir is
+                    // genuinely populated. Retry rather than trust this pass.
                     Err(_) => had_entry_error = true,
                 }
             }
@@ -1707,13 +1573,9 @@ fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
         Ok(c) => c.clone(),
         Err(_) => return false,
     };
-    // Recover from a poisoned mutex rather than silently returning false (which
-    // would re-rip an already-completed disc). Matches update_state/is_busy.
-    //
-    // The basename is disc-specific, not just title-specific: disc 2 of a
-    // boxset resolves to disc 1's TMDB title, and matching on the title alone
-    // is what made this function find disc 1's `.completed` and skip disc 2
-    // entirely — the disc was never read.
+    // Recover from a poisoned mutex rather than silently returning false
+    // (would re-rip a completed disc). Basename is disc-specific, not just
+    // title-specific — disc 2 of a boxset shares disc 1's TMDB title.
     let Some(sanitized) = staging_basename_for_device(&cfg_read, device) else {
         return false;
     };
@@ -1742,24 +1604,15 @@ fn staging_disc_completed(staging_root: &std::path::Path, sanitized: &str) -> bo
     };
     for basename in basenames {
         let path = staging_root.join(&basename);
-        // EXACT match only. Staging dirs are created with the exact sanitized
-        // disc name (no year/suffix), so a prefix match never legitimately
-        // fires for the disc's own dir — it only invites collisions where a
-        // shorter title's name is a prefix of a longer one ("Redshift" sanitizes
-        // to "Redshift", "Redshift 2" to "Redshift_2"; a word-boundary check still fails
-        // since `_` is the space separator). Exact equality is collision-free.
+        // EXACT match only: a prefix match would collide where a shorter
+        // title's sanitized name is a prefix of a longer one's (e.g.
+        // "Redshift" vs "Redshift_2"). Exact equality is collision-free.
         if !staging_dir_matches_disc(&basename, sanitized) {
             continue;
         }
-        // Use the NFS-resilient snapshot (3-retry read_dir) rather than bare
-        // `path.join(MARKER).exists()` — on a cold NFS attribute cache an
-        // `.exists()` immediately after `write_completed_marker` can
-        // false-negative even though the marker is durably on disk, which
-        // would let the Default auto-insert path re-rip a finished disc and
-        // truncate the staged ISO the mux worker / mover is still using. The
-        // snapshot is the same view every other marker-detection caller
-        // (resume_or_quarantine_staging, check_and_mux, remux_from_ripped_marker)
-        // relies on for NFS consistency.
+        // NFS-resilient snapshot, not a bare `.exists()`: on a cold attribute
+        // cache `.exists()` can false-negative right after the marker write,
+        // letting Default auto-insert re-rip a finished disc mid-mux.
         if let Some(snap) = staging::snapshot_staging_disc(&path)
             && snap.completed
             && !snap.has_review
@@ -1800,13 +1653,9 @@ fn staging_disc_owned_by_worker(staging_root: &std::path::Path, sanitized: &str)
         if !staging_dir_matches_disc(&basename, sanitized) {
             continue;
         }
-        // Read `.ripped`/`.muxing` from the NFS-resilient, 3x-retried snapshot
-        // rather than two bare `.exists()` stats. On a cold-cache NFS mount after
-        // a container restart the marker can be momentarily invisible to a raw
-        // stat, making this return false; the Default auto-rip path then falls
-        // through to `rip_disc`, which O_TRUNCs the ISO the mux worker is
-        // reading. The snapshot matches `resumable_dir_blocked` /
-        // `find_resumable_for_disc`, which are already NFS-resilient.
+        // NFS-resilient snapshot, not two bare `.exists()` stats: a cold-cache
+        // mount after a restart can hide the marker from a raw stat, letting
+        // Default auto-rip fall through to rip_disc and O_TRUNC the ISO.
         if let Some(snap) = staging::snapshot_staging_disc(&path)
             && (snap.has_ripped || snap.has_muxing)
         {
@@ -1830,14 +1679,9 @@ fn staging_disc_owned_by_worker(staging_root: &std::path::Path, sanitized: &str)
 ///   explicitly Wipe + re-rip. Keyed on PRESENCE (`has_failed`) so a non-JSON
 ///   `.failed` body is still honoured (M3).
 fn resumable_dir_blocked(snap: &staging::StagingSnapshot) -> bool {
-    // `completed` also blocks: a FINISHED rip (state Done/Review/Completed) must
-    // never be drive-resumed. The design relied on the intermediate ISO being
-    // pruned after completion (so `has_iso` is false and the ISO guard skips it),
-    // but with `keep_iso = true` the ISO survives — so a manual
-    // `ResumeMode::Require` on a just-finished, not-yet-moved dir would otherwise
-    // pass this gate, and `resume_remux`'s `delete_partial_output` would destroy
-    // the delivered MKV before re-muxing it. Keying on `completed` closes that
-    // race independent of the prune.
+    // `completed` also blocks: with `keep_iso = true` the ISO survives past
+    // completion, so a manual Require on a just-finished dir could otherwise
+    // pass this gate and delete_partial_output would destroy the delivered MKV.
     snap.has_ripped || snap.has_muxing || snap.has_review || snap.has_failed || snap.completed
 }
 
@@ -1925,11 +1769,9 @@ fn end_of_recovery_loss(
     if bad_ranges.is_empty() {
         return none;
     }
-    // Raw byte count under the muxed-title scope, computed FIRST and with no
-    // bitrate condition: the perfect-rip gate keys on bytes. Converting to time
-    // needs a bitrate, and without one the loss is real but unquantifiable —
-    // NaN, which fails safe to abort — rather than a comfortable 0.0 that a
-    // configured seconds tolerance would silently accept.
+    // Raw byte count under the muxed-title scope: the perfect-rip gate keys
+    // on bytes. Without a bitrate, converting to time yields NaN (fails safe
+    // to abort) rather than a 0.0 a seconds tolerance would silently accept.
     let lost_bytes = abort_lost_bytes(output_is_iso, title, &bad_ranges);
     EndOfRecoveryLoss {
         lost_bytes,
@@ -1952,30 +1794,19 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
     // Recover from a poisoned mutex rather than silently returning None (which
     // would fail to resume a valid staged ISO). Matches disc_already_completed.
     let sanitized = staging_basename_for_device(&cfg_read, device)?;
-    // NFS-resilient listing (retries + surfaces per-entry errors) instead of
-    // `read_dir(...).flatten()`, which would silently drop the disc's own dir
-    // on a cold-cache DirEntry error and fall through to a fresh sweep rather
-    // than resuming the existing ISO.
+    // NFS-resilient listing, not `read_dir(...).flatten()`, which would
+    // silently drop the disc's dir on a cold-cache error and fall through
+    // to a fresh sweep instead of resuming the existing ISO.
     let staging_root = std::path::Path::new(&cfg_read.staging_dir);
     let basenames = list_staging_basenames(staging_root)?;
     for basename in basenames {
         let path = staging_root.join(&basename);
-        // Match the disc's own staging dir by EXACT name. Staging dirs are
-        // created with the exact sanitized disc name, so a prefix match never
-        // legitimately fires — it only collides ("Feature" is a prefix of
-        // "Feature_2" from "Feature 2"; a short title that is a prefix of a
-        // longer one), resuming onto a different title's partial ISO +
-        // mapfile. Exact equality is safe.
+        // EXACT name match: a prefix match would collide (e.g. "Feature" vs
+        // "Feature_2") and resume onto a different title's partial ISO.
         if staging_dir_matches_disc(&basename, &sanitized) {
-            // User-initiated resume goes straight to the underlying
-            // remux-eligibility check (ISO + mapfile present, mapfile
-            // parses, no bytes_pending, lost_secs within threshold).
-            // It still refuses dirs that are OWNED by the mux worker
-            // (`.ripped`/`.muxing`), HELD for review (`.review`), or
-            // TERMINAL (`.failed`) — see the per-marker skips below.
-            // A `.completed` dir naturally has bytes_pending == 0 and no
-            // owner/held/terminal marker, but its ISO was already pruned,
-            // so `has_iso` is false and it falls through the ISO guard.
+            // User-initiated resume goes straight to the remux-eligibility
+            // check, still refusing OWNED (.ripped/.muxing), HELD (.review),
+            // or TERMINAL (.failed) dirs — see resumable_dir_blocked below.
             let snap = staging::snapshot_staging_disc(&path)?;
             // Owned/held/terminal dirs are not drive-resumable — see
             // `resumable_dir_blocked` for the per-marker reasoning (H1/M3).
@@ -1994,37 +1825,15 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
             if stats.bytes_pending != 0 {
                 continue;
             }
-            // Same truncation guard `classify_resume` applies (resume.rs): a
-            // mapfile can read fully-swept (bytes_pending == 0) while its ISO was
-            // truncated on disk afterwards by a crash/OOM-kill/disk-full. Muxing
-            // that shorter-than-bytes_total image would silently drop its tail, so
-            // refuse and let the disc re-sweep fresh rather than resume onto it.
+            // Same truncation guard as classify_resume: the mapfile can read
+            // fully-swept while its ISO was truncated afterward (crash/OOM/
+            // disk-full). Refuse and re-sweep fresh rather than resume onto it.
             if std::fs::metadata(&iso_path).is_ok_and(|m| m.len() < stats.bytes_total) {
                 continue;
             }
-            // Pre-filter loss estimate. Two cases:
-            //
-            // abort_on_lost_secs == 0 ("perfect rip required"): the
-            // whole-disc bad-byte count is the WRONG predicate here. A
-            // disc with unreadable sectors entirely OUTSIDE the main title
-            // is still a valid mux candidate — the authoritative
-            // per-title check in `resume_remux` (which runs after
-            // `scan_image` and scopes to the title via
-            // `bytes_bad_in_title`) will allow it. Using the whole-disc
-            // count as the pre-filter would block those candidates before
-            // the title-scoped check ever runs.
-            //
-            // For abort_on_lost_secs == 0 we therefore ALLOW here and
-            // defer the real decision to the per-title re-validation in
-            // `resume_remux`. That check is already `lost_secs >
-            // abort_on_lost_secs` (same semantics: 0 → require in-title
-            // loss == 0), so the pre-filter must not be STRICTER than
-            // the authoritative gating.
-            //
-            // abort_on_lost_secs > 0: keep the coarse whole-disc fallback
-            // estimate as an early-reject to avoid loading scan_image for
-            // every disc with heavy global damage. Same constant as
-            // `classify_resume` to prevent silent bitrate drift.
+            // Pre-filter: at ==0, whole-disc bytes are the wrong predicate
+            // (defer to resume_remux's per-title check); at >0, use them as
+            // a coarse early-reject to skip scan_image on heavy damage.
             if cfg_read.abort_on_lost_secs > 0 {
                 let lost_secs =
                     stats.bytes_unreadable as f64 / resume::FALLBACK_BITRATE_BYTES_PER_SEC;
@@ -2032,13 +1841,9 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
                     continue;
                 }
             }
-            // FILE basename (the staged ISO's stem), never `basename` — that
-            // is the DIRECTORY name and carries the `_2` boxset disc suffix
-            // the files inside it never take. Same invariant, and same
-            // reasoning, as `classify_resume`: `resume_remux` uses this to
-            // clear the partial at `<dir>/<name>.<ext>` and to name its own
-            // output, so the directory form misses the partial and muxes a
-            // second file the mover then delivers alongside it.
+            // FILE basename (ISO stem), never `basename` — that's the dir
+            // name carrying the `_2` boxset suffix the files never take.
+            // Same invariant as classify_resume; resume_remux names output from it.
             let display_name = match iso_path.file_stem() {
                 Some(n) => n.to_string_lossy().into_owned(),
                 None => continue,
@@ -2104,9 +1909,8 @@ fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
         return;
     };
     // Defence-in-depth: never let an untrusted disc label sanitize to a
-    // segment that escapes (or resolves to) the staging root. Without
-    // this a label of `..` makes `join("..")` point at staging's parent
-    // and `remove_dir_all` would delete it.
+    // segment that escapes the staging root — else `join("..")` +
+    // `remove_dir_all` would delete its parent.
     if !is_safe_staging_segment(&sanitized) {
         crate::log::device_log(
             device,
@@ -2160,42 +1964,28 @@ fn resumable_for_disc(cfg: &Config, display_name: &str, disc_label: &str) -> Opt
         display_name,
         disc_label,
     );
-    // NFS-resilient listing (retries + surfaces per-entry errors) instead of
-    // `read_dir(...).flatten()`, which would silently drop the disc's own dir
-    // on a cold-cache DirEntry error and hide an existing resumable staging
-    // dir — making the scan-complete tile omit the Resume button and the
-    // operator re-sweep instead of resuming. Mirrors `disc_already_completed`.
+    // NFS-resilient listing, not `read_dir(...).flatten()`, which could hide
+    // an existing resumable dir and make the operator re-sweep instead of
+    // resuming. Mirrors disc_already_completed.
     let staging_root = std::path::Path::new(&cfg.staging_dir);
     let basenames = list_staging_basenames(staging_root)?;
     for basename in basenames {
         let path = staging_root.join(&basename);
-        // EXACT match only. Staging dirs are created with the exact sanitized
-        // disc name (no year/suffix), so a prefix match never legitimately
-        // fires — it only invites the collision class (`Redshift` prefixing
-        // `Redshift_2`) fixed in staging_dir_matches_disc.
+        // EXACT match only — a prefix match invites the collision class
+        // (`Redshift` prefixing `Redshift_2`) staging_dir_matches_disc fixes.
         if basename != sanitized {
             continue;
         }
-        // A terminal `.failed` (or held `.review`) dir is NOT resumable, even
-        // when its mapfile still shows pending bytes. Offering a Resume here is
-        // the data-stranding bug: the Sweep-resume branch in `handle_rip_request`
-        // re-rips WITHOUT clearing the stale `.failed`, so a successful re-rip's
-        // `.ripped` ends up shadowed by the lingering `.failed` and the mux
-        // worker skips it forever (`.failed` is terminal-by-presence). Mirror the
-        // Remux-branch policy (`resumable_dir_blocked`): a terminal/held dir
-        // forces the operator to explicitly Wipe. Snapshot first so this is read
-        // from the same NFS-resilient, primed view the markers come from.
+        // A terminal `.failed` (or held `.review`) dir is NOT resumable: a
+        // re-rip wouldn't clear stale `.failed`, and the mux worker would
+        // skip it forever. Mirrors resumable_dir_blocked; forces a Wipe.
         if let Some(snap) = staging::snapshot_staging_disc(&path) {
             if snap.has_failed || snap.has_review {
                 return None;
             }
-            // A dir the mux worker owns (.ripped sweep-complete handoff or an
-            // in-flight .muxing) must NOT be offered as resumable. Resuming it
-            // would re-enter the rip/sweep path on a disc the worker is mid-mux
-            // on — racing the mux's reads against a fresh sweep that overwrites
-            // the staged ISO. Mirror the sibling Wipe guard
-            // (`disc_owned_by_worker` / `staging_disc_owned_by_worker`): a dir
-            // owned by the worker is off-limits until the mux finishes.
+            // A dir the mux worker owns (.ripped/.muxing) must NOT be offered
+            // as resumable — resuming would race a fresh sweep against the
+            // worker's reads. Mirrors disc_owned_by_worker's Wipe guard.
             if snap.has_ripped || snap.has_muxing {
                 return None;
             }
@@ -2209,11 +1999,9 @@ fn resumable_for_disc(cfg: &Config, display_name: &str, disc_label: &str) -> Opt
             Err(_) => continue,
         };
         let st = map.stats();
-        // Any not-good data is retryable: pending (NonTried/NonTrimmed/
-        // NonScraped) OR a previously-stamped Unreadable. Continue the sweep so
-        // the remaining passes get another shot — there is NO terminal "won't
-        // retry" state; the patch re-attempts Unreadable ranges every pass.
-        // Only a mapfile that is 100% Finished resumes straight to remux.
+        // Any not-good data (pending or previously Unreadable) is retryable —
+        // there is NO terminal "won't retry" state. Only a mapfile that is
+        // 100% Finished resumes straight to remux.
         return Some(if st.bytes_pending == 0 && st.bytes_unreadable == 0 {
             Resumable::Remux
         } else {
@@ -2336,10 +2124,9 @@ fn install_rip_halt(device: &str) {
 fn abort_post_mux_preserving_staging(device: &str, log_line: &str, last_error: &str) {
     crate::log::device_log(device, log_line);
     update_state_with(device, |s| {
-        // "error", not "failed": `failed` is the quarantined-disc status that
-        // pairs with a `.failed` marker, and neither of these sites writes
-        // one. Matches the mux-time loss-abort return a few lines above,
-        // which is the other resumable-but-over exit from this function.
+        // "error", not "failed": `failed` pairs with a `.failed` marker, and
+        // neither call site here writes one. Matches the mux-time loss-abort
+        // return above, the other resumable-but-over exit from this function.
         s.status = "error".to_string();
         if s.last_error.is_empty() {
             s.last_error = last_error.to_string();
@@ -2411,41 +2198,25 @@ fn fire_rip_complete_webhook(
 /// non-tried) ranges are read. When false, Pass 1 starts fresh (the mapfile
 /// is recreated and the ISO truncated) — the classic full sweep.
 pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resume_sweep: bool) {
-    // The poll-loop spawn site already registered a fresh `Halt` for
-    // this device (so an HTTP stop during scan has something to flip).
-    // Replace it with a Halt backed by the drive's halt-flag once the
-    // drive is open below — that way Stop also pre-empts in-flight
-    // `Drive::read` calls inside libfreemkv. The swap CARRIES a Stop that
-    // landed on the spawn-site token (see `install_rip_halt`); it cannot
-    // carry a stale one from a prior rip, because `HaltGuard` unregisters
-    // on every exit and the spawn site registers fresh per attempt.
+    // Replace the spawn site's fresh Halt with one backed by the drive's
+    // halt-flag once open, so Stop also pre-empts in-flight Drive::read
+    // calls; the swap carries a Stop already landed on the spawn-site token.
     install_rip_halt(device);
 
-    // RAII cleanup for the halt-map entry. Every exit path from `rip_disc`
-    // (including the many early returns on scan/open/keys/staging errors)
-    // must drop this device's `Halt` so a subsequent rip starts with a
-    // fresh token; leaking it on an error path was the v0.13.6 class of
-    // bug. Holding the guard for the function's whole body guarantees the
-    // `unregister_halt` runs on return, panic, and `?`-style early exits
-    // alike. `unregister_halt` is idempotent (a `HashMap::remove`), so it
-    // composes safely with the eject path that also unregisters.
+    // RAII cleanup for the halt-map entry: every exit path must drop this
+    // device's Halt (leaking it was the v0.13.6 bug class). Idempotent, so
+    // it composes safely with the eject path that also unregisters.
     let _halt_guard = HaltGuard {
         device: device.to_string(),
     };
 
-    // NOTE: the per-device log is archived/cleared at SCAN start
-    // (`scan_disc`), NOT here. A rip always follows a scan for this attempt, so
-    // clearing again on rip start would wipe the scan context (disc identity,
-    // the unlocker matrix, key resolution) the operator wants to see carry into
-    // the rip. One clear per attempt, at scan.
+    // The per-device log is archived/cleared at SCAN start, NOT here —
+    // clearing again would wipe the scan context (disc identity, unlocker
+    // matrix, key resolution) the operator wants carried into the rip.
 
-    // Snapshot the Config struct (it's Clone) and drop the read guard
-    // immediately. Holding the guard across the rip body would block
-    // any settings POST (Auto Eject, on_read_error, max_retries, …)
-    // for the rip's full duration, and Linux's writer-priority RwLock
-    // would queue all subsequent GETs behind the pending writer —
-    // the live observed bug where /api/settings, /api/history, and
-    // /api/system stopped responding mid-rip until the rip ended.
+    // Snapshot Config and drop the read guard immediately: holding it across
+    // the rip body would block settings POSTs, and Linux's writer-priority
+    // RwLock would then queue GETs behind it — the observed /api/* hang bug.
     let cfg_read = match cfg.read() {
         Ok(c) => c.clone(),
         Err(_) => {
@@ -2621,21 +2392,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         libfreemkv::DiscFormat::Unknown => "unknown",
     }
     .to_string();
-    // Pass 1 reads the WHOLE DISC (not a single title), so the total must be
-    // disc.capacity_bytes — using titles[0].size_bytes (the chosen movie's
-    // duration-weighted size estimate) was the v0.13.12 bug that made the UI
-    // show "0.0 GB / 0.0 GB" during Pass 1. Mux phase below already
-    // re-derives its own total from the input stream, so we don't lose that.
+    // Pass 1 reads the WHOLE DISC, so total must be capacity_bytes — using
+    // titles[0].size_bytes was the v0.13.12 bug showing "0.0 GB / 0.0 GB".
+    // Mux phase below re-derives its own total from the input stream.
     let total_bytes = if disc.capacity_bytes > 0 {
         disc.capacity_bytes
     } else {
         disc.titles.first().map(|t| t.size_bytes).unwrap_or(0)
     };
 
-    // An operator title override (set from the Ripper card's "✎ change" picker
-    // before clicking Rip) takes precedence over the scan's auto-match — the rip
-    // then files under the operator's pick. Taken once; falls back to the scan
-    // result. A picked title is trusted (treated as confident → no review hold).
+    // An operator title override (Ripper card's "✎ change" picker) takes
+    // precedence over the scan's auto-match; falls back to the scan result.
+    // A picked title is trusted (treated as confident → no review hold).
     let title_override = take_title_override(device);
     let overridden = title_override.is_some();
     let tmdb_owned: Option<crate::tmdb::TmdbResult> =
@@ -2651,15 +2419,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         .as_ref()
         .map(|t| t.overview.clone())
         .unwrap_or_default();
-    // Cloned for use in the finalize block (history record) — after multipass
-    // we drop `session` to release the drive, so we can't borrow session.tmdb
-    // at the tail of this function.
-    // No TMDB result → the EMPTY string, which is the mover's documented
-    // no-match sentinel: `routing_media_type` coalesces "" to the movie root and
-    // the mover/muxer tests assert exactly that ("" routes as a movie). A literal
-    // "unknown" here is neither empty nor "movie"/"tv", so it fell through to the
-    // output-root dump — a no-TMDB-key rip (a supported mode) never reached the
-    // movie library.
+    // No TMDB result → EMPTY string, the mover's documented no-match sentinel:
+    // routing_media_type coalesces "" to the movie root. A literal "unknown"
+    // here previously fell through to the output-root dump instead.
     let tmdb_media_type = tmdb
         .as_ref()
         .map(|t| t.media_type.clone())
@@ -2673,16 +2435,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     } else {
         tmdb_title.clone()
     };
-    // Confident = an exact title match WITH a year. Carried to the finalize block
-    // to decide auto-file (.done) vs hold-for-review (.review). disc_name is the
-    // disc's volume label; display_name is the resolved (TMDB) title.
-    //
-    // When TMDB is NOT configured (no API key) no rip can ever produce a
-    // confident match, so every rip would land in `.review` and never
-    // auto-file. Operators running without a TMDB key expect the disc-label
-    // filename, not a review hold. Treat "no API key" as confident so the rip
-    // files under the disc label and writes `.done`. The review hold is
-    // preserved ONLY when TMDB IS configured but returns low confidence.
+    // Confident = exact title match WITH a year; decides auto-file (.done) vs
+    // hold-for-review (.review). No TMDB key means no match is ever possible,
+    // so "no API key" counts as confident too, else every rip would review-hold.
     let title_confident = title_is_confident(
         &cfg_read.tmdb_api_key,
         overridden,
@@ -2719,14 +2474,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let codecs = format_codecs(&disc.titles[0]);
     let title = disc.titles[0].clone();
 
-    // Down-vs-no-key (rip path): if the ONLINE key service left this encrypted
-    // disc keyless, that may be a transient service outage (502 / timeout), not
-    // a genuinely missing key. Classify the service's reachability and bounded-
-    // retry resolution before we permanently fail the rip. A recovered service
-    // resolves keys here and the rip proceeds; a persistent outage yields
-    // `Some(reach)` and is parked below in a retryable/pending state instead of
-    // the old permanent "no keys found" error. No-op unless online + keyless;
-    // capture-without-keys keeps its ISO-now path untouched.
+    // Down-vs-no-key (rip path): an online-keyless disc may just be a transient
+    // outage, not a missing key — bounded-retry before failing permanently.
+    // A persistent outage yields Some(reach), parked below as retryable/pending.
     let mut key_outage: Option<crate::keysource::ServiceReachability> = None;
     if should_retry_online_keys(
         crate::keysource::uses_online(&cfg_read),
@@ -2740,23 +2490,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         key_outage = reach;
     }
 
-    // Base decode keys. `mut` because the shared FMTS pre-decode step below may
-    // re-derive them after banking forensic index keys onto the disc, so BOTH
-    // rip paths (single-pass feeds `keys` straight into the inline reader) see
-    // the complete key pool.
+    // Base decode keys; `mut` because the shared FMTS pre-decode step below
+    // may re-derive them after banking forensic index keys onto the disc.
     let mut keys = disc.decrypt_keys();
 
-    // No-keys decision. An encrypted disc with no usable keys can still be swept
-    // to a raw ISO (the sweep uses `decrypt: false`); only the MUX needs keys.
-    // The operator's `capture_without_keys` toggle decides what happens:
-    //   * enabled  → capture to ISO now, defer the mux until keys are available
-    //                (the mux is skipped below; staging is preserved for resume).
-    //   * disabled → don't rip; surface the explicit reason and stop here.
+    // No-keys decision: a keyless encrypted disc can still be swept to a raw
+    // ISO (only the mux needs keys). `capture_without_keys` decides: enabled
+    // → capture now, defer mux; disabled → don't rip, surface the reason.
     let keys_missing = disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None);
     if keys_missing {
-        // A persistent online-key-service outage is NOT a missing key: park the
-        // disc in a retryable/pending state (status idle, distinct message) so a
-        // later insert / rescan retries — do not permanently fail, do not eject.
+        // A persistent outage is NOT a missing key: park in a retryable/pending
+        // state so a later insert/rescan retries — don't fail or eject.
         if let Some(reach) = key_outage {
             let status_msg = key_service_transient_status(reach).unwrap_or(KEY_SERVICE_DOWN_STATUS);
             crate::log::device_log(device, &format!("Not ripping now — {status_msg}"));
@@ -2799,36 +2543,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         session.probed = true;
     }
 
-    // Detect the kernel-reported max batch size (aligned to AACS unit
-    // boundaries). Fall back to libfreemkv's documented default of 60
-    // sectors if detection fails. Pre-fix this was hardcoded to 1,
-    // which:
-    //   - made the API display `current_batch: 1` (misleading — it
-    //     suggested the rip was reading sector-by-sector during sweep,
-    //     but the actual sweep batch is determined inside libfreemkv's
-    //     freemkv_engine::sweep and is unaffected by this value)
-    //   - made the mux phase read the ISO **one sector at a time**
-    //     (2 KB chunks) via DiscStream::new(reader, title, keys, batch,
-    //     format) — a real perf bug on the mux read path
+    // Detect the kernel-reported max batch size (fallback: 60 sectors).
+    // Pre-fix this was hardcoded to 1, misleading the API's `current_batch`
+    // display and making the mux phase read the ISO one sector at a time.
     let batch = libfreemkv::disc::detect_max_batch_sectors(device_path);
     let format = disc.content_format;
 
     let output_format = cfg_read.output_format.clone();
 
-    // `output_format == "iso"` means "capture the whole disc image", and its
-    // abort accounting is whole-disc scoped: every unreadable sector counts,
-    // including scratched menus / trailers OUTSIDE any title's extents (see the
-    // multi-pass pre-mux gate and `abort_lost_ms`). Single-pass mode streams
-    // only the selected title's sectors straight to the muxer — it never reads
-    // (let alone recovers) out-of-title sectors and produces no whole-disc ISO.
-    // So single-pass cannot honour ISO semantics at all: there is no whole-disc
-    // image to hand the operator, and its rip-phase loss accounting is in-title
-    // only, so out-of-title damage that the multi-pass / resume ISO paths would
-    // capture (and gate on, whole-disc, under `abort_on_lost_secs=0`) is never
-    // seen. Refuse the incoherent combination up front and point the operator
-    // at multi-pass (the only path that captures a real whole-disc ISO and
-    // applies whole-disc loss accounting), mirroring the single-pass no-keys
-    // guidance below.
+    // ISO output needs whole-disc-scoped abort accounting, but single-pass
+    // streams only the selected title and never produces a whole-disc ISO.
+    // Refuse the incoherent combination and point at multi-pass instead.
     if iso_output_needs_multipass(&output_format, cfg_read.max_retries) {
         crate::log::device_log(
             device,
@@ -2849,12 +2574,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
     let ext = output_extension_for(&output_format, &disc);
 
-    // `disc_name` is the RAW volume label (meta_title, else volume_id) — the
-    // same value `DiscId::name()` gives the scan path, and the only thing that
-    // distinguishes two discs of a boxset behind their one shared TMDB title.
-    // The dir this resolves to must agree exactly with the one
-    // `disc_already_completed` / `find_resumable_for_disc` looked at a moment
-    // ago, which is why both go through `staging::staging_basename`.
+    // `disc_name` is the RAW volume label, the only thing distinguishing two
+    // discs of a boxset behind one shared TMDB title. Must resolve to the
+    // same dir disc_already_completed/find_resumable_for_disc just checked.
     let staging = cfg_read.staging_device_dir(&staging::staging_basename(
         std::path::Path::new(&cfg_read.staging_dir),
         &display_name,
@@ -2875,47 +2597,31 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         return;
     }
     // Stamp the dir with this disc's raw volume label so the NEXT disc of the
-    // same boxset — same TMDB title, different disc — is routed to its own dir
-    // instead of reading this one's `.completed` and being skipped unread.
-    // Also adopts a legacy dir that predates labels: it matches every disc
-    // until someone claims it, and the disc ripping into it now is the owner.
-    // Never overwrites an existing, different label (see `adopt_disc_label`).
+    // same boxset routes to its own dir instead of reading this `.completed`.
+    // Also adopts a legacy pre-label dir; never overwrites a different label.
     staging::adopt_disc_label(std::path::Path::new(&staging), &disc_name);
-    // Write the `.sweeping` in-progress marker immediately after the staging
-    // dir exists, before Pass 1. This governs the whole multi-hour sweep+patch
-    // window: without it the dir has only ISO+mapfile until `.ripped`, so a
-    // crash mid-sweep leaves it ungoverned — the startup resume scan would
-    // restart-count a healthy long rip toward `.failed`, and the mover would
-    // WARN-flood every 10s tick on the absent `.done`. Replaced by `.ripped`
-    // (hand-off) or `.failed` (abort) on every exit path below.
+    // Write `.sweeping` before Pass 1 to govern the whole sweep+patch window;
+    // without it a crash mid-sweep leaves the dir ungoverned (restart-count
+    // toward `.failed`, mover WARN-floods). Replaced by `.ripped`/`.failed`.
     staging::write_sweeping_marker(std::path::Path::new(&staging));
-    // RAII cleanup for the `.sweeping` marker. The terminal-marker writers
-    // clear it first, so this is a no-op on success/`.ripped`/`.failed`
-    // paths and only fires on the early-return error branches and panic,
-    // preventing a stale `.sweeping` from stranding the dir `InProgress`
-    // across restarts.
+    // RAII cleanup for `.sweeping`: terminal-marker writers clear it first,
+    // so this only fires on error/panic, preventing a stale `.sweeping` from
+    // stranding the dir InProgress across restarts.
     let _sweeping_guard = SweepingGuard {
         staging: std::path::PathBuf::from(&staging),
     };
-    // FILE names inside the staging dir, NOT the dir basename — deliberately
-    // plain `sanitize(display_name)`, with no `_2` disc suffix. The dir already
-    // separates the discs, so these are unambiguous on disk, and two things
-    // break if they take the suffix: `resume::delete_partial_output` looks for
-    // `<dir>/<display_name>.<ext>` when clearing a partial mux, and the mover's
-    // TV/fallback branches derive the DELIVERED filename from the staged
-    // filename (the movie branch rebuilds it from the TMDB title). Whether the
-    // suffix should reach output naming is a separate decision — see the mover.
+    // FILE names, NOT the dir basename — plain sanitize(display_name), no
+    // `_2` disc suffix (the dir already separates discs). delete_partial_output
+    // and the mover's TV/fallback delivery both key off this exact form.
     let filename = format!(
         "{}.{}",
         crate::util::sanitize_path_compact(&display_name),
         ext
     );
     let output_path = format!("{}/{}", staging, filename);
-    // Intermediate-ISO + mapfile-sidecar paths for multipass mode, derived
-    // once here from `staging` + `display_name`. Only the `max_retries > 0`
-    // branch writes/reads these; single-pass rips never produce an ISO. They
-    // were previously rebuilt at ~5 sites scattered through this function.
-    // Plain title, no disc suffix — same reasoning as `filename` above.
+    // Intermediate-ISO + mapfile paths for multipass, derived once here
+    // (previously rebuilt at ~5 scattered sites). Plain title, no disc
+    // suffix — same reasoning as `filename` above.
     let iso_filename = format!("{}.iso", crate::util::sanitize_path_compact(&display_name));
     let iso_path_str = format!("{staging}/{iso_filename}");
     let mapfile_path_str = format!("{iso_path_str}.mapfile");
@@ -2964,72 +2670,40 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         }
     };
 
-    // Shared state read by event callbacks (no &mut self) and the main
-    // rip loop (which copies atomics into RipState every ~1s). The watchdog
-    // timestamp is updated on ANY sector-level event — not just frame writes —
-    // so a long run of skipped sectors doesn't falsely register as "stalled".
+    // Shared state read by event callbacks and the rip loop (copies atomics
+    // into RipState every ~1s). The watchdog timestamp updates on ANY sector
+    // event, not just frame writes, so skipped sectors aren't seen as stalled.
     let wd_last_frame = Arc::new(AtomicU64::new(crate::util::epoch_secs()));
     let latest_bytes_read = Arc::new(AtomicU64::new(0));
     let rip_last_lba = Arc::new(AtomicU64::new(0));
     let rip_current_batch = Arc::new(AtomicU16::new(batch));
 
-    // Wire the drive's halt-flag into the per-device `Halt` token.
-    // Before this point the registered token was a placeholder
-    // (allocated at the top of `rip_disc` so a stop click had
-    // *something* to cancel); now we swap it for a `Halt` that views
-    // the same `Arc<AtomicBool>` the drive's internal recovery loops
-    // poll on — so `device_halt(device).cancel()` simultaneously
-    // propagates to libfreemkv's `Drive::read` and every phase loop
-    // here in autorip that holds a `halt.clone()`.
+    // Wire the drive's halt-flag into the per-device Halt token, swapping
+    // the top-of-function placeholder for one viewing the same AtomicBool
+    // the drive's recovery loops poll — so cancel() reaches libfreemkv too.
     let drive_halt_arc = session.drive.halt_flag();
     let halt_token = libfreemkv::Halt::from_arc(drive_halt_arc.clone());
-    // Carry a Stop that landed on the OLD (placeholder) token in the
-    // window between the dispatch-site cancellation check and this swap
-    // into the new token. Without this, the first stop click would
-    // cancel a token nobody reads again and silently no-op (the user
-    // would have to click again). The check+insert+carry is done under a
-    // single HALTS-lock acquisition so a concurrent /api/stop landing during
-    // the swap can't be lost (TOCTOU).
+    // Carry a Stop that landed on the OLD placeholder token during this
+    // window, else the first click would cancel a token nobody reads again.
+    // Check+insert+carry happens under one HALTS-lock acquisition (TOCTOU).
     swap_halt_carrying_cancel(device, halt_token.clone());
-    // Local alias: pre-existing call sites refer to `halt` as the
-    // legacy `Arc<AtomicBool>`. Keep the same name so the watcher
-    // helpers (which still take `Arc<AtomicBool>`) compile unchanged
-    // — this is a deprecated bridge, dropped together with
-    // `freemkv_engine::sweep()` in round 3.
+    // Local alias: pre-existing call sites use `halt` as the legacy
+    // `Arc<AtomicBool>`; deprecated bridge dropped with sweep() in round 3.
     let halt = drive_halt_arc;
 
-    // Rip-level wallclock watcher. Historically capped the ENTIRE rip at
-    // max(disc_runtime, 1h); the cap itself was removed 2026-06-04 (the
-    // watcher now just exits silently when the budget elapses — see the
-    // body below). Kept as a no-op poll loop that bails cleanly on
-    // rip_complete / halt. Configurable via MAX_RIP_DURATION_SECS.
-    // Snapshot every cfg field the rip needs upfront, then drop the read
-    // lock immediately. Pre-fix this binding shadowed the outer `cfg`
-    // RwLock<Config> with the read guard for the entire `rip_disc` body,
-    // holding the lock for the whole 60+ minute rip. The settings POST
-    // handler takes a write lock, so a user toggling Auto Eject (or any
-    // setting) hung on `cfg.write()` for the duration; once a writer is
-    // queued, Linux's writer-priority RwLock blocks subsequent reads
-    // too — so `/api/settings`, `/api/history`, `/api/system` all stop
-    // responding until the rip ends. `/api/state` survived because it
-    // uses a separate lock.
+    // Snapshot cfg fields upfront and drop the read lock immediately —
+    // pre-fix, holding the guard for the whole rip body queued a
+    // writer-priority RwLock writer and blocked /api/* for 60+ minutes.
     let (rip_budget_secs, transport_recovery_delay_secs) = {
-        // Recover the guard if the RwLock is poisoned (a settings writer
-        // panicked mid-write) rather than unwrapping and killing the rip
-        // thread — the snapshotted config values are still valid to read.
-        // Every other cfg read in this file degrades gracefully; this was
-        // the lone `.unwrap()`.
+        // Recover if the RwLock is poisoned rather than unwrapping and
+        // killing the rip thread — every other cfg read in this file
+        // degrades gracefully; this was the lone `.unwrap()`.
         let c = cfg.read().unwrap_or_else(|e| e.into_inner());
         (c.max_rip_duration_secs, c.transport_recovery_delay_secs)
     };
-    // Rip-level wallclock watcher. Cancellable via `rip_complete` —
-    // when the main rip thread finishes (success or graceful eject),
-    // it flips this flag and the watcher exits silently. Without this,
-    // the thread sleeps blindly for `rip_budget_secs` and fires the
-    // "budget exceeded" warning long after the rip already succeeded
-    // — empirically (2026-05-11): rip done at 13:27, false warning
-    // at 13:31. Now: poll every 5s, bail early when
-    // rip_complete is set.
+    // Cancellable via `rip_complete`: without it the watcher sleeps blindly
+    // for rip_budget_secs and fires a false "budget exceeded" warning long
+    // after the rip already succeeded (observed 2026-05-11).
     let halt_rip_watcher = halt.clone();
     let device_rip_watcher = device.to_string();
     let rip_complete = Arc::new(AtomicBool::new(false));
@@ -3058,15 +2732,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 return;
             }
         }
-        // Arbitrary whole-rip time cap REMOVED (2026-06-04). A rip stops on
-        // failure or pass exhaustion, never on a wall-clock: `passes = N` is the
-        // budget for recovering not-good data, and libfreemkv's own
-        // progress/stall watchdogs catch a genuinely stuck pass. The watcher
-        // no longer fires a halt when the (legacy) budget elapses — it just
-        // exits. The loop above still bails cleanly on rip_complete / halt.
+        // Arbitrary whole-rip time cap REMOVED (2026-06-04): a rip stops on
+        // failure/pass exhaustion, never wall-clock, since libfreemkv's own
+        // stall watchdogs catch a stuck pass. The watcher just exits now.
     });
-    // Drop guard that signals rip_complete on scope exit (rip
-    // function returns). The watcher polls this and exits cleanly.
+    // Signals rip_complete on scope exit; the watcher polls it and exits.
     struct RipCompleteGuard(Arc<AtomicBool>);
     impl Drop for RipCompleteGuard {
         fn drop(&mut self) {
@@ -3075,22 +2745,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     }
     let _rip_complete_guard = RipCompleteGuard(rip_complete);
 
-    // Per-pass user-stop forwarding. The per-pass wall-clock cap was
-    // removed 2026-06-04: a pass is bounded by its own work +
-    // libfreemkv's failure/stall watchdogs, never an arbitrary clock, so
-    // MIN_PASS_BUDGET_SECS no longer gates anything here.
+    // Per-pass wall-clock cap was removed 2026-06-04 — a pass is bounded by
+    // its own work + libfreemkv's stall watchdogs, not a clock.
     struct WallclockGuard(Arc<AtomicBool>);
     impl Drop for WallclockGuard {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Relaxed);
         }
     }
-    // Per-pass user-stop forwarder. Returns a guard that, on drop, stops
-    // the watcher thread. While alive it only forwards a user stop
-    // (`user_halt`) into the per-pass `pass_halt` flag. The per-pass
-    // wall-clock cap was REMOVED (2026-06-04): a pass is bounded by its
-    // own work + libfreemkv's failure/stall watchdogs, never an arbitrary
-    // clock — so this is no longer a "watcher", just a halt bridge.
+    // Forwards a user stop (`user_halt`) into the per-pass `pass_halt` flag;
+    // no longer a "watcher" since the wall-clock cap was removed, just a
+    // halt bridge. Returns a guard that stops the thread on drop.
     fn spawn_pass_watcher(
         pass_halt: Arc<AtomicBool>,
         user_halt: Arc<AtomicBool>,
@@ -3118,82 +2783,49 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // from this via spawn_pass_watcher. Renamed locally for clarity.
     let user_halt = halt.clone();
 
-    // Drive-level events: any one means something is happening, so the
-    // handler resets the watchdog so the "stalled" timer doesn't monotonically
-    // climb while the library works through recovery. See
-    // [`make_drive_event_fn`].
+    // Drive-level events reset the watchdog so the "stalled" timer doesn't
+    // climb while the library works through recovery. See make_drive_event_fn.
     session.drive.on_event(make_drive_event_fn(
         device.to_string(),
         wd_last_frame.clone(),
         latest_bytes_read.clone(),
     ));
-    // Multi-pass vs direct flow.
-    //
-    // When max_retries > 0, we go through an ISO intermediate: freemkv_engine::sweep writes
-    // the disc to an ISO (fast skip-forward on failure, ddrescue-style mapfile),
-    // then freemkv_engine::patch retries the bad ranges up to max_retries times, then the
-    // mux pipeline reads from the ISO (no drive involvement past this point).
-    //
-    // When max_retries == 0, we keep the existing direct disc→MKV flow —
-    // session.drive is passed to DiscStream::new and sectors stream straight
-    // through decrypt/demux/mux. Fastest path, no ISO overhead, but no retry.
-    // Lifted out of the multipass branch below so the mux progress loop
-    // (which lives in the outer scope) can reference it. Single-pass mode
-    // (max_retries == 0) has no multipass concept; the mux loop's checks
-    // gate on `total_passes > 0` before threading it into UI state.
+    // Multi-pass (max_retries > 0) goes through an ISO intermediate before
+    // mux; single-pass streams disc→MKV directly. Lifted out of the
+    // multipass branch so the outer-scope mux loop can reference it.
     let total_passes: u8 = plan_passes(cfg_read.max_retries).total_passes;
-    // Captured from the multipass branch so the mux call site (which is
-    // outside that branch) can pass it into MuxInputs for total-progress
-    // weighting. Stays at 0 in direct (single-pass) mode — the mux's
-    // total_pct helper falls through to mux-pct passthrough when
-    // max_retries == 0 anyway.
+    // Captured from the multipass branch so the mux call site can pass it
+    // into MuxInputs for total-progress weighting; stays 0 in single-pass.
     let mut bytes_unreadable_at_mux: u64 = 0;
     // Damage snapshot from the final sweep/patch pass, carried forward into
     // every mux-phase push_state call so /api/state damage fields don't
     // zero out the moment mux starts. Defaults (all-zero) for direct mode.
     let mut sweep_damage_snapshot = mux::SweepDamageSnapshot::default();
-    // In-title-scoped loss computed by the abort gate (abort_lost_ms).
-    // Hoisted here so the final status=done update can use the same
-    // in-title value the abort check used, instead of recomputing from
-    // whole-disc bytes_unreadable (which inflates the 'done' card when
-    // menus/trailers outside title extents are scratched).
-    // 0.0 in single-pass mode or when no unreadable sectors exist.
+    // In-title loss from the abort gate, hoisted so the final status=done
+    // update reuses it instead of recomputing from whole-disc bytes_unreadable
+    // (which inflates the card when out-of-title menus are scratched).
     let mut main_lost_ms_for_history_outer = 0.0f64;
 
-    // Retained FMTS forensic key map — set by the shared pre-decode gate BELOW
-    // (which runs for BOTH rip paths, before the workflow split) and read by the
-    // live single-pass inline reader after the split. Declared here to bridge
-    // those scopes. `None` for every non-FMTS disc.
+    // Retained FMTS forensic key map, set by the shared pre-decode gate below
+    // and read by the single-pass inline reader; bridges those scopes.
+    // `None` for every non-FMTS disc.
     let mut fmts_key_map: Option<std::sync::Arc<libfreemkv::decrypt::AacsKeyMap>> = None;
-    // FMTS CaptureOnly deferral flag. Set true by the pre-decode gate below when it
-    // resolved an INCOMPLETE forensic key map but the operator opted into capture-
-    // without-keys. Base AACS keys are present (so `keys_missing` is false and the
-    // no-keys mux-skip won't fire), yet muxing now would emit forensic garbage — so
-    // both mux-skip points honour this to defer the mux and preserve the ISO,
-    // mirroring the no-keys capture flow. `false` for every other disc.
+    // FMTS CaptureOnly deferral: set when the pre-decode gate resolved an
+    // INCOMPLETE forensic map with capture-without-keys on. Base keys are
+    // present, but muxing now would emit garbage — defer and preserve the ISO.
     let mut defer_forensic_mux = false;
-    // On-decrypt-miss key fetch. Online/sample-driven sources resolve only the
-    // CPS units sampled up front; when a read hits an orphan unit no held key
-    // opens, this asks the SAME key sources with that unit's ciphertext, caches
-    // the returned key, and retries — recovering an orphan CPS unit (e.g. a
-    // bonus clip not reachable from any playlist) instead of hard-failing the
-    // read. `None` for non-AACS discs. Built once, shared (cloned Arc) into the
-    // sweep and patch read paths; the mux reads main-title (already-resolved)
-    // extents only, so it doesn't need it. Only its consumers are the FMTS gate
-    // below and the multipass sweep/patch, so skip building it (and its live-drive
-    // MKB read) for a single-pass non-FMTS disc, where nothing reads it.
+    // On-decrypt-miss key fetch: when a read hits an orphan CPS unit no held
+    // key opens, asks the same key sources with its ciphertext and retries.
+    // `None` for non-AACS discs; skipped for single-pass non-FMTS (unused).
     let key_fetch: Option<libfreemkv::sector::KeyFetch> = disc
         .inputs()
         .filter(|_| {
             disc.format == libfreemkv::DiscFormat::Fmts || uses_multipass(cfg_read.max_retries)
         })
         .map(|mut inputs| {
-            // The live scan reads the MKB for the up-front resolve but does NOT
-            // retain it on the disc state, so `disc.inputs()` carries an EMPTY
-            // MKB. An online key service NEEDS the MKB to derive an orphan unit's
-            // key (decode rejects `mkb=0` with 404). Read it once here so every
-            // refetch request carries the full inf+MKB, exactly like the up-front
-            // resolve did. One drive read at rip start; `inf` filled too if absent.
+            // The scan doesn't retain the MKB on disc state, so disc.inputs()
+            // carries an empty one — but an online key service needs it to
+            // derive an orphan unit's key. Read it once here, up front.
             if inputs.mkb.is_empty()
                 && let Ok((inf, mkb, _version)) =
                     libfreemkv::Disc::read_aacs_inputs_from_drive(&mut session.drive)
@@ -3207,41 +2839,20 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let make: std::sync::Arc<
                 dyn Fn() -> Vec<Box<dyn libfreemkv::keysource::KeySource>> + Send + Sync,
             > = std::sync::Arc::new(move || {
-                // Recover the guard if the config lock was poisoned by a panicking
-                // settings writer, rather than panicking this rip thread — matches
-                // the file's graceful-degradation convention.
+                // Recover if the config lock was poisoned rather than
+                // panicking this rip thread — matches the file's convention.
                 crate::keysource::build_sources(&cfg.read().unwrap_or_else(|e| e.into_inner()))
             });
             libfreemkv::keysource::key_fetch(inputs, make)
         });
 
-    // ── Shared pre-decode: FMTS forensic key resolution (BOTH rip paths) ──
-    // Key resolution is a DECODE concern, so it runs here — before the single-
-    // pass/multipass workflow split — and both paths consume the result the same
-    // way. It used to be nested in the multipass-only reader block, so single-
-    // pass FMTS got neither the gate nor the read plan (its inline reader muxed
-    // the alternate device-group half as garbage). Base keys already passed the
-    // gate above; the forensic index keys are online-only and used to be resolved
-    // only at mux, so a base-keyed-but-forensic-missing FMTS disc swept for ~an
-    // hour and THEN failed. Prove the full (base + per-index-phase) map up front
-    // off the live drive — the `resolve_mux_key_map` seam does base + FMTS and
-    // folds the forensic keys into the pool. Fail fast unless the operator opted
-    // into capture-without-keys. Non-FMTS discs are unaffected (base gate already
-    // ran; `key_fetch` is `None` for CSS and for single-pass non-FMTS).
-    //
-    // The resolved map is retained (`fmts_key_map`, declared at the function
-    // body level) so the LIVE single-pass mux reads only our-phase units —
-    // without it, single-pass FMTS would pass the alternate device-group half
-    // to the demux (the pre-fix bug).
+    // Shared pre-decode FMTS forensic key resolution, before the single-
+    // pass/multipass split (previously multipass-only, so single-pass FMTS
+    // muxed garbage). Fails fast up front instead of after an hour-long sweep.
     if disc.format == libfreemkv::DiscFormat::Fmts {
-        // Honor a Stop that lands during forensic key resolution. `resolve_mux_key_map`
-        // runs BEFORE the sweep and takes no cancel token, so a user Stop (marginal
-        // disc → repeated read-fault attempts, or a slow keyserver) can't interrupt it
-        // by signature. Gate the call with a halt check on the SAME `Arc<AtomicBool>`
-        // the sweep loop polls: a Stop before or right after the resolve exits cleanly
-        // — no `.failed` marker, because a Stop is not a failure — and libfreemkv's own
-        // read loops already poll this flag, so an in-flight resolve unwinds at its next
-        // read boundary and surfaces here on return.
+        // Honor a Stop during forensic key resolution: resolve_mux_key_map
+        // runs before the sweep, so gate with a halt check on the same flag
+        // the sweep polls — a Stop exits cleanly with no `.failed` marker.
         let gate_stopped = || -> bool {
             if halt.load(Ordering::Relaxed) {
                 crate::log::device_log(
@@ -3288,23 +2899,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 {
                     a.unit_keys = unit_keys.clone();
                 }
-                // Re-derive the shared decode keys so BOTH paths see the forensic
-                // index keys just banked. This is essential for SINGLE-PASS, whose
-                // inline reader is handed `keys` directly (a stale base-only pool
-                // would miss the `fmts_key_map` forensic slots → DecryptFailed).
-                // Multi-pass re-resolves its own map from the ISO at resume-mux, so
-                // for it this is harmless; the `fmts_key_map` below is consumed only
-                // by the single-pass inline reader (via `with_key_map`).
+                // Re-derive shared decode keys so both paths see the banked
+                // forensic keys — essential for single-pass, whose inline
+                // reader is handed `keys` directly (stale pool → DecryptFailed).
                 keys = disc.decrypt_keys();
                 fmts_key_map = resolved_map.ok().map(std::sync::Arc::new);
                 crate::log::device_log(device, "FMTS: complete forensic key map resolved pre-rip.");
             }
             FmtsGate::CaptureOnly => {
-                // `defer_forensic_mux` is now set (from `plan`), so the mux-skip below
-                // (single-pass) or the resume path (`resume_remux` re-defers on
-                // `FmtsKeyMissing`, multi-pass) will actually arrange the deferral this
-                // log promises — previously this arm was a no-op and the mux ran with
-                // base-only keys, producing garbage / a hard quarantine.
+                // `defer_forensic_mux` is now set, so the mux-skip below (or
+                // resume_remux's re-defer) arranges the deferral this log
+                // promises — previously a no-op that muxed base-only garbage.
                 crate::log::device_log(
                     device,
                     "FMTS: forensic keys unavailable — capturing raw ISO now \
@@ -3317,11 +2922,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     "FMTS: forensic keys missing — not ripping. Enable \
                          \"capture without keys\" to save an ISO for later.",
                 );
-                // Clean up the staging dir like every sibling early-failure exit in
-                // `rip_disc` (write the `.failed` marker + clear the restart count),
-                // instead of leaving an empty, marker-less dir orphaned until a
-                // container restart. Driven by `plan.quarantine` so the routing is
-                // pinned by `fmts_gate_plan`'s unit test.
+                // Clean up like every sibling early-failure exit (write
+                // `.failed` + clear restart count) instead of leaving an
+                // orphaned dir. Driven by plan.quarantine (unit-tested).
                 if plan.quarantine {
                     let staging_disc_path = std::path::Path::new(&staging);
                     staging::write_failed_marker(
@@ -3344,26 +2947,12 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         let iso_path = std::path::Path::new(&iso_path_str);
         let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
 
-        // Pre-flight disk-space check. Multipass needs:
-        //   - one disc-sized ISO in staging (Pass 1 sweep target)
-        //   - one MKV being written by mux (~25-50 % of disc; counted as
-        //     1× to be conservative — the ISO is removed mid-mux when
-        //     keep_iso=false but only AFTER the MKV completes)
-        // → require at least 2× capacity_bytes free at staging.
-        // Without this, a UHD rip on a too-small disk runs ~30 minutes
-        // before ENOSPC at the boundary; user loses the time and the
-        // staging dir is left half-full of partial ISO (cleanup on
-        // ENOSPC failure isn't perfect).
-        // Escape hatch: AUTORIP_SKIP_DISKCHECK=1 bypasses the pre-flight
-        // check. Used to deliberately rip onto a smaller volume than 2×
-        // disc capacity for diagnostics (speed isolation, partial ISO
-        // tests). The rip will run and predictably ENOSPC mid-stream;
-        // the operator accepts that. Don't use in production.
+        // Pre-flight: require 2× capacity_bytes free at staging (ISO + an
+        // in-progress MKV), else a too-small disk ENOSPCs ~30 min in.
+        // AUTORIP_SKIP_DISKCHECK=1 bypasses this for diagnostics only.
         if bytes_total_disc == 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
-            // read_capacity() returned 0/unknown, so we can't compute the
-            // 2×-capacity requirement. Don't silently skip the preflight —
-            // tell the operator why the space check didn't run, so an
-            // eventual mid-stream ENOSPC isn't a surprise.
+            // read_capacity() returned 0/unknown, so the 2× requirement is
+            // uncomputable; tell the operator why the check didn't run.
             crate::log::device_log(
                 device,
                 "disk-space preflight skipped: drive reported unknown capacity (read_capacity=0); \
@@ -3385,13 +2974,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     return;
                 }
             } else {
-                // statvfs failed: staging path doesn't exist yet, the
-                // volume isn't mounted, or the path isn't a POSIX
-                // filesystem. We can't compute free space, so the 2×
-                // requirement can't be checked. Don't silently skip the
-                // preflight — tell the operator why, so an eventual
-                // mid-stream ENOSPC (e.g. an unmounted staging volume)
-                // isn't a surprise. Mirrors the unknown-capacity branch.
+                // statvfs failed (missing path / unmounted volume / non-POSIX
+                // fs), so free space can't be computed; tell the operator why
+                // rather than silently skipping. Mirrors the unknown-capacity branch.
                 crate::log::device_log(
                     device,
                     &format!(
@@ -3436,10 +3021,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             0, // bytes_lost
         );
 
-        // Progress callback — runs every read block (~64 KB). Throttle the
-        // mapfile re-read + state push to once every 1.5 s so we don't pound
-        // the mutex or the filesystem. State tracker holds last-sample
-        // timestamp + bytes for speed/ETA calc.
+        // Runs every read block (~64 KB); throttled to once every 1.5s so
+        // it doesn't pound the mutex/filesystem. Tracks last-sample for ETA.
         let pass1_state = std::cell::RefCell::new(PassProgressState::new());
         let pass1_ctx = &pass_ctx;
         let pass1_progress = |p: &libfreemkv::progress::PassProgress| -> bool {
@@ -3455,22 +3038,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             true
         };
 
-        // Pass 1: disc → ISO with transport-failure recovery.
-        //
-        // The Initio USB-SATA bridge crashes when reading damaged sectors,
-        // causing a USB re-enumeration (sg device changes number). The copy
-        // aborts, but the mapfile captures all progress. We retry with
-        // resume=true after re-opening the drive on its new device path.
+        // Pass 1 with transport-failure recovery: the Initio USB-SATA bridge
+        // crashes on damaged sectors, causing a USB re-enumeration (sg device
+        // renumbers). Retry with resume=true on the new device path.
         let pass1_halt = Arc::new(AtomicBool::new(false));
         let _pass1_guard = spawn_pass_watcher(pass1_halt.clone(), user_halt.clone());
 
         const MAX_PASS1_ATTEMPTS: u32 = 10;
         let mut attempt = 0;
         let mut result = None;
-        // The most recent sweep error, kept so the `result = None`
-        // fallthrough can translate the underlying SCSI cause through
-        // `format_pass_error` rather than surfacing a bare internal
-        // strategy identifier to the operator.
+        // Kept so the `result = None` fallthrough can translate the SCSI
+        // cause via format_pass_error, not a bare internal identifier.
         let mut last_sweep_err: Option<libfreemkv::Error> = None;
 
         'pass1: loop {
@@ -3480,17 +3058,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 break;
             }
 
-            // 0.18 round 3: Pass 1 calls freemkv_engine::sweep directly. The old
-            // disc.copy(opts.multipass=true) dispatched to sweep_internal
-            // which forwarded {decrypt, skip_on_error=multipass} to
-            // SweepOptions. resume=true on retry attempts so the existing
-            // mapfile state continues where the bridge crash left it
-            // (matches the pre-existing implicit resume behaviour: the
-            // first attempt is fresh and each retry resumes from mapfile).
-            //
-            // `resume_sweep` (user clicked Resume on a partial) makes even the
-            // FIRST attempt resume from the existing mapfile + ISO, so the
-            // ~40 GB already swept isn't re-read off the disc.
+            // resume=true on retry attempts so mapfile state continues where
+            // a bridge crash left it. `resume_sweep` (user clicked Resume)
+            // makes even the FIRST attempt resume, skipping already-swept data.
             let sweep_opts = freemkv_engine::SweepOptions {
                 decrypt: false,
                 resume: resume_sweep || attempt > 1,
@@ -3498,12 +3068,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 skip_on_error: true,
                 progress: Some(&pass1_progress),
                 halt: Some(pass1_halt.clone()),
-                // Persist the disc's decryption state into the mapfile so it
-                // survives to deferred-mux / resume. KEYS XOR VID: if the disc
-                // resolved a key, persist the unit keys (the final answer — the
-                // mux decrypts directly, no second key-service call); otherwise
-                // persist the VID (the retry marker). libfreemkv writes whichever
-                // applies (set_unit_keys clears vid when keys are present).
+                // Persist decryption state so it survives to deferred-mux/
+                // resume. KEYS XOR VID: unit keys if resolved (mux decrypts
+                // directly), else VID as the retry marker.
                 vid: disc.aacs.as_ref().map(|a| a.volume_id),
                 unit_keys: disc
                     .aacs
@@ -3553,12 +3120,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         return;
                     }
 
-                    // Transport failure — bridge crashed. Remember the
-                    // underlying cause so the exhaustion fallthrough can
-                    // translate it to operator-facing text via
-                    // `format_pass_error` rather than leaking the internal
-                    // strategy identifier. (`e` is unused past here; the
-                    // recovery arms shadow it with their own local errors.)
+                    // Transport failure — bridge crashed. Remember the cause
+                    // so exhaustion fallthrough can translate it via
+                    // format_pass_error, not leak an internal identifier.
                     last_sweep_err = Some(e);
 
                     // Drop stale drive, wait for USB re-enumeration, re-open
@@ -3648,11 +3212,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                                 break 'pass1;
                             }
 
-                            // Engage the drive's disc-type read mode before any
-                            // read. Idempotent. Kept here to stay structurally
-                            // identical to scan_disc / the fresh-open path / the
-                            // initial session probe, which all call probe_disc()
-                            // after init().
+                            // Engage disc-type read mode before any read
+                            // (idempotent); mirrors scan_disc and the other
+                            // open paths, which all call probe_disc() after init().
                             if let Err(e) = drive.probe_disc() {
                                 tracing::warn!(device = %device, error = %e, "drive probe_disc failed (continuing)");
                             }
@@ -3733,19 +3295,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                                 );
 
                                 // Same wedged-firmware diagnostic as the
-                                // new-path arm: an ILLEGAL REQUEST after a
-                                // same-sg re-enumeration also means the
-                                // firmware needs a power-cycle.
+                                // new-path arm: same-sg re-enumeration too
+                                // means the firmware needs a power-cycle.
                                 log_init_recovery_failure(device, &e);
 
                                 break 'pass1;
                             }
 
-                            // Engage the drive's disc-type read mode before any
-                            // read. Idempotent. Kept here to stay structurally
-                            // identical to scan_disc / the fresh-open path / the
-                            // initial session probe, which all call probe_disc()
-                            // after init().
+                            // Engage disc-type read mode before any read
+                            // (idempotent); mirrors scan_disc and the other
+                            // open paths, which all call probe_disc() after init().
                             if let Err(e) = drive.probe_disc() {
                                 tracing::warn!(device = %device, error = %e, "drive probe_disc failed (continuing)");
                             }
@@ -3839,10 +3398,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     ),
                 );
 
-                // Translate the underlying SCSI cause into operator-facing
-                // text. `format_pass_error` turns sense data into an
-                // actionable message (e.g. "power-cycle the drive"); fall
-                // back to a plain message only if no error was captured.
+                // format_pass_error turns sense data into an actionable
+                // message (e.g. "power-cycle the drive"); fall back to plain
+                // text only if no error was captured.
                 let user_msg = match &last_sweep_err {
                     Some(e) => format_pass_error("Pass 1", e),
                     None => "Pass 1 failed — see logs for detailed error breakdown".to_string(),
@@ -3911,10 +3469,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         let mut bytes_unreadable = result.bytes_unreadable;
         let mut bytes_pending = result.bytes_pending;
 
-        // Retry passes: freemkv_engine::patch re-reads only the bad ranges
-        // recorded in the mapfile sector-by-sector with full
-        // drive-level recovery. Each pass gets its own wallclock cap
-        // watcher; cap-fire marks the rip as failed.
+        // Retry passes: freemkv_engine::patch re-reads only the bad ranges,
+        // sector-by-sector, with full drive-level recovery.
 
         let max_retries = cfg_read.max_retries;
         // The patch-pass count comes from the pass plan (== max_retries); this
@@ -3938,30 +3494,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 break;
             }
 
-            // Skip remaining retry passes once the *muxable* scope is
-            // 100 % recovered. The user setting that decides scope:
-            //   - output_format = "iso"  → whole disc must be clean
-            //                              (every sector is part of what
-            //                              gets handed off; nothing to
-            //                              skip elsewhere)
-            //   - output_format = "mkv"/"m2ts" → only the title that
-            //                              actually gets muxed needs to
-            //                              be clean. Bad ranges that
-            //                              fall outside that title's
-            //                              extents (deleted scenes,
-            //                              menus, trailers) are not
-            //                              going into the output and
-            //                              do not earn additional retry
-            //                              passes.
-            //
-            // Note: `abort_on_lost_secs` is *not* the trigger here. That
-            // setting is the user's tolerance for content that ends up
-            // in the MKV; it gates abort vs. mux at the END of all
-            // retries. The skip-passes check is strictly "is everything
-            // we'll mux now Finished in the mapfile?". A disc with 5 s
-            // of loss when the threshold allows 10 s does NOT earn a
-            // skip — there's still recoverable damage in the muxed
-            // scope, so we keep trying.
+            // Skip remaining retry passes once the *muxable* scope is 100%
+            // recovered: ISO needs the whole disc clean, MKV/M2TS only the
+            // muxed title. `abort_on_lost_secs` is NOT the trigger; it gates the END.
             let mux_scope_bad =
                 match freemkv_engine::Mapfile::load(std::path::Path::new(&mapfile_path_str)) {
                     Ok(map) => {
@@ -4020,13 +3555,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let patch_title = &title_for_progress;
             let patch_map = std::path::Path::new(&mapfile_path_str);
 
-            // Paint the map (red bad ranges + at-risk movie time) at pass start,
-            // BEFORE the 30 s settle. Otherwise the bar sits all-green with
-            // "Maybe … · 0:00" for 30 s until the patch loop's first emission —
-            // most visible on resume, where there's no prior sweep push to carry
-            // the ranges across the pass boundary. The lib builds the snapshot
-            // from the mapfile (autorip never parses it); there's no live `p`
-            // yet at the boundary.
+            // Paint the map at pass start, BEFORE the settle. Otherwise the bar
+            // sits all-green for 30s until the patch loop's first emission —
+            // most visible on resume, with no prior sweep push to carry the ranges.
             if let Some(snap) = freemkv_engine::progress_snapshot_from_mapfile(
                 patch_map,
                 Some(patch_title),
@@ -4053,10 +3584,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let patch_progress = |p: &libfreemkv::progress::PassProgress| -> bool {
                 patch_state.borrow_mut().last_work_done = p.work_done;
                 patch_state.borrow_mut().last_work_total = p.work_total;
-                // 250 ms UI push cadence (matches libfreemkv's snapshot
-                // republish). The speed/ETA window is time-based, so finer
-                // samples only smooth it; the per-push mapfile reload is cheap
-                // for the usual handful of ranges.
+                // 250ms UI push cadence matches libfreemkv's snapshot republish;
+                // the per-push mapfile reload is cheap for the usual handful of ranges.
                 if patch_state.borrow().last_update.elapsed().as_millis() < 250 {
                     return true;
                 }
@@ -4066,21 +3595,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let pass_halt = Arc::new(AtomicBool::new(false));
             let _pass_guard = spawn_pass_watcher(pass_halt.clone(), user_halt.clone());
 
-            // 0.18 round 3: Pass 2..N calls freemkv_engine::patch directly. The old
-            // disc.copy(opts.multipass=true) dispatched to patch_internal
-            // when the mapfile already had retryable bytes; these PatchOptions
-            // mirror what patch_internal was constructing internally.
+            // 0.18 round 3: Pass 2..N calls freemkv_engine::patch directly; these
+            // PatchOptions mirror what the old patch_internal constructed.
             let patch_opts = freemkv_engine::PatchOptions {
                 decrypt: false,
-                // Enter each bad range BATCHED (not single-sector). A bad
-                // range from Pass 1 is mostly the good skip-ahead overshoot
-                // with a small damaged core; reading it one sector at a time
-                // (the old Some(1)) paid a SCSI op + AACS-unit decrypt per
-                // sector even through the good part. With a batch, the good
-                // overshoot reads in bulk and a batch failure bisects
-                // (handle_read_failure halves) down to the actual bad sector
-                // — single-sector cost is confined to real damage. Matches
-                // the sweep's batch size.
+                // Enter each bad range BATCHED, not single-sector: it's mostly
+                // good skip-ahead overshoot with a small damaged core, so a batch
+                // reads the overshoot in bulk and bisects down to the real bad sector.
                 block_sectors: Some(32),
                 full_recovery: true,
                 reverse: true,
@@ -4089,22 +3610,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 halt: Some(pass_halt.clone()),
                 key_fetch: key_fetch.clone(),
             };
-            // Un-wedge the drive in SOFTWARE before each retry pass. Grinding a
-            // bad cluster leaves the BU40N in a HARDWARE_ERROR fast-fail wedge
-            // where it fails even readable sectors; our notes say that needs a
-            // power-cycle. spin_cycle() is exactly that WITHOUT ejecting (the
-            // drive is slot-loading — a human eject is a product failure for an
-            // unattended service). Validated live: took the drive from
-            // failing-every-read back to reading at MB/s. This ACTIVE reset
-            // supersedes the old 30 s passive settle (which used to also run
-            // before pass 2 — the two stacked to 45 s of redundant delay on a
-            // fresh rip); a power-cycle recovers a wedged drive better than idle.
+            // Un-wedge the drive in SOFTWARE before each retry pass: grinding a
+            // bad cluster leaves it in a HARDWARE_ERROR wedge needing a power-cycle.
+            // spin_cycle() does that WITHOUT ejecting (slot-loading drive).
             if let Err(e) = session.drive.spin_cycle() {
-                // spin_cycle's SCSI command itself failed (dead bus / file-backed
-                // resume with no real drive). Fall back to a short passive idle so
-                // a drive that just ground a sweep still gets SOME recovery time
-                // before the retry reads — never zero (a bridge transport fault
-                // self-recovers in ~15 s of idle).
+                // spin_cycle's SCSI command failed (dead bus / file-backed resume).
+                // Fall back to a short passive idle for SOME recovery time — a
+                // bridge transport fault self-recovers in ~15s of idle.
                 crate::log::device_log(
                     device,
                     &format!(
@@ -4222,12 +3734,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             } else {
                 ""
             };
-            // Report the three buckets that actually tell success from failure:
-            // recovered THIS pass, how much is still bad (pending — retryable next
-            // pass), and how much has been given up (unreadable). The old line
-            // showed only `unreadable`, which is 0 until the post-loop promotion —
-            // so a pass that recovered nothing read as "0 recovered; 0 unreadable"
-            // and told you nothing.
+            // Report all three buckets — recovered this pass, still-pending, and
+            // given-up unreadable. The old line showed only `unreadable` (0 until
+            // post-loop promotion), so a failed pass read as "told you nothing".
             crate::log::device_log(
                 device,
                 &format!(
@@ -4271,37 +3780,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             }
         }
 
-        // End-of-recovery promotion: walk the mapfile and promote any
-        // still-NonTrimmed bytes to Unreadable. This is the "good or
-        // maybe until all passes are done, then it's gone" step that
-        // libfreemkv's patch loop intentionally defers to the
-        // orchestrator (see PatchItem::NonTrimmed doc + libfreemkv
-        // commit 863e04c). Pre-promotion: failed Pass-N bytes are
-        // still "maybe" in the mapfile. Post-promotion: they're
-        // confirmed lost, feeding the abort_on_lost_secs check below
-        // and the final Cosmetic-vs-Maybe display.
-        //
-        // Only runs in multi-pass mode (max_retries > 0); single-pass
-        // rips don't have a "final pass" boundary and have no mapfile,
-        // so their abort_on_lost_secs check runs AFTER the mux instead,
-        // gating on the demux skip count (see the single-pass abort gate
-        // below `run_mux`). Sweep never marks Unreadable either.
-        // End-of-recovery promotion + abort check: a single block so the
-        // abort check operates on the already-promoted in-memory map rather
-        // than re-loading from disk (the previous two-block design dropped
-        // `map` without flushing, then re-loaded the pre-promotion file,
-        // causing the abort check to see zero Unreadable bytes even after
-        // promotion — MED logic bug fixed here).
-        // A user STOP is NOT recovery-exhaustion. If the user halted (before or
-        // within the retry passes), skip the NonTrimmed→Unreadable promotion AND
-        // the abort-on-loss check below — those un-retried ranges are still
-        // recoverable. Preserve the partial sweep (ISO + mapfile, ranges left
-        // NonTrimmed, no terminal marker) and stop cleanly so a later Resume
-        // continues Pass 1 + Pass N from the mapfile. (Bug fixed here: this halt
-        // check previously lived only at the mux gate, AFTER this promote+abort
-        // block — so a stop before the retry passes promoted un-retried ranges to
-        // Unreadable and wrote a spurious `.aborted-loss`, mis-routing the disc to
-        // the accept-loss/remux resume path instead of continue-the-sweep.)
+        // End-of-recovery promotion: promote still-NonTrimmed bytes to Unreadable,
+        // feeding the abort check below via the SAME in-memory map (a prior re-load
+        // design saw zero Unreadable bytes pre-flush). Only multi-pass has a "final pass".
+
+        // A user STOP is NOT recovery-exhaustion: skip promotion and the abort
+        // check so un-retried ranges stay recoverable for a later Resume (a prior
+        // bug promoted them anyway and wrote a spurious `.aborted-loss`).
         if user_halt.load(Ordering::Relaxed) {
             crate::log::device_log(
                 device,
@@ -4317,23 +3802,15 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             let mapfile_path = std::path::Path::new(&mapfile_path_str);
             if let Ok(mut map) = freemkv_engine::Mapfile::load(mapfile_path) {
                 use freemkv_engine::SectorStatus;
-                // Promote still-NonTrimmed bytes to Unreadable — these are
-                // bytes that remained "maybe" across all patch passes and are
-                // now confirmed lost. The (from, to) pair is the pinned
-                // end-of-recovery promotion decision.
+                // Promote still-NonTrimmed bytes to Unreadable — "maybe" states
+                // that survived every patch pass are now confirmed lost. The
+                // abort gate reads Unreadable only, so unpromoted is invisible loss.
                 let (promote_from, promote_to) = end_of_recovery_promotion();
-                // `from` is a SET: NonTrimmed and NonScraped are both "maybe"
-                // states that survived every pass, and the abort gate reads
-                // only Unreadable, so a state left unpromoted is loss the
-                // gate cannot see.
                 let nontrimmed_ranges = map.ranges_with(promote_from);
                 let total_promoted: u64 = nontrimmed_ranges.iter().map(|(_, sz)| *sz).sum();
                 let n_ranges = nontrimmed_ranges.len();
-                // Promotion is what MAKES the loss visible: the abort gate below
-                // reads Unreadable ranges only, so a range that fails to promote
-                // is loss the gate cannot see. Logging and carrying on turns a
-                // write error into a rip delivered as good — the comment above
-                // says exactly this, and the code did it anyway.
+                // A range that fails to promote is loss the gate below cannot
+                // see — logging and carrying on would deliver a lossy rip as good.
                 let mut promotion_intact = true;
                 for (pos, size) in nontrimmed_ranges {
                     if let Err(e) = map.record(pos, size, promote_to) {
@@ -4351,10 +3828,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     bytes_promoted = total_promoted,
                     "end_of_recovery_promote: NonTrimmed -> Unreadable after final retry pass"
                 );
-                // Flush the promoted state to disk so downstream consumers
-                // (muxer, resume check) see the terminal Unreadable marks.
-                // Surface flush errors as warnings rather than silently
-                // dropping them.
+                // Flush the promoted state so downstream consumers (muxer,
+                // resume) see the terminal Unreadable marks; don't drop errors.
                 if let Err(e) = map.flush() {
                     // Downstream (mux, resume) re-reads the mapfile from DISK,
                     // so an unflushed promotion means they see the pre-promotion
@@ -4371,11 +3846,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // could return the pre-promotion state on slow storage).
                 bytes_unreadable = map.stats().bytes_unreadable;
 
-                // Abort check: use the already-promoted in-memory map so
-                // bad_ranges reflects the just-promoted Unreadable sectors.
-                // The previous design re-loaded the mapfile here, which
-                // returned the pre-promotion state when the flush above had
-                // not yet hit disk.
+                // Abort check uses the already-promoted in-memory map, not a
+                // re-load, which used to return pre-promotion state if the flush
+                // above hadn't hit disk yet.
                 if !promotion_intact {
                     tracing::error!(
                         device = %device,
@@ -4398,14 +3871,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // update (after run_mux) can use the same in-title value without
                 // re-reading the mapfile.
                 main_lost_ms_for_history_outer = main_lost_ms_for_history;
-                // Re-derive damage fields from the just-promoted in-memory map
-                // and push them to STATE before `map` is dropped. The
-                // marker_damage snapshot (~80 lines below) reads from STATE; if
-                // we skip this step it reads the last push_pass_state snapshot,
-                // which predates the NonTrimmed→Unreadable promotion and therefore
-                // under-reports errors / total_lost_ms / bad_ranges for a damaged
-                // rip. Mirrors resume.rs build_bad_ranges + damage-aggregation
-                // logic (see resume.rs ~692-713).
+                // Re-derive damage fields from the promoted map and push to STATE
+                // before `map` drops: the marker_damage snapshot below reads STATE,
+                // and skipping this would under-report a damaged rip's stale figures.
                 {
                     let (
                         promoted_bad_ranges,
@@ -4436,16 +3904,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     });
                 }
             } else {
-                // Fail-safe: the mapfile could not be loaded, so we cannot
-                // promote residual NonTrimmed bytes to Unreadable nor measure
-                // in-title loss. Leaving `main_lost_*_for_history` at their 0
-                // initializers would let the abort gate below conclude "no
-                // loss" and deliver a possibly-lossy rip as perfect. Instead,
-                // mark loss unquantifiable (NaN ms) so `loss_aborts` fires
-                // regardless of threshold — a mapfile we cannot read at the
-                // abort-decision point means the rip's damage record is gone,
-                // and the safe verdict is abort/quarantine, never silent
-                // delivery.
+                // Fail-safe: the mapfile couldn't load, so we can't measure loss.
+                // The 0 initializers would let the gate conclude "no loss" and
+                // deliver a lossy rip as perfect — mark NaN so `loss_aborts` fires.
                 crate::log::device_log(
                     device,
                     "Recovery mapfile could not be loaded to verify loss — forcing abort (cannot confirm a clean rip)",
@@ -4512,18 +3973,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         );
                     }
                 });
-                // Record the abort as a RESUMABLE `.aborted-loss` (not a
-                // terminal `.failed`): the full ISO + mapfile are on disk, so a
-                // raised `abort_on_lost_secs`, a fresh patch pass, or a code
-                // change may bring the loss under threshold on a later attempt.
-                // `mark_aborted_on_loss` keeps the dir RESUMABLE indefinitely:
-                // a loss-abort is deterministic media damage a plain re-rip
-                // won't change, so it is NEVER promoted to terminal `.failed` by
-                // attempt count (the operator resolves it via Accept or another
-                // pass). It also clears `.restart_count` so a deterministically-
-                // lossy rip doesn't ALSO walk the crash-restart loop. The `bool`
-                // it returns is now always `false`; the `if terminal` log below
-                // is inert (retained so the call site compiles unchanged).
+                // Record the abort as RESUMABLE `.aborted-loss`, not `.failed`:
+                // deterministic media damage a plain re-rip won't fix, so it's
+                // never promoted by attempt count. `if terminal` below is now inert.
                 let staging_disc_path = std::path::Path::new(&staging);
                 let terminal = staging::mark_aborted_on_loss(
                     staging_disc_path,
@@ -4563,28 +4015,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             unregister_halt(device);
             return;
         }
-        // (The per-pass wall-clock cap and its mux-skip branch were
-        // removed 2026-06-04 along with `cap_fired_any` — a pass is now
-        // bounded only by its own work + libfreemkv's stall watchdogs, so
-        // there is no cap-fire failure signal to gate the mux on.)
+        // (The per-pass wall-clock cap was removed 2026-06-04 along with
+        // `cap_fired_any` — passes are now bounded only by stall watchdogs.)
 
-        // ISO output: the deliverable is the whole-disc image we just swept,
-        // not a re-muxed title. The settings UI promises "ISO copies the whole
-        // disc; the other formats mux selected titles" — so skip the title mux
-        // entirely and hand the operator the intermediate `<name>.iso`. The
-        // abort gate above already scoped loss whole-disc for this mode, and
-        // the mover validates + moves `.iso` (its move filter is widened for
-        // ISO output via `retain_intermediate_iso`, and the ISO is never
-        // pruned here). Without this branch an ISO rip would fall through to
-        // the MKV mux below and the user would receive a `.mkv` selected-title
-        // mux — the opposite of what was requested.
+        // ISO output: the deliverable is the whole-disc image just swept, not a
+        // re-muxed title, so skip the title mux and hand over `<name>.iso` directly
+        // — otherwise an ISO rip would fall through to the MKV mux below.
         if output_is_iso_image(&cfg_read.output_format) {
             let iso_path = std::path::Path::new(&iso_path_str);
-            // Durability gate before the success markers, mirroring the MKV
-            // path's fsync-before-.done: a crash must not leave a `.done`
-            // pointing at a page-cache-only ISO. If the fsync fails, withhold
-            // the markers and preserve staging so a later attempt re-runs the
-            // flush rather than handing the mover a possibly-truncated image.
+            // Durability gate mirroring the MKV path: a crash must not leave a
+            // `.done` pointing at a page-cache-only ISO. If fsync fails, withhold
+            // the markers and preserve staging for retry.
             if !staging::durability_gate_passes(false, || staging::fsync_output_file(iso_path)) {
                 crate::log::device_log(
                     device,
@@ -4602,12 +4043,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 return;
             }
             let staging_path = std::path::Path::new(&staging);
-            // Confident match → `state: Done` (mover files it); otherwise
-            // `state: Review` (operator confirms the title before it leaves
-            // staging). One `state.json` transition carries the mover metadata +
-            // the single ISO output. TV structuring metadata (`season`/`disc`)
-            // is parsed from the raw disc label; `tmdb_id` threads through so the
-            // mover can fold the rip under `Show (Year)/Season NN/`.
+            // Confident match → `state: Done`; otherwise `state: Review`. One
+            // `state.json` transition carries mover metadata + the ISO output,
+            // plus TV metadata so the mover can fold it under `Show (Year)/Season NN/`.
             let marker_name = staging::handoff_label(title_confident);
             let iso_leaf = iso_filename.clone();
             if let Err(e) = staging::mark_handoff(staging_path, title_confident, |s| {
@@ -4677,20 +4115,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             return;
         }
 
-        // v0.25.3 parallel pipeline hand-off — sweep + patch are done,
-        // the ISO is on disk, the drive is no longer needed. Write
-        // the `.ripped` marker so the muxer worker can pick this
-        // staging dir up on its next tick, eject the disc if the
-        // operator asked for it, return the drive tile to idle, and
-        // exit `rip_disc`. The mux + post-mux bookkeeping that used
-        // to run below now runs inside `muxer::check_and_mux ->
-        // ripper::resume::remux_from_ripped_marker`.
-        //
-        // Snapshot sweep damage from STATE before building the marker.
-        // Snapshot the final post-promotion damage from STATE (already updated
-        // above, including promoted NonTrimmed→Unreadable bytes) and carry it
-        // into the marker so remux_from_ripped_marker can restore
-        // SweepDamageSnapshot on resume without re-reading the mapfile.
+        // v0.25.3 parallel pipeline hand-off: write `.ripped` so the muxer worker
+        // picks up staging; mux/post-mux now runs in `remux_from_ripped_marker`.
+        // Snapshot post-promotion damage into the marker for resume to restore.
         let marker_damage = {
             let s = state::STATE.lock().unwrap_or_else(|e| e.into_inner());
             s.get(device).map(|rs| mux::SweepDamageSnapshot {
@@ -4739,10 +4166,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 .as_ref()
                 .map(|d| d.largest_gap_ms)
                 .unwrap_or(0.0),
-            // Carry the fresh-rip confidence verdict (which already folds in
-            // the operator '✎ change' override) so the mux worker's
-            // resume_remux doesn't recompute confidence from the match check
-            // alone and second-guess a deliberate operator pick into .review.
+            // Carry the fresh-rip confidence verdict (folds in the operator
+            // override) so resume_remux doesn't second-guess a deliberate pick.
             title_confident,
         };
         let staging_path = std::path::Path::new(&staging);
@@ -4755,14 +4180,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 &format!(".ripped marker write failed ({e}); falling back to inline mux"),
             );
         } else {
-            // Record the TV-routing metadata the `RippedMarker` does not carry
-            // (`tmdb_id`, parsed `season`/`disc`, raw `disc_name`) and the
-            // deliverable PLAN (`outputs[]`) onto the just-written `state: Ripped`
-            // so it propagates through the mux/resume hand-off into the mover.
-            // For a movie the plan is one output (byte-identical); for a TV disc
-            // under `tv_auto` it is one per episode. The mux worker fans out over
-            // this list; the mover files each. Recording it here also fixes TV
-            // MKV rips previously losing their season on every non-ISO path.
+            // Record TV-routing metadata `RippedMarker` doesn't carry, plus the
+            // deliverable PLAN (`outputs[]`), onto `state: Ripped` so it propagates
+            // through mux/resume into the mover — fixes TV MKV rips losing their season.
             let plan = plan_mux_outputs(
                 &disc.titles,
                 &cfg_read,
@@ -4782,26 +4202,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 device,
                 "Sweep + patch complete; handed off to mux worker via .ripped marker.",
             );
-            // Status: "done" — the DISC READ is complete. Sweep + patch
-            // captured the whole-disc ISO; the drive is no longer needed
-            // and (with auto_eject) is ejected just below. The mux is a
-            // SEPARATE phase that runs off the staged ISO and is tracked
-            // in the System tab's Mux queue via the synthetic `_mux`
-            // device — it must NOT keep the real drive's tile on
-            // "ripping". Marking the real device "done" here also means
-            // the mux worker's post-mux `still_ripping` revert
-            // (`crate::muxer::check_and_mux`) is a no-op for this device:
-            // the synthetic mux device can never revert this tile's
-            // status, so the read-complete view is stable for the whole
-            // mux. (Previously this set "ripping", leaving the tile stuck
-            // on "Ripping" for the entire mux — the user-visible bug.)
-            //
-            // Carry damage fields (errors, total_lost_ms, main_lost_ms,
-            // bad_ranges, largest_gap_ms) from the current STATE entry so
-            // /api/state doesn't show zeroed damage during the hand-off
-            // window. push_pass_state wrote those fields; a bare
-            // ..Default::default() would zero them until the mux worker's
-            // first push_state tick re-derives them from sweep_damage.
+            // Status: "done" — the DISC READ is complete; mux is a SEPARATE phase
+            // tracked via the synthetic `_mux` device, which can never revert
+            // this tile back to "ripping" (previously it did). Carry damage fields too.
             let handoff_damage = {
                 let s = state::STATE.lock().unwrap_or_else(|e| e.into_inner());
                 s.get(device).map(|rs| mux::SweepDamageSnapshot {
@@ -4819,10 +4222,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 RipState {
                     device: device.to_string(),
                     status: "done".to_string(),
-                    // The read is finished; the tile shows a completed
-                    // (100%) card while the mux runs separately. The
-                    // delivered output file is the MKV the mux worker will
-                    // write under this name into the same staging dir.
+                    // The read is finished; the tile shows a completed (100%)
+                    // card while the mux runs separately and writes this filename.
                     progress_pct: 100,
                     output_file: filename.clone(),
                     disc_present: true,
@@ -4865,10 +4266,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     ..Default::default()
                 },
             );
-            // Rip stage done: the disc read finished, the ISO is staged and
-            // handed off to the mux worker, and the drive is now free for the
-            // next disc. Fire the drive-free hook here — at the eject decision
-            // point — BEFORE the separate mux worker later fires mux_complete.
+            // Rip stage done: the ISO is staged and the drive is now free.
+            // Fire the drive-free hook here, at the eject decision point,
+            // BEFORE the separate mux worker later fires mux_complete.
             fire_rip_complete_webhook(
                 &cfg_read,
                 device,
@@ -4929,13 +4329,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 Err(e) => {
                     let msg = format_lib_error("Open ISO", &e);
                     crate::log::device_log(device, &msg);
-                    // Cannot open the ISO for mux — if the sweep was
-                    // interrupted before any ISO data flushed (and the
-                    // `.ripped` hand-off also failed, which is the only way
-                    // this inline-mux fallback is reached), this ENOENT
-                    // repeats on every startup. Quarantine with `.failed`
-                    // so the restart scan classifies it terminal instead of
-                    // leaving it stranded `InProgress`.
+                    // Cannot open the ISO for mux — if the sweep was interrupted
+                    // and `.ripped` also failed, this ENOENT repeats every startup.
+                    // Quarantine with `.failed` so restart classifies it terminal.
                     let staging_disc_path = std::path::Path::new(&staging);
                     staging::write_failed_marker(staging_disc_path, &msg);
                     staging::clear_restart_count(staging_disc_path);
@@ -4962,10 +4358,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     return;
                 }
             };
-        // Capture the final bytes_unreadable for the mux call site (which
-        // is outside this multipass branch). Used by `total_pct_byte_weight`
-        // to size the total-progress denominator. By this point retries
-        // are done and the abort check has passed (we're entering mux).
+        // Capture bytes_unreadable for the mux call site (outside this branch),
+        // used to size the total-progress denominator once retries are done.
         bytes_unreadable_at_mux = bytes_unreadable;
 
         // Entering mux phase — push final mapfile state so the UI keeps the
@@ -4987,11 +4381,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 &mux_state,
             );
         }
-        // Snapshot the damage fields just written to STATE so the mux phase
-        // can carry them forward in every per-frame push_state call.
-        // Without this snapshot, push_state's `..Default::default()` would
-        // zero out errors / total_lost_ms / bad_ranges on the very first
-        // mux tick, making a damaged disc look perfectly clean during mux.
+        // Snapshot the damage fields just written to STATE so mux carries them
+        // forward each tick; without it, push_state's Default would zero them.
         sweep_damage_snapshot = {
             let s = state::STATE.lock().unwrap_or_else(|e| e.into_inner());
             s.get(device)
@@ -5011,26 +4402,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         Box::new(session.drive) as Box<dyn libfreemkv::SectorSource>
     };
 
-    // Keyless-capture mux-skip: an encrypted disc with no usable keys was
-    // swept to a raw ISO above (sweep needs no keys). Muxing now with
-    // `DecryptKeys::None` would write a garbage/encrypted MKV, so SKIP the
-    // mux entirely and PRESERVE staging (ISO + mapfile) so the deferred
-    // mux can run once keys exist.
-    //
-    // Reachability:
-    //   - multipass (max_retries > 0): the primary route already returned
-    //     via the `.ripped` marker hand-off above; the muxer worker re-tries
-    //     and `resume_remux` applies the same no-keys deferral. We only land
-    //     here on the rare marker-write-failure fallback — keep the ISO.
-    //   - single-pass (max_retries == 0): live disc→MKV with no ISO
-    //     intermediate. There's nothing to defer to, but we must NOT write a
-    //     garbage MKV. Skip and surface the deferral reason.
-    // `defer_forensic_mux` (FMTS CaptureOnly) joins `keys_missing` here: the base
-    // AACS keys are present but the forensic index keys are not, so muxing now would
-    // emit garbage — defer it exactly like the no-keys capture flow. Multi-pass FMTS
-    // CaptureOnly normally returns via the `.ripped` hand-off above (and defers in
-    // `resume_remux` on `FmtsKeyMissing`); it only lands here on the rare
-    // marker-write-failure fallback, where preserving the ISO is still correct.
+    // Keyless-capture mux-skip: keys are missing, so muxing now would write
+    // garbage — SKIP mux and PRESERVE staging for a deferred mux. Multipass
+    // normally already returned via `.ripped`; single-pass has no ISO to defer to.
     if keys_missing || defer_forensic_mux {
         let msg = keyless_failure_message(&disc);
         if uses_multipass(cfg_read.max_retries) {
@@ -5090,42 +4464,21 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Debug log reader type for mux - confirms ISO vs drive source
     tracing::debug!(target: "mux", " mux using reader: {}", if uses_multipass(cfg_read.max_retries) { "ISO file (multipass)" } else { "physical drive" });
 
-    // DiscStream gets the per-device `Halt` at construction (passed
-    // directly to `DiscStream::new`, so it also covers the CSS crack
-    // that runs there). Stop interrupts `fill_extents` at the next
-    // retry boundary on the same signal that breaks sweep, patch, and
-    // the mux frame loop — required for Stop to work during dense
-    // bad-sector regions where the outer PES read() loop may never
-    // emit a frame.
-    //
-    // Multipass ISO path: wrap the reader in a `PrefetchedSectorSource`
-    // so the read+decrypt work runs on a dedicated producer thread
-    // while the mux consumer (demux + codec parsers + writer) runs on
-    // the main thread. On the testbed this took the null:// /
-    // consumer ceiling from ~70 MB/s to ~124 MB/s and lets production
-    // mux push closer to the disk's combined r+w wall. The drive
-    // single-pass path keeps the inline reader because `DiscStream`'s
-    // adaptive batch retry only fires inside `fill_extents` and the
-    // prefetch wrapper would bypass it.
-    //
-    // The reader-side stream events (BytesRead / BatchSizeChanged /
-    // SectorSkipped) are now forwarded by libfreemkv's `mux_stream` through the
-    // `AutoripMuxEvents` bridge (in `mux.rs`) for BOTH the multipass ISO path
-    // (`mux_iso`) and the single-pass inline path (`mux_live`) — so the old
-    // shared `make_stream_event_fn` closure is gone; the atomics it fed
-    // (`wd_last_frame`, `rip_last_lba`, `rip_current_batch`, `latest_bytes_read`)
-    // are handed to the bridge via `MuxAtomics` below.
+    // DiscStream gets the per-device `Halt` at construction (covering the CSS
+    // crack too). Stop interrupts `fill_extents` at the next retry boundary,
+    // required during dense bad-sector regions where a frame may never emit.
 
-    // Mux-phase progress denominator. The multipass/resume highway reads the
-    // WHOLE disc-capacity ISO, so its `BytesRead` climbs to `disc.capacity_bytes`
-    // — keep `total_bytes` (disc capacity) as-is there. The single-pass path
-    // (max_retries == 0) streams ONLY the selected title's extents over the live
-    // drive, so `DiscStream`'s `BytesRead` caps at the title's extent byte sum
-    // (`bytes_total_extents` = Σ sector_count × 2048). Using disc capacity as the
-    // denominator there made the live progress bar / ETA plateau at
-    // title_size ÷ disc_capacity (e.g. ~50% for a 25 GB title on a 50 GB disc).
-    // Scope the denominator to the same extent sum the read source reports so the
-    // bar reaches 100%. Computed before `title` is moved into the stream below.
+    // Multipass ISO path: wrap the reader in `PrefetchedSectorSource` so
+    // read+decrypt run on a producer thread (~70→124 MB/s on the testbed).
+    // Single-pass keeps the inline reader, since prefetch would bypass `fill_extents`'s retry.
+
+    // Reader-side stream events are forwarded by `mux_stream`'s `AutoripMuxEvents`
+    // bridge for both ISO and live paths, so the old shared closure is gone;
+    // its atomics are now handed to the bridge via `MuxAtomics` below.
+
+    // Mux-phase progress denominator: multipass/resume reads the WHOLE disc, so
+    // disc capacity is correct there. Single-pass streams only the title's
+    // extents, so disc capacity there plateaued the bar — scope to the extent sum.
     let mux_total_bytes = mux_progress_denominator(cfg_read.max_retries, total_bytes, &title);
 
     let _mux_span =
@@ -5187,10 +4540,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         match mux::mux_iso(mux_inputs, iso_src, mux_atomics) {
             Ok(o) => o,
             Err(e) => {
-                // Construction-time classification preserved verbatim: a Stop
-                // pressed during the CSS crack inside pipeline construction
-                // surfaces as `Error::Halted` — a user halt, not a structural
-                // failure: preserve staging for auto-resume, no `.failed`.
+                // A Stop pressed during the CSS crack surfaces as `Error::Halted`
+                // — a user halt, not structural: preserve staging, no `.failed`.
                 if is_halt_error(&e) {
                     crate::log::device_log(
                         device,
@@ -5199,10 +4550,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     unregister_halt(device);
                     return;
                 }
-                // A pipeline BUILD failure (header resolution, codec negotiation,
-                // format error) is structural and permanent — retries won't fix
-                // it. Quarantine the dir with `.failed` (mirrors the header-phase
-                // failure path below).
+                // A pipeline BUILD failure is structural and permanent — retries
+                // won't fix it. Quarantine with `.failed` (mirrors header-phase path below).
                 tracing::error!(target: "mux", device=%device, "mux_stream setup failed: {e}");
                 let msg = format!(
                     "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
@@ -5221,16 +4570,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             }
         }
     } else {
-        // Drive single-pass path (STEP 4c-ii): the live inline `DiscStream` via
-        // libfreemkv::mux_stream (`MuxInput::Live`). It stays INLINE — NOT the
-        // prefetch highway — because `DiscStream::fill_extents`' adaptive
-        // batch-retry on a bad live-drive sector only fires on the inline reader;
-        // the highway wrapper would bypass it. The header pump / write pipeline /
-        // finish loop the hand-rolled `run_mux` used to own now live inside
-        // `mux_stream`; `AutoripMuxEvents` feeds the same watchdog + UI atomics.
-        // The forensic `fmts_key_map` is applied inside `mux_stream` via
-        // `DiscStream::with_key_map` (single-pass FMTS: read only our-phase units
-        // and decrypt the forensic segment correctly); `None` for non-FMTS discs.
+        // Drive single-pass path (STEP 4c-ii): live inline `DiscStream` via
+        // `mux_stream`. Stays INLINE, not the prefetch highway, since
+        // `fill_extents`' adaptive batch-retry only fires on the inline reader.
         let live_src = mux::LiveMuxSource {
             reader,
             title,
@@ -5242,11 +4584,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         match mux::mux_live(mux_inputs, live_src, mux_atomics) {
             Ok(o) => o,
             Err(e) => {
-                // Same construction-time classification as the multipass branch
-                // and the pre-migration inline path: a Stop pressed during the CSS
-                // crack inside `DiscStream::new` (run within `mux_stream`) surfaces
-                // as `Error::Halted` — a user halt, not a structural failure:
-                // preserve staging for auto-resume, no `.failed`.
+                // Same classification as the multipass branch: a Stop pressed
+                // during the CSS crack surfaces as `Error::Halted` — a user
+                // halt, not structural: preserve staging, no `.failed`.
                 if is_halt_error(&e) {
                     crate::log::device_log(
                         device,
@@ -5255,10 +4595,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     unregister_halt(device);
                     return;
                 }
-                // A build failure (header resolution, codec negotiation, or a
-                // scrambled-but-uncrackable CSS DVD → CssKeyMissing) is structural
-                // and permanent — retries won't fix it. Quarantine with `.failed`
-                // (mirrors the multipass branch and the header-phase path below).
+                // A build failure (or a scrambled-but-uncrackable CSS DVD →
+                // CssKeyMissing) is structural — retries won't fix it. Quarantine
+                // with `.failed` (mirrors the multipass branch and header-phase path).
                 tracing::error!(target: "mux", device=%device, "mux_stream (live) setup failed: {e}");
                 let msg = format!(
                     "Mux setup failed — the disc's title or stream layout could not be prepared for muxing. The source may be damaged or use an unsupported format ({e})."
@@ -5278,26 +4617,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         }
     };
 
-    // Output never opened. Two sub-cases:
-    //
-    //   a) `finalize_error == None` — a clean stop during header read
-    //      (halt / EOF with headers already resolvable but cancelled).
-    //      The pre-split code returned early without writing a history
-    //      record or marker, leaving the dir resumable. Preserve that.
-    //
-    //   b) `finalize_error == Some(msg)` — run_mux gave up in the header
-    //      phase because the stream is structurally unusable: the header
-    //      buffer exceeded its cap before codec_privates resolved, or EOF
-    //      / a read error hit before `headers_ready()` (the
-    //      header-resolution-incomplete path). No output file exists, but
-    //      this is a terminal failure, not a resumable stop. Falling
-    //      through to the bare return drops the reason on the floor: no
-    //      `.failed` marker (so resume-on-startup may re-resume a dir that
-    //      can never succeed) and the device tile stays in its prior
-    //      `status="ripping"` with the reason only in the device log.
-    //      Quarantine + surface it, mirroring the post-finalize failure
-    //      path below (write `.failed`, status="failed", reason in
-    //      `last_error`). No output file to fsync (none was opened).
+    // Output never opened: `None` is a clean stop (halt/EOF pre-headers) —
+    // preserve as resumable. `Some(msg)` means the stream was structurally
+    // unusable — quarantine + surface it rather than leaving a dir resume can't fix.
     let header_phase = header_phase_disposition(
         mux_outcome.output_opened,
         mux_outcome.finalize_error.as_deref(),
@@ -5347,42 +4669,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let bytes_done = mux_outcome.bytes_done;
     let elapsed = mux_outcome.elapsed_secs;
     let speed = mux_outcome.speed_mbs;
-    // 0.20.8 validation-audit fix #1: if `MuxSink::close` failed inside
-    // `output.finish()`, the MKV is structurally invalid (unseekable —
-    // Cues never landed and the segment-info length header wasn't
-    // patched). Quarantine the staging dir with `.failed` and report
-    // status=failed in the history record. Skipped here for halt /
-    // timeout / panic — those are wedge cases handled by the existing
-    // "stopped" path so the user can retry.
+    // 0.20.8 fix #1: if `MuxSink::close` failed in `output.finish()`, the MKV
+    // is structurally invalid (unseekable). Quarantine with `.failed`; skipped
+    // for halt/timeout/panic, which the existing "stopped" retry path handles.
     let finalize_error = mux_outcome.finalize_error.clone();
-    // A hard producer read error (on_read_error=stop saw an unrecoverable
-    // read Err and truncated the MKV) is reported here, distinct from a
-    // user-initiated halt. Both yield `completed=false` with no
-    // `finalize_error`, but only a halt should fall through to the silent
-    // "stopped → idle" path: a read failure must surface on `/api/state`
-    // (status="error" + last_error) so the operator sees the rip failed
-    // due to a read error rather than a user stop. The disc stays
-    // resumable (no `.failed` quarantine — a transient drive/NFS read may
-    // succeed on retry), matching run_mux's resumable-stop semantics.
+    // A hard producer read error is distinct from a user halt: both yield
+    // `completed=false` with no `finalize_error`, but only halt falls through
+    // to silent "stopped → idle" — a read failure must surface as an error.
     let read_error = mux_outcome.read_error.clone();
-    // Streams the sink accepted frames for but could not deliver into the
-    // finished container are NOT re-reported here. `map_iso_mux_outcome`
-    // produces every outcome that can carry them and already logs
-    // `undelivered_streams_note` into this same device log, so a summary copy
-    // here was a second, differently-worded line for one event — one lossy mux
-    // reading as two, and an alert on either phrase seeing half the story.
+    // Undelivered streams are NOT re-reported here: `map_iso_mux_outcome`
+    // already logs `undelivered_streams_note` into this same log, so a summary
+    // copy would be a second, differently-worded line for one event.
     let mut final_errors = mux_outcome.errors;
     let final_last_sector = rip_last_lba.load(Ordering::Relaxed);
     let final_current_batch = rip_current_batch.load(Ordering::Relaxed);
     let mut final_lost_secs = mux_outcome.lost_video_secs;
-    // Demux-time loss (sectors that read into the ISO fine but fail AACS/CSS
-    // decrypt at mux, or codec-corruption demux skips that zero-fill output).
-    // This is the in-title-scoped demux-skip estimate from `run_mux`, the same
-    // quantity the single-pass (mod.rs) and resume (resume.rs) success paths
-    // fold into their reported figures. Captured BEFORE the multipass overwrite
-    // below replaces `final_lost_secs` with the sweep-mapfile loss for the UI
-    // card, so a fresh multi-pass rip can still report this demux loss. The mux
-    // never aborts on it — it is concealed and tallied only.
+    // Demux-time loss (fails decrypt at mux, or codec-skip zero-fills): the
+    // in-title estimate single-pass/resume also fold in. Captured BEFORE the
+    // multipass overwrite below replaces `final_lost_secs`; mux never aborts on it.
     let demux_lost_secs = mux_outcome.lost_video_secs;
     // In multipass mode the `input.errors` counter above counts ISO→MKV demux
     // skips (usually zero — ISO reads don't fail). The real bad-sector count
@@ -5391,43 +4695,29 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         && let Ok(map) = freemkv_engine::Mapfile::load(std::path::Path::new(&mapfile_path_str))
     {
         let stats = map.stats();
-        // Only Unreadable counts as "lost" — NonTried / NonTrimmed /
-        // NonScraped at the END of a rip means the rip was interrupted,
-        // not that those bytes are damaged. For an interrupted rip the
-        // final history record reflects what we know: unreadable = bad.
+        // Only Unreadable counts as "lost" — NonTried/NonTrimmed/NonScraped at
+        // the end means the rip was interrupted, not those bytes damaged.
         let bad_bytes = stats.bytes_unreadable;
         final_errors = (bad_bytes / 2048) as u32;
-        // Use the in-title-scoped loss already computed by abort_lost_ms()
-        // (same gate the abort check used above). Whole-disc `bad_bytes /
-        // title_bytes_per_sec` inflates the 'done' card when menus or trailers
-        // outside the title extents are scratched — the abort gate correctly
-        // accepted the rip because in-title loss was within threshold, but the
-        // final UI card would show a larger number from out-of-title damage.
+        // Use the in-title-scoped loss already computed by abort_lost_ms() (same
+        // gate used above). Whole-disc `bad_bytes / bps` inflates the 'done' card
+        // when out-of-title menus/trailers are scratched but the gate accepted it.
         final_lost_secs = if main_lost_ms_for_history_outer > 0.0 {
             main_lost_ms_for_history_outer / MILLIS_PER_SEC
         } else {
-            // main_lost_ms_for_history_outer is 0 when either: no bad sectors
-            // exist (clean disc), or bytes_unreadable == 0. In those cases
-            // fall back to the mux outcome's own lost_video_secs (usually 0
-            // on a clean disc, or the demux skip count for single-pass mode).
+            // Zero here means no bad sectors (or bytes_unreadable == 0); fall
+            // back to the mux outcome's own lost_video_secs in that case.
             mux_outcome.lost_video_secs
         };
     }
 
-    // A loss is a loss. Mux-time (decrypt/codec) loss is missing in-title data
-    // just like a read error — it's concealed for playability (NULL-TS fill +
-    // drop-to-keyframe, so the file decodes clean) but the data is still gone.
-    // So it is gated against `abort_on_lost_secs` below, right before the `.done`
-    // marker, exactly as read-time loss is. The PRE-mux gate can't catch it (it
-    // reads only the mapfile Unreadable set — decrypt/codec skips never appear
-    // there), so this is the sole enforcement point for mux-time loss.
+    // A loss is a loss: mux-time loss is concealed for playability but the data
+    // is still gone, so it's gated against `abort_on_lost_secs` below — the sole
+    // enforcement point, since the PRE-mux gate only reads the Unreadable set.
 
-    // Emit a final mux summary line so the history record's captured log
-    // ends with a clean terminal event instead of whatever the last 60s
-    // progress tick happened to be. Without this, a mux that finishes
-    // within 60s of its last tick freezes the log at e.g. "(84%) 21.8 MB/s
-    // ETA 9:27" — visibly truncated even though the rip completed cleanly.
-    // History snapshot below captures whatever's in LOGS, so write here.
+    // Emit a final mux summary line so the log ends with a clean terminal
+    // event, not a stale progress tick (e.g. "(84%) ... ETA 9:27") from a mux
+    // that finished within 60s of its last tick. History snapshot reads LOGS.
     if completed {
         crate::log::device_log(
             device,
@@ -5442,14 +4732,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         crate::log::device_log(device, &format!("Mux failed: {reason}"));
     }
 
-    // ── Mux-time loss gate (a loss is a loss) ───────────────────────────────
-    // Read-time loss was already gated PRE-mux (it reads the mapfile Unreadable
-    // set); this catches the mux-time (decrypt/codec) loss the pre-mux gate can't
-    // see, before filing `.done`. Over `abort_on_lost_secs` → quarantine to a
-    // RESUMABLE `.aborted-loss` (a keydb refresh + re-mux can complete it),
-    // exactly as the pre-mux abort does. ISO output is exempt (whole-disc, gated
-    // by 100% elsewhere). Only fires when the MUX itself contributed loss —
-    // read-time loss alone already passed the pre-mux gate.
+    // ── Mux-time loss gate (a loss is a loss) ─────────────────────────────
+    // Catches mux-time (decrypt/codec) loss the pre-mux gate can't see. Over
+    // threshold → RESUMABLE `.aborted-loss`. ISO is exempt; only fires on mux-caused loss.
     {
         let effective_abort =
             effective_abort_secs(&cfg_read.output_format, cfg_read.abort_on_lost_secs);
@@ -5493,25 +4778,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         }
     }
 
-    // Write the staging markers (.done / .completed / .failed) the mover and the
-    // resume-on-startup detector depend on. (The per-rip history record/log that
-    // used to be written here was removed in 0.30.1 — the History tab was
-    // unmaintained and didn't work; see web.rs.)
+    // Write the staging markers (.done/.completed/.failed) the mover and resume
+    // detector depend on. (The per-rip history record removed in 0.30.1 — see web.rs.)
     {
         if completed {
-            // Durability gate: fsync the finished MKV/M2TS before any
-            // success marker so a crash/power-loss can't leave a "done"
-            // marker pointing at a page-cache-only (truncated on disk)
-            // file. Library mux finish() only flushes to the OS and the
-            // bounded fsync inside it returns Ok even on timeout/halt — so
-            // THIS fsync is the real durability gate. Skip for network://
-            // output, which has no local file.
-            //
-            // If the fsync fails (false), do NOT write the
-            // `.done`/`.completed` markers: the output is not provably
-            // durable, so treat the rip as resumable this cycle. Leaving
-            // the staging dir intact lets a later attempt re-run the flush
-            // rather than handing a possibly-truncated file to the mover.
+            // Durability gate: fsync the finished MKV/M2TS before any success marker,
+            // since mux finish()'s bounded fsync returns Ok even on timeout/halt.
+            // Skipped for network:// output; on failure, withhold markers and retry.
             let is_network = staging::is_network_output(&output_format, &cfg_read.network_target);
             if !staging::durability_gate_passes(is_network, || {
                 staging::fsync_output_file(std::path::Path::new(&output_path))
@@ -5524,21 +4797,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 );
                 return;
             }
-            // Confident match (exact title + year) → hand straight to the mover
-            // (.done). Otherwise HOLD for operator review (.review): the rip is
-            // complete and staged, but we will NOT auto-file it into the library
-            // under a guessed name. The Needs-review UI resolves it (pick the
-            // right title → promotes to .done, or proceed as-is). "Better to
-            // pause; worst case the operator clicks proceed." A would-overwrite
-            // collision is still caught later by the mover's own guard.
+            // Confident match → hand straight to the mover (.done). Otherwise HOLD
+            // for review (.review) rather than auto-file under a guessed name; a
+            // would-overwrite collision is still caught later by the mover's own guard.
             let marker_name = staging::handoff_label(title_confident);
-            // One durable `state.json` transition (tmp + fsync + rename +
-            // dir-fsync). The staging-dir fsync is the crash barrier: `state:
-            // Done` is observed on disk before the later `.completed`/ISO-prune,
-            // so a crash can never leave a completed/pruned dir without a durable
-            // hand-off. Carries the mover metadata + the single MKV output, plus
-            // the `season`/`tmdb_id`/`disc` the pre-unification MKV path dropped
-            // (the bug that filed every TV MKV rip under `Season 01`).
+            // One durable `state.json` transition: the staging-dir fsync is the
+            // crash barrier, so a crash can't leave a dir without a hand-off.
+            // Carries mover metadata + season/tmdb_id/disc.
             let staging_disc_path = std::path::Path::new(&staging);
             let mkv_leaf = filename.clone();
             if let Err(e) = staging::mark_handoff(staging_disc_path, title_confident, |s| {
@@ -5557,11 +4822,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     ..Default::default()
                 }];
             }) {
-                // The mux finished and the MKV is in staging, but the
-                // mover keys off this marker — without it the file sits
-                // in staging forever with no signal. Surface it so the
-                // operator can see the rip is staged-but-unqueued rather
-                // than silently lost.
+                // The MKV is staged, but the mover keys off this marker — without
+                // it the file sits forever with no signal. Surface staged-but-unqueued.
                 abort_post_mux_preserving_staging(
                     device,
                     &format!(
@@ -5569,12 +4831,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     ),
                     &format!("MKV staged but {marker_name} marker write failed: {e}"),
                 );
-                // The durable hand-off marker never landed. Do NOT proceed to
-                // `.completed` / `clear_restart_count`: that would make the
-                // staging dir look terminal-complete while the mover has no
-                // signal to pick it up, and the resume detector would never
-                // re-run — a data-integrity gap. Return early, leaving the dir
-                // resumable so a later attempt re-writes the marker.
+                // The hand-off marker never landed. Do NOT proceed to `.completed`:
+                // that would look terminal-complete with no mover signal and no
+                // resume re-run. Return early so a later attempt re-writes it.
                 return;
             }
             if !title_confident {
@@ -5586,28 +4845,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     ),
                 );
             }
-            // Advance to process-level clean completion. `write_completed_marker`
-            // does NOT downgrade the `Done`/`Review` hand-off state (the resume
-            // detector's "finished" check covers both); it only releases the
-            // in-progress lock and clears the restart counter.
+            // `write_completed_marker` does NOT downgrade the `Done`/`Review`
+            // state (resume's "finished" check covers both); it just releases the lock.
             staging::write_completed_marker(staging_disc_path);
             staging::clear_restart_count(staging_disc_path);
         } else if let Some(reason) = finalize_error.as_ref() {
-            // 0.20.8 validation-audit fix #1: post-mux validation gate.
-            // `MuxSink::close()` propagated a `output.finish()` error,
-            // which means the MKV's Cues / segment-size header didn't
-            // get written. The file on disk is unseekable / invalid;
-            // shipping it to the user's library would surface as a
-            // broken playback later. Quarantine the staging dir with
-            // `.failed` so:
-            //   1. The mover never writes a half-baked file into the
-            //      output dir (no `.done`, so `mover.rs::check_and_move`
-            //      skips this staging entry entirely).
-            //   2. The resume-on-startup detector recognises the dir as
-            //      terminal-failed instead of bumping `.restart_count`
-            //      and trying to "resume" a broken rip.
-            //   3. The UI surfaces the reason in `last_error` via the
-            //      same path used by `resume_or_quarantine_staging`.
+            // 0.20.8 fix #1: `output.finish()` errored, so the MKV's Cues/
+            // segment-size header wasn't written — unseekable/invalid. Quarantine
+            // with `.failed` so mover skips it and resume treats it as terminal-failed.
             let staging_disc_path = std::path::Path::new(&staging);
             staging::write_failed_marker(
                 staging_disc_path,
@@ -5618,11 +4863,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     }
 
     if !completed {
-        // 0.20.8 validation-audit fix #1: a finalize error means the
-        // MKV is broken. Log + surface `status="failed"` so the device
-        // tile flips red with the underlying reason; otherwise fall
-        // through to the pre-existing "stopped → idle" behaviour
-        // (halt / write error / wedge).
+        // 0.20.8 fix #1: a finalize error means the MKV is broken. Log +
+        // surface `status="failed"` so the tile flips red with the reason;
+        // otherwise fall through to "stopped → idle" (halt/write error/wedge).
         let (log_prefix, ui_status, ui_failure_reason) =
             incomplete_mux_status(finalize_error.as_deref(), read_error.as_deref());
         crate::log::device_log(
@@ -5664,23 +4907,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         return;
     }
 
-    // Operator-facing done figures fold in demux-time loss the same way the
-    // single-pass path (above) and the resume path (resume.rs) do, so a fresh
-    // multi-pass rip and a resume of the IDENTICAL ISO report the same loss
-    // figures whenever demux loss is non-zero. (The mux always proceeds; this is
-    // reporting only — demux-time loss never aborts the disc.)
-    //
-    // Single-pass (max_retries == 0): the 3812 overwrite block was skipped, so
-    // `final_lost_secs == demux_lost_secs` and `final_errors == mux_outcome.errors`
-    // already — report them as-is to avoid double-counting.
-    //
-    // Multi-pass (max_retries > 0): `final_lost_secs` was overwritten with the
-    // sweep-mapfile loss and `final_errors` with the mapfile bad-sector count;
-    // both are disjoint from the demux skip count (sweep = Unreadable sectors
-    // baked into the ISO; demux = decrypt/codec skips at mux), so add the demux
-    // loss / errors. (The resume path in resume.rs folds the two the same way,
-    // so a fresh multi-pass rip and a resume of the identical ISO report
-    // matching figures.)
+    // Done figures fold in demux-time loss like single-pass/resume do, so
+    // identical rips match. Single-pass already equals demux/errors as-is;
+    // multi-pass overwrote both with sweep-mapfile values, so add the demux figures.
     let (done_errors, done_lost_secs, done_demux_extra_ms) =
         if !uses_multipass(cfg_read.max_retries) {
             (final_errors, final_lost_secs, 0.0)
@@ -5725,32 +4954,18 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             tmdb_overview: tmdb_overview.clone(),
             duration: duration.clone(),
             codecs: codecs.clone(),
-            // Carry sweep damage so the done card reflects real damage
-            // instead of showing a clean result for a damaged rip.
-            //
-            // Single-pass mode (max_retries == 0) has no mapfile, so
-            // `sweep_damage_snapshot` is the all-zero Default (see the
-            // comment where it's declared). Feeding its `total_lost_ms`
-            // (0.0) into update_state's damage_severity_for() starves the
-            // ms-branch of classify_damage: a rip that skipped a handful
-            // of sectors but lost >1s of low-bitrate video would be rated
-            // Cosmetic instead of Moderate. Derive total_lost_ms from the
-            // real in-title loss (`final_lost_secs`) instead. Multipass
-            // keeps the snapshot's whole-disc value, which is genuinely
-            // computed from the mapfile's per-range durations.
+            // Carry sweep damage so the done card reflects it. Single-pass has no
+            // mapfile, so the all-zero snapshot would starve classify_damage's
+            // ms-branch; derive from `final_lost_secs` instead. Multipass keeps the real one.
             total_lost_ms: done_card_lost_ms(
                 uses_multipass(cfg_read.max_retries),
                 final_lost_secs,
                 sweep_damage_snapshot.total_lost_ms,
                 done_demux_extra_ms,
             ),
-            // Single-pass mode has no mapfile, so `sweep_damage_snapshot` is
-            // the all-zero Default and its `main_lost_ms` is always 0.0 —
-            // leaving the done card showing "(0s in main movie)" even when the
-            // demux skipped in-title sectors. `final_lost_secs` is already the
-            // in-title loss for single-pass (the demux-skip estimate), so mirror
-            // the `total_lost_ms` branch above. Multipass keeps the snapshot's
-            // value, which is derived from the mapfile's in-title bad ranges.
+            // Single-pass has no mapfile, so `main_lost_ms` would stay 0.0 even
+            // when the demux skipped in-title sectors; `final_lost_secs` already
+            // holds that loss, so mirror the `total_lost_ms` branch above.
             main_lost_ms: done_card_lost_ms(
                 uses_multipass(cfg_read.max_retries),
                 final_lost_secs,
@@ -5803,13 +5018,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         },
     );
 
-    // Eject LAST. `eject_drive` archives the device log partway through, so
-    // every line this rip still had to write — the ISO prune above, "Rip
-    // complete", and anything the webhook logs — has to be emitted first or
-    // it lands in the NEXT rip's ring instead of this rip's archived log.
-    // Routed through `should_auto_eject` like the other two completion
-    // terminals: that predicate, not an inline flag test, is where the
-    // "fires once, at read-complete, never from the mux worker" rule lives.
+    // Eject LAST: `eject_drive` archives the device log partway through, so
+    // every remaining log line must be emitted first or it lands in the NEXT
+    // rip's ring. Routed through `should_auto_eject`, where the eject-once rule lives.
     if should_auto_eject(cfg_read.auto_eject, device) {
         eject_drive(device_path);
     }
@@ -5973,16 +5184,9 @@ pub(super) fn abort_lost_ms(
     freemkv_engine::abort_lost_ms(output_is_iso, title, bad_ranges, title_bytes_per_sec)
 }
 
-// `should_abort_for_loss` lives in freemkv-engine. The local forwarder was
-// removed once `loss_aborts` started forwarding too: it had no non-test caller
-// left, and keeping a second name for the abort predicate is how the two crates
-// drifted in the first place. Tests call the engine directly.
-//
-// Its contract, for readers of the call sites here: strictly `>`, never `>=`,
-// so a threshold of 0 means "require a perfect in-title rip" — any positive
-// in-title loss aborts, exactly zero proceeds. And a NaN loss aborts, because
-// `NaN > x` is false and a plain comparison would silently mark an
-// unquantifiable loss as a complete rip.
+// `should_abort_for_loss` lives in freemkv-engine; keeping a second local name
+// is how the two crates drifted, so tests call the engine directly. Contract:
+// strictly `>`, so NaN always aborts (fail-safe, since `NaN > x` is false).
 
 /// The flawless-rip loss gate. `abort_on_lost_secs == 0` means ZERO — abort on
 /// ANY lost byte (unreadable OR undecryptable), keyed on the raw byte count so
@@ -5991,11 +5195,9 @@ pub(super) fn abort_lost_ms(
 /// abort only when the loss exceeds N seconds. A NaN `lost_ms` always aborts
 /// (fail-safe: an unquantifiable loss must never pass as success).
 fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
-    // Forward to the engine rather than re-implementing. This was a full local
-    // copy of the engine's body — the one abort DECISION in the whole rip, kept
-    // hand-synced in two crates. The bodies stayed identical but the code
-    // feeding them drifted, so autorip and the engine could return opposite
-    // verdicts for the same damaged disc. One owner, one answer.
+    // Forward rather than re-implement: this was a full local copy of the
+    // engine's body, hand-synced across crates, until the feeding code drifted
+    // and autorip/engine returned opposite verdicts on the same damaged disc.
     freemkv_engine::loss_aborts(lost_bytes, lost_ms, abort_on_lost_secs)
 }
 
@@ -6020,11 +5222,9 @@ fn mux_loss_aborts(
     demux_lost_secs: f64,
     effective_abort: u64,
 ) -> bool {
-    // Bind the comparison rather than writing `!(demux_lost_secs > 0.0)`:
-    // clippy rejects a negated comparison on a partially ordered type, and the
-    // obvious rewrite `demux_lost_secs <= 0.0` is NOT equivalent — every NaN
-    // comparison is false, so `<=` would let a NaN fall through to the
-    // threshold check instead of declining to abort. The test pins the NaN case.
+    // Bind rather than write `!(demux_lost_secs > 0.0)`: clippy rejects that
+    // negation, and `<= 0.0` is NOT equivalent — NaN comparisons are always
+    // false, so `<=` would wrongly let NaN reach the threshold check.
     let mux_contributed_loss = demux_lost_secs > 0.0;
     if !completed || is_iso || !mux_contributed_loss {
         return false;
@@ -6163,13 +5363,9 @@ fn plan_mux_outputs(
     }
     let season_num = season.unwrap_or(1);
     let title_secs: Vec<f64> = indices.iter().map(|&i| titles[i].duration_secs).collect();
-    // Multi-disc offset. A disc can't count the episodes on the discs *before*
-    // it, so start from the uniform-split guess — `(disc-1)*count + 1`, correct
-    // for the common even boxset — then let `align_disc_offset` repair uneven
-    // splits (6+4, etc.) when the runtimes carry enough signal to pin the true
-    // position. With no signal (uniform season, or no TMDB data) the alignment
-    // ties and returns this same fallback, so we never number worse than the
-    // guess. Disc 1 (or an unmarked label) falls back to E01.
+    // Multi-disc offset: start from the uniform-split guess `(disc-1)*count+1`,
+    // then let `align_disc_offset` repair uneven splits when runtimes carry
+    // signal. With no signal it ties and returns this same fallback (never worse).
     let disc_num = crate::tmdb::disc_from_label(disc_name).unwrap_or(1).max(1);
     let fallback_start = 1u16.saturating_add(
         disc_num
@@ -6277,21 +5473,9 @@ fn iso_output_needs_multipass(output_format: &str, max_retries: u8) -> bool {
     output_is_iso_image(output_format) && !uses_multipass(max_retries)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Multipass recovery-loop STRATEGY DECISIONS.
-//
-// The pure decisions the multipass loop in `rip_disc` makes about pass
-// ordering, scope-aware convergence, no-progress exhaustion, and the
-// end-of-recovery promotion now live in `freemkv-engine` (`multipass.rs`) —
-// they were characterized here first (this module's `char_*` tests still pin
-// them through this call path) and then relocated so autorip and the future
-// freemkv GUI share one implementation instead of each carrying a copy. Only
-// the pass-1 transport-retry gating stays here: it mirrors an inline
-// hardware/USB-re-enumeration path that is autorip-specific.
-// `scope_converged` is only reached directly by this module's `char_*` tests
-// (production call sites go through `patch_pass_decision`, which already
-// composes it engine-side) — `#[allow(unused_imports)]` keeps the non-test
-// build warning-free without a separate cfg(test)-only import.
+// Multipass recovery-loop STRATEGY DECISIONS now live in `freemkv-engine`
+// (`multipass.rs`), relocated so autorip and the future GUI share one impl.
+// `scope_converged` is reached only by this module's tests, hence the allow.
 #[allow(unused_imports)]
 use freemkv_engine::{
     PatchDecision, bad_sector_statuses, end_of_recovery_promotion, patch_made_progress,
@@ -6556,17 +5740,9 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
         );
     }
 
-    // KeydbLoad is a structural pre-condition failure, not an AACS
-    // resolution failure — surface it with its own messaging before
-    // the numeric dispatch.
-    //
-    // The library populates `path` with either the real filesystem path
-    // that failed to load or the sentinel `<no keydb in search paths>`.
-    // The sentinel means "nothing configured" — point the operator at
-    // Settings. A real path means a *configured* key source failed to
-    // load (wrong path, NFS not mounted, permissions): include it so the
-    // operator can diagnose the load failure instead of being told to
-    // configure a source that already exists.
+    // KeydbLoad is a structural pre-condition, not an AACS resolution failure —
+    // handle it before the numeric dispatch. `path` is either the sentinel
+    // (nothing configured) or a real path that failed to load (include it).
     if let Some(libfreemkv::Error::KeydbLoad { path }) = err {
         const KEYDB_SENTINEL: &str = "<no keydb in search paths>";
         if path == KEYDB_SENTINEL {
@@ -6594,10 +5770,8 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
     };
 
     let code = e.code();
-    // Intentional overlap: specific 7xxx codes have dedicated arms above
-    // the `7000..=7999` catch-all. Match-order semantics give us the
-    // dispatch we want; clippy's match-overlapping-arm lint is a false
-    // positive in this layout.
+    // Intentional overlap: dedicated arms sit above the `7000..=7999` catch-all;
+    // match-order gives the dispatch we want, so the overlapping-arm lint is a false positive.
     #[allow(clippy::match_overlapping_arm)]
     match code {
         // E7000 — generic "everything tried, nothing worked" catch-all.
@@ -6607,14 +5781,9 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
              derivation path worked.",
         ),
 
-        // Host cert rejected by the drive's HRL. Surfaces from
-        // `aacs/handshake.rs` as drive-side AGID/cert rejection (7003),
-        // host-side verify failure on the drive's cert (7005), drive
-        // rejected our processing key (7007), or the post-loop
-        // `AacsHostCertRejected` (7015) when every host cert was
-        // rejected. "Update keys" intentionally NOT suggested — the
-        // key source has the cert, the drive HRL is blocking it; fresh
-        // keys do not change the cert content.
+        // Host cert rejected by the drive's HRL (codes 7003/7005/7007/7015).
+        // "Update keys" intentionally NOT suggested — the key source has the
+        // cert, the drive HRL is blocking it; fresh keys don't change cert content.
         ec::E_AACS_CERT_REJECTED
         | ec::E_AACS_CERT_VERIFY
         | ec::E_AACS_KEY_REJECTED
@@ -6633,11 +5802,8 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
              is available. This drive cannot rip this disc.",
         ),
 
-        // VID retrieval failed. From cert path: VID read (7009) or VID
-        // MAC verification (7010) went sideways. From raw-read path:
-        // the alternate READ_DISC_STRUCTURE read failed (7017). Either
-        // way the disc isn't in any key source (otherwise Path 1 would
-        // have hit before we landed here).
+        // VID retrieval failed (cert path: 7009/7010; raw-read path: 7017).
+        // Either way the disc isn't in any key source, or Path 1 would have hit first.
         ec::E_AACS_VID_READ | ec::E_AACS_VID_MAC | ec::E_AACS_VID_UNAVAILABLE => error_line(
             code,
             "The drive did not return the disc Volume ID during AACS authentication, \
@@ -6662,10 +5828,9 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
              source.",
         ),
 
-        // No host cert available at all — the OEM auth route can't run
-        // because there's nothing to authenticate with. Distinct from
-        // cert-rejected (7003/7005/7007/7015): there a cert existed but
-        // the drive HRL blocked it; here no cert was present.
+        // No host cert available — OEM auth can't run with nothing to
+        // authenticate with. Distinct from cert-rejected: there a cert
+        // existed but was HRL-blocked; here none was present.
         ec::E_AACS_NO_HOST_CERT => error_line(
             code,
             "No host certificate is available, so the OEM authentication route cannot \
@@ -6800,15 +5965,9 @@ fn format_pass_error(pass_label: &str, e: &libfreemkv::Error) -> String {
     };
 
     let Some(sense) = sense else {
-        // Non-SCSI error (transport / IO / other) — surface the inner
-        // io::Error detail. The libfreemkv Error Display is code-only
-        // (language-neutral) as of 0.31; its `source` carries the message.
-        //
-        // For IoError we have the inner io::Error message. For any other
-        // non-SCSI variant the bare Display is code-only (e.g. "E6010" for
-        // Halted, "E6011: hex" for MapfileInvalid), which leaves the operator
-        // reading an opaque code. Prefix those with a short English label so
-        // the message names what failed, not just its number.
+        // Non-SCSI error: libfreemkv's Display is code-only (e.g. "E6010"
+        // for Halted). For IoError use the inner io::Error message; for
+        // other variants, prefix a short English label so it names what failed.
         let detail = match e {
             libfreemkv::Error::IoError { source } => source.to_string(),
             other => format!("{} ({})", other, non_scsi_error_label(other)),
@@ -7016,12 +6175,9 @@ fn format_lib_error(phase: &str, e: &libfreemkv::Error) -> String {
 /// Returns `Some(drive)` on success, or `None` once recovery is exhausted
 /// (the caller should `break 'pass1` — all per-attempt and STRATEGY_FAILURE
 /// logging is emitted here).
-// TODO(step1-followup): the SCSI transport-failure recovery ladder (this
-// backoff re-open plus the wait_ready/init/sense-inspection retry blocks in the
-// Pass-1 loop) is NOT folded into DiscSession::recover yet. It is entangled with
-// autorip's device_log/update_state UI, the `break 'pass1` control flow, and
-// disc-identity (volume-id) matching — moving it cleanly is out of the step-1
-// (read-only scan bring-up) scope. Left in autorip per contract Q3 default.
+// TODO(step1-followup): this backoff re-open plus the Pass-1 retry blocks
+// aren't folded into DiscSession::recover yet — entangled with autorip's
+// UI/control-flow. Left in autorip per contract Q3 default.
 fn open_drive_with_backoff(
     device: &str,
     attempt: u32,
@@ -7781,15 +6937,9 @@ mod tests {
         assert!((lost_iso - 50_000.0).abs() < 1.0, "iso whole-disc sum");
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // CHARACTERIZATION TESTS — golden baseline for the multipass recovery
-    // loop's decisions. These pin `rip_disc`'s CURRENT behavior so the later
-    // inversion of the loop into freemkv-engine can be proven behavior-
-    // preserving. They exercise the pure strategy fns the loop calls; the
-    // hardware/UI touch-points the decisions sit between (drive reopen,
-    // spin_cycle, watchdogs, STATE painting) are documented in the module
-    // report as still requiring a physical drive.
-    // ─────────────────────────────────────────────────────────────────────
+    // loop's decisions, pinning `rip_disc`'s CURRENT behavior so a later
+    // inversion into freemkv-engine can be proven behavior-preserving.
 
     /// PASS ORDERING. `max_retries = N` (N > 0) plans exactly one Pass-1 sweep
     /// then N patch passes, with `total_passes = N + 2` (sweep + N patch +
@@ -8119,10 +7269,9 @@ mod tests {
 
     #[test]
     fn pass1_exhaustion_message_translates_cause_not_strategy_id() {
-        // Regression: the Pass 1 `result = None` exhaustion fallthrough must
-        // surface the underlying SCSI cause via `format_pass_error`, never a
-        // bare internal strategy identifier. This mirrors the fallthrough's
-        // translation of the captured `last_sweep_err`.
+        // Regression: the Pass 1 exhaustion fallthrough must surface the
+        // underlying SCSI cause via `format_pass_error`, never a bare
+        // internal strategy identifier, mirroring `last_sweep_err`'s translation.
         let last_sweep_err = Some(Error::DiscRead {
             sector: 1_000,
             status: Some(2),
@@ -8176,8 +7325,7 @@ mod tests {
     fn format_pass_error_no_sense_non_io_gets_english_label() {
         // Regression: a non-SCSI, non-IoError error (no sense triple) must
         // carry an English label, not just the bare code-only Display.
-        // Halted ("rip stopped by user") is the actionable example — a user
-        // stop propagated into the sweep.
+        // Halted ("rip stopped by user") is the actionable example here.
         let s = format_pass_error("Pass 1", &Error::Halted);
         assert!(s.contains("Pass 1 failed"), "msg: {s}");
         // Still routable: the numeric code is preserved.
@@ -8198,12 +7346,9 @@ mod tests {
         );
     }
 
-    // ── format_lib_error: setup/scan/open/mux phase rendering ─────────
-    //
-    // The library Display is code-only (`E1002: /dev/sg0`). Every variant
-    // autorip reaches off the drive-open / identify / scan / open-ISO paths
-    // must render as plain English with NO raw `E####` code and NO leaked
-    // device path, leading with the phase label.
+    // ── format_lib_error: setup/scan/open/mux phase rendering ────────
+    // Library Display is code-only (`E1002: /dev/sg0`); every variant here
+    // must render as plain English, phase-labeled, with no code or device path.
 
     #[test]
     fn format_lib_error_device_permission_says_privileged_not_code() {
@@ -8311,13 +7456,9 @@ mod tests {
         assert!(!s.contains("E2002"), "msg leaks code: {s}");
     }
 
-    // ── aacs_failure_message dispatch ────────────────────────────────
-    //
-    // Locked rc.6 messaging standard: every user-facing message renders as
-    // `Error: E<code> <message>` — (1) the `Error:` level word leads, (2) the
-    // language-neutral `E<code>` token follows so support requests stay
-    // routable, (3) a single plain-English sentence, and (4) never leak the
-    // `{e:?}` debug dump the pre-rewrite catch-all produced.
+    // ── aacs_failure_message dispatch ──────────────────────────────
+    // Locked rc.6 standard: every message renders `Error: E<code> <msg>` —
+    // level word, routable code, one plain-English sentence, never a raw `{e:?}` dump.
 
     #[test]
     fn aacs_failure_messages_follow_level_code_format() {
@@ -8366,10 +7507,9 @@ mod tests {
 
     #[test]
     fn aacs_failure_keydb_load_corrupt() {
-        // A *configured* keydb that failed to load (real path, not the
-        // sentinel) must surface that path so the operator can diagnose
-        // the load failure, and must NOT collapse to the generic
-        // "configure a key source" message reserved for the no-keydb case.
+        // A *configured* keydb (real path, not the sentinel) that fails to
+        // load must surface that path, not the generic "configure a key
+        // source" message reserved for the no-keydb case.
         let path = "/config/keys/keydb.cfg";
         let e = Error::KeydbLoad { path: path.into() };
         let s = aacs_failure_message(Some(&e));
@@ -8616,11 +7756,9 @@ mod tests {
 
     #[test]
     fn css_crack_failure_is_not_aacs_messaging() {
-        // Regression: a CSS (DVD) known-plaintext crack failure records
-        // `Error::CssKeyMissing` in `disc.css_error` (not `aacs_error`).
-        // The keyless-disc message must surface the CSS heading, NOT the
-        // AACS-oriented "check the key source" fallback that the bare
-        // `aacs_failure_message(None)` path produced.
+        // Regression: a CSS crack failure records `Error::CssKeyMissing`, not
+        // `aacs_error`. The keyless-disc message must surface the CSS heading,
+        // NOT the AACS "check the key source" fallback that `None` produced.
         let msg = aacs_failure_message(Some(&Error::CssKeyMissing));
         assert!(
             msg.to_lowercase().contains("unscramble") || msg.to_lowercase().contains("css"),
@@ -8785,10 +7923,8 @@ mod tests {
 
     #[test]
     fn abort_lost_ms_ignores_out_of_title_loss_for_mkv() {
-        // Title occupies sectors 1000..2000. The only unreadable range
-        // is at byte offset 0 (a scratched menu / pre-title region) and
-        // does NOT overlap the title extents — so for an MKV mux the
-        // in-title loss must be zero.
+        // Title occupies sectors 1000..2000; the only unreadable range is at
+        // byte offset 0 (scratched menu, pre-title) and doesn't overlap it.
         let bps = 8_250_000.0;
         let title = title_lba(1000, 1000, bps);
         // 50 sectors bad starting at byte 0 (well before the title).
@@ -8838,12 +7974,9 @@ mod tests {
 
     #[test]
     fn iso_output_rejected_in_single_pass_only() {
-        // Regression: `output_format="iso"` is whole-disc scoped for abort
-        // accounting (every unreadable sector counts, including out-of-title
-        // damage). Single-pass (max_retries=0) reads only the title and scopes
-        // loss in-title, so it would ACCEPT a disc the multi-pass / resume paths
-        // ABORT on for identical input — a rip-mode-dependent verdict. ISO must
-        // therefore require multi-pass.
+        // Regression: ISO is whole-disc scoped for abort accounting, but
+        // single-pass reads only the title, so it would ACCEPT a disc that
+        // multi-pass/resume ABORT on. ISO must require multi-pass to avoid that.
         assert!(
             super::iso_output_needs_multipass("iso", 0),
             "single-pass ISO must be rejected (it cannot honour whole-disc scope)"
@@ -8867,13 +8000,9 @@ mod tests {
 
     #[test]
     fn iso_output_delivers_the_disc_image_not_a_mux() {
-        // Regression: the settings UI advertises `output_format="iso"` as
-        // "ISO copies the whole disc; the other formats mux selected titles".
-        // Previously both rip paths special-cased only "m2ts" and defaulted
-        // everything else (including "iso") to an `.mkv` selected-title mux,
-        // then PRUNED the swept ISO — so the operator received the opposite of
-        // what was requested. `output_is_iso_image` is the single predicate the
-        // mux-skip + deliverable + prune decisions now key off.
+        // Regression: rip paths used to default "iso" to an `.mkv` mux, then
+        // PRUNE the swept ISO — the opposite of what was requested.
+        // `output_is_iso_image` is now the single predicate those decisions key off.
         assert!(
             super::output_is_iso_image("iso"),
             "iso output must be recognised as a whole-disc deliverable"
@@ -9268,14 +8397,9 @@ mod tests {
             .remove(device);
     }
 
-    // ===================================================================
-    // Auto-eject timing contract (bug #2): the drive ejects EXACTLY ONCE,
-    // at the `.ripped` read-complete hand-off, only when the operator
-    // enabled `auto_eject`, and NEVER from the synthetic `_mux` worker.
-    // `should_auto_eject` is the single predicate all four completion
-    // sites (fresh ISO/MKV, resume ISO/MKV) now gate on, so testing it
-    // covers the whole contract.
-    // ===================================================================
+    // Auto-eject timing contract: the drive ejects EXACTLY ONCE, at the
+    // `.ripped` hand-off, only when `auto_eject` is on, and NEVER from the
+    // synthetic `_mux` worker. All four completion sites gate on `should_auto_eject`.
 
     #[test]
     fn auto_eject_fires_for_real_device_when_enabled() {
@@ -9295,11 +8419,9 @@ mod tests {
 
     #[test]
     fn auto_eject_never_fires_from_synthetic_mux_device() {
-        // The `_mux` worker reaches a completion path AFTER the drive
-        // thread already ejected at the hand-off; it must never issue a
-        // second eject (the drive may now hold a different disc). The
-        // guard keys on the underscore prefix, so even with auto_eject on
-        // a synthetic device is refused.
+        // `_mux` reaches completion AFTER the drive already ejected at
+        // hand-off, so it must never eject again (may now hold a different
+        // disc). The guard keys on the underscore prefix, refusing even with auto_eject on.
         assert!(!super::should_auto_eject(true, "_mux"));
         assert!(!super::should_auto_eject(true, "_move"));
         assert!(!super::should_auto_eject(true, "_anything"));
@@ -9568,11 +8690,9 @@ mod tests {
             .remove(device);
     }
 
-    // Regression guard for the `entries.flatten()` silent-drop bug in
-    // `disc_already_completed` / `find_resumable_for_disc`: both now route
-    // their staging-root walk through `list_staging_basenames`, which lists
-    // every immediate child and (unlike `.flatten()`) is built to retry and
-    // surface per-DirEntry NFS errors rather than silently undercount.
+    // Regression guard for the `entries.flatten()` silent-drop bug: staging-root
+    // walks now route through `list_staging_basenames`, which lists every child
+    // and retries/surfaces per-DirEntry NFS errors instead of silently undercounting.
     #[test]
     fn list_staging_basenames_returns_all_children() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9603,14 +8723,8 @@ mod tests {
     }
 
     // Regression for the largest-count-vs-union bug: a clean pass returns the
-    // accumulated UNION of every basename observed, and never duplicates a name
-    // it has already seen. On a healthy mount the very first pass opens cleanly
-    // and short-circuits, so a single child must appear exactly once (the union
-    // accumulator must not double-count). The cross-pass union (a name from an
-    // earlier degraded pass surviving a later, larger pass that dropped it)
-    // depends on injectable per-DirEntry NFS errors, which the real filesystem
-    // can't reproduce deterministically; the union code path is exercised by
-    // the accumulate-then-return wiring this test pins.
+    // UNION of every basename seen, never duplicating one. Real FS can't inject
+    // the per-DirEntry errors for cross-pass union, so this pins the wiring.
     #[test]
     fn list_staging_basenames_union_does_not_duplicate() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9890,9 +9004,6 @@ mod tests {
         );
     }
 
-    /// H1 + M3: the drive-resume (Remux) selector must skip dirs that are
-    /// owned (`.ripped`/`.muxing`), held (`.review`), or terminal (`.failed`),
-    /// while still resuming a plain ISO+mapfile dir. Drives the pure
     /// A tolerance-configured rip must NOT accept loss it could not measure.
     ///
     /// Regression: the two inputs to the gate were both computed inside a
@@ -9929,6 +9040,9 @@ mod tests {
         );
     }
 
+    /// H1 + M3: the drive-resume (Remux) selector must skip dirs that are
+    /// owned (`.ripped`/`.muxing`), held (`.review`), or terminal (`.failed`),
+    /// while still resuming a plain ISO+mapfile dir. Drives the pure
     /// `resumable_dir_blocked` against real snapshots.
     #[test]
     fn resumable_dir_blocked_skips_owned_held_and_terminal() {
@@ -10096,10 +9210,9 @@ mod tests {
             "...including at zero tolerance"
         );
 
-        // NaN loss must not silently read as "under threshold" and file a
-        // damaged rip as done. Every NaN comparison is false, so the gate
-        // declines to abort — record that so a future change to the upstream
-        // fail-safe cannot quietly turn this into a wrong pass.
+        // NaN must not read as "under threshold": every NaN comparison is
+        // false, so the gate declines to abort — pin that so it can't
+        // silently become a wrong pass.
         assert!(!mux_loss_aborts(true, false, f64::NAN, f64::NAN, 0));
     }
 
@@ -10140,15 +9253,9 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Auto-file (.done) vs hold-for-review (.review)
-    //
-    // `title_is_confident` is the whole policy and `handoff_marker_name`
-    // is the only thing that turns it into a marker. Both completion
-    // routes (MKV at the mux tail, ISO at the sweep tail) call exactly
-    // these two, so pinning them pins which of the operator's rips get
-    // filed into the library automatically and which wait for a human.
-    // ===================================================================
+    // Auto-file (.done) vs hold-for-review (.review): `title_is_confident`
+    // is the whole policy and `handoff_marker_name` turns it into a marker.
+    // Both completion routes call these two, so pinning them pins auto-vs-manual.
 
     /// The three ways a rip earns `.done`, and the one way it doesn't.
     ///
@@ -10520,14 +9627,9 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Disc-identity guards for the unattended auto-insert path
-    //
-    // The pure cores are tested above; these pin the STATE/Config
-    // wrappers the auto-insert path actually calls. `→ false` re-rips a
-    // finished disc and O_TRUNCs the staged ISO the mover or mux worker
-    // is still reading; `→ true` wedges every disc as "already done".
-    // ===================================================================
+    // Disc-identity guards for the unattended auto-insert path: these pin the
+    // STATE/Config wrappers it calls. `→ false` re-rips a finished disc and
+    // O_TRUNCs the staged ISO still being read; `→ true` wedges every disc as done.
 
     /// Seed `STATE[device].disc_name` and hand back a `Config` pointing at
     /// `staging_root`, exactly as the drive thread sees them after a scan.
@@ -11013,10 +10115,8 @@ mod tests {
     #[test]
     fn the_completion_tail_logs_and_notifies_before_ejecting() {
         let src = crate::util::source_lf(include_str!("mod.rs"));
-        // Bound the scan to the fresh-rip completion tail: from the last field
-        // of its terminal done-state write to the `should_auto_eject` doc that
-        // follows the function. Both anchors are unique in this file, so the
-        // ordering below is this tail's, not some other eject site's.
+        // Scan just the fresh-rip completion tail (unique anchors), so the
+        // ordering checked below is this tail's, not some other eject site's.
         let start = src
             .find("largest_gap_ms: sweep_damage_snapshot.largest_gap_ms,")
             .expect("the fresh-rip completion tail must write its done state");
