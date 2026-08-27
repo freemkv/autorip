@@ -25,15 +25,9 @@ static AGENT: once_cell::sync::Lazy<ureq::Agent> = once_cell::sync::Lazy::new(||
     let config = ureq::config::Config::builder()
         .timeout_connect(Some(std::time::Duration::from_secs(5)))
         .timeout_recv_response(Some(std::time::Duration::from_secs(10)))
-        // Follow NO redirects, like every other outbound agent here. The
-        // no-pinned-resolver argument above is about where the REQUEST is
-        // aimed; it says nothing about where a RESPONSE can send it. This
-        // URL carries the operator's api_key in its query string, so a 3xx
-        // — TMDB compromised, misconfigured, or tampered with on-path —
-        // would hand that key to an arbitrary host. At zero, ureq returns
-        // the 3xx as a normal response instead of erroring, and
-        // `read_capped_json` then fails to parse it, which `fetch_multi`
-        // already reports as "no result" rather than a match.
+        // Follow NO redirects: the URL carries the operator's api_key in its
+        // query string, so a 3xx (TMDB compromised/tampered on-path) would
+        // hand that key to an arbitrary host; `fetch_multi` reports it as "no result".
         .max_redirects(0)
         .build();
     ureq::Agent::new_with_config(config)
@@ -117,12 +111,9 @@ fn fetch_multi(query: &str, api_key: &str) -> Option<serde_json::Value> {
             None
         }
         Err(e) => {
-            // Do NOT log `e` directly. Written against ureq 2, whose Display
-            // carried the request URL — and this URL has the api_key in its
-            // query string, with autorip.jsonl served unauthenticated by GET
-            // /api/debug. ureq 3's Display is URL-free on the variants
-            // reachable here, but `BadUri` still prints the URI it rejected,
-            // so the masking stays and the reason is now the accurate one.
+            // Do NOT log `e` directly: the URL has the api_key in its query
+            // string, and `BadUri`'s Display still prints the rejected URI,
+            // so masking stays even though ureq 3 is URL-free elsewhere.
             let error_kind = crate::web::ureq_error_kind(&e);
             tracing::warn!(query = %query, error_kind = %error_kind, "tmdb: request failed (network/transport)");
             None
@@ -177,11 +168,9 @@ pub fn lookup(label: &str, api_key: &str) -> Option<TmdbResult> {
     if api_key.is_empty() {
         return None;
     }
-    // A separator-only volume label reduces to no query variants; short-circuit
-    // rather than firing a `query=&...` request that TMDB answers with HTTP 422.
-    //
-    // A season marker in the label ("… Season 5") means the disc is TV — bias
-    // the pick toward the series so a same-named film can't outrank the show.
+    // A separator-only label yields no query variants; short-circuit rather
+    // than firing `query=&...` (TMDB answers HTTP 422). A season marker
+    // ("… Season 5") means TV — bias the pick so it can't be outranked.
     let prefer_tv = season_from_label(label).is_some();
     let mut fallback: Option<TmdbResult> = None;
     for variant in query_variants(label) {
@@ -301,19 +290,9 @@ fn rank_search_results(
 /// release year, and break ties on TMDB popularity.
 fn pick_best(query: &str, results: &[serde_json::Value], prefer_tv: bool) -> Option<TmdbResult> {
     let want = norm(query);
-    // Ranking key per candidate, compared lexicographically, highest wins:
-    //   (exact, dated, tv_preferred, popularity)
-    // - `exact` (dated + normalized-title match) beats popularity — else a
-    //   generic label like "Undertow" matches the most POPULAR "Undertow"
-    //   (Captain Nova, 2016) instead of the 2024 film whose title IS
-    //   "Undertow". Same class as "Skyburner Ace" vs the more popular "Skyburner".
-    // - `dated` beats undated (a yearless entry yields a yearless folder).
-    // - `tv_preferred` is set ONLY when the disc label carried a season marker
-    //   (`prefer_tv`) and this candidate is a series: it breaks a tie between a
-    //   show and a same-named film ("Longacre" a TV series vs a film of the same name) in
-    //   favour of the series. Placed BELOW exact/dated so it only decides
-    //   otherwise-equal candidates — an exact film match still beats a fuzzy
-    //   series one.
+    // Ranking key, lexicographic, highest wins: (exact, dated, tv_preferred,
+    // popularity). `exact` beats popularity (else generic "Undertow" matches
+    // the more popular 2016 film); `tv_preferred` only breaks equal ties.
     let key = |cand: &TmdbResult, pop: f64| {
         let exact = cand.year > 0 && !want.is_empty() && norm(&cand.title) == want;
         (
@@ -453,26 +432,15 @@ pub fn clean_title(label: &str) -> String {
         "disk 3",
         "disk 4",
     ];
-    // Search AND slice the SAME (lowercased) string. `to_lowercase()` can
-    // change byte length (e.g. 'İ' U+0130 -> 2 bytes, 'ẞ' -> 'ß'), so an
-    // offset found in `lower` is NOT a valid byte index into `s` and slicing
-    // `s` at it can panic mid-codepoint. Title-casing below re-lowercases the
-    // tail anyway, so working from `lower` yields identical output.
-    //
-    // Strip only suffixes anchored at the END of the (current) string —
-    // never an embedded match, which would truncate a real title mid-string
-    // (the "dvd" in "DOCUMENTARY_ABOUT_DVD_COLLECTIONS", the "bluray" in
-    // "HOLIDAY_BLURAY_SPECIAL"). Repeat so a chained tail like "4K UHD BLURAY"
-    // peels off group by group.
+    // Search AND slice the SAME (lowercased) string: `to_lowercase()` can
+    // change byte length, so an offset in `lower` may not index into `s`.
+    // Strip only END-anchored suffixes, never embedded; repeat to peel groups.
     let lower = s.to_lowercase();
     let mut clipped = lower.as_str();
     loop {
-        // Trim trailing whitespace AND non-alphanumeric junk (trademark glyphs
-        // ™/®, punctuation, stray separators) before testing the END-anchor.
-        // Retail UHD/BD volume labels routinely carry such trailing characters
-        // after the format words ("Ultra HD™", "Blu-ray."), and trimming only
-        // whitespace left the suffix un-anchored so it was never stripped — the
-        // polluted title ("Fight Club Ultra Hd™") then matched nothing on TMDB.
+        // Trim trailing whitespace AND non-alphanumeric junk (™/®, punctuation)
+        // before testing the END-anchor: retail labels carry such trailing
+        // chars ("Ultra HD™"), and whitespace-only trimming left it un-anchored.
         let trimmed = clipped.trim_end_matches(|c: char| !c.is_alphanumeric());
         let mut next: Option<&str> = None;
         for suffix in &suffixes {
@@ -483,10 +451,9 @@ pub fn clean_title(label: &str) -> String {
                 break;
             }
         }
-        // Also peel a trailing TV season marker ("Season 5", "Series 2") so a
-        // series disc resolves to the base show title. Only when no format
-        // suffix matched this round, so the two peels interleave across the
-        // loop ("… Season 5 Disc 2" -> drop "Disc 2" -> drop "Season 5").
+        // Also peel a trailing season marker ("Season 5") so a series disc
+        // resolves to the base show title, only when no format suffix
+        // matched this round — the two peels interleave across the loop.
         if next.is_none() {
             next = strip_trailing_season(trimmed);
         }
@@ -678,11 +645,9 @@ fn is_trailing_junk(tok: &str) -> bool {
     if has_alpha && has_digit {
         return true;
     }
-    // Short all-caps abbreviation (not a roman numeral): UE, SE, EDC, WW.
-    // Case is preserved here because variants are peeled from the RAW label
-    // BEFORE `clean_title` title-cases — so "UE" (junk) stays distinguishable
-    // from "Us" (a real one-word title, which is not all-caps in a label like
-    // "US_2019" and is protected by being queried in full first regardless).
+    // Short all-caps abbreviation (not roman numeral): UE, SE, EDC, WW. Case
+    // is preserved here since variants are peeled BEFORE `clean_title`
+    // title-cases, so "UE" (junk) stays distinguishable from "Us" (real title).
     tok.len() <= 4 && tok.chars().all(|c| c.is_ascii_uppercase())
 }
 
@@ -893,10 +858,9 @@ pub fn align_disc_offset(title_secs: &[f64], episodes: &[Episode], fallback: u16
             .map(|e| e.runtime_min)
     };
 
-    // Best = smallest average runtime distance over the pairs that actually have
-    // a runtime to compare; ties break toward `fallback`. An offset with no
-    // comparable pair contributes no evidence and is skipped, so a season with
-    // no runtime data leaves `best_signal == 0` → `fallback`.
+    // Best = smallest average runtime distance over comparable pairs; ties
+    // break toward `fallback`. An offset with no comparable pair is skipped,
+    // so a season with no runtime data leaves `best_signal == 0` → `fallback`.
     let mut best_start = fallback;
     let mut best_avg = f64::INFINITY;
     let mut best_signal = 0u32;
@@ -1025,11 +989,9 @@ mod tests {
 
     #[test]
     fn clean_title_multibyte_lowercase_does_not_panic() {
-        // 'İ' (U+0130) and 'ẞ' (U+1E9E) change byte length under to_lowercase,
-        // so an offset found in the lowercased string is not a valid index into
-        // the original — slicing the original there panicked ("not a char
-        // boundary"). Searching+slicing the same lowercased string fixes it.
-        // The disc volume label is disc-controlled, so this must never panic.
+        // 'İ'/'ẞ' change byte length under to_lowercase, so slicing the
+        // original at an offset found in the lowercased string used to
+        // panic ("not a char boundary"); disc labels are disc-controlled.
         let _ = clean_title("İẞẞdvd");
         let _ = clean_title("İstanbul DVD");
         let _ = clean_title("Straße ẞ Blu-ray");
@@ -1061,11 +1023,9 @@ mod tests {
 
     #[test]
     fn clean_title_strips_suffix_followed_by_trademark_or_punctuation() {
-        // Regression: retail volume labels carry a trademark glyph or trailing
-        // punctuation AFTER the format word. Trimming only whitespace before the
-        // END-anchor test left "ultra hd" un-anchored, so it was never stripped
-        // and TMDB matched nothing. The cleaned title must drop both the suffix
-        // and the trailing junk.
+        // Regression: retail labels carry a trademark glyph/punctuation after
+        // the format word; whitespace-only trimming left it un-anchored, so
+        // it was never stripped. Cleaned title must drop both suffix and junk.
         assert_eq!(clean_title("Fight Club - Ultra HD™"), "Fight Club");
         assert_eq!(clean_title("Wraithline 4K Ultra HD®"), "Wraithline");
         assert_eq!(clean_title("The Matrix Blu-ray."), "The Matrix");
@@ -1216,10 +1176,8 @@ mod tests {
 
     #[test]
     fn pick_best_exact_title_beats_more_popular() {
-        // The "Undertow" disc (volume label exactly "Undertow" = the 2024
-        // standalone film) must NOT be matched to the far more popular
-        // "Captain Nova: Undertow" (2016). An exact normalized-title match
-        // wins over popularity.
+        // The "Undertow" disc (2024 standalone film) must NOT match the far
+        // more popular "Captain Nova: Undertow" (2016): exact title beats popularity.
         let results = serde_json::json!([
             {"media_type": "movie", "title": "Captain Nova: Undertow",
              "release_date": "2016-04-27", "popularity": 200.0},
@@ -1295,14 +1253,9 @@ mod tests {
     /// a future edit to that arm will be caught here.
     #[test]
     fn tmdb_agent_follows_no_redirects() {
-        // The agent skips resolver pinning because the host is the hard-coded
-        // api.themoviedb.org — but that argument covers where the REQUEST is
-        // aimed, not where a RESPONSE can send it. The request URL carries the
-        // operator's TMDB api_key in its query string, so following a 3xx
-        // (TMDB compromise, misconfiguration, or on-path tampering) hands that
-        // key to whatever host the redirect names. Nothing in this crate needs
-        // redirect-following, and every other outbound agent already sets
-        // max_redirects(0).
+        // The request URL carries the api_key in its query string, so
+        // following a 3xx (TMDB compromise, misconfig, or on-path tampering)
+        // would hand that key to whatever host the redirect names.
         assert_eq!(
             AGENT.config().max_redirects(),
             0,
@@ -1369,10 +1322,9 @@ mod tests {
 
     #[test]
     fn read_capped_json_end_to_end_rejects_oversized_body_via_real_response() {
-        // Exercise the actual `read_capped_json` (not just the extracted
-        // helper) against a real `ureq::Response`, built from a local TCP
-        // listener that streams a body over `MAX_TMDB_BYTES` — proving the
-        // real function, not a copy of its logic, enforces the cap.
+        // Exercise the actual `read_capped_json` against a real
+        // `ureq::Response` from a local TCP listener streaming a body over
+        // `MAX_TMDB_BYTES` — proving the real function enforces the cap.
         use std::io::Write;
         use std::net::TcpListener;
 
@@ -1400,13 +1352,9 @@ mod tests {
             .call()
             .expect("local server must respond");
         let err = read_capped_json(resp).expect_err("oversized body must be rejected");
-        // Check the SPECIFIC message, not just the io::ErrorKind: a truncated
-        // read (e.g. a regressed `take(cap)` instead of `take(cap + 1)`) would
-        // silently hand a truncated `cap`-byte body to serde_json, which is
-        // ALSO invalid JSON and ALSO produces `ErrorKind::InvalidData` — so a
-        // bare kind() check can't tell "the size cap fired" from "the
-        // (wrongly) truncated body failed to parse". The message text is the
-        // one observable difference between those two failure causes.
+        // Check the SPECIFIC message, not just io::ErrorKind: a regressed
+        // `take(cap)` would hand serde_json a truncated body, which is ALSO
+        // invalid JSON with the SAME ErrorKind — only the message differs.
         assert_eq!(
             err.to_string(),
             "tmdb response exceeded size cap",
@@ -1420,20 +1368,17 @@ mod tests {
 
     #[test]
     fn norm_collapses_separator_runs_to_single_space() {
-        // Every existing norm() test applies it to BOTH sides of an equality
-        // check with structurally-parallel inputs, so a regression that
-        // collapsed the collapse-to-one-space step (word concatenation
-        // instead) would degrade both sides identically and still compare
-        // equal. Assert the actual character content instead.
+        // Other norm() tests compare both sides of an equality with
+        // parallel inputs, so a regressed collapse-to-space step could
+        // degrade both sides identically and still compare equal.
         assert_eq!(norm("Top  Gun"), "top gun");
         assert_eq!(norm("Top Gun: Maverick"), "top gun maverick");
         assert_eq!(norm("Top___Gun"), "top gun");
     }
 
     // --- search(): the manual "needs review" correction picker ---------------
-    // No existing test called `search()` (or the ranking logic it now
-    // delegates to) at all — every mutation inside it, including replacing
-    // the whole function body with an empty Vec, passed trivially.
+    // No existing test called `search()` before — every mutation inside it,
+    // including replacing the whole body with an empty Vec, passed trivially.
 
     #[test]
     fn search_empty_api_key_or_query_yields_empty() {
@@ -1444,12 +1389,9 @@ mod tests {
 
     #[test]
     fn rank_search_results_orders_exact_dated_first_then_dated_then_popularity() {
-        // The real ranking logic `search()` calls after `fetch_multi` — pure,
-        // so it's driven directly here rather than needing a network round
-        // trip. Same fixture shape as the pick_best tests, but this checks
-        // the FULL returned order (search's whole reason to exist over
-        // pick_best), and includes a highly-popular but DATELESS decoy that
-        // must sort last despite its popularity.
+        // The pure ranking logic `search()` calls after `fetch_multi`, driven
+        // directly to avoid a network round trip. Checks the FULL returned
+        // order, including a highly-popular but DATELESS decoy sorting last.
         let results = serde_json::json!([
             {"media_type": "movie", "title": "Captain Nova: Undertow",
              "release_date": "2016-04-27", "popularity": 200.0},
@@ -1487,10 +1429,8 @@ mod tests {
     }
 
     // --- lookup(): the guard logic ahead of the untestable network call ------
-    // `lookup()` itself has zero test coverage — a regression collapsing it to
-    // unconditional `None` would pass every existing test. The happy path
-    // needs HTTP mocking (out of scope here), but the two guards that decide
-    // whether it even ATTEMPTS a request are pure and cheap to pin directly.
+    // `lookup()` has zero coverage otherwise (happy path needs HTTP mocking,
+    // out of scope); the guards deciding whether it attempts a request are pure.
 
     #[test]
     fn lookup_empty_api_key_returns_none_without_network() {
@@ -1661,10 +1601,8 @@ mod tests {
 
     #[test]
     fn align_repairs_uneven_split_via_distinctive_finale() {
-        // 10-ep season, 90-min finale (E10). Disc 1 held 6 (E01–06), disc 2 the
-        // remaining 4 (E07–10). The uniform-split guess for disc 2 is
-        // (2-1)*4 + 1 = 5, which is WRONG — the alignment must pin it to 7 by
-        // matching the 90-min finale to E10.
+        // 10-ep season, 90-min finale (E10), disc 2 holds E07-10. Uniform-split
+        // guess is (2-1)*4+1 = 5, WRONG — alignment must pin it to 7 via the finale.
         let eps = season(&[45, 45, 45, 45, 45, 45, 45, 45, 45, 90]);
         let disc2 = [45.0 * 60.0, 45.0 * 60.0, 45.0 * 60.0, 90.0 * 60.0];
         assert_eq!(align_disc_offset(&disc2, &eps, 5), 7);

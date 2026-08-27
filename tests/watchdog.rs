@@ -49,10 +49,9 @@ where
 
 #[test]
 fn watchdog_counter_bump_happy_path_increments() {
-    // Sanity: when the staging dir is healthy, the bounded counter
-    // bump returns Ok within its deadline and the on-disk count
-    // increments. This is the happy path the watchdog takes on
-    // healthy mounts.
+    // Sanity: on a healthy staging dir, the bounded counter bump returns
+    // Ok within its deadline and the on-disk count increments — the
+    // happy path the watchdog takes on healthy mounts.
     let tmp = tempdir().expect("tempdir");
     let staging_dir = tmp.path().to_path_buf();
     assert_eq!(staging::restart_count(&staging_dir), 0);
@@ -78,12 +77,9 @@ fn watchdog_counter_bump_happy_path_increments() {
 
 #[test]
 fn watchdog_counter_bump_times_out_when_op_hangs() {
-    // Simulate a wedged increment_restart_count by sleeping longer
-    // than the 5 s deadline. The bounded pattern must return Err
-    // within roughly the deadline so the watchdog can proceed to
-    // `exit(1)` instead of trapping forever inside a kernel syscall
-    // on a wedged NFS mount. Uses a short deadline (200 ms) and a
-    // 5 s op so the test is fast.
+    // Simulate a wedged increment_restart_count (sleep past the 5s
+    // deadline); the bounded pattern must return Err near the deadline so
+    // the watchdog can exit(1) instead of trapping in a wedged NFS syscall.
     let started = Instant::now();
     let res = bounded_call(Duration::from_millis(200), || {
         std::thread::sleep(Duration::from_secs(5));
@@ -102,21 +98,6 @@ fn watchdog_counter_bump_times_out_when_op_hangs() {
     );
 }
 
-// The settings-save guard-drop test that used to live here has been REMOVED,
-// not moved: it never invoked `handle_settings_post`. It re-implemented the
-// post-fix shape inline ("Same shape as handle_settings_post post-fix"),
-// dropped its own guard at the end of its own block expression, and then
-// asserted `try_write().is_ok()` — i.e. it asserted that Rust drops a scoped
-// `RwLockWriteGuard`. Reintroducing the exact production bug (holding
-// `cfg.write()` across `config::save`) left it green, so it was a guard in
-// name only, and its presence here made the real gap look covered.
-//
-// `handle_settings_post` is private to `src/web.rs` and takes a
-// `tiny_http::Request`, which has no public constructor — an integration test
-// in this crate cannot reach it at all. The real coverage lives in-crate,
-// where both are reachable:
-//
-//   * `web::web_tests::http::settings_post_persists_a_field_to_disk` — drives
-//     the handler through a live loopback server and reads settings.json back.
-//   * `web::web_tests::settings_post_saves_outside_the_config_write_guard` —
-//     pins the drop-before-save ORDERING against the handler's own source.
+// The settings-save guard-drop test here was REMOVED, not moved: it never
+// invoked `handle_settings_post` (private, unreachable) and only proved Rust
+// drops a scoped guard. Real coverage now lives in `web::web_tests`.
