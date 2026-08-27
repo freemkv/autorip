@@ -90,12 +90,9 @@ pub fn init() {
     let log_dir = log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
 
-    // Honour AUTORIP_LOG_LEVEL if the operator set one explicitly; that
-    // becomes the starting filter for the whole process. /api/debug
-    // becomes a no-op on the filter when AUTORIP_LOG_LEVEL is set (the
-    // operator's directive wins; flipping the API toggle would be
-    // surprising). Otherwise we install FILTER_OFF and wire up a
-    // reload handle so /api/debug can swap to FILTER_ON at runtime.
+    // Honour AUTORIP_LOG_LEVEL if set explicitly; /api/debug becomes a
+    // no-op on the filter then (operator directive wins). Otherwise
+    // install FILTER_OFF with a reload handle for /api/debug to use.
     let env_override = std::env::var("AUTORIP_LOG_LEVEL")
         .ok()
         .filter(|s| !s.is_empty());
@@ -129,12 +126,9 @@ pub fn init() {
         .with_target(true)
         .with_thread_ids(true);
 
-    // Machine-readable JSONL: NOT rolled. The web UI / `/api/debug` endpoint
-    // tails this file by a stable path; daily rotation would mean
-    // `autorip.jsonl.YYYY-MM-DD`, breaking lookups (the v0.13.0 file-not-
-    // found regression). We accept unbounded growth here — disk usage is
-    // ~1 KB per event × ~hundreds of events / day = MB/day at most. A
-    // future external `logrotate` (or similar) can rotate it out-of-band.
+    // Machine-readable JSONL: NOT rolled. `/api/debug` tails a stable path;
+    // daily rotation broke lookups before (v0.13.0 regression). Growth is
+    // unbounded but small (~MB/day); an external logrotate can handle it.
     let json_appender = rolling::never(&log_dir, "autorip.jsonl");
     let (json_writer, json_guard) = tracing_appender::non_blocking(json_appender);
     guards.push(json_guard);
@@ -342,10 +336,9 @@ mod tests {
     /// silently mis-report success.
     #[test]
     fn set_debug_returns_false_without_init() {
-        // RELOAD_HANDLE is a process-wide OnceCell. If another test in
-        // the same binary called `observe::init()` first, the handle
-        // may be present. We only assert the negative case when the
-        // handle is genuinely absent — otherwise the assertion is moot.
+        // RELOAD_HANDLE is a process-wide OnceCell; only assert the
+        // negative case when it's genuinely absent (another test may
+        // have called `observe::init()` first, making this moot).
         if RELOAD_HANDLE.get().is_none() {
             assert!(!set_debug(true));
             assert!(!set_debug(false));

@@ -99,10 +99,9 @@ pub(crate) fn webhook_url_origin(url: &str) -> String {
             .find(['/', '?', '#'])
             .map(|i| after + i)
             .unwrap_or(url.len());
-        // The authority span is `url[after..origin_end]`. If it carries
-        // HTTP basic-auth userinfo (`user:pass@host`), drop everything up
-        // to and including the last '@' so only `host[:port]` survives —
-        // otherwise the credential would leak straight through unredacted.
+        // If the authority carries basic-auth userinfo (`user:pass@host`),
+        // drop through the last '@' so only `host[:port]` survives, else
+        // the credential would leak straight through unredacted.
         let authority = &url[after..origin_end];
         let host_start = match authority.rfind('@') {
             Some(at) => after + at + 1,
@@ -134,10 +133,9 @@ pub(crate) fn active_urls(entries: &[WebhookEntry], event: WebhookEvent) -> Vec<
         .collect()
 }
 
-// Bound the number of concurrent webhook-dispatch threads. Each event
-// otherwise spawns an unbounded OS thread; a burst of events (or a hostile
-// client triggering many) could exhaust threads. Past the cap, drop the
-// event with a warning rather than spawning.
+// Bound concurrent webhook-dispatch threads: unbounded spawning under a
+// burst (or hostile client) could exhaust threads. Past the cap, drop
+// the event with a warning rather than spawning.
 use std::sync::atomic::{AtomicUsize, Ordering};
 const MAX_INFLIGHT: usize = 8;
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -186,25 +184,18 @@ fn fire(cfg: &Config, payload: &serde_json::Value, event: WebhookEvent) {
         return;
     }
 
-    // The guard is built HERE, on the spawning thread, and moved in — not
-    // constructed inside the closure. If `std::thread::spawn` itself fails the
-    // OS refuses a thread and std panics; with the guard built inside, the slot
-    // stayed claimed forever, and eight of those silence every webhook for the
-    // life of the process. `web.rs`'s `ConnGuard` was reshaped for exactly this
-    // and its comment says so.
+    // Guard built HERE on the spawning thread, not inside the closure: if
+    // spawn fails, a guard built inside would leave the slot claimed
+    // forever. See `web.rs`'s `ConnGuard`, reshaped for the same reason.
     let guard = InflightGuard;
     let spawned = std::thread::Builder::new()
         .name("webhook".into())
         .spawn(move || {
             let _guard = guard;
             for url in &urls {
-                // Webhooks are deliberately NOT SSRF-guarded: a webhook is a
-                // blind notification POST with no response channel, and aiming
-                // one at a LAN service (Home Assistant, a NAS) is the intended
-                // use. Delivery goes through the un-pinned `web::webhook_agent`
-                // (default resolver, no private-address block); see its doc
-                // comment. `redirects(0)` is still set there, so `deliver`
-                // still refuses to count a 3xx as a delivery.
+                // Deliberately NOT SSRF-guarded: aiming a webhook at a LAN
+                // service (Home Assistant, a NAS) is intended use. Goes
+                // through un-pinned `web::webhook_agent`; see its doc comment.
                 let _ = deliver(url, &body);
             }
         });
@@ -237,13 +228,9 @@ fn deliver(url: &str, body: &str) -> bool {
         .header("Content-Type", "application/json")
         .send(body)
     {
-        // NOT every `Ok` is a delivery. `webhook_agent` sets
-        // `max_redirects(0)`, and at zero ureq's `max_redirects_do_error` is
-        // false, so a 3xx comes back as `Ok` rather than an error — so an
-        // http webhook URL that its receiver redirects to https logged
-        // "Webhook sent" forever while nothing was ever delivered. A 4xx/5xx
-        // already arrives as `Err`; this closes the redirect gap and anything
-        // else non-2xx with it.
+        // NOT every `Ok` is a delivery: at `max_redirects(0)` ureq still
+        // returns `Ok` for a 3xx, so an http->https redirected webhook used
+        // to log "sent" while nothing delivered. This closes that gap.
         Ok(r) if r.status().is_success() => {
             // Log only the origin — the path may contain a secret token.
             crate::log::syslog(&format!("Webhook sent to {}", webhook_url_origin(url)));
@@ -258,12 +245,9 @@ fn deliver(url: &str, body: &str) -> bool {
             false
         }
         Err(e) => {
-            // Summarise the error WITHOUT embedding `e` directly. NOTE: in
-            // ureq 3 the Display of the variants reachable here is already
-            // URL-free (`io: {kind}`, `timeout: …`, `connection failed`); the
-            // habit is kept because `ureq_error_kind` is the one place that
-            // guarantee is stated, and `BadUri` — which does embed the URI —
-            // would otherwise be one refactor away from the log.
+            // Summarise WITHOUT embedding `e` directly: `ureq_error_kind` is
+            // the one place the URL-free guarantee is stated, since `BadUri`
+            // does embed the URI and would else be one refactor from the log.
             let summary = crate::web::ureq_error_kind(&e);
             crate::log::syslog(&format!(
                 "Webhook failed {}: {}",
@@ -493,11 +477,9 @@ mod tests {
         );
         assert!(delivered, "a 204 is a delivery");
 
-        // Hand the observation back over a channel and take it with a
-        // DEADLINE. `deliver` swallows transport errors (it only logs), so if
-        // the pinned-resolver wiring ever regresses, no request arrives, the
-        // stub blocks in `accept`, and an unconditional `join()` turns a test
-        // failure into a hung suite.
+        // Take with a DEADLINE: `deliver` swallows transport errors (only
+        // logs), so if pinned-resolver wiring regresses, no request arrives
+        // and an unconditional `join()` would hang the suite instead of failing.
         let (head, body) = rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("no request reached the stub — deliver() never sent one");
@@ -568,11 +550,9 @@ mod tests {
     /// neither the full URL nor any embedded token — only the HTTP status code.
     #[test]
     fn fire_error_summary_status_no_url_leak() {
-        // Simulate what the Err(e) arm produces for a Status error.
-        // We can't call fire() directly (it needs a Config + spawns a thread
-        // and makes a real HTTP request), so we replicate the summary logic
-        // inline. If the logic in fire() changes, this test must change too —
-        // that's the point: it pins the shape of the logged string.
+        // Simulate the Err(e) arm's output for a Status error. Can't call
+        // fire() directly (needs a Config + spawns + real HTTP), so this
+        // replicates the summary logic inline, pinning the logged shape.
         let url = "https://discord.com/api/webhooks/123456/SECRET_TOKEN";
         // We can't construct a `ureq::Error::Status` without a live connection, so
         // we test the origin-stripping half (already well-tested above) and the
@@ -613,17 +593,9 @@ mod tests {
         assert!(log_line.contains("hooks.example.com"));
     }
 
-    // The tests above all use long example hostnames (discord.com,
-    // jellyfin.example:8096, hooks.example.com, example.com). A previous
-    // arithmetic bug in this function (`scheme_end + 3` accidentally written
-    // as `scheme_end * 3`) happened to still compute the right origin for
-    // those specific hosts, because `scheme_end * 3` (12 or 15, since
-    // `scheme_end` is 4/5 for "http"/"https") lands inside or past the real
-    // host boundary for a long enough hostname. It does NOT for a short one.
-    // These tests pin the token-stripping behaviour against hosts short
-    // enough that the `* 3` bug would visibly leak the token, so a
-    // regression back to that arithmetic is caught regardless of hostname
-    // length used elsewhere in the suite.
+    // Tests above use long hostnames, under which a past `scheme_end + 3`
+    // vs `* 3` typo happened to still compute the right origin. These use
+    // short hosts so that bug would visibly leak the token if it recurred.
 
     #[test]
     fn webhook_url_origin_short_host_path_token() {
@@ -837,11 +809,9 @@ mod tests {
         assert!(try_acquire_slot(&counter, max));
         assert_eq!(counter.load(Ordering::Acquire), max);
 
-        // Release everything currently held (3 slots) and confirm the
-        // counter returns all the way to zero — this is the guarantee that
-        // `InflightGuard::drop` must uphold on every dispatch thread exit,
-        // otherwise the counter ratchets upward forever and every webhook
-        // past the cap gets silently dropped for the rest of the process.
+        // Release all 3 held slots and confirm the counter hits zero — the
+        // guarantee `InflightGuard::drop` must uphold, else it ratchets up
+        // forever and every webhook past the cap silently drops thereafter.
         release_slot(&counter);
         release_slot(&counter);
         release_slot(&counter);

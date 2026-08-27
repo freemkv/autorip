@@ -366,13 +366,9 @@ fn push_mux_state(
             progress_gb: bytes_done as f64 / BYTES_PER_GIB,
             speed_mbs: speed,
             eta: eta.clone(),
-            // During the mux phase the demux error counter (`errors`) is
-            // usually zero — the ISO reads don't fail. Carry the real
-            // bad-sector count and lost-time from the final sweep/patch
-            // pass so the damage pill / bad-ranges list remain visible
-            // to operators polling /api/state during mux. The live
-            // demux skip count is still surfaced via `lost_video_secs`
-            // for the single-pass (no-snapshot) path.
+            // Demux `errors` is usually 0 during mux (ISO reads don't fail), so
+            // carry the sweep/patch bad-sector count instead, keeping the
+            // damage pill visible to operators polling /api/state during mux.
             errors: if ui.sweep_damage.errors > 0 {
                 ui.sweep_damage.errors
             } else {
@@ -393,14 +389,9 @@ fn push_mux_state(
             tmdb_overview: ui.tmdb_overview.clone(),
             duration: ui.duration.clone(),
             codecs: ui.codecs.clone(),
-            // Carry the multipass identity through every per-frame
-            // update so the UI doesn't snap back to a "fresh rip"
-            // view when mux starts. pass == total_passes is the
-            // established convention for "we're on the mux pass".
-            //
-            // Total progress uses `total_pct_byte_weight` — the same
-            // byte-weighted formula as sweep/patch, so the bar
-            // progresses smoothly across the sweep→mux handoff.
+            // Carry multipass identity per frame so the UI doesn't snap back to
+            // "fresh rip" at mux start (pass == total_passes = "on mux pass").
+            // Total progress uses sweep/patch's byte-weighted formula for a smooth handoff.
             pass: ui.total_passes,
             total_passes: ui.total_passes,
             pass_progress_pct: pct,
@@ -442,12 +433,9 @@ fn push_mux_state(
 fn producer_read_error_cause(e: &std::io::Error) -> String {
     match coded_prefix(&e.to_string()) {
         Some(code) if code != libfreemkv::error::E_IO_ERROR => {
-            // The library `Display` is code-only, so `{e}` stringifies to a
-            // bare `E####` for argument-less variants (e.g. DecryptFailed →
-            // `E7013`). Attach a short English label so the operator reads a
-            // human cause in the red banner, not `(E7013): E7013`. This keeps
-            // the mux read-error path consistent with the sweep/patch path,
-            // which labels via `non_scsi_error_label` / `format_pass_error`.
+            // `Display` is code-only, so `{e}` is a bare `E####` for
+            // argument-less variants. Attach an English label so the operator
+            // sees a human cause, matching sweep/patch's error labeling.
             format!(
                 "read error mid-stream (E{code}): {}",
                 coded_error_label(code)
@@ -529,12 +517,9 @@ fn spawn_mux_watchdog(
     let wd_tmdb_year = inputs.tmdb_year;
     let wd_filename = inputs.filename.clone();
     let wd_staging_disc_dir = inputs.staging_disc_dir.clone();
-    // Intentionally detached (no JoinHandle kept). The watchdog holds only
-    // Arc<Atomic*> clones — no file handles, no heap buffers, nothing that
-    // accumulates across rips. It self-terminates when `active` goes false
-    // (WatchdogGuard drop at run_mux return), so it never outlives its
-    // owning mux call. Hard escalation (stall ≥ 20 min) calls exit(1)
-    // directly; at that point there is nothing left to join anyway.
+    // Intentionally detached (no JoinHandle): holds only Arc<Atomic*> clones,
+    // self-terminates when `active` goes false (WatchdogGuard drop), and hard
+    // escalation just calls exit(1) directly — nothing left to join anyway.
     std::thread::spawn(move || {
         let mut was_stalled = false;
         let mut last_log_secs: u64 = 0;
@@ -547,18 +532,9 @@ fn spawn_mux_watchdog(
             let last = last_frame.load(Ordering::Relaxed);
             let stall_secs = now.saturating_sub(last);
 
-            // Hard watchdog escalation. When the consumer / reader
-            // is stuck this far past the soft warning, graceful
-            // cleanup is impossible — the offending thread is
-            // inside a syscall that the kernel won't return from
-            // (hung NFS, wedged decrypt, frozen device ioctl).
-            // Bump the disc's `.restart_count` so post-restart
-            // resume can promote to `.failed` once the limit is
-            // reached, then `exit(1)` and let Docker
-            // `restart: unless-stopped` bring us back.
-            //
-            // No graceful join, no halt-token flip — those have
-            // already failed for 20 minutes by definition.
+            // Hard escalation: the thread is stuck in an un-returning syscall
+            // (hung NFS, wedged decrypt, frozen ioctl), so graceful cleanup is
+            // impossible — bump `.restart_count` and `exit(1)` for Docker to recover.
             if stall_secs >= HARD_WATCHDOG_STALL_SECS {
                 let bytes_good = wbytes.load(Ordering::Relaxed);
                 let msg = format!(
@@ -566,13 +542,9 @@ fn spawn_mux_watchdog(
                     stall_secs,
                     bytes_good as f64 / BYTES_PER_GIB,
                 );
-                // CRITICAL: do NOT call `device_log` here. The log
-                // file lives on the same NFS-mounted `/config`
-                // that's quite possibly the exact mount we're
-                // escalating because it's wedged. `eprintln!` and
-                // `tracing::error!` both go to docker logs /
-                // journald — no NFS, no filesystem dependency, so
-                // they can't block `exit(1)` from firing.
+                // CRITICAL: do NOT call `device_log` — the log lives on the
+                // same NFS `/config` we may be escalating because it's wedged.
+                // `eprintln!`/`tracing::error!` go to docker logs, so `exit(1)` isn't blocked.
                 eprintln!("[mux/{}] {}", wd_device, msg);
                 tracing::error!(
                     target: "mux",
@@ -582,25 +554,9 @@ fn spawn_mux_watchdog(
                     staging = %wd_staging_disc_dir.display(),
                     "hard watchdog escalating; exiting process for container restart"
                 );
-                // Best-effort: bump the restart counter so the
-                // resume detector knows this disc has wedged the
-                // process before. Errors are intentionally ignored
-                // — we're about to exit(1) anyway and Docker will
-                // get us back. clear_restart_count happens on
-                // success / failed path elsewhere; on this path it
-                // stays bumped so RESTART_LIMIT can engage.
-                //
-                // 0.20.8 hardening: wrap the counter bump in a
-                // local bounded-syscall pattern (5 s deadline) so
-                // even if staging shares the wedged NFS mount with
-                // `/config`, we still proceed to `exit(1)`. If the
-                // bump times out, the next restart sees count N-1
-                // instead of N — at worst one extra retry, vastly
-                // better than never exiting.
-                // `libfreemkv::io::bounded::bounded_syscall` is
-                // `pub(crate)` so it's not reachable from autorip;
-                // we hand-roll the equivalent pattern (15 lines)
-                // here.
+                // Best-effort: bump the restart counter (errors ignored, exiting
+                // anyway) so RESTART_LIMIT can engage, with a 5 s bounded
+                // deadline so a wedged NFS mount still lets us `exit(1)`.
                 {
                     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
                     let bump_dir = wd_staging_disc_dir.clone();
@@ -660,20 +616,9 @@ fn spawn_mux_watchdog(
                     );
                 }
                 super::state::update_state_with(&wd_device, |s| {
-                    // Don't clobber any terminal/intentional state set
-                    // by another path. The watchdog runs on a 15 s
-                    // wake tick and can fire AFTER:
-                    //   - `handle_stop` reset state to "idle"
-                    //     (60 s drain timed out, rip thread still
-                    //     wedged inside a syscall)
-                    //   - `rip_disc` / `resume_remux` completed and
-                    //     transitioned to "done" / "complete" /
-                    //     "failed" / "error"
-                    // In all those cases the operator-facing status
-                    // is authoritative; flipping it back to "ripping"
-                    // would be a UI lie. The hard-watchdog
-                    // escalation above (stall_secs >= 1200) still
-                    // runs unconditionally to recover real wedges.
+                    // Don't clobber terminal state: the 15 s wake tick can fire
+                    // after `handle_stop` set "idle" or a rip finished as
+                    // "done"/"complete"/"failed"/"error" — that status wins.
                     match s.status.as_str() {
                         "idle" | "done" | "complete" | "failed" | "error" => return,
                         _ => {}
@@ -723,15 +668,8 @@ pub(crate) struct MuxAtomics {
 }
 
 // ── ISO / multipass + resume mux via libfreemkv's `mux_stream` ───────────────
-//
-// STEP 4c-i: the inner drive loop (header pump → headers_resolved gate →
-// output() → frame pump → NoStreams gate → finish + the write pipeline) now
-// lives in `libfreemkv::mux_stream` / `drive_mux`. autorip KEEPS the hard
-// watchdog (`spawn_mux_watchdog`), the `MuxAtomics` the watchdog reads, the
-// staging/marker writes + FMTS deferral (done at the call sites in `mod.rs` /
-// `resume.rs`), and the `MuxOutcome` mapping. `AutoripMuxEvents` is the bridge
-// that FEEDS those atomics from inside `mux_stream` so the watchdog keeps
-// working exactly as before.
+// Drive loop lives in `mux_stream`/`drive_mux`; autorip keeps the watchdog,
+// `MuxAtomics`, staging/FMTS deferral, and `MuxOutcome` mapping, fed via `AutoripMuxEvents`.
 
 /// Everything `mux_iso` needs to build a [`libfreemkv::MuxInput::Iso`]. The
 /// orchestrator (`rip_disc` multipass branch / `resume_remux`) fills this
@@ -810,10 +748,9 @@ impl libfreemkv::MuxEvents for AutoripMuxEvents {
     }
 
     fn on_read_progress(&self, bytes_read: u64, _bytes_total: u64) {
-        // Reader-side (highway producer thread) BytesRead — mirrors the old
-        // `stream_event_fn`: keep the watchdog fresh during header reads (which
-        // have no SCSI READ_TIMEOUT backstop on the ISO path) and feed the
-        // read-ahead progress position the UI prefers over write-lagged output.
+        // Reader-side BytesRead: keeps the watchdog fresh during header reads
+        // (no SCSI READ_TIMEOUT backstop on the ISO path) and feeds the
+        // read-ahead position the UI prefers over write-lagged output.
         self.atomics
             .wd_last_frame
             .store(crate::util::epoch_secs(), Ordering::Relaxed);
@@ -919,11 +856,9 @@ impl libfreemkv::MuxEvents for AutoripMuxEvents {
         }
 
         let skip_errors = self.atomics.input_errors.load(Ordering::Relaxed);
-        // Live lost-video-secs from bytes actually zero-filled. On the file
-        // highway `input_lost_bytes` typically stays 0 during the run (the
-        // reader-side events carry no per-unit loss count); the AUTHORITATIVE
-        // total lost is taken from `MuxOutcome.lost_bytes` at the end (see
-        // `map_iso_mux_outcome`). This live figure only refines the mid-mux UI.
+        // Live lost-video-secs from bytes zero-filled so far; the file highway's
+        // `input_lost_bytes` usually stays 0 mid-run, so this only refines the
+        // mid-mux UI — the authoritative total comes from `MuxOutcome.lost_bytes`.
         let lost_bytes = self.atomics.input_lost_bytes.load(Ordering::Relaxed);
         let lost_video_secs = if self.ui.title_bytes_per_sec > 0.0 {
             lost_bytes as f64 / self.ui.title_bytes_per_sec
@@ -946,15 +881,9 @@ impl libfreemkv::MuxEvents for AutoripMuxEvents {
         self.atomics
             .wd_last_frame
             .store(crate::util::epoch_secs(), Ordering::Relaxed);
-        // Store the skipped LBA into `rip_last_lba` — the UI last_sector /
-        // playhead atomic `push_mux_state` reads — AND emit the per-skip
-        // device-log line, exactly as the pre-refactor `make_stream_event_fn`
-        // did (mod.rs `SectorSkipped` arm: `last_lba.store(sector)` +
-        // `"Sector {sector} skipped (zero-filled)"`). These fire on the LIVE
-        // inline single-pass path from `DiscStream::fill_extents`; dropping them
-        // froze `last_sector` and lost the record of which sectors were
-        // zero-filled during a skip-heavy live rip. The `input_errors` bump is
-        // additive (kept from the post-refactor bridge, surfaces the skip count).
+        // Store the skipped LBA into `rip_last_lba` (UI last_sector/playhead)
+        // and log the per-skip line — fires on the LIVE inline single-pass path
+        // from `DiscStream::fill_extents`; `input_errors` bump surfaces the skip count.
         self.atomics
             .rip_last_lba
             .store(lba as u64, Ordering::Relaxed);
@@ -969,11 +898,9 @@ impl libfreemkv::MuxEvents for AutoripMuxEvents {
         self.atomics
             .rip_current_batch
             .store(batch, Ordering::Relaxed);
-        // Emit the batch-change device-log line the pre-refactor
-        // `make_stream_event_fn` produced (mod.rs `BatchSizeChanged` arm).
-        // Fires on the live inline single-pass path from the adaptive sizer in
-        // `DiscStream::fill_extents`; restoring it keeps the operator-facing
-        // record of when/why the read batch adapted during a live rip.
+        // Log the batch-change line; fires on the live inline single-pass path
+        // from the adaptive sizer in `DiscStream::fill_extents`, keeping the
+        // operator-facing record of when/why the read batch adapted.
         let label = match reason {
             libfreemkv::event::BatchSizeReason::Shrunk => "shrunk",
             libfreemkv::event::BatchSizeReason::Probed => "probed up",
@@ -1080,15 +1007,9 @@ fn map_iso_mux_outcome(
     };
     match result {
         Ok(o) if o.completed => {
-            // libfreemkv's contract: non-empty `undelivered_streams` means the
-            // finished file does NOT match the pre-mux plan even though
-            // `completed == true` — a lossy-but-successful export. Dormant
-            // today (only the `mp4://` sink populates it; autorip's
-            // `output_scheme_for` never returns "mp4"), but a caller that
-            // reports a successful export must report these too, so this
-            // logs loudly the moment it stops being empty rather than
-            // waiting for an mp4 destination to make the silence a HIGH.
-
+            // Non-empty `undelivered_streams` means a lossy-but-successful
+            // export despite `completed == true`. Dormant today (only the
+            // `mp4://` sink populates it), but log loudly the moment it's not.
             if !o.undelivered_streams.is_empty() {
                 crate::log::device_log(device, &undelivered_streams_note(&o.undelivered_streams));
             }
@@ -1332,15 +1253,8 @@ pub(crate) fn mux_iso(
 }
 
 // ── LIVE single-pass mux via libfreemkv's `mux_stream` ───────────────────────
-//
-// STEP 4c-ii: the live single-pass path (`max_retries == 0`) now runs through
-// `libfreemkv::mux_stream` with the `MuxInput::Live` source — the INLINE
-// `DiscStream` (NOT the prefetch highway), so `DiscStream::fill_extents`'
-// adaptive batch-retry on a bad live-drive sector still fires. This retires the
-// hand-rolled `run_mux` producer/consumer loop. Everything else — the hard
-// watchdog, the `MuxAtomics` it reads, `AutoripMuxEvents`, and the
-// `map_iso_mux_outcome` classification — is REUSED verbatim from `mux_iso`, so
-// the two mux paths are now one engine differing only in their `MuxInput`.
+// The live path (`max_retries == 0`) runs through `mux_stream` with the
+// inline `DiscStream` (not the prefetch highway); rest reused from `mux_iso`.
 
 /// Everything `mux_live` needs to build a [`libfreemkv::MuxInput::Live`] — the
 /// live analogue of [`IsoMuxSource`]. The orchestrator (`rip_disc`'s single-pass
@@ -1370,7 +1284,7 @@ pub(crate) struct LiveMuxSource {
 }
 
 /// Run the LIVE single-pass mux via [`libfreemkv::mux_stream`] on the inline
-/// [`DiscStream`] (`MuxInput::Live`). The STEP 4c-ii replacement for the
+/// `DiscStream` (`MuxInput::Live`). The STEP 4c-ii replacement for the
 /// hand-rolled `run_mux` producer/consumer loop. Mirrors [`mux_iso`] exactly —
 /// same watchdog spawn, same `AutoripMuxEvents` bridge feeding the same
 /// `MuxAtomics`, same `map_iso_mux_outcome` classification — differing only in
@@ -1408,10 +1322,9 @@ pub(crate) fn mux_live(
         wd_bytes.clone(),
     );
 
-    // Same per-device Halt the orchestrator threaded through sweep/patch and the
-    // `/api/stop` handler cancels. Absent-token fallback = never-cancelled. On
-    // the live path this is the SAME token the pre-migration `DiscStream::new`
-    // received (covering the CSS key setup that runs at construction).
+    // Same per-device Halt the orchestrator threads through sweep/patch and
+    // `/api/stop` cancels; absent-token fallback = never-cancelled. Covers the
+    // CSS key setup that runs at `DiscStream` construction.
     let halt_token = device_halt(inputs.device).unwrap_or_default();
 
     // Progress denominator: caller's `total_bytes` (the single-pass extent sum
@@ -1423,9 +1336,8 @@ pub(crate) fn mux_live(
     };
 
     // The events bridge shares the orchestrator's watchdog/UI atomics — same
-    // shape as `mux_iso`. On the live inline path `on_sector_skipped` /
-    // `on_batch_size_changed` DO fire (from `DiscStream::fill_extents`), and the
-    // bridge already routes them to `input_errors` / `rip_current_batch`.
+    // shape as `mux_iso`, but here `on_sector_skipped`/`on_batch_size_changed`
+    // DO fire (from `DiscStream::fill_extents`) and route through as usual.
     let shared = SharedAtomics {
         latest_bytes_read: atomics_in.latest_bytes_read.clone(),
         rip_last_lba: atomics_in.rip_last_lba.clone(),
@@ -1514,10 +1426,9 @@ mod tests {
         let decrypt_io: std::io::Error = libfreemkv::Error::DecryptFailed.into();
         let decrypt_code = libfreemkv::Error::DecryptFailed.code();
         let cause = producer_read_error_cause(&decrypt_io);
-        // The annotated parenthetical form must actually be emitted — not
-        // just an incidental `E####` in the message tail. (Guards the dead
-        // `else` branch the code-extraction round-trip used to leave
-        // unreachable.)
+        // The annotated parenthetical form must actually be emitted — not just
+        // an incidental `E####` in the message tail (guards the dead `else`
+        // branch the code-extraction round-trip used to leave unreachable).
         assert!(
             cause.contains(&format!("(E{decrypt_code})")),
             "decrypt cause must name the coded fault in the annotation, got: {cause}"
@@ -1744,10 +1655,9 @@ mod tests {
     /// return mux_pct directly, erasing the sweep's ~50% credit.
     #[test]
     fn resume_progress_starts_above_zero_when_max_retries_nonzero() {
-        // Clean disc: bytes_unreadable=0 → retry term vanishes.
-        // total_work = 2 × cap. At mux start (mux_pct=0):
-        //   total_done = cap + 0 + 0 = cap
-        //   total_pct = cap / (2*cap) * 100 = 50%
+        // Clean disc (bytes_unreadable=0, retry term vanishes): total_work =
+        // 2×cap. At mux start (mux_pct=0), total_done = cap, so total_pct =
+        // cap / (2*cap) * 100 = 50%.
         let pct = total_pct_byte_weight(DISC, 3, 0, 0);
         assert_eq!(
             pct, 50,
@@ -2002,10 +1912,8 @@ mod tests {
                 errors: 0,
                 lost_bytes: 0,
                 streams: 2,
-                // Added to libfreemkv::MuxOutcome during the 1.6.0 audit: the
-                // stream indices the sink accepted frames for but could not put
-                // in the finished container. Empty here — this fixture is the
-                // clean completed run.
+                // Stream indices the sink accepted frames for but couldn't put
+                // in the finished container. Empty here — clean completed run.
                 undelivered_streams: Vec::new(),
             }),
             true,
@@ -2019,12 +1927,9 @@ mod tests {
         assert!(ok.completed && ok.output_opened);
         assert_eq!(ok.bytes_done, 1234);
 
-        // Ok(..) with completed=false — a clean operator stop or a
-        // join-timeout wedge (see the code comment on the `Ok(o)` non-guard
-        // arm). This must NOT be reported as a finished mux: a mutant that
-        // widens the `Ok(o) if o.completed` guard to unconditionally match
-        // would report this halted/wedged run as `completed=true`, which is
-        // rule 1 verbatim (a damaged/incomplete rip filed as good).
+        // Ok(..) with completed=false — a clean stop or join-timeout wedge —
+        // must NOT report as a finished mux: a mutant widening the
+        // `Ok(o) if o.completed` guard would file a damaged rip as good (rule 1).
         let not_done = map_iso_mux_outcome(
             Ok(libfreemkv::MuxOutcome {
                 completed: false,
@@ -2090,15 +1995,9 @@ mod tests {
     /// success.
     #[test]
     fn map_iso_mux_outcome_surfaces_undelivered_streams_on_a_completed_run() {
-        // Unique to this test: the per-device log ring is a process-global
-        // static and `"sr-test"` is the shared fixture name seven sibling
-        // tests in this module also pass to `map_iso_mux_outcome`. Reading
-        // back the last 50 lines of a ring those tests are concurrently
-        // appending to made BOTH assertions below unsound: the exact-count
-        // assertion could see a sibling's line, and — because the ring is
-        // never cleared between tests — the `notes[0]` assertion could be
-        // reading a note this test did not write at all. Mint a unique name,
-        // per the convention in `mod.rs`'s hot-unplug tests.
+        // The per-device log ring is a process-global static shared by sibling
+        // tests using `"sr-test"`; reading it back would make both assertions
+        // below unsound (sibling lines, uncleared ring). Mint a unique name.
         let device = "sr_mux_undelivered_streams_note_test";
         let start = Instant::now();
         let lossy = map_iso_mux_outcome(
@@ -2120,10 +2019,9 @@ mod tests {
         )
         .expect("completed run maps to Ok");
         assert!(lossy.completed);
-        // REPORTED, not merely carried: the per-device log is where this fact
-        // reaches the operator, and it is the only place it was ever consumed.
-        // Exactly once — zero is a silently lossy "success", two is the
-        // duplicate-wording bug this replaced.
+        // REPORTED, not merely carried: the device log is where this reaches
+        // the operator. Exactly once — zero is a silent lossy "success", two
+        // is the duplicate-wording bug this replaced.
         let logged = crate::log::get_device_log(device, 50);
         let notes: Vec<&String> = logged
             .iter()

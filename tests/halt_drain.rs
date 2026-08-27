@@ -17,14 +17,9 @@ use libfreemkv::Halt;
 
 #[test]
 fn test_cancel_halt_propagates_to_rip_clones() {
-    // Register a per-device `Halt` token (the same call rip_disc
-    // makes at its top); look it up via `device_halt` (the same call
-    // the HTTP /api/stop handler in web.rs makes); cancel it; assert
-    // the original Halt observes cancellation. Models the production
-    // path: the rip thread holds clones threaded through sweep /
-    // patch / mux / DiscStream, the UI calls /api/stop, the handler
-    // calls device_halt(device).cancel(), every clone observes the
-    // flip on its next is_cancelled() poll.
+    // Register a per-device Halt (as rip_disc does), look it up via
+    // device_halt (as the /api/stop handler does), cancel it, and assert
+    // the original Halt observes cancellation — the production stop path.
     let device = "sg_halt_test";
     let halt = Halt::new();
     ripper::register_halt(device, halt.clone());
@@ -42,19 +37,9 @@ fn test_cancel_halt_propagates_to_rip_clones() {
 
 #[test]
 fn test_stop_and_drain_waits_for_thread_to_finish() {
-    // The stop→drain contract: stop must cancel the device's halt token AND
-    // block until the rip thread has actually finished — it must NOT return
-    // while the thread is still mid-write holding the SCSI session.
-    //
-    // This drives the REAL production function `ripper::stop_and_drain` (the
-    // core handle_stop now delegates to), not a replica. A synthetic rip
-    // thread polls the halt token, then takes ~100 ms to "close its output"
-    // before exiting. The test asserts:
-    //   - stop_and_drain returned true (it observed the thread finish), and
-    //   - the thread's own exit flag is set by the time stop returned, and
-    //   - stop took at least the drain delay (it genuinely waited).
-    // If stop_and_drain ever regressed to fire-and-forget, `drained` would be
-    // false (timeout) and/or `exited` would still be false right after.
+    // Stop must cancel the halt token AND block until the rip thread has
+    // finished, not return mid-write. Drives the REAL `ripper::stop_and_drain`;
+    // a synthetic thread takes ~100ms to "close output" so a fire-and-forget regression fails.
     let device = "sg_drain_test";
     let halt = Halt::new();
     ripper::register_halt(device, halt.clone());
@@ -118,21 +103,9 @@ impl Drop for DropCounter {
 
 #[test]
 fn test_eject_does_not_double_drop() {
-    // TDD-red: depends on the eject sync fix. Today,
-    // handle_eject (web.rs:1470) calls eject_drive which can drop
-    // the SCSI session while the rip thread is still mid-call into
-    // libfreemkv. If the rip thread also drops its session on exit,
-    // the underlying Drive could be dropped twice.
-    //
-    // We model the contract with DropCounter: Arc<Mutex<DropCounter>>
-    // shared between an "eject" task and a "rip exit" task. After
-    // both run concurrently, the counter must be exactly 1 — the
-    // Arc<Mutex> wrapper guarantees this AS LONG AS production also
-    // routes both code paths through the same Arc<Mutex>.
-    //
-    // If a future refactor accidentally clones the Drive into two
-    // separate ownership paths (or extracts it from the mutex
-    // without taking it), this test would catch the regression.
+    // TDD-red: handle_eject can drop the SCSI session via eject_drive while
+    // the rip thread is still mid-call, risking a double drop of Drive. Model
+    // via DropCounter/Arc<Mutex> shared by "eject" and "rip exit" tasks; count must be 1.
     let counter = Arc::new(AtomicUsize::new(0));
     let drive_slot: Arc<std::sync::Mutex<Option<DropCounter>>> =
         Arc::new(std::sync::Mutex::new(Some(DropCounter {

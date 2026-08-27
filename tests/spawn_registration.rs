@@ -35,9 +35,8 @@ fn spawn_rip_thread_registers_handle() {
     .expect("spawn_rip_thread should succeed");
 
     // The 100 ms worker is still sleeping; the handle must be in
-    // RIP_THREADS right now. If take returns None here, registration
-    // didn't happen — that's exactly the v0.13.6 bug we're guarding
-    // against.
+    // RIP_THREADS now. take() returning None here means registration
+    // didn't happen — the v0.13.6 bug this guards against.
     let handle = ripper::take_rip_thread(device);
     assert!(
         spawn_started.elapsed() < Duration::from_millis(80),

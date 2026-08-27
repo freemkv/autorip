@@ -106,11 +106,9 @@ fn resume_classifies_partial_mapfile_as_not_remux() {
 
 #[test]
 fn resume_classifies_short_iso_as_not_remux() {
-    // Regression for the truncated-ISO / short total_size case: a settled
-    // mapfile (bytes_pending==0) whose ISO is SHORTER than its declared
-    // total_size means the ISO is incomplete (or the mapfile undercounts the
-    // disc, hiding NonTried tail sectors). Either way, jumping to mux would
-    // emit a truncated/zero-filled movie — reject and re-sweep fresh.
+    // Regression: a settled mapfile (bytes_pending==0) whose ISO is SHORTER
+    // than its declared total_size means the ISO is incomplete or the
+    // mapfile undercounts — reject and re-sweep instead of jumping to mux.
     let td = tmpdir();
     let dir = td.path().join("MyDisc");
     std::fs::create_dir_all(&dir).unwrap();
@@ -164,10 +162,9 @@ fn resume_classifies_missing_iso_as_not_remux() {
 
 #[test]
 fn resume_remux_deletes_partial_mkv() {
-    // delete_partial_output is the cleanup helper invoked at the top
-    // of resume_remux. The full run_mux happy path needs a real ISO,
-    // which the live test bed exercises; here we just confirm the
-    // pre-mux cleanup is correct and idempotent.
+    // delete_partial_output is the cleanup helper invoked at the top of
+    // resume_remux; the full run_mux happy path needs a real ISO (live test
+    // bed), so here we just confirm the pre-mux cleanup is idempotent.
     let td = tmpdir();
     let staging = td.path().join("MyDisc");
     std::fs::create_dir_all(&staging).unwrap();
@@ -186,10 +183,9 @@ fn resume_remux_deletes_partial_mkv() {
 
 #[test]
 fn resume_remux_writes_completed_marker_on_success() {
-    // Driving `run_mux` to success requires a real UDF ISO. Instead
-    // confirm that the marker-write helpers we delegate to on the
-    // success path do what resume_remux expects (and that we share
-    // the SAME helpers rip_disc uses — no parallel codepath).
+    // Driving run_mux to success requires a real UDF ISO. Instead confirm
+    // the marker-write helpers on the success path do what resume_remux
+    // expects, and that they're the SAME helpers rip_disc uses.
     let td = tmpdir();
     let staging = td.path().join("MyDisc");
     std::fs::create_dir_all(&staging).unwrap();
@@ -215,11 +211,9 @@ fn resume_remux_writes_completed_marker_on_success() {
 
 #[test]
 fn resume_remux_preserves_state_on_classifier_rejection() {
-    // The orchestrator must NOT clear .restart_count when the
-    // classifier rejects. Guards the 3-strike rule against an
-    // accidental "everything looks fine to keep retrying forever"
-    // bug if a future classifier tweak silently downgrades a
-    // legitimate Remux to NotEligible.
+    // The orchestrator must NOT clear .restart_count when the classifier
+    // rejects — guards the 3-strike rule against a future classifier tweak
+    // silently downgrading a legitimate Remux to NotEligible.
     let td = tmpdir();
     let dir = td.path().join("MyDisc");
     std::fs::create_dir_all(&dir).unwrap();

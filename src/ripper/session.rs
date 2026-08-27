@@ -64,7 +64,7 @@ pub enum RegisterError {
 ///   We leave the running prior in place and return
 ///   `Err(RegisterError::PriorThreadRunning(new))`, handing the new
 ///   handle back so the caller reaps the worker it just spawned. The
-///   spawn sites gate on [`try_claim_active`], which now consults thread
+///   spawn sites gate on [`crate::ripper::try_claim_active`], which now consults thread
 ///   liveness as well as STATE status, so this branch should be
 ///   unreachable — but it is the last line of defense and is defended
 ///   rather than trusted. (It was previously justified by STATE status
@@ -72,10 +72,9 @@ pub enum RegisterError {
 ///   status and then keeps unwinding, so this branch was reachable from
 ///   an unauthenticated LAN POST.)
 pub fn register_rip_thread(device: &str, handle: JoinHandle<()>) -> Result<(), RegisterError> {
-    // Recover from poison rather than silently dropping the handle: a
-    // dropped JoinHandle here can never be reaped, breaking
-    // drain-before-wipe (the v0.13.6 bug class). Same recover-and-proceed
-    // convention as update_state/is_busy/log.rs.
+    // Recover from poison instead of dropping the handle: a dropped
+    // JoinHandle can never be reaped, breaking drain-before-wipe (v0.13.6
+    // bug class). Same convention as update_state/is_busy/log.rs.
     let mut t = RIP_THREADS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(prior) = t.get(device) {
         if prior.is_finished() {
@@ -104,12 +103,9 @@ pub fn register_rip_thread(device: &str, handle: JoinHandle<()>) -> Result<(), R
 }
 
 pub fn take_rip_thread(device: &str) -> Option<JoinHandle<()>> {
-    // Recover from a poisoned lock (`into_inner`) rather than swallowing it with
-    // `.ok()?`: a poisoned RIP_THREADS means a rip worker panicked, which is
-    // exactly when `handle_stop` must still recover the JoinHandle to drain the
-    // thread before wiping staging. Returning `None` here would lose the handle
-    // and reintroduce the v0.13.6 stop-without-drain bug. Matches the
-    // poison-recovering convention used everywhere else in this module.
+    // Recover from poison rather than `.ok()?`: a poisoned RIP_THREADS means a
+    // worker panicked, exactly when `handle_stop` must still recover the
+    // handle to drain before wiping staging (else v0.13.6 stop-without-drain).
     RIP_THREADS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -149,25 +145,20 @@ where
     F: FnOnce() + Send + 'static,
 {
     let name = format!("{}-{}", role, device);
-    // Enter a per-thread span carrying the build + device for the worker's whole
-    // life. tracing spans are thread-local, so events from THIS crate AND from
-    // libfreemkv (called synchronously on this thread — its read_error / wedge /
-    // bus_key_unavailable warns) inherit these fields. That stamps the running
-    // build onto every diagnostic line in autorip.log / autorip.jsonl — the lines
-    // that previously couldn't be attributed to a build across a redeploy.
+    // Per-thread span carrying build + device for the worker's whole life;
+    // tracing spans are thread-local, so events from this crate AND from
+    // libfreemkv (called synchronously here) can be attributed to a build.
     let span_build = crate::VERSION_LABEL;
     let span_device = device.to_string();
     let span_role = role.to_string();
-    // The registration gate (see this function's doc). `recv()` returns
-    // `Ok(())` only if we won the slot; `Err` means the sender was dropped —
-    // rejection, or an unexpected unwind between the spawn and the decision —
-    // and the worker must abort before running a single line of `f`.
+    // Registration gate (see doc): `recv()` is `Ok` only if we won the slot;
+    // `Err` means the sender was dropped (rejection, or an unwind between
+    // spawn and decision), so the worker must abort before running `f`.
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let wrapped = move || {
         if go_rx.recv().is_err() {
-            // Not registered: another worker owns this device. Returning here
-            // is what keeps a duplicate `/api/rip` POST from executing a whole
-            // second rip against the incumbent's staging dir.
+            // Not registered: another worker owns this device — abort here so
+            // a duplicate `/api/rip` POST can't run a second rip.
             return;
         }
         let _span =
@@ -185,12 +176,9 @@ where
             Ok(())
         }
         Err(RegisterError::PriorThreadRunning(new_handle)) => {
-            // A prior worker for this device is still running and owns the
-            // registration slot. We just spawned a duplicate: drop the gate's
-            // sender so it aborts at its `recv` WITHOUT running `f` — it must
-            // never touch the incumbent's device, staging dir or Halt token —
-            // then join it so it can't leak, and surface failure so the caller
-            // runs its existing spawn-failure rollback path.
+            // A prior worker still owns the slot; we just spawned a duplicate.
+            // Drop the gate's sender so it aborts at `recv` without touching
+            // the incumbent's staging/Halt, join it, then fail the rollback.
             drop(go_tx);
             if let Err(e) = new_handle.join() {
                 tracing::error!(
@@ -265,10 +253,9 @@ pub fn join_rip_thread(device: &str, timeout: Duration) -> Result<(), ()> {
             Running,
         }
         let observed = {
-            // Recover from poison: a poisoned RIP_THREADS means a rip worker
-            // panicked, which is exactly when the stop path must still drain
-            // before staging is touched. Same convention as everywhere else in
-            // this module.
+            // Recover from poison: a poisoned map means a worker panicked,
+            // exactly when the stop path must still drain before staging is
+            // touched. Same convention as everywhere else in this module.
             let t = RIP_THREADS.lock().unwrap_or_else(|e| e.into_inner());
             match t.get(device) {
                 None => Observed::Absent,
@@ -279,14 +266,9 @@ pub fn join_rip_thread(device: &str, timeout: Duration) -> Result<(), ()> {
         };
         match observed {
             Observed::Absent => return Ok(()),
-            // Self-join: we are *on* the registered rip thread (e.g.
-            // `eject_drive` called from the rip's own auto-eject path at the
-            // end of `rip_disc`). `is_finished()` can never become true while
-            // we sit here, so polling would burn the whole timeout and log a
-            // spurious "did not drain". The thread is by definition still
-            // running (it's us) and will exit as soon as we return up the
-            // stack. The handle stays registered — which is also what keeps
-            // the device's liveness fact true for the rest of our tail.
+            // Self-join: we're *on* the registered rip thread (e.g. eject_drive
+            // from rip_disc's own auto-eject tail). is_finished() can never
+            // become true here, so return now and leave the handle registered.
             Observed::SelfJoin => return Ok(()),
             Observed::Finished => break,
             Observed::Running => {
@@ -326,17 +308,9 @@ pub fn join_all_rip_threads(timeout: Duration) {
         .keys()
         .cloned()
         .collect();
-    // Cancel every active rip's halt FIRST, then join. Cancelling makes the rip
-    // break out of its sweep/patch loop and RETURN, which runs the
-    // SweepingGuard / MuxingGuard `Drop` impls that clear the `.sweeping` /
-    // `.muxing` markers — leaving a CLEAN resumable dir (same end-state as
-    // `/api/stop`). Without this the rip ignores SHUTDOWN, the join below times
-    // out, the process exits, and the thread is killed WITHOUT unwinding, so
-    // Drop never runs and a stale `.sweeping` survives. The startup classifier
-    // then reads that as an in-progress crash and bumps `.restart_count` — so a
-    // few operator redeploys / reboots / Watchtower updates DURING a rip walk a
-    // perfectly healthy resumable rip to a false `.failed`. A graceful shutdown
-    // is NOT a failure and must never increment. (Bitten 2026-06-30.)
+    // Cancel every active rip's halt FIRST, then join: cancelling makes the
+    // rip return via its guard Drop impls, leaving a clean resumable dir —
+    // otherwise a stale `.sweeping` reads as a crash. (Bitten 2026-06-30.)
     for device in &devices {
         if let Some(h) = device_halt(device) {
             h.cancel();
@@ -708,14 +682,9 @@ pub(super) fn drop_session(device: &str) {
 /// change. Probe the original path and its neighbors to find the drive
 /// that still has the disc. Returns the new device path (e.g. "/dev/sg5").
 pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<String> {
-    // TODO(step1-followup): /dev/sgN device-path synthesis for hot-plug
-    // rediscovery is NOT moved into DiscSession. It is entangled with autorip's
-    // disc-identity matching (expected_volume_id), device_log, and the sg-number
-    // shift heuristic — out of the step-1 scope. Left in autorip per contract Q3.
-    // Only meaningful for /dev/sgN paths. If the path is not sgN, a
-    // numeric default (the old `unwrap_or(-1)`) plus the per-iteration
-    // `< 0` skip would probe sg0..sg2 and could latch onto an unrelated
-    // drive that merely happens to have a disc loaded. Bail instead.
+    // TODO(step1-followup): not moved into DiscSession — entangled with
+    // disc-identity/device_log/sg-shift logic; left per contract Q3. Only
+    // valid for /dev/sgN; bail rather than risk latching a wrong drive.
     let sg_num = match original_path
         .rsplit('/')
         .next()
@@ -733,14 +702,9 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
         }
     };
 
-    // Stable disc identifier from the last scan (UDF Volume Identifier).
-    // When present, a candidate at a SHIFTED sg number must carry the
-    // same disc before we accept it — otherwise a neighbouring drive
-    // (e.g. sg2) holding an unrelated disc could win the probe while the
-    // intended drive is still re-enumerating, silently attaching the
-    // session to the WRONG disc. When absent (disc was never scanned, or
-    // had no volume label) we fall back to the old disc-present heuristic
-    // and log that the match is unverified.
+    // Stable disc identifier from the last scan. A candidate at a SHIFTED sg
+    // number must carry the same disc before we accept it, else a neighbour
+    // with an unrelated disc could win; when absent, fall back unverified.
     let expected_vid = expected_volume_id(device);
 
     for delta in [0i32, -1, 1, -2, 2, -3, 3] {
@@ -753,10 +717,9 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
             continue;
         }
 
-        // delta == 0 means the sg number did not change — same physical
-        // device node, so it is by definition the same drive. Accept
-        // without a disc-identity read (which would be a redundant probe
-        // of a drive we already trust).
+        // delta == 0: same physical device node, so it's by definition the
+        // same drive — accept without a disc-identity read, which would
+        // just be a redundant probe of a drive we already trust.
         if path_unchanged(delta) {
             tracing::info!(
                 device = %device,
@@ -766,10 +729,9 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
             return Some(path);
         }
 
-        // Shifted sg number — could be the intended drive OR a neighbour.
-        // If we know the disc identity, verify the candidate carries the
-        // same disc before accepting it. No stored identity → keep the
-        // legacy disc-present behaviour but flag it as unverified.
+        // Shifted sg number — could be the intended drive or a neighbour.
+        // Verify the candidate's disc identity if known; with no stored
+        // identity, keep the legacy disc-present behaviour but flag unverified.
         let Some(expected) = expected_vid.as_deref() else {
             tracing::warn!(
                 device = %device,
@@ -854,11 +816,9 @@ fn vid_for_log(vid: &str) -> String {
 /// sectors), so this is far lighter than a full `Disc::scan` and safe to
 /// run once per shifted candidate.
 fn probe_volume_id(path: &str) -> Option<String> {
-    // TODO(step1-followup): NOT migrated to DiscSession. This path's error model
-    // is fail-fast-to-None (a wait_ready/init failure returns None WITHOUT
-    // attempting identify), whereas DiscSession::open treats wait_ready/init as
-    // advisory (logs + continues). Folding it in would change the short-circuit
-    // semantics of hot-plug rediscovery, so it stays a direct Drive open here.
+    // TODO(step1-followup): NOT migrated to DiscSession, which treats
+    // wait_ready/init failures as advisory instead of fail-fast-to-None —
+    // folding it in would change rediscovery's short-circuit semantics.
     let mut drive = libfreemkv::Drive::open(std::path::Path::new(path)).ok()?;
     drive.wait_ready().ok()?;
     drive.init().ok()?;
@@ -954,13 +914,9 @@ mod rollback_tests {
             "a rollback for a superseded claim must NOT idle the winner"
         );
 
-        // Now the H2 wedge itself: the claim that IS in force is rolled back
-        // while a worker thread is still alive for this device. That is the
-        // shape of a losing `/api/rip` whose `spawn_rip_thread` came back
-        // `PriorThreadRunning` — it claimed (bumping the generation to the one
-        // in force) and registered its own Halt before the spawn was refused.
-        // Round 1 returned early here because a thread was running, leaving
-        // "scanning" set with nothing left that would ever clear it.
+        // The H2 wedge: the claim IN FORCE is rolled back while a worker is
+        // still alive — the shape of a losing `/api/rip` whose spawn came back
+        // `PriorThreadRunning`. Round 1 returned early here, wedging "scanning".
         super::super::register_halt(&dev, Halt::new());
         super::rollback_failed_spawn(&dev, winner_gen);
         assert!(
@@ -1013,10 +969,8 @@ mod rollback_tests {
         assert_eq!(snap.status, "idle", "must roll back to idle");
         assert!(snap.disc_present, "disc still present after rollback");
         assert!(!super::super::is_busy(&dev), "device no longer busy");
-        // rollback_failed_spawn builds its own `RipState { device: ...,
-        // status: "idle", disc_present: true, ..Default::default() }`
-        // literal — the map lookup above only proves the KEY is right, not
-        // that the struct's own `device` field survived. Assert it too.
+        // The map lookup above only proves the KEY is right, not that the
+        // struct's own `device` field in rollback's RipState literal survived.
         assert_eq!(
             snap.device, dev,
             "device field in the rollback RipState must match"
@@ -1025,13 +979,9 @@ mod rollback_tests {
 
     #[test]
     fn swap_halt_carrying_cancel_carries_forward_a_pending_cancel() {
-        // HIGH-ish (rule 3, TOCTOU): swap_halt_carrying_cancel exists
-        // specifically so a Stop that lands on the OUTGOING placeholder
-        // token between rip_disc allocating it and swapping in the real
-        // one is not lost. No existing test calls it at all. Pin both
-        // halves of the contract: (1) a cancelled outgoing token's Stop
-        // carries onto the incoming token, and (2) an un-cancelled
-        // outgoing token does NOT spuriously cancel the incoming one.
+        // HIGH-ish (rule 3, TOCTOU): swap_halt_carrying_cancel exists so a Stop
+        // landing on the OUTGOING placeholder between allocation and swap isn't
+        // lost. Pin both: cancelled outgoing carries forward; clean one doesn't.
         let dev = format!("swap-halt-test-{}", std::process::id());
 
         // Case 1: outgoing token already cancelled (a Stop raced the swap).
@@ -1063,10 +1013,9 @@ mod rollback_tests {
 
     #[test]
     fn path_unchanged_only_for_zero_delta() {
-        // rediscover_drive's delta==0 fast path skips disc-identity
-        // verification entirely (same physical device node => trusted by
-        // construction). Any nonzero delta is a SHIFTED candidate and must
-        // go through the identity check instead.
+        // delta==0 skips disc-identity verification entirely (same device
+        // node => trusted by construction); any nonzero delta is a SHIFTED
+        // candidate and must go through the identity check instead.
         assert!(path_unchanged(0));
         assert!(!path_unchanged(1));
         assert!(!path_unchanged(-1));
@@ -1075,12 +1024,9 @@ mod rollback_tests {
 
     #[test]
     fn candidate_identity_confirmed_requires_exact_match() {
-        // The whole point of the disc-identity check rediscover_drive relies
-        // on: a shifted-sg candidate is only accepted if its probed volume
-        // id EXACTLY matches the expected one. A failed probe (None) or a
-        // different disc's id must both be rejected — accepting either
-        // would let a neighbouring drive's unrelated disc silently take
-        // over an in-flight rip's session after a USB re-enumeration.
+        // A shifted-sg candidate is accepted only if its probed volume id
+        // EXACTLY matches expected; a failed probe or a different disc's id
+        // must be rejected, or a neighbour's disc could hijack the rip session.
         assert!(candidate_identity_confirmed(
             Some("DISC_VOL_123"),
             "DISC_VOL_123"
@@ -1147,10 +1093,9 @@ mod rollback_tests {
             .unwrap()
             .insert(dev.clone(), "VOL_FORGET_REAP".to_string());
 
-        // Watchdog: wait for the worker to actually exit before asserting on
-        // the reap, but never block the suite. The closure is empty, so 5 s
-        // is ~4 orders of magnitude of margin over a thread spawn+exit; a
-        // regression that never finishes fails here instead of hanging.
+        // Watchdog: wait for the worker to exit before asserting the reap,
+        // without blocking the suite forever. 5s is ample margin for an
+        // empty closure's spawn+exit; a hung regression fails here instead.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let finished = RIP_THREADS
@@ -1198,10 +1143,9 @@ mod rollback_tests {
         let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_gate = gate.clone();
         spawn_rip_thread(&dev, "rip", move || {
-            // Watchdog: 5 s is the ceiling, not the expectation — the
-            // assertions below run in microseconds, so the release comes
-            // essentially immediately. The bound only stops a regression
-            // from parking this thread for the life of the suite.
+            // Watchdog: 5 s is the ceiling, not the expectation — release
+            // comes almost immediately. This only stops a regression from
+            // parking this thread for the life of the suite.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while !worker_gate.load(std::sync::atomic::Ordering::SeqCst)
                 && std::time::Instant::now() < deadline

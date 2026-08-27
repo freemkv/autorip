@@ -62,14 +62,9 @@ pub fn format_iso_datetime_filename() -> String {
     format_iso_datetime().replace(':', "-")
 }
 
-// ─── Filename / display helpers ──────────────────────────────────────────────
-//
-// Pre-0.13 these lived in `ripper::sanitize_filename`, `mover::sanitize_dir_name`,
-// `ripper::format_duration`, and `ripper::format_codecs`. The two sanitizers
-// drifted (one replaced spaces with `_`, the other kept them) and a single rip
-// could produce a `Aurora_Drift` staging dir but a `Aurora Drift (2024)`
-// destination dir — same logic, two implementations. Consolidated here as
-// the single source of truth.
+// ─── Filename / display helpers ────────────────────────────────────────────
+// Pre-0.13 these lived split across `ripper`/`mover` and drifted (e.g. two
+// sanitizers disagreeing on spaces vs `_`). Consolidated here as the source of truth.
 
 /// Fallback path segment when sanitization yields nothing usable.
 /// Deliberately constant + filesystem-trivial so the downstream callers
@@ -314,11 +309,8 @@ mod tests {
     }
 
     // ─── Hostile path-segment inputs (untrusted disc label / TMDB title) ──
-    //
-    // A disc volume label or external TMDB title must never sanitize to a
-    // segment the OS treats specially: "" (join resolves to the parent),
-    // "." / ".." (traversal), or a leading-dot hidden name. Verified these
-    // outputs are NEVER produced — they collapse to the safe fallback.
+    // A disc label or TMDB title must never sanitize to "" (resolves to
+    // parent), "."/".." (traversal), or a hidden dot-name — verify fallback.
 
     #[test]
     fn sanitize_compact_never_emits_empty() {

@@ -73,7 +73,8 @@ fn media_file(dir: &Path) -> Option<String> {
     names.into_iter().next()
 }
 
-/// List every held rip under `staging_root` (a `.review` marker, no `.done`).
+/// List every held rip under `staging_root`: `state == Review` in the unified
+/// `state.json` when present, else the legacy `.review` marker with no `.done`.
 pub fn list_held(staging_root: &str) -> Vec<HeldRip> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(staging_root) else {
@@ -86,10 +87,9 @@ pub fn list_held(staging_root: &str) -> Vec<HeldRip> {
         }
         let m = read_marker(&dir);
         let title = m["title"].as_str().unwrap_or("").to_string();
-        // Range-validate rather than a truncating `as u16`: a corrupt /
-        // hand-edited marker with year > 65535 would otherwise WRAP (e.g.
-        // 70000 → 4464) and mislabel the held rip. Out-of-range → 0
-        // ("no confident year"), the same as a missing field.
+        // Range-validate rather than a truncating `as u16`: a corrupt/
+        // hand-edited year > 65535 would otherwise WRAP (e.g. 70000 → 4464).
+        // Out-of-range → 0 ("no confident year"), same as a missing field.
         let year = m["year"]
             .as_u64()
             .and_then(|y| u16::try_from(y).ok())
@@ -115,10 +115,13 @@ pub fn list_held(staging_root: &str) -> Vec<HeldRip> {
 }
 
 /// Resolve a held rip. `dir` is the staging subdir name (not a path — guarded
-/// against traversal). Actions:
-/// * `Proceed`            — promote `.review` → `.done` as-named.
-/// * `Retitle{title,year}`— rewrite the marker's title/year, then `.done`.
-/// * `Cancel`             — mark `.failed` (so it isn't retried), then drop `.review`.
+/// against traversal). When the unified `state.json` is present it is
+/// mutated in place (`StagingState`); otherwise the legacy marker files are
+/// used. Actions:
+/// * `Proceed`            — promote to `Done` / `.review` → `.done` as-named.
+/// * `Retitle{title,year}`— rewrite the title/year, then promote to `Done`.
+/// * `Cancel`             — mark `Failed` / `.failed` (so it isn't retried),
+///   then drop `.review` in the legacy case.
 pub enum Resolve {
     Proceed,
     Retitle { title: String, year: u16 },
@@ -127,10 +130,8 @@ pub enum Resolve {
 
 pub fn resolve(staging_root: &str, dir: &str, action: Resolve) -> Result<(), String> {
     // Path-traversal guard: a held-rip handle is a single staging subdir
-    // name. Inspect path components rather than substring-matching `..` —
-    // a substring check wrongly rejects legitimate titles like
-    // `Blade..Runner (1982)` while a component check still rejects `..`,
-    // absolute paths, a bare `.`, and any nested path.
+    // name. Inspect path components rather than substring-matching `..`,
+    // which would wrongly reject a title like `Blade..Runner (1982)`.
     if dir.is_empty()
         || Path::new(dir).components().count() != 1
         || Path::new(dir)
@@ -210,9 +211,8 @@ pub fn resolve(staging_root: &str, dir: &str, action: Resolve) -> Result<(), Str
         }
         Resolve::Cancel => {
             // Terminal `.failed` (so it isn't retried). The contract requires
-            // propagating a write error and preserving the held state on failure,
-            // so use the fallible transition rather than the best-effort
-            // `write_failed_marker`.
+            // propagating a write error and preserving held state on failure,
+            // so use the fallible transition, not `write_failed_marker`.
             if unified {
                 let mut st = crate::ripper::staging::read_state(&d)
                     .ok_or_else(|| "state.json vanished".to_string())?;
@@ -411,11 +411,9 @@ mod tests {
 
     #[test]
     fn proceed_carries_marker_body_into_durable_done() {
-        // Regression (finding 7): Proceed now writes a DURABLE `.done`
-        // (write_handoff_marker: tmp + fsync + rename + dir-fsync) carrying the
-        // `.review` JSON forward, instead of a bare rename that doesn't fsync
-        // the new dirent. The `.review` is removed and the `.done` keeps the
-        // body so the mover sees the title.
+        // Regression (finding 7): Proceed writes a DURABLE `.done`
+        // (write_handoff_marker: tmp+fsync+rename+dir-fsync) carrying the
+        // `.review` JSON forward, not a bare non-fsyncing rename.
         let tmp = std::env::temp_dir().join(format!(
             "autorip-review-proceed-{}-{:?}",
             std::process::id(),
@@ -484,8 +482,7 @@ mod tests {
 
         // M2: the `.failed` marker is valid JSON carrying a machine-readable
         // reason, so `read_failed_reason` recovers it (the legacy non-JSON
-        // "cancelled by operator\n" body parsed to None and defeated the
-        // reason-keyed terminal checks).
+        // body parsed to None, defeating reason-keyed terminal checks).
         let reason = crate::ripper::staging::read_failed_reason(&held);
         assert_eq!(
             reason.as_deref(),

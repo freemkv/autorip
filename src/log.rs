@@ -47,6 +47,17 @@ fn device_log_path(device: &str) -> String {
     format!("{}/logs/device_{}.log", log_dir(), sanitize_device(device))
 }
 
+/// Strip terminal control/escape bytes from log content. A crafted disc string
+/// (UDF volume-id, Blu-ray `bdmt` title) logged verbatim could otherwise inject
+/// ANSI escape sequences into an operator's terminal (`docker logs` / `tail`) or
+/// the on-disk `.log`. Replaces any control character (C0 / DEL / C1, ESC
+/// included) with `?`; ordinary text is untouched.
+pub(crate) fn sanitize_log_msg(msg: &str) -> String {
+    msg.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// Log a message for a specific device. Three sinks:
 ///
 /// - **In-memory ring** (last 500 lines per device) — read by the web UI's
@@ -61,17 +72,6 @@ fn device_log_path(device: &str) -> String {
 /// Line format in the per-device file: `[YYYY-MM-DDTHH:MM:SSZ] msg`. The
 /// in-memory ring stores the same. ISO-8601 timestamps so rip log archives
 /// sort correctly and midnight isn't ambiguous.
-/// Strip terminal control/escape bytes from log content. A crafted disc string
-/// (UDF volume-id, Blu-ray `bdmt` title) logged verbatim could otherwise inject
-/// ANSI escape sequences into an operator's terminal (`docker logs` / `tail`) or
-/// the on-disk `.log`. Replaces any control character (C0 / DEL / C1, ESC
-/// included) with `?`; ordinary text is untouched.
-pub(crate) fn sanitize_log_msg(msg: &str) -> String {
-    msg.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
-}
-
 pub fn device_log(device: &str, msg: &str) {
     // Sanitize ONCE, up front, so EVERY sink (ring, file, and the structured
     // tracing event below) gets the escape-free text — not just the file line.
@@ -80,16 +80,9 @@ pub fn device_log(device: &str, msg: &str) {
     let ts = crate::util::format_iso_datetime();
     let line = format!("[{}] {}", ts, msg);
 
-    // In-memory ring (last RING_CAP lines per device). VecDeque gives O(1)
-    // eviction from the front instead of Vec::remove(0)'s O(n) shift.
-    // `new_session` = this is the first line for the device since the ring was
-    // empty (process start, or just after `archive_device_log`). We anchor each
-    // session's file with a build banner so any log slice is attributable to the
-    // build that produced it — without that, a Watchtower redeploy mid-session
-    // interleaves two builds' lines indistinguishably (the bug that turned
-    // "which build emitted this?" into archaeology). The banner goes to the FILE
-    // only — keeping the in-memory ring (the live UI view) byte-for-byte as
-    // before so its line accounting is unchanged.
+    // In-memory ring (last RING_CAP lines/device, O(1) VecDeque eviction).
+    // `new_session` = first line since the ring was empty; the file gets a
+    // build banner then so redeploy mid-session doesn't mix builds' lines.
     let new_session = if let Ok(mut logs) = LOGS.lock() {
         let log = logs.entry(device.to_string()).or_default();
         let was_empty = log.is_empty();
@@ -102,10 +95,9 @@ pub fn device_log(device: &str, msg: &str) {
         false
     };
 
-    // File log — per-device, append-only between archive points. A disk-full
-    // or NFS stale-handle condition here must not break a rip (logging is
-    // never load-bearing), but it should be observable rather than fully
-    // silent.
+    // File log — per-device, append-only between archive points. Disk-full
+    // or NFS stale-handle here must not break a rip (logging isn't
+    // load-bearing), but should stay observable rather than fully silent.
     let path = device_log_path(device);
     match std::fs::OpenOptions::new()
         .create(true)
@@ -131,9 +123,8 @@ pub fn device_log(device: &str, msg: &str) {
     }
 
     // Structured event into the central log stream. `device` enables
-    // `jq 'select(.fields.device == "sg4")' autorip.jsonl`; `build` stamps the
-    // running binary on EVERY device event so the central log (autorip.log /
-    // autorip.jsonl) is self-identifying across redeploys.
+    // `jq 'select(.fields.device == "sg4")'`; `build` stamps the binary on
+    // every event so the central log is self-identifying across redeploys.
     tracing::info!(device = %device, build = %crate::VERSION_LABEL, "{}", msg);
 }
 
@@ -165,12 +156,9 @@ pub fn archive_device_log(device: &str) {
         .map(|m| m.len() > 0)
         .unwrap_or(false);
 
-    // Track whether the on-disk archive actually happened. When there is
-    // nothing to archive (`!should_archive`) there is nothing to lose, so
-    // that counts as "ok" to clear. Only an actual rename failure must
-    // keep the in-memory ring intact — otherwise the web UI's live view
-    // would go empty while the un-archived device_*.log still sits on
-    // disk, with no signal to the operator.
+    // Tracks whether the on-disk archive happened. Nothing to archive counts
+    // as "ok" to clear; only a real rename failure must keep the in-memory
+    // ring intact, or the live UI would go empty with no on-disk trace.
     let mut archived_ok = !should_archive;
 
     if should_archive {
@@ -465,9 +453,8 @@ mod tests {
     #[test]
     fn archive_failure_keeps_in_memory_ring() {
         // If the on-disk archive fails, the in-memory ring MUST survive so
-        // the live UI view doesn't go empty while the log is still on disk.
-        // Force create_dir_all("logs/rips") to fail by planting a regular
-        // file where the rips directory needs to be.
+        // the live UI doesn't go empty while the log is still on disk. Force
+        // create_dir_all("logs/rips") to fail via a regular file in its place.
         let _guard = crate::log::env_guard();
         let d = tmpdir("archive_fail");
         unsafe {
@@ -537,12 +524,9 @@ mod tests {
 
     #[test]
     fn sanitize_log_msg_strips_ansi_and_control_bytes() {
-        // Log-injection defense: a crafted disc string (UDF volume-id,
-        // Blu-ray `bdmt` title) logged verbatim could inject ANSI escape
-        // sequences into an operator's terminal (`docker logs` / `tail`) or
-        // the on-disk `.log`. Every control byte (C0 / DEL / C1, ESC
-        // included) must be neutralized to '?'; ordinary printable text —
-        // including non-ASCII UTF-8 — must pass through untouched.
+        // Log-injection defense: a crafted disc string (UDF volume-id, `bdmt`
+        // title) could inject ANSI escapes into a terminal or the on-disk
+        // log. Every control byte must become '?'; printable UTF-8 passes.
 
         // ESC + ANSI CSI sequences (clear screen + cursor home). Only the two
         // ESC (\u{1b}) bytes are control; '[', digits, ';', 'J', 'H' are
@@ -657,13 +641,9 @@ mod tests {
         let big = "x".repeat((SYSTEM_LOG_ROTATE_BYTES + 1024) as usize);
         std::fs::write(device_log_path("system"), big).unwrap();
         rotate_system_log_if_large();
-        // The invariant is that the OVERSIZED log is gone, not that no log
-        // exists. `syslog()` is reached transitively by tests in other modules
-        // that do not hold the env guard, and it resolves its path through the
-        // process-global AUTORIP_DIR — into this test's tempdir. One such
-        // append immediately after rotation recreates the file, which failed a
-        // bare `!exists()` while rotation had in fact done its job. Assert what
-        // rotation actually promises: nothing oversized is left behind.
+        // Invariant: the OVERSIZED log is gone, not that no log exists.
+        // `syslog()` runs transitively from other tests without the env
+        // guard and can recreate the file post-rotation via AUTORIP_DIR.
         let live_path = device_log_path("system");
         let live_len = std::fs::metadata(&live_path).map(|m| m.len()).unwrap_or(0);
         assert!(
