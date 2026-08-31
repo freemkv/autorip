@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.14] — UNRELEASED
+
+### Fixed
+
+- The web dashboard no longer briefly hangs while the queue view refreshes during a large library scan.
+
 ## [1.6.13] — 2026-08-28
 
 ### Changed
