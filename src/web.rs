@@ -3498,6 +3498,51 @@ mod web_tests {
         );
     }
 
+    /// Deterministic guard for the root cause behind the block above: the
+    /// Phase-3 prune must NOT evict a stale-but-recently-active key. Evicting at
+    /// the sub-second serve TTL destroyed the stale snapshot that
+    /// stale-while-revalidate serves, so the key's next slow refresh had nothing
+    /// to hand a concurrent reader and forced it to block the whole scan. Here
+    /// one key goes stale, an unrelated key is scanned (running the prune over
+    /// the whole map), and the stale key must survive to still be serveable.
+    #[test]
+    fn queue_view_prune_keeps_stale_but_recent_key_serveable() {
+        use std::time::Duration;
+
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let a = tmp_a.path().to_string_lossy().to_string();
+        let disc = tmp_a.path().join("Kept");
+        std::fs::create_dir_all(&disc).unwrap();
+        crate::muxer::write_marker(&disc, &ripped_marker_for("Kept", "sg0")).unwrap();
+        let (primed, _, _, _) = build_queue_views_cached(&a);
+        assert!(
+            primed.iter().any(|s| s.contains("Kept")),
+            "priming scan must see the disc"
+        );
+
+        // Age A's snapshot past the serve TTL — the threshold the OLD prune
+        // (wrongly) used to evict, but well within the RETAIN horizon.
+        std::thread::sleep(QUEUE_VIEW_CACHE_TTL + Duration::from_millis(50));
+
+        // A scan of an unrelated dir B runs the Phase-3 prune across the whole
+        // map. Under the old TTL-based retain this evicted A; it must not now.
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        let b = tmp_b.path().to_string_lossy().to_string();
+        let _ = build_queue_views_cached(&b);
+
+        let map = QUEUE_VIEW_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = map
+            .get(&a)
+            .and_then(|e| e.snapshot.as_ref())
+            .map(|s| s.views().0);
+        assert!(
+            kept.is_some_and(|mux| mux.iter().any(|s| s.contains("Kept"))),
+            "the prune evicted a stale-but-recent key's snapshot; \
+             stale-while-revalidate is broken and a concurrent reader of that \
+             key will block a full staging scan (the healthcheck stall)"
+        );
+    }
+
     /// The counterpart guard: fixing the blocking above must NOT turn the
     /// cache into a thundering herd. N concurrent cold callers must produce
     /// ONE scan of the staging dir, not N.
@@ -6412,6 +6457,17 @@ const QUEUE_VIEW_MAX_REFRESHERS: usize = 2;
 /// observes staleness worse than what the poll cadence already implies.
 const QUEUE_VIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(750);
 
+/// How long an idle key is RETAINED in the map — deliberately far longer than
+/// the serve-freshness TTL above. The Phase-3 prune exists only to stop distinct
+/// ephemeral staging paths from growing the map without bound; it must NOT evict
+/// a still-active key just because its snapshot aged past the sub-second TTL.
+/// Evicting there throws away the stale snapshot that stale-while-revalidate
+/// relies on, so the key's next (slow) refresh has nothing to serve and forces a
+/// concurrent /api/state reader to block for the whole scan — the healthcheck
+/// stall the cache exists to prevent. Retain by recency-of-refresh instead: a
+/// key polled each second stays warm; one nobody reads ages out and is pruned.
+const QUEUE_VIEW_CACHE_RETAIN: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Test-only seam around the staging-dir scan a cache miss performs.
 ///
 /// Keyed by staging dir so tests that arm it are isolated from every other
@@ -6677,15 +6733,15 @@ fn build_queue_views_cached(staging_dir: &str) -> (Vec<String>, Vec<String>, usi
     // Phase 3 — publish. The single-flight marker is released by
     // `_refresh_guard` as this function returns.
     let mut map = QUEUE_VIEW_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    // Opportunistic prune so a staging path that keeps changing (or a test
-    // suite hammering many distinct tempdirs) can't grow this map forever.
-    // Keep anything with a scan in flight, and this key (updated below).
+    // Opportunistic prune so ever-changing staging paths (or a test suite's
+    // distinct tempdirs) can't grow this map forever. Keep this key, anything
+    // scanning, and any snapshot within RETAIN (not the serve TTL — see const).
     map.retain(|k, v| {
         k == staging_dir
             || v.refreshers > 0
             || v.snapshot
                 .as_ref()
-                .is_some_and(|s| s.computed_at.elapsed() < QUEUE_VIEW_CACHE_TTL)
+                .is_some_and(|s| s.computed_at.elapsed() < QUEUE_VIEW_CACHE_RETAIN)
     });
     let entry = map
         .entry(staging_dir.to_string())
