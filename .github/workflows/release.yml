@@ -3,12 +3,11 @@ name: Release
 on:
   push:
     tags:
+      # Real version tags (vX.Y.Z) publish a full release + move :latest.
+      # Release candidates (vX.Y.Z-rc<N>, cut on every push to `qa` by the rc
+      # cascade) publish a PRERELEASE and an rc-only Docker tag — never :latest —
+      # so a candidate can be deployed and tested before it is promoted to main.
       - 'v*'
-      # NOT the release-candidate tags. Every push to `qa` stamps a
-      # v<version>-rc<N> so a run can be named, and 'v*' matches those too —
-      # which would have this workflow build and PUBLISH a GitHub release for
-      # every candidate, including the red ones.
-      - '!v*-rc*'
 
 permissions:
   contents: write
@@ -20,6 +19,9 @@ jobs:
       - uses: actions/checkout@v5
       - name: Verify Cargo.toml version matches tag
         run: |
+          # The rc cascade bumps Cargo.toml to the FULL rc version (1.7.0-rc1) in
+          # the tagged commit, so the crate version equals the tag for both real
+          # releases and rc prereleases — a plain equality check is correct.
           CARGO_VER="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
           if [ "$CARGO_VER" != "${{ github.ref_name }}" ]; then
             echo "::error::Cargo.toml says $CARGO_VER but tag is ${{ github.ref_name }}"
@@ -233,6 +235,8 @@ jobs:
       - name: Upload assets to release
         uses: softprops/action-gh-release@v3
         with:
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
+          make_latest: ${{ contains(github.ref_name, '-rc') && 'false' || 'true' }}
           files: |
             *.tar.gz
             *.zip
@@ -286,15 +290,19 @@ jobs:
           context: .
           file: Dockerfile.ci
           push: true
+          # An rc prerelease publishes ONLY the rc-named tag — never :latest, so
+          # the prod pointer stays on the last real release until promotion.
           tags: |
-            ghcr.io/freemkv/autorip:latest
             ghcr.io/freemkv/autorip:${{ github.ref_name }}
+            ${{ !contains(github.ref_name, '-rc') && 'ghcr.io/freemkv/autorip:latest' || '' }}
 
   # 0.18.13: only needs `verify` (the version-match check). It does
   # NOT need the binary, so it runs in parallel with `build` and
   # `docker` instead of blocking on either.
   update-homepage:
     needs: verify
+    # A prerelease (rc) must not touch the public homepage version.
+    if: ${{ !contains(github.ref_name, '-rc') }}
     runs-on: ubuntu-latest
     steps:
       - name: Update org README with new version
