@@ -118,7 +118,7 @@ jobs:
           freemkv-engine = { path = "../freemkv-engine" }
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -172,12 +172,66 @@ jobs:
           freemkv-engine = { path = "../freemkv-engine" }
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: autorip
       - run: cargo test --tests
         working-directory: autorip
+
+  # cargo-deny — gates the RESOLVED dependency graph (RUSTSEC advisories, a
+  # permissive licence allow-list, source/ban hygiene) against the committed
+  # Cargo.lock. Mirrors the `test` job's sibling checkouts and generated
+  # .cargo/config.toml so the freemkv crates resolve as path deps from their
+  # dev tips exactly as the other jobs do; the action then reads deny.toml.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: libfreemkv
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-keysources
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-engine
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-engine
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-i18n
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-i18n
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: autorip
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          manifest-path: autorip/Cargo.toml
 
   # Coverage — additive, NON-REQUIRED. Mirrors the `test` job's sibling
   # checkouts and generated .cargo/config.toml so the workspace resolves the
@@ -232,7 +286,7 @@ jobs:
           freemkv-engine = { path = "../freemkv-engine" }
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
@@ -297,7 +351,7 @@ jobs:
           freemkv-engine = { path = "../freemkv-engine" }
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
@@ -369,7 +423,7 @@ jobs:
           freemkv-engine = { path = "../freemkv-engine" }
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: autorip
@@ -445,7 +499,7 @@ jobs:
           freemkv-engine = { path = "../freemkv-engine" }
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: autorip

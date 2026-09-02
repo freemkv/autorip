@@ -1,57 +1,26 @@
 //! Observability — single init point for the structured event log.
 //!
 //! Three sinks, written from the same tracing event stream:
-//!
-//! - **`{AUTORIP_DIR}/logs/autorip.log`** — daily-rolling, human-readable.
-//!   The file an operator tails when something is going on.
-//! - **`{AUTORIP_DIR}/logs/autorip.jsonl`** — non-rolling (stable path),
-//!   JSON Lines. The file a tool greps when something already went wrong.
-//!   Not rolled so the `/api/debug` tailer can rely on a fixed filename
-//!   (see the appender setup in `init`).
-//! - **stderr** — compact, captured by Docker as the container log.
+//! `{AUTORIP_DIR}/logs/autorip.log` (daily-rolling, human-readable),
+//! `{AUTORIP_DIR}/logs/autorip.jsonl` (non-rolling, tailed by
+//! `/api/debug`), and stderr (compact, captured by Docker).
 //!
 //! Filter level via `AUTORIP_LOG_LEVEL` (env-filter syntax). Default
-//! `autorip=info,libfreemkv=warn` — autorip's own events at info, library
-//! noise muted unless explicitly enabled. For deep dives:
-//! `AUTORIP_LOG_LEVEL=autorip=debug docker compose up -d`.
-//!
-//! Why this exists: pre-0.13 the codebase had ~60 silent failure paths
-//! (`Err(_) => continue`, `let _ = …`, `unwrap_or_default`) and ad-hoc
-//! `eprintln!` for the rest. Diagnosing "No drives detected" required
-//! reading source + poking `/proc` + reading `/sys` because the running
-//! process produced zero observable evidence of the poll loop's decisions.
-//! Tracing fixes that structurally: every silent path is replaced by a
-//! structured event, every lifecycle function is wrapped in a span, and
-//! the JSONL stream is machine-queryable.
+//! `autorip=info,libfreemkv=warn`. See docs/observe.md for rationale.
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling;
 use tracing_subscriber::reload;
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-/// EnvFilter directive used when /api/debug is OFF (the normal state).
-/// `autorip=info` for the binary's own narration, `libfreemkv=warn` so
-/// the library is quiet — warnings + errors only. Two modes, one flag:
-/// prod = warnings only; dev = full debug (see FILTER_ON).
+// EnvFilter directive used when /api/debug is OFF (the normal state).
+// prod = warnings only; dev = full debug (see FILTER_ON).
+// See docs/observe.md — FILTER_OFF.
 const FILTER_OFF: &str = "autorip=info,libfreemkv=warn,freemkv=warn";
 
-/// EnvFilter directive used when /api/debug is ON. `debug` globally,
-/// plus `mux=debug` and `stream=debug` so the `target: "mux"` /
-/// `target: "stream"` events (writeback seeks, WAIT_AFTER latency,
-/// fill_extents stalls — the events the user actually wants when
-/// diagnosing a jumpy mux) are visible. `freemkv::scsi` / `freemkv::disc`
-/// inherit `libfreemkv=debug` here so SCSI CDB events surface at debug
-/// (not the per-CDB trace firehose — ~800 lines/sec during sweep would
-/// drown the useful signal and could itself slow throughput via stdout
-/// contention; raise to `freemkv::scsi=trace` via AUTORIP_LOG_LEVEL if
-/// you need per-CDB forensics for a drive issue). Producer's per-frame
-/// log is at `trace` and stays muted here on purpose.
-///
-/// NOTE: libfreemkv namespaces its events on `freemkv::*` targets (not
-/// `libfreemkv::*`), so the `freemkv=debug` directive — NOT `libfreemkv=debug`
-/// — is what surfaces `freemkv::scan` phase markers, `freemkv::heartbeat`
-/// liveness beats, `freemkv::css/disc/drive/scsi`, etc. Both directives are
-/// kept: `libfreemkv=debug` covers any event that uses the bare crate target.
+// EnvFilter directive used when /api/debug is ON: debug globally, plus
+// mux/stream/freemkv targets needed for drive + mux forensics.
+// See docs/observe.md — FILTER_ON.
 const FILTER_ON: &str = "autorip=debug,libfreemkv=debug,freemkv=debug,mux=debug,stream=debug";
 
 /// Worker guards for the non-blocking file appenders. Must outlive the
@@ -59,29 +28,18 @@ const FILTER_ON: &str = "autorip=debug,libfreemkv=debug,freemkv=debug,mux=debug,
 /// from `main` without the caller having to thread guards through.
 static GUARDS: once_cell::sync::OnceCell<Vec<WorkerGuard>> = once_cell::sync::OnceCell::new();
 
-/// Reload handle for the active EnvFilter. Set by `init()`, swapped by
-/// `set_debug()` from the /api/debug endpoint. Stored as `Option<...>`
-/// so init failures (or a custom `AUTORIP_LOG_LEVEL`) leave the handle
-/// absent and `set_debug` becomes a no-op rather than panicking.
+// Reload handle for the active EnvFilter, set by `init()` and swapped by
+// `set_debug()`. Absent when init failed or AUTORIP_LOG_LEVEL was set
+// explicitly, in which case `set_debug` becomes a no-op.
 static RELOAD_HANDLE: once_cell::sync::OnceCell<reload::Handle<EnvFilter, Registry>> =
     once_cell::sync::OnceCell::new();
 
 /// Initialize the tracing stack. Returns nothing.
 ///
 /// Contract: call exactly once, early in `main`, before any threads are
-/// spawned. The leading `GUARDS.get().is_some()` check makes a *sequential*
-/// second call a no-op, but it is not a synchronization barrier — two
-/// concurrent callers could both pass the check, and the loser's
-/// `tracing_subscriber::...init()` would then panic (global subscriber
-/// already installed). Single-call-from-main is the contract, not a
-/// thread-safe guard.
-///
-/// No `Result`: log-dir creation is best-effort (`create_dir_all` errors are
-/// ignored — the appenders below will simply fail to write into a missing
-/// dir), the file appenders are lazy (no file is opened at init time, so
-/// there is no open-time error to surface), and the stderr layer is always
-/// in the stack — events surface in `docker logs` regardless of whether the
-/// file sinks can be written.
+/// spawned. A sequential second call is a no-op, but this is not a
+/// synchronization barrier — see docs/observe.md for the concurrency
+/// caveat and why this returns no `Result`.
 pub fn init() {
     if GUARDS.get().is_some() {
         return;
@@ -196,10 +154,8 @@ mod tests {
         EnvFilter::try_new(FILTER_ON).expect("FILTER_ON must parse");
     }
 
-    /// FILTER_ON must enable the `mux` and `stream` targets at
-    /// debug — these are the events the user actually wants from
-    /// /api/debug. Belt-and-braces guard against future edits that
-    /// drop them.
+    // FILTER_ON must enable the `mux` and `stream` targets at debug —
+    // guard against future edits that drop them.
     #[test]
     fn filter_on_includes_mux_and_stream_targets() {
         assert!(
@@ -235,11 +191,8 @@ mod tests {
         );
     }
 
-    /// `/api/debug ON` (FILTER_ON) must surface the new DEBUG liveness
-    /// heartbeats. They are emitted on `target: "freemkv::heartbeat"` from
-    /// libfreemkv, which inherits the `libfreemkv=debug` directive — so the
-    /// filter that's already asserted to raise libfreemkv to debug carries
-    /// them. This pins that the heartbeat target is NOT excluded.
+    // FILTER_ON must surface DEBUG liveness heartbeats, emitted on
+    // `target: "freemkv::heartbeat"`. Pins that the target is not excluded.
     #[test]
     fn filter_on_enables_heartbeats() {
         // Heartbeats are emitted on target `freemkv::heartbeat`, which matches
@@ -256,10 +209,8 @@ mod tests {
         );
     }
 
-    /// End-to-end: under a FILTER_ON subscriber, a DEBUG heartbeat event on
-    /// `freemkv::heartbeat` is actually recorded, AND a CSS-style key event is
-    /// emitted WITHOUT any raw key bytes (redaction confirmed). Uses a
-    /// capturing writer scoped to this test via `with_default`.
+    // End-to-end: under FILTER_ON, a heartbeat event is recorded and a
+    // CSS-style key event is emitted without raw key bytes (redaction).
     #[test]
     fn debug_on_shows_heartbeats_and_redacts_keys() {
         use std::sync::{Arc, Mutex};
@@ -329,11 +280,8 @@ mod tests {
         );
     }
 
-    /// `set_debug` must report `false` when init() never ran (no
-    /// reload handle installed). The /api/debug handler surfaces this
-    /// to the caller via the `filter_swapped` JSON field; assert the
-    /// contract so a future refactor that flips the default doesn't
-    /// silently mis-report success.
+    // `set_debug` must report `false` when init() never ran (no reload
+    // handle). Surfaced to callers via the `filter_swapped` JSON field.
     #[test]
     fn set_debug_returns_false_without_init() {
         // RELOAD_HANDLE is a process-wide OnceCell; only assert the

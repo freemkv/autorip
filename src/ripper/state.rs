@@ -47,13 +47,8 @@ pub struct RipState {
     pub disc_name: String,
     /// The disc's RAW volume label (`DiscId::name()`), before the TMDB lookup.
     ///
-    /// [`Self::disc_name`] is the TMDB-resolved title, and it is deliberately
-    /// NOT unique per disc: `tmdb::clean_title` strips "disc 1".."disc 4"
-    /// before the lookup, so every disc of a boxset resolves to one title and
-    /// wants one staging directory. This is the field that still tells them
-    /// apart, and it is what
-    /// [`staging::staging_name_for_disc`](crate::ripper::staging::staging_name_for_disc)
-    /// uses to decide whether an existing staging dir belongs to THIS disc.
+    /// Distinguishes discs of a boxset that share one [`Self::disc_name`]
+    /// (TMDB title). See docs/state.md#ripstatedisc_label for why.
     ///
     /// Server-side bookkeeping only — not serialized, the UI shows the TMDB
     /// title. Carried forward across state pushes by [`update_state`] (see
@@ -64,12 +59,8 @@ pub struct RipState {
     /// stopped for a reason that fixes itself (keys arrive), staging is
     /// intact, and the next pass will pick it up unchanged.
     ///
-    /// Set only by the deferral exits themselves. The alternative — inferring
-    /// it from `status == "idle"` — is wrong, and was: `"idle"` is also what
-    /// several HARD failures in `resume_remux` write (no title after key
-    /// resolution, an unreadable mapfile, an over-threshold loss abort), so a
-    /// corrupt ISO was presented to the operator as "no keys yet, it'll mux
-    /// itself". Status says how the device LOOKS; this says what happened.
+    /// Set only by the deferral exits themselves; NOT inferred from
+    /// `status == "idle"`. See docs/state.md#ripstatefailure_deferred.
     ///
     /// Server-side bookkeeping only — not serialized. Deliberately NOT
     /// carried forward across state pushes: it describes one terminal push.
@@ -77,13 +68,11 @@ pub struct RipState {
     pub failure_deferred: bool,
     /// This device's terminal state is a structural FINALIZE failure (the MKV
     /// could not be finalized — e.g. E6008 no muxable frames / unseekable
-    /// output), as opposed to a resumable mid-mux read error. Recorded
-    /// explicitly for the same reason as [`RipState::failure_deferred`]: the
-    /// terminal `status` string cannot distinguish a finalize failure
-    /// (terminal) from a read error (resumable) reliably enough for the mux
-    /// worker's quarantine decision, and inferring terminality from
-    /// `!failure_deferred` false-quarantines a resumable read error. Set only
-    /// by the mux-incomplete finalize exit in `resume_remux`.
+    /// output), as opposed to a resumable mid-mux read error.
+    ///
+    /// Set only by the mux-incomplete finalize exit in `resume_remux`. See
+    /// docs/state.md#ripstatefailure_finalize for why this can't be inferred
+    /// from `!failure_deferred`.
     ///
     /// Server-side bookkeeping only — not serialized. Deliberately NOT
     /// carried forward across state pushes: it describes one terminal push.
@@ -145,12 +134,9 @@ pub struct RipState {
     /// **Main-feature time still AT RISK** — the honest live "Maybe" metric.
     /// The duration of every not-yet-good range (`NonTrimmed` + `NonScraped` +
     /// `Unreadable`) that falls within the main title's extents. Unlike
-    /// [`Self::main_lost_ms`] (terminal `Unreadable`-only — correct for the
-    /// abort verdict, but trivially 0 mid-rip), this counts pending in-feature
-    /// data as movie-at-risk, so the two-pill UI's `Maybe N · <time>` is honest
-    /// during the rip: `0:00` when the pending bytes are out-of-feature, a real
-    /// ms figure when they're in the movie. It melts toward `main_lost_ms` as
-    /// retry passes resolve pending sectors to `Finished` or `Unreadable`.
+    /// [`Self::main_lost_ms`], this is non-zero mid-rip and melts toward it as
+    /// retry passes resolve pending sectors. See
+    /// docs/state.md#ripstatemain_at_risk_ms for the full rationale.
     pub main_at_risk_ms: f64,
     /// Largest single contiguous bad range's duration. Tells the difference
     /// between 1000 × 1ms gaps (unnoticeable) vs 1 × 1s gap (noticeable glitch).
@@ -337,15 +323,9 @@ pub fn take_title_override(device: &str) -> Option<crate::tmdb::TmdbResult> {
     m.remove(device)
 }
 
-/// Stop cooldowns: device -> the MONOTONIC instant the cooldown expires.
-///
-/// `Instant`, not an `epoch_secs()` deadline. This is a 5-second interval, and
-/// a wall-clock deadline is only as good as the wall clock: a backward step
-/// bigger than the window (NTP correction, host clock reset, VM snapshot
-/// resume) keeps `now < expires` true until the clock catches up, and
-/// `insert_tick` suppresses the auto-scan/auto-rip dispatch for that whole
-/// time — an unattended box quietly ignoring the disc in the drive. `Instant`
-/// cannot step backwards.
+// Stop cooldowns: device -> the MONOTONIC instant the cooldown expires.
+// `Instant`, not an `epoch_secs()` deadline, so it can't step backwards
+// (NTP/clock-reset/VM-resume). See docs/state.md#stop_cooldowns.
 pub(super) static STOP_COOLDOWNS: once_cell::sync::Lazy<
     Mutex<std::collections::HashMap<String, std::time::Instant>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -369,29 +349,8 @@ pub(super) fn is_in_cooldown(device: &str) -> bool {
 }
 
 /// Drop the auxiliary per-device state on hot-unplug, so nothing accumulates
-/// as device paths churn over a long container lifetime.
-///
-/// The complete per-device inventory, and who evicts each map — this list is
-/// the contract, so add to it when a new per-device map appears:
-///
-/// | map | where | evicted by |
-/// |---|---|---|
-/// | `STATE` | `state.rs` | `forget_removed_device` directly |
-/// | log ring | `log.rs` | `forget_removed_device` (`log::forget_device`) |
-/// | `SESSIONS` | `session.rs` | `forget_removed_device` (`drop_session`) |
-/// | `TITLE_OVERRIDES` | `state.rs` | here |
-/// | `STOP_COOLDOWNS` | `state.rs` | here |
-/// | `DISC_IDENTITY` | `session.rs` | here, via `forget_device_session_state` |
-/// | `RIP_THREADS` | `session.rs` | here, via `forget_device_session_state` (finished handles only) |
-/// | `HALTS` | `session.rs` | here, via `forget_device_session_state` (with the handle) |
-///
-/// The doc this replaces claimed `TITLE_OVERRIDES` and `STOP_COOLDOWNS` were
-/// "the only other per-device state". They are not: `DISC_IDENTITY` had no
-/// remover anywhere in the crate, and a torn-down device's finished
-/// `JoinHandle` sat in `RIP_THREADS` forever — one entry per device path the
-/// kernel ever handed out.
-///
-/// Recover-and-proceed on poison (same convention as the rest of this module).
+/// as device paths churn over a long container lifetime. Poison-recovers like
+/// the rest of this module. Full per-device map inventory: docs/state.md#forget_device_state.
 pub(super) fn forget_device_state(device: &str) {
     TITLE_OVERRIDES
         .lock()
@@ -501,97 +460,27 @@ pub fn update_state_with<F: FnOnce(&mut RipState)>(device: &str, f: F) {
 }
 
 /// Atomically claim a device for active work. If it is already
-/// `scanning`/`ripping`, returns `false` (the caller should reject with 409);
-/// otherwise marks it `scanning` and returns `true`.
+/// `scanning`/`ripping`, returns `None` (the caller should reject with 409);
+/// otherwise marks it `scanning` and returns the new `claim_gen`. Folds the
+/// busy-check and the status-set into ONE `STATE` lock, closing a TOCTOU
+/// between a separate check and a separate `update_state`; see
+/// docs/state.md#try_claim_active_checked.
 ///
-/// Folding the busy-check and the status-set into ONE `STATE` lock closes a
-/// TOCTOU: the web handlers previously did a separate `is_busy`-style check and
-/// then a separate `update_state`, so two concurrent POSTs could both observe
-/// `idle` and both launch a rip on the same device (orphaned halt token +
-/// concurrent writes to one staging dir). Poison-recovers like the rest of this
-/// module. The caller may follow with a full `update_state` to populate the
-/// remaining fields — the claim has already made the device read as busy.
-///
-/// Thin wrapper over [`try_claim_active_checked`] with `known = true` —
-/// every existing call site (the poll loop's own enumerated device list;
-/// `handle_scan`/`handle_rip`/`handle_eject` in web.rs) is left with
-/// identical behaviour. See `try_claim_active_checked`'s doc for why a
-/// caller that has NOT independently verified the device is a real,
-/// enumerated drive must use that function instead.
+/// Thin wrapper over [`try_claim_active_checked`] with `known = true` — see
+/// that function's doc for when a caller must pass `false` instead.
 pub fn try_claim_active(device: &str) -> Option<u64> {
     try_claim_active_checked(device, true)
 }
 
 /// Same contract as [`try_claim_active`], but `known` tells it whether the
 /// caller has already verified `device` names a real, currently-enumerated
-/// drive. When `known` is `false` and the device has no existing STATE
-/// entry, the claim is refused instead of creating one.
+/// drive. When `known` is `false` and the device has no existing STATE entry,
+/// the claim is refused instead of creating one — closes an unauthenticated
+/// resource-exhaustion path. Pass `true` only when `device` came from the
+/// poll loop's own enumerated drive list, or was cross-checked against it.
 ///
-/// Why this matters: `device` on the web path is caller-supplied (the URL
-/// segment of `/api/scan/{device}`, `/api/rip/{device}`,
-/// `/api/eject/{device}`) and is only shape-checked by
-/// `web.rs::is_valid_device_name` — a 3..=64-character ASCII-alphanumeric
-/// check, explicitly documented there as NOT an existence check. This
-/// server binds `0.0.0.0:8080` with no authentication, so any LAN host can
-/// loop `POST /api/scan/<random-alnum-name>`. Before this guard, every such
-/// call reached the old `try_claim_active`'s `.entry(...).or_insert_with(..)`
-/// and created a brand-new, permanent `RipState` — and, once `handle_scan`'s
-/// `spawn_rip_thread` follows a successful claim, a permanent `JoinHandle` in
-/// `session::RIP_THREADS` too. Nothing ever prunes either: the hot-unplug
-/// sweep in `drive_poll_loop` only removes devices that were previously in
-/// its own enumerated `drive_paths` list, and a forged name never enters
-/// that list. The two maps would grow without bound until the process is
-/// OOM-killed.
-///
-/// A device that legitimately exists always has a STATE entry already —
-/// `drive_poll_loop` pushes one (idle or with a disc) on every poll tick for
-/// every device it enumerates, before the operator can ever see it in the
-/// dashboard (the UI only offers Scan/Rip/Eject for devices `/api/state`
-/// already reports) — so gating the *new-entry* path on `known` does not
-/// affect any real device, only a name nothing has ever enumerated.
-///
-/// `known` should be `true` for the poll loop's own internal claim (its
-/// `device` always comes from a just-enumerated `drive_paths` entry) and for
-/// any caller that has cross-checked `device` against the live drive list.
-/// Callers that receive `device` verbatim from an untrusted request and
-/// have NOT done that cross-check must pass `false`.
-///
-/// # The claim needs TWO facts, not one
-///
-/// The claim refuses a device whose `STATE` status is scanning/ripping **and**
-/// a device whose rip thread is still alive. Those are independent facts. A
-/// worker writes its TERMINAL status (`done` / `error`) and then keeps running
-/// its tail on the same thread: auto-eject (`Drive::open` + `eject()`, real
-/// hardware I/O), the eject-failure device-log lines, guard drops. For that
-/// whole window `is_busy` is false while the worker still owns the drive, the
-/// staging dir and the device's `Halt` token.
-///
-/// Checking status alone was directly reachable from the network. This server
-/// binds `0.0.0.0` with no authentication, so a `POST /api/rip/sr0` landing in
-/// that tail won the claim, `spawn_rip_after_claim` overwrote the incumbent's
-/// `Halt` with a fresh token (so the incumbent's trailing `unregister_halt`
-/// then deleted the NEW rip's token and `/api/stop` could not cancel it), and
-/// the duplicate worker ran until `register_rip_thread` rejected it. The other
-/// half of that fix lives in [`super::session::spawn_rip_thread`], which now
-/// decides registration before the worker runs any work; this half stops the
-/// duplicate from being admitted in the first place.
-///
-/// **Ordering, and why it cannot deadlock.** The liveness question is asked
-/// BEFORE `STATE` is locked, so `RIP_THREADS` and `STATE` are never held at
-/// the same time and no lock-order inversion is possible; `rip_thread_running`
-/// only reads `JoinHandle::is_finished`, never `join`, so it cannot block
-/// either. Splitting the two checks is not a TOCTOU in the dangerous
-/// direction: a handle can only APPEAR for a device after some caller wins
-/// this very claim, so a `false -> true` transition between our read and our
-/// `STATE` lock implies a competitor already took the `STATE` lock and our own
-/// claim fails anyway. The benign direction (`true -> false`: the worker
-/// exited in between) merely admits a claim for a device that is now genuinely
-/// free, which is correct.
-///
-/// The accepted cost is the same one `forget_removed_device` already accepts:
-/// a worker that hangs forever keeps its device unclaimable. A finished
-/// handle reads as not-running, so an ordinary completed rip frees the device
-/// the instant the thread exits, with no reaping required first.
+/// Refuses the claim if EITHER the status is scanning/ripping OR the rip
+/// thread is still alive. See docs/state.md#try_claim_active_checked.
 pub fn try_claim_active_checked(device: &str, known: bool) -> Option<u64> {
     // Liveness first, and OUTSIDE the STATE lock (see the doc above for both
     // the why and the ordering argument).
@@ -661,9 +550,8 @@ pub(super) struct PassContext {
 }
 
 /// Walk the title's extents to find the byte offset *within the title* for a
-/// given disc LBA. Returns None if the LBA falls outside every extent — meaning
-/// the bad region is in UDF metadata or some other non-AV area, where chapter
-/// mapping doesn't apply.
+/// given disc LBA. None if the LBA falls outside every extent (UDF metadata
+/// or other non-AV area, where chapter mapping doesn't apply).
 pub(super) fn byte_offset_in_title(lba: u32, title: &libfreemkv::DiscTitle) -> Option<u64> {
     let mut cumulative = 0u64;
     for ext in &title.extents {
@@ -706,11 +594,7 @@ pub(crate) fn build_bad_ranges(
 
 /// Build a located range list (LBA + sectors + duration + chapter) for the
 /// given mapfile `statuses`, capped at 50 by duration (largest first); the
-/// truncation count lets the UI say "+X more". The status set is the caller's:
-/// terminal `Unreadable` for the verdict snapshot ([`build_bad_ranges`]), or the
-/// full not-yet-good set (`NonTrimmed`/`NonScraped`/`Unreadable`) for the live
-/// **Maybe** drilldown — so a patch pass shows WHERE it is working instead of a
-/// black box. `NonTried` (unread, ahead of the head) is never included.
+/// truncation count lets the UI say "+X more". `NonTried` is never included.
 pub(crate) fn located_ranges(
     map: &freemkv_engine::Mapfile,
     title: &libfreemkv::DiscTitle,
@@ -760,19 +644,13 @@ pub(crate) fn located_ranges(
 // `RipProgress` / `from_map` were deleted in the 1.2.0 mapfile-free rework:
 // `push_pass_state` now reads the drilldown from `PassProgress.located`.
 
-/// Per-pass progress state. The speed/ETA math (windowed display speed +
-/// pass-start ETA rate, and why a sliding window beats an EWMA through a stall)
-/// now lives in `freemkv_engine::SpeedEstimator` — see its docs; this struct
-/// just holds one estimator plus autorip's own per-pass bookkeeping. Held in a
-/// RefCell inside the callback closure so interior mutability keeps the closure
-/// `Fn`.
+/// Per-pass progress state: one `freemkv_engine::SpeedEstimator` (speed/ETA
+/// math lives there — see its docs) plus autorip's per-pass bookkeeping. Held
+/// in a RefCell inside the callback closure so interior mutability keeps the closure `Fn`.
 #[derive(Debug)]
 pub(super) struct PassProgressState {
-    /// The engine's canonical speed/ETA estimator (windowed display speed +
-    /// pass-start ETA rate + responsive mode). Autorip's finely-tuned speed
-    /// math was promoted into `freemkv_engine::SpeedEstimator` so every
-    /// front-end shares it; this holds the per-pass instance. A fresh
-    /// `PassProgressState` is built per pass, so this anchors cleanly each pass.
+    // The engine's canonical speed/ETA estimator, promoted from autorip's own
+    // math so every front-end shares it. A fresh instance per pass.
     pub(super) speed: freemkv_engine::SpeedEstimator,
     /// Wall-clock of the last throttled callback. The progress closure
     /// checks this to skip work when less than 250 ms have passed.
@@ -785,15 +663,9 @@ pub(super) struct PassProgressState {
     /// Last `work_total` reported by libfreemkv's `Progress` trait — total
     /// bytes this pass will process. Drives `pass_progress_pct` denominator.
     pub(super) last_work_total: u64,
-    /// `bytes_unreadable` snapshotted on this pass's first
-    /// `push_pass_state` callback, frozen for the rest of the pass. The
-    /// total-progress denominator (`max_retries × bytes_lost`) uses this
-    /// frozen value instead of the live mapfile figure: during Pass 1
-    /// `bytes_unreadable` grows from 0 as new bad sectors are discovered,
-    /// so a live read inflated the denominator mid-pass and made
-    /// `total_pct` visibly stall or regress. Re-snapshotted each pass (a
-    /// fresh `PassProgressState` is built per pass), so the estimate
-    /// still tightens pass-to-pass.
+    // `bytes_unreadable` snapshotted on this pass's first `push_pass_state`
+    // callback, frozen for the rest of the pass so the total-progress
+    // denominator doesn't inflate mid-pass. See docs/state.md#passprogressstatefrozen_bytes_lost.
     pub(super) frozen_bytes_lost: Option<u64>,
 }
 
@@ -816,12 +688,9 @@ impl PassProgressState {
     }
 }
 
-/// Push a fresh RipState snapshot for the current pass. Feeds the pass's
-/// work_done into the engine `SpeedEstimator` for the displayed speed + ETA —
-/// otherwise the UI shows 0 KB/s through the whole rip, since the main stream
-/// loop's speed tracker isn't running during `freemkv_engine::sweep` / `patch`.
-/// Buckets/drilldown come straight from `PassProgress.located` (autorip no
-/// longer parses the mapfile on this path).
+/// Push a fresh RipState snapshot for the current pass. Feeds work_done into
+/// the engine `SpeedEstimator` for displayed speed + ETA (the main stream
+/// loop's tracker isn't running during `sweep`/`patch`); buckets/drilldown come from `PassProgress.located`.
 pub(super) fn push_pass_state(
     ctx: &PassContext,
     p: &libfreemkv::progress::PassProgress,
@@ -1049,11 +918,9 @@ pub(super) fn push_pass_state(
     }
 }
 
-/// Build a RipState snapshot for a multi-pass rip in a specific pass, with
-/// everything the UI needs to render pass progress. The immutable per-rip
-/// fields (disc / TMDB / batch / capacity) come from `ctx`; the rest are the
-/// per-pass dynamic values. Status is always "ripping" during the passes;
-/// pass=total_passes indicates the mux phase.
+/// Build a RipState snapshot for a multi-pass rip in a specific pass. Immutable
+/// per-rip fields come from `ctx`; the rest are per-pass dynamic values.
+/// Status is always "ripping"; pass=total_passes indicates the mux phase.
 pub(super) fn set_pass_progress(
     ctx: &PassContext,
     pass: u8,
@@ -1117,10 +984,9 @@ mod tests {
     use super::*;
     use freemkv_engine::{Mapfile, SectorStatus};
 
-    /// Create a throwaway mapfile inside a fresh `TempDir`. The returned
-    /// `TempDir` guard must be held for the test's lifetime; its Drop
-    /// removes the directory (and the mapfile) so temp_dir() doesn't
-    /// accumulate `autorip-ripper-test-*.mapfile` artifacts across runs.
+    /// Create a throwaway mapfile inside a fresh `TempDir`. Caller must hold
+    /// the `TempDir` guard for the test's lifetime so its Drop cleans up the
+    /// mapfile instead of leaking it into temp_dir().
     fn tmp_map(tag: &str, total: u64) -> (tempfile::TempDir, Mapfile) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(format!("{tag}.mapfile"));
@@ -1129,17 +995,8 @@ mod tests {
     }
 
     /// Catches the mutation that feeds the done card the STARVED
-    /// `sweep_damage_snapshot.total_lost_ms` (0.0 in single-pass, which has no
-    /// mapfile) instead of the real in-title loss — a damaged rip filed as
-    /// clean.
-    ///
-    /// The previous version of this test only called `damage_severity_for`
-    /// with two literals. That pins the classifier, which was never the thing
-    /// at risk: the wiring lives in `rip_disc`, and reintroducing the bug there
-    /// left this test green. The decision now lives in one function
-    /// (`super::super::done_card_lost_ms`) and this drives it, then pushes the
-    /// result through the REAL `update_state` — which is where
-    /// `damage_severity` is actually computed for the card.
+    /// single-pass `total_lost_ms` instead of the real in-title loss. See
+    /// docs/state.md#single_pass_done_card_total_lost_ms_drives_severity-test.
     #[test]
     fn single_pass_done_card_total_lost_ms_drives_severity() {
         // 10 skipped sectors -> below the 51-sector Moderate threshold, so
@@ -1219,21 +1076,9 @@ mod tests {
     // into libfreemkv (`locate_ranges` tests, src/disc/mod.rs). The terminal
     // build_bad_ranges path (still autorip-side, done card) keeps coverage below.
 
-    /// The post-Stop cooldown is a SHORT INTERVAL, so it must be measured on
-    /// the monotonic clock, not the wall clock.
-    ///
-    /// It was stored as an absolute `epoch_secs()` deadline. A backward wall
-    /// clock step larger than the 5s window — an NTP correction, a container
-    /// host clock reset, a VM resuming from a snapshot — leaves `now <
-    /// expires` true for as long as the clock takes to catch back up, and the
-    /// device stays wedged in "just stopped, ignore this insert" for that whole
-    /// time: `insert_tick` suppresses the auto-scan/auto-rip dispatch, so an
-    /// unattended box quietly ignores the disc sitting in the drive. `Instant`
-    /// cannot step backwards, which is the whole reason it exists.
-    ///
-    /// Proven structurally: stepping the system clock inside the test process
-    /// is not portable. The behavioural halves (active when set, inactive once
-    /// the deadline has passed) are pinned below.
+    /// The post-Stop cooldown must be measured on the monotonic clock, not
+    /// the wall clock (proven structurally; see docs/state.md
+    /// #the_stop_cooldown_is_not_measured_on_the_wall_clock-test).
     #[test]
     fn the_stop_cooldown_is_not_measured_on_the_wall_clock() {
         let src = crate::util::source_lf(include_str!("state.rs"));
@@ -1314,15 +1159,9 @@ mod tests {
             .remove(dev);
     }
 
-    /// A disc-supplied extent must never be able to panic the rip thread.
-    ///
-    /// `start_lba` and `sector_count` come straight from the UDF allocation
-    /// descriptors — untrusted, disc-controlled data. `start_lba +
-    /// sector_count` is `u32` arithmetic: a corrupt or hostile image with
-    /// `start_lba` near `u32::MAX` overflows, which panics in debug (killing
-    /// the rip thread mid-rip, on damage attribution of all things) and wraps
-    /// in release, making the containment test answer nonsense. An extent that
-    /// cannot express its own end simply does not contain the LBA.
+    /// A disc-supplied extent (untrusted `start_lba`/`sector_count`) must
+    /// never be able to overflow-panic the rip thread. See docs/state.md
+    /// #byte_offset_in_title_survives_an_overflowing_extent-test.
     #[test]
     fn byte_offset_in_title_survives_an_overflowing_extent() {
         let mut title = minimal_title();
@@ -1528,10 +1367,8 @@ mod tests {
     }
 
     /// Regression: set_pass_progress must not zero total_progress_pct /
-    /// total_progress_eta that were set by a previous pass's push_pass_state.
-    /// Before the fix, the `..Default::default()` in the full RipState
-    /// replacement zeroed those fields at the start of every new pass, causing
-    /// the UI total-progress bar to visibly drop to 0 between passes.
+    /// total_progress_eta set by a previous pass's push_pass_state — the old
+    /// `..Default::default()` full-RipState replacement zeroed them each pass.
     #[test]
     fn set_pass_progress_preserves_total_progress_fields() {
         let dev = format!("test-spp-preserve-{}", std::process::id());
@@ -1583,11 +1420,9 @@ mod tests {
         );
     }
 
-    /// Regression: the post-promotion damage snapshot pushed via
-    /// update_state_with must reflect the final Unreadable sectors
-    /// (NonTrimmed promoted → Unreadable) and produce non-zero damage
-    /// fields.  This guards the build_bad_ranges + update_state_with
-    /// pattern used in mod.rs after the promotion+flush block.
+    /// Regression: the post-promotion damage snapshot must reflect the final
+    /// Unreadable sectors and produce non-zero damage fields — guards the
+    /// build_bad_ranges + update_state_with pattern used after promotion+flush.
     #[test]
     fn post_promotion_damage_push_is_non_zero_for_damaged_rip() {
         let dev = format!("test-promo-damage-{}", std::process::id());
@@ -1797,22 +1632,9 @@ mod tests {
         );
     }
 
-    /// Catches the mutation that deletes the thread-liveness half of the
-    /// claim (leaving only the STATE-status check it had before).
-    ///
-    /// The device is left with a TERMINAL status — exactly the state a worker
-    /// writes just before it starts unwinding (auto-eject, log archive, guard
-    /// drops) — while its thread is still on the CPU. `is_busy` is false for
-    /// that whole window, so a status-only claim admitted an unauthenticated
-    /// LAN `POST /api/rip/{device}` into a device another worker still owns:
-    /// the new claim overwrote the incumbent's `Halt` token (so `/api/stop`
-    /// could no longer cancel either rip) and launched a second worker against
-    /// the same staging dir.
-    ///
-    /// The second half of the test is just as load-bearing: once the worker
-    /// really has exited, the device must be claimable again immediately. A
-    /// "fix" that latched the device shut would break every normal
-    /// rip-then-rip-again sequence.
+    /// Catches admitting a claim while a TERMINAL-status device's worker is
+    /// still unwinding. See docs/state.md
+    /// #try_claim_active_refuses_a_device_whose_worker_is_still_unwinding-test.
     #[test]
     fn try_claim_active_refuses_a_device_whose_worker_is_still_unwinding() {
         let dev = format!("sg_claim_liveness_test_{}", std::process::id());
@@ -1873,21 +1695,9 @@ mod tests {
         STATE.lock().unwrap().remove(&dev);
     }
 
-    /// Catches the mutation that puts `take_rip_thread` back at the top of
-    /// `join_rip_thread` (i.e. drains by REMOVING the handle and stashing it
-    /// back afterwards) — the H1 duplicate-rip window.
-    ///
-    /// The drain is what `POST /api/stop/{device}` does, for up to 60 s. While
-    /// it ran, the handle was OUT of `RIP_THREADS`, so the device's only
-    /// liveness fact read `false`. Land that on a worker in its terminal tail
-    /// (status already "done", so `is_busy` is false too) and a concurrent
-    /// `POST /api/rip/{device}` — unauthenticated, this server binds 0.0.0.0 —
-    /// wins the claim, clobbers the incumbent's `Halt`, finds an empty
-    /// registration slot and runs a full duplicate rip on the same drive and
-    /// the same staging dir.
-    ///
-    /// So: a claim must be refused for the WHOLE life of the worker thread,
-    /// including while another thread is draining it.
+    /// Catches the H1 duplicate-rip drain window; a claim must be refused for
+    /// the WHOLE life of the worker thread, even while another thread drains
+    /// it. See docs/state.md#a_drain_in_flight_never_makes_a_live_worker_claimable-test.
     #[test]
     fn a_drain_in_flight_never_makes_a_live_worker_claimable() {
         let dev = format!("sg_claim_during_drain_test_{}", std::process::id());
@@ -2071,13 +1881,9 @@ mod tests {
         );
     }
 
-    /// `disc_label` is the raw volume label — the only thing telling two discs
-    /// of a boxset apart behind their one shared TMDB title, and what decides
-    /// which staging dir a disc owns. Nearly every caller pushes a fresh
-    /// `RipState` with `..Default::default()`, so `update_state` must carry it
-    /// forward or the first progress push erases it and the disc collapses back
-    /// onto its sibling's directory. It must NOT be carried onto a different
-    /// disc, or onto an empty drive.
+    /// `update_state` must carry `disc_label` forward across the
+    /// `..Default::default()` fresh-RipState pushes, but never onto a
+    /// different disc or an empty drive. See docs/state.md#ripstatedisc_label.
     #[test]
     fn update_state_carries_the_disc_label_but_never_onto_another_disc() {
         let dev = format!("test-disclabel-{}", std::process::id());

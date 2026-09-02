@@ -2,14 +2,12 @@
 //!
 //! libfreemkv does no key lookup — its `KeySource`s resolve a disc's terminal
 //! Unit Keys, driving the library's boil-down crypto. autorip resolves from the
-//! configured *published key source* (`freemkv_keysources`): a local keydb
-//! (`local`) or a remote key service (`online`).
+//! configured *published key source* (`local` keydb or `online` key service).
 //!
 //! The flow is the same for a live drive and a staged ISO: scan the disc
-//! KEYLESS (structure + AACS inputs, no resolution), build [`libfreemkv::DiscInputs`] from
-//! its key files (+ content samples for wrong-key validation), then resolve via
-//! [`resolve_and_apply_traced`] — the first source whose Unit Keys validate
-//! wins. The only drive-vs-ISO difference is the [`DiscKeyAccess`] impl.
+//! KEYLESS, build [`libfreemkv::DiscInputs`] from its key files, then resolve
+//! via [`resolve_and_apply_traced`] — the first source whose Unit Keys
+//! validate wins. The only drive-vs-ISO difference is the [`DiscKeyAccess`] impl.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -21,12 +19,9 @@ use libfreemkv::read_encrypted_units;
 
 use crate::config::Config;
 
-/// Is this resolved address one a key-service request must never reach?
-/// Blocks loopback, link-local (incl. the 169.254.169.254 cloud metadata
-/// endpoint), private RFC1918 / ULA, unspecified, and other non-global
-/// ranges. Defense-in-depth at the request use-site: the web store-side
-/// guard rejects most of these at save time, but `keyserver_url` is POSTed
-/// verbatim at rip time, so we re-check here too.
+// Is this resolved address one a key-service request must never reach?
+// Blocks loopback, link-local/metadata, RFC1918/ULA, and other non-global
+// ranges; defense-in-depth since `keyserver_url` is POSTed verbatim at rip time.
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -54,11 +49,9 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Validate a key-service base URL before it is handed to `OnlineSource`.
-/// Requires http(s), extracts the host, and rejects any host that is a
-/// literal blocked IP or that resolves to one (SSRF / cloud-metadata
-/// exfiltration guard). Returns the input on success so call sites can
-/// gate construction.
+// Validate a key-service base URL before handing it to `OnlineSource`.
+// Requires http(s); rejects a host that is (or resolves to) a blocked IP
+// (SSRF / cloud-metadata exfiltration guard).
 fn validate_keyserver_url(raw: &str) -> Result<(), String> {
     let url = raw.trim();
     // Log/error identifier for `url`: origin only, never the raw string.
@@ -180,12 +173,9 @@ pub fn keydb_path(cfg: &Config) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("keydb.cfg"))
 }
 
-/// autorip's default keydb location: `$HOME/.config/freemkv/keydb.cfg`.
-///
-/// The container bind-mounts the keydb to `/root/.config/freemkv`, so the
-/// service resolves it under the standard per-user config dir — NOT the CLI's
-/// exe-local default, which is correct for the portable CLI but wrong for a
-/// containerized service whose binary and keydb live in different places.
+// autorip's default keydb location: `$HOME/.config/freemkv/keydb.cfg`.
+// The container bind-mounts the keydb there, so the service uses the
+// per-user config dir, not the CLI's exe-local default.
 fn service_default_keydb() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/freemkv/keydb.cfg"))
 }
@@ -290,26 +280,12 @@ pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
 /// Build the fresh-key-on-decrypt-failure closure ([`libfreemkv::sector::KeyFetch`])
 /// for an ISO mux.
 ///
-/// The library owns the recovery loop: when the mux highway hits an AACS unit
-/// that NO held key decrypts, it hands that ciphertext to this closure, which
-/// forwards the failing units (as content samples) to the configured key
-/// source(s); any Unit Keys the service derives are added to the pool and the
-/// unit is re-decrypted and TS-sync-validated. This is the seam that lets a
-/// **multi-CPS-unit disc recover its 2nd/Nth CPS-unit key mid-mux**: the
-/// upfront resolve validates only ONE unit key (the key service returns the one
-/// UK that opens the sample it was sent), so a disc whose feature spans a
-/// second CPS unit would otherwise drop that unit's content as decrypt loss —
-/// the exact 0.44s-in-the-main-movie failure. Wiring this closure sends the
-/// server the failing unit's data and gets that unit's key, on demand.
+/// The library owns the recovery loop: when the mux hits an AACS unit no held
+/// key decrypts, it hands the ciphertext to this closure, which forwards it to
+/// the configured key source(s); derived Unit Keys are added to the pool and
+/// the unit re-decrypted. See docs/keysource.md for why this seam exists.
 ///
-/// Mirrors `freemkv::pipe::build_iso_key_fetch`: read the ISO's AACS inputs
-/// (inf + MKB + version) ONCE, then reuse them per fetch with the failing units
-/// swapped in as `samples`. `None` for a non-AACS ISO (nothing to fetch) or
-/// when the inputs can't be read — the mux then behaves exactly as before. The
-/// VID is all-zero (an ISO carries no live-drive AACS handshake); the key
-/// service resolves the disc from its own catalog. `make_sources` is invoked
-/// per fetch (the cold path, ~once per CPS unit), rebuilding the SAME sources
-/// the upfront resolve used, so `online`/`local` config is honored identically.
+/// Returns `None` for a non-AACS ISO, or when its AACS inputs can't be read.
 pub fn build_iso_key_fetch(cfg: &Config, iso_path: &Path) -> Option<libfreemkv::sector::KeyFetch> {
     match build_iso_key_fetch_outcome(cfg, iso_path) {
         IsoKeyFetch::Ready(fetch) => Some(fetch),
@@ -329,19 +305,10 @@ pub fn build_iso_key_fetch(cfg: &Config, iso_path: &Path) -> Option<libfreemkv::
 /// Why [`build_iso_key_fetch`] did or did not produce a fetch seam.
 ///
 /// Both negative arms collapse to `None` at the call site, but only one of
-/// them is normal, and the difference is the whole point: a non-AACS ISO has
-/// nothing to fetch, whereas an ISO we could not READ (ESTALE on the staging
-/// mount, a truncated file, EACCES) is a fault that used to vanish into the
-/// same `.ok()?` — the mux then dropped the 2nd CPS unit as decrypt loss with
-/// no line anywhere saying why.
-///
-/// This is an enum rather than a log line alone so the distinction can be
-/// asserted directly. The previous test drove the real function under a
-/// capturing subscriber and asserted on captured output; that passed alone and
-/// failed in the full suite, because sibling tests dispatch the same `warn!`
-/// callsite with no subscriber installed and tracing caches `Interest::never`
-/// for the whole process. Testing the decision instead of its rendering has no
-/// such race.
+/// them is normal: a non-AACS ISO has nothing to fetch, whereas an ISO that
+/// could not be READ (ESTALE, truncated, EACCES) is a fault. This is an enum
+/// rather than a log line alone so the distinction can be asserted directly
+/// in tests, independent of log rendering. See docs/keysource.md for why.
 pub enum IsoKeyFetch {
     /// AACS inputs read; mid-mux CPS-unit key recovery is available.
     Ready(libfreemkv::sector::KeyFetch),
@@ -395,15 +362,12 @@ pub fn uses_online(cfg: &Config) -> bool {
 
 /// Reachability verdict for the online key service, used to distinguish a
 /// *transient outage* (the service is down / throttled — a later attempt may
-/// succeed) from a *genuine no-key* (the service is up and simply has no key /
-/// rejected the request for this disc).
+/// succeed) from a *genuine no-key* (the service is up and simply has no key
+/// for this disc).
 ///
-/// This is the crux of the "down vs no-key" fix: when the online source
-/// resolves NO key, autorip alone can't tell whether the service HAD the key
-/// but was unreachable (a 502 outage, connect-refused, timeout) or genuinely
-/// has none. A single bounded probe against the configured `keyserver_url`
-/// answers that — and only the [`Up`](Self::Up) verdict keeps the pre-fix
-/// "no keys found" behaviour.
+/// A single bounded probe against the configured `keyserver_url` answers
+/// this; only the [`Up`](Self::Up) verdict means "no keys found" is final.
+/// See docs/keysource.md for the down-vs-no-key design rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceReachability {
     /// The service answered with an HTTP status (any 2xx / 3xx / non-429 4xx).
@@ -459,21 +423,9 @@ pub fn classify_reachability(outcome: ProbeOutcome) -> ServiceReachability {
     }
 }
 
-/// What a URL we could not even validate says about the key SERVICE.
-///
-/// `validate_fetch_url` fails for two unrelated reasons and the probe used to
-/// answer [`ServiceReachability::Up`] to both:
-///
-/// * A permanent verdict on the URL — empty, not http(s), no host, or an
-///   address the SSRF guard blocks. The online source was already dropped for
-///   such a URL, so a resulting no-key is genuine and `Up` is right: calling
-///   it an outage would park every disc forever on a config mistake.
-/// * A failed LOOKUP — DNS timed out (including the `MAX_INFLIGHT` fail-fast),
-///   the resolver errored, or the host resolved to nothing. That is the same
-///   evidence `ProbeOutcome::Transport` is built from: we never reached the
-///   service. Reporting `Up` here made a DNS blip finalise a rippable disc as
-///   permanently keyless, which is precisely what the `Down` path exists to
-///   prevent — the disc parks, retries, and rips when the network returns.
+// What a URL we could not even validate says about the key SERVICE: a
+// permanent verdict (bad scheme/host/SSRF) means `Up` (genuine no-key), but
+// a failed DNS lookup means `Down` (transient). See docs/keysource.md.
 fn reachability_for_unprobeable_url(err: &str) -> ServiceReachability {
     if crate::web::is_transient_resolve_error(err) {
         ServiceReachability::Down
@@ -487,20 +439,14 @@ fn reachability_for_unprobeable_url(err: &str) -> ServiceReachability {
 const PROBE_TIMEOUT_SECS: u64 = 8;
 
 /// Perform ONE bounded reachability probe against the configured
-/// `keyserver_url` and classify the result. Never hammers: a single cheap
-/// `GET` with short connect/read timeouts, zero redirects, and the same
-/// SSRF-pinning (`validate_fetch_url`) the rest of autorip's outbound HTTP
-/// uses. A `GET` on the (POST) key endpoint typically 404/405s — that's fine,
-/// *any* HTTP answer proves the service is UP; only transport failures / 5xx /
-/// 429 are transient.
+/// `keyserver_url` and classify the result. A single cheap `GET` with short
+/// connect/read timeouts, zero redirects, and the same SSRF-pinning
+/// (`validate_fetch_url`) the rest of autorip's outbound HTTP uses. Any HTTP
+/// answer proves the service is UP; only transport failures / 5xx / 429 are
+/// transient.
 ///
-/// If the URL is empty or SSRF-blocked we can't probe, so we report
-/// [`ServiceReachability::Up`] — that preserves the pre-fix behaviour (the
-/// online source was already dropped for such a URL, so the no-key is treated
-/// as genuine rather than a spurious "outage").
-///
-/// A validation failure that is merely a failed LOOKUP is the opposite case
-/// and is classified by [`reachability_for_unprobeable_url`]: see there.
+/// Empty or SSRF-blocked URLs can't be probed and report
+/// [`ServiceReachability::Up`]; see [`reachability_for_unprobeable_url`].
 pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
     let url = cfg.keyserver_url.trim();
     if url.is_empty() {
@@ -546,12 +492,10 @@ pub trait DiscKeyAccess {
 /// `access`. Returns the disc with keys applied (`Resolved`) or unchanged.
 ///
 /// The disc must have been scanned KEYLESS (see [`drive_scan_opts`] /
-/// [`iso_scan_opts`]). Each
-/// source offers candidate keys; the first whose [`libfreemkv::Disc::decrypt_with`]
-/// derives unit keys wins. A wrong candidate (e.g. a device-key set that does
-/// not apply to this disc's MKB) is rejected by `decrypt_with` and the next
-/// candidate / source is tried. `decrypt_with` only mutates the disc on success,
-/// so a rejected candidate leaves it untouched.
+/// [`iso_scan_opts`]). Each source offers candidate keys; the first whose
+/// [`libfreemkv::Disc::decrypt_with`] derives unit keys wins. A wrong
+/// candidate is rejected by `decrypt_with` and the next tried; it only
+/// mutates the disc on success, so a rejected candidate leaves it untouched.
 pub fn resolve_keys<A: DiscKeyAccess>(
     sources: Vec<Box<dyn KeySource>>,
     access: &mut A,
@@ -757,11 +701,9 @@ mod tests {
         assert!(validate_keyserver_url("https://1.1.1.1:443").is_ok());
     }
 
-    /// The two rejection arms that fire BEFORE a host is extracted (missing
-    /// scheme, empty host) must never echo the raw input back — `keyserver_url`
-    /// can carry a bearer token in its path/query, and `build_sources` logs
-    /// this `Err` at ERROR level into autorip.jsonl, which unauthenticated
-    /// `GET /api/debug` serves verbatim to any LAN host.
+    // The two rejection arms that fire BEFORE a host is extracted must never
+    // echo the raw input — `keyserver_url` can carry a bearer token, and
+    // `build_sources` logs this `Err` at ERROR, readable via `GET /api/debug`.
     #[test]
     fn validate_keyserver_url_error_never_echoes_raw_token() {
         let scheme_missing =
@@ -802,10 +744,9 @@ mod tests {
         ));
     }
 
-    /// Regression: to_ipv4_mapped() missed the deprecated IPv4-compatible form
-    /// (::a.b.c.d) and both v4+v6 multicast and Class-E were absent.
-    /// These must all be blocked — divergence from web.rs's is_blocked_ip is
-    /// a SSRF middle-layer gap.
+    // Regression: to_ipv4_mapped() missed the deprecated IPv4-compatible form
+    // (::a.b.c.d), and v4+v6 multicast / Class-E were absent — divergence from
+    // web.rs's is_blocked_ip would be a SSRF middle-layer gap.
     #[test]
     fn ssrf_classifier_ipv4_compat_multicast_class_e() {
         use std::net::{Ipv4Addr, Ipv6Addr};
@@ -859,11 +800,9 @@ mod tests {
         ));
     }
 
-    /// IPv6 Unique-Local-Address range (`fc00::/7`) — IPv6's rough equivalent
-    /// of RFC1918 — has no dedicated test elsewhere in this file, unlike every
-    /// other branch of `is_blocked_ip` (loopback, RFC1918, link-local, CGNAT,
-    /// Class-E, multicast are all covered above). A keyserver_url pointed at
-    /// a bare ULA literal must still be rejected.
+    // IPv6 Unique-Local-Address range (`fc00::/7`) — IPv6's rough RFC1918
+    // equivalent — has no dedicated coverage elsewhere; a keyserver_url pointed
+    // at a bare ULA literal must still be rejected.
     #[test]
     fn ssrf_classifier_ipv6_unique_local_address() {
         use std::net::Ipv6Addr;
@@ -878,10 +817,9 @@ mod tests {
         ));
     }
 
-    /// TEST-NET ranges (RFC 5737: 192.0.2.0/24, 198.51.100.0/24,
-    /// 203.0.113.0/24) are `Ipv4Addr::is_documentation()` — a defense-in-depth
-    /// layer with no dedicated test. These ranges aren't routable to anything
-    /// sensitive, but the guard should still actually block them.
+    // TEST-NET ranges (RFC 5737: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
+    // are `Ipv4Addr::is_documentation()` — defense-in-depth with no dedicated
+    // test elsewhere; the guard should still actually block them.
     #[test]
     fn ssrf_classifier_test_net_documentation_ranges() {
         use std::net::Ipv4Addr;
@@ -890,13 +828,9 @@ mod tests {
         assert!(is_blocked_ip(Ipv4Addr::new(203, 0, 113, 1).into()));
     }
 
-    /// CGNAT (100.64.0.0/10) is `octets[0] == 100 && (octets[1] & 0xc0) ==
-    /// 0x40` — an AND of two conditions on DIFFERENT octets. A public address
-    /// whose second octet merely falls in the 64-127 range (top two bits
-    /// `01`) but whose first octet ISN'T 100 must NOT be blocked by this
-    /// term: the existing test IPs (8.8.8.8, 1.1.1.1) both have a second
-    /// octet outside 64-127, so they can't catch a regression that widened
-    /// this to an OR.
+    // CGNAT (100.64.0.0/10) is an AND of two conditions on DIFFERENT octets.
+    // A public address with second-octet in 64-127 but first octet != 100 must
+    // NOT be blocked — catches a regression that widened this check to an OR.
     #[test]
     fn ssrf_classifier_cgnat_does_not_overreach_public_space() {
         use std::net::Ipv4Addr;
@@ -913,10 +847,9 @@ mod tests {
         assert!(!is_blocked_ip(Ipv4Addr::new(100, 128, 0, 1).into()));
     }
 
-    /// Cross-side agreement: autorip's sample selector (`read_encrypted_units`)
-    /// hands the key service only units the service's own gate accepts —
-    /// because both sides call the SAME predicate,
-    /// `libfreemkv::aacs::content::ts_sync_destroyed`.
+    // Cross-side agreement: autorip's sample selector (`read_encrypted_units`)
+    // hands the key service only units the service's own gate accepts, since
+    // both sides call the SAME predicate, `ts_sync_destroyed`.
     #[test]
     fn sample_units_are_all_aacs_scrambled() {
         use std::io::Write;
@@ -968,15 +901,9 @@ mod tests {
         ));
     }
 
-    /// The test above drives the free function `read_encrypted_units`
-    /// directly, never the actual `IsoAccess::sample_units` trait impl that
-    /// `resolve_keys` calls in production (which opens the file via
-    /// `libfreemkv::FileSectorSource::open` and handles the Err path itself).
-    /// Route the same scrambled-ISO fixture through the REAL trait impl so a
-    /// regression there (e.g. `IsoAccess::sample_units` silently stops
-    /// sampling real disc content) is actually caught — a bug that would
-    /// otherwise let the online key service validate against fake ciphertext
-    /// and every ISO/resume key resolution spuriously report `NoKey`.
+    // The test above drives `read_encrypted_units` directly, not the real
+    // `IsoAccess::sample_units` impl `resolve_keys` calls in production —
+    // route the same fixture through it so a regression there isn't silently missed.
     #[test]
     fn iso_access_sample_units_reads_through_the_real_trait_impl() {
         use std::io::Write;
@@ -1015,10 +942,9 @@ mod tests {
         }
     }
 
-    /// `IsoAccess::sample_units` against a path that isn't a valid ISO (the
-    /// `FileSectorSource::open` Err branch) must fail SAFE — an empty sample
-    /// list, not a panic — since a bad/missing staged ISO must not crash key
-    /// resolution.
+    // `IsoAccess::sample_units` against a path that isn't a valid ISO must fail
+    // SAFE — an empty sample list, not a panic — since a bad/missing staged
+    // ISO must not crash key resolution.
     #[test]
     fn iso_access_sample_units_empty_on_open_failure() {
         let title = libfreemkv::DiscTitle {
@@ -1042,10 +968,9 @@ mod tests {
         );
     }
 
-    /// autorip's keydb *writes* and the startup *existence check* must land on
-    /// the same service-canonical path the *reads* resolve through (keydb_path /
-    /// keydb_exists). `save_keydb` now writes STRAIGHT to `keydb_path(cfg)` via
-    /// `KeydbSource::save` — no validate-then-relocate dance.
+    // autorip's keydb writes and the startup existence check must land on the
+    // same service-canonical path the reads resolve through (keydb_path /
+    // keydb_exists) — save_keydb writes straight there, no relocate dance.
     #[test]
     fn save_keydb_writes_to_service_path_and_existence_agrees() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1092,17 +1017,9 @@ mod tests {
         );
     }
 
-    // --- keydb path resolution: the four resolvers must agree (rc.6 WS3) -----
-
-    /// With no explicit `keydb_path`, all the resolvers fall through to the
-    /// SAME service default (`$HOME/.config/freemkv/keydb.cfg`): `keydb_path`,
-    /// `service_default_keydb`, and the read path (`drive_scan_opts` builds its
-    /// `KeydbSource` from `keydb_path`). The rc.6 bug was the reads going to
-    /// `$HOME/.config/freemkv` while the writes/gate went to an exe-local
-    /// default; this pins they resolve to one location.
-    ///
-    /// Reads the ambient `$HOME` rather than mutating it — mutating the global
-    /// env would race with other tests that read it.
+    // keydb path resolution (rc.6 WS3): with no explicit `keydb_path`, all
+    // resolvers fall through to the SAME service default (rc.6 bug: reads and
+    // writes disagreed). Reads the ambient $HOME rather than mutating it.
     #[test]
     fn keydb_resolvers_all_agree_on_service_default() {
         let Some(home) = std::env::var_os("HOME") else {
@@ -1135,10 +1052,9 @@ mod tests {
         assert_eq!(keydb_exists(&cfg), expected.exists());
     }
 
-    /// An explicit `keydb_path` in config overrides the service default, and the
-    /// existence gate + the read path both honor that override (so an operator
-    /// who points autorip at a non-standard keydb gets reads, writes, and the
-    /// startup gate all aimed at the same file).
+    // An explicit `keydb_path` overrides the service default, and the existence
+    // gate + read path both honor it — an operator pointing autorip at a
+    // non-standard keydb gets reads, writes, and the startup gate aligned.
     #[test]
     fn explicit_keydb_path_overrides_default_and_gate_honors_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1185,11 +1101,9 @@ mod tests {
         assert!(!written.contains("0xAAAA"), "old content fully replaced");
     }
 
-    /// `drive_scan_opts_for_keydb` must wire `DriveCredentials` when the
-    /// keydb carries at least one host cert, so the AACS host-cert handshake
-    /// actually gets the credentials it needs. No existing test drives this
-    /// function with a real keydb fixture (the `save_keydb`/`keydb_path`
-    /// tests never call it).
+    // `drive_scan_opts_for_keydb` must wire `DriveCredentials` when the keydb
+    // carries a host cert, so the AACS handshake gets it — no existing test
+    // drove this function with a real keydb fixture before.
     #[test]
     fn drive_scan_opts_for_keydb_wires_credentials_when_host_certs_present() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1271,10 +1185,9 @@ mod tests {
         }
     }
 
-    /// A `KeySource` fixture whose `get_uk` FAILS (returns `Err`) — models a
-    /// source that errored (e.g. an unreachable key service). With the reshaped
-    /// trait there is no per-source `errored()` signal, so `resolve_and_apply`
-    /// treats this exactly like "no key here": it maps to `NoKey`.
+    // A `KeySource` fixture whose `get_uk` FAILS — models an errored source
+    // (e.g. unreachable key service). The reshaped trait has no per-source
+    // `errored()` signal, so `resolve_and_apply` maps this to `NoKey`.
     struct ErroringSource;
     impl KeySource for ErroringSource {
         fn get_unit_keys(
@@ -1295,10 +1208,9 @@ mod tests {
         }
     }
 
-    /// Like [`keyless_encrypted_disc`] but WITH AACS state, so `disc.inputs()`
-    /// returns `Some` and `resolve_keys` proceeds to the key sources (rather than
-    /// short-circuiting on `MissingInputs`). Minimal state — the outcome tests use
-    /// only no-key / erroring sources, so the AACS bytes themselves don't matter.
+    // Like `keyless_encrypted_disc` but WITH AACS state, so `disc.inputs()`
+    // returns `Some` and `resolve_keys` proceeds past `MissingInputs`. Minimal
+    // state — outcome tests use only no-key/erroring sources.
     fn keyless_encrypted_disc_with_aacs() -> libfreemkv::Disc {
         let mut disc = keyless_encrypted_disc();
         disc.aacs = Some(libfreemkv::disc::AacsState {
@@ -1342,11 +1254,9 @@ mod tests {
         assert_eq!(outcome, KeyOutcome::NoKey);
     }
 
-    /// Key files present, a source that ERRORS (its `get_uk` returns `Err`) and
-    /// no other source has a key → `NoKey`. The reshaped `KeySource` trait
-    /// dropped the per-source `errored()` signal, so a failed source is no
-    /// longer distinguished from a clean miss — both map to `NoKey` (the
-    /// finer-grained per-source walk is in the rendered ResolutionTrace).
+    // A source that ERRORS and no other source has a key → `NoKey`. The
+    // reshaped `KeySource` trait dropped the per-source `errored()` signal, so
+    // a failed source is indistinguishable from a clean miss (see ResolutionTrace).
     #[test]
     fn resolve_keys_reports_no_key_when_a_source_errors() {
         let mut access = FixtureAccess;
@@ -1396,10 +1306,9 @@ mod tests {
         assert_eq!(sources[0].label(), "keydb");
     }
 
-    /// An online `key_source` with an SSRF-blocked URL drops the online source
-    /// entirely (rather than handing OnlineSource a URL we won't trust). That
-    /// leaves ZERO sources — the rip then surfaces NoKey instead of
-    /// exfiltrating disc-key material to an internal address.
+    // An online `key_source` with an SSRF-blocked URL drops the online source
+    // entirely, leaving ZERO sources — the rip surfaces NoKey instead of
+    // exfiltrating disc-key material to an internal address.
     #[test]
     fn build_sources_drops_online_source_on_ssrf_blocked_url() {
         let cfg = Config {
@@ -1427,13 +1336,9 @@ mod tests {
         assert!(!uses_online(&cfg), "a typo'd source is not 'online'");
     }
 
-    // --- reachability classification: down vs no-key (v1.3.0) ----------------
-
-    /// The core down-vs-no-key mapping. An HTTP 5xx (502/503/504) OR a
-    /// transport failure (timeout / connect-refused) means the service is DOWN
-    /// (transient); 429 means rate-limited (transient); any other HTTP answer
-    /// — including 404 (auth wall) and 422 (no-key) — means the service is UP,
-    /// so a no-key is genuine.
+    // reachability classification (v1.3.0): the core down-vs-no-key mapping is
+    // HTTP 5xx or a transport failure → DOWN (transient); 429 → rate-limited
+    // (transient); any other answer (incl. 404/422) → UP, so a no-key is genuine.
     #[test]
     fn classify_reachability_down_vs_no_key() {
         use ProbeOutcome::{Status, Transport};
@@ -1478,16 +1383,9 @@ mod tests {
         assert!(!ServiceReachability::Up.is_transient());
     }
 
-    // --- build_iso_key_fetch (rc.6 WS3 multi-CPS-unit recovery) --------------
-
-    /// `build_iso_key_fetch` reads the ISO's AACS inputs via
-    /// `libfreemkv::Disc::read_aacs_inputs`, which requires a real UDF
-    /// filesystem structure (/AACS/Unit_Key_RO.inf etc) — building that from
-    /// scratch here would duplicate libfreemkv's own extensive UDF fixture
-    /// tests. The one cheap, real thing to pin from autorip's side is the
-    /// fail-safe path: a path that isn't a readable ISO at all (not just
-    /// "no AACS data") must return `None`, not panic or propagate an error
-    /// past the `Option`-returning signature the mux code depends on.
+    // build_iso_key_fetch (rc.6 WS3 multi-CPS-unit recovery) needs a real UDF
+    // fixture to test the happy path (duplicating libfreemkv's own UDF
+    // tests), so the cheap thing to pin here: an unreadable path → `None`.
     #[test]
     fn build_iso_key_fetch_none_for_unreadable_path() {
         let cfg = Config::default();
@@ -1495,17 +1393,9 @@ mod tests {
         assert!(build_iso_key_fetch(&cfg, missing).is_none());
     }
 
-    /// An ISO we could not READ must not vanish silently. Both negative
-    /// outcomes of `build_iso_key_fetch` are `None` and the caller cannot tell
-    /// them apart — so a staging mount that ESTALEs, or a truncated ISO, used
-    /// to disable mid-mux CPS-unit key recovery with nothing anywhere saying
-    /// why, and the rip surfaced it only as decrypt loss.
-    ///
-    /// Asserted on the decision, not on captured log output: the earlier
-    /// version of this test drove the function under a capturing subscriber,
-    /// which passed alone and failed in the full suite because sibling tests
-    /// dispatch the same callsite with no subscriber installed and tracing
-    /// caches `Interest::never` process-wide.
+    // An ISO we could not READ must not vanish silently — a staging mount
+    // ESTALE or truncated ISO used to disable mid-mux key recovery with no
+    // visible cause. Asserted on the decision, not captured logs (see docs/keysource.md).
     #[test]
     fn an_unreadable_iso_is_distinguishable_from_a_non_aacs_one() {
         let cfg = Config::default();
@@ -1529,12 +1419,9 @@ mod tests {
         }
     }
 
-    /// A URL the probe cannot even validate is classified by WHY.
-    ///
-    /// The three transient literals come from `web`'s own constants, which
-    /// `resolve_with_timeout` / `validate_fetch_url` build their errors from,
-    /// so this cannot drift from the producer. The permanent side is pinned
-    /// against real `validate_fetch_url` output below.
+    // A URL the probe cannot even validate is classified by WHY. The transient
+    // literals come from `web`'s own constants (so this can't drift from the
+    // producer); the permanent side is pinned against real validate_fetch_url output.
     #[test]
     fn a_failed_lookup_is_an_outage_but_a_rejected_url_is_not() {
         assert_eq!(
@@ -1581,12 +1468,9 @@ mod tests {
         assert!(build_iso_key_fetch(&cfg, tmp.path()).is_none());
     }
 
-    /// `render_resolution_trace` is the app-layer's ENTIRE English mapping of
-    /// the library's typed unlock/key trace (the library itself emits no
-    /// prose). It is shown to the operator on every rip, success or failure,
-    /// so a dropped or mis-mapped arm ships a blank or wrong diagnostic. Drive
-    /// every `UnlockOutcome`, every `KeyNode`, and every `KeyOutcome` through it
-    /// and pin the rendered lines — including the `MKBvN` suffix formatting.
+    // `render_resolution_trace` is the app-layer's ENTIRE English mapping of
+    // the library's typed trace, shown on every rip — a dropped/mis-mapped arm
+    // ships a wrong diagnostic. Drive every enum arm through it and pin output.
     #[test]
     fn render_resolution_trace_maps_every_enum_arm() {
         use libfreemkv::aacs::trace::{
@@ -1670,11 +1554,9 @@ mod tests {
         );
     }
 
-    /// `probe_online_reachability`'s two non-network arms: an EMPTY keyserver
-    /// URL cannot be probed, so the no-key is treated as genuine → `Up`; a URL
-    /// that fails validation permanently (a loopback/private address the SSRF
-    /// guard blocks) is a config verdict, not an outage → also `Up`. Neither
-    /// arm touches the network.
+    // `probe_online_reachability`'s two non-network arms: an EMPTY keyserver URL
+    // can't be probed → `Up`; an SSRF-blocked URL is a config verdict, not an
+    // outage → also `Up`. Neither arm touches the network.
     #[test]
     fn probe_online_reachability_unprobeable_urls_report_up() {
         let empty = Config {

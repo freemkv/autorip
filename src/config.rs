@@ -7,18 +7,15 @@ use std::sync::{Arc, RwLock};
 pub(crate) const OUTPUT_FORMAT_ISO: &str = "iso";
 pub(crate) const OUTPUT_FORMAT_NETWORK: &str = "network";
 
-/// `#[serde(default)]` helper: a webhook with an unspecified `post_rip` /
-/// `post_mux` / `post_move` flag fires on that stage. This is the
-/// backward-compat default — before per-stage selection existed every webhook
-/// fired on completion, so an entry that omits a flag (a legacy config, or a
-/// client that doesn't send it) must keep firing. A pre-1.6.8 config that only
-/// carries `post_rip`/`post_move` therefore gains `post_mux = true` on load, so
-/// the mux-stage notification (which used to ride the single `rip_complete`
-/// event) is never silently dropped.
+// `#[serde(default)]` helper: an unspecified per-stage flag fires on that
+// stage, preserving pre-1.6.8 behaviour where every webhook fired on
+// completion. See docs/webhook-defaults.md for the full migration rationale.
 fn default_true() -> bool {
     true
 }
 
+// Per-stage selection is opt-out; a legacy bare-string entry fires on
+// every stage. See docs/webhook-defaults.md for the migration rationale.
 /// One configured webhook: the destination URL plus which of the three
 /// pipeline stages (rip → mux → move) it fires on. The stages are distinct
 /// events:
@@ -27,11 +24,6 @@ fn default_true() -> bool {
 ///   disc while the mux runs on a separate worker.
 /// - `post_mux`: the `.mkv` has been produced from the staged ISO.
 /// - `post_move`: the finished file has landed in its final library location.
-///
-/// Before 1.6.8 a webhook fired only once, at end-of-mux, under the name
-/// `post_rip`; per-stage selection is opt-out, so all three flags default to
-/// `true` and a legacy bare-string entry maps to "fire on every stage" (see the
-/// custom `Deserialize` below).
 #[derive(Clone, Serialize, PartialEq, Eq, Debug)]
 pub struct WebhookEntry {
     pub url: String,
@@ -57,13 +49,9 @@ impl WebhookEntry {
         }
     }
 
-    /// Parse one entry from a settings.json array element, accepting BOTH the
-    /// legacy bare string (`"https://…"`) and the object form
-    /// (`{"url":"…","post_rip":true,"post_mux":true,"post_move":false}`). A
-    /// missing flag on the object form defaults to `true` (fire) to match the
-    /// bare-string default. Returns `None` for a malformed element or a
-    /// blank/whitespace URL so the caller drops it, exactly as the old
-    /// string-only loader did.
+    // Parses either the legacy bare string or the object form; a missing
+    // flag on the object form defaults to `true`. Returns `None` for a
+    // malformed element or blank/whitespace URL so the caller drops it.
     fn from_json(v: &serde_json::Value) -> Option<Self> {
         let entry = if let Some(s) = v.as_str() {
             Self::both(s.to_string())
@@ -124,28 +112,11 @@ impl<'de> Deserialize<'de> for WebhookEntry {
 /// Runtime config. Single source of truth is `settings.json` on disk;
 /// the UI POSTs updates to it via `/api/settings`.
 ///
-/// **Bootstrap-only env vars** (v0.25.7 cleanup, "no dupes" rule):
-/// only these env vars influence Config — everything else is read
-/// from `settings.json` (or, on first boot, the hardcoded
-/// [`Config::default`] values):
-/// - `PORT` — web bind port. Can't change after the server is
-///   listening, so it must be set before the daemon starts.
-/// - `AUTORIP_DIR` — where `settings.json` itself lives. Chicken-
-///   and-egg with everything else.
-/// - `AUTORIP_LOG_LEVEL` (read inside `observe::init`, not here) —
-///   tracing filter is built before web is up.
-/// - `RIP_USER`, `NFS_*` (read inside `autorip --bootstrap` in
-///   `main.rs`, not here) — mount/user setup runs before the
-///   daemon starts.
-///
-/// Operator-facing knobs (AUTO_EJECT, MAX_RETRIES, KEEP_ISO,
-/// MIN_LENGTH, MAIN_FEATURE, OUTPUT_FORMAT, NETWORK_TARGET,
-/// ON_READ_ERROR, ABORT_ON_LOST_SECS, MOVIE_DIR / TV_DIR /
-/// STAGING_DIR / OUTPUT_DIR, TMDB_API_KEY, KEYDB_*, the new
-/// FREEMKV_THREADS / LOG_RETENTION_DAYS): all UI now, no env-var
-/// reads, no duplication. Pre-0.25.7 deployments that set these in
-/// docker-compose.yml will see the env values silently ignored —
-/// operators must set them via the Settings page.
+/// Only `PORT`, `AUTORIP_DIR`, `AUTORIP_LOG_LEVEL`, `RIP_USER`, and `NFS_*`
+/// are read from the environment (all bootstrap-only, needed before
+/// `settings.json` can be loaded). Every other field is operator-facing
+/// and UI-only, with no env-var fallback — see docs/config-env-vars.md
+/// for the full bootstrap-var list and the legacy env-var deprecation.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Bootstrap-only (env `PORT`, set before the server binds). Never
@@ -234,12 +205,9 @@ pub struct Config {
     pub log_retention_days: u64,
 }
 
-/// Manual `Debug` that redacts the secret-bearing fields. The derived
-/// `Debug` would print `tmdb_api_key`, `keyserver_secret`, and the
-/// `webhook_urls` (Discord/Slack/Jellyfin URLs embed bearer tokens in
-/// their path/query) verbatim — a `tracing::debug!(?cfg)` anywhere would
-/// then spill them into logs. Non-secret fields are printed normally so
-/// the Debug output stays useful for diagnostics.
+// Manual `Debug` that redacts secret-bearing fields (tmdb_api_key,
+// keyserver_secret, webhook_urls — the latter embed bearer tokens in
+// their path/query) so `tracing::debug!(?cfg)` never leaks them.
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fn redact(s: &str) -> &'static str {
@@ -299,11 +267,9 @@ fn default_port() -> u16 {
 }
 
 impl Default for Config {
-    /// Hardcoded first-boot defaults. UI changes overlay these via
-    /// `settings.json`. No env-var sourcing here — `PORT` and
-    /// `AUTORIP_DIR` are spliced in by [`load`] because they're the
-    /// only two knobs that genuinely need to come from env (see the
-    /// `Config` doc comment).
+    // Hardcoded first-boot defaults, overlaid by `settings.json`. No
+    // env-var sourcing here — `PORT`/`AUTORIP_DIR` are spliced in by
+    // [`load`], the only two knobs that come from env.
     fn default() -> Self {
         Self {
             port: 8080,
@@ -365,22 +331,16 @@ fn dir_is_writable(p: &str) -> bool {
     }
 }
 
+// See docs/default-autorip-dir.md for the per-step OS rationale.
 /// Resolve where autorip keeps all its state (settings.json, logs, keys,
-/// staging, output). Identical logic on EVERY OS — no per-platform branches —
-/// and always returns a REAL ABSOLUTE path the UI/logs can show verbatim.
+/// staging, output). Identical logic on every OS, and always returns a
+/// real absolute path the UI/logs can show verbatim.
 ///
 /// Order:
-///   1. `AUTORIP_DIR` — explicit override. The Docker image sets this to
-///      `/config` (its bind mount), so the container is handled here.
-///   2. A writable `/config` — the container bind mount, for older Docker
-///      deployments that didn't set `AUTORIP_DIR`. On a fresh native Windows /
-///      macOS box this directory does not exist, so it is skipped — autorip
-///      never creates `C:\config` at the drive root.
-///   3. A `config` folder NEXT TO the executable — the self-contained default
-///      for a downloaded binary. `current_exe()` is absolute on every OS, so
-///      this is a real absolute path (the download folder + `config`), never a
-///      relative `.\config`. Move the folder, the app's state moves with it.
-///   4. Last resort: the absolute working directory + `config`.
+///   1. `AUTORIP_DIR` env var, if set.
+///   2. A writable `/config` (the Docker bind mount).
+///   3. A `config` folder next to the executable.
+///   4. Last resort: the working directory + `config`.
 pub fn default_autorip_dir() -> String {
     if let Ok(d) = std::env::var("AUTORIP_DIR")
         && !d.is_empty()
@@ -401,13 +361,9 @@ pub fn default_autorip_dir() -> String {
     "config".to_string()
 }
 
-/// Parse the `PORT` env var's raw string value into a bind port. Returns
-/// `None` for anything that isn't a valid 1..=65535 port (unparseable, or
-/// the reserved `0` sentinel) so the caller can warn and fall back to 8080
-/// instead of silently binding an ephemeral OS-assigned port. Pulled out of
-/// [`load`] as a pure function so the exact boundary (`"0"` rejected, a
-/// real custom port accepted) is directly testable without touching the
-/// real process environment.
+// Parses `PORT`'s raw string into a bind port; `None` for anything not a
+// valid 1..=65535 port (unparseable, or the reserved `0` sentinel) so the
+// caller can warn and fall back to 8080 instead of binding ephemerally.
 fn parse_port_env(s: &str) -> Option<u16> {
     match s.trim().parse::<u16>() {
         Ok(p) if p != 0 => Some(p),
@@ -415,13 +371,9 @@ fn parse_port_env(s: &str) -> Option<u16> {
     }
 }
 
-/// Build the bootstrap `Config` from the two env-sourced values layered
-/// onto the hardcoded defaults. Pulled out of [`load`] as its own function
-/// (rather than an inline struct-update literal) so a test can assert the
-/// env-sourced `port`/`autorip_dir` actually survive into the returned
-/// `Config` — a field silently dropped from the literal would otherwise
-/// fall back to `Config::default()`'s value via the `..` and pass every
-/// existing test.
+// Builds the bootstrap `Config` from the two env-sourced values layered
+// onto the hardcoded defaults; kept as its own function (not an inline
+// literal) so a test can assert `port`/`autorip_dir` survive the `..`.
 fn build_bootstrap_config(port: u16, autorip_dir: String) -> Config {
     Config {
         port,
@@ -430,14 +382,9 @@ fn build_bootstrap_config(port: u16, autorip_dir: String) -> Config {
     }
 }
 
-/// Decide whether a bare-run (no container) relocation of `dir` should
-/// happen: only when `dir` is still exactly the container-default path AND
-/// that default path doesn't exist on disk (no bind mount). Pulled out of
-/// [`load`] as a pure predicate — the common case (an operator who never
-/// customized `staging_dir`/`output_dir`, running in Docker with the real
-/// mount present) must NOT relocate, or every normal deployment would have
-/// its rips silently redirected into the container's ephemeral overlay
-/// instead of the operator's real storage.
+// True only when `dir` is still exactly the container-default path AND
+// that path doesn't exist on disk (no bind mount) — an operator who
+// customized the path, or has the real mount present, must NOT relocate.
 fn should_relocate_bare_run_dir(dir: &str, default_path: &str, default_path_exists: bool) -> bool {
     dir == default_path && !default_path_exists
 }
@@ -1019,12 +966,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Parse a CHECKED-IN, realistic settings.json fixture through the REAL
-    /// `load_saved` overlay and assert every field independently. This is not
-    /// a serialize→deserialize self-roundtrip (which would tautologically pass
-    /// whatever the struct serializes): the fixture is hand-authored JSON with
-    /// deployment-shaped values, so the test fails if `load_saved` ever stops
-    /// reading a field, mis-keys it, or drops a clamp/validation/migration.
+    // Parses a checked-in, hand-authored settings.json fixture through the
+    // real `load_saved` and asserts every field independently — not a
+    // serialize/deserialize self-roundtrip, so a dropped/mis-keyed field fails.
     #[test]
     fn real_settings_json_fixture_parses_field_by_field() {
         const FIXTURE: &str = include_str!("../tests/fixtures/settings.json");
@@ -1087,12 +1031,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The modern object form `{url, post_rip, post_mux, post_move}` loads with
-    /// its per-stage flags, a bare string still loads as fire-on-every-stage, an
-    /// object missing a flag defaults that flag to true (so a pre-1.6.8 config
-    /// with no `post_mux` gains `post_mux = true`), and a blank/urlless entry is
-    /// dropped — all in one mixed array, since a real settings.json may carry
-    /// any mixture after an upgrade.
+    // Exercises a mixed array: object form keeps its flags, bare string
+    // fires every stage, a missing flag defaults true, and a blank/urlless
+    // entry drops — the real shape settings.json may carry after upgrade.
     #[test]
     fn webhook_entries_load_mixed_string_and_object_forms() {
         let d = scratch("webhook-forms");
@@ -1152,10 +1093,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A `Config` whose `webhook_urls` carry per-event flags must round-trip
-    /// through `save`'s serializer and back through `load_saved` unchanged —
-    /// the object form is what gets persisted, so a saved "move only" hook must
-    /// still be "move only" on the next boot.
+    // Per-event webhook flags must round-trip through `save`/`load_saved`
+    // unchanged: a saved "move only" hook must still be "move only" on reload.
     #[test]
     fn webhook_entries_survive_save_load_round_trip() {
         let d = scratch("webhook-roundtrip");
@@ -1253,10 +1192,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Numeric knobs above their trust-boundary ceiling are clamped on load.
-    /// (Complements `load_saved_clamps_pathological_durations` with the
-    /// retention + decrypt_threads ceilings exercised via a fixture-shaped
-    /// JSON rather than struct literals.)
+    // Numeric knobs above their trust-boundary ceiling are clamped on load;
+    // complements `load_saved_clamps_pathological_durations` by exercising
+    // the retention + decrypt_threads ceilings via fixture-shaped JSON.
     #[test]
     fn over_ceiling_numeric_knobs_are_clamped_on_load() {
         let d = scratch("clamp_ceiling");
@@ -1272,15 +1210,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A realistic operator-configured duration comfortably under the 30-day
-    /// ceiling but well above an hour must survive `load_saved` UNCLAMPED.
-    /// Unlike `load_saved_clamps_pathological_durations` (which feeds
-    /// `u64::MAX` and asserts against the SAME `30 * 24 * 3600` literal the
-    /// production code uses — so a collapsed constant still passes
-    /// tautologically), this pins an absolute value: if `MAX_DURATION_SECS`
-    /// ever regressed to something near an hour (e.g. `30 + 24 + 3600`,
-    /// ~61 minutes), the UHD default of 8h (28800s) — or this test's 6h —
-    /// would get silently clamped down and this assertion would catch it.
+    // A realistic duration well under the 30-day ceiling must survive
+    // `load_saved` unclamped, pinned to an absolute value (not the
+    // production literal). See docs/config-tests.md for the full rationale.
     #[test]
     fn realistic_mid_range_duration_survives_unclamped() {
         let d = scratch("mid_range_duration");
@@ -1305,12 +1237,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// `Debug for Config` must mask every secret-bearing field and must
-    /// NEVER print the raw secret value. Nothing in the suite previously
-    /// called `format!("{:?}", cfg)` at all, so a future edit swapping
-    /// `redact(&self.x)` for `&self.x` on any of these fields would leak
-    /// straight into any `tracing::debug!(?cfg)` call site and pass every
-    /// existing test.
+    // `Debug for Config` must mask every secret-bearing field. No existing
+    // test called `format!("{:?}", cfg)`, so a future edit swapping
+    // `redact(&self.x)` for `&self.x` would otherwise leak silently.
     #[test]
     fn debug_redacts_all_secret_fields() {
         let cfg = Config {
@@ -1343,12 +1272,10 @@ mod tests {
         assert!(!debug_output.contains("keyserver-bearer-token-xyz789"));
         assert!(!debug_output.contains("DISCORD_SECRET_TOKEN"));
         assert!(!debug_output.contains("WEBHOOK_SECRET"));
-        // keyserver_url may carry a token as userinfo/query, so it's always
-        // redacted too; just confirm the placeholder appears.
+        // keyserver_url may carry a token, so it's always redacted too.
 
-        // The redaction markers must actually be present (proves the
-        // fields were visited and masked, not merely absent from a
-        // truncated/no-op Debug impl).
+        // The redaction markers must be present too, proving the fields
+        // were visited and masked rather than absent from a no-op Debug.
         assert!(debug_output.contains("<redacted>"));
         assert!(debug_output.contains("2 redacted")); // webhook_urls count
         // Non-secret fields must still print normally — Debug stays useful.
@@ -1356,10 +1283,9 @@ mod tests {
         assert!(debug_output.contains("port"));
     }
 
-    /// `Debug for Config` on an all-empty-secrets `Config::default()` must
-    /// show the "<unset>" marker, not "<redacted>" — proves `redact()`
-    /// still distinguishes "no secret configured" from "secret present and
-    /// hidden" rather than collapsing both to a fixed placeholder.
+    // On an all-empty-secrets `Config::default()`, Debug must show "<unset>"
+    // not "<redacted>" — proving `redact()` distinguishes "no secret" from
+    // "secret present and hidden" rather than a fixed placeholder.
     #[test]
     fn debug_marks_empty_secrets_as_unset_not_redacted() {
         let cfg = Config::default();
@@ -1367,12 +1293,9 @@ mod tests {
         assert!(debug_output.contains("<unset>"));
     }
 
-    /// `should_relocate_bare_run_dir` — the pure decision behind `load()`'s
-    /// bare-run relocation guard. The common real-world case (operator never
-    /// customized the path, running in Docker with the bind mount healthy)
-    /// must NOT relocate: mutating this guard's `&&`/`==`/`!` would make a
-    /// normal deployment silently redirect every rip into the container's
-    /// ephemeral overlay instead of the operator's real storage.
+    // `should_relocate_bare_run_dir` — the common case (unmodified path,
+    // real Docker mount present) must NOT relocate, or every normal
+    // deployment would redirect rips into the container's ephemeral overlay.
     #[test]
     fn should_relocate_only_when_default_path_and_mount_absent() {
         // Default path, mount present (normal Docker deployment) -> do NOT relocate.

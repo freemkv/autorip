@@ -62,31 +62,15 @@ pub fn format_iso_datetime_filename() -> String {
     format_iso_datetime().replace(':', "-")
 }
 
-// ─── Filename / display helpers ────────────────────────────────────────────
-// Pre-0.13 these lived split across `ripper`/`mover` and drifted (e.g. two
-// sanitizers disagreeing on spaces vs `_`). Consolidated here as the source of truth.
+// ─── Filename / display helpers — consolidated here as the source of truth.
 
-/// Fallback path segment when sanitization yields nothing usable.
-/// Deliberately constant + filesystem-trivial so the downstream callers
-/// (staging dir, ISO basename, library destination) always receive a
-/// real, non-traversing segment.
+// Fallback path segment when sanitization yields nothing usable: a constant,
+// filesystem-trivial, non-traversing segment callers always receive.
 const SAFE_FALLBACK: &str = "untitled";
 
-/// Make a filtered/trimmed string safe to use as a *single* path segment.
-///
-/// Input is attacker-controllable (disc UDF volume label from physical
-/// media; TMDB title from external HTTP), so the result must never be a
-/// segment that the OS interprets specially:
-///   - empty (`""`) — `Path::join("")` resolves to the parent itself, so a
-///     `remove_dir_all` on the joined path would wipe the staging/library
-///     root and every in-progress rip under it.
-///   - `"."` / `".."` / any all-dots run (`"..."`) — directory traversal:
-///     `join("..")` escapes one level up.
-///   - leading dots — hidden files and broken resume prefix-matching.
-///
-/// Leading dots are stripped; if what remains is empty or consists solely
-/// of dots, a deterministic safe fallback is substituted. Keeping this in
-/// the sanitizers covers every call site rather than each caller patching it.
+// See docs/util-safe-segment.md — makes a string safe as a single path
+// segment (input is attacker-controllable disc/TMDB text); rejects empty,
+// ".", "..", all-dots, and strips leading dots, falling back to a constant.
 fn ensure_safe_segment(s: String) -> String {
     // Strip leading dots (hidden-file / "." / ".." defense).
     let stripped = s.trim_start_matches('.');
@@ -119,24 +103,14 @@ pub fn sanitize_path_compact(name: &str) -> String {
 pub const MAX_DISC_VARIANTS: u32 = 64;
 
 /// THE "another disc of the same title" naming rule, in one place.
+/// See docs/util-disc-variant.md for why this is a single shared function.
 ///
-/// `tmdb::clean_title` strips "disc 1".."disc 4" before the TMDB lookup, so
-/// every disc of a boxset resolves to ONE title and wants ONE name — for its
-/// staging directory AND for its delivered file. Both need the same answer:
-/// keep the plain title when it is free or already this disc's, and step to
-/// `_2`, `_3`, ... when it belongs to a DIFFERENT disc.
-///
-/// This yields the variant numbers (1, 2, 3, ... [`MAX_DISC_VARIANTS`]) and
-/// returns the first one `claimable` accepts. Callers supply what "claimable"
-/// means in their domain — a staging dir carrying this disc's `.disc-label`, a
-/// library file whose bytes are this disc's output — and render the number with
-/// [`disc_variant_name`]. `None` means every variant is taken by some other
-/// disc; callers must treat that as an error, never as licence to overwrite.
-///
-/// One function on purpose. Staging naming and output naming are the same
-/// policy, and the original bug (disc 2 silently skipped as "already ripped")
-/// exists because that policy was open-coded at ten call sites, so hardening
-/// any one of them fixed nothing.
+/// Yields the variant numbers (1, 2, 3, ... [`MAX_DISC_VARIANTS`]) and
+/// returns the first one `claimable` accepts. Callers supply what
+/// "claimable" means in their domain (e.g. a staging dir carrying this
+/// disc's `.disc-label`, or a library file whose bytes are this disc's
+/// output) and render the result with [`disc_variant_name`]. `None` means
+/// every variant is taken by some other disc; treat that as an error.
 pub fn disc_variant(mut claimable: impl FnMut(u32) -> bool) -> Option<u32> {
     (1..=MAX_DISC_VARIANTS).find(|n| claimable(*n))
 }

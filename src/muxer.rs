@@ -1,33 +1,13 @@
 //! Background mux worker — pipelines mux behind the drive thread.
 //!
-//! Mirrors the shape of [`crate::mover`]:
-//! - A 10-second tick loop polling the staging dir for hand-off markers.
-//! - A `BTreeMap<String, MuxerError>` for stuck-dir surfacing.
+//! Mirrors [`crate::mover`]: a 10-second tick loop polls the staging dir for
+//! disc state, dispatching each `state: Ripped` dir (`mux_dispatch_verdict`)
+//! through the resume-mux path, then transitioning to `Done`/`Review` via
+//! `staging::mark_handoff`. On failure it records a `MuxerError` and leaves
+//! the dir `Ripped` for next-tick retry / operator inspection. Single-pass
+//! live-disc rips (`cfg.max_retries == 0`) stay inline; this worker no-ops.
 //!
-//! Hand-off contract (unified `state.json`, since 1.6.9):
-//!
-//! The staging lifecycle is one `state.json` per disc (a `StagingState` enum +
-//! data), NOT the old marker FILES. The `.ripped`/`.done` names below survive
-//! only as `StagingState` values and as a legacy read-fallback; write paths go
-//! through `crate::ripper::staging` transition helpers.
-//!
-//! 1. The drive thread (`ripper::rip_disc`) finishes sweep + patch.
-//! 2. It transitions the dir to `state: Ripped` (via `write_marker` →
-//!    `staging::try_write_state`), recording everything the mux worker needs to
-//!    reconstruct a `MuxInputs` (TMDB metadata, byte counts, batch size, ISO
-//!    filename, plus the `outputs[]` plan for a TV disc).
-//! 3. If `cfg.auto_eject` is set, it ejects the drive — the disc is no longer
-//!    needed once the ISO + `state: Ripped` are on disk.
-//! 4. The drive returns to `idle`, ready for the next disc.
-//! 5. This worker polls the staging dir, dispatches `state: Ripped` dirs
-//!    (`mux_dispatch_verdict`), muxes against the ISO, then transitions to
-//!    `state: Done`/`Review` (the mover's hand-off) via `staging::mark_handoff`.
-//!    On failure it records a `MuxerError` and leaves the dir in `Ripped` for
-//!    next-tick retry / operator inspection.
-//!
-//! Single-pass live-disc rips (`cfg.max_retries == 0`) stay inline —
-//! there's no ISO to hand off and the drive needs to be open for the
-//! whole mux. The worker is a no-op for those titles.
+//! See docs/muxer.md for the full hand-off contract and design rationale.
 
 use crate::config::Config;
 use std::collections::BTreeMap;
@@ -38,13 +18,10 @@ use std::sync::{Arc, Mutex, RwLock};
 /// complete, picked up by this worker on the next tick. Lives at
 /// `<staging>/<disc>/.ripped`.
 ///
-/// Captures the minimum the mux side needs that can't be re-derived
-/// from the ISO + mapfile + scan_image — primarily TMDB metadata,
-/// display naming, cfg-bound knobs, and a few rip-side stats that
-/// will land in the history record. Everything title-related
-/// (streams, codecs, duration, capacity) is re-derived by
-/// `Disc::scan_image` against the ISO, so the marker stays small and
-/// resilient to libfreemkv DiscTitle field shifts.
+/// Captures the minimum the mux side needs that isn't re-derived from the
+/// ISO + mapfile + scan_image — TMDB metadata, display naming, cfg-bound
+/// knobs, and rip-side stats for the history record. Title-related fields
+/// (streams, codecs, duration) are re-derived by `Disc::scan_image`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RippedMarker {
     pub schema_version: u32, // currently 1
@@ -83,17 +60,14 @@ pub struct RippedMarker {
     pub sweep_num_bad_ranges: u32,
     #[serde(default)]
     pub sweep_largest_gap_ms: f64,
-    /// Operator-confidence of the resolved title at hand-off time. True
-    /// when the fresh-rip path decided the title is trustworthy enough to
-    /// auto-file (`.done`) — either an exact normalized match with a year
-    /// OR an explicit operator override via the '✎ change' picker. The mux
-    /// worker's `resume_remux` ORs this into its own match check so an
-    /// operator's deliberate pick isn't second-guessed when the chosen
-    /// title differs from the disc's own (often cryptic) label.
+    /// Operator-confidence of the resolved title at hand-off time. True when
+    /// the fresh-rip path decided the title is trustworthy enough to
+    /// auto-file (`.done`) — an exact normalized match with a year, or an
+    /// explicit operator override via the '✎ change' picker. See
+    /// docs/muxer.md for how `resume_remux` uses this.
     ///
     /// Optional (serde default `false`) for backward-compat with pre-rc.4
-    /// markers that lack the field — those fall back to the match check
-    /// alone, the prior behavior.
+    /// markers that lack the field — those fall back to the match check alone.
     #[serde(default)]
     pub title_confident: bool,
 }
@@ -169,22 +143,18 @@ pub struct MuxerError {
 pub static MUX_ERRORS: once_cell::sync::Lazy<Mutex<BTreeMap<String, MuxerError>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(BTreeMap::new()));
 
-/// Paths the operator has dismissed (the System-tab ✕ / Clear-all). A dismissed
-/// path is suppressed from re-recording, so a persistently-erroring dir — e.g. a
-/// loss-aborted disc the worker re-scans every tick (`SkipAbortedLoss`) — STAYS
-/// cleared instead of reappearing on the next tick. The dismissal is lifted when
-/// the dir is freshly DISPATCHED (a new mux attempt may produce a new error
-/// worth showing) or when the dir is pruned (gone from staging). Without this,
-/// the move-errors' "reappears if still blocked" model would make an old
-/// loss-abort card un-dismissable — the exact "old errors hanging around"
-/// complaint.
+/// Paths the operator has dismissed (the System-tab ✕ / Clear-all). A
+/// dismissed path is suppressed from re-recording, so a persistently-erroring
+/// dir stays cleared instead of reappearing every tick. Lifted when the dir is
+/// freshly DISPATCHED (a new mux attempt may produce a new error worth
+/// showing) or when the dir is pruned (gone from staging). See docs/muxer.md
+/// for the rationale.
 pub static MUX_DISMISSED: once_cell::sync::Lazy<Mutex<std::collections::BTreeSet<String>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::BTreeSet::new()));
 
-/// Operator hint for a loss-abort error card. A loss-abort is deterministic
-/// media damage that will NOT clear on its own (an identical re-mux reproduces
-/// the exact same loss), so the card must point at the two real resolutions
-/// instead of implying a retry will help.
+// Operator hint for a loss-abort error card: deterministic media damage
+// that won't clear on its own, so point at the two real resolutions
+// instead of implying a retry will help.
 pub(crate) const ABORTED_LOSS_HINT: &str = "the delivered title lost more data than 'abort_on_lost_secs' allows, so this rip will NOT auto-retry (an identical re-mux reproduces the same loss). Re-insert the disc to Accept & deliver it as-is or run another recovery pass — or raise 'abort_on_lost_secs' in Settings first, then re-insert to deliver it automatically.";
 
 pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
@@ -284,13 +254,11 @@ fn prune_stale_errors() {
 /// Worker entry point — spawn from `main` alongside the mover thread.
 ///
 /// A 10-second tick loop: each tick scans the staging dir for `.ripped`
-/// hand-off markers (`check_and_mux`) and dispatches every one it finds
-/// through the resume-mux path (`remux_from_ripped_marker`). On success
-/// the dir gets a `.done`/`.completed` marker (handed to the mover) and
-/// the `.ripped` marker is deleted; on failure the `.ripped` marker is
-/// left in place for next-tick retry and a `MuxerError` is surfaced to
-/// the System page. SHUTDOWN-responsive so SIGTERM doesn't wait a full
-/// tick.
+/// hand-off markers (`check_and_mux`) and dispatches each through the
+/// resume-mux path (`remux_from_ripped_marker`). On success the dir gets
+/// a `.done`/`.completed` marker (handed to the mover) and `.ripped` is
+/// deleted; on failure `.ripped` stays for next-tick retry and a
+/// `MuxerError` surfaces to the System page. SHUTDOWN-responsive.
 pub fn run(cfg: &Arc<RwLock<Config>>) {
     use std::sync::atomic::Ordering;
     tracing::info!("mux loop starting");
@@ -311,12 +279,9 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
     tracing::info!("mux loop stopping");
 }
 
-/// Verdict for whether the mux worker should act on one staging dir this
-/// tick. Pure projection of the dir's marker state so the full
-/// present/absent matrix is unit-testable (`mux_dispatch_verdict`) without
-/// standing up a real mux pipeline. The driving loop in `check_and_mux`
-/// translates `Dispatch` into an actual `remux_from_ripped_marker` call and
-/// every `Skip*` into `continue`.
+// Verdict for whether the mux worker should act on one staging dir this
+// tick. Pure projection of the dir's marker state, unit-testable via
+// `mux_dispatch_verdict`; `check_and_mux` turns `Dispatch` into a real mux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MuxVerdict {
     /// `.ripped` present, no terminal marker, listing trustworthy — run the mux.
@@ -327,10 +292,9 @@ pub(crate) enum MuxVerdict {
     /// title carried more decrypt/codec loss than `abort_on_lost_secs` allows.
     /// That loss is DETERMINISTIC media damage: re-muxing the same ISO with the
     /// same keys reproduces the exact same loss, so auto-retrying every tick
-    /// just re-muxes 60 GB forever. This is a RESUMABLE, operator-resolved
-    /// state (Accept & deliver, run another recovery pass, or raise the
-    /// threshold) — exactly how the drive-side resume classifier already treats
-    /// `.aborted-loss` (see `staging.rs`). The worker surfaces the reason and
+    /// just re-muxes forever. This is RESUMABLE and operator-resolved (Accept &
+    /// deliver, run another recovery pass, or raise the threshold), matching the
+    /// drive-side classifier in `staging.rs`. The worker surfaces the reason and
     /// stops re-dispatching.
     SkipAbortedLoss,
     /// No `.ripped` hand-off marker — nothing for the worker to do here.
@@ -341,27 +305,9 @@ pub(crate) enum MuxVerdict {
     SkipUnknown,
 }
 
-/// Pure dispatch decider for the mux worker. `snap` is the result of
-/// `snapshot_staging_disc` for the dir (`None` ⇒ UNKNOWN contents).
-///
-/// Order matters and mirrors `check_and_mux`'s former inline guards:
-/// 1. `None` snapshot ⇒ `SkipUnknown` (don't dispatch on a degraded listing).
-/// 2. `.completed` OR `.failed` ⇒ `SkipTerminal` — terminal regardless of
-///    whether `.ripped` still lingers (the terminal-mux-failure `.ripped`+`.failed`
-///    re-mux loop, da16f00, lives or dies on this arm).
-/// 3. `.aborted-loss` ⇒ `SkipAbortedLoss` — a completed mux whose delivered
-///    loss exceeded `abort_on_lost_secs`. Checked AFTER `.failed`/`.completed`
-///    (so a promoted-to-terminal dir stays terminal) and BEFORE the `.ripped`
-///    dispatch, because the loss-abort leaves `.ripped` in place: without this
-///    arm the worker re-muxes the whole ISO every tick to reproduce the exact
-///    same deterministic loss. Mirrors the drive-side classifier's ordering in
-///    `staging.rs` (`.failed` before `.aborted-loss`).
-/// 4. `.ripped` absent ⇒ `SkipNoMarker`.
-/// 5. otherwise ⇒ `Dispatch`.
-///
-/// `has_ripped` is read from the same primed `read_dir` view as the snapshot
-/// so a cold-cache NFS miss can't race `.ripped` to "absent" while the
-/// snapshot surfaces a terminal marker — see `StagingSnapshot::has_ripped`.
+// Pure dispatch decider. `snap` is `snapshot_staging_disc` (`None` ⇒ UNKNOWN).
+// Order: None→SkipUnknown, terminal→SkipTerminal, aborted-loss→SkipAbortedLoss,
+// no marker→SkipNoMarker, else→Dispatch. See docs/muxer.md for the rationale.
 pub(crate) fn mux_dispatch_verdict(
     snap: Option<&crate::ripper::staging::StagingSnapshot>,
 ) -> MuxVerdict {
@@ -386,11 +332,9 @@ pub(crate) fn mux_dispatch_verdict(
     MuxVerdict::Dispatch
 }
 
-/// RAII cleanup for the `.muxing` exclusion lock. Removing the marker on drop
-/// guarantees it is cleared on every exit of one `check_and_mux` loop iteration
-/// — the success branch, the failure branch, or a panic in the mux pipeline —
-/// so a crashed/aborted mux never strands a stale `.muxing` lock that would
-/// permanently hide the dir from the drive-resume paths.
+// RAII cleanup for the `.muxing` exclusion lock: cleared on every exit of a
+// check_and_mux iteration (success, failure, or panic) so a crashed mux never
+// strands a stale lock hiding the dir from drive-resume paths.
 struct MuxingGuard<'a>(&'a Path);
 
 impl Drop for MuxingGuard<'_> {
@@ -399,37 +343,9 @@ impl Drop for MuxingGuard<'_> {
     }
 }
 
-/// Find all staging dirs with a `.ripped` marker and dispatch each
-/// through the resume-mux path. Serialized — only one mux runs at a
-/// time inside this worker thread (the next one waits on the loop
-/// tick). v0.25.3 ships with a single shared worker; concurrent
-/// muxes are explicitly out of scope (RAM/CPU thrash with no real
-/// win on a single-host setup).
-/// Whether a mux-worker failure is TERMINAL — the staging dir should be
-/// quarantined (`state → Failed`) so `mux_dispatch_verdict` stops re-Dispatching
-/// it every tick — vs left resumable. Pure projection so the decision is
-/// unit-testable without a real mux pipeline. Terminal IFF a structural
-/// FINALIZE failure surfaced (`is_finalize` — the MKV could not be finalized,
-/// e.g. E6008 no muxable frames / unseekable output). NOT terminal for:
-/// an aborted-loss (owns its own resumable state), or ANY non-finalize failure.
-///
-/// The prior gate was `!aborted_loss && has_worker_reason && !failure_retryable`
-/// — but `failure_retryable` (`RipState::failure_deferred`) is set true ONLY on
-/// the keyless deferral path. A genuinely RESUMABLE non-deferral failure — a
-/// mid-mux read error (truncated MKV), an fsync failure below RESTART_LIMIT, the
-/// unreadable-mapfile TOCTOU — has `failure_retryable == false`, so that gate
-/// FALSE-QUARANTINED it (state → Failed) even though `resume_remux`'s own gate
-/// leaves it resumable: a lost rip that would have succeeded on retry. Gating on
-/// the SAME finalize-error signal `resume_remux` uses (threaded through as
-/// `MuxHandoffOutcome::failure_finalize`) quarantines ONLY a structural finalize
-/// error. `has_worker_reason` is kept as a defensive precondition (a finalize
-/// always carries a reason).
-///
-/// The three flags are passed as named struct fields rather than positional
-/// bools: they are same-typed and adjacent, so a positional call could transpose
-/// two of them (e.g. `has_worker_reason` and `is_finalize`) and still compile —
-/// silently inverting the terminal-vs-resumable verdict, the highest-stakes bug
-/// class on this path. Named construction makes a transposition a compile error.
+// Whether a mux-worker failure is TERMINAL (state → Failed, so
+// `mux_dispatch_verdict` stops re-Dispatching) vs resumable. Terminal IFF a
+// structural FINALIZE failure. See docs/muxer.md#terminal-failure-class.
 pub(crate) struct MuxFailureClass {
     /// The mux completed but delivered loss exceeded threshold (`.aborted-loss`).
     /// It owns its own resumable state and must never be quarantined here.
@@ -446,13 +362,9 @@ pub(crate) fn mux_failure_is_terminal(class: MuxFailureClass) -> bool {
     !class.aborted_loss && class.has_worker_reason && class.is_finalize
 }
 
-/// Persist the terminal `.failed` quarantine and, when the state.json write does
-/// NOT land, surface it LOUD (syslog + an operator card) instead of swallowing
-/// it. A dropped terminal write leaves the dir in its prior `Ripped` state, so
-/// the worker re-Dispatches it every tick (a full re-mux each time) — the exact
-/// loop this quarantine exists to break, silently reopened. Returns whether the
-/// terminal state actually landed so the alarm can't be lost by discarding the
-/// `write_failed_marker` return (the round-1 gap this closes).
+// Persist the terminal `.failed` quarantine; if the state.json write does NOT
+// land, surface it LOUD (syslog + operator card) instead of silently leaving
+// the dir re-dispatching forever. See docs/muxer.md#quarantine-persistence.
 pub(crate) fn persist_terminal_mux_quarantine(path_str: &str, dir: &Path, reason: &str) -> bool {
     let landed = crate::ripper::staging::write_failed_marker(dir, reason);
     if !landed {
@@ -468,6 +380,9 @@ pub(crate) fn persist_terminal_mux_quarantine(path_str: &str, dir: &Path, reason
     landed
 }
 
+// Find all staging dirs with a `.ripped` marker and dispatch each through
+// the resume-mux path. Serialized — only one mux runs at a time in this
+// worker thread; concurrent muxes are explicitly out of scope.
 fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
     // Recover from a poisoned config lock rather than returning (which,
     // combined with the per-tick loop, would silently wedge the worker
@@ -684,23 +599,9 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
     }
 }
 
-/// Should the mux worker drive the origin device to "done" after a
-/// successful mux? Pure projection of the device key + its current status
-/// so the contract is unit-testable without standing up STATE + a real mux.
-///
-/// Two rules:
-/// 1. A real origin device only needs the revert if it is STILL "ripping"
-///    — the inline-mux FALLBACK path (the `.ripped` marker write failed, so
-///    `rip_disc` muxed inline while leaving the tile "ripping"). On the
-///    normal `.ripped` hand-off path the tile is already "done" (the read
-///    finished) and this is a no-op, so the synthetic `_mux` worker can
-///    never push a real "done" tile back through "ripping" (bug #1).
-/// 2. A synthetic underscore-prefixed `origin` (defensive — should not
-///    occur, the marker's `origin_device` is the physical drive) is never
-///    reverted: those carry no user-visible tile.
-///
-/// `status == None` (the device entry vanished — re-used / cleared) ⇒ no
-/// revert, matching the prior `.unwrap_or(false)`.
+// Should the mux worker drive the origin device to "done"? Only if it's
+// still "ripping" (the inline-mux fallback path) and not a synthetic
+// `_`-prefixed origin. See docs/muxer.md#origin-revert-rules.
 pub(crate) fn should_revert_origin_to_done(origin: &str, status: Option<&str>) -> bool {
     !origin.is_empty() && !origin.starts_with('_') && status == Some("ripping")
 }
@@ -838,10 +739,9 @@ mod tests {
         assert_eq!(back.tmdb_media_type, "tv");
     }
 
-    /// Backward-compat: a pre-rc.4 `.ripped` marker on disk has no
-    /// `tmdb_media_type` field. It must deserialize (serde default = empty
-    /// string) rather than failing the resume. The resume mux path then
-    /// falls back to "movie" — identical to the mover's own default.
+    // Backward-compat: a pre-rc.4 marker lacks `tmdb_media_type`; it must
+    // deserialize (serde default = empty) rather than fail resume, then the
+    // resume mux path falls back to "movie" — same as the mover's default.
     #[test]
     fn marker_without_media_type_defaults_empty() {
         let json = r#"{
@@ -1494,10 +1394,9 @@ mod tests {
         assert_eq!(verdict_for(&[]), MuxVerdict::SkipNoMarker);
     }
 
-    /// The quarantine decision the mux worker's failure branch now makes: ONLY a
-    /// structural finalize failure (`is_finalize`) is terminal → `state → Failed`.
-    /// This predicate is what stops the re-mux-forever loop; the non-terminal
-    /// rows are the cases that MUST stay resumable.
+    // Quarantine decision: ONLY a structural finalize failure (`is_finalize`)
+    // is terminal → `state → Failed`. This predicate stops the re-mux-forever
+    // loop; the non-terminal rows below MUST stay resumable.
     #[test]
     fn mux_failure_is_terminal_truth_table() {
         assert!(
@@ -1537,13 +1436,9 @@ mod tests {
         );
     }
 
-    /// FIX 2 regression: the worker's quarantine gate is fed from the
-    /// `MuxHandoffOutcome` the resume path returns. A resumable, NON-finalize
-    /// worker failure (a mid-mux read error — truncated MKV, resumable) carries
-    /// `failure_finalize == false`, so it must NOT be quarantined; a structural
-    /// finalize failure carries `failure_finalize == true`, so it MUST be. The
-    /// prior gate keyed on `!failure_retryable`, which is false for BOTH — so it
-    /// false-quarantined the read error (a lost rip that would retry-succeed).
+    // FIX 2 regression: the quarantine gate keys on `failure_finalize`, not the
+    // old `!failure_retryable` (false for both resumable and terminal cases,
+    // which false-quarantined resumable reads). See docs/muxer.md#fix-2.
     #[test]
     fn resumable_worker_failure_not_quarantined_finalize_is() {
         use crate::ripper::resume::MuxHandoffOutcome;
@@ -1582,10 +1477,9 @@ mod tests {
         );
     }
 
-    /// End-to-end mechanism the fix relies on: a Ripped dir dispatches; after the
-    /// worker's failure branch writes the terminal state (as it now does on a
-    /// non-retryable finalize error), the verdict flips to SkipTerminal so the
-    /// dir is never re-dispatched — the Decoy_Feature_3 / E6008 loop, fixed.
+    // End-to-end: a Ripped dir dispatches; once the failure branch writes the
+    // terminal state on a non-retryable finalize error, the verdict flips to
+    // SkipTerminal so the dir is never re-dispatched (the E6008 loop, fixed).
     #[test]
     fn terminal_finalize_quarantine_stops_redispatch() {
         let tmp = TempDir::new().unwrap();
@@ -1616,16 +1510,9 @@ mod tests {
         );
     }
 
-    /// FIX (entry-side TOCTOU): the `.muxing` ownership lock must be stamped the
-    /// INSTANT the Dispatch verdict commits — before `read_marker` + logging — so a
-    /// concurrent web entry's `is_muxing` guard sees the lock across the whole
-    /// dispatch. Stamping it only just before the mux (after `read_marker`) left a
-    /// window where `is_muxing == false` and the entry raced the muxer's state.json
-    /// write. Pins, at source level, that `write_muxing_marker` precedes
-    /// `read_marker(&dir)` in the worker loop.
-    ///
-    /// Red-before-green: the pre-fix order (stamp after `read_marker`) reverses the
-    /// two indices and fails this assertion.
+    // FIX (entry-side TOCTOU): `.muxing` must be stamped the INSTANT Dispatch
+    // commits, before `read_marker`, so a concurrent web entry's `is_muxing`
+    // guard covers the whole dispatch. See docs/muxer.md#muxing-toctou.
     #[test]
     fn muxing_marker_stamped_before_marker_read() {
         let src = crate::util::source_lf(include_str!("muxer.rs"));
@@ -1650,14 +1537,9 @@ mod tests {
         );
     }
 
-    /// FIX-3 production wiring: the mux worker's terminal-quarantine site consumes
-    /// `write_failed_marker`'s return. When the state.json write LANDS, the dir goes
-    /// terminal and no operator card is raised. When it does NOT land (unwritable
-    /// staging), the site must surface a LOUD operator card so the stuck quarantine
-    /// is visible instead of silently re-dispatching forever.
-    ///
-    /// Red-before-green: if the site reverts to discarding the return (no alarm on a
-    /// failed write), the `MUX_ERRORS` assertion below goes RED.
+    // FIX-3: the terminal-quarantine site consumes `write_failed_marker`'s
+    // return — a failed write must raise a LOUD operator card instead of
+    // silently re-dispatching forever. See docs/muxer.md#fix-3.
     #[test]
     fn persist_terminal_mux_quarantine_alarms_when_write_fails() {
         // Happy path: a writable dir goes terminal, returns true, raises no card.
@@ -1704,10 +1586,9 @@ mod tests {
         clear_error(&bad_path);
     }
 
-    /// TRANSITION: ripped → mux success → completed → (mover takes over).
-    /// After the worker writes `.completed`, a lingering `.ripped` (delete
-    /// failed) must flip the verdict from Dispatch to SkipTerminal, so the
-    /// worker doesn't wipe the just-written MKV and re-mux.
+    // TRANSITION: ripped → completed. After `.completed` is written, a
+    // lingering `.ripped` (delete failed) must still flip the verdict to
+    // SkipTerminal, so the worker doesn't wipe the MKV and re-mux.
     #[test]
     fn mux_transition_ripped_to_completed_stops_dispatch() {
         let tmp = TempDir::new().unwrap();
@@ -1733,10 +1614,9 @@ mod tests {
         );
     }
 
-    /// TRANSITION: ripped → loss-abort → failed → not re-dispatched.
-    /// Mirrors a terminal mux failure branch, which writes `.failed` (and
-    /// deletes `.ripped`). Even if `.ripped` survives, the verdict must be
-    /// terminal — the re-mux-forever loop is impossible.
+    // TRANSITION: ripped → failed → not re-dispatched. Mirrors a terminal
+    // mux failure branch (writes `.failed`); even if `.ripped` survives, the
+    // verdict must stay terminal — the re-mux-forever loop is impossible.
     #[test]
     fn mux_transition_ripped_to_failed_stops_dispatch() {
         let tmp = TempDir::new().unwrap();
@@ -1761,15 +1641,9 @@ mod tests {
         );
     }
 
-    /// Catches the mutation that restores `pending_queue`'s silent
-    /// `Err(_) => return Vec::new()` on an unreadable staging root.
-    ///
-    /// An unreadable staging root is not an empty mux queue. When the share is
-    /// down (NFS timeout, permissions lost, the mount not yet up at container
-    /// start) the System page rendered "no jobs queued" and there was nothing
-    /// anywhere — no log line, no error card — to say the list was a guess.
-    /// That is the failure-that-looks-like-success class: an operator sees a
-    /// queue they believe is empty and concludes the mux worker is idle.
+    // Catches the mutation that restores `pending_queue`'s silent
+    // `Err(_) => return Vec::new()`: an unreadable staging root is not an
+    // empty queue and must be logged. See docs/muxer.md#silent-empty-queue.
     #[test]
     fn pending_queue_logs_an_unreadable_staging_root() {
         use std::sync::{Arc, Mutex};
@@ -1823,15 +1697,9 @@ mod tests {
         );
     }
 
-    /// Catches the mutation that restores `pending_queue`'s
-    /// `.filter_map(|e| e.ok())` over the staging entries.
-    ///
-    /// A source-pin because the branch needs a dentry-level failure (an NFS
-    /// ESTALE on one entry of an otherwise-healthy directory) that cannot be
-    /// synthesised locally. `staging::resume_or_quarantine_staging` already
-    /// carries the same defense with the same reasoning: dropping a per-entry
-    /// error silently removes a whole disc subdir from the queue, and the
-    /// operator watches a queued title simply disappear.
+    // Catches the mutation that restores `pending_queue`'s
+    // `.filter_map(|e| e.ok())`: a source-pin since an NFS ESTALE on one
+    // entry can't be synthesised locally. See docs/muxer.md#per-entry-error.
     #[test]
     fn pending_queue_does_not_flatten_away_a_per_entry_error() {
         let src = crate::util::source_lf(include_str!("muxer.rs"));

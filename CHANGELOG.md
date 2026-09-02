@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.7.0] — 2026-09-02
+
+### Fixed
+
+- `staging`: a `state.json` written under a different schema version is now declined (starting a fresh run) instead of being resumed on, which could mis-map stage state across a schema change.
+
+### Changed
+
+- Version aligned to 1.7.0 for the unified release. Documentation fixes (build-from-source instructions) and internal CI/lint hardening.
+
 ## [1.6.14] — 2026-08-31
 
 ### Fixed

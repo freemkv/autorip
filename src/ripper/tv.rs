@@ -18,13 +18,8 @@ pub fn select_episode_titles(titles: &[DiscTitle], min_len_secs: u64) -> Vec<usi
     dedup_by_content(titles, cluster)
 }
 
-/// The indices whose duration sits in the modal episode-length cluster.
-///
-/// Uses the median of the above-minimum candidates as the cluster centre and
-/// keeps everything within a generous tolerance (the larger of 5 min and 25%).
-/// A "play all" title (≈ N× an episode) lands far above the median and is
-/// dropped; short extras land far below and are dropped. With 0–1 candidates
-/// there is no cluster to speak of, so the candidates pass through unchanged.
+// Indices whose duration sits in the modal episode-length cluster.
+// See docs/tv-episode-cluster.md for the median/tolerance rationale.
 fn episode_cluster(durations: &[f64], min_len: f64) -> Vec<usize> {
     let cands: Vec<usize> = durations
         .iter()
