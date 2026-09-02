@@ -144,12 +144,9 @@ fn test_eject_does_not_double_drop() {
     );
 }
 
-/// (a) A prior handle that has already *finished* is reaped quietly:
-/// `register_rip_thread` joins it under the lock (safe — `is_finished()`
-/// guarantees `join()` won't block) and returns `Ok(())` with no
-/// "prior thread not reaped" warning. Models the observed benign case:
-/// an `on_insert=scan` thread completes, then the rip thread registers
-/// over its already-finished handle.
+// (a) A finished prior handle is reaped quietly: register_rip_thread joins
+// it under the lock (safe — is_finished() guarantees join() won't block)
+// and returns Ok(()), modeling a scan thread that finishes first.
 #[test]
 fn test_register_reaps_finished_prior_quietly() {
     let device = "sg_reap_finished_test";
@@ -195,12 +192,9 @@ fn test_register_reaps_finished_prior_quietly() {
     assert!(exited.load(Ordering::Relaxed), "next worker ran");
 }
 
-/// (b) A prior handle that is still *running* is NOT overwritten:
-/// `register_rip_thread` returns `Err(PriorThreadRunning(handle))`,
-/// handing back the new handle (so it is never dropped on the floor)
-/// and leaving the running prior registered so stop/eject/shutdown can
-/// still drain it. This is the latent-hazard branch (the v0.13.6 bug
-/// class) the fix defends against.
+// (b) A still-running prior is NOT overwritten: register_rip_thread returns
+// Err(PriorThreadRunning(handle)), handing the new handle back (never
+// dropped) and leaving the prior registered so stop/eject can drain it.
 #[test]
 fn test_register_rejects_running_prior_without_orphaning() {
     let device = "sg_reject_running_test";
@@ -251,13 +245,9 @@ fn test_register_rejects_running_prior_without_orphaning() {
     );
 }
 
-/// (c) The spawn-site guard prevents a double-spawn while a worker is
-/// running, and the running worker still drains via stop. Drives
-/// `spawn_rip_thread` (the production helper all three spawn sites use):
-/// the first spawn registers; a second spawn for the same device while
-/// the first is still running returns `Err(AlreadyExists)` (the same
-/// error shape the callers' spawn-failure rollback handles), and the
-/// first worker remains drainable.
+// (c) The spawn-site guard blocks a double-spawn while a worker runs:
+// spawn_rip_thread returns Err(AlreadyExists) for a second spawn on the
+// same device, and the first worker remains drainable via stop.
 #[test]
 fn test_spawn_guard_blocks_double_spawn_and_drain_still_works() {
     let device = "sg_double_spawn_test";

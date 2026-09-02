@@ -1,21 +1,12 @@
 //! Staging-directory bookkeeping: free-space probe + the unified per-disc
-//! lifecycle state.
+//! lifecycle state (`state.json`: a [`StagingState`] enum + data + an
+//! `outputs[]` plan, written atomically via crash-safe `tmp → fsync →
+//! rename → dir-fsync`). Old marker files (`.done`/`.completed`/`.failed`/
+//! `.ripped`/…) survive only as `StagingState` values and legacy-upgrade
+//! read-fallback constants.
 //!
-//! Since 1.6.9 the per-disc lifecycle is ONE atomic `state.json` (a
-//! [`StagingState`] enum + data + an `outputs[]` plan), NOT the old marker
-//! FILES — see the "Unified per-disc state" section below, which is the source
-//! of truth. The old marker names (`.done`/`.completed`/`.failed`/`.ripped`/…)
-//! survive only as `StagingState` values, as the marker-name constants used by
-//! the one-time legacy-upgrade read-fallback, and in tests. Steady-state writes
-//! never create those files; they go through the `mark_*` / `write_*` /
-//! `mutate_state` transition helpers, each doing a single crash-atomic
-//! `tmp → fsync → rename → dir-fsync` rewrite of `state.json`.
-//!
-//! Lifecycle at a glance: `Sweeping` (owned, sweeping) → `Ripped` (handed to the
-//! mux worker) → `Done`/`Review` (handed to the mover) → `Completed`; terminal
-//! `Failed`; resumable `AbortedLoss`. `muxing` / `accept_loss` / `restart_count`
-//! are orthogonal fields. `restart_count` is the three-strike gate against an
-//! infinite container restart loop from a deterministic post-startup crash.
+//! Lifecycle: `Sweeping` → `Ripped` → `Done`/`Review` → `Completed`;
+//! terminal `Failed`; resumable `AbortedLoss`. See docs/staging.md.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -33,16 +24,12 @@ pub const COMPLETED_MARKER: &str = ".completed";
 pub const FAILED_MARKER: &str = ".failed";
 /// Resumable-failure marker for an abort-on-loss outcome (main-movie /
 /// demux loss exceeded `abort_on_lost_secs` after retries). UNLIKE the
-/// terminal `.failed`, this dir is RECOVERABLE: the full ISO + mapfile are on
-/// disk, so a raised `abort_on_lost_secs`, a code change, or a fresh patch pass
-/// (drive reload) may bring the loss under threshold on a later attempt. The
-/// resume scan re-enters such a dir instead of quarantining it. Carries a JSON
-/// `{reason, attempt, timestamp}` body; `attempt` is the count of abort-on-loss
-/// outcomes so far. A loss-abort is DETERMINISTIC (a plain re-rip won't change
-/// the media damage), so the dir stays resumable INDEFINITELY — it is never
-/// auto-promoted to a terminal `.failed` by attempt count. The operator resolves
-/// it: Accept the loss (deliver as-is) or run another recovery pass. The
-/// `attempt` counter is informational (how many times it has aborted).
+/// terminal `.failed`, this dir is RECOVERABLE: the resume scan re-enters
+/// it instead of quarantining it. Carries a JSON `{reason, attempt,
+/// timestamp}` body; `attempt` is the count of abort-on-loss outcomes so
+/// far. Never auto-promoted to `.failed` by attempt count — the operator
+/// resolves it (accept the loss, or run another recovery pass).
+/// See docs/staging.md — `ABORTED_LOSS_MARKER`.
 pub const ABORTED_LOSS_MARKER: &str = ".aborted-loss";
 /// Hand-off marker written by `rip_disc` and consumed by the mux worker.
 /// Kept here (duplicated from `crate::muxer::RIPPED_MARKER_NAME`) so the
@@ -66,19 +53,12 @@ pub const SWEEPING_MARKER: &str = ".sweeping";
 pub const MUXING_MARKER: &str = ".muxing";
 pub const RESTART_COUNT_FILE: &str = ".restart_count";
 
-/// The disc's RAW volume label (UDF `meta_title`, else `volume_id`), recorded
-/// in its staging dir at creation.
-///
-/// The dir itself is named for the TMDB-resolved title, which is deliberately
-/// NOT unique: `tmdb::clean_title` strips "disc 1".."disc 4" before the lookup,
-/// so every disc of a boxset resolves to the same title and wants the same
-/// directory. The raw label is the thing that still tells them apart, so it is
-/// recorded here and used to decide whether an existing dir belongs to THIS
-/// disc or merely to one with the same title.
-///
-/// Absent in dirs written before this existed. A missing label reads as "same
-/// disc", which preserves the old skip-on-`.completed` behaviour for legacy
-/// staging rather than re-ripping it on upgrade.
+/// The disc's RAW volume label (UDF `meta_title`, else `volume_id`),
+/// recorded in its staging dir at creation. Used to tell apart same-title
+/// boxset discs (dir names collapse after `tmdb::clean_title` strips
+/// "disc N"). Absent in dirs written before this existed; a missing
+/// label reads as "same disc" (legacy skip-on-`.completed` behaviour).
+/// See docs/staging.md — `DISC_LABEL_FILE`.
 pub const DISC_LABEL_FILE: &str = ".disc-label";
 
 // Unified per-disc state (`state.json`) supersedes the old marker-file machine
@@ -291,13 +271,9 @@ pub fn read_state(staging_disc_dir: &Path) -> Option<DiscState> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Like [`read_state`], but when the file EXISTS yet fails to parse, log a loud
-/// error before returning `None`. Used by the read-modify-write transition
-/// helpers, whose `unwrap_or_else(DiscState::new)` fallback would otherwise
-/// SILENTLY discard all accumulated data (title, season, `outputs[]`, …) if a
-/// present `state.json` were ever unreadable (external corruption / bit-rot —
-/// our own writes are atomic, so this is not reachable from a torn write). A
-/// legitimately absent file (the first write) logs nothing.
+// Like `read_state`, but logs loudly if the file exists but fails to parse,
+// so read-modify-write callers' `unwrap_or_else(DiscState::new)` fallback
+// doesn't silently discard accumulated data on external corruption.
 fn read_state_or_warn_corrupt(staging_disc_dir: &Path) -> Option<DiscState> {
     let p = state_path(staging_disc_dir);
     let Ok(bytes) = std::fs::read(&p) else {
@@ -345,28 +321,15 @@ pub fn try_write_state(staging_disc_dir: &Path, st: &DiscState) -> io::Result<()
     write_marker_durable(&p, serialized.as_bytes())
 }
 
-/// Read-modify-write `state.json`: apply `f` to the current state (or a fresh
-/// `new(default_state)` when the file is absent) and durably rewrite it. This is
-/// the single transition primitive; a transition mutates fields, it never blows
-/// away accumulated data. Safe because one writer owns a staging dir at a time
-/// (the sweeping/muxing ownership rules, now fields).
+/// Read-modify-write `state.json`: apply `f` to the current state (or a
+/// fresh `new(default_state)` when the file is absent) and durably
+/// rewrite it. This is the single transition primitive; a transition
+/// mutates fields, it never blows away accumulated data. Safe because
+/// one writer owns a staging dir at a time (the sweeping/muxing
+/// ownership rules, now fields).
 ///
-/// RESIDUAL RACE (documented, partially mitigated — needs a follow-up design):
-/// this read-modify-write is lock-free. The "one writer at a time" invariant is
-/// enforced only by the advisory `.muxing`/`.sweeping` ownership markers, and
-/// not every caller honours them. The mux worker's terminal `write_failed_marker`
-/// (state → Failed) and the web `handle_accept_loss` handler's
-/// `apply_accept_loss_reopen` (state → Ripped) both mutate the SAME dir's
-/// state.json with no shared lock, and the worker does not hold the physical
-/// device's claim (it runs on the synthetic `_mux` device), so the device claim
-/// does not serialise them. A fully correct fix is a per-dir advisory lock (or
-/// flock) wrapping the whole read→modify→write in every writer — broad
-/// restructuring, deliberately NOT attempted here. As a minimal mitigation the
-/// primary observed window is closed at the call site: `handle_accept_loss`
-/// refuses (409) while `.muxing` is set, and the worker clears `.muxing`
-/// atomically with its terminal write, so the accept path only proceeds once
-/// the dir is stable. Other lock-free writers on the same dir remain
-/// theoretically racy under concurrent mutation.
+/// Lock-free; see docs/staging.md — `mutate_state` residual race — for
+/// the known, partially-mitigated concurrent-writer race.
 pub fn mutate_state(
     staging_disc_dir: &Path,
     default_state: StagingState,
@@ -485,16 +448,9 @@ impl DiscState {
     }
 }
 
-/// Available bytes at the given path's filesystem, via `statvfs(3)`.
-/// Returns None on any error (path missing, not POSIX, syscall failure).
-/// Used by the pre-flight check in `rip_disc` to refuse rips that would
-/// run out of space mid-stream.
-///
-/// `clippy::unnecessary_cast` allowed here intentionally: libc's
-/// `f_bavail` / `f_frsize` are `c_ulong` which is u64 on
-/// x86_64 Linux (so clippy on x86_64 sees the cast as a no-op) but
-/// u32 on some 32-bit / BSD targets (where the cast is required).
-/// Drop the cast and the build breaks on the latter.
+// Available bytes at the given path's filesystem, via statvfs(3). None on
+// any error. `unnecessary_cast` allowed: libc's f_bavail/f_frsize are
+// c_ulong (u64 on x86_64 Linux, u32 on some 32-bit/BSD targets needing the cast).
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 pub(super) fn staging_free_bytes(path: &str) -> Option<u64> {
@@ -511,12 +467,9 @@ pub(super) fn staging_free_bytes(path: &str) -> Option<u64> {
     Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
-/// Available bytes at the given path's volume on Windows, via
-/// `GetDiskFreeSpaceExW`. Returns None on any error (path missing, not a real
-/// volume), matching the unix `statvfs` contract so the pre-flight check
-/// behaves identically across platforms. Without this the guard was dead on
-/// Windows (`cfg(not(unix)) → None`), so a too-small staging volume would
-/// ENOSPC mid-rip with no warning.
+// Available bytes at the given path's volume on Windows, via
+// GetDiskFreeSpaceExW; matches the unix statvfs contract (None on error)
+// so the pre-flight space check behaves identically cross-platform.
 #[cfg(windows)]
 pub(super) fn staging_free_bytes(path: &str) -> Option<u64> {
     use std::ffi::OsStr;
@@ -617,10 +570,8 @@ pub fn increment_restart_count(staging_disc_dir: &Path) -> io::Result<u64> {
     Ok(next)
 }
 
-/// Durably write a marker file: write `<path>.tmp`, `sync_all()` it, rename(2)
-/// over the final name, then fsync the containing directory. A crash mid-write
-/// thus never leaves an empty/torn marker — readers observe either the old
-/// state or the complete new one. Mirrors `increment_restart_count`.
+// Durably write a marker: tmp write + sync_all + rename + dir fsync, so a
+// crash mid-write never leaves a torn marker. Mirrors `increment_restart_count`.
 pub(crate) fn write_marker_durable(path: &Path, contents: &[u8]) -> io::Result<()> {
     let tmp = match path.file_name() {
         Some(name) => {
@@ -668,17 +619,9 @@ pub fn clear_restart_count(staging_disc_dir: &Path) {
 
 /// Write the `.failed` marker with a structured reason. Returns whether the
 /// terminal `state: Failed` actually LANDED on disk (`true`) or the state.json
-/// write failed (`false`).
-///
-/// A dropped write here is the dangerous case: the dir stays in its prior state
-/// (typically `Ripped`), so the mux worker re-Dispatches it every ~10s tick
-/// forever — the exact loop this quarantine exists to break, silently reopened.
-/// The return value lets the quarantine call sites surface a stuck quarantine
-/// LOUDLY (operator signal) instead of swallowing it; the legacy-marker cleanup
-/// stays best-effort. Not `#[must_use]`: the one-shot startup/auto-resume call
-/// sites already get the loud `tracing::error!` above and have nothing to
-/// retry; only the mux worker's per-tick loop consults the return to raise an
-/// operator card.
+/// write failed (`false`); callers that loop on the mux worker's per-tick
+/// re-dispatch should check this to raise an operator card on a stuck
+/// quarantine. See docs/staging.md — `write_failed_marker`.
 pub fn write_failed_marker(staging_disc_dir: &Path, reason: &str) -> bool {
     // Terminal transition → `state: Failed`. This atomic rewrite supersedes
     // any in-progress `.sweeping`/`.muxing` ownership so `disc_owned_by_worker`
@@ -815,15 +758,12 @@ pub fn read_aborted_loss(staging_disc_dir: &Path) -> Option<(String, u64)> {
 }
 
 /// Record an abort-on-loss outcome for `staging_disc_dir`. Reads the prior
-/// attempt count from any existing `.aborted-loss` marker, increments it, and
-/// (re)writes a fresh `.aborted-loss` — the dir ALWAYS stays resumable.
-///
-/// A loss-abort is deterministic media damage, so it is NEVER promoted to a
-/// terminal `.failed` by attempt count; the operator resolves it (Accept the
-/// loss, or run another recovery pass). Clears `.restart_count` (a
+/// attempt count from any existing `.aborted-loss` marker, increments it,
+/// and (re)writes a fresh `.aborted-loss` — the dir ALWAYS stays resumable
+/// (never promoted to terminal `.failed`). Clears `.restart_count` (a
 /// deterministically-lossy rip must not ALSO accrue crash-restart counts).
-/// Always returns `false` (never terminal) — the `bool` return is retained so
-/// existing callers compile unchanged; their terminal branch is now inert.
+/// Always returns `false`; the `bool` return is retained so existing
+/// callers compile unchanged (their terminal branch is now inert).
 pub fn mark_aborted_on_loss(staging_disc_dir: &Path, reason: &str) -> bool {
     let prior = read_aborted_loss(staging_disc_dir)
         .map(|(_, a)| a)
@@ -886,16 +826,9 @@ pub fn clear_muxing_marker(staging_disc_dir: &Path) {
 
 /// Release the `.sweeping` ownership. Called on a graceful stop / rip-thread
 /// cancel (the `SweepingGuard` drop and `clear_inprogress_markers`) and,
-/// vestigially, by paths that supersede a sweep.
-///
-/// A graceful stop is NOT a crash, so an interrupted sweep must become plain
-/// resumable partial state that the startup classifier does NOT restart-count
-/// (the exact "don't walk a healthy rip to `.failed`" invariant). The faithful
-/// unified representation of "resumable, not owned, no marker" is the ABSENCE of
-/// `state.json` (the legacy model literally had no marker here) — so when the
-/// dir is still `Sweeping`, remove `state.json`, leaving the ISO/mapfile
-/// artifacts. Once the sweep has already advanced (`Ripped`/terminal), this is a
-/// no-op, so it is safe to call unconditionally.
+/// vestigially, by paths that supersede a sweep. Safe to call
+/// unconditionally: a no-op once the sweep has already advanced.
+/// See docs/staging.md — `clear_sweeping_marker`.
 pub fn clear_sweeping_marker(staging_disc_dir: &Path) {
     if let Some(st) = read_state(staging_disc_dir)
         && st.state == StagingState::Sweeping
@@ -906,16 +839,10 @@ pub fn clear_sweeping_marker(staging_disc_dir: &Path) {
 }
 
 /// Clear every `.sweeping` / `.muxing` in-progress marker under `staging_root`.
-/// Called on GRACEFUL shutdown (SIGTERM: operator redeploy, reboot, Watchtower
-/// update, `docker stop`). A clean stop is NOT a crash, so every interrupted dir
-/// must be left clean-resumable — otherwise the startup classifier reads the
-/// leftover marker as an in-progress crash and bumps `.restart_count` toward a
-/// false `.failed`. This is the belt-and-suspenders to the rip-thread cancel:
-/// even if a rip drain overruns docker's stop-grace and the process is SIGKILLed
-/// before the SweepingGuard/MuxingGuard `Drop` runs, the markers are already
-/// gone, so the restart never counts the stop. Only a TRUE ungraceful crash
-/// (panic=abort / OOM / power loss — none of which reach this path) can leave a
-/// marker behind to be counted.
+/// Called on GRACEFUL shutdown (SIGTERM: operator redeploy, reboot,
+/// Watchtower update, `docker stop`) so every interrupted dir is left
+/// clean-resumable instead of accruing a false `.restart_count`.
+/// See docs/staging.md — `clear_inprogress_markers`.
 pub fn clear_inprogress_markers(staging_root: &Path) {
     let entries = match std::fs::read_dir(staging_root) {
         Ok(e) => e,
@@ -956,17 +883,11 @@ pub fn write_handoff_marker(marker_path: &Path, contents: &[u8]) -> io::Result<(
 }
 
 /// Hand-off transition: a completed mux moves the dir to `state: Done` (title
-/// confident → the mover auto-files it) or `state: Review` (held for operator
-/// confirmation). `apply` populates the mover-facing metadata + `outputs`
-/// (title, year, media_type, tmdb_id, season, poster, overview, …). This is the
-/// single hand-off writer; every completion path (ISO, MKV-resume, inline-mux)
-/// routes through it, so the `season`/`tmdb_id` propagation is identical on
-/// every path (the pre-unification bug where only the ISO path carried them).
-///
-/// Returns whether the durable write appeared to succeed — mirrors the old
-/// `write_handoff_marker` `io::Result` at the call sites, but always `Ok` here
-/// since the underlying write is best-effort-logged; kept infallible so callers
-/// that gated on the write result now gate on `true`.
+/// confident → the mover auto-files it) or `state: Review` (held for
+/// operator confirmation). `apply` populates the mover-facing metadata +
+/// `outputs` (title, year, media_type, tmdb_id, season, poster, overview,
+/// …). Always returns `Ok`; kept infallible so callers gate on `true`.
+/// See docs/staging.md — `mark_handoff`.
 pub fn mark_handoff(
     staging_disc_dir: &Path,
     title_confident: bool,
@@ -1020,17 +941,12 @@ pub fn is_network_output(output_format: &str, network_target: &str) -> bool {
     output_format == crate::config::OUTPUT_FORMAT_NETWORK && !network_target.is_empty()
 }
 
-/// The durability gate: may a success marker be written yet?
-///
-/// `false` means the output is not provably on stable storage, so `.done` and
-/// `.completed` must be withheld and the staging dir preserved for a retry —
-/// writing them anyway hands the mover a page-cache-only, possibly truncated
-/// file and files it into the operator's library as a finished title.
-///
-/// The fsync is injected so the decision is testable without a filesystem. It
-/// is NOT evaluated for a network sink, which is the point: an eagerly
-/// evaluated `is_network || fsync(path)` would still stat a path that does not
-/// exist.
+/// The durability gate: may a success marker be written yet? `false` means
+/// the output is not provably on stable storage, so `.done` and
+/// `.completed` must be withheld and the staging dir preserved for a
+/// retry. `fsync` is injected so the decision is testable without a
+/// filesystem, and is NOT evaluated for a network sink.
+/// See docs/staging.md — `durability_gate_passes`.
 pub fn durability_gate_passes(is_network: bool, fsync: impl FnOnce() -> bool) -> bool {
     if is_network {
         return true;
@@ -1038,26 +954,14 @@ pub fn durability_gate_passes(is_network: bool, fsync: impl FnOnce() -> bool) ->
     fsync()
 }
 
-/// Force the just-muxed output file to durable storage before any
-/// success marker (`.done` / `.completed`) is written.
-///
-/// The library's mux `finish()` only flushes its `BufWriter` down to the
-/// OS — the bytes can still be sitting in the page cache when autorip
-/// writes the staging markers and the mover acts on them. On a crash or
-/// power loss in that window the marker says "done" but the file on disk
-/// is truncated. `sync_all()` (fsync) closes that gap.
-///
-/// Returns `true` only when the output was provably synced to durable
-/// storage. The library's mux `finish()` swallows an fsync timeout/halt
-/// (returns Ok to bound the hang), so durability cannot be assumed from a
-/// successful mux alone — this fsync is the gate. A `false` return means
-/// the open or fsync failed; the caller MUST NOT write the
-/// `.done`/`.completed` success marker this cycle, leaving the staging dir
-/// resumable so a later attempt re-runs the durable flush.
-///
-/// Call this ONLY on the success path, immediately before the marker
-/// write, and only for a real local output file (skip `network://` sinks,
-/// which have no local path).
+/// Force the just-muxed output file to durable storage before any success
+/// marker (`.done` / `.completed`) is written. Returns `true` only when
+/// the output was provably synced; a `false` return means the caller
+/// MUST NOT write the success marker this cycle, leaving the staging dir
+/// resumable so a later attempt re-runs the durable flush. Call this ONLY
+/// on the success path, immediately before the marker write, and only
+/// for a real local output file (skip `network://` sinks).
+/// See docs/staging.md — `fsync_output_file`.
 pub fn fsync_output_file(output_path: &Path) -> bool {
     // Delegate to the shared, platform-aware durability primitive. It opens the
     // file read+write before `sync_all`: Windows' `FlushFileBuffers` rejects a
@@ -1088,15 +992,11 @@ pub struct StagingSnapshot {
     /// reason when the body is JSON (None otherwise).
     pub has_failed: bool,
     pub failed_reason: Option<String>,
-    /// `.aborted-loss` resumable-failure marker present — a rip aborted because
-    /// main-movie loss exceeded `abort_on_lost_secs`, either read-time
-    /// (unreadable sectors, pre-mux gate) or mux-time (decrypt/codec loss,
-    /// post-mux gate), but the ISO + mapfile are intact so it's RECOVERABLE
-    /// (raised threshold, fresh patch, keydb refresh, code change). Distinct from
-    /// terminal `.failed`: the resume scan re-enters such a dir indefinitely
-    /// (a loss-abort is deterministic, never promoted to terminal by attempt
-    /// count). `attempt` carries the abort count parsed from the marker (0 if
-    /// unparseable), kept solely to inform the UI.
+    /// `.aborted-loss` resumable-failure marker present (main-movie loss
+    /// exceeded `abort_on_lost_secs`, but the ISO + mapfile are intact).
+    /// Distinct from terminal `.failed`: the resume scan re-enters such a
+    /// dir indefinitely. `attempt` carries the abort count for the UI.
+    /// See docs/staging.md — `StagingSnapshot::has_aborted_loss`.
     pub has_aborted_loss: bool,
     pub aborted_loss_reason: Option<String>,
     pub aborted_loss_attempt: u64,
@@ -1160,10 +1060,9 @@ impl StagingSnapshot {
     }
 }
 
-/// Raw, untrusted observations from scanning a staging dir's entries.
-/// Separated from the classification decision so the "what does this
-/// mean?" logic (`classify_observations`) is unit-testable without
-/// having to provoke real per-entry NFS I/O errors from the filesystem.
+// Raw, untrusted observations from scanning a staging dir's entries.
+// Separated from `classify_observations` so it's unit-testable without
+// provoking real per-entry NFS I/O errors from the filesystem.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanObservations {
     /// A `state.json` (unified store) was seen in the primed listing. When set,
@@ -1207,17 +1106,9 @@ impl ScanObservations {
             && !self.has_mkv
     }
 
-    /// True iff the dir's contents must be treated as UNKNOWN (not empty,
-    /// not partial) — the caller must skip it without wiping OR bumping
-    /// `.restart_count`. Two cases, both NFS-startup degradation:
-    ///
-    /// 1. Every `read_dir` attempt errored (`!saw_read_ok`) — never got
-    ///    a listing at all.
-    /// 2. `read_dir` opened but every DirEntry I/O errored
-    ///    (`had_entry_error`) and nothing trustworthy was observed
-    ///    (`observed_nothing`) — a possibly-completed 85 GB rip whose
-    ///    listing degraded mid-scan must NOT be counted as partial state
-    ///    and walked toward `.failed` over RESTART_LIMIT restarts.
+    // True iff contents are UNKNOWN: every read_dir errored, or every entry
+    // errored with nothing trustworthy observed. NFS-startup degradation must
+    // not look like partial state and bump `.restart_count`.
     fn contents_unknown(&self) -> bool {
         !self.saw_read_ok || (self.had_entry_error && self.observed_nothing())
     }
@@ -1237,10 +1128,9 @@ impl ScanObservations {
     }
 }
 
-/// The lifecycle projection that fills a [`StagingSnapshot`]'s marker bits.
-/// Sourced from `state.json` when present, else derived from legacy marker
-/// files. Artifact bits (`has_iso`/`has_mapfile`/`has_mkv`) are NOT here — they
-/// always come straight from the directory scan.
+// The lifecycle projection that fills a StagingSnapshot's marker bits.
+// Sourced from state.json when present, else derived from legacy marker
+// files; artifact bits are NOT here (always from the directory scan).
 #[derive(Default)]
 struct Lifecycle {
     completed: bool,
@@ -1370,16 +1260,9 @@ fn read_legacy_aborted_loss(dir: &Path) -> Option<(String, u64)> {
     Some((reason, attempt))
 }
 
-/// Upgrade a pre-migration staging dir to `state.json` in place: build a
-/// full-fidelity [`DiscState`] from the legacy marker payloads (lifecycle state,
-/// `.ripped` `RippedMarker`, `.done`/`.review` metadata body, restart count,
-/// locks, reasons), write it durably, then remove the legacy marker files so the
-/// reader's fallback can never contradict the unified store. Best-effort — a
-/// write failure just leaves the dir on the legacy path for the next scan.
-///
-/// Called only when a lifecycle marker was observed (`legacy_state` is `Some`);
-/// a pure partial-state dir (artifacts, no marker) is deliberately left with NO
-/// `state.json`, mirroring the legacy "resumable, not owned" representation.
+// Upgrade a pre-migration staging dir to state.json in place: build a
+// DiscState from the legacy markers, write it durably, then remove the
+// legacy files (best-effort). Skipped when no lifecycle marker was observed.
 fn upgrade_legacy_to_state(dir: &Path, obs: &ScanObservations) {
     let Some(state) = Lifecycle::legacy_state(obs) else {
         return;
@@ -1506,24 +1389,12 @@ pub fn dir_is_same_disc(dir: &Path, raw_label: &str) -> bool {
 }
 
 /// Pick a staging dir name for `raw_label` under `staging_root`, given the
-/// title-derived `base` name.
-///
-/// Returns `base` when it is free or already belongs to this disc, and
-/// `base_2`, `base_3`, ... when it is taken by a DIFFERENT disc — the discs of
-/// a boxset all resolve to one title, and before this they silently shared one
-/// directory, so inserting disc 2 after disc 1 finished was read as "already
-/// ripped" and disc 2 was never read at all.
-///
-/// Deliberately does NOT uniquify for the same disc: re-inserting one disc
-/// after a container restart must still find its own dir, or every restart
-/// would re-sweep a finished disc into a fresh directory.
-///
-/// An EMPTY `raw_label` means the caller does not know which disc this is (a
-/// state entry seeded by the mux/mover paths rather than by a drive scan).
-/// That is the mirror of an unlabelled dir and takes the same conservative
-/// answer — plain `base`, the pre-existing behaviour. Without this an unknown
-/// label would compare unequal to every recorded label and send such a caller
-/// off to a fresh `base_2` that no rip ever created.
+/// title-derived `base` name. Returns `base` when free or already this
+/// disc's; `base_2`, `base_3`, ... when taken by a DIFFERENT disc (boxset
+/// discs share a title). Does NOT uniquify for the same disc: re-inserting
+/// after a restart must still find its own dir. An EMPTY `raw_label` (caller
+/// doesn't know which disc) takes the same conservative `base` answer.
+/// See docs/staging.md — `staging_name_for_disc`.
 pub fn staging_name_for_disc(staging_root: &Path, base: &str, raw_label: &str) -> String {
     if raw_label.is_empty() {
         return base.to_string();
@@ -1700,27 +1571,13 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
     })
 }
 
-/// Startup safety net: walk `<staging_dir>/*` and classify each
-/// per-disc subdirectory. Decisions:
-///
-/// - `.completed` exists → idle/clean, leave alone. (The mover will
-///   pick it up via `.done` if that's also present.)
-/// - `.failed` exists → leave alone; the orchestrator will surface
-///   the reason in `RipState` once a device claims the dir.
-/// - Partial state (ISO and/or mapfile and/or partial MKV present,
-///   no completion/failed marker):
-///   - read `.restart_count`. If `>= RESTART_LIMIT`, write `.failed`
-///     with a "restart loop detected" reason and clear the counter.
-///   - else bump the counter; leave the partial state in place so the
-///     next rip on the same disc can reuse the mapfile/ISO (libfreemkv's
-///     `sweep_opts.resume` path on transport-failure retries).
-/// - Empty/junk subdir with no recognisable artefacts → wipe.
-///
-/// Returns a list of per-disc resume hints so the caller can log a
-/// summary at startup. **Never deletes user data that looks like an
-/// in-flight or recovered rip** — that's the whole point of this
-/// function. The only `remove_dir_all` is the "no partial state, no
-/// markers, dir is just orphaned junk" branch.
+/// Startup safety net: walk `<staging_dir>/*` and classify each per-disc
+/// subdirectory (clean/failed → leave alone; partial state → restart-count
+/// or preserve for resume; junk → wipe). Returns a list of per-disc resume
+/// hints so the caller can log a summary at startup. **Never deletes user
+/// data that looks like an in-flight or recovered rip** — that's the whole
+/// point of this function; the only `remove_dir_all` is orphaned junk.
+/// See docs/staging.md — `resume_or_quarantine_staging` decision table.
 pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint> {
     let mut hints = Vec::new();
     let entries = match std::fs::read_dir(staging_dir) {
@@ -2039,11 +1896,9 @@ mod tests {
         clear_restart_count(&d); // already gone — must not error
     }
 
-    /// The durability gate decides whether `.done`/`.completed` may be
-    /// written. Getting it backwards files a page-cache-only, possibly
-    /// truncated file into the operator's library as a finished title. It was
-    /// four hand-rolled copies of `!is_network && !fsync(..)`; a mutation run
-    /// dropped the `!` in each and nothing failed.
+    // The durability gate decides whether `.done`/`.completed` may be
+    // written; getting it backwards files a truncated file as a finished
+    // title. A mutation run once dropped the `!` in each copy unnoticed.
     #[test]
     fn durability_gate_blocks_markers_unless_the_output_is_provably_durable() {
         // A failed fsync must withhold the markers.
@@ -2062,9 +1917,8 @@ mod tests {
         assert!(!called, "the fsync must not run for a network sink");
     }
 
-    /// Both halves of the network check matter: a `"network"` format with no
-    /// target configured falls back to LOCAL output and still needs the flush.
-    /// Mutants flipped `==` to `!=`, `&&` to `||`, and dropped the `!`.
+    // Both halves matter: a "network" format with no target configured
+    // falls back to LOCAL output and still needs the flush.
     #[test]
     fn network_output_requires_both_the_format_and_a_target() {
         assert!(is_network_output("network", "nfs://box/media"));
@@ -2076,13 +1930,9 @@ mod tests {
         assert!(!is_network_output("iso", ""));
     }
 
-    /// `fsync_output_file` is the mux durability gate: `true` only when the
-    /// output was provably synced (lets the `.done` marker be written), `false`
-    /// when there is no file to sync (caller must preserve staging and retry).
-    /// The rc.4.1 Windows remux loop was this returning `false` forever because
-    /// it opened the output read-only and `FlushFileBuffers` rejects a
-    /// read-only handle; it now delegates to `io::fsync::file_durable`, which
-    /// opens read+write. This test pins both arms of the contract.
+    // `fsync_output_file` is the mux durability gate. The rc.4.1 Windows
+    // remux loop was this returning false forever (opened read-only, and
+    // FlushFileBuffers rejects that); this pins both arms of the contract.
     #[test]
     fn fsync_output_file_true_for_real_false_for_missing() {
         let d = tmpdir();
@@ -2098,10 +1948,9 @@ mod tests {
         );
     }
 
-    /// `increment_restart_count` must round-trip the incremented value and
-    /// leave NO `.restart_count.tmp` behind — the temp file is renamed over
-    /// the target (atomic), so a dangling `.tmp` would mean the rename never
-    /// happened (torn write) or a stray file the resume scan could trip on.
+    // Must round-trip the incremented value and leave no `.restart_count.tmp`
+    // behind — a dangling `.tmp` would mean a torn write or a rename that
+    // never happened.
     #[test]
     fn increment_roundtrips_and_cleans_up_tmp() {
         let d = tmpdir();
@@ -2136,12 +1985,9 @@ mod tests {
         assert_eq!(read_failed_reason(&d).as_deref(), Some("test reason"));
     }
 
-    /// A hand-off marker (`.done`/`.review`) must never be written empty: the
-    /// mover skips directories whose marker won't parse, so an empty marker
-    /// strands a finished output in staging with no operator-facing signal.
-    /// The hand-off sites serialize a `json!` Value and `.expect` the (today
-    /// infallible) result rather than falling back to empty bytes; this guards
-    /// that the durable write path produces a non-empty, parseable marker.
+    // A hand-off marker must never be written empty: the mover skips
+    // directories whose marker won't parse, stranding a finished output
+    // with no operator-facing signal.
     #[test]
     fn handoff_marker_is_nonempty_and_parseable() {
         let d = tmpdir();
@@ -2165,13 +2011,9 @@ mod tests {
         );
     }
 
-    /// `clear_inprogress_markers` is the graceful-shutdown belt-and-suspenders:
-    /// it strips every `.sweeping`/`.muxing` marker under the staging root so a
-    /// clean SIGTERM doesn't get misread by the next startup's resume
-    /// classifier as a crash. A no-op here (the exact shape of the
-    /// `replace clear_inprogress_markers with ()` mutant) leaves both markers
-    /// in place, and the next startup would restart-count a perfectly healthy
-    /// stop toward a false `.failed`.
+    // Graceful-shutdown belt-and-suspenders: strips every `.sweeping`/
+    // `.muxing` marker under the root so a clean SIGTERM isn't misread by
+    // the next startup's resume classifier as a crash.
     #[test]
     fn clear_inprogress_markers_strips_sweeping_and_muxing_under_root() {
         let root = tmpdir();
@@ -2198,11 +2040,9 @@ mod tests {
         );
     }
 
-    /// FIX 3 — `write_failed_marker` must REPORT whether the terminal state
-    /// actually landed, not silently swallow a write failure. A dropped write at
-    /// quarantine time leaves the dir in its prior state (`Ripped`), so it
-    /// re-dispatches to the mux worker forever; the worker relies on this return
-    /// value to raise a LOUD operator card instead of looping invisibly.
+    // `write_failed_marker` must REPORT whether the terminal state landed,
+    // not silently swallow a write failure — a dropped write re-dispatches
+    // to the mux worker forever without this signal.
     #[test]
     fn write_failed_marker_reports_whether_state_landed() {
         // Success: a normal dir → terminal state lands, returns true.
@@ -2350,13 +2190,9 @@ mod tests {
         assert_eq!(read_state(&disc).unwrap().state, StagingState::Review);
     }
 
-    /// The legacy-upgrade path (`upgrade_legacy_to_state` /
-    /// `apply_legacy_handoff_body`) must fold every field of a real (non-empty)
-    /// `.done` body into the fresh `state.json`, AND remove the legacy `.done`
-    /// file so the reader's fallback can never contradict the unified store
-    /// afterwards. Earlier tests only ever wrote `b"{}"` bodies, so the
-    /// field-folding itself — and the "legacy file removed" invariant — were
-    /// untested.
+    // The legacy-upgrade path must fold every field of a real (non-empty)
+    // `.done` body into the fresh state.json, and remove the legacy file.
+    // Earlier tests only wrote `b"{}"` bodies, so field-folding was untested.
     #[test]
     fn legacy_done_body_migrates_metadata_into_state() {
         let root = tmpdir();
@@ -2449,10 +2285,8 @@ mod tests {
         );
     }
 
-    /// A legacy `.failed` marker migrates its `reason` into
-    /// `DiscState::failure_reason` via `upgrade_legacy_to_state` (NOT
-    /// `apply_legacy_handoff_body`, which only reads `.done`/`.review`), and
-    /// the legacy `.failed` file must be removed afterwards.
+    // A legacy `.failed` marker migrates its `reason` into
+    // `DiscState::failure_reason`, and the legacy file must be removed.
     #[test]
     fn legacy_failed_migrates_and_removes_file() {
         let root = tmpdir();
@@ -2584,13 +2418,9 @@ mod tests {
         assert!(disc.join("foo.iso").exists());
     }
 
-    /// Abort-on-loss bounding (unit): `mark_aborted_on_loss` records resumable
-    /// A loss-abort stays RESUMABLE no matter how many times it recurs — it is
-    /// deterministic media damage, not a crash loop, so it is NEVER promoted to
-    /// terminal `.failed` by attempt count (the operator resolves it via Accept
-    /// or run-another-pass). The attempt counter still advances on disk so the
-    /// UI can report how many times it has aborted; the count survives restarts
-    /// (it lives in the marker, not in memory).
+    // A loss-abort stays RESUMABLE no matter how many times it recurs — never
+    // promoted to terminal `.failed` by attempt count. The attempt counter
+    // still advances on disk so the UI can report it.
     #[test]
     fn mark_aborted_on_loss_always_resumable() {
         let disc = tmpdir();
@@ -2650,10 +2480,8 @@ mod tests {
         );
     }
 
-    /// (b) A `.aborted-loss` marker stays RESUMABLE regardless of attempt count
-    /// — no terminal promotion, no `.failed`. Even a high attempt count keeps
-    /// the ISO recoverable for the operator (Accept / run another pass); the old
-    /// attempt-cap promotion is exactly what clobbered a complete swept ISO.
+    // (b) Stays RESUMABLE regardless of attempt count — no terminal
+    // promotion. The old attempt-cap promotion clobbered a complete swept ISO.
     #[test]
     fn aborted_loss_high_attempt_count_stays_resumable() {
         let root = tmpdir();
@@ -2684,10 +2512,8 @@ mod tests {
         );
     }
 
-    /// (c) A real terminal `.failed` (operator cancel / durability failure)
-    /// stays terminal — unaffected by the abort-loss path. (Mirrors
-    /// `resume_preserves_failed_dirs` but pinned alongside the new variants so a
-    /// future change to the abort-loss branch can't silently reroute it.)
+    // (c) A real terminal `.failed` stays terminal — unaffected by the
+    // abort-loss path; pinned alongside the new variants against regression.
     #[test]
     fn real_failed_stays_terminal_alongside_abort_loss() {
         let root = tmpdir();
@@ -2737,13 +2563,9 @@ mod tests {
         );
     }
 
-    /// R3 finding 2 regression: a `.sweeping` dir from a NON-watchdog hard crash
-    /// (OOM-kill / SIGKILL / panic=abort) lands with `.restart_count == 0`
-    /// because nothing ran to bump it. The InProgress carve-out must STILL
-    /// restart-count it, so a deterministically-crashing owned sweep walks toward
-    /// `.failed` over RESTART_LIMIT restarts instead of looping forever. Before
-    /// the fix the carve-out skipped without counting and the count stayed pinned
-    /// at 0.
+    // A `.sweeping` dir from a NON-watchdog hard crash lands with
+    // `.restart_count == 0`. The InProgress carve-out must STILL restart-count
+    // it so a deterministically-crashing sweep walks toward `.failed`.
     #[test]
     fn sweeping_in_progress_is_restart_counted() {
         let root = tmpdir();
@@ -2770,10 +2592,8 @@ mod tests {
         assert!(!disc.join(FAILED_MARKER).exists());
     }
 
-    /// R3 finding 2 regression (terminal end): once a `.sweeping` dir's restart
-    /// count reaches RESTART_LIMIT the carve-out must promote it to `.failed` and
-    /// clear the in-progress marker, capping a deterministic wedge instead of
-    /// spinning forever.
+    // Once a `.sweeping` dir's restart count reaches RESTART_LIMIT the
+    // carve-out must promote it to `.failed` and clear the in-progress marker.
     #[test]
     fn sweeping_in_progress_fails_after_limit() {
         let root = tmpdir();
@@ -2796,11 +2616,9 @@ mod tests {
         assert_eq!(restart_count(&disc), 0);
     }
 
-    /// R3 finding 3 regression: a terminal write must release the `.muxing`
-    /// exclusion lock. The cold operator-resume path (`resume::resume_remux`)
-    /// writes `.completed`/`.failed` WITHOUT going through the worker's
-    /// MuxingGuard; if a stale `.muxing` lingered, `disc_owned_by_worker` would
-    /// read true forever on a terminal dir and silently block the re-insert path.
+    // A terminal write must release the `.muxing` exclusion lock — the cold
+    // operator-resume path writes terminal markers without the worker's
+    // MuxingGuard, so a stale lock would block the re-insert path forever.
     #[test]
     fn terminal_writers_clear_muxing_lock() {
         // .completed clears .muxing.
@@ -2828,15 +2646,9 @@ mod tests {
         );
     }
 
-    /// Regression (HIGH audit #7): if the durable hand-off (`.done`) marker
-    /// write FAILS, the caller must NOT proceed to write `.completed` or clear
-    /// `.restart_count`. Otherwise the staging dir looks terminal-complete
-    /// while the mover has no `.done` to act on and the resume detector never
-    /// re-runs — a data-integrity gap.
-    ///
-    /// This pins the early-return invariant in `rip_disc`'s marker-write block:
-    /// `write_handoff_marker` Err ⇒ leave the dir resumable (no `.completed`,
-    /// `.restart_count` preserved).
+    // If the durable `.done` write FAILS, the caller must NOT proceed to
+    // write `.completed` or clear `.restart_count`, else the dir looks
+    // terminal-complete while the mover has nothing to act on.
     #[test]
     fn failed_done_write_leaves_no_completed_and_preserves_restart_count() {
         let disc = tmpdir();
@@ -2874,11 +2686,9 @@ mod tests {
         );
     }
 
-    /// A rename failure in `write_marker_durable` must not leak the `.tmp`
-    /// sibling. We force the failure by making the target `path` a non-empty
-    /// directory: `rename(file, non_empty_dir)` fails on both Linux and macOS,
-    /// and it fails AFTER the `.tmp` file has been created + fsynced — so it
-    /// exercises the cleanup-on-rename-error path specifically.
+    // A rename failure must not leak the `.tmp` sibling. Forced by making the
+    // target path a non-empty directory, which fails rename(2) AFTER the
+    // tmp file was created + fsynced, exercising cleanup-on-error.
     #[test]
     fn marker_rename_failure_cleans_up_tmp() {
         let d = tmpdir();
@@ -3205,13 +3015,9 @@ mod tests {
         assert_eq!(resume_verdict(&[]), Verdict::Wiped);
     }
 
-    /// H2/M1 + R3 finding 2 regression: a dir with `.sweeping` + ISO/mapfile (a
-    /// crash mid-sweep) is classified InProgress and left in place (artifacts +
-    /// marker preserved). As of R3 finding 2 it is ALSO restart-counted on each
-    /// InProgress skip, so a deterministically-crashing owned sweep (whose count
-    /// no watchdog bumped) walks toward `.failed` over RESTART_LIMIT restarts
-    /// instead of looping forever. Below the limit the dir is still preserved
-    /// and never promoted to `.failed`.
+    // A dir with `.sweeping` + ISO/mapfile (crash mid-sweep) is classified
+    // InProgress and left in place, but ALSO restart-counted on each skip so
+    // a deterministically-crashing sweep walks toward `.failed`.
     #[test]
     fn sweeping_marker_is_in_progress_and_restart_counted() {
         let root = tmpdir();
@@ -3240,13 +3046,9 @@ mod tests {
         assert_eq!(read_state(&disc).unwrap().state, StagingState::Sweeping);
     }
 
-    /// Convergence M (findings 3 & 4): a STRUCTURAL mux failure in the inline
-    /// fallback (ISO-open / build_iso_pipeline) must quarantine the dir, not
-    /// leak `.sweeping`. The fix writes `.failed` (which clears `.sweeping`)
-    /// and clears the restart count. Verify the resulting dir — ISO + mapfile
-    /// present, `.sweeping` gone, `.failed` present — classifies terminal
-    /// `AlreadyFailed`, NOT stranded `InProgress`, so the operator sees the
-    /// failure and the dir isn't re-resumed against a permanent error.
+    // A STRUCTURAL mux failure in the inline fallback must quarantine the
+    // dir, not leak `.sweeping`: `.failed` present, `.sweeping` gone, and it
+    // classifies terminal AlreadyFailed, not stranded InProgress.
     #[test]
     fn structural_mux_failure_quarantines_instead_of_stranding() {
         let root = tmpdir();
@@ -3277,11 +3079,9 @@ mod tests {
         );
     }
 
-    /// H1 + R3 finding 2 regression: a `.muxing` lock dir is owned by the mux
-    /// worker — the resume scan leaves it in place (InProgress). As of R3
-    /// finding 2 it is restart-counted on the InProgress skip too, so a
-    /// non-watchdog hard kill mid-mux (which left the count un-bumped) still
-    /// walks toward `.failed` over RESTART_LIMIT restarts rather than looping.
+    // A `.muxing` lock dir is owned by the mux worker — the resume scan
+    // leaves it InProgress but restart-counts it too, so a hard kill mid-mux
+    // still walks toward `.failed` over RESTART_LIMIT restarts.
     #[test]
     fn muxing_marker_is_in_progress_and_restart_counted() {
         let root = tmpdir();
@@ -3300,14 +3100,9 @@ mod tests {
         assert_ne!(read_state(&disc).unwrap().state, StagingState::Failed);
     }
 
-    /// Convergence R2 finding 1 regression: a deterministically-wedging mux
-    /// killed by the hard watchdog re-acquires `.muxing` on every restart and
-    /// the watchdog leaves `.restart_count` bumped (it exit(1)s without running
-    /// any guard). The owned/in-progress carve-out must HONOR that counter:
-    /// once it reaches RESTART_LIMIT the dir is promoted to `.failed` (clearing
-    /// `.muxing` + the count), not left InProgress to re-dispatch and re-wedge
-    /// forever. Without the fix the carve-out short-circuits before the
-    /// restart-loop gate and the watchdog's guard is defeated.
+    // A wedging mux killed by the hard watchdog re-acquires `.muxing` with
+    // `.restart_count` bumped. The carve-out must promote to `.failed` at
+    // RESTART_LIMIT, not re-dispatch and re-wedge forever.
     #[test]
     fn muxing_at_restart_limit_is_promoted_to_failed() {
         let root = tmpdir();
@@ -3361,13 +3156,9 @@ mod tests {
         assert_eq!(restart_count(&disc), 0);
     }
 
-    /// Convergence R2 finding 1 boundary, updated for R3 finding 2: a restart of
-    /// an owned `.muxing` dir whose count is BELOW the limit (pre-bump
-    /// `rc < RESTART_LIMIT`) is still left InProgress and preserved — but the
-    /// scan now bumps the counter on the skip (R3 finding 2) so a non-watchdog
-    /// hard kill doesn't loop with the count pinned. Pre-bump RESTART_LIMIT-1 is
-    /// below the failure gate, so the dir stays InProgress; the count advances to
-    /// RESTART_LIMIT, failing on the NEXT restart.
+    // A restart of an owned `.muxing` dir whose count is BELOW the limit
+    // stays InProgress and preserved, but the scan bumps the counter on the
+    // skip, so it advances to RESTART_LIMIT and fails on the NEXT restart.
     #[test]
     fn muxing_below_restart_limit_stays_in_progress() {
         let root = tmpdir();
@@ -3394,10 +3185,8 @@ mod tests {
         assert_eq!(restart_count(&disc), RESTART_LIMIT);
     }
 
-    /// H2/M1: the `.sweeping` marker is superseded by every terminal/hand-off
-    /// transition. `write_failed_marker`, `write_completed_marker`, and
-    /// `muxer::write_marker` (`.ripped`) all clear it so a finished/quarantined
-    /// dir isn't also mis-read as an active sweep.
+    // The `.sweeping` marker is superseded by every terminal/hand-off
+    // transition, so a finished/quarantined dir isn't mis-read as active.
     #[test]
     fn sweeping_marker_cleared_by_terminal_writes() {
         let d = tmpdir();
@@ -3428,10 +3217,8 @@ mod tests {
         clear_sweeping_marker(&d3);
     }
 
-    /// M2 regression: a `.failed`-only dir with a non-JSON body (review.rs's
-    /// legacy "cancelled by operator") is still terminal to the resume scan.
-    /// `read_failed_reason` returns None for it, but the scan keys on
-    /// `has_failed` (presence), not parse-success.
+    // A `.failed`-only dir with a non-JSON body is still terminal to the
+    // resume scan — it keys on `has_failed` presence, not parse-success.
     #[test]
     fn non_json_failed_is_terminal() {
         let root = tmpdir();
@@ -3478,11 +3265,9 @@ mod tests {
         );
     }
 
-    /// Every disc of a boxset resolves to one TMDB title, so before this they
-    /// shared a staging dir: insert disc 2 after disc 1 finished and
-    /// `disc_already_completed` saw disc 1's `.completed`, logged "already
-    /// ripped", and never read disc 2. The raw volume label is what still
-    /// tells the discs apart.
+    // Every disc of a boxset resolves to one TMDB title, so before this they
+    // shared a staging dir and disc 2 was never read. The raw volume label
+    // is what still tells the discs apart.
     #[test]
     fn a_different_disc_with_the_same_title_gets_its_own_staging_dir() {
         let root = tempfile::tempdir().unwrap();
@@ -3524,10 +3309,9 @@ mod tests {
         assert_eq!(staging_name_for_disc(r, "Movie", "ANY_LABEL"), "Movie");
     }
 
-    /// The mirror case: the CALLER doesn't know the label. Some `RipState`s are
-    /// seeded by the mux/mover paths, not by a drive scan, and carry no raw
-    /// label. An unknown label must resolve to the plain title dir — the
-    /// pre-existing behaviour — and never to a `_2` that no rip created.
+    // The mirror case: the CALLER doesn't know the label (some RipStates
+    // are seeded by the mux/mover paths). Must resolve to the plain title
+    // dir, never to a `_2` that no rip created.
     #[test]
     fn an_unknown_disc_label_resolves_to_the_plain_title_dir() {
         let root = tempfile::tempdir().unwrap();

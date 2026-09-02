@@ -5,11 +5,8 @@
 //! built via libfreemkv's `Mapfile::create` + `record` + `flush` so
 //! we don't hand-roll the on-disk text format.
 //!
-//! Deliberate gap: `Disc::scan_image` and `run_mux` end-to-end need a
-//! real UDF ISO. Feeding synthetic bytes into `scan_image` reliably
-//! fails (per the libfreemkv library rules). The live test bed validates the
-//! full flow on a real disc; the gap is documented in
-//! `src/ripper/resume.rs`.
+//! Deliberate gap: `Disc::scan_image`/`run_mux` need a real UDF ISO —
+//! see docs/resume-remux-tests.md.
 
 use std::path::{Path, PathBuf};
 
@@ -24,10 +21,9 @@ fn make_hint(dir: PathBuf, action: ResumeAction) -> StagingResumeHint {
     StagingResumeHint { dir, action }
 }
 
-/// Write a placeholder ISO of exactly `size_bytes` so it satisfies the
-/// resume classifier's ISO-size gate (a settled Pass-1 ISO must be at least
-/// as large as the mapfile claims). The bytes don't matter — classify_resume
-/// only stats the length, it doesn't read content.
+// Write a placeholder ISO of exactly `size_bytes` so it satisfies the resume
+// classifier's ISO-size gate. Bytes don't matter — classify_resume only
+// stats the length, it doesn't read content.
 fn write_iso(path: &Path, size_bytes: u64) {
     let f = std::fs::File::create(path).expect("iso create");
     f.set_len(size_bytes).expect("iso set_len");
@@ -254,12 +250,9 @@ fn write_mapfile_with_unreadable(path: &Path, total_bytes: u64, unreadable_bytes
     map.flush().expect("mapfile flush");
 }
 
-/// Regression: abort_on_lost_secs==0 with whole-disc unreadable bytes must
-/// still classify as Remux. Pre-fix, the coarse pre-filter would convert
-/// the whole-disc bad-byte count to estimated lost-seconds and return
-/// NotEligible whenever any unreadable bytes were present — even though those
-/// sectors might be entirely outside the main title. The real per-title check
-/// in `resume_remux` (run after `scan_image`) is the authoritative gate.
+// Regression: abort_on_lost_secs==0 with whole-disc unreadable bytes must
+// still classify as Remux — see docs/resume-remux-tests.md for the
+// pre-fix pre-filter bug this guards against.
 #[test]
 fn classify_resume_allows_out_of_title_damage_when_abort_on_lost_secs_is_zero() {
     let td = tmpdir();
@@ -327,21 +320,9 @@ fn classify_resume_rejects_heavy_damage_when_abort_on_lost_secs_positive() {
     );
 }
 
-/// Tight boundary check on the pre-filter's `lost_secs > abort_on_lost_secs`
-/// gate. The two tests above use damage an order of magnitude past the
-/// threshold, so a `/` → `%` mutant on `bad_bytes as f64 /
-/// FALLBACK_BITRATE_BYTES_PER_SEC` still lands on the reject side by
-/// accident (both a correct ~2.4x-over lost-secs value and a `%`-corrupted
-/// one exceed a 1-second threshold). Pin the exact arithmetic instead:
-/// `FALLBACK_BITRATE_BYTES_PER_SEC` is 8_250_000.0 bytes/sec, so at a
-/// 10-second threshold the boundary is exactly 82_500_000 bytes. One byte
-/// under must classify as Remux (deferred to the real per-title check);
-/// exactly at the threshold must ALSO defer (`>`, not `>=` — the code comment
-/// establishes the gate is strictly-greater); one byte over must reject.
-/// A `%` in place of `/` turns 82_500_001 % 8_250_000 == 1, which is nowhere
-/// near 10 and would wrongly classify as Remux; a `*` in place of `/` turns
-/// even 82_499_999 bytes into an astronomically large "lost_secs" and would
-/// wrongly reject. Either mutant flips one of the three assertions below.
+// Tight boundary check on the pre-filter's `lost_secs > abort_on_lost_secs`
+// gate — pins the exact arithmetic so a `/`→`%` or `/`→`*` mutant is caught.
+// See docs/resume-remux-tests.md for the full mutant analysis.
 #[test]
 fn classify_resume_pre_filter_boundary_is_strictly_greater_than() {
     const FALLBACK_BITRATE_BYTES_PER_SEC: u64 = 8_250_000;
@@ -381,20 +362,9 @@ fn classify_resume_pre_filter_boundary_is_strictly_greater_than() {
     );
 }
 
-/// Cold resume must hand `resume_remux` a FILE basename, not the staging
-/// DIRECTORY name.
-///
-/// `rip_disc` documents the split explicitly (`src/ripper/mod.rs`, where
-/// `filename` is built): the staging DIR carries the `_2` disc suffix that
-/// separates the discs of a boxset, but the FILES inside it are named from the
-/// plain title with no suffix, because `delete_partial_output` looks for
-/// `<dir>/<display_name>.<ext>` and the mover derives the delivered filename
-/// from the staged one.
-///
-/// `classify_resume` was taking `hint.dir.file_name()` — the suffixed
-/// directory name — so on a boxset variant dir it looked for the partial under
-/// the wrong name, left it in place, and muxed a SECOND file next to it. Both
-/// then carry a `.done` hand-off and the mover delivers both.
+// Cold resume must hand `resume_remux` a FILE basename, not the staging
+// DIRECTORY name (boxset dirs carry a `_2` suffix the files don't).
+// See docs/resume-remux-tests.md for the bug this regression-tests.
 #[test]
 fn cold_resume_of_a_boxset_variant_dir_uses_the_file_basename_not_the_dir_name() {
     let td = tmpdir();

@@ -1,24 +1,23 @@
 //! Per-device drive sessions, halt/stop bookkeeping, and the registry
 //! of in-flight rip threads.
 //!
-//! 0.18 round 2: the old `HALT_FLAGS` + `STOP_FLAGS` + `register_halt`
-//! / `request_stop` / `stop_requested` / `reset_stop_flag` machinery
-//! is gone. Each rip-thread spawn site now allocates a single
-//! [`libfreemkv::Halt`] token, registers it in [`HALTS`] keyed by
-//! device, and threads `halt.clone()` through every cancellable phase
-//! (sweep / patch / mux). The HTTP `/api/stop/{device}` handler looks
-//! up the device's `Halt` and calls `.cancel()`; phase loops poll
+//! Each rip-thread spawn site allocates a single [`libfreemkv::Halt`]
+//! token, registers it in [`HALTS`] keyed by device, and threads
+//! `halt.clone()` through every cancellable phase (sweep / patch /
+//! mux). The HTTP `/api/stop/{device}` handler looks up the device's
+//! `Halt` and calls `.cancel()`; phase loops poll
 //! `halt.is_cancelled()` at their tops.
+//
+// See docs/ripper-session-notes.md — module history (0.18 round-2 halt rework)
 
 use libfreemkv::Halt;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// Global table of rip-thread JoinHandles keyed by device. Populated
-/// when the poll loop spawns the scan/rip thread; consumed by
-/// `join_rip_thread` (called from `handle_stop`, `eject_drive`, and
-/// the shutdown path).
+// Global table of rip-thread JoinHandles keyed by device. Populated when the
+// poll loop spawns the scan/rip thread; consumed by `join_rip_thread`
+// (called from `handle_stop`, `eject_drive`, and the shutdown path).
 static RIP_THREADS: once_cell::sync::Lazy<
     Mutex<std::collections::HashMap<String, JoinHandle<()>>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -40,37 +39,16 @@ pub enum RegisterError {
     PriorThreadRunning(JoinHandle<()>),
 }
 
-/// Register a rip-thread JoinHandle for `device`. Production calls
-/// this (via [`spawn_rip_thread`]) from the poll-loop and web spawn
-/// sites; the integration tests under `tests/halt_drain.rs` also call
-/// it to plug a synthetic thread into the same machinery `handle_stop`
-/// uses.
+// See docs/ripper-session-notes.md — register_rip_thread reap-or-reject semantics
+/// Register a rip-thread JoinHandle for `device`. The device map holds at
+/// most one handle: if the prior one has finished, it is reaped and the
+/// new one takes its place (`Ok(())`); if the prior one is still running,
+/// it is left in place and this returns
+/// `Err(RegisterError::PriorThreadRunning(handle))`, handing the caller's
+/// handle back so it can be reaped instead of leaked.
 ///
-/// Reap-or-reject semantics for a pre-existing entry (the device map
-/// holds at most one handle):
-///
-/// * **Prior handle finished** → it is removed and joined *inside the
-///   lock*. `JoinHandle::is_finished() == true` guarantees `join()`
-///   returns without blocking, so holding `RIP_THREADS` across the
-///   join cannot deadlock. This quietly reaps the common benign case
-///   (a completed scan thread still registered when the rip thread
-///   spawns) that previously logged a scary "prior thread not reaped"
-///   warning. The new handle then takes its place and we return
-///   `Ok(())`.
-/// * **Prior handle still running** → we must NOT overwrite it; a
-///   dropped running handle can never be joined, so a later
-///   stop/eject/shutdown drain returns before the thread actually
-///   exits (staging could be wiped mid-write — the v0.13.6 bug class).
-///   We leave the running prior in place and return
-///   `Err(RegisterError::PriorThreadRunning(new))`, handing the new
-///   handle back so the caller reaps the worker it just spawned. The
-///   spawn sites gate on [`crate::ripper::try_claim_active`], which now consults thread
-///   liveness as well as STATE status, so this branch should be
-///   unreachable — but it is the last line of defense and is defended
-///   rather than trusted. (It was previously justified by STATE status
-///   ALONE, which is not a liveness fact: a worker writes its terminal
-///   status and then keeps unwinding, so this branch was reachable from
-///   an unauthenticated LAN POST.)
+/// Called (via [`spawn_rip_thread`]) from the poll-loop and web spawn
+/// sites, and from `tests/halt_drain.rs`.
 pub fn register_rip_thread(device: &str, handle: JoinHandle<()>) -> Result<(), RegisterError> {
     // Recover from poison instead of dropping the handle: a dropped
     // JoinHandle can never be reaped, breaking drain-before-wipe (v0.13.6
@@ -112,34 +90,16 @@ pub fn take_rip_thread(device: &str) -> Option<JoinHandle<()>> {
         .remove(device)
 }
 
-/// Spawn a rip-related worker thread and register its `JoinHandle`
-/// in `RIP_THREADS` atomically. Use this for every code path that
-/// runs scan/rip work — `handle_stop` relies on the registration to
-/// drain the thread before wiping staging. Bypassing this helper
-/// (`std::thread::spawn` directly) reintroduces the v0.13.6 stop bug
-/// where stop returned in 27 ms because no handle was registered.
+// See docs/ripper-session-notes.md — spawn_rip_thread: register-before-run gate
+/// Spawn a rip-related worker thread and register its `JoinHandle` in
+/// `RIP_THREADS` atomically. Use this for every scan/rip code path —
+/// `handle_stop` relies on the registration to drain the thread before
+/// wiping staging. Bypassing this (`std::thread::spawn` directly)
+/// reintroduces the v0.13.6 bug: stop returning before a handle was
+/// registered.
 ///
-/// `role` is a short tag (e.g. "rip", "scan") used for the OS thread
-/// name; `device` is both the registration key and part of the name.
-///
-/// **Registration is decided BEFORE the worker does any work.** The spawned
-/// thread parks on a one-shot channel and runs `f` only once this function has
-/// confirmed it won the `RIP_THREADS` slot. The previous order — spawn, *then*
-/// register — meant a duplicate spawn ran `f` to completion (for the rip role,
-/// `handle_rip_request`: a full multi-hour disc rip) before
-/// `register_rip_thread` rejected it and the `join()` below reaped it. That
-/// turned a "refused" spawn into: an HTTP worker thread blocked for the whole
-/// rip, a second worker writing the same staging dir as the incumbent, and
-/// finally a `rollback_failed_spawn` + 500 for a rip that had actually
-/// finished. Parking first makes the rejection cost a channel `recv` instead
-/// of an hour of disk work.
-///
-/// The gate cannot hang either side. The worker's only pre-`f` action is the
-/// `recv`, and every exit from this function either sends (accepted) or drops
-/// the sender (rejected, or a panic between spawn and register) — a dropped
-/// sender wakes the `recv` with `Err` and the worker returns without touching
-/// anything. So the `join()` in the rejection branch is bounded by a thread
-/// that is already on its way out.
+/// `role` tags the OS thread name; `device` is the registration key.
+/// Registration happens BEFORE the worker runs `f`.
 pub fn spawn_rip_thread<F>(device: &str, role: &str, f: F) -> std::io::Result<()>
 where
     F: FnOnce() + Send + 'static,
@@ -194,50 +154,17 @@ where
     }
 }
 
-/// Wait (up to `timeout`) for the rip thread for `device` to exit.
-/// Returns `Ok(())` if the thread finished within the window or no
-/// thread was registered. Returns `Err(())` on timeout.
+// See docs/ripper-session-notes.md — join_rip_thread: why the handle is polled in place
+/// Wait (up to `timeout`) for the rip thread for `device` to exit. Returns
+/// `Ok(())` if the thread finished within the window or no thread was
+/// registered; `Err(())` on timeout.
 ///
-/// Best-effort drain: callers should treat a timeout as a warning,
-/// not a fatal error. The rip thread's `Halt` token was already
-/// cancelled by the stop path before this is called; the thread will
-/// exit eventually. The timeout just bounds how long the HTTP
-/// response (or shutdown sequence) blocks.
+/// Best-effort drain: a timeout is a warning, not a fatal error — the
+/// `Halt` was already cancelled by the stop path, so the thread will exit
+/// eventually; the timeout just bounds how long the caller blocks.
 ///
-/// # The handle is POLLED IN PLACE — it never leaves `RIP_THREADS`
-///
-/// This used to open with `take_rip_thread`, poll the handle it had removed,
-/// and stash it back on timeout or self-join. That REMOVED THE DEVICE'S ONLY
-/// LIVENESS FACT for the whole drain — up to 60 s for `/api/stop` — while the
-/// worker was still running, and every gate that asks
-/// [`rip_thread_running`] read `false` for that window:
-///
-/// * `POST /api/stop/sr0` lands on a worker in its terminal tail (it has
-///   written `status = "done"` and is still inside auto-eject). `is_busy` is
-///   already false. `handle_stop` takes the handle and starts polling.
-/// * A concurrent `POST /api/rip/sr0` — unauthenticated, this server binds
-///   `0.0.0.0` — now sees NEITHER fact: `is_busy` false, `rip_thread_running`
-///   false. It wins `try_claim_active_checked`, `register_halt` clobbers the
-///   incumbent's `Halt` (so the incumbent's trailing `unregister_halt` deletes
-///   the NEW rip's token and `/api/stop` can no longer cancel it),
-///   `register_rip_thread` finds the slot EMPTY because we took the handle,
-///   and a full duplicate rip runs against the incumbent's staging dir.
-///
-/// Round 1's TOCTOU argument (see `try_claim_active_checked`) only covered a
-/// handle APPEARING between the liveness read and the `STATE` lock. It never
-/// covered one DISAPPEARING out from under a live worker, which is what the
-/// drain itself was doing.
-///
-/// Polling in place also removes the re-stash entirely, and with it the
-/// separate defect where the timeout path `insert`ed unconditionally and
-/// could REPLACE a newer live handle with the stale one it was holding —
-/// making the live rip unjoinable, so the next stop reported a clean drain
-/// while that worker was still mid-write.
-///
-/// Implementation: every 25 ms, take `RIP_THREADS` briefly, look at the entry
-/// for `device`, and drop the lock again. Nothing is ever held across the
-/// sleep or across `join()`. `join()` runs only once `is_finished()` is true,
-/// so it cannot block.
+/// The handle is POLLED IN PLACE, every 25 ms — it never leaves
+/// `RIP_THREADS` for the duration of the wait.
 #[allow(clippy::result_unit_err)]
 pub fn join_rip_thread(device: &str, timeout: Duration) -> Result<(), ()> {
     let deadline = std::time::Instant::now() + timeout;
@@ -325,14 +252,9 @@ pub fn join_all_rip_threads(timeout: Duration) {
     }
 }
 
-/// Per-device cooperative-cancel tokens. The rip thread spawn site
-/// allocates one [`Halt`] per rip and stashes its clone here so the
-/// HTTP stop handler in `web.rs` (and `eject_drive`) can find it.
-///
-/// Replaces the 0.17 `HALT_FLAGS` + `STOP_FLAGS` pair (two parallel
-/// `Arc<AtomicBool>` registries that the old `request_stop` flipped
-/// in lockstep). One token, one bit, one source of truth — every
-/// phase that holds a clone observes Stop on its next poll.
+// Per-device cooperative-cancel tokens; the rip thread spawn site allocates
+// one Halt per rip and stashes its clone here so the HTTP stop handler (and
+// `eject_drive`) can find it. See docs/ripper-session-notes.md — HALTS.
 static HALTS: once_cell::sync::Lazy<Mutex<std::collections::HashMap<String, Halt>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -363,11 +285,10 @@ pub fn device_halt(device: &str) -> Option<Halt> {
 /// finishes or `timeout` elapses. Returns `true` if the thread drained
 /// (finished, or there was none) within the budget, `false` on timeout.
 ///
-/// This is the core of the HTTP `/api/stop` handler — extracted so the
-/// stop→drain contract (handle_stop must not return while the rip thread is
-/// still mid-write, holding the SCSI session) is testable by driving the
-/// REAL function rather than a replica. `handle_stop` calls this, then layers
-/// on the verify-worker drain + STATE reset that are specific to the web path.
+/// This is the core of the HTTP `/api/stop` handler, extracted so the
+/// stop→drain contract is testable by driving the REAL function rather
+/// than a replica. `handle_stop` calls this, then layers on the
+/// verify-worker drain + STATE reset specific to the web path.
 pub fn stop_and_drain(device: &str, timeout: Duration) -> bool {
     if let Some(halt) = device_halt(device) {
         halt.cancel();
@@ -380,12 +301,10 @@ pub fn stop_and_drain(device: &str, timeout: Duration) -> bool {
 /// `HALTS` lock this: reads the outgoing token's `is_cancelled()`, inserts
 /// `new`, and — if the old token was already cancelled — cancels `new`.
 ///
-/// This closes a TOCTOU race at the placeholder→real token swap in
-/// `rip_disc`: doing read-then-insert-then-cancel as three separate steps let
-/// a concurrent `/api/stop` (which calls `device_halt(device).cancel()`)
-/// landing between the read and the insert get lost — the user's Stop would
-/// cancel a token nobody polls again, hanging the drain. Holding the lock
-/// across the whole check+insert+carry serialises the two paths.
+/// Closes a TOCTOU race at the placeholder→real token swap in `rip_disc`:
+/// doing read/insert/cancel as three separate steps let a concurrent
+/// `/api/stop` landing between the read and the insert get lost, hanging
+/// the drain. Holding the lock across all three serialises the two paths.
 pub fn swap_halt_carrying_cancel(device: &str, new: Halt) {
     // Recover from poison (same convention as register_halt / device_halt):
     // a dropped swap would strand /api/stop on a token no phase loop reads.
@@ -410,43 +329,16 @@ pub fn unregister_halt(device: &str) {
     halts.remove(device);
 }
 
-/// Roll a device back to idle after a failed `spawn_rip_thread`, undoing the
-/// claim identified by `claim_gen` — the value the caller's own
-/// [`super::try_claim_active_checked`] returned — and nothing else.
+// See docs/ripper-session-notes.md — rollback_failed_spawn: why the generation, and not a liveness check
+/// Roll a device back to idle after a failed `spawn_rip_thread`, undoing
+/// the claim identified by `claim_gen` (the value the caller's own
+/// [`super::try_claim_active_checked`] returned) and nothing else. The
+/// single rollback used by both web handlers and the disc-insert poll
+/// loop; the disc is assumed still present.
 ///
-/// A spawn failure after the device has been claimed (the claim set
-/// `status="scanning"`) and a `Halt` token registered would otherwise wedge the
-/// device in "scanning" forever (409 on every future scan/rip) and leak the
-/// Halt. This is the single rollback used by BOTH web handlers (`/api/scan`,
-/// `/api/rip`) and the disc-insert poll loop so they can't drift. The disc is
-/// assumed still present.
-///
-/// # Why the generation, and not a liveness check
-///
-/// A spawn can fail for two very different reasons: the OS refused the thread
-/// (nothing is registered for this device — the case this function exists
-/// for), or `spawn_rip_thread` refused to displace a still-running incumbent.
-/// In the second case the "failure" belongs to the duplicate, and an
-/// unconditional rollback would vandalise the WINNER: `unregister_halt`
-/// deletes the token `/api/stop` needs to cancel the live rip, and the idle
-/// push overwrites a running rip's state.
-///
-/// The previous guard answered that with *liveness* — "is any worker thread
-/// running for this device?" — and returned early if so. That is the wrong
-/// question, and it introduced a wedge of its own: the early return left the
-/// LOSER's claim standing. No thread, no Halt, `status == "scanning"`,
-/// `is_busy()` true forever if the incumbent never writes state again (which
-/// is precisely the case in the incumbent's terminal tail, the window this
-/// whole race lives in). All four device routes then answer 409 indefinitely
-/// and only `/api/stop` can recover the device.
-///
-/// The generation answers the *right* question — "is the claim I made still
-/// the claim in force?" — and it is exactly what `RipState::claim_gen` was
-/// added for. It is correct under every interleaving with no liveness read at
-/// all: the loser always clears its own claim, and can never clear the
-/// winner's, because a winner's claim necessarily bumped the generation past
-/// the loser's. `update_state` carries the generation forward, so an ordinary
-/// progress write does not look like a re-claim.
+/// Scoped to `claim_gen`, not a liveness check: a failed spawn may be this
+/// device's own claim, or a duplicate that lost to a still-running
+/// incumbent — rolling back unconditionally would vandalise the winner.
 pub fn rollback_failed_spawn(device: &str, claim_gen: u64) {
     {
         // Recover-and-proceed on poison (module convention). Guard is dropped
@@ -493,14 +385,9 @@ pub(super) struct DriveSession {
 static SESSIONS: once_cell::sync::Lazy<Mutex<std::collections::HashMap<String, DriveSession>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// Last-known disc identity per device — the UDF Volume Identifier of
-/// the disc that was scanned into the device's `DriveSession`. Kept in
-/// a separate table (not on `DriveSession`) so it OUTLIVES the session:
-/// the transport-failure recovery path drops the session before it
-/// calls `rediscover_drive`, and the rediscovery needs the identity to
-/// reject a neighbouring drive that merely happens to have an unrelated
-/// disc loaded (see `rediscover_drive`). Populated automatically by
-/// `store_session` from `session.disc.volume_id`.
+// Last-known disc identity per device (UDF Volume Identifier). Kept
+// separate from `DriveSession` so it OUTLIVES the session for
+// `rediscover_drive`. See docs/ripper-session-notes.md — DISC_IDENTITY.
 static DISC_IDENTITY: once_cell::sync::Lazy<Mutex<std::collections::HashMap<String, String>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -514,17 +401,9 @@ pub(super) fn take_session(device: &str) -> Option<DriveSession> {
         .remove(device)
 }
 
-/// Record (or clear) the device's cached disc identity for the rediscovery
-/// path. `volume_id` is the freshly-scanned disc's UDF Volume Identifier;
-/// empty means the disc has no usable label.
-///
-/// An empty label is not a discriminator — storing it would match every
-/// other label-less disc — but it must still CLEAR any previous disc's
-/// entry. Skipping the write outright (what this did before) left the
-/// PREVIOUS disc's volume id cached against a device that now holds a
-/// different, unlabelled disc, and `rediscover_drive` would then "confirm" a
-/// shifted candidate against a disc that is no longer in the drive: the
-/// exact wrong-disc attachment the identity check exists to prevent.
+// Record (or clear) the device's cached disc identity for the rediscovery
+// path. An empty `volume_id` still CLEARS any previous entry (skipping the
+// write would leave a stale identity). See docs/ripper-session-notes.md — cache_disc_identity.
 pub(super) fn cache_disc_identity(device: &str, volume_id: &str) {
     let vid = volume_id.trim();
     // Recover-and-proceed on poison (module convention): a skipped clear is
@@ -557,25 +436,9 @@ pub(super) fn store_session(device: &str, session: DriveSession) {
         .insert(device.to_string(), session);
 }
 
-/// Is a rip/scan worker for `device` still running?
-///
-/// The thread-liveness fact `is_busy` cannot give. `is_busy` is
-/// `STATE[device].status == "scanning" | "ripping"`, and a worker writes its
-/// TERMINAL status and then keeps running its tail on the same thread —
-/// auto-eject (`Drive::open` + `session.eject()`, real hardware I/O), the
-/// eject-failure device log lines, guard drops. Teardown paths that would
-/// pull state out from under that tail must ask this too, exactly as
-/// [`forget_device_session_state`] asks the handle itself rather than
-/// trusting the status.
-///
-/// `false` for a device with no registered handle: nothing is running, so
-/// nothing is deferred. Residual window (unchanged by this predicate, and
-/// narrower than the one it closes): [`join_rip_thread`] takes the handle OUT
-/// of the map for the duration of an off-thread drain, so while another
-/// thread sits in that poll a live worker reads as not-running here. The
-/// self-join drain — the auto-eject tail, which is the tail that actually
-/// races the hot-unplug rescan — re-stashes the handle immediately and so is
-/// covered.
+// Is a rip/scan worker for `device` still running? A fact `is_busy` cannot
+// give: a worker writes its TERMINAL status, then keeps running its tail.
+// See docs/ripper-session-notes.md — rip_thread_running.
 pub(super) fn rip_thread_running(device: &str) -> bool {
     // Recover-and-proceed on poison (module convention): a poisoned map means
     // a worker panicked, and reporting "nothing is running" there is the
@@ -587,29 +450,9 @@ pub(super) fn rip_thread_running(device: &str) -> bool {
         .is_some_and(|h| !h.is_finished())
 }
 
-/// Evict the per-device state THIS module owns, on hot-unplug teardown:
-/// the cached [`DISC_IDENTITY`] entry, and — only if the rip thread has
-/// already exited — its [`RIP_THREADS`] handle and its [`HALTS`] token.
-/// Called from [`super::state::forget_device_state`], which is the single
-/// teardown entry point; see its doc for the full per-device inventory.
-///
-/// Returns `true` if a finished rip-thread handle was reaped.
-///
-/// A *running* handle is deliberately left in place. Dropping it makes the
-/// thread unjoinable, so a later stop/eject/shutdown drain returns while the
-/// worker is still mid-write and staging can be wiped underneath it — the
-/// v0.13.6 bug class that `register_rip_thread` and `join_rip_thread` are
-/// both built around. `forget_removed_device` only calls in here for a
-/// device that is not `is_busy`, but "not busy" is a STATE *status*, not a
-/// thread-liveness fact: the worker clears its status and then keeps
-/// unwinding (eject, log flush, guard drops). So we ask the handle itself,
-/// and leave a live one for the next `register_rip_thread` reap or the
-/// shutdown `join_all_rip_threads` to collect.
-///
-/// The `Halt` is evicted on the same condition, and only then: while a
-/// thread is still running its token must stay reachable so `/api/stop`
-/// can cancel it. Once the thread is gone nothing polls the token, and a
-/// leftover entry would shadow the next rip's fresh one.
+// Evict per-device state on hot-unplug teardown: DISC_IDENTITY always,
+// plus RIP_THREADS/HALTS only once the rip thread has exited. Returns
+// true if a finished handle was reaped. See docs/ripper-session-notes.md.
 pub(super) fn forget_device_session_state(device: &str) -> bool {
     // Recover-and-proceed on poison (module convention): a skipped eviction
     // here is the unbounded growth this function exists to prevent.
@@ -649,17 +492,9 @@ pub(super) fn expected_volume_id(device: &str) -> Option<String> {
     DISC_IDENTITY.lock().ok()?.get(device).cloned()
 }
 
-/// True iff `device` has a stored `DriveSession` with `scanned == true`.
-/// Used by `handle_rip_request` to skip a redundant `scan_disc` call
-/// when the disc has just been scanned (e.g. ON_INSERT=scan ran on
-/// disc insertion, then the user clicked Rip). Without this check the
-/// scan ran twice — clearing the TMDB poster + title in the UI and
-/// burning 10-30 s redoing identify + lookup + full title scan.
-///
-/// Returns false if the lock can't be acquired, the device has no
-/// session, or the session exists but was created without `scanned=true`
-/// (currently impossible — every `store_session` call site passes true —
-/// but keeps the check honest if that invariant ever loosens).
+// True iff `device` has a stored `DriveSession` with `scanned == true`. Lets
+// `handle_rip_request` skip a redundant re-scan (which clears the TMDB
+// poster/title). See docs/ripper-session-notes.md — session_is_scanned.
 pub(super) fn session_is_scanned(device: &str) -> bool {
     SESSIONS
         .lock()
@@ -774,47 +609,30 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
     None
 }
 
-/// True when a rediscovery probe's sg-number delta indicates the candidate
-/// path did not change from the original — i.e. it's definitionally the
-/// same physical device node, not a shifted candidate needing disc-identity
-/// verification. Extracted from [`rediscover_drive`] so the branch decision
-/// is unit-testable without the surrounding real-hardware probe loop
-/// (`libfreemkv::drive_has_disc`).
+// True when a rediscovery probe's sg-number delta indicates the candidate
+// path is unchanged (same physical device node, no identity verification
+// needed). Extracted from `rediscover_drive` for unit-testability.
 fn path_unchanged(delta: i32) -> bool {
     delta == 0
 }
 
-/// Whether a shifted-sg rediscovery candidate's probed volume id confirms it
-/// carries the expected disc. `probed` is `None` when the identity read
-/// itself failed (drive not ready, no volume label, etc.). Extracted from
-/// `rediscover_drive` so the accept/reject decision — "does this candidate
-/// carry the SAME disc, or could it be an unrelated one in a neighbouring
-/// bay" — is unit-testable without real drive I/O, which the enclosing
-/// function otherwise requires end-to-end (`drive_has_disc`,
-/// `probe_volume_id` both talk to hardware).
+// Whether a shifted-sg candidate's probed volume id confirms it carries the
+// expected disc (`probed` is `None` if the identity read itself failed).
+// Extracted from `rediscover_drive` for unit-testability without hardware I/O.
 fn candidate_identity_confirmed(probed: Option<&str>, expected: &str) -> bool {
     probed == Some(expected)
 }
 
-/// A disc-supplied UDF Volume Identifier, made safe to put in a log field.
-///
-/// `log::sanitize_log_msg`'s own doc names the UDF volume-id as the string it
-/// exists to defend against, but it only ran on `device_log`'s path — these
-/// `tracing` fields reach the human-readable `autorip.log` and stderr (so
-/// `docker logs` / `tail`) formatted with plain `Display` and no escaping, so a
-/// crafted disc could inject ANSI into an operator's terminal through the
-/// rediscovery path.
+// A disc-supplied UDF Volume Identifier, made safe to put in a log field —
+// these `tracing` fields reach `autorip.log`/stderr unescaped, so a crafted
+// disc could inject ANSI. See docs/ripper-session-notes.md — vid_for_log.
 fn vid_for_log(vid: &str) -> String {
     crate::log::sanitize_log_msg(vid)
 }
 
-/// Read the UDF Volume Identifier of the disc currently in the drive at
-/// `path`, for disc-identity matching during rediscovery. Returns None
-/// on any failure (open / ready / init / identify) — the caller treats
-/// "couldn't read identity" as "not a confirmed match" and keeps
-/// probing. `Disc::identify` only reads the UDF filesystem (a handful of
-/// sectors), so this is far lighter than a full `Disc::scan` and safe to
-/// run once per shifted candidate.
+// Read the UDF Volume Identifier of the disc in the drive at `path`, for
+// rediscovery identity matching. Returns None on any failure; the caller
+// treats that as "not a confirmed match" and keeps probing.
 fn probe_volume_id(path: &str) -> Option<String> {
     // TODO(step1-followup): NOT migrated to DiscSession, which treats
     // wait_ready/init failures as advisory instead of fail-fast-to-None —
@@ -836,16 +654,9 @@ fn probe_volume_id(path: &str) -> Option<String> {
 mod rollback_tests {
     use super::*;
 
-    /// A disc-supplied volume-id must not carry terminal escapes into a log.
-    ///
-    /// `log::sanitize_log_msg`'s own doc names the UDF volume-id as the string
-    /// it exists to defend against, but it only ran on `device_log`'s path.
-    /// The rediscovery `tracing` fields reach `autorip.log` and stderr — so
-    /// `docker logs` and `tail` — formatted with plain `Display` and no
-    /// escaping, so a crafted disc could paint an operator's terminal.
-    ///
-    /// The expectation is control-bytes-out, taken from what a terminal must
-    /// never receive, not from what the sanitizer happens to do.
+    // A disc-supplied volume-id must not carry terminal escapes into a log
+    // (rediscovery's `tracing` fields reach autorip.log/stderr unescaped).
+    // See docs/ripper-session-notes.md — a_volume_id_reaches_a_log_field_with_no_terminal_escapes.
     #[test]
     fn a_volume_id_reaches_a_log_field_with_no_terminal_escapes() {
         // ESC [ 2 J is "clear screen"; a bare CR hides the line before it.
@@ -862,23 +673,9 @@ mod rollback_tests {
         );
     }
 
-    /// Catches the mutation that drops the generation check from
-    /// `rollback_failed_spawn` (making it roll back unconditionally), and the
-    /// mutation that restores the round-1 `rip_thread_running` early return
-    /// (which left the loser's own claim standing forever).
-    ///
-    /// A spawn can fail for two unrelated reasons, and only one of them means
-    /// "the claim I made is still the claim in force". When `spawn_rip_thread`
-    /// refuses to displace a still-running incumbent, the loser's caller runs
-    /// this same rollback. It must do BOTH of these, and the round-1 guard did
-    /// only the first:
-    ///
-    /// * not vandalise the WINNER — no unregistering the `Halt` that
-    ///   `/api/stop` needs to cancel the live rip, no idling a running rip's
-    ///   state row;
-    /// * still clear the LOSER's own claim, or the device sits at
-    ///   `status="scanning"` with no thread and no Halt, `is_busy()` true, and
-    ///   every route answering 409 until someone POSTs `/api/stop`.
+    // Catches the mutation dropping rollback_failed_spawn's generation check,
+    // and the one restoring the round-1 rip_thread_running early return.
+    // See docs/ripper-session-notes.md — rollback_scoped_to_its_own_claim_spares_the_winner_and_clears_the_loser.
     #[test]
     fn rollback_scoped_to_its_own_claim_spares_the_winner_and_clears_the_loser() {
         let dev = format!("rollback-live-worker-test-{}", std::process::id());
@@ -1038,12 +835,9 @@ mod rollback_tests {
         assert!(!candidate_identity_confirmed(None, "DISC_VOL_123"));
     }
 
-    /// Swapping in a disc with NO volume label must not leave the previous
-    /// disc's identity cached. `store_session` used to `filter(|v|
-    /// !v.is_empty())` and simply skip the write, so `expected_volume_id`
-    /// kept answering with a disc that had been ejected — and
-    /// `rediscover_drive` would accept a shifted sg candidate carrying that
-    /// old disc as "identity confirmed".
+    // Swapping in a disc with NO volume label must not leave the previous
+    // disc's identity cached (the old `filter`-and-skip form left it stale).
+    // See docs/ripper-session-notes.md — an_unlabelled_disc_clears_the_previous_discs_cached_identity.
     #[test]
     fn an_unlabelled_disc_clears_the_previous_discs_cached_identity() {
         let dev = format!("disc-identity-swap-{}", std::process::id());
@@ -1071,13 +865,9 @@ mod rollback_tests {
         assert_eq!(expected_volume_id(&dev), None);
     }
 
-    /// Regression: hot-unplug teardown must not leak this module's
-    /// per-device maps. `forget_device_state` used to evict only
-    /// `TITLE_OVERRIDES` + `STOP_COOLDOWNS` (and said so in a doc that
-    /// claimed they were the only other per-device state), leaving the
-    /// device's finished `JoinHandle` in `RIP_THREADS`, its cached volume
-    /// id in `DISC_IDENTITY` and its token in `HALTS` for the container's
-    /// lifetime — one set per device path the kernel ever handed out.
+    // Regression: hot-unplug teardown must not leak this module's per-device
+    // maps (RIP_THREADS/DISC_IDENTITY/HALTS), as it used to.
+    // See docs/ripper-session-notes.md — forgetting_a_removed_device_reaps_its_finished_thread_and_identity.
     #[test]
     fn forgetting_a_removed_device_reaps_its_finished_thread_and_identity() {
         // Fixture name unique to this test: RIP_THREADS / DISC_IDENTITY /
@@ -1131,12 +921,9 @@ mod rollback_tests {
         );
     }
 
-    /// The other half of the contract: a rip thread that is still RUNNING
-    /// must keep its registration. Dropping a live `JoinHandle` makes the
-    /// thread unjoinable, so a later stop/eject/shutdown drain returns while
-    /// the worker is still mid-write and staging is wiped underneath it —
-    /// the v0.13.6 bug class. Teardown is allowed to be slower, never
-    /// unsafe.
+    // The other half of the contract: a still-RUNNING rip thread must keep
+    // its registration, or a later drain returns while it is mid-write.
+    // See docs/ripper-session-notes.md — forgetting_a_device_leaves_a_still_running_thread_registered.
     #[test]
     fn forgetting_a_device_leaves_a_still_running_thread_registered() {
         let dev = format!("forget-keep-running-{}", std::process::id());
@@ -1174,12 +961,9 @@ mod rollback_tests {
         let _ = join_rip_thread(&dev, Duration::from_secs(5));
     }
 
-    /// Regression: `take_session` and `drop_session` must recover from a
-    /// poisoned `SESSIONS` lock (unwrap_or_else into_inner), not silently
-    /// no-op as the old `.lock().ok()?` / `if let Ok(..)` forms did. A
-    /// silent no-op in `drop_session` would leak a stale session; a silent
-    /// no-op in `take_session` discards a usable one. We poison the lock
-    /// (panic while holding it, caught) and assert neither helper panics.
+    // Regression: take_session/drop_session must recover from a poisoned
+    // SESSIONS lock, not silently no-op as the old `.lock().ok()?` form did.
+    // See docs/ripper-session-notes.md — session_helpers_recover_from_poison.
     #[test]
     fn session_helpers_recover_from_poison() {
         // Poison SESSIONS by panicking while the guard is held.
@@ -1198,18 +982,9 @@ mod rollback_tests {
         drop_session(&dev); // must not panic
     }
 
-    /// Catches the mutation that deletes `join_rip_thread`'s self-join branch
-    /// (or turns it into an ordinary poll), and the mutation that has it
-    /// UNREGISTER the handle on the way out.
-    ///
-    /// `eject_drive` is called from the rip's own auto-eject tail, so
-    /// `join_rip_thread` regularly runs ON the thread it is being asked to
-    /// join. `is_finished()` can never become true from there, so an ordinary
-    /// poll burns the entire 60 s stop budget inside a rip that is doing
-    /// nothing wrong and then logs "did not drain". And the handle must stay
-    /// registered while we sit in that tail: it is the fact that keeps a
-    /// concurrent `/api/rip` from claiming a device whose worker is still
-    /// holding the drive.
+    // Catches the mutation deleting join_rip_thread's self-join branch: it
+    // runs ON its own thread from eject_drive, where is_finished() can never
+    // become true. See docs/ripper-session-notes.md — join_rip_thread self-join.
     #[test]
     fn join_rip_thread_called_on_its_own_thread_returns_at_once() {
         let dev = format!("self-join-test-{}", std::process::id());

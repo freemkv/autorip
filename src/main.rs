@@ -352,12 +352,9 @@ fn main() {
     log::syslog("autorip stopped");
 }
 
-/// Join `handle`, but give up after `timeout` so a wedged worker can't
-/// pin shutdown indefinitely. Polls `is_finished` because the std
-/// library has no join-with-timeout; same shape as the rip-thread
-/// drain in `ripper::session`. The worker is expected to observe
-/// `SHUTDOWN` and return after its current work unit; the timeout is a
-/// backstop for a genuinely stuck I/O path (e.g. an NFS write stall).
+// Join `handle`, giving up after `timeout` so a wedged worker can't pin
+// shutdown. Polls `is_finished` (no join-with-timeout in std); worker is
+// expected to observe SHUTDOWN, with the timeout as a stuck-I/O backstop.
 fn join_bounded(handle: std::thread::JoinHandle<()>, name: &str, timeout: std::time::Duration) {
     let deadline = std::time::Instant::now() + timeout;
     while !handle.is_finished() {
@@ -385,16 +382,8 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Release);
 }
 
-/// Probe the local HTTP API and exit 0 (healthy) or 1 (unhealthy).
-///
-/// Replaces the v0.25.5 `curl --fail http://127.0.0.1:8080/api/state`
-/// HEALTHCHECK so the deployed image doesn't need curl installed —
-/// freeing ~3 MB on the Option C / `FROM scratch` build and removing
-/// one more "why is this here" surface from the runtime image.
-///
-/// Reads the same `PORT` env var the web server binds to (default
-/// 8080). 2 s connect, 2 s read — both well under the 5 s timeout
-/// the Dockerfile HEALTHCHECK gives us.
+// Probe the local HTTP API and exit 0 (healthy) or 1 (unhealthy).
+// See docs/healthcheck.md — why this replaces the curl-based HEALTHCHECK.
 fn run_healthcheck() -> i32 {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
@@ -443,34 +432,9 @@ fn run_healthcheck() -> i32 {
     }
 }
 
-/// Container bootstrap — replaces the v0.25.5 `entrypoint.sh` so the
-/// final image can drop `bash`, `shadow` (`useradd`), and the shell
-/// scripts themselves.
-///
-/// Behaviour mirrors the prior shell entrypoint:
-/// - Create per-instance dirs under `$AUTORIP_DIR` (logs, freemkv,
-///   history) and `/staging`.
-/// - If running as root, ensure the `rip` user exists (writes
-///   `/etc/passwd` + `/etc/group` lines directly so we don't need
-///   `useradd`) and chown the working dirs.
-/// - Symlink `/home/<rip>/.config/freemkv` → `$AUTORIP_DIR/freemkv`
-///   so libfreemkv finds the KEYDB at its canonical path.
-/// - Snapshot relevant env vars to `/etc/autorip.env` for the
-///   `udev-trigger.sh` rip-on-insert path.
-/// - Write the udev rule.
-/// - If `NFS_HOST` + `NFS_EXPORT` + `NFS_MOUNTPOINT` are set, mount
-///   NFS inside the container via `/sbin/mount.nfs4` (bundled by the
-///   Option C harvest stage) so each container start gets a fresh
-///   NFS session and stale handles self-heal on restart.
-///
-/// All steps log to stderr (observe::init hasn't run yet) and are
-/// non-fatal — a transient mount failure shouldn't trip the
-/// restart loop; the mover will simply fail to write to the empty
-/// dir until the next container start retries the mount.
-///
-/// Linux-only: it manipulates `/etc/passwd`, chowns the working dirs, and
-/// mounts NFS — all container-init concerns that don't exist on macOS or
-/// Windows, where the daemon runs directly. cfg-gated out of those builds.
+// Container bootstrap — replaces the v0.25.5 entrypoint.sh (drops bash,
+// shadow, and the shell scripts). Linux-only; container-init concerns.
+// See docs/bootstrap.md — full step list and behaviour.
 #[cfg(unix)]
 fn run_bootstrap() {
     use std::io::Write;
@@ -615,10 +579,9 @@ fn run_bootstrap() {
     }
 }
 
-/// Wrap a value in single quotes for safe inclusion in a POSIX-shell
-/// `KEY=value` line that will be `.`-sourced. Embedded single quotes are
-/// escaped via the standard `'\''` idiom, so the result is always exactly
-/// one shell token regardless of newlines, spaces, or metacharacters.
+// Wrap a value in single quotes for safe inclusion in a POSIX-shell
+// `KEY=value` line that will be `.`-sourced. Embedded quotes use the
+// standard `'\''` idiom, so the result is always exactly one shell token.
 fn shell_single_quote(v: &str) -> String {
     let mut out = String::with_capacity(v.len() + 2);
     out.push('\'');
@@ -633,11 +596,9 @@ fn shell_single_quote(v: &str) -> String {
     out
 }
 
-/// Validate a Unix username against `^[a-z_][a-z0-9_-]{0,31}$` — the
-/// conservative POSIX-portable shape. Rejects anything with a colon or
-/// newline (the chars that would corrupt /etc/passwd or /etc/group when
-/// the name is interpolated into a record), as well as empty / overlong
-/// values.
+// Validate a Unix username against `^[a-z_][a-z0-9_-]{0,31}$` — the
+// conservative POSIX-portable shape. Rejects colon/newline (would corrupt
+// /etc/passwd or /etc/group when interpolated) and empty/overlong values.
 fn is_valid_username(user: &str) -> bool {
     let mut chars = user.chars();
     let Some(first) = chars.next() else {
@@ -727,10 +688,9 @@ fn normalize_mount_path(s: &str) -> &str {
     if t.is_empty() { "/" } else { t }
 }
 
-/// Wait for `child` to exit, but give up after `timeout` and kill it so
-/// an unreachable NFS server can't block bootstrap (and thus the daemon)
-/// for the full foreground-mount retry window. Returns `Some(status)` if
-/// the child exited in time, `None` if it was killed on timeout.
+// Wait for `child` to exit, but give up after `timeout` and kill it so an
+// unreachable NFS server can't block bootstrap for the full mount-retry
+// window. Returns `Some(status)` if exited in time, `None` if killed.
 fn wait_bounded(
     mut child: std::process::Child,
     timeout: std::time::Duration,
@@ -764,10 +724,9 @@ fn is_mountpoint(path: &str) -> bool {
         .any(|mp| normalize_mount_path(mp) == want)
 }
 
-/// Delete `.log` files under `log_dir` older than `retention_days`.
-/// Replaces the v0.25.5 cron-based cleanup so the deployed image
-/// doesn't need a cron daemon. Single-shot; the caller drives the
-/// daily cadence.
+// Delete `.log` files under `log_dir` older than `retention_days`. Replaces
+// the v0.25.5 cron-based cleanup (no cron daemon needed). Single-shot; the
+// caller drives the daily cadence.
 fn prune_old_logs(log_dir: &str, retention_days: u64) {
     // `retention_days * 86_400` can overflow u64 for an absurd value
     // (silent wraparound in release could delete fresh logs). Guard
@@ -789,18 +748,8 @@ fn prune_old_logs(log_dir: &str, retention_days: u64) {
     }
 }
 
-/// Whether a filename is one of the log files retention applies to.
-///
-/// NOT `extension() == "log"`, which is what this was. `tracing-appender`'s
-/// daily rotation writes `autorip.log.2026-05-01`, whose extension is the DATE
-/// — so every rolled daily was skipped and `log_retention_days` reclaimed only
-/// `device_*.log` and the per-rip logs. The central human-readable log grew for
-/// the container's lifetime while the prune reported zero files removed, on
-/// every install, at the shipped log level.
-///
-/// Matches on the `.log` component instead, which covers both the live file and
-/// every rolled name, and still excludes `autorip.jsonl` — whose unbounded
-/// growth is a separate, documented decision.
+// Whether a filename is one of the log files retention applies to.
+// See docs/log-retention.md — why this isn't `extension() == "log"`.
 fn is_prunable_log_name(path: &std::path::Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -808,11 +757,9 @@ fn is_prunable_log_name(path: &std::path::Path) -> bool {
     name.ends_with(".log") || name.contains(".log.")
 }
 
-/// Recursively delete the log files under `dir` older than `cutoff`, returning
-/// the count removed. Subdirectories are descended into (so `logs/rips/` is
-/// covered); anything [`is_prunable_log_name`] rejects is left alone. IO errors
-/// on individual entries are skipped, not propagated — pruning is best-effort
-/// and must never break the daemon.
+// Recursively delete log files under `dir` older than `cutoff` (descends into
+// subdirs, e.g. logs/rips/), returning the count removed. IO errors on
+// entries are swallowed — pruning is best-effort, must never break the daemon.
 fn prune_dir_recursive(dir: &std::path::Path, cutoff: std::time::SystemTime) -> u32 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -979,18 +926,9 @@ mod tests {
         assert_eq!(rc, 0, "utimes failed");
     }
 
-    /// `join_bounded` is the only thing between a wedged mover/muxer thread
-    /// and either hanging shutdown forever or abandoning an in-flight file
-    /// move before it finishes. Both failure directions matter: hanging keeps
-    /// the container from restarting, and abandoning early can leave the
-    /// operator's media half-moved.
-    ///
-    /// It had no test at all, and a mutation run flipped every part of it.
-    /// Note the `delete !` mutant is the subtle one — it skips the loop body
-    /// entirely and falls through to an unconditional `join()`, silently
-    /// turning the bounded join back into an unbounded one. A healthy-thread
-    /// test cannot see that, because joining works fine there. Only timing a
-    /// thread that outlives its deadline exposes it.
+    // Covers a wedged mover/muxer thread: shutdown must neither hang forever
+    // nor abandon an in-flight move too early.
+    // See docs/join-bounded-test.md — mutation-testing rationale.
     #[test]
     fn join_bounded_waits_for_a_healthy_worker_but_abandons_a_wedged_one() {
         use std::sync::Arc;
