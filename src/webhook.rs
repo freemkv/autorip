@@ -78,18 +78,9 @@ pub fn send_rich(cfg: &Config, event: WebhookEvent, ev: &RipEvent) {
     fire(cfg, &payload, event);
 }
 
-/// Return only the `scheme://host[:port]` portion of `url`, dropping any
-/// userinfo, path, query, or fragment. Webhook/keyserver URLs commonly embed
-/// a secret token in the path (Discord, Slack, Jellyfin), in the query
-/// string, or as HTTP basic-auth userinfo (`scheme://user:token@host/...`),
-/// so logging the full URL would expose that secret in the system log,
-/// which GET /api/system serves unredacted to any LAN client. Logging the
-/// origin is enough to identify the destination.
-///
-/// The userinfo-stripping step mirrors `web.rs`'s `mask_webhook_url` (which
-/// has its own test proving it strips userinfo) — this is the same policy,
-/// applied here as the one place it was missing rather than a second copy
-/// of the logic.
+// Return only the `scheme://host[:port]` portion of `url`, dropping any
+// userinfo, path, query, or fragment — the rest may carry a secret token.
+// See docs/webhook.md — webhook_url_origin
 pub(crate) fn webhook_url_origin(url: &str) -> String {
     if let Some(scheme_end) = url.find("://") {
         let after = scheme_end + 3;
@@ -113,13 +104,8 @@ pub(crate) fn webhook_url_origin(url: &str) -> String {
     "<redacted>".to_string()
 }
 
-/// Return the non-blank webhook URLs that opted in to `event`, in order.
-/// Pulled out of [`fire`] as a pure, directly-testable predicate — a
-/// blank/whitespace-only entry (e.g. an unconfigured slot in the settings
-/// array) must never be treated as a real destination to dispatch, and an
-/// entry whose `post_rip`/`post_move` flag is false for this event is
-/// deliberately skipped so a "move only" hook never receives a rip payload
-/// (and vice versa).
+// Return the non-blank webhook URLs that opted in to `event`, in order.
+// See docs/webhook.md — active_urls
 pub(crate) fn active_urls(entries: &[WebhookEntry], event: WebhookEvent) -> Vec<String> {
     entries
         .iter()
@@ -140,15 +126,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const MAX_INFLIGHT: usize = 8;
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// Attempt to claim one slot of a bounded concurrency counter. Returns
-/// `true` and increments `counter` if it is currently below `max`;
-/// otherwise leaves `counter` untouched and returns `false`.
-///
-/// Pulled out of [`fire`] as a pure function parameterised on `counter`
-/// (rather than reaching for the module's `static INFLIGHT` directly) so a
-/// test can drive the cap logic — including the exact boundary at `max` —
-/// against a private counter instead of racing the real process-wide one
-/// shared with every other test in the binary.
+// Attempt to claim one slot of a bounded concurrency counter. Returns
+// `true` and increments `counter` if below `max`, else leaves it untouched
+// and returns `false`. See docs/webhook.md — try_acquire_slot
 pub(crate) fn try_acquire_slot(counter: &AtomicUsize, max: usize) -> bool {
     counter
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -207,20 +187,9 @@ fn fire(cfg: &Config, payload: &serde_json::Value, event: WebhookEvent) {
     }
 }
 
-/// POST one payload to one URL.
-///
-/// Split out of [`fire`] so it can be TESTED against a loopback stub — until
-/// this seam existed, the only HTTP call in this module (the one carrying the
-/// user's rip-complete event) had no test at all. A mistake in it — a header
-/// that stopped being sent, a body that never reached the wire — would compile,
-/// pass every test, and be discovered by an operator whose Discord webhook
-/// silently stopped arriving.
-///
-/// Uses `web::webhook_agent` (default resolver, redirects blocked, no SSRF
-/// pinning): a webhook is a blind notification POST and is intended to be
-/// able to reach LAN hosts. Tests drive it against a loopback stub by
-/// pointing the URL straight at the listener's `127.0.0.1:<port>` address,
-/// which the default resolver connects to directly.
+// POST one payload to one URL. Split out of `fire` so the one HTTP call in
+// this module can be tested against a loopback stub.
+// See docs/webhook.md — deliver
 fn deliver(url: &str, body: &str) -> bool {
     let agent = crate::web::webhook_agent();
     match agent
@@ -261,12 +230,9 @@ fn deliver(url: &str, body: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    /// `send_rich` end-to-end through `fire`'s real spawn path to a loopback
-    /// stub — the whole rip-complete webhook, the one delivery this module
-    /// exists for, which no prior test drove (`fire` needs a `Config` and
-    /// spawns a thread, so it was only exercised piecemeal). Asserts the
-    /// spawned delivery actually reaches the wire and that `send_rich`'s
-    /// rounding + field mapping produce the JSON receivers see.
+    // `send_rich` end-to-end through `fire`'s real spawn path to a loopback
+    // stub — the one rip-complete delivery this module exists for.
+    // See docs/webhook.md — send_rich_delivers_the_rip_complete_payload_end_to_end
     #[test]
     fn send_rich_delivers_the_rip_complete_payload_end_to_end() {
         use std::io::{Read as _, Write as _};
@@ -344,10 +310,9 @@ mod tests {
         );
     }
 
-    /// `deliver`'s transport-error arm: a connection refused at a dead port
-    /// must return `false` (not a delivery) and never panic — the arm that
-    /// logs the URL-free summary. Closing a freshly-bound listener yields a
-    /// port nothing is listening on.
+    // `deliver`'s transport-error arm: a connection refused at a dead port
+    // must return `false` and never panic. Closing a freshly-bound listener
+    // yields a port nothing is listening on.
     #[test]
     fn deliver_reports_a_refused_connection_as_undelivered() {
         use std::net::TcpListener;
@@ -360,13 +325,9 @@ mod tests {
         assert!(!delivered, "a refused connection is not a delivery");
     }
 
-    /// A redirect is NOT a delivery.
-    ///
-    /// `webhook_agent` sets `max_redirects(0)`, and at zero ureq's
-    /// `max_redirects_do_error` is false — so a 3xx comes back as `Ok`, and
-    /// `deliver` logged "Webhook sent". An http webhook URL whose receiver
-    /// redirects to https reported success forever while nothing was ever
-    /// delivered, with nothing in the log to say otherwise.
+    // A redirect is NOT a delivery: `webhook_agent` sets `max_redirects(0)`,
+    // and at zero ureq's `max_redirects_do_error` is false, so a 3xx used to
+    // log "Webhook sent". See docs/webhook.md — a_redirect_is_not_reported_as_a_delivered_webhook
     #[test]
     fn a_redirect_is_not_reported_as_a_delivered_webhook() {
         use std::io::{Read as _, Write as _};
@@ -419,21 +380,9 @@ mod tests {
         );
     }
 
-    /// The webhook POST itself, driven to a real socket.
-    ///
-    /// Everything else in this module is helper-level (URL masking, the
-    /// in-flight counter); the request that actually carries the user's event
-    /// was never exercised. It was migrated from ureq 2's
-    /// `.set()`/`.send_string()` to ureq 3's `.header()`/`.send()` without a
-    /// test, and a mistake there — wrong header, a body that never reached the
-    /// wire — compiles and passes everything.
-    ///
-    /// Driven against a loopback listener by pointing the webhook URL straight
-    /// at its `127.0.0.1:<port>` address, which the default resolver connects
-    /// to directly (webhook delivery is intentionally un-pinned). Asserts the
-    /// request line, the content type and the body, and nothing else — header
-    /// order and `User-Agent` are ureq's business and would make this brittle
-    /// across a version bump.
+    // The webhook POST itself, driven to a real socket — the request that
+    // actually carries the user's event was never exercised before this.
+    // See docs/webhook.md — deliver_posts_json_with_the_content_type_header
     #[test]
     fn deliver_posts_json_with_the_content_type_header() {
         use std::io::{Read as _, Write as _};
@@ -779,14 +728,9 @@ mod tests {
         assert!(active_urls(&entries, WebhookEvent::Move).is_empty());
     }
 
-    /// Drives `try_acquire_slot`/`release_slot` directly against a private
-    /// counter (not the shared process-wide `INFLIGHT` static, to avoid
-    /// cross-test interference) through several full acquire/release
-    /// cycles. This is the real cap-and-release logic `fire()` uses, not a
-    /// re-implementation of it — so a regression in either function is
-    /// caught here directly, including `InflightGuard::drop` never
-    /// decrementing (which would show up as slot 9+ never becoming
-    /// available again).
+    // Drives `try_acquire_slot`/`release_slot` directly against a private
+    // counter (not the shared `INFLIGHT` static) through full
+    // acquire/release cycles. See docs/webhook.md — inflight_slot_cap_and_release_cycle
     #[test]
     fn inflight_slot_cap_and_release_cycle() {
         let counter = AtomicUsize::new(0);

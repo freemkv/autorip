@@ -41,12 +41,15 @@ chmod +x autorip-x86_64-linux && sudo mv autorip-x86_64-linux /usr/local/bin/aut
 ### Build from source
 
 ```bash
-# Clone both repos side-by-side (autorip depends on ../libfreemkv)
-git clone https://github.com/freemkv/libfreemkv
 git clone https://github.com/freemkv/autorip
 cd autorip
 cargo build --release
 ```
+
+`libfreemkv` and the other freemkv crates are resolved from their git tags via
+`[patch.crates-io]` in `Cargo.toml` (they're off crates.io) — no separate
+clone needed. Local development against a working-tree `libfreemkv` checkout
+instead is done via a gitignored `.cargo/config.toml` path patch.
 
 ## Features
 

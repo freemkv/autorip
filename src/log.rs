@@ -6,10 +6,9 @@ use std::sync::Mutex;
 /// durable record; this is just the live UI view.
 const RING_CAP: usize = 500;
 
-/// Size threshold above which the non-device `system` log file is rotated
-/// into `logs/rips/` on startup. The system log is never archived per-rip
-/// (no eject/scan boundary), so without this it would grow unbounded for
-/// the container lifetime.
+// Size threshold above which the non-device `system` log file is rotated
+// into `logs/rips/` on startup — it has no eject/scan boundary, so without
+// this it would grow unbounded for the container lifetime.
 const SYSTEM_LOG_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 
 static LOGS: once_cell::sync::Lazy<Mutex<HashMap<String, VecDeque<String>>>> =
@@ -22,13 +21,9 @@ fn log_dir() -> String {
     crate::config::default_autorip_dir()
 }
 
-/// Neutralize a device string into a safe single path component for the
-/// log filename. Enforced at the single construction point so no caller
-/// (web routes, SCSI enumeration, the literal "system" syslog channel, or
-/// any future caller) can write or rename outside `logs/` via a `/`, `\`,
-/// or `..` in the device name. Reachable callers are all well-behaved
-/// today (web gates on is_valid_device_name), so this is a hard invariant,
-/// not a live exploit fix.
+// Neutralize a device string into a safe single path component for the
+// log filename, so no caller can escape `logs/` via `/`, `\`, or `..`.
+// See docs/log.md — sanitize_device invariant.
 fn sanitize_device(device: &str) -> String {
     if device.is_empty()
         || device == "."
@@ -47,31 +42,23 @@ fn device_log_path(device: &str) -> String {
     format!("{}/logs/device_{}.log", log_dir(), sanitize_device(device))
 }
 
-/// Strip terminal control/escape bytes from log content. A crafted disc string
-/// (UDF volume-id, Blu-ray `bdmt` title) logged verbatim could otherwise inject
-/// ANSI escape sequences into an operator's terminal (`docker logs` / `tail`) or
-/// the on-disk `.log`. Replaces any control character (C0 / DEL / C1, ESC
-/// included) with `?`; ordinary text is untouched.
+// Strip terminal control/escape bytes from log content, so a crafted disc
+// string (UDF volume-id, `bdmt` title) can't inject ANSI escapes into an
+// operator's terminal or the on-disk log. Any control byte becomes `?`.
 pub(crate) fn sanitize_log_msg(msg: &str) -> String {
     msg.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
 }
 
-/// Log a message for a specific device. Three sinks:
-///
-/// - **In-memory ring** (last 500 lines per device) — read by the web UI's
-///   `/api/logs/{device}` endpoint to render the live log view.
-/// - **`{AUTORIP_DIR}/logs/device_{dev}.log`** — per-device file, archived
-///   per-rip via `archive_device_log`. Operators tail when troubleshooting
-///   one drive.
-/// - **Tracing event** at info level with `device` field — flows into
-///   `autorip.log` (everything) and `autorip.jsonl` (machine-greppable).
-///   See `observe.rs`.
-///
-/// Line format in the per-device file: `[YYYY-MM-DDTHH:MM:SSZ] msg`. The
-/// in-memory ring stores the same. ISO-8601 timestamps so rip log archives
-/// sort correctly and midnight isn't ambiguous.
+/// Log a message for a specific device. Writes to three sinks: the
+/// in-memory ring (last `RING_CAP` lines/device, read by the web UI's
+/// `/api/logs/{device}` endpoint), the per-device file
+/// `{AUTORIP_DIR}/logs/device_{dev}.log` (archived per-rip via
+/// [`archive_device_log`]), and a tracing `info` event with a `device`
+/// field (flows into `autorip.log` / `autorip.jsonl`, see `observe.rs`).
+/// Per-device file/ring lines are ISO-8601 timestamped:
+/// `[YYYY-MM-DDTHH:MM:SSZ] msg`.
 pub fn device_log(device: &str, msg: &str) {
     // Sanitize ONCE, up front, so EVERY sink (ring, file, and the structured
     // tracing event below) gets the escape-free text — not just the file line.
@@ -201,13 +188,11 @@ pub fn archive_device_log(device: &str) {
 /// Drop a device's in-memory ring buffer without archiving it.
 ///
 /// Called when a drive is hot-unplugged: there is no eject/scan boundary
-/// to trigger `archive_device_log`, so without this the device's `LOGS`
-/// entry would linger for the container's lifetime. Distinct device
-/// strings (e.g. enumeration churn or paths that change across reconnects)
-/// would then accumulate dead entries. The on-disk `device_*.log` is left
-/// in place — it is the durable record and is reclaimed on the next scan's
-/// `archive_device_log` if the device returns; this only evicts the live
-/// UI ring for a device that is gone.
+/// to trigger [`archive_device_log`], so without this the device's `LOGS`
+/// entry would linger for the container's lifetime. The on-disk
+/// `device_*.log` is left in place — it is the durable record, reclaimed
+/// on the next scan's `archive_device_log` if the device returns; this
+/// only evicts the live UI ring for a device that is gone.
 pub fn forget_device(device: &str) {
     if let Ok(mut logs) = LOGS.lock() {
         logs.remove(device);
@@ -235,28 +220,9 @@ pub fn rotate_system_log_if_large() {
     }
 }
 
-/// Serializes tests that manipulate the process-wide `AUTORIP_DIR` env var
-/// (and the module-global `LOGS` state that reads it).
-///
-/// Cargo runs tests in parallel threads within ONE process, so any test that
-/// re-points `AUTORIP_DIR` races every other test that resolves a log path.
-/// `archive_device_log_moves_to_rips_dir` failed intermittently for exactly
-/// that reason: another test swapped the dir between its `device_log` write
-/// and the `exists()` assertion on the resolved path, so the path pointed
-/// into the other test's tempdir.
-///
-/// This lives at crate scope, NOT inside `log::tests`, because the racing
-/// writers are in other modules (e.g. `ripper::resume`). EVERY test that
-/// sets `AUTORIP_DIR` must hold this guard for the whole test.
-///
-/// Acquire it through [`env_guard`], never directly: serialising the writers is
-/// only half the problem. Nothing used to RESTORE `AUTORIP_DIR`, and most tests
-/// delete their tempdir at the end, so the process-wide var was left pointing
-/// at a deleted directory for every later test in the run. Unguarded readers
-/// (any test that reaches `device_log`/`syslog` transitively) then resolved
-/// paths into it — which is what made `find_iso_tests::pairs_despite_extra_entries`
-/// and `resume_lock_and_fsync_tests::fsync_failure_below_limit_preserves_and_bumps`
-/// fail intermittently after the write race itself was fixed.
+// Serializes tests that manipulate the process-wide `AUTORIP_DIR` env var
+// (crate scope: racing writers live in other modules too, e.g.
+// `ripper::resume`). Acquire via [`env_guard`] — see docs/log.md.
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -524,13 +490,9 @@ mod tests {
 
     #[test]
     fn sanitize_log_msg_strips_ansi_and_control_bytes() {
-        // Log-injection defense: a crafted disc string (UDF volume-id, `bdmt`
-        // title) could inject ANSI escapes into a terminal or the on-disk
-        // log. Every control byte must become '?'; printable UTF-8 passes.
-
-        // ESC + ANSI CSI sequences (clear screen + cursor home). Only the two
-        // ESC (\u{1b}) bytes are control; '[', digits, ';', 'J', 'H' are
-        // ordinary printable ASCII and survive.
+        // Log-injection defense: a crafted disc string could inject ANSI
+        // escapes into a terminal/log; every control byte (incl. ESC
+        // \u{1b}) becomes '?', while ordinary printable text survives.
         assert_eq!(
             sanitize_log_msg("\u{1b}[2J\u{1b}[1;1H"),
             "?[2J?[1;1H",
