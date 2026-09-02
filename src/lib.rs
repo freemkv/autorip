@@ -7,21 +7,14 @@
 //! `pub mod` so external consumers (tests) can name the items.
 //!
 //! Keep this file purely declarative — no logic, almost no statics.
-//!
-//! The one exception is `SHUTDOWN`: several modules reference
-//! `crate::SHUTDOWN` directly, so the lib crate has to provide its
-//! own copy. The bin still owns the authoritative one in `main.rs`;
-//! the lib copy only matters for integration tests, which never
-//! actually drive the long-running loops that read it.
+//! See docs/lib-facade.md for why `SHUTDOWN` is duplicated here.
 
 use std::sync::atomic::AtomicBool;
 
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Full build label (package version + git short hash, e.g. `1.1.1 (g2014a41)`).
-/// Mirrors the `main.rs` const for the same reason `SHUTDOWN` is duplicated:
-/// modules reference `crate::VERSION_LABEL`, so both crate roots must define it.
-/// Built by `build.rs`.
+/// Built by `build.rs`. See docs/lib-facade.md for why this is duplicated.
 pub const VERSION_LABEL: &str = concat!(env!("AUTORIP_VERSION"), env!("GIT_SUFFIX"));
 
 pub mod config;

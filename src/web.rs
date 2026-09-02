@@ -1516,11 +1516,9 @@ fn default_port_for_scheme(s: &str) -> u16 {
     }
 }
 
-/// Normalize an authority (`host` or `host:port`) to a canonical
-/// `host:port`, filling in `default_port` when the port is omitted. This
-/// lets `http://host` (Origin, port implied) compare equal to `host:80`
-/// (Host header) so a legitimate same-origin request on the scheme's
-/// default port isn't falsely rejected as cross-origin.
+// Normalize an authority (`host` or `host:port`) to canonical `host:port`,
+// filling in `default_port` when omitted, so `http://host` (Origin) compares
+// equal to `host:80` (Host header) instead of falsely reading cross-origin.
 fn normalize_authority(authority: &str, default_port: u16) -> Option<String> {
     let a = authority_of(authority)?;
     // Bracketed IPv6 literal: [::1] or [::1]:8080.
@@ -1545,29 +1543,18 @@ fn normalize_authority(authority: &str, default_port: u16) -> Option<String> {
     }
 }
 
-/// Lightweight cross-origin defense for state-changing POST routes.
-///
-/// This service is intentionally unauthenticated on the LAN and is driven
-/// both by a browser dashboard and by operator `curl`/monitoring scripts
-/// (which send no Origin header). So the policy is deliberately permissive:
-/// if an `Origin` (or, failing that, `Referer`) header is PRESENT and its
-/// host does NOT match the request's Host header, reject with 403. If no
-/// such header is present we ALLOW the request, so curl and monitoring
-/// keep working. This is defense-in-depth against a browser on the same
-/// LAN being used to forge state-changing requests (CSRF); it is not an
-/// authentication mechanism.
-///
-/// Returns `true` if the request should be rejected (caller sends 403).
+// Lightweight CSRF defense for state-changing POSTs: reject only when an
+// Origin/Referer header is present and disagrees with Host (403); an absent
+// header is allowed so curl/monitoring keep working. See docs/web-csrf.md.
 fn is_cross_origin_post(request: &tiny_http::Request) -> bool {
     let origin = header_value(request, "Origin").or_else(|| header_value(request, "Referer"));
     let host = header_value(request, "Host");
     is_cross_origin(origin, host)
 }
 
-/// Pure cross-origin decision over the raw `Origin`/`Referer` and `Host`
-/// header values. Returns `true` when the request should be rejected.
-/// Absent/empty Origin → allow (curl/monitoring). Unparseable Origin or
-/// absent Host → can't prove cross-origin, so allow.
+// Pure cross-origin decision over raw Origin/Referer + Host header values;
+// `true` means reject. Absent/unparseable input can't prove cross-origin, so
+// it's allowed. See docs/web-csrf.md for the full policy rationale.
 fn is_cross_origin(origin: Option<&str>, host: Option<&str>) -> bool {
     let origin = match origin {
         None => return false,
@@ -1751,10 +1738,9 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     }
 }
 
-/// Defensive validation for an operator-supplied poster URL. The value is
-/// later interpolated into an `<img src>` attribute on the dashboard; require
-/// an http(s) scheme and reject control characters or quotes so it can't break
-/// out of the attribute context even if the front-end escaping regresses.
+// Defensive check for an operator poster URL later interpolated into an
+// `<img src>` attribute: require http(s) and reject control chars/quotes so
+// it can't break out of the attribute even if front-end escaping regresses.
 fn is_valid_poster_url(url: &str) -> bool {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return false;
@@ -1763,10 +1749,9 @@ fn is_valid_poster_url(url: &str) -> bool {
         .any(|c| c.is_control() || c == '"' || c == '\'' || c == '<' || c == '>')
 }
 
-/// `POST /api/title/<device>` — operator's TMDB pick for the active disc (from the
-/// Ripper card). Body: `{"title":"…","year":2024,"poster_url":"…","overview":"…"}`.
-/// Stored as a one-shot override `rip_disc` consumes; also reflected on the live
-/// card immediately.
+// POST /api/title/<device>: operator's TMDB pick for the active disc.
+// Body: {"title","year","poster_url","overview"}. Stored as a one-shot
+// override `rip_disc` consumes; also reflected on the live card immediately.
 fn handle_title_override(request: tiny_http::Request, device: &str) {
     // An override for an untracked drive has nothing to attach to and
     // would persist orphaned; reject before reading the body, matching
@@ -1986,18 +1971,14 @@ fn json_response(request: tiny_http::Request, status: u16, body: &str) {
     let _ = request.respond(response);
 }
 
-/// Sentinel returned in place of a stored secret on GET /api/settings.
-/// On POST, a field carrying exactly this value is treated as "unchanged"
-/// so the UI can round-trip the redacted form without clobbering the real
-/// secret.
+// Sentinel returned in place of a stored secret on GET /api/settings; a
+// POST field carrying exactly this value is treated as "unchanged" so the
+// UI can round-trip the redacted form without clobbering the real secret.
 const SECRET_SENTINEL: &str = "********";
 
-/// Mask a webhook URL for display: keep the origin (`scheme://host[:port]`)
-/// so the operator can tell Discord from Slack from Jellyfin, but replace the
-/// path/query — where Discord/Slack/Jellyfin embed the secret token — with the
-/// sentinel. e.g. `https://discord.com/api/webhooks/1/tok` → `https://discord.com/********`.
-/// A masked value round-trips on POST: any entry CONTAINING the sentinel is
-/// treated as "unchanged" and resolved back to the stored URL.
+// Mask a webhook URL for display: keep the origin (scheme://host[:port])
+// but replace the path/query — where the secret token lives — with the
+// sentinel; a value containing the sentinel round-trips as "unchanged".
 fn mask_webhook_url(url: &str) -> String {
     // Origin = everything up to the first '/', '?', or '#' after `scheme://`.
     // Treating '?' and '#' as terminators prevents a token carried in a query
@@ -2027,25 +2008,16 @@ fn mask_webhook_url(url: &str) -> String {
     SECRET_SENTINEL.to_string()
 }
 
-/// Mask a webhook URL for display, embedding a STABLE per-entry identifier
-/// (its index in the stored `webhook_urls` array) so resolution on POST is by
-/// identity, not by origin. Two distinct webhooks that share an origin
-/// (e.g. two Discord hooks) mask to DIFFERENT placeholders and so round-trip
-/// unambiguously — the origin-only mask used to collide them and force the
-/// save to be rejected.
-///
-/// Form: `https://discord.com/********#<idx>` — the `#<idx>` fragment is
-/// appended to the origin-masked value. [`resolve_webhook_entries`] reads it back.
+// Mask a webhook URL, appending a stable `#<idx>` (its index in
+// `webhook_urls`) so POST resolves by identity, not origin — two hooks
+// sharing an origin would otherwise mask identically and collide.
 fn mask_webhook_url_indexed(url: &str, idx: usize) -> String {
     format!("{}#{idx}", mask_webhook_url(url))
 }
 
-/// True if `s` is a redacted webhook placeholder produced by
-/// [`mask_webhook_url`] / [`mask_webhook_url_indexed`] — i.e. it ends with the
-/// sentinel, or with `********#<digits>` (the indexed form). Used to skip
-/// re-validating / re-fetching a masked round-trip. Deliberately strict: a
-/// hostile URL that merely *embeds* the sentinel mid-path (e.g.
-/// `https://evil/********@host/x`) does NOT match and is still validated.
+// True if `s` is a redacted placeholder from `mask_webhook_url[_indexed]`:
+// ends with the sentinel, or `********#<digits>`. Strict on purpose — a URL
+// that merely embeds the sentinel mid-path still gets validated.
 fn is_masked_webhook(s: &str) -> bool {
     if s.ends_with(SECRET_SENTINEL) {
         return true;
@@ -2058,10 +2030,9 @@ fn is_masked_webhook(s: &str) -> bool {
     false
 }
 
-/// One webhook as it arrives on POST /api/settings: a (possibly masked) URL
-/// plus the two per-event flags the UI collected from its checkboxes.
-/// [`resolve_webhook_entries`] turns a slice of these into stored
-/// [`WebhookEntry`]s, unmasking the URL while carrying the flags through.
+// One webhook as it arrives on POST /api/settings: a (possibly masked) URL
+// plus its per-event flags. `resolve_webhook_entries` turns these into
+// stored `WebhookEntry`s, unmasking the URL while keeping the flags.
 struct IncomingWebhook {
     /// May be a real URL (newly entered) or a masked placeholder to resolve.
     url: String,
@@ -2070,22 +2041,9 @@ struct IncomingWebhook {
     post_move: bool,
 }
 
-/// Resolve an incoming `webhook_urls` array against the currently-stored
-/// entries, replacing each redacted URL placeholder with its real
-/// (token-bearing) value while preserving the per-entry `post_rip`/`post_mux`/`post_move`
-/// flags the client sent. Only the URL is ever masked, so the flags always
-/// come straight from `incoming`.
-///
-/// URL matching is BY STABLE `#idx` (falling back to origin prefix), never by
-/// array position: the UI can delete or reorder rows between GET and POST, so
-/// a positional match would bind a masked entry to a different stored secret.
-/// A masked URL whose `#idx` (or, for older clients, origin) resolves to
-/// exactly one stored entry takes that entry's real URL. A non-masked URL is
-/// taken verbatim (a newly-entered secret). `Err(url)` is returned when a
-/// masked URL is ambiguous — it matches 0 stored entries (the row it referred
-/// to was deleted) or >1 (two stored hooks share an origin) — so the caller
-/// can reject the save instead of guessing. Entries with a blank/whitespace
-/// URL are dropped.
+// Resolve an incoming webhook_urls array against stored entries, unmasking
+// each placeholder by stable #idx (falling back to origin) — never by array
+// position, since rows can be reordered. See docs/web-webhooks.md.
 fn resolve_webhook_entries(
     incoming: &[IncomingWebhook],
     existing: &[WebhookEntry],
@@ -2137,10 +2095,9 @@ fn resolve_webhook_entries(
     Ok(resolved)
 }
 
-/// Serialize Config for GET /api/settings with credential fields redacted.
-/// No route is authenticated and the server binds 0.0.0.0, so returning
-/// `keyserver_secret` / `tmdb_api_key` in cleartext would hand any
-/// LAN/host client the operator's bearer token and API key.
+// Serialize Config for GET /api/settings with credential fields redacted:
+// no route is authenticated and the server binds 0.0.0.0, so cleartext
+// keyserver_secret/tmdb_api_key would hand any LAN client the operator's key.
 fn settings_json_redacted(c: &Config) -> String {
     let mut v = serde_json::to_value(c).unwrap_or_else(|_| serde_json::json!({}));
     for field in ["keyserver_secret", "tmdb_api_key"] {
@@ -2160,10 +2117,7 @@ fn settings_json_redacted(c: &Config) -> String {
             v[field] = serde_json::json!(mask_webhook_url(s));
         }
     }
-    // webhook_urls embed bearer tokens in the path/query; mask the token
-    // but keep the origin visible so the operator can identify each hook.
-
-    // keydb_path is an absolute container path; leaking it exposes the
+    // keydb_path is an absolute container path; leaking it would expose the
     // internal filesystem layout, so return only the filename component.
     if let Some(s) = v.get("keydb_path").and_then(|x| x.as_str())
         && !s.is_empty()
@@ -2190,12 +2144,9 @@ fn settings_json_redacted(c: &Config) -> String {
     v.to_string()
 }
 
-/// Cap on a request body we read fully into memory. Every POST handler
-/// deals in small JSON documents (a settings patch, a title override, a
-/// review action, a debug toggle); 1 MiB is orders of magnitude above
-/// the largest legitimate body. Without this cap a LAN client could
-/// stream a multi-GB body and OOM the container, killing any in-flight
-/// rip/mux — a trivial unauthenticated DoS.
+// Cap on a request body read fully into memory. POST bodies are small JSON
+// (settings/title/review/debug); without this cap an unauthenticated LAN
+// client could stream a multi-GB body and OOM the container (DoS).
 const MAX_REQUEST_BODY: u64 = 1024 * 1024;
 
 /// Outcome of [`read_body_capped`].
@@ -2208,12 +2159,9 @@ enum BodyRead {
     TooLarge,
 }
 
-/// Read a request body fully into a `String`, but never more than
-/// `MAX_REQUEST_BODY + 1` bytes. We read one byte past the cap so an
-/// exactly-at-limit body is accepted while an oversized one is detected
-/// (the reader yields the extra byte only if more data exists). The
-/// client-supplied Content-Length is never trusted — the `take` adapter
-/// bounds the actual bytes pulled off the socket.
+// Read a body into a String, capped at MAX_REQUEST_BODY + 1 bytes: the
+// extra byte lets an exactly-at-limit body pass while detecting oversize.
+// Content-Length is never trusted; `take` bounds actual bytes read.
 fn read_body_capped(request: &mut tiny_http::Request) -> BodyRead {
     let mut body = String::new();
     match request
@@ -2253,11 +2201,9 @@ fn read_json_body(mut request: tiny_http::Request) -> Result<(tiny_http::Request
     }
 }
 
-/// Validate that a device name is `sg\d+`. Rejects anything containing slashes
-/// or other characters that would let a malformed URL (e.g. a typo like
-/// `/api/rip/sg4/stop`) hit the rip handler with `device = "sg4/stop"`, which
-/// previously spawned a doomed rip thread and surfaced as a phantom tab in
-/// the UI.
+// Validate device name is alphanumeric-only (sgN/diskN/CdRomN): rejects
+// slashes/traversal so a malformed URL like /api/rip/sg4/stop can't reach
+// the rip handler with device="sg4/stop" (previously spawned a doomed thread).
 fn is_valid_device_name(s: &str) -> bool {
     // Cross-OS device key (Linux `sgN`, macOS `diskN`, Windows `CdRomN`).
     // ASCII-alphanumeric only is the path-safety boundary rejecting
@@ -2265,20 +2211,9 @@ fn is_valid_device_name(s: &str) -> bool {
     (3..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// Clamp `s` to at most `max` characters (Unicode scalar values), never
-/// splitting a multi-byte char. Used to bound operator-supplied free text
-/// (title/overview/poster_url) before it's persisted and re-broadcast.
-/// The stored `media_type` for a title override, reduced to the vocabulary
-/// the router actually understands.
-///
-/// `media_type` is the one field of `handle_title_override` that was neither
-/// clamped nor allow-listed, on a route reachable unauthenticated from the
-/// LAN — the sibling fields all go through `clamp_chars`. It is also not
-/// free-form data: `mover::routing_media_type` recognises `"tv"` and treats
-/// everything else as a movie, and TMDB itself only ever yields these two. An
-/// allow-list is therefore both the tighter bound AND the honest description
-/// of the field — it stores what the router will act on, instead of persisting
-/// and re-broadcasting an arbitrary caller-supplied string to every dashboard.
+// media_type on a title override is the one field handle_title_override left
+// unclamped/unallow-listed; the router only acts on "tv" vs everything else
+// (and TMDB only ever yields these two), so allow-listing is the honest bound.
 fn normalize_media_type(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "tv" => "tv".to_string(),
@@ -2286,6 +2221,9 @@ fn normalize_media_type(raw: &str) -> String {
     }
 }
 
+// Clamp `s` to `max` Unicode scalar values without splitting a multi-byte
+// char; bounds operator-supplied free text (title/overview/poster_url)
+// before it's persisted and re-broadcast.
 fn clamp_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((byte_idx, _)) => s[..byte_idx].to_string(),
@@ -2293,17 +2231,9 @@ fn clamp_chars(s: &str, max: usize) -> String {
     }
 }
 
-// ── SSRF guard ─────────────────────────────────────────────────────────
-
-// Operator-supplied URLs autorip fetches (keydb_url, keyserver_url,
-// webhook_urls) are an SSRF vector; blocked at store and fetch time,
-// pinned to the validated IP to defeat DNS-rebinding TOCTOU.
-
-/// True when `ip` is in a class autorip must never connect to: loopback,
-/// any RFC1918 / link-local / ULA private range, multicast, unspecified,
-/// the cloud-metadata anycast 169.254.169.254, and other non-global
-/// space. Conservative — anything not clearly a routable public address
-/// is blocked.
+// ── SSRF guard: operator-supplied URLs are blocked at store/fetch time and
+// pinned to the validated IP (DNS-rebinding TOCTOU). Conservative: anything
+// not clearly a routable public address is blocked (loopback/RFC1918/etc).
 fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -2336,46 +2266,25 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
     }
 }
 
-/// Validate an operator-supplied fetch/POST URL against the SSRF guard.
-///
-/// Requires an `http`/`https` scheme, resolves the host **once**, and
-/// rejects the URL if it has no addresses or any resolved address is in
-/// a blocked class. On success returns the resolved+validated socket
-/// addresses so the caller can pin the connection to them (avoiding a
-/// re-resolve race). `Err(msg)` carries an operator-facing reason.
-/// Resolve `host:port` to socket addresses with a bounded deadline.
-///
-/// `ToSocketAddrs` performs a blocking DNS lookup, which can hang for the OS
-/// resolver timeout (potentially tens of seconds) and freeze the calling
-/// (unauthenticated) handler thread. Run it on a spawned thread and join with
-/// a short deadline; error on timeout. Shared by `validate_fetch_url` and
-/// `validate_network_target` so neither can re-introduce an unbounded lookup.
-/// The three failure strings [`resolve_with_timeout`] and
-/// [`validate_fetch_url`] emit for "we could not find out", as opposed to
-/// "this URL is not allowed". They are constants because
-/// [`is_transient_resolve_error`] classifies on them: a caller that has to
-/// tell a DNS blip from a config error would otherwise be matching literals
-/// typed twice, and the day one side is reworded the classification silently
-/// inverts.
+// The three "could not find out" failure strings, as opposed to "this URL
+// is not allowed"; kept as constants so is_transient_resolve_error can
+// classify without duplicated literals. See docs/web-ssrf.md.
 pub(crate) const RESOLVE_TIMEOUT_MSG: &str = "DNS resolution timed out";
 pub(crate) const RESOLVE_FAILED_PREFIX: &str = "could not resolve host: ";
 pub(crate) const RESOLVE_NO_ADDRS_MSG: &str = "host did not resolve to any address";
 
-/// True when a [`validate_fetch_url`] / [`resolve_with_timeout`] error means
-/// the host could not be LOOKED UP right now — a DNS timeout, a resolver
-/// failure, or an empty answer — rather than a permanent verdict on the URL
-/// (bad scheme, no host, blocked address).
-///
-/// The distinction matters wherever a failed validation is folded into a
-/// judgement about the remote SERVICE: a resolver blip is not evidence that
-/// the service answered. See `keysource::probe_online_reachability`, where
-/// getting this wrong finalised a rippable disc as permanently keyless.
+// True when the error means the host could not be looked up right now (DNS
+// blip), not a permanent verdict on the URL — a resolver blip is not
+// evidence the remote service is down. See docs/web-ssrf.md.
 pub(crate) fn is_transient_resolve_error(msg: &str) -> bool {
     msg == RESOLVE_TIMEOUT_MSG
         || msg == RESOLVE_NO_ADDRS_MSG
         || msg.starts_with(RESOLVE_FAILED_PREFIX)
 }
 
+// Resolve host:port with a bounded deadline: ToSocketAddrs blocks and can
+// hang for the OS resolver timeout, freezing the calling handler thread.
+// Runs on a spawned thread, joined with a short deadline. See docs/web-ssrf.md.
 pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -2414,6 +2323,9 @@ pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAd
     }
 }
 
+// Validate an operator-supplied fetch/POST URL against the SSRF guard:
+// requires http(s), resolves the host once, and rejects blocked addresses.
+// Returns resolved sockets so the caller can pin the connection. See docs/web-ssrf.md.
 pub(crate) fn validate_fetch_url(url: &str) -> Result<Vec<SocketAddr>, String> {
     let url = url.trim();
     if url.is_empty() {
@@ -2480,11 +2392,9 @@ pub(crate) fn validate_fetch_url(url: &str) -> Result<Vec<SocketAddr>, String> {
     Ok(addrs)
 }
 
-/// Validate an operator-supplied network output target against the SSRF
-/// guard. Unlike [`validate_fetch_url`] the target is a bare `host:port`
-/// (no scheme) — at rip time libfreemkv streams decrypted disc content to
-/// it, so the same non-public-address rule applies. Resolves the host once
-/// and rejects if it has no addresses or any resolved address is blocked.
+// Validate an operator network output target against the SSRF guard.
+// Unlike validate_fetch_url the target is a bare host:port (no scheme) —
+// libfreemkv streams decrypted disc content to it — same blocked-address rule.
 pub(crate) fn validate_network_target(target: &str) -> Result<(), String> {
     let target = target.trim();
     if target.is_empty() {
@@ -2531,44 +2441,21 @@ pub(crate) fn validate_network_target(target: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Build a ureq agent that (a) follows zero redirects — so a permitted
-/// public URL can't 30x-redirect into an internal address — and (b)
-/// pins DNS resolution to `pinned`, the exact addresses
-/// `validate_fetch_url` already vetted. Pinning closes the DNS-rebinding
-/// TOCTOU: ureq connects to the validated IPs instead of re-resolving
-/// the hostname (which an attacker could flip to 169.254.169.254 /
-/// RFC1918 in the window between validation and fetch).
-/// ureq's `ResolvedSocketAddrs` is a fixed 16-slot array whose `push` writes
-/// straight into it, so handing it a 17th address is an out-of-bounds panic —
-/// on a host that merely publishes a lot of A records. Keep the first 16; all
-/// of them were vetted by [`validate_fetch_url`].
+// Cap on pinned addresses: ureq's fixed 16-slot ResolvedSocketAddrs panics
+// (out-of-bounds) on a 17th push, so cap to the first 16 validate_fetch_url
+// already vetted. See docs/web-ureq-agent.md.
 const MAX_PINNED_ADDRS: usize = 16;
 
-/// The addresses a resolve may actually hand back, capped.
-///
-/// Separated from the `Resolver` impl so the cap is TESTABLE: ureq's
-/// `ResolvedSocketAddrs` and `NextTimeout` are built from types that are not
-/// nameable outside the crate, so nothing in the suite could construct a
-/// resolve call — and every socket test pins exactly one address, so deleting
-/// the cap left the whole suite green.
-///
-/// The cap is not a nicety. `ResolvedSocketAddrs` is a fixed 16-slot array
-/// whose `push` writes `self.arr[self.len]` with no bounds check, so a
-/// seventeenth address is an out-of-bounds panic inside a resolver that runs on
-/// every request. `validate_fetch_url` returns whatever DNS gave it, with no
-/// count limit of its own.
+// The addresses a resolve may actually hand back, capped at MAX_PINNED_ADDRS.
+// Separated from the Resolver impl so the cap is testable — ureq's resolver
+// types aren't nameable outside the crate. See docs/web-ureq-agent.md.
 fn pinned_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
     addrs.iter().copied().take(MAX_PINNED_ADDRS).collect()
 }
 
-/// The pinned-address resolver behind [`guarded_agent_with_timeouts`].
-///
-/// ureq 3 replaced v2's resolver closure with this trait, and the agent must be
-/// built through `Agent::with_parts` to take one. `Agent::new_with_config`
-/// compiles identically and then silently uses the DEFAULT resolver — which
-/// would re-resolve the hostname over live DNS and reopen the exact rebinding
-/// TOCTOU this agent exists to close, with no visible symptom. Pinned by
-/// `guarded_agent_connects_to_the_pinned_address_not_dns`.
+// Pinned-address resolver behind guarded_agent_with_timeouts. Must be wired
+// via Agent::with_parts — Agent::new_with_config compiles but silently uses
+// the default (re-resolving) resolver. See docs/web-ureq-agent.md.
 #[derive(Debug)]
 struct PinnedResolver(Vec<SocketAddr>);
 
@@ -2591,19 +2478,9 @@ impl ureq::unversioned::resolver::Resolver for PinnedResolver {
     }
 }
 
-/// A short, URL-FREE description of a ureq failure.
-///
-/// ureq's own `Display` embeds the full request URL, and these summaries reach
-/// syslog, `autorip.jsonl` and the unauthenticated `/api/system` + `/api/debug`
-/// endpoints. The URLs involved carry secrets: a TMDB api_key in the query
-/// string, a Discord/Slack/Jellyfin token in the webhook path, a token-bearing
-/// keydb_url. So the error is never formatted — each variant maps to a fixed
-/// label instead.
-///
-/// ureq 3 split v2's single `Transport(t)` (which had `.kind()`) across many
-/// variants, and the enum is `non_exhaustive`, so the catch-all is both
-/// required and the safe default: an unrecognised variant degrades to a bare
-/// label rather than to something that might interpolate a URL.
+// A short, URL-FREE description of a ureq failure: these summaries reach
+// syslog/autorip.jsonl/unauthenticated endpoints, so each variant maps to a
+// fixed label instead of ever formatting the error. See docs/web-ureq-agent.md.
 pub(crate) fn ureq_error_kind(e: &ureq::Error) -> String {
     match e {
         ureq::Error::StatusCode(code) => format!("HTTP {code}"),
@@ -2627,33 +2504,14 @@ pub(crate) fn ureq_error_kind(e: &ureq::Error) -> String {
     }
 }
 
-/// No progress for this long on an open connection means the peer is dead,
-/// whatever it promised in its headers. This is the knob ureq 2's
-/// `timeout_read` used to provide and the 2→3 migration dropped: it is
-/// ROLLING, re-armed on every read that returns bytes, so it kills a stalled
-/// transfer without putting a ceiling on a slow-but-progressing one.
+// Rolling stall detector (re-armed on every read that returns bytes): no
+// progress for this long means the peer is dead. Replaces the ureq 2
+// timeout_read knob the 2→3 migration dropped. See docs/web-ureq-agent.md.
 pub(crate) const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Build a DNS-pinned, redirect-blocking ureq agent with caller-chosen
-/// timeouts. The ONE place the pinned agent is constructed, so no call site
-/// can quietly drop the resolver.
-///
-/// ureq sets NO default connect/read timeout. Without one a peer that
-/// accepts the connection but never responds would block the caller's
-/// thread (and hold its socket) forever, so every caller must pass bounds.
-/// The key-service reachability probe wants to give up much sooner than a
-/// keydb download; the caller picks.
-///
-/// `response` is NOT just a header timeout, despite ureq naming it
-/// `timeout_recv_response`. In ureq 3 the body read also checks its preceding
-/// timeout, and that deadline is absolute — `headers_complete + response` — so
-/// `response` is the ceiling on the WHOLE transfer. Measured against a real
-/// socket: with `response = 2s` a server that trickles one byte every 500 ms
-/// is killed at 2.0 s, four bytes in. Size it for the largest body this caller
-/// should ever accept, not for how long a header may take.
-///
-/// `idle` is the rolling stall detector ([`STALL_TIMEOUT`]) — the one that
-/// catches a dead peer quickly regardless of how generous `response` is.
+// Build the ONE DNS-pinned, redirect-blocking ureq agent, with caller-chosen
+// connect/response/idle timeouts (ureq sets no defaults, so an unresponsive
+// peer would otherwise block the thread forever). See docs/web-ureq-agent.md.
 pub(crate) fn guarded_agent_with_timeouts(
     pinned: Vec<SocketAddr>,
     connect: std::time::Duration,
@@ -2674,22 +2532,9 @@ pub(crate) fn guarded_agent_with_timeouts(
     )
 }
 
-/// Agent for webhook delivery — a plain outbound POST with the standard
-/// resolver, deliberately NOT SSRF-guarded.
-///
-/// Unlike `keydb_url` / `keyserver_url` / `network_target`, a webhook is a
-/// blind fire-and-forget notification: autorip POSTs a rip/move event and
-/// never reads the response body back to any caller, so there is no
-/// disc-key or plaintext-exfiltration channel to protect — and the
-/// operator who sets a webhook is on the same LAN as any host it targets.
-/// Aiming a webhook at a LAN service (Home Assistant, a NAS, an internal
-/// automation endpoint) is the *intended* use, which the pinned-resolver
-/// guard on the other URL classes actively prevents. So this agent uses
-/// the DEFAULT resolver (`new_with_config`) — no private-address block, no
-/// DNS pinning — while keeping the two properties that are about
-/// robustness rather than SSRF: bounded timeouts (a dead receiver must not
-/// wedge the per-delivery thread) and `max_redirects(0)` (a 3xx is not a
-/// delivery — see `webhook::deliver`).
+// Agent for webhook delivery: a plain outbound POST with the standard
+// resolver, deliberately NOT SSRF-guarded — a webhook targeting a LAN
+// service (Home Assistant, a NAS) is the intended use. See docs/web-http-client.md.
 pub(crate) fn webhook_agent() -> ureq::Agent {
     let config = ureq::config::Config::builder()
         .max_redirects(0)
@@ -2700,56 +2545,22 @@ pub(crate) fn webhook_agent() -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-/// SSRF-guarded HTTP GET. Runs [`validate_fetch_url`] (scheme + resolved-IP
-/// allow-list) and then issues the request through [`guarded_agent_with_timeouts`] so the
-/// connection is pinned to the validated addresses and redirects are blocked.
-///
-/// This is the single entry point any code path that fetches an
-/// operator-supplied URL from inside the container should use — the KEYDB
-/// download on startup and the daily-refresh thread (main.rs) both route
-/// through here instead of calling `ureq::get` directly, which would bypass
-/// the guard entirely. Returns the response on success or an
-/// operator-facing reason string on rejection / transport failure.
-///
-/// `pub` (not `pub(crate)`): the binary's `main.rs` declares its own `mod
-/// web`, but the library facade in `lib.rs` re-exports this module too. In
-/// the lib build nothing inside the crate calls this helper — only the bin
-/// and the test module do — so `pub(crate)` would trip `dead_code`. Exposing
-/// it as the crate's public SSRF-guarded fetch entry point is also the honest
-/// description of its role.
+// SSRF-guarded HTTP GET: the single entry point any code path fetching an
+// operator-supplied URL should use, instead of calling ureq::get directly
+// and bypassing the guard. `pub` because the lib facade re-exports this
+// module too and only the bin/tests call it. See docs/web-http-client.md.
 pub fn guarded_get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
     guarded_get_within(url, KEYDB_TRANSFER_BUDGET)
 }
 
-/// End-to-end ceiling on the unauthenticated `/api` KEYDB update.
-///
-/// Deliberately tighter than [`KEYDB_TRANSFER_BUDGET`]: this path is reachable
-/// without authentication, holds an in-flight handler slot and the
-/// process-wide update flag that 429s every other attempt, so a hostile peer
-/// must not be able to hold it for minutes.
+// End-to-end ceiling on the unauthenticated /api KEYDB update; tighter than
+// KEYDB_TRANSFER_BUDGET because this path holds an in-flight handler slot
+// and the update flag that 429s everyone else. See docs/web-http-client.md.
 pub(crate) const KEYDB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long a KEYDB body may take IN TOTAL, once headers are in.
-///
-/// [`guarded_agent_with_timeouts`]'s 30 s is right for a webhook POST and far too short
-/// here: `read_capped_keydb_body` accepts up to [`KEYDB_MAX_BYTES`], and 30 s
-/// is the ceiling on the whole transfer (see
-/// [`guarded_agent_with_timeouts`]), so a keydb that takes longer than half a
-/// minute to arrive fails on a link that is merely slow rather than broken —
-/// and the daily refresh thread then retries on the same too-short budget
-/// once every 24 hours.
-///
-/// A dead peer is still caught in [`STALL_TIMEOUT`] seconds, because the idle
-/// timeout is rolling and independent of this ceiling. This number only buys
-/// patience for a transfer that is actually progressing.
-///
-/// Sized to the REAL artifact, not to [`KEYDB_MAX_BYTES`]: that 100 MiB is a
-/// defensive ceiling on what will be read, and a published keydb is a
-/// single-digit-MB compressed export. Two minutes covers ~10 MB at well under
-/// 1 Mbit/s. Deriving the budget from the DoS cap instead would put a
-/// five-minute stall in front of the operator at first boot — `main.rs`
-/// fetches the keydb BEFORE the web server thread starts, so a slow keydb
-/// host would hold back the very Settings page they would use to fix the URL.
+// How long a KEYDB body may take IN TOTAL once headers are in — sized to a
+// real single-digit-MB keydb export, not to KEYDB_MAX_BYTES's defensive
+// 100 MiB DoS cap. See docs/web-http-client.md.
 pub(crate) const KEYDB_TRANSFER_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// [`guarded_get`] with an explicit total-transfer budget.
@@ -2772,43 +2583,22 @@ pub(crate) fn guarded_get_within(
     .map_err(|e| format!("fetch failed: {}", ureq_error_kind(&e)))
 }
 
-// ── Connection caps ────────────────────────────────────────────────────
-
-// run() spawns one OS thread per connection, and /events holds its
-// thread until disconnect. With no cap a LAN client can pin N threads
-// and exhaust the container; we bound both total handlers and SSE streams.
-
-/// Max concurrent request-handler threads. Generous — normal use is a
-/// handful of browser tabs polling — but finite so a flood can't fork
-/// the box to death.
+// ── Connection caps: run() spawns one OS thread per connection and /events
+// holds its thread until disconnect, so without a cap a LAN client can pin
+// N threads and exhaust the container. See docs/web-connection-caps.md.
 const MAX_INFLIGHT_HANDLERS: usize = 64;
 
-/// The cap for a request that carries a BODY, which the handler thread must
-/// read off the socket while holding its admission token.
-///
-/// Lower than [`MAX_INFLIGHT_HANDLERS`] on purpose, and the gap is the whole
-/// point: those remaining slots can only ever be taken by a bodyless request,
-/// so no number of stalled POSTs can keep `GET /api/state` — the container
-/// healthcheck — from being answered. Without the gap, 64 half-sent POSTs held
-/// every slot until their sockets died, the healthcheck 503'd three times, and
-/// the daemon was restarted, possibly mid-rip.
-///
-/// This bounds the DAMAGE, not the stall: the honest fix is a socket read
-/// timeout, and tiny_http 0.12 neither sets one nor exposes the stream to set
-/// it on. That needs a server change, which is not a thing to do quietly.
+// Lower than MAX_INFLIGHT_HANDLERS on purpose: the gap is reserved for
+// bodyless requests so stalled POSTs can never starve the healthcheck
+// (GET /api/state). See docs/web-connection-caps.md.
 const MAX_INFLIGHT_BODY_HANDLERS: usize = 48;
 
-/// The gap between the two caps is what the healthcheck survives on, so it is
-/// checked at COMPILE time rather than in a test — equalising them cannot even
-/// build. (A test asserting it would be an assertion over two constants, which
-/// clippy rejects for exactly this reason: the compiler is the right place.)
+// The gap is what the healthcheck survives on, checked at compile time
+// since equalising the caps cannot even build. See docs/web-connection-caps.md.
 const _: () = assert!(MAX_INFLIGHT_BODY_HANDLERS < MAX_INFLIGHT_HANDLERS);
 
-/// Whether a request will make its handler read a body off the socket.
-///
-/// Read from the headers tiny_http has ALREADY parsed by the time the request
-/// is yielded, so this costs nothing and cannot itself block. A chunked or
-/// unknown-length body counts too: the length is what the reader waits for.
+// Whether a request will make its handler read a body off the socket; read
+// from headers tiny_http already parsed, so this is free. See docs/web-connection-caps.md.
 fn carries_body(request: &tiny_http::Request) -> bool {
     match request.body_length() {
         Some(0) => false,
@@ -2821,17 +2611,17 @@ fn carries_body(request: &tiny_http::Request) -> bool {
         ),
     }
 }
-/// Max concurrent SSE (`/events`) streams. Each pins a thread for its
-/// whole lifetime, so this is the tighter bound.
+
+// Max concurrent SSE (/events) streams; each pins a thread for its whole
+// lifetime, so this is the tighter bound.
 const MAX_SSE_CLIENTS: usize = 8;
 
 static INFLIGHT_HANDLERS: AtomicUsize = AtomicUsize::new(0);
 static SSE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 
-/// RAII admission token for a counted connection slot. Decrements its
-/// counter on drop, so the slot is freed no matter how the handler exits
-/// (return, panic-unwind). `try_acquire` returns None when the cap is
-/// already reached.
+// RAII admission token for a counted connection slot: decrements its counter
+// on drop so the slot frees on any exit path (return, panic-unwind).
+// try_acquire returns None when the cap is already reached.
 struct ConnGuard(&'static AtomicUsize);
 
 impl ConnGuard {
@@ -2858,13 +2648,9 @@ impl Drop for ConnGuard {
 mod web_tests {
     use super::*;
 
-    /// FIX-5 production wiring: `handle_accept_loss` refuses (409) while the mux
-    /// worker owns the dir (`.muxing`), because its lock-free state.json write would
-    /// otherwise clobber the worker's terminal quarantine and silently drop the
-    /// operator's Accept. The guard lives in `accept_loss_entry_verdict`.
-    ///
-    /// Red-before-green: deleting the `.muxing` arm (so entry always proceeds)
-    /// flips the middle assertion from `MuxInProgress` to `Proceed` and fails.
+    // FIX-5: handle_accept_loss refuses (409) while the mux worker owns the
+    // dir (.muxing), else a lock-free state.json write could clobber the
+    // worker's terminal quarantine and silently drop the operator's Accept.
     #[test]
     fn accept_loss_entry_verdict_gates_on_muxing() {
         assert_eq!(
@@ -2973,14 +2759,9 @@ mod web_tests {
         assert!(!both_contain(&mux, &mv));
     }
 
-    /// Regression for the double-render bug: the staging dir currently being
-    /// moved keeps its `.done` marker throughout the copy, so it appears in the
-    /// Move-queue scan — but it is ALSO shown as its live per-artifact progress
-    /// bars. `build_queue_views` must exclude the dir named in
-    /// `ACTIVE_MOVE_DIR` so it is listed exactly once (as bars, not a queue
-    /// row). The old client-side de-dup matched on a punctuation-stripped title
-    /// and silently failed for any title containing `:` `/` `*`, etc.; this
-    /// exclusion is by exact on-disk basename and so is punctuation-proof.
+    // Regression: a moving dir keeps its .done marker, so build_queue_views
+    // must exclude ACTIVE_MOVE_DIR by exact basename or it double-renders
+    // (old title-based de-dup broke on punctuation like `:`).
     #[test]
     fn build_queue_views_excludes_the_actively_moving_dir() {
         use std::fs;
@@ -3076,10 +2857,9 @@ mod web_tests {
         mux.iter().any(|m| mv.iter().any(|v| strip(m) == strip(v)))
     }
 
-    /// FULL marker lifecycle with the device-status view folded in. At each
-    /// step assert (a) which queue(s) the disc is in and (b) the device
-    /// tile status. The disc is NEVER in two queues; the tile is correct at
-    /// every stage. Covers `.ripped → .muxing → .done → .completed`.
+    // FULL marker lifecycle with device-status folded in: at each step assert
+    // which queue(s) the disc is in and the tile status; the disc is never
+    // in two queues. Covers .ripped -> .muxing -> .done -> .completed.
     #[test]
     fn full_lifecycle_queue_and_status_consistent() {
         use std::fs;
@@ -3172,12 +2952,9 @@ mod web_tests {
         crate::ripper::STATE.lock().unwrap().remove(device);
     }
 
-    /// LOW-CONFIDENCE lifecycle: the mux writes `.review` (not `.done`) for
-    /// an operator hold. The disc must leave the Mux queue (it's the mover's
-    /// concern now) and NOT double-list. `.review` is a Move-queue concept
-    /// only via the operator review flow, so it appears in neither the
-    /// "(moving)" list nor the Mux "(queued)" list here — the key invariant
-    /// is it is never simultaneously in both.
+    // LOW-CONFIDENCE lifecycle: the mux writes .review (not .done) for an
+    // operator hold. The disc must leave the Mux queue and never appear in
+    // both the Mux "(queued)" and Move "(moving)" lists at once.
     #[test]
     fn review_hold_leaves_mux_queue_no_double_listing() {
         use std::fs;
@@ -3322,11 +3099,9 @@ mod web_tests {
         crate::ripper::STATE.lock().unwrap().remove(dev_b);
     }
 
-    /// `get_state_json` END-TO-END: the serialized live payload (the source
-    /// for the SSE/dashboard) must never list a disc in BOTH `_mux_queue`
-    /// and `_move_queue`, across MULTIPLE discs at different stages. This is
-    /// the top-level guarantee fix C makes — all three views derive from one
-    /// snapshot.
+    // get_state_json END-TO-END: the serialized live payload (SSE/dashboard
+    // source) must never list a disc in both _mux_queue and _move_queue,
+    // across multiple discs — all three views derive from one snapshot.
     #[test]
     fn get_state_json_never_double_lists_across_discs() {
         use std::fs;
@@ -3426,16 +3201,9 @@ mod web_tests {
         );
     }
 
-    /// `/api/state` (and therefore `--healthcheck`, and therefore the
-    /// Dockerfile HEALTHCHECK) must stay responsive while a staging-dir
-    /// refresh is in flight. A slow `read_dir` must never be able to park
-    /// every other caller behind it.
-    ///
-    /// Timing margin: the in-flight scan is held for 1500 ms; the reader is
-    /// asserted to return in under 250 ms — a 6x margin over a code path
-    /// that, when it does not block, is a HashMap lookup plus two Vec
-    /// clones (microseconds). The test FAILS rather than hangs: a blocked
-    /// reader returns after the 1500 ms scan and trips the bound.
+    // /api/state (and thus the Dockerfile HEALTHCHECK) must stay responsive
+    // while a staging-dir refresh is in flight — a slow read_dir must never
+    // park every other caller. 250ms bound trips a blocked reader, not a hang.
     #[test]
     fn queue_view_cache_reader_not_blocked_by_in_flight_scan() {
         use std::time::{Duration, Instant};
@@ -3498,13 +3266,9 @@ mod web_tests {
         );
     }
 
-    /// Deterministic guard for the root cause behind the block above: the
-    /// Phase-3 prune must NOT evict a stale-but-recently-active key. Evicting at
-    /// the sub-second serve TTL destroyed the stale snapshot that
-    /// stale-while-revalidate serves, so the key's next slow refresh had nothing
-    /// to hand a concurrent reader and forced it to block the whole scan. Here
-    /// one key goes stale, an unrelated key is scanned (running the prune over
-    /// the whole map), and the stale key must survive to still be serveable.
+    // Root-cause guard: the Phase-3 prune must NOT evict a stale-but-recent
+    // key. Evicting at the sub-second serve TTL destroyed the stale snapshot
+    // stale-while-revalidate needs, forcing the next reader to block the scan.
     #[test]
     fn queue_view_prune_keeps_stale_but_recent_key_serveable() {
         use std::time::Duration;
@@ -3591,15 +3355,9 @@ mod web_tests {
         );
     }
 
-    /// Run `build_queue_views_cached(dir)` on a scratch thread and return its
-    /// result, or `None` if it had not returned within `bound`.
-    ///
-    /// Every timing assertion below goes through this: the call under test is
-    /// the thing that might block forever, so a regression must surface as a
-    /// FAILED assertion, not as a suite that hangs until CI's job timeout.
-    /// The scratch thread is deliberately never joined on the timeout path —
-    /// a wedged scan is exactly what we are simulating, and the process exits
-    /// fine with it parked.
+    // Run build_queue_views_cached(dir) on a scratch thread, returning None on
+    // timeout so a regression surfaces as a FAILED assertion, not a CI hang.
+    // The thread is deliberately never joined — a wedged scan is what we simulate.
     fn cached_within(
         dir: &str,
         bound: std::time::Duration,
@@ -3624,20 +3382,9 @@ mod web_tests {
         true
     }
 
-    /// A refresher that HANGS — a wedged `read_dir` on an unresponsive mount,
-    /// no panic needed — must not latch the single-flight marker forever.
-    ///
-    /// The `refreshing` marker was a plain bool cleared only by the refresher
-    /// itself, so a refresher that never returns left it set for the process
-    /// lifetime: every later caller took the serve-stale branch and the queue
-    /// views froze permanently. `/api/state` kept 200-ing with a snapshot from
-    /// the moment the mount wedged, so nothing surfaced the freeze either.
-    ///
-    /// Timing margin: the wedged scan is held for 60 s; this dir's marker
-    /// deadline is cut to 300 ms; the takeover is asserted to land within
-    /// 4 s — a >13x margin over the deadline, and 1/200th of the wedge, so
-    /// a pass can only mean a real takeover. Bounded by `cached_within`, so
-    /// a regression that blocks the caller FAILS instead of hanging.
+    // A refresher that HANGS (wedged read_dir) must not latch the
+    // single-flight marker forever: the old plain-bool marker stayed set for
+    // the process lifetime, freezing queue views with no surfaced failure.
     #[test]
     fn queue_view_cache_recovers_from_a_refresher_that_never_returns() {
         use std::time::Duration;
@@ -3703,21 +3450,9 @@ mod web_tests {
         );
     }
 
-    /// The cold-path counterpart: when there is NOTHING to serve and the
-    /// in-flight first scan is wedged, callers must neither park forever nor
-    /// pile up.
-    ///
-    /// The old cold valve abandoned single-flight — after 5 s each waiter went
-    /// and scanned for itself — so on a wedged staging mount one HTTP worker
-    /// thread (and its admission token) was consumed every 5 s until
-    /// `/api/state` started 503-ing and the container HEALTHCHECK restarted
-    /// the daemon mid-rip.
-    ///
-    /// Timing margin: the wedged scan is held for 60 s and the cold wait is
-    /// cut to 200 ms; callers are asserted to return within 3 s — 15x the cold
-    /// wait, 1/20th of the wedge. `cached_within` bounds every call, so both
-    /// failure modes (park forever / pile up behind a 60 s scan) FAIL here
-    /// rather than hang.
+    // Cold-path counterpart: with nothing to serve and the first scan wedged,
+    // callers must neither park forever nor pile up (old valve burned an
+    // HTTP worker per waiter every 5s until /api/state 503'd and restarted).
     #[test]
     fn queue_view_cache_cold_callers_neither_park_nor_pile_up_on_a_wedged_scan() {
         use std::time::Duration;
@@ -3842,13 +3577,9 @@ mod web_tests {
         assert!(!is_valid_poster_url("https://example.com/a\nb"));
     }
 
-    /// The dashboard's `esc()` must HTML-escape all five sensitive characters
-    /// (`&`, `<`, `>`, `"`, `'`) because its output is interpolated into both
-    /// double-quoted attributes and `innerHTML`. A `textContent`/`innerHTML`
-    /// round-trip (the prior implementation) leaves `"` and `'` unescaped.
-    /// We mirror the shipped regex chain here and assert the full set, and
-    /// also assert the JS source carries the quote escapes so a regression in
-    /// the template is caught.
+    // The dashboard's esc() must HTML-escape all five sensitive characters
+    // (& < > " '); a textContent/innerHTML round-trip (prior impl) leaves
+    // " and ' unescaped. Also assert the shipped JS carries the quote escapes.
     #[test]
     fn dashboard_esc_escapes_all_five() {
         fn esc(s: &str) -> String {
@@ -3909,20 +3640,9 @@ mod web_tests {
         assert_eq!(json2["keydb_url"], "");
     }
 
-    /// `handle_settings_post` must finish mutating and DROP the config write
-    /// guard before it saves: `config::save` does `fs::write` + `fs::rename`
-    /// on `/config/settings.json`, and on NFS those can hang indefinitely,
-    /// blocking every concurrent `cfg.read()` — which is nearly the whole
-    /// `/api/*` surface (the 0.20.8 lock stall).
-    ///
-    /// This is an ORDERING property inside one private function, so it is
-    /// pinned against that function's own source, the way the resume-path
-    /// invariants in `ripper/resume.rs` are. The test it replaces lived in
-    /// `tests/watchdog.rs` and re-implemented the pattern inline — it never
-    /// called the handler, so reinstating the bug left it green.
-    ///
-    /// The behavioural half (the handler really does persist through
-    /// `config::save`) is covered by `http::settings_post_persists_a_field_to_disk`.
+    // handle_settings_post must DROP the config write guard before saving:
+    // config::save's fs::write+rename can hang on NFS, blocking every
+    // concurrent cfg.read() (the 0.20.8 lock stall) — pinned against source.
     #[test]
     fn settings_post_saves_outside_the_config_write_guard() {
         let src = crate::util::source_lf(include_str!("web.rs"));
@@ -4173,13 +3893,9 @@ mod web_tests {
         assert!(masked.ends_with(sentinel));
     }
 
-    /// One question, one predicate. A genuine URL that merely EMBEDS the
-    /// sentinel is not masked (`is_masked_webhook` says so, and the SSRF
-    /// filter therefore validates it as real) — so the resolver must take it
-    /// verbatim. While the resolver used `contains` instead, that URL was
-    /// validated as genuine and then rejected 400 as an "ambiguous masked
-    /// webhook entry", an error about a masking that never happened, and the
-    /// whole settings save died with no way to enter the URL at all.
+    // A genuine URL that merely EMBEDS the sentinel is not masked, so the
+    // resolver must take it verbatim. Using `contains` instead rejected such
+    // a URL 400 as "ambiguous masked entry", killing settings save entirely.
     #[test]
     fn a_url_that_only_embeds_the_sentinel_is_saved_verbatim() {
         // Not masked by the strict predicate — the filter validates it.
@@ -4564,31 +4280,9 @@ mod web_tests {
         assert!(guarded_get("file:///etc/passwd").is_err());
     }
 
-    /// A KEYDB body that is SLOW but PROGRESSING must be allowed to finish.
-    ///
-    /// ureq 2's `timeout_read` was a per-read bound, so a slow transfer never
-    /// tripped it. ureq 3's `timeout_recv_response` — what the 2→3 migration
-    /// replaced it with — is an ABSOLUTE deadline anchored at header
-    /// completion that also caps the body, so `guarded_agent`'s 30 s became a
-    /// hard 30 s ceiling on the whole download. Measured against a real
-    /// socket: with a 2 s bound, a server trickling a byte every 500 ms dies
-    /// at 2.0 s having delivered four bytes.
-    ///
-    /// NOTE what this does NOT prove: delete `timeout_recv_body` entirely and
-    /// this test still passes, because with no body timeout at all the slow
-    /// body also arrives. Removal is caught by its sibling
-    /// (`a_stalled_body_is_cut_off_by_the_idle_bound_not_the_total_budget`),
-    /// which was proven red at 30 s and green at 1 s. This one guards the
-    /// complementary property, and the two are only meaningful together.
-    ///
-    /// What this guards is the NEW idle knob: `timeout_recv_body` is ROLLING,
-    /// so a body that keeps arriving must survive even when the transfer takes
-    /// many times the idle bound. Wire it up as a total instead — the easy
-    /// mistake — and this test fails. It is a guard on the fix, not a
-    /// reproduction of the original defect: the budget change itself
-    /// (`guarded_get`'s 30 s → `KEYDB_TRANSFER_BUDGET`) has no automated proof
-    /// here, because `guarded_get` resolves and rejects loopback before it
-    /// connects, so no local listener can stand in for a keydb mirror.
+    // A KEYDB body that is SLOW but PROGRESSING must finish — ureq 3's
+    // timeout_recv_response is an absolute header-anchored deadline that
+    // must not also cap a rolling-idle body. See docs/web-timeout-tests.md.
     #[test]
     fn a_slow_but_progressing_keydb_body_is_not_killed_by_the_header_deadline() {
         use std::io::{Read as _, Write as _};
@@ -4647,11 +4341,9 @@ mod web_tests {
         assert_eq!(body, vec![b'k'; 40], "the whole body must arrive");
     }
 
-    /// The other half: a peer that sends headers and then NOTHING must be cut
-    /// off by the rolling idle bound, not held until the (much larger) total
-    /// budget expires. This is the protection ureq 2's `timeout_read` gave and
-    /// the migration dropped; without `timeout_recv_body` a dead peer would be
-    /// held for the whole KEYDB budget.
+    // The other half: a peer sending headers then NOTHING must be cut off by
+    // the rolling idle bound, not held for the whole total budget — the
+    // protection ureq 2's timeout_read gave. See docs/web-timeout-tests.md.
     #[test]
     fn a_stalled_body_is_cut_off_by_the_idle_bound_not_the_total_budget() {
         use std::io::{Read as _, Write as _};
@@ -4709,17 +4401,9 @@ mod web_tests {
         let _ = server.join();
     }
 
-    /// The tests above prove which addresses `validate_fetch_url` REJECTS.
-    /// None of them makes a connection, so every one still passes if
-    /// `guarded_agent_with_timeouts` ignores the pinned addresses and resolves
-    /// through live DNS instead — which is exactly how the rebinding TOCTOU
-    /// gets back in, with no visible symptom. This is the test that notices.
-    ///
-    /// Pin the agent at a loopback listener this test owns, then ask for a
-    /// host that cannot resolve (`.test`, reserved by RFC 6761). Only a
-    /// consulted resolver can turn that name into a connection. Touches no
-    /// network, and drives `guarded_agent_with_timeouts` directly, since
-    /// `guarded_get`'s guard blocks loopback by design.
+    // The rejection tests above never connect, so they'd still pass if the
+    // agent silently ignored pinned addresses and re-resolved via live DNS.
+    // This pins a loopback listener and requests an unresolvable `.test` host.
     #[test]
     fn guarded_agent_connects_to_the_pinned_address_not_dns() {
         use std::io::{Read as _, Write as _};
@@ -4772,22 +4456,9 @@ mod web_tests {
         );
     }
 
-    /// Secret-leak guard: guarded_get error strings from the ureq transport
-    /// layer must never embed the full request URL (which may contain a token
-    /// in the path/query). ureq 2's Display included the URL, which is what
-    /// this guards; ureq 3's does not for the variants reachable here, but
-    /// `BadUri` still prints its URI — so the map_err must keep stripping to a
-    /// status code / transport kind only.
-    ///
-    /// We test this via a public literal IP that passes the SSRF guard (so we
-    /// reach the ureq call), but where the connection is immediately refused
-    /// (no server listening). This exercises the Transport error arm of our
-    /// map_err, which is what keeps the full URL out of the message.
-    ///
-    /// Note: the RFC1918-rejection errors come from validate_fetch_url (via ?)
-    /// before ureq is called; those contain the blocked IP, which is expected
-    /// (IP is not sensitive, token path is). The ureq-level error is what we
-    /// must not leak.
+    // Secret-leak guard: guarded_get error strings must never embed the full
+    // request URL (path/query may hold a token). Uses a public IP with
+    // nothing listening to reach ureq's Transport error arm, not the SSRF guard.
     #[test]
     fn guarded_get_ureq_error_does_not_embed_url() {
         // Port 1 on a public IP: passes SSRF guard (it's public) but the
@@ -4807,12 +4478,9 @@ mod web_tests {
         );
     }
 
-    /// `is_transient_resolve_error` must say NO to every permanent verdict
-    /// `validate_fetch_url` can reach without a network round-trip. Its
-    /// consumer (`keysource::probe_online_reachability`) turns a `true` here
-    /// into "the key service is down", which parks a disc — so a scheme
-    /// error or a blocked address must never be mistaken for a DNS blip.
-    /// Driven through the REAL validator, not against hand-written strings.
+    // is_transient_resolve_error must say NO to every permanent verdict
+    // validate_fetch_url can reach without a network round-trip — its
+    // consumer turns `true` into "the key service is down" and parks a disc.
     #[test]
     fn a_rejected_url_is_never_classified_as_a_failed_lookup() {
         for url in [
@@ -4916,15 +4584,9 @@ mod web_tests {
         assert_eq!(C.load(Ordering::SeqCst), 0);
     }
 
-    // ── A stalled POST must not starve the healthcheck ────────────────────
-
-    // tiny_http 0.12 has no socket read timeout, so a peer that sends headers
-    // then stalls parks its admission token indefinitely, starving `GET
-    // /api/state` and causing the healthcheck to restart the daemon.
-
-    /// The reservation, exercised against the real counter: fill it to the
-    /// body cap, then show a bodyless request still gets in and a
-    /// body-carrying one does not.
+    // ── A stalled POST must not starve the healthcheck (tiny_http 0.12 has
+    // no socket read timeout). Fill the body cap, then confirm a bodyless
+    // request still gets admitted while a body-carrying one does not.
     #[test]
     fn a_bodyless_request_is_admitted_while_the_body_cap_is_full() {
         static C: AtomicUsize = AtomicUsize::new(0);
@@ -4948,11 +4610,9 @@ mod web_tests {
         assert_eq!(C.load(Ordering::SeqCst), 0, "every slot released");
     }
 
-    // ── Two guards nothing exercised ──────────────────────────────────────
-
-    /// The pin caps at what ureq's fixed 16-slot array can hold. A seventeenth
-    /// address is an out-of-bounds panic inside a resolver that runs on every
-    /// request, and `validate_fetch_url` applies no count limit of its own.
+    // ── Two guards nothing exercised: the pin caps at ureq's fixed 16-slot
+    // array. A 17th address is an out-of-bounds panic in a resolver that
+    // runs on every request; validate_fetch_url applies no count limit.
     #[test]
     fn the_pinned_address_list_cannot_overrun_ureqs_fixed_array() {
         let many: Vec<SocketAddr> = (0..MAX_PINNED_ADDRS + 1)
@@ -4976,13 +4636,9 @@ mod web_tests {
         assert!(pinned_addrs(&[]).is_empty());
     }
 
-    /// `ureq_error_kind` is the single chokepoint keeping token-bearing URLs
-    /// out of four log sites that reach the unauthenticated `/api/debug` and
-    /// `/api/system`. The only test that reached it made ONE connection-refused
-    /// call, which lands in the explicit `Io` arm — so mutating the CATCH-ALL
-    /// to `e.to_string()` stayed green, and the catch-all is exactly where
-    /// `BadUri` (which prints the URI it rejected) arrives, the enum being
-    /// non_exhaustive.
+    // ureq_error_kind is the single chokepoint keeping token-bearing URLs out
+    // of log sites reaching unauthenticated /api/debug + /api/system. Covers
+    // every variant, including the non_exhaustive catch-all where BadUri lands.
     #[test]
     fn no_ureq_error_kind_output_can_carry_a_url() {
         let cases = vec![
@@ -5004,12 +4660,9 @@ mod web_tests {
         assert_eq!(ureq_error_kind(&ureq::Error::StatusCode(404)), "HTTP 404");
     }
 
-    /// An OS-generated transport error (a real errno, e.g. ECONNRESET from a
-    /// receiver that RSTs the socket instead of answering) must surface its
-    /// descriptive syscall message, not collapse to the useless
-    /// "io: uncategorized error" that `io.kind()` alone prints when the kind is
-    /// `Uncategorized`. Regression for a webhook that logged only
-    /// "io: uncategorized error" with nothing an operator could act on.
+    // An OS-generated transport error (real errno, e.g. ECONNRESET) must
+    // surface its descriptive syscall message, not collapse to the useless
+    // "io: uncategorized error" io.kind() alone prints for Uncategorized.
     #[test]
     fn ureq_error_kind_surfaces_os_error_detail() {
         // ECONNRESET (54 on macOS/BSD, 104 on Linux) can arrive as the
@@ -5032,16 +4685,9 @@ mod web_tests {
         assert_eq!(ureq_error_kind(&synthetic), "io: connection refused");
     }
 
-    /// The fourth ureq log site. Round 1 routed three failures through
-    /// `ureq_error_kind` and missed this one, which masks the configured KEYDB
-    /// origin from the CLIENT and then logged the raw error anyway — and
-    /// `keydb_url` is token-bearing, with this line reaching `autorip.jsonl`
-    /// and thence the unauthenticated `GET /api/debug`.
-    ///
-    /// A source-pin, like `resolve_with_timeout_uses_raii_guard_...` above,
-    /// because the leak is in a `tracing` field inside a handler that wants a
-    /// live `tiny_http::Request` and a real connection failure to reach. What
-    /// it pins is exactly the shape of the defect: `%e` on the ureq error.
+    // The fourth ureq log site, missed by round 1: it masked the KEYDB origin
+    // from the client but logged the raw (token-bearing) error anyway,
+    // reaching autorip.jsonl and unauthenticated GET /api/debug.
     #[test]
     fn the_keydb_update_handler_masks_its_ureq_error() {
         let src = crate::util::source_lf(include_str!("web.rs"));
@@ -5067,23 +4713,9 @@ mod web_tests {
         );
     }
 
-    /// Catches the mutation that restores `get_state_json`'s
-    /// `Err(_) => return "{}"` bail-out on a poisoned STATE.
-    ///
-    /// A source-pin, like the handler pins above, because the only way to
-    /// exercise the behaviour is to poison the process-global `ripper::STATE`,
-    /// and a `Mutex` stays poisoned for the life of the process — it would
-    /// panic every other test in this binary that locks STATE with `unwrap`.
-    ///
-    /// What it pins is the whole point of the defect: this was the ONE STATE
-    /// consumer that abandoned on poison instead of recovering the guard like
-    /// its ten siblings. STATE is poisoned by the first panic taken while its
-    /// guard is held, so from that moment `GET /api/state` answered `{}` with
-    /// HTTP 200 forever: a blank dashboard, and — because
-    /// `main.rs::run_healthcheck` only checks for an `HTTP/1.1 200` status
-    /// line — a permanently green Docker HEALTHCHECK that never restarts the
-    /// container. The map's contents are still perfectly readable; serving
-    /// them is both correct and the house convention.
+    // Catches the mutation restoring get_state_json's Err(_) => return "{}"
+    // bail-out on a poisoned STATE; source-pinned since poisoning a real
+    // Mutex would break every other STATE-locking test. See docs/web-state-lock-tests.md.
     #[test]
     fn get_state_json_recovers_a_poisoned_state_lock() {
         let src = crate::util::source_lf(include_str!("web.rs"));
@@ -5172,11 +4804,9 @@ mod web_tests {
         assert_eq!(percent_decode("50%2"), "50%2");
     }
 
-    /// `media_type` is the one title-override field that was neither clamped
-    /// nor allow-listed, on an unauthenticated-LAN route whose value is
-    /// persisted into the `.done` marker and re-broadcast to every dashboard.
-    /// The router only ever acts on `"tv"`; anything else is a movie. Store
-    /// that vocabulary, not an arbitrary caller string.
+    // media_type was the one title-override field neither clamped nor
+    // allow-listed on an unauthenticated route whose value is persisted and
+    // re-broadcast; the router only ever acts on "tv" vs everything else.
     #[test]
     fn media_type_is_reduced_to_the_routers_vocabulary() {
         assert_eq!(normalize_media_type("tv"), "tv");
@@ -5195,12 +4825,9 @@ mod web_tests {
         );
     }
 
-    /// Only ASCII hex digits are percent-escape payloads.
-    ///
-    /// `u8::from_str_radix` accepts a leading sign, so `%+3` parsed as 3 and a
-    /// device segment or settings value carrying a literal `%+3` decoded to a
-    /// control byte instead of staying as typed. RFC 3986 admits `HEXDIG`
-    /// only; anything else is literal text.
+    // Only ASCII hex digits are percent-escape payloads: from_str_radix
+    // accepts a leading sign, so %+3 used to parse as 3 (a control byte)
+    // instead of staying literal. RFC 3986 admits HEXDIG only.
     #[test]
     fn percent_decode_rejects_non_hex_escape_payloads() {
         assert_eq!(
@@ -5219,22 +4846,17 @@ mod web_tests {
         assert_eq!(percent_decode("%2F"), "/");
     }
 
-    // ── Real HTTP integration: drive handle_request via a live server ──
-
+    // ── Real HTTP integration: drive handle_request via a live server —
     // tiny_http::Request has no public constructor, so these tests bind a
-    // loopback server and hand a received real Request to PRODUCTION
-    // `handle_request` — the only way to exercise it end-to-end.
+    // loopback server and hand a received real Request to production code.
     mod http {
         use super::*;
         use std::io::{Read, Write};
         use std::net::TcpStream;
 
-        /// One real request/response round-trip through `handle_request`.
-        ///
-        /// Binds an ephemeral loopback server, spawns a client that writes the
-        /// raw request and reads the full response, then on this thread accepts
-        /// the request and dispatches it through production code. Returns the
-        /// parsed (status_code, body).
+        // One real request/response round-trip through handle_request: binds
+        // an ephemeral loopback server, spawns a client that writes the raw
+        // request, and dispatches through production code. Returns (status, body).
         fn roundtrip(
             cfg: &Arc<RwLock<Config>>,
             method: &str,
@@ -5278,17 +4900,9 @@ mod web_tests {
             parse_response(&raw)
         }
 
-        /// Classify ONE real `tiny_http::Request` — built by sending `head`
-        /// verbatim over a loopback socket — with the production
-        /// [`carries_body`] predicate.
-        ///
-        /// Verbatim, because the arm that matters is the one with NO
-        /// `Content-Length` header at all, and `roundtrip` always sends one.
-        ///
-        /// Watchdog: `recv_timeout(5s)` rather than `recv()`, so a request
-        /// the server never sees FAILS this test instead of parking the
-        /// suite forever. The client writes a complete request head before
-        /// the accept, so the real margin is a loopback round-trip.
+        // Classify ONE real tiny_http::Request, sent verbatim (roundtrip
+        // always adds a Content-Length; the arm that matters here has none),
+        // via production carries_body. recv_timeout(5s) fails, not hangs.
         fn carries_body_of(head: &str) -> bool {
             let server = Server::http("127.0.0.1:0").expect("bind loopback server");
             let addr = server.server_addr().to_ip().expect("ip addr");
@@ -5310,14 +4924,9 @@ mod web_tests {
             carries
         }
 
-        /// The accept loop reserves a smaller admission cap for requests that
-        /// carry a body, because those hold a handler thread across an
-        /// unbounded socket read. Which cap a request gets is decided ONLY by
-        /// [`carries_body`], and no test called it: the sibling cap test
-        /// exercises `ConnGuard` arithmetic at two literal caps, so inverting
-        /// `Some(0) => false`, dropping `Get` from the bodyless methods, or
-        /// negating the `None` arm all stayed green while every healthcheck
-        /// GET started consuming a body slot. Drive it with real requests.
+        // The accept loop reserves a smaller cap for body-carrying requests,
+        // decided ONLY by carries_body — the sibling cap test never called
+        // it, so an inverted arm there stayed green. Drive with real requests.
         #[test]
         fn carries_body_classifies_real_requests() {
             // No Content-Length, bodyless method — the healthcheck's own
@@ -5436,20 +5045,9 @@ mod web_tests {
             assert!(body.contains("invalid device name"));
         }
 
-        /// A shape-VALID but nonexistent device name must not create state.
-        ///
-        /// `/api/scan`, `/api/rip` and `/api/eject` are unauthenticated and
-        /// reachable from any LAN host, and `is_valid_device_name` only checks
-        /// the shape (3..=64 ASCII alphanumeric) — never that the drive exists.
-        /// `try_claim_active` used to insert a permanent STATE entry for any
-        /// such name, and `spawn_rip_thread` a permanent JoinHandle, while the
-        /// hot-unplug sweep only prunes devices it actually enumerated. Looping
-        /// `POST /api/scan/<random>` therefore grew both maps without bound
-        /// until the process was OOM-killed.
-        ///
-        /// This asserts the END-TO-END property through the real HTTP handler,
-        /// not just the helper: the guard lives in `try_claim_active_checked`,
-        /// but it is inert unless the handlers actually pass `known = false`.
+        // A shape-VALID but nonexistent device name must not create state:
+        // looping unauthenticated POST /api/scan/<random> used to grow the
+        // STATE/JoinHandle maps without bound until OOM-killed.
         #[test]
         fn unauthenticated_scan_of_a_nonexistent_device_does_not_grow_state() {
             // Assert per-device, never on total STATE size: STATE is a
@@ -5575,18 +5173,9 @@ mod web_tests {
             );
         }
 
-        /// A present-but-invalid `on_read_error` must not block the legacy
-        /// `abort_on_error` migration.
-        ///
-        /// The legacy fallback was gated on the KEY EXISTING
-        /// (`patch.get(..).is_some()`) while the assignment required a
-        /// STRING. A body carrying `"on_read_error": null` (a templating bug,
-        /// an older client) alongside `abort_on_error` therefore took neither
-        /// branch: the new field was never applied, the migration was skipped
-        /// as "explicitly overridden", and the PATCH still answered 200. The
-        /// operator sees the save succeed while the read-error policy silently
-        /// keeps its old value — config drift that only shows up as rips
-        /// behaving under a policy nobody selected.
+        // A present-but-invalid on_read_error must not block the legacy
+        // abort_on_error migration: the fallback was gated on key-exists but
+        // assignment needed a string, so `null` silently skipped both.
         #[test]
         fn settings_post_null_on_read_error_still_applies_the_legacy_migration() {
             let tmp = tempfile::TempDir::new().unwrap();
@@ -5865,11 +5454,9 @@ mod web_tests {
             );
         }
 
-        // ── FIX 5: accept-loss must respect the `.muxing` ownership marker ──
-
-        // apply_accept_loss_reopen and the mux worker's write_failed_marker
-        // are both lock-free RMWs on state.json with no shared device claim,
-        // so arming accept-loss mid-mux can clobber a just-written quarantine.
+        // ── FIX 5: accept-loss must respect the .muxing ownership marker —
+        // apply_accept_loss_reopen and write_failed_marker are both
+        // lock-free RMWs on state.json, so arming mid-mux can clobber a quarantine.
         #[test]
         fn accept_loss_guard_refuses_while_muxing() {
             use ripper::staging::{DiscState, StagingState, write_state};
@@ -5896,12 +5483,9 @@ mod web_tests {
             );
         }
 
-        // ── handle_title_override: omitted media_type preserves detection ──
-
-        // A title override with NO `media_type` must fall back to the disc's
-        // DETECTED `tmdb_media_type`, not blindly default to "movie" — that
-        // collapses every TV episode into one `Show (Year).mkv` downstream.
-
+        // ── handle_title_override: a title override with no media_type must
+        // fall back to the disc's detected tmdb_media_type, not default to
+        // "movie" (which collapses every TV episode into one Show (Year).mkv).
         #[test]
         fn title_override_omitted_media_type_preserves_detected_tv() {
             let cfg = Arc::new(RwLock::new(Config::default()));
@@ -6255,12 +5839,9 @@ mod web_tests {
             assert!(b3.contains("missing path"));
         }
 
-        // ── SSE first frame (GET /events) ───────────────────────────────
-
-        /// The `/events` stream loops forever, so `roundtrip` (which reads to
-        /// EOF) would hang. Run the production handler on its own thread, read
-        /// exactly the first `data: …\n\n` frame on the client, then drop the
-        /// socket — the handler's next write fails and it returns.
+        // ── SSE first frame (GET /events): it loops forever, so roundtrip
+        // (reads to EOF) would hang. Run the handler on its own thread, read
+        // the first SSE frame, then drop the socket so the next write fails.
         #[test]
         fn sse_emits_a_json_state_first_frame() {
             let cfg = Arc::new(RwLock::new(Config::default()));
@@ -6331,21 +5912,9 @@ fn text_response(request: tiny_http::Request, body: &str) {
     let _ = request.respond(response);
 }
 
-/// Cached result of [`build_queue_views`], shared across every concurrent
-/// `/events` (SSE) client and `/api/state` poller.
-///
-/// `/events` holds one thread per client for the life of the connection
-/// (up to `MAX_SSE_CLIENTS`) and each thread independently rebuilds the
-/// Mux/Move queue view every second — a fresh `read_dir` over the whole
-/// staging directory plus a handful of `Path::exists()`/marker reads per
-/// subdirectory (see [`build_queue_views`] / `crate::muxer::pending_queue`).
-/// With a large staging backlog and several dashboard tabs open, that is
-/// the same filesystem the ripper and mover are actively writing to,
-/// scanned redundantly by every open tab in lockstep. The queue view only
-/// changes when a rip/mux/move transitions state, so a sub-second-stale
-/// shared snapshot is invisible in a UI that itself only polls once a
-/// second — trading a small, bounded staleness window for turning N
-/// concurrent full-directory scans per second into at most one.
+// Cached result of build_queue_views, shared across every concurrent
+// /events (SSE) client and /api/state poller — trades a small, bounded
+// staleness window for turning N concurrent directory scans into one.
 struct QueueViewSnapshot {
     computed_at: std::time::Instant,
     mux_queue: Vec<String>,
@@ -6366,29 +5935,21 @@ impl QueueViewSnapshot {
 }
 
 struct QueueViewCache {
-    /// `None` only between the moment a key's FIRST scan starts and the
-    /// moment it finishes — there is simply nothing to serve yet.
+    // None only between a key's first scan starting and finishing — nothing
+    // to serve yet. See docs/web-queue-view-cache.md.
     snapshot: Option<QueueViewSnapshot>,
-    /// When the scan that currently owns this key STARTED, if one does.
-    ///
-    /// Single-flight marker, deliberately a timestamp rather than a bool: a
-    /// bool can only be cleared by the refresher that set it, so a refresher
-    /// that never returns latches it forever. Trusted for
-    /// `QUEUE_VIEW_REFRESH_DEADLINE`, after which the owner is presumed dead
-    /// and the next caller may take the key over.
+    // Single-flight marker: a timestamp (not a bool, which only the setter
+    // could clear) for when the owning scan started; trusted for
+    // QUEUE_VIEW_REFRESH_DEADLINE. See docs/web-queue-view-cache.md.
     refresh_started: Option<std::time::Instant>,
-    /// How many threads are inside `scan_queue_views` for this key right now.
-    /// Maintained by `RefreshGuard`, so it is decremented on panic too, and
-    /// capped at `QUEUE_VIEW_MAX_REFRESHERS` so repeated takeovers of a key
-    /// that stays wedged cannot pile threads up without bound.
+    // Threads inside scan_queue_views for this key now; maintained by
+    // RefreshGuard and capped at QUEUE_VIEW_MAX_REFRESHERS.
     refreshers: usize,
 }
 
-/// RAII owner of a key's single-flight marker.
-///
-/// Drop — not the happy path — is what releases the marker, so a scan that
-/// panics inside `read_dir` (or anywhere else in `build_queue_views`) hands
-/// the key straight back instead of stranding it until the deadline.
+// RAII owner of a key's single-flight marker: Drop (not the happy path)
+// releases it, so a scan that panics inside read_dir hands the key back
+// instead of stranding it until the deadline.
 struct RefreshGuard {
     key: String,
     claimed_at: std::time::Instant,
@@ -6412,69 +5973,42 @@ impl Drop for RefreshGuard {
     }
 }
 
-/// Keyed by staging_dir rather than a single slot: the staging path can
-/// change at runtime (a Settings edit), and — just as importantly — this
-/// keeps two DIFFERENT staging dirs from evicting each other's cached scan
-/// (a real scenario if the operator ever repoints staging, and exactly the
-/// shape our own parallel tests exercise with distinct tempdirs).
+// Keyed by staging_dir rather than a single slot, since the path can change
+// at runtime and two different staging dirs must not evict each other's
+// cached scan. See docs/web-queue-view-cache.md.
 static QUEUE_VIEW_CACHE: Lazy<std::sync::Mutex<std::collections::HashMap<String, QueueViewCache>>> =
     Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Signalled when an in-flight scan completes. Only the cold-start case
-/// (no snapshot to serve at all) ever waits on it; a caller that has ANY
-/// snapshot, however stale, is served immediately instead.
+// Signalled when an in-flight scan completes; only the cold-start case (no
+// snapshot at all) waits on it — any stale snapshot is served immediately.
 static QUEUE_VIEW_REFRESHED: Lazy<std::sync::Condvar> = Lazy::new(std::sync::Condvar::new);
 
-/// Safety valve for the cold-start wait: a caller with NOTHING to serve gives
-/// up after this long and returns an empty queue view rather than parking on
-/// the condvar for as long as the in-flight scan takes. It deliberately does
-/// NOT scan for itself — that abandons single-flight, and on a wedged staging
-/// mount it consumes one HTTP worker thread (plus its admission token) per
-/// give-up, which is how `/api/state` starts 503-ing and the container
-/// HEALTHCHECK restarts the daemon mid-rip. Recovery from a dead scanner is
-/// `QUEUE_VIEW_REFRESH_DEADLINE`'s job instead. Never hit in normal operation.
+// Safety valve for the cold-start wait: gives up after this long rather than
+// parking forever. Deliberately does NOT scan for itself (that abandons
+// single-flight). See docs/web-queue-view-cache.md.
 const QUEUE_VIEW_COLD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long the per-key single-flight marker is TRUSTED. A refresher that has
-/// held it longer than this is presumed dead — panicked before the drop guard
-/// could run, or wedged inside `read_dir` on an unresponsive mount — and the
-/// next caller that needs fresh data is allowed to take the marker over.
-///
-/// Without this, `refreshing` is a latch: a refresher that never returns makes
-/// every later caller take the serve-stale branch forever, so the queue views
-/// freeze for the process lifetime.
+// How long the per-key single-flight marker is TRUSTED before a refresher is
+// presumed dead (panicked/wedged) and the next caller may take it over.
+// See docs/web-queue-view-cache.md.
 const QUEUE_VIEW_REFRESH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Hard ceiling on threads inside `scan_queue_views` for ONE key at a time.
-/// The deadline above permits a takeover; this bounds how many takeovers can
-/// pile up when the takeover ALSO wedges (a mount that is down stays down).
-/// Two: the original plus one retry. When the mount recovers both publish, the
-/// count drops back to zero, and normal single-flight resumes.
+// Hard ceiling on threads inside scan_queue_views for ONE key: the original
+// plus one retry, so a takeover that also wedges cannot pile up unboundedly.
 const QUEUE_VIEW_MAX_REFRESHERS: usize = 2;
 
-/// How long a cached queue view is served before the next caller triggers a
-/// fresh scan. Kept comfortably under the ~1s SSE tick so no client ever
-/// observes staleness worse than what the poll cadence already implies.
+// How long a cached queue view is served before the next caller triggers a
+// fresh scan; kept under the ~1s SSE tick so staleness stays invisible.
 const QUEUE_VIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(750);
 
-/// How long an idle key is RETAINED in the map — deliberately far longer than
-/// the serve-freshness TTL above. The Phase-3 prune exists only to stop distinct
-/// ephemeral staging paths from growing the map without bound; it must NOT evict
-/// a still-active key just because its snapshot aged past the sub-second TTL.
-/// Evicting there throws away the stale snapshot that stale-while-revalidate
-/// relies on, so the key's next (slow) refresh has nothing to serve and forces a
-/// concurrent /api/state reader to block for the whole scan — the healthcheck
-/// stall the cache exists to prevent. Retain by recency-of-refresh instead: a
-/// key polled each second stays warm; one nobody reads ages out and is pruned.
+// How long an idle key is RETAINED, far longer than QUEUE_VIEW_CACHE_TTL, so
+// the Phase-3 prune doesn't evict a still-active key mid-stale-while-revalidate.
+// See docs/web-queue-view-cache.md.
 const QUEUE_VIEW_CACHE_RETAIN: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Test-only seam around the staging-dir scan a cache miss performs.
-///
-/// Keyed by staging dir so tests that arm it are isolated from every other
-/// test in this process (the cache itself, `STATE`, and the log dir are all
-/// process-global here, so a shared fixture name would be a real race).
-/// Lets a test (a) make one specific dir's scan artificially slow and
-/// (b) count how many scans a dir actually received.
+// Test-only seam around the staging-dir scan a cache miss performs, keyed by
+// staging dir so tests stay isolated. Lets a test slow one dir's scan and
+// count how many scans it received. See docs/web-queue-view-cache.md.
 #[cfg(test)]
 pub(crate) mod queue_scan_probe {
     use std::collections::HashMap;
@@ -6591,37 +6125,9 @@ fn scan_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usiz
     build_queue_views(staging_dir)
 }
 
-/// [`build_queue_views`], but shared across concurrent callers within
-/// `QUEUE_VIEW_CACHE_TTL` instead of re-scanning the staging directory once
-/// per caller. Used by [`get_state_json`] (the per-second SSE/`/api/state`
-/// payload); `handle_system_info`'s on-demand `/api/system` panel calls the
-/// uncached `build_queue_views` directly so a manual refresh always sees the
-/// latest disk state.
-///
-/// The cache mutex is NEVER held across the scan. `build_queue_views` does
-/// `read_dir` plus a stat per entry, and this function backs `/api/state` —
-/// which `--healthcheck` probes and the Dockerfile HEALTHCHECK runs — so a
-/// staging dir that is slow to enumerate must not be able to park every
-/// other caller (and get the container restarted mid-rip). Single-flight is
-/// preserved without the lock: a per-key marker means exactly one caller
-/// scans, while everyone else is served the previous snapshot
-/// (stale-while-revalidate) and never blocks. Only a genuinely cold key —
-/// no snapshot at all — makes callers wait, and they wait on a condvar with
-/// the map lock released, not on the scan's mutex.
-///
-/// Three separate bounds keep a refresher that never comes back from wedging
-/// the whole daemon, and they are deliberately distinct:
-///
-/// * `QUEUE_VIEW_REFRESH_DEADLINE` bounds the MARKER. A single-flight bool can
-///   only be cleared by the thread that set it, so a thread stuck in `read_dir`
-///   latches it and every later caller serves stale forever. A timestamp lets a
-///   later caller decide the owner is dead and take the key over, which is what
-///   unfreezes the views.
-/// * `QUEUE_VIEW_MAX_REFRESHERS` bounds the takeovers that deadline permits, so
-///   a mount that stays down cannot accumulate one wedged thread per deadline.
-/// * `QUEUE_VIEW_COLD_WAIT` bounds an individual COLD caller, which returns an
-///   empty view rather than scanning: the give-up path must not start work, or
-///   the caller bound becomes an accumulation rate.
+// build_queue_views, shared across callers within QUEUE_VIEW_CACHE_TTL,
+// single-flighted with no lock held across the scan so a slow staging dir
+// can't park /api/state (the HEALTHCHECK probe). See docs/web-queue-view-cache.md.
 fn build_queue_views_cached(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usize) {
     // Phase 1 — decide, under the lock, whether THIS caller scans. The lock
     // is never held across `scan_queue_views`: a slow-to-enumerate staging
@@ -6803,37 +6309,14 @@ fn get_state_json(staging_dir: &str) -> String {
     obj.to_string()
 }
 
-/// Cap on how many queue entries we serialize so a staging dir holding a
-/// pathological number of subdirs can't produce an unbounded response. Shared
-/// by `build_queue_views` (the actual truncation) and `handle_system_info`
-/// (the "+N more" math) so the displayed list and its overflow count can never
-/// drift apart.
+// Cap on serialized queue entries so a pathological subdir count can't
+// produce an unbounded response; shared with handle_system_info's "+N more"
+// math so the list and its overflow count can never drift apart.
 const QUEUE_DISPLAY_CAP: usize = 100;
 
-/// Build the Mux-queue and Move-queue display lists from the staging dir.
-/// Shared by `get_state_json` (the live SSE/`/api/state` payload) and
-/// `handle_system_info` (the `/api/system` panel) so both endpoints derive
-/// the two queues from one place and can never disagree on membership.
-///
-/// Returns `(mux_queue, move_queue, mux_full_count, move_full_count)`: the
-/// first two are capped at `QUEUE_DISPLAY_CAP` for display, the last two are
-/// the uncapped totals from the SAME scan so callers can compute a "+N more"
-/// overflow count that always matches the displayed lists (one snapshot, no
-/// TOCTOU between count and list).
-///
-/// Mutual exclusion is guaranteed by the unified `state.json` itself: the Move
-/// queue selects dirs in `StagingState::Done` (legacy `.done` file as fallback),
-/// and `crate::muxer::pending_queue` (the Mux queue) skips any dir that is not a
-/// clean `Ripped` hand-off — i.e. muxing, terminal, or already handed to the
-/// mover (`.done`/`.review`/`.muxing`/`.completed`/
-/// `.failed`. So a given staging dir lands in at most one of the two lists.
-///
-/// The Move queue additionally excludes the staging dir currently being moved
-/// (`crate::mover::ACTIVE_MOVE_DIR`): that dir keeps its `.done` throughout the
-/// copy and is already shown as its live per-artifact progress bars (`_move`),
-/// so listing it here as a "(moving)" row too is the double-render bug. The
-/// exclusion is by exact on-disk basename, so it holds regardless of any title
-/// punctuation the filesystem sanitizer drops.
+// Builds the Mux-queue and Move-queue display lists, shared by
+// get_state_json and handle_system_info so both derive from one place.
+// Mutual exclusion comes from state.json itself. See docs/web-queue-view-cache.md.
 fn build_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usize) {
     let active_move_dir = crate::mover::ACTIVE_MOVE_DIR
         .lock()
@@ -6875,12 +6358,9 @@ fn build_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usi
 }
 
 fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
-    // Degrade gracefully on a poisoned lock, matching every other handler,
-    // rather than panicking this thread and silently breaking the System tab.
-
-    // Copy the two paths out and DROP the read guard before any I/O: the
-    // scan and log tail below do filesystem work, and holding the RwLock
-    // across it would block a concurrent `cfg.write()` (e.g. Settings-save).
+    // Degrade gracefully on a poisoned lock like every other handler; copy
+    // the two paths out and DROP the read guard before the I/O below, or a
+    // held RwLock would block a concurrent cfg.write() (Settings-save).
     let (staging_dir, syslog_path) = match cfg.read() {
         Ok(c) => (
             c.staging_dir.clone(),
@@ -6951,22 +6431,17 @@ fn handle_device_log(request: tiny_http::Request, _cfg: &Arc<RwLock<Config>>, de
     text_response(request, &lines.join("\n"));
 }
 
-/// Upper bound on how many trailing bytes of a log file we read into
-/// memory when tailing. The JSONL event log uses `rolling::never`
-/// (observe.rs) so it grows unbounded for the container's life; the
-/// System/Debug tabs poll it every few seconds. 8 MiB comfortably holds
-/// the 5000-line `n` cap of typical events while keeping per-request
-/// allocation bounded regardless of total file size.
+// Upper bound on trailing bytes read when tailing a log. The JSONL event
+// log uses rolling::never so it grows unbounded; 8 MiB comfortably holds
+// the 5000-line n cap while keeping per-request allocation bounded.
 const DEBUG_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Same idea for the system log: 50 lines, generously bounded.
+// Same idea for the system log: 50 lines, generously bounded.
 const SYSLOG_TAIL_BYTES: u64 = 256 * 1024;
 
-/// Read up to the last `max_bytes` of a file as a UTF-8 string, seeking
-/// from the end rather than slurping the whole file. If the file is
-/// larger than `max_bytes`, the first (partial) line of the returned
-/// region may be truncated mid-record — acceptable for a tail view and
-/// the truncated head line is dropped by callers that split on `\n`.
+// Read up to the last max_bytes of a file, seeking from the end rather than
+// slurping the whole file; a partial first line from a mid-file seek is
+// acceptable and dropped by callers that split on \n.
 fn tail_file(path: &str, max_bytes: u64) -> std::io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
@@ -6985,20 +6460,9 @@ fn tail_file(path: &str, max_bytes: u64) -> std::io::Result<String> {
     Ok(s)
 }
 
-/// `GET /api/debug?n=N&level=L&device=D&q=substr` — last N JSONL events.
-///
-/// Tails `{AUTORIP_DIR}/logs/autorip.jsonl` (the structured event stream
-/// emitted by the tracing layer in `observe.rs`). Optional filters:
-///
-/// - `n` (default 500, max 5000) — number of trailing lines to return
-/// - `level` — `error|warn|info|debug|trace` minimum level
-/// - `device` — only events whose `fields.device` matches
-/// - `q` — substring match anywhere in the JSON line (cheap grep)
-///
-/// Output is **raw JSONL** (newline-separated JSON objects), not wrapped
-/// in a JSON array — keeps it streamable, greppable, and easy for shell
-/// tools to consume. Used by the web UI Debug tab and by anyone running
-/// `curl http://autorip:8080/api/debug?level=warn | jq` from a terminal.
+// GET /api/debug?n=N&level=L&device=D&q=substr: last N JSONL events, tailed
+// from autorip.jsonl with optional level/device/substring filters. Output
+// is raw JSONL (not a JSON array) for streamability, used by the Debug tab.
 fn handle_debug_log(request: tiny_http::Request, url: &str) {
     let params = parse_query(url);
     let n: usize = params
@@ -7074,12 +6538,9 @@ fn handle_debug_log(request: tiny_http::Request, url: &str) {
     text_response(request, &out.join("\n"));
 }
 
-/// Parse `?key=value&key2=v2` from a URL into a HashMap. Naive:
-/// percent-decodes each key and value via `percent_decode`, but does NOT
-/// translate `+` to space (so this is not full
-/// application/x-www-form-urlencoded decoding) and has no array-style
-/// keys — sufficient for our handful of debug filters and easier to
-/// audit than pulling a URL parser dep.
+// Parse ?key=value&key2=v2 into a HashMap. Naive: percent-decodes but does
+// NOT translate + to space and has no array-style keys — sufficient for our
+// debug filters and easier to audit than a URL parser dep.
 fn parse_query(url: &str) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let q = match url.split_once('?') {
@@ -7211,12 +6672,9 @@ mod parse_query_tests {
     }
 }
 
-/// Deadline for the bounded settings-save on the HTTP handler thread.
-/// 15 s is well above any reasonable NFS write latency on a healthy
-/// mount but short enough that a wedged `/config` doesn't permanently
-/// block the API thread. On timeout we return 503; the previous
-/// settings file remains intact because we always write to a temp
-/// file and only rename on success.
+// Deadline for the bounded settings-save: above any reasonable NFS write
+// latency, short enough a wedged /config doesn't block the API thread
+// forever. On timeout we 503; write-then-rename keeps the old file intact.
 const SETTINGS_SAVE_DEADLINE_SECS: u64 = 15;
 
 fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
@@ -7291,17 +6749,9 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             );
         }
     }
-    // NOTE: webhook_urls are intentionally NOT SSRF-validated (unlike the
-    // fields above) — a webhook is a fire-and-forget notification, and
-    // pointing one at a LAN service is the intended use (see webhook_agent).
-
-    // Resolve masked webhook_urls placeholders BEFORE the write guard: it
-    // used to run INSIDE cfg.write(), so a rejected ambiguous entry left
-    // ~20 earlier fields already mutated. Pure string matching, cheap here.
-
-    // Race note: `cfg.read()` here and `cfg.write()` later never overlap;
-    // a racing POST at worst gives last-write-wins on a resolution computed
-    // one snapshot earlier — never binds a masked entry to the WRONG secret.
+    // webhook_urls are intentionally NOT SSRF-validated (fire-and-forget;
+    // LAN targets are intended — see webhook_agent). Resolved here, BEFORE
+    // the write guard, so a rejected entry can't leave fields already mutated.
     let webhook_urls_resolved: Option<Vec<WebhookEntry>> = if let Some(arr) =
         patch.get("webhook_urls").and_then(|v| v.as_array())
     {
@@ -7823,22 +7273,9 @@ fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     json_response(request, 200, r#"{"ok":true}"#);
 }
 
-/// POST `/api/rip/{device}[?resume=yes|no]`.
-///
-/// Contract: this is the *only* path that starts disk work.
-/// Disc-insert detection is scan-only; auto-resume on container start
-/// is gone. The user's intent (POST) is the trigger.
-///
-/// Query param semantics:
-/// - `resume=yes` → re-mux the existing staging ISO if one exists for
-///   this disc. Reject (404) if no resumable state is found rather
-///   than silently doing a fresh sweep.
-/// - `resume=no` → wipe the staging dir for this disc, then fresh
-///   sweep+mux. Explicit clean slate.
-/// - (no param) → fresh sweep+mux from disc. The classic behavior.
-///   Does NOT delete any pre-existing staging dir, but starts writing
-///   to it (libfreemkv's sweep `resume` flag picks up where the
-///   mapfile left off, if applicable).
+// POST /api/rip/{device}[?resume=yes|no] — the ONLY path that starts disk
+// work. resume=yes re-muxes an existing staging ISO (404 if none); resume=no
+// wipes staging first; no param does a fresh sweep+mux, keeping any staging dir.
 fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str, query: &str) {
     let resume_mode = parse_resume_param(query);
 
@@ -7852,15 +7289,9 @@ fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &s
     let _ = spawn_rip_after_claim(request, cfg, device, resume_mode, claim_gen);
 }
 
-/// Spawn the rip worker thread for `device`, assuming the caller has ALREADY
-/// won the claim via `ripper::try_claim_active`. Shared by [`handle_rip`]
-/// (claims for itself) and [`handle_accept_loss`] (must claim BEFORE writing
-/// any staging markers, so a losing claim leaves the on-disk override
-/// unarmed — see the comment there).
-/// Returns `true` if the worker was spawned. The response has already been
-/// sent either way; the boolean exists so a caller that armed on-disk state
-/// BEFORE calling (only [`handle_accept_loss`], which writes `.accept-loss`)
-/// can disarm it when no worker will ever consume it.
+// Spawn the rip worker for `device`, assuming the caller ALREADY won the
+// claim. Shared by handle_rip and handle_accept_loss. Returns true if
+// spawned, so accept_loss can disarm its pre-written marker if unused.
 #[must_use]
 fn spawn_rip_after_claim(
     request: tiny_http::Request,
@@ -7910,11 +7341,9 @@ fn spawn_rip_after_claim(
     true
 }
 
-/// Entry verdict for [`handle_accept_loss`]'s ownership gates, factored out of the
-/// handler so they are unit-testable without a live `tiny_http::Request`. Reverting
-/// the `.muxing` 409 guard flips the `MuxInProgress` arm and fails
-/// `accept_loss_entry_verdict_gates_on_muxing` — the coverage the inline guard
-/// lacked (the whole suite stayed green when the guard was deleted).
+// Entry verdict for handle_accept_loss's ownership gates, factored out so
+// they're unit-testable without a live Request; reverting the .muxing 409
+// guard flips MuxInProgress and fails the pinned test.
 #[derive(Debug, PartialEq, Eq)]
 enum AcceptLossEntry {
     /// No staging dir on disk for this device — 404.
@@ -7937,14 +7366,9 @@ fn accept_loss_entry_verdict(dir_exists: bool, is_muxing: bool) -> AcceptLossEnt
     }
 }
 
-/// POST `/api/accept-loss/{device}` — operator override.
-///
-/// Accept the recorded over-threshold main-movie loss and deliver the existing
-/// rip instead of re-ripping. Writes the one-shot `.accept-loss` marker into the
-/// disc's staging dir, clears the terminal/abort markers so the dir is resumable
-/// again, then re-muxes the EXISTING ISO via the resume path (no re-sweep) — where
-/// `resume_remux` honors the marker and bypasses the abort gate. Fixes the
-/// exhaust → `.failed` → wasteful full-re-rip loop.
+// POST /api/accept-loss/{device}: accept a recorded over-threshold loss and
+// deliver the existing rip. Writes .accept-loss, clears terminal/abort
+// markers, then re-muxes the EXISTING ISO — fixing the exhaust->.failed loop.
 fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
     // Resolve via the one naming rule, not the title alone: with a boxset
     // in the drive, Accept must arm the marker on THIS disc's dir, not a
@@ -7968,13 +7392,9 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
         }
     };
     let dir = std::path::Path::new(&staging);
-    // Entry ownership gates factored into pure `accept_loss_entry_verdict`
-    // so they're unit-testable without a live Request; `is_muxing` on an
-    // absent dir is side-effect-free and reads false.
-
-    // Respect `.muxing`: the mux worker holds no device claim, so this
-    // handler isn't otherwise serialized against its lock-free state.json
-    // RMWs. Refusing while set avoids clobbering a just-written quarantine.
+    // Ownership gates factored into pure accept_loss_entry_verdict above;
+    // refusing on .muxing avoids clobbering a just-written quarantine, since
+    // this handler isn't otherwise serialized against the mux worker's RMWs.
     match accept_loss_entry_verdict(dir.exists(), crate::ripper::staging::is_muxing(dir)) {
         AcceptLossEntry::NoStagingDir => {
             json_response(
@@ -8065,17 +7485,9 @@ fn parse_resume_param(query: &str) -> ResumeMode {
 mod stop_report_tests {
     use super::stop_report;
 
-    /// Catches the mutation that makes a timed-out Stop report the clean-stop
-    /// answer (status "idle" + `{"ok":true}`) — a failure rendered as a
-    /// success, which is the highest-value defect class in this crate.
-    ///
-    /// `handle_stop` used to reset the row to "idle" and answer `{"ok":true}`
-    /// whether or not the rip thread drained. When it had NOT drained the
-    /// worker was still running, still holding the drive and the staging dir,
-    /// and still making the claim's liveness half refuse every later
-    /// scan/rip/eject on that device — so the operator saw an idle, quiet card
-    /// and a 409 on the next click, with no explanation anywhere but a WARN in
-    /// the server log.
+    // Catches the mutation making a timed-out Stop report the clean-stop
+    // answer (idle + ok:true): a failure rendered as success. handle_stop
+    // used to reset to "idle" regardless of drain, leaving every later route 409ing.
     #[test]
     fn a_stop_that_did_not_drain_is_not_reported_as_a_clean_stop() {
         let clean = stop_report(true);
@@ -8111,17 +7523,9 @@ mod stop_report_tests {
 
 #[cfg(test)]
 mod worker_panic_tests {
-    /// Catches the mutation that removes the `catch_unwind` from ANY worker
-    /// spawn site.
-    ///
-    /// The claim is taken before the spawn (`status="scanning"`), so the worker
-    /// owns clearing it on every exit path — and an unwind is an exit path. The
-    /// scan spawn site had no `catch_unwind` while the rip site and the poll
-    /// loop both did: a panic anywhere in `scan_disc` therefore left the device
-    /// claimed with no thread behind the claim, `is_busy` true forever, and
-    /// every route on that device answering 409 until the container restarted.
-    /// `forget_removed_device` will not evict a busy row and the poll loop
-    /// skips busy devices, so nothing self-heals it.
+    // Catches the mutation removing catch_unwind from ANY worker spawn site.
+    // The claim is taken before spawn, so the worker owns clearing it even
+    // on panic; the scan site once lacked this, 409ing a device forever.
     #[test]
     fn every_worker_spawn_site_catches_its_panic() {
         let src = crate::util::source_lf(include_str!("web.rs"));
@@ -8148,21 +7552,9 @@ mod worker_panic_tests {
 
 #[cfg(test)]
 mod accept_loss_spawn_failure_tests {
-    /// Catches the mutation that drops the disarm branch from
-    /// `handle_accept_loss` when `spawn_rip_after_claim` fails.
-    ///
-    /// The handler arms `.accept-loss` on disk BEFORE it spawns, deliberately:
-    /// a rejected (409) accept must leave the staging dir untouched, so the
-    /// claim is taken first. But if the OS then refuses the thread, the handler
-    /// answers 500 and NOTHING will ever consume the marker it just wrote. The
-    /// next legitimate rip or resume of that disc picks the stale override up
-    /// and delivers a rip whose loss was never accepted for that run — a
-    /// damaged rip filed as finished with no operator confirmation, which is
-    /// exactly the hazard the claim-before-write ordering exists to prevent,
-    /// reached through the other door.
-    ///
-    /// Proven structurally: making a real `thread::Builder::spawn` fail inside
-    /// the test binary means exhausting the process's thread limit.
+    // Catches the mutation dropping the disarm branch when
+    // spawn_rip_after_claim fails: .accept-loss is armed BEFORE spawning, so
+    // a refused thread must disarm it or the next rip inherits stale consent.
     #[test]
     fn a_failed_spawn_disarms_the_accept_loss_override() {
         let src = crate::util::source_lf(include_str!("web.rs"));
@@ -8192,21 +7584,9 @@ mod accept_loss_spawn_failure_tests {
 
 #[cfg(test)]
 mod dashboard_button_tests {
-    /// Catches the mutation that puts a bare `fetch(...)` back into any
-    /// device-action button's `onclick`.
-    ///
-    /// The drive-card buttons were fire-and-forget: `fetch()` with no `.then`
-    /// and no `.catch`, so the server's answer was discarded entirely. Eject
-    /// renders on `discIn && !active` and "Accept & deliver" on
-    /// `lossAborted && !active` — both of those overlap the window in which the
-    /// claim refuses with 409 because a worker is still unwinding. The operator
-    /// clicked Eject and the disc stayed in the drive with no message; clicked
-    /// "Accept & deliver" and watched it grey out (it set `this.disabled=true`
-    /// FIRST, which reads as success) while no `.accept-loss` marker was ever
-    /// written and the override was never armed. A 409 rendered as success.
-    ///
-    /// Comment lines are stripped before matching so this pin cannot be
-    /// satisfied by its own explanation.
+    // Catches the mutation putting a bare fetch(...) back into any
+    // device-action button's onclick: no .then/.catch discarded the server's
+    // answer, so a 409 (claim held by an unwinding worker) read as success.
     #[test]
     fn no_device_action_button_discards_the_servers_answer() {
         let src = crate::util::source_lf(include_str!("web.rs"));
@@ -8255,14 +7635,9 @@ mod dashboard_button_tests {
 mod resume_param_tests {
     use super::{ResumeMode, parse_resume_param};
 
-    /// `?resume=no` selects `Wipe`, which DELETES an existing staging dir
-    /// before starting a fresh sweep. That makes this the only query-parameter
-    /// decision in the crate that can destroy an in-progress or not-yet-moved
-    /// rip — the operator's media — and it is reachable unauthenticated from
-    /// any host on the LAN.
-    ///
-    /// It had no test at all. A mutation run flipped the `k == "resume"`
-    /// comparison and deleted each value arm with the whole suite still green.
+    // ?resume=no selects Wipe, DELETING an existing staging dir before a
+    // fresh sweep — the only unauthenticated param that can destroy a rip.
+    // Had no test; a mutation flipped the key comparison and stayed green.
     #[test]
     fn resume_param_maps_only_the_documented_values() {
         // The destructive one. Every spelling of it.
@@ -8300,11 +7675,9 @@ mod resume_param_tests {
         }
     }
 
-    /// The scan must match on the KEY, not stumble into the first value that
-    /// happens to look like one. With `==` flipped to `!=` the first
-    /// non-`resume` pair would decide the mode, so a URL carrying
-    /// `?title=no&resume=yes` would wipe the staging dir the operator just
-    /// asked to keep.
+    // The scan must match on the KEY, not the first value that looks like
+    // one — with == flipped to != a URL like ?title=no&resume=yes would wipe
+    // the staging dir the operator asked to keep.
     #[test]
     fn resume_param_reads_the_resume_key_not_a_neighbouring_one() {
         assert_eq!(
@@ -8337,12 +7710,9 @@ pub(crate) enum KeydbReadError {
     TooLarge,
 }
 
-/// Read a keydb response body, rejecting bodies larger than `max_bytes`.
-///
-/// `Read::take(max_bytes)` would cap the read but SUCCEED at exactly the cap,
-/// silently truncating an oversized plain-text keydb into a half-valid file.
-/// Read one byte past the cap instead so an oversized body is detectable, and
-/// return `TooLarge` rather than a truncated buffer.
+// Read a keydb body, rejecting anything over max_bytes. Read::take(max)
+// would silently truncate an oversized body into a half-valid file; reading
+// one byte past the cap instead makes an oversized body detectable.
 pub(crate) fn read_capped_keydb_body<R: std::io::Read>(
     reader: R,
     max_bytes: u64,
@@ -8411,23 +7781,15 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             return;
         }
     };
-    // NOT the plain `guarded_agent`: its 30s `response` ceiling would
-    // silently override the KEYDB_FETCH_TIMEOUT budget below. Built with
-    // that budget as the response ceiling so the constant means what it says.
-
-    // This LAN-facing path keeps the tighter 60s ceiling rather than
-    // `KEYDB_TRANSFER_BUDGET`: it's unauthenticated and holds an in-flight
-    // slot plus the update flag that 429s every other attempt.
+    // NOT the plain guarded_agent (its 30s ceiling would override the budget
+    // below); this LAN-facing unauthenticated path keeps the tighter 60s
+    // KEYDB_FETCH_TIMEOUT rather than KEYDB_TRANSFER_BUDGET.
     let agent = guarded_agent_with_timeouts(
         pinned,
         std::time::Duration::from_secs(5),
         KEYDB_FETCH_TIMEOUT,
         STALL_TIMEOUT,
     );
-
-    // Wall-clock bound on the whole download so a slow-loris server can't
-    // hold the in-flight slot indefinitely (anchored at request start, vs
-    // the response ceiling anchored at header completion).
 
     // Cap is the shared KEYDB_MAX_BYTES (100 MiB); read_capped_keydb_body
     // returns 413 on an oversized body rather than silently truncating.
@@ -8525,13 +7887,9 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 }
 
 fn handle_eject(request: tiny_http::Request, device: &str) {
-    // Gate on rip status: the BU40N is slot-loading, so a software eject is
-    // irreversible and ejecting mid-rip abandons it. POST /api/eject/<dev>
-    // is unauthenticated, so the server must enforce this, not just the JS.
-
-    // Claim the device before ejecting: a separate busy-check then eject
-    // leaves a TOCTOU where a rip could start between the two. The claim
-    // closes it via one STATE lock; the idle reset below releases it.
+    // Gate on rip status (BU40N is slot-loading; eject mid-rip is
+    // irreversible), enforced server-side since POST is unauthenticated.
+    // Claim first, closing the busy-check/eject TOCTOU via one STATE lock.
     if ripper::try_claim_active_checked(device, false).is_none() {
         return json_response(
             request,
@@ -8553,27 +7911,14 @@ fn handle_eject(request: tiny_http::Request, device: &str) {
 }
 
 fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
-    // Stop signals threads to abort, waits for the rip thread to drain,
-    // drops the SCSI session, and collapses the state entry to idle.
-
-    // **Stop preserves partial staging state for resume.** Pre-0.21.10 this
-    // wiped staging on stop, conflicting with auto-resume and once nuking
-    // an 85 GB ISO. Now left as-is; delete by hand for a clean slate.
-
-    // The 60s drain budget covers a 30s in-flight CDB plus margin; a
-    // timeout is logged but not fatal — the response still goes 200.
+    // Stop signals threads to abort, drains the rip thread, drops the SCSI
+    // session, and collapses state to idle. Stop preserves partial staging
+    // state for resume (pre-0.21.10 wiped it, once nuking an 85 GB ISO).
     let _ = cfg;
 
-    // Cancel the per-device halt and drain the rip thread (the core
-    // stop→drain contract; see ripper::stop_and_drain).
-
-    // A drain that TIMES OUT is not a stop: the worker still owns the drive,
-    // refusing every later scan/rip/eject for as long as it runs — a thread
-    // wedged in `Drive::open`/`eject()` can't be killed or taken back.
-
-    // What CAN be fixed is the reporting: this used to reset to "idle" and
-    // answer `{"ok":true}` either way, hiding a still-mid-write worker
-    // behind a quiet card. Say what actually happened instead.
+    // Cancel the halt and drain (ripper::stop_and_drain). A timed-out drain
+    // is not a stop — the worker still owns the drive — so report what
+    // actually happened instead of the old "reset to idle either way".
     let drained = ripper::stop_and_drain(device, std::time::Duration::from_secs(60));
     if !drained {
         tracing::error!(
@@ -8619,10 +7964,9 @@ fn handle_stop(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
     json_response(request, 200, report.body);
 }
 
-/// What a Stop reports, as a function of whether the rip thread ACTUALLY
-/// drained. Split out of [`handle_stop`] so the "a stop that did not stop
-/// anything must not render as success" rule is testable without waiting out
-/// the real 60 s drain budget.
+// What a Stop reports, as a function of whether the rip thread ACTUALLY
+// drained. Split out of handle_stop so "a stop that stopped nothing must
+// not render as success" is testable without the real 60s drain budget.
 struct StopReport {
     /// `RipState::status` to publish.
     status: &'static str,
