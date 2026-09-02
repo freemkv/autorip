@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.15] — 2026-09-02
+
+### Changed
+
+- Version aligned to 1.6.15 for the unified release. Documentation fixes (build-from-source instructions) and internal CI/lint hardening; no functional changes.
+
 ## [1.6.14] — 2026-08-31
 
 ### Fixed
