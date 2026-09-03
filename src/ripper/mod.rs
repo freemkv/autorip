@@ -973,6 +973,20 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         }
     };
     tracing::info!(device = %device, elapsed_ms = scan_t0.elapsed().as_millis() as u64, "scan: structure done");
+
+    // User-facing unlocker matrix — which unlockers RAN, emitted right after
+    // disc-identify and BEFORE the keyserver (depends only on drive-init + scan
+    // state, not key resolution). See docs/ripper-mod-notes.md.
+    {
+        let matrix = disc
+            .unlocker_matrix(&drive)
+            .into_iter()
+            .map(|(name, ok)| format!("{name}: {}", if ok { "yes" } else { "no" }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        crate::log::device_log(device, &format!("Unlockers — {matrix}"));
+    }
+
     // Sample-based key resolve (online path can take a minute or two — status
     // update avoids that looking like a hang). DVD is CSS not AACS, so skip
     // resolve entirely or the scan reads it as AACS/UHD and stalls.
@@ -1040,19 +1054,6 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             disc.titles.len()
         ),
     );
-
-    // User-facing unlocker matrix — which registered unlockers actually RAN
-    // (not just "matched the disc kind"), so a missing one is visible.
-    // Registry-driven and kept byte-identical to the CLI's rendering.
-    {
-        let matrix = disc
-            .unlocker_matrix(&drive)
-            .into_iter()
-            .map(|(name, ok)| format!("{name}: {}", if ok { "yes" } else { "no" }))
-            .collect::<Vec<_>>()
-            .join(", ");
-        crate::log::device_log(device, &format!("Unlockers — {matrix}"));
-    }
 
     // Extract title info before storing session
     let duration = disc
