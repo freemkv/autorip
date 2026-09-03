@@ -438,15 +438,14 @@ fn reachability_for_unprobeable_url(err: &str) -> ServiceReachability {
 /// learn *whether* the service answers, not to complete a key exchange.
 const PROBE_TIMEOUT_SECS: u64 = 8;
 
-/// Perform ONE bounded reachability probe against the configured
-/// `keyserver_url` and classify the result. A single cheap `GET` with short
-/// connect/read timeouts, zero redirects, and the same SSRF-pinning
-/// (`validate_fetch_url`) the rest of autorip's outbound HTTP uses. Any HTTP
-/// answer proves the service is UP; only transport failures / 5xx / 429 are
-/// transient.
-///
-/// Empty or SSRF-blocked URLs can't be probed and report
-/// [`ServiceReachability::Up`]; see [`reachability_for_unprobeable_url`].
+/// ONE bounded reachability probe against `keyserver_url`, classified. A cheap
+/// `POST` (empty body) with short timeouts and autorip's usual SSRF-pinning; any
+/// HTTP answer proves the service is UP, only transport / 5xx / 429 are transient.
+/// POST (not GET) is load-bearing: the key service is POST-only, so a GET
+/// transport-fails (status `000`) and is misread as "DOWN", firing the pointless
+/// 3x outage-retry on every definitive 4xx. A POST gets a real status → answered
+/// → `Up`. Empty/SSRF-blocked URLs report [`ServiceReachability::Up`]; see
+/// [`reachability_for_unprobeable_url`].
 pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
     let url = cfg.keyserver_url.trim();
     if url.is_empty() {
@@ -465,7 +464,7 @@ pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
         std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
         std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
     );
-    let outcome = match agent.get(url).call() {
+    let outcome = match agent.post(url).send_empty() {
         Ok(resp) => ProbeOutcome::Status(resp.status().as_u16()),
         Err(ureq::Error::StatusCode(code)) => ProbeOutcome::Status(code),
         // ureq 3 fans v2's `Transport` out across `Io`, `Timeout`, `Tls`,
