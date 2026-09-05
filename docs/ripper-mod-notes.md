@@ -1551,3 +1551,10 @@ different degraded passes can surface disjoint partial views of the
 same mount: a disc's subdir present in an earlier, smaller pass but
 absent from a later, larger one would otherwise be silently dropped,
 defeating the whole point of the retry.
+
+## User-facing unlocker matrix
+
+Emitted right after disc-identify and before the keyserver call, since
+it depends only on drive-init + scan state (`disc.unlocker_matrix`),
+not on key resolution — the operator sees which unlockers ran even if
+key lookup later fails or is deferred.

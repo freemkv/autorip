@@ -685,18 +685,31 @@ pub fn read_failed_reason(staging_disc_dir: &Path) -> Option<String> {
 /// Write (or rewrite) the `.aborted-loss` resumable-failure marker with a
 /// reason and the current attempt count. Like `write_failed_marker` this is
 /// the end-of-run state for this attempt, so it supersedes the in-progress
-/// `.sweeping`/`.muxing` markers (clear them). Best-effort.
-pub fn write_aborted_loss_marker(staging_disc_dir: &Path, reason: &str, attempt: u64) {
+/// `.sweeping`/`.muxing` markers (clear them). Best-effort. Returns whether the
+/// `state.json` write landed (see `write_failed_marker`).
+pub fn write_aborted_loss_marker(staging_disc_dir: &Path, reason: &str, attempt: u64) -> bool {
     // Resumable-failure transition → `state: AbortedLoss`, carrying the reason
     // and attempt count. Releases in-progress ownership like `.failed` does.
-    mutate_state(staging_disc_dir, StagingState::AbortedLoss, |s| {
-        s.state = StagingState::AbortedLoss;
-        s.failure_reason = Some(reason.to_string());
-        s.aborted_loss_attempt = attempt;
-        s.muxing = false;
-    });
+    let mut st = read_state_or_warn_corrupt(staging_disc_dir)
+        .unwrap_or_else(|| DiscState::new(StagingState::AbortedLoss));
+    st.state = StagingState::AbortedLoss;
+    st.failure_reason = Some(reason.to_string());
+    st.aborted_loss_attempt = attempt;
+    st.muxing = false;
+    let landed = match try_write_state(staging_disc_dir, &st) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                path = %state_path(staging_disc_dir).display(),
+                error = %e,
+                "failed to persist .aborted-loss — dir stays in its prior state and may keep re-dispatching until the staging mount recovers"
+            );
+            false
+        }
+    };
     remove_legacy_marker(staging_disc_dir, SWEEPING_MARKER);
     remove_legacy_marker(staging_disc_dir, MUXING_MARKER);
+    landed
 }
 
 /// Best-effort clear of the aborted-loss state. Used when the dir is promoted to
@@ -786,8 +799,20 @@ pub fn mark_aborted_on_loss(staging_disc_dir: &Path, reason: &str) -> bool {
     // Loss is deterministic (a re-rip won't fix media damage), so this is never
     // promoted to terminal `.failed` by attempt count — the dir stays resumable
     // indefinitely; the operator resolves via Accept or Run-another-pass.
-    write_aborted_loss_marker(staging_disc_dir, reason, attempt);
+    let _ = write_aborted_loss_marker(staging_disc_dir, reason, attempt);
     false
+}
+
+/// Like [`mark_aborted_on_loss`], but reports whether the `.aborted-loss`
+/// write actually landed, so a caller can raise an operator card on a
+/// dropped write instead of silently re-dispatching forever.
+pub fn mark_aborted_on_loss_reporting_landed(staging_disc_dir: &Path, reason: &str) -> bool {
+    let prior = read_aborted_loss(staging_disc_dir)
+        .map(|(_, a)| a)
+        .unwrap_or(0);
+    let attempt = prior.saturating_add(1);
+    clear_restart_count(staging_disc_dir);
+    write_aborted_loss_marker(staging_disc_dir, reason, attempt)
 }
 
 /// Write the `.sweeping` in-progress marker durably. Called at staging-dir
