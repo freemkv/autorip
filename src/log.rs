@@ -207,9 +207,10 @@ pub fn syslog(msg: &str) {
 /// Rotate the non-device `system` log into `logs/rips/` if it has grown past
 /// `SYSTEM_LOG_ROTATE_BYTES`. Unlike per-device logs (archived on each
 /// scan/eject boundary), the system log has no natural archive point, so
-/// without this it grows unbounded for the container's lifetime. Called once
-/// at startup; reuses `archive_device_log`'s rename-into-rips behaviour.
-/// Best-effort and never propagates — logging must not break startup.
+/// without this it grows unbounded for the container's lifetime. Called at
+/// startup and re-checked on the log-prune tick (main.rs) so a long-uptime
+/// daemon still bounds it; reuses `archive_device_log`'s rename-into-rips
+/// behaviour. Best-effort and never propagates — logging must not break startup.
 pub fn rotate_system_log_if_large() {
     let path = device_log_path("system");
     let too_big = std::fs::metadata(&path)
