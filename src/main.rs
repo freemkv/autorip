@@ -111,8 +111,8 @@ fn main() {
         );
     }
 
-    // Rotate the system log if it has grown large across many restarts —
-    // it has no per-rip archive boundary, so this is its only bound.
+    // Rotate the system log if it has grown large across restarts. Also
+    // re-checked on the log-prune tick below, bounding a long-uptime daemon too.
     log::rotate_system_log_if_large();
 
     log::syslog(&format!(
@@ -319,6 +319,9 @@ fn main() {
                     .ok()
                     .map(|c| (c.log_dir(), c.log_retention_days))
                     .unwrap_or_default();
+                // Re-check the live system log too — the mtime-based prune
+                // above can't reclaim a file still being written.
+                log::rotate_system_log_if_large();
                 if log_dir.is_empty() {
                     continue;
                 }
@@ -787,6 +790,26 @@ fn prune_dir_recursive(dir: &std::path::Path, cutoff: std::time::SystemTime) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FIX: on a long-uptime daemon the system log only shrank at boot, so it
+    // grew unbounded between restarts. Pins that the log-prune tick (24h,
+    // same thread as `prune_old_logs`) also re-checks the rotation size.
+    #[test]
+    fn log_prune_thread_rechecks_system_log_rotation() {
+        let src = crate::util::source_lf(include_str!("main.rs"));
+        let start = src
+            .find("Log prune thread")
+            .expect("main.rs should have the log prune thread");
+        let end = src[start..]
+            .find("Main loop: poll drives")
+            .map(|i| start + i)
+            .expect("main.rs should have the main poll loop after the prune thread");
+        assert!(
+            src[start..end].contains("rotate_system_log_if_large()"),
+            "the log-prune tick must re-check the system log's rotation size, \
+             not only at startup"
+        );
+    }
 
     // Log retention has to see ROLLED files: `tracing-appender`'s daily
     // rotation writes `autorip.log.YYYY-MM-DD`, whose `Path::extension()`
