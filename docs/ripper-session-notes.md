@@ -215,10 +215,11 @@ insertion, then the user clicked Rip). Without this check the scan ran
 twice — clearing the TMDB poster + title in the UI and burning 10-30 s
 redoing identify + lookup + full title scan.
 
-Returns false if the lock can't be acquired, the device has no session,
-or the session exists but was created without `scanned=true`
-(currently impossible — every `store_session` call site passes true —
-but keeps the check honest if that invariant ever loosens).
+Returns false if the device has no session, or the session exists but
+was created without `scanned=true` (currently impossible — every
+`store_session` call site passes true — but keeps the check honest if
+that invariant ever loosens). Recovers on a poisoned `SESSIONS` lock
+(`unwrap_or_else` into_inner) rather than abandoning the check.
 
 ## `vid_for_log`: why sanitisation is needed here too
 
@@ -281,12 +282,17 @@ v0.13.6 bug class. Teardown is allowed to be slower, never unsafe.
 
 ## Test: `session_helpers_recover_from_poison`
 
-Regression: `take_session` and `drop_session` must recover from a
-poisoned `SESSIONS` lock (unwrap_or_else into_inner), not silently
-no-op as the old `.lock().ok()?` / `if let Ok(..)` forms did. A silent
-no-op in `drop_session` would leak a stale session; a silent no-op in
-`take_session` discards a usable one. We poison the lock (panic while
-holding it, caught) and assert neither helper panics.
+Regression: `take_session`, `drop_session`, and `session_is_scanned`
+must recover from a poisoned `SESSIONS` lock (unwrap_or_else
+into_inner), not silently no-op as the old `.lock().ok()?` / `if let
+Ok(..)` forms did. A silent no-op in `drop_session` would leak a stale
+session; in `take_session` it discards a usable one; in
+`session_is_scanned` it wedges the check at `false` forever, forcing a
+redundant re-scan on every rip request for the rest of the process.
+Poisoning the lock is permanent for the test binary (no reset), so
+every SESSIONS consumer must tolerate it — this test is the one place
+that's pinned. We poison the lock (panic while holding it, caught) and
+assert none of the three helpers panics.
 
 ## Test: `join_rip_thread_called_on_its_own_thread_returns_at_once`
 
