@@ -617,6 +617,17 @@ Red-before-green: before the fix, `handle_resume_fsync_failure` never
 calls `crate::muxer::record_error`, so `MUX_ERRORS` has no entry for
 this staging dir and the assertion fails.
 
+## `loss_abort_dropped_write_raises_operator_card`
+
+OPERATOR-CARD PARITY (loss-abort gates): the §3/§4 loss-abort gates now
+check whether `.aborted-loss` landed, mirroring
+`fsync_dropped_write_raises_operator_card`. A dropped write raises the
+same `record_error` operator card so a persistent write failure can't
+cause silent infinite re-dispatch.
+
+Red-before-green: before the fix the gates called `mark_aborted_on_loss`
+and discarded the result, so a dropped write raised no card.
+
 ## `the_accept_loss_override_raises_the_threshold_for_every_resume_gate`
 
 Catches the mutation that recomputes the abort threshold from raw

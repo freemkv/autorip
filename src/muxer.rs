@@ -1217,11 +1217,13 @@ mod tests {
                 M::Iso => std::fs::write(dir.join("Disc.iso"), b"x").unwrap(),
                 M::Mapfile => std::fs::write(dir.join("Disc.iso.mapfile"), b"x").unwrap(),
                 M::Mkv => std::fs::write(dir.join("Disc.mkv"), b"x").unwrap(),
-                M::AbortedLoss => crate::ripper::staging::write_aborted_loss_marker(
-                    &dir,
-                    "aborted: 0.44s lost at mux, decrypt/codec (threshold 0s)",
-                    1,
-                ),
+                M::AbortedLoss => {
+                    crate::ripper::staging::write_aborted_loss_marker(
+                        &dir,
+                        "aborted: 0.44s lost at mux, decrypt/codec (threshold 0s)",
+                        1,
+                    );
+                }
             }
         }
         let snap = crate::ripper::staging::snapshot_staging_disc(&dir);

@@ -461,6 +461,23 @@ fn handle_resume_fsync_failure(device: &str, staging_dir: &Path, output_desc: &s
     }
 }
 
+// Raise the operator card `handle_resume_fsync_failure` raises for its own
+// dropped terminal-write, on a dropped `.aborted-loss` write — so a
+// persistent write failure can't cause silent infinite re-dispatch.
+fn record_loss_abort_write_failure(device: &str, staging_dir: &Path, reason: &str) {
+    crate::log::syslog(&format!(
+        "Auto-resume loss-abort quarantine FAILED to persist (state.json write error) — {} will keep retrying until the staging mount recovers",
+        staging_dir.display()
+    ));
+    if device != "_mux" {
+        crate::muxer::record_error(
+            &staging_dir.to_string_lossy(),
+            reason,
+            "the loss-abort quarantine could not be written to state.json (staging mount full / unwritable); auto-resume will keep retrying until the mount recovers — free space or fix permissions on the staging share",
+        );
+    }
+}
+
 // RAII exclusion lock for the cold operator-resume mux path: writes
 // .muxing so a concurrent ResumeMode::Wipe can't delete the ISO out from
 // under an in-flight mux. See docs/resume.md for the full data-loss story.
@@ -765,13 +782,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             // Quarantine to a RESUMABLE `.aborted-loss` exactly as the §4 mux-time
             // loss gate below does. WITHOUT this the sweep gate wrote NO terminal or
             // a fresh rip can still deliver), mirroring §4.
-            let _ = staging::mark_aborted_on_loss(
-                &staging_dir,
-                &format!(
-                    "aborted: {scope} loss {:.2}s exceeds threshold {}s (sweep)",
-                    lost_secs, effective_abort
-                ),
+            let loss_reason = format!(
+                "aborted: {scope} loss {:.2}s exceeds threshold {}s (sweep)",
+                lost_secs, effective_abort
             );
+            if !staging::mark_aborted_on_loss_reporting_landed(&staging_dir, &loss_reason) {
+                record_loss_abort_write_failure(device, &staging_dir, &loss_reason);
+            }
             reset_status_after_ripping(
                 device,
                 "error",
@@ -1312,13 +1329,13 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                     done_lost_video_secs, effective_abort
                 ),
             );
-            let _ = staging::mark_aborted_on_loss(
-                &staging_dir,
-                &format!(
-                    "aborted: {:.2}s lost at mux, decrypt/codec (threshold {}s)",
-                    done_lost_video_secs, effective_abort
-                ),
+            let loss_reason = format!(
+                "aborted: {:.2}s lost at mux, decrypt/codec (threshold {}s)",
+                done_lost_video_secs, effective_abort
             );
+            if !staging::mark_aborted_on_loss_reporting_landed(&staging_dir, &loss_reason) {
+                record_loss_abort_write_failure(device, &staging_dir, &loss_reason);
+            }
             reset_status_after_ripping(
                 device,
                 "error",
@@ -2947,7 +2964,7 @@ mod post_mux_loss_reporting_tests {
         // identifier — a prose mention of the symbol in a nearby comment must not
         // satisfy this (the vacuous-substring trap).
         assert!(
-            region.contains("staging::mark_aborted_on_loss("),
+            region.contains("staging::mark_aborted_on_loss_reporting_landed("),
             "the §3 sweep-loss abort must quarantine to a resumable .aborted-loss (mirror §4), \
              else the worker re-dispatches the doomed dir forever"
         );
@@ -3484,6 +3501,32 @@ mod resume_lock_and_fsync_tests {
             "a dropped terminal write on the cold operator-resume path must raise \
              an operator card (MUX_ERRORS) — syslog/device_log alone are not \
              visible on the System page"
+        );
+        crate::muxer::clear_error(&path_key);
+    }
+
+    // Mirrors `fsync_dropped_write_raises_operator_card`: a dropped
+    // `.aborted-loss` write must also raise an operator card, not just
+    // silently retry forever. See docs/resume.md.
+    #[test]
+    fn loss_abort_dropped_write_raises_operator_card() {
+        let d = tmpdir();
+        // Force the state.json write to fail (a dir can't be renamed over).
+        std::fs::create_dir(d.join(staging::STATE_FILE)).unwrap();
+        let path_key = d.to_string_lossy().to_string();
+        crate::muxer::clear_error(&path_key);
+
+        let landed = staging::mark_aborted_on_loss_reporting_landed(&d, "loss exceeds threshold");
+        assert!(!landed, "the forced write failure must report landed=false");
+        record_loss_abort_write_failure("sg0", &d, "loss exceeds threshold");
+
+        assert!(
+            crate::muxer::MUX_ERRORS
+                .lock()
+                .unwrap()
+                .contains_key(&path_key),
+            "a dropped .aborted-loss write on a real device must raise an \
+             operator card (MUX_ERRORS)"
         );
         crate::muxer::clear_error(&path_key);
     }
