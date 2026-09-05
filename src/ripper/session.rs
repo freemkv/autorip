@@ -496,10 +496,13 @@ pub(super) fn expected_volume_id(device: &str) -> Option<String> {
 // `handle_rip_request` skip a redundant re-scan (which clears the TMDB
 // poster/title). See docs/ripper-session-notes.md — session_is_scanned.
 pub(super) fn session_is_scanned(device: &str) -> bool {
+    // Recover-and-proceed on poison (module convention): `.ok()` alone would
+    // abandon this check forever after any panic elsewhere under SESSIONS.
     SESSIONS
         .lock()
-        .ok()
-        .and_then(|s| s.get(device).map(|sess| sess.scanned))
+        .unwrap_or_else(|e| e.into_inner())
+        .get(device)
+        .map(|sess| sess.scanned)
         .unwrap_or(false)
 }
 
@@ -980,6 +983,12 @@ mod rollback_tests {
             "take_session on poisoned lock returns None for an absent device, not panic"
         );
         drop_session(&dev); // must not panic
+        // session_is_scanned must also recover, not abandon (the old `.ok()`
+        // form would wedge it at `false` forever for the rest of the binary).
+        assert!(
+            !session_is_scanned(&dev),
+            "session_is_scanned on poisoned lock must recover and answer, not panic"
+        );
     }
 
     // Catches the mutation deleting join_rip_thread's self-join branch: it
