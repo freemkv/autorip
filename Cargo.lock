@@ -54,9 +54,9 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bitflags"
-version = "2.13.1"
+version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "block-buffer"
@@ -90,9 +90,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.4.5"
+version = "1.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
+checksum = "a3eb0f42d6c360dc3f8a821f6bf2fdea7f72bfd36b3076eb0e6d1e9e0752fff4"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -192,9 +192,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.1"
+version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
 dependencies = [
  "cfg-if",
 ]
@@ -376,8 +376,8 @@ dependencies = [
 
 [[package]]
 name = "freemkv-engine"
-version = "1.7.0"
-source = "git+https://github.com/freemkv/freemkv-engine?tag=v1.7.0#ce125b72fec9792523c480c319f997dcf61a1e33"
+version = "1.7.1"
+source = "git+https://github.com/freemkv/freemkv-engine?tag=v1.7.1#ea31dcef4a3b6b97031ed8cad7f25cd73ef13f10"
 dependencies = [
  "anyhow",
  "freemkv-keysources",
@@ -389,16 +389,16 @@ dependencies = [
 
 [[package]]
 name = "freemkv-i18n"
-version = "1.7.0"
-source = "git+https://github.com/freemkv/freemkv-i18n?tag=v1.7.0#b1bac69fcb8ac7b374f6710e10ecf58c97fc0486"
+version = "1.7.1"
+source = "git+https://github.com/freemkv/freemkv-i18n?tag=v1.7.1#7291014e306d2446494f5263854af7abefd46407"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "freemkv-keysources"
-version = "1.7.0"
-source = "git+https://github.com/freemkv/freemkv-keysources?tag=v1.7.0#423f60b8c0699fb53309fb1da0bdd221b1db619f"
+version = "1.7.1"
+source = "git+https://github.com/freemkv/freemkv-keysources?tag=v1.7.1#aa2193e88361d001e822f881b482119a39171f44"
 dependencies = [
  "base64",
  "flate2",
@@ -411,8 +411,8 @@ dependencies = [
 
 [[package]]
 name = "freemkv-unlock"
-version = "1.7.0"
-source = "git+https://github.com/freemkv/freemkv-unlock?tag=v1.7.0#676a55c234ec26456f77de97f0ee8c4a37c513ba"
+version = "1.7.1"
+source = "git+https://github.com/freemkv/freemkv-unlock?tag=v1.7.1#f421a2a3348afd9e8b960950d565c18e05ccdbbe"
 dependencies = [
  "aes",
  "base64",
@@ -489,9 +489,9 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.14"
+version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
+checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
 ]
@@ -648,8 +648,8 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfreemkv"
-version = "1.7.0"
-source = "git+https://github.com/freemkv/libfreemkv?tag=v1.7.0#0954b8e4d8e45f79fbe2c6b76a62a9bd10793d19"
+version = "1.7.1"
+source = "git+https://github.com/freemkv/libfreemkv?tag=v1.7.1#f5427dd37958d992f5412a6c3faab85559ff2617"
 dependencies = [
  "aes",
  "base64",
@@ -941,9 +941,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
 dependencies = [
  "log",
  "once_cell",
@@ -1068,9 +1068,9 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "smallvec"
-version = "1.16.0"
+version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
+checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 
 [[package]]
 name = "stable_deref_trait"
@@ -1330,9 +1330,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "3.4.0"
+version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "972d7902c8735f2695410b8aed7df6ed12a47394aa1c8d7af49f0497b731a94d"
+checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
 dependencies = [
  "base64",
  "cookie_store",
@@ -1350,9 +1350,9 @@ dependencies = [
 
 [[package]]
 name = "ureq-proto"
-version = "0.6.1"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da5f78b09e6941e1a0f2e30e695e4b120377b54d5e0aec11b594bb57b3971613"
+checksum = "5b0809a01d1ca5a51ca70db32bb2a19157582a526505ef3c19e3b343a59aa5ad"
 dependencies = [
  "base64",
  "http",
