@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.1] — UNRELEASED
+
+### Fixed
+
+- LibreDrive (LD) unlocker again matches drives that report a specific `product_id`, fixing an LD-unlock regression from 1.7.0 (observed on LG BU40N / MK firmware). Confirmed on hardware: drive init reports `unlocker="LD" ok=true`.
+
 ## [1.7.0] — 2026-09-02
 
 ### Fixed
