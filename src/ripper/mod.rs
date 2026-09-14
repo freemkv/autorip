@@ -332,15 +332,17 @@ fn retry_online_keys_on_outage(
     cfg: &Config,
     drive: &mut libfreemkv::Drive,
     mut disc: libfreemkv::Disc,
+    decode_reach: Option<crate::keysource::ServiceReachability>,
 ) -> (
     libfreemkv::Disc,
     crate::keysource::KeyOutcome,
     Option<crate::keysource::ServiceReachability>,
 ) {
     use crate::keysource::KeyOutcome;
-    // ONE probe to classify. Reachable → genuine no-key; stop immediately and
-    // preserve the pre-fix behaviour.
-    let reach = crate::keysource::probe_online_reachability(cfg);
+    // Classify from the REAL decode's HTTP outcome — no second empty probe (its
+    // 0-byte POST to the POST-only `/decode` logged a spurious `404` after every
+    // real no-key). Probe only when the decode made no HTTP answer (`None`).
+    let reach = decode_reach.unwrap_or_else(|| crate::keysource::probe_online_reachability(cfg));
     if !reach.is_transient() {
         return (disc, KeyOutcome::NoKey, None);
     }
@@ -366,13 +368,19 @@ fn retry_online_keys_on_outage(
         // (also re-samples the disc). A recovered service resolves here.
         let (d, outcome) = resolve_keys_from_drive(cfg, drive, disc);
         disc = d;
+        // Consume THIS retry's decode outcome immediately (before the next loop
+        // overwrites it), so the re-classify below reads the real POST rather
+        // than a fresh empty probe.
+        let retry_reach = crate::keysource::take_online_decode_reachability();
         if outcome == KeyOutcome::Resolved {
             crate::log::device_log(device, "Key service recovered — keys resolved on retry.");
             return (disc, KeyOutcome::Resolved, None);
         }
-        // Still no key — re-classify: is the service back (genuine no-key now)
-        // or still down (keep the transient, retryable state)?
-        last_reach = crate::keysource::probe_online_reachability(cfg);
+        // Still no key — re-classify from the retry's decode outcome: is the
+        // service back (genuine no-key now) or still down (keep the transient,
+        // retryable state)? Probe only if the retry made no HTTP answer.
+        last_reach =
+            retry_reach.unwrap_or_else(|| crate::keysource::probe_online_reachability(cfg));
         if !last_reach.is_transient() {
             crate::log::device_log(
                 device,
@@ -1004,6 +1012,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
         let resolve_t0 = std::time::Instant::now();
         tracing::info!(device = %device, "resolve_keys: begin");
         let (disc, outcome) = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
+        // Capture the real decode's reachability now, before anything else can
+        // overwrite the per-thread slot — it classifies a no-key without a
+        // second empty probe.
+        let decode_reach = crate::keysource::take_online_decode_reachability();
         tracing::info!(device = %device, elapsed_ms = resolve_t0.elapsed().as_millis() as u64, "resolve_keys: end");
         // Down-vs-no-key: bounded-retry a transient online outage rather than
         // reporting a permanent "no keys found". `key_reach` is `Some` only
@@ -1014,7 +1026,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             && outcome == crate::keysource::KeyOutcome::NoKey
             && no_keys
         {
-            retry_online_keys_on_outage(device, &cfg_read, &mut drive, disc)
+            retry_online_keys_on_outage(device, &cfg_read, &mut drive, disc, decode_reach)
         } else {
             (disc, outcome, None)
         }
@@ -1957,6 +1969,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         },
     );
 
+    // Reachability of the fresh-scan decode POST, set below when this rip
+    // resolves keys just now. `None` for a reused session — the outage retry
+    // then falls back to a probe, as before.
+    let mut resume_decode_reach: Option<crate::keysource::ServiceReachability> = None;
     // Take the existing session, or open fresh
     let mut session = match take_session(device) {
         Some(s) if s.scanned => {
@@ -2031,6 +2047,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             } else {
                 scan_wd.enter_resolve();
                 let (disc, _key_outcome) = resolve_keys_from_drive(&cfg_read, &mut drive, disc);
+                // Capture the real decode's reachability from this fresh resolve
+                // so the outage retry below classifies a no-key without a second
+                // empty probe.
+                resume_decode_reach = crate::keysource::take_online_decode_reachability();
                 disc
             };
             drop(scan_wd);
@@ -2182,8 +2202,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         disc.encrypted,
         matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None),
     ) {
-        let (rdisc, _outcome, reach) =
-            retry_online_keys_on_outage(device, &cfg_read, &mut session.drive, disc);
+        let (rdisc, _outcome, reach) = retry_online_keys_on_outage(
+            device,
+            &cfg_read,
+            &mut session.drive,
+            disc,
+            resume_decode_reach,
+        );
         disc = rdisc;
         key_outage = reach;
     }

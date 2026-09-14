@@ -475,6 +475,34 @@ pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
     classify_reachability(outcome)
 }
 
+/// The reachability verdict from the most recent online `/decode` POST on THIS
+/// thread — the REAL decode's HTTP outcome — or `None` when no decode reached
+/// the network since the last read (online source not attempted, or a path that
+/// never POSTed). The redundant-probe eliminator: the ripper classifies
+/// genuine-no-key vs transient from THIS verdict instead of a second empty POST
+/// to the POST-only `/decode` (which logged a spurious `404` after every real
+/// no-key). Reading CONSUMES the value; the call site probes only on `None`.
+/// See [`reachability_from_decode`] for the mapping.
+pub fn take_online_decode_reachability() -> Option<ServiceReachability> {
+    freemkv_keysources::take_last_decode_reachability().map(reachability_from_decode)
+}
+
+/// Map a keysources [`DecodeReachability`](freemkv_keysources::DecodeReachability)
+/// — the raw outcome of the online source's real `/decode` POST — to a
+/// [`ServiceReachability`] verdict, routing through the SAME
+/// [`classify_reachability`] the probe uses (5xx/429/transport → transient;
+/// 200/404/422 → up/genuine-no-key). Pure, so the down-vs-no-key decision the
+/// ripper now makes from the real decode is unit-tested without a network.
+fn reachability_from_decode(
+    outcome: freemkv_keysources::DecodeReachability,
+) -> ServiceReachability {
+    let probe = match outcome {
+        freemkv_keysources::DecodeReachability::Status(code) => ProbeOutcome::Status(code),
+        freemkv_keysources::DecodeReachability::Transport => ProbeOutcome::Transport,
+    };
+    classify_reachability(probe)
+}
+
 /// How a disc's key-resolution inputs are obtained. Decouples [`resolve_keys`]
 /// from WHERE the disc lives — a live drive or a staged ISO — so the resolution
 /// logic is written once. See [`DriveAccess`] and [`IsoAccess`].
@@ -1370,6 +1398,43 @@ mod tests {
         assert_eq!(classify_reachability(Status(422)), ServiceReachability::Up);
         assert_eq!(classify_reachability(Status(200)), ServiceReachability::Up);
         assert_eq!(classify_reachability(Status(405)), ServiceReachability::Up);
+    }
+
+    // v1.7.2: the ripper classifies a no-key from the REAL decode's HTTP outcome
+    // instead of a second empty probe. 422/404 → UP (genuine no-key, no extra
+    // POST); 5xx/429 → transient; transport → DOWN. Tests that outcome→verdict map.
+    #[test]
+    fn decode_outcome_drives_the_down_vs_no_key_verdict() {
+        use freemkv_keysources::DecodeReachability::{Status, Transport};
+        // The bug's exact case: 422 "licensed but unresolved" → genuine no-key,
+        // classified from the decode itself with NO redundant probe.
+        assert_eq!(
+            reachability_from_decode(Status(422)),
+            ServiceReachability::Up
+        );
+        assert_eq!(
+            reachability_from_decode(Status(404)),
+            ServiceReachability::Up
+        );
+        assert_eq!(
+            reachability_from_decode(Status(200)),
+            ServiceReachability::Up
+        );
+        // A transport failure is still a transient outage (retryable), never a
+        // genuine no-key — the outage-retry loop must keep working.
+        assert_eq!(
+            reachability_from_decode(Transport),
+            ServiceReachability::Down
+        );
+        // 5xx / 429 remain transient exactly as before.
+        assert_eq!(
+            reachability_from_decode(Status(503)),
+            ServiceReachability::Down
+        );
+        assert_eq!(
+            reachability_from_decode(Status(429)),
+            ServiceReachability::RateLimited
+        );
     }
 
     /// Only `Down` and `RateLimited` are transient/retryable; `Up` is terminal
