@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.2] — UNRELEASED
+
+### Fixed
+
+- Online key service: after a real `/decode` POST returns a definitive answer for a disc (e.g. HTTP 422 "licensed but unresolved", or 404), autorip no longer fires a second, redundant reachability probe. That probe was an empty-body POST against the POST-only `/decode` endpoint, which the decode server logged as `reject: malformed JSON body … 404` after every genuine no-key. The ripper now classifies genuine-no-key vs transient outage directly from the decode's own HTTP outcome (recorded by the online source): a `422`/`404`/`200` answer is a genuine no-key decided immediately with no extra POST, while `5xx`/`429`/transport failures still classify as a transient outage and drive the existing bounded outage-retry. A probe is used only when no decode HTTP answer exists (the online source was not attempted, or a path that never POSTed).
+
 ## [1.7.1] — UNRELEASED
 
 ### Fixed
