@@ -486,7 +486,8 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     const RESCAN_INTERVAL_SECS: u64 = 30;
     // Startup staging scan: quarantine terminally-failed dirs, preserve
     // resumable ones. Resume is recomputed on demand via find_resumable_for_disc.
-    if let Ok(c) = cfg.read() {
+    {
+        let c = cfg.read().unwrap_or_else(|e| e.into_inner());
         let hints = staging::resume_or_quarantine_staging(&c.staging_dir);
         tracing::info!(
             staging_dir = %c.staging_dir,
@@ -802,12 +803,11 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         // handlers' rollback instead.
                         rollback_failed_spawn(&device, claim_gen);
                     }
-                } else if !is_new_insert
-                    && !is_busy(&device)
-                    && let Ok(mut s) = STATE.lock()
-                    && let Some(rs) = s.get_mut(&device)
-                {
-                    rs.disc_present = true;
+                } else if !is_new_insert && !is_busy(&device) {
+                    let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(rs) = s.get_mut(&device) {
+                        rs.disc_present = true;
+                    }
                 }
             }
 

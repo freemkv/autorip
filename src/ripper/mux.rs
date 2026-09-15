@@ -596,12 +596,8 @@ impl libfreemkv::MuxEvents for AutoripMuxEvents {
         // Reset the throttles so the first progress tick lands promptly after
         // the sink opens (matches the pre-migration `start`-relative cadence).
         let now = Instant::now();
-        if let Ok(mut g) = self.last_update.lock() {
-            *g = now;
-        }
-        if let Ok(mut g) = self.last_log.lock() {
-            *g = now;
-        }
+        *self.last_update.lock().unwrap_or_else(|e| e.into_inner()) = now;
+        *self.last_log.lock().unwrap_or_else(|e| e.into_inner()) = now;
     }
 
     fn on_read_progress(&self, bytes_read: u64, _bytes_total: u64) {

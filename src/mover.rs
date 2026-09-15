@@ -99,9 +99,7 @@ pub static MOVE_ERRORS: once_cell::sync::Lazy<Mutex<BTreeMap<String, MoverError>
     once_cell::sync::Lazy::new(|| Mutex::new(BTreeMap::new()));
 
 fn record_error(path: &str, reason: &str, hint: &str) {
-    let Ok(mut m) = MOVE_ERRORS.lock() else {
-        return;
-    };
+    let mut m = MOVE_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
     let same_reason = m.get(path).map(|e| e.reason == reason).unwrap_or(false);
     m.insert(
         path.to_string(),
@@ -117,9 +115,10 @@ fn record_error(path: &str, reason: &str, hint: &str) {
 }
 
 fn clear_error(path: &str) {
-    if let Ok(mut m) = MOVE_ERRORS.lock() {
-        m.remove(path);
-    }
+    MOVE_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
 }
 
 // Drop any MOVE_ERRORS row keyed by this DESTINATION path, on every exit
@@ -151,9 +150,10 @@ pub fn clear_move_error(path: &str) {
 /// Operator-initiated clear of ALL move errors (the System-tab "Clear all").
 /// Same self-healing semantics: still-real blocks re-record on the next tick.
 pub fn clear_all_move_errors() {
-    if let Ok(mut m) = MOVE_ERRORS.lock() {
-        m.clear();
-    }
+    MOVE_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Outcome of moving a single file. Distinguishes between an active move
@@ -1017,9 +1017,8 @@ fn check_and_move(cfg: &Config) {
                 } else {
                     String::new()
                 };
-                if let Ok(mut ms) = MOVE_STATE.lock()
-                    && let Some(entry) = ms.get_mut(i)
-                {
+                let mut ms = MOVE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = ms.get_mut(i) {
                     entry.progress_pct = pct;
                     entry.progress_gb = gb;
                     entry.total_gb = total_gb;
@@ -1086,13 +1085,14 @@ fn check_and_move(cfg: &Config) {
             if matches!(
                 outcome,
                 MoveOutcome::Moved | MoveOutcome::MovedDirty | MoveOutcome::Skipped
-            ) && let Ok(mut ms) = MOVE_STATE.lock()
-                && let Some(entry) = ms.get_mut(i)
-            {
-                entry.progress_pct = 100;
-                entry.progress_gb = entry.total_gb;
-                entry.speed_mbs = 0.0;
-                entry.eta = String::new();
+            ) {
+                let mut ms = MOVE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = ms.get_mut(i) {
+                    entry.progress_pct = 100;
+                    entry.progress_gb = entry.total_gb;
+                    entry.speed_mbs = 0.0;
+                    entry.eta = String::new();
+                }
             }
             match outcome {
                 MoveOutcome::Collision => {}
