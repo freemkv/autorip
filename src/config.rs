@@ -58,12 +58,20 @@ impl WebhookEntry {
         } else {
             let obj = v.as_object()?;
             let url = obj.get("url").and_then(|u| u.as_str())?.to_string();
-            let flag = |k: &str| obj.get(k).and_then(|b| b.as_bool()).unwrap_or(true);
+            // Distinguish ABSENT (→ default true) from PRESENT-BUT-WRONG-TYPE: a
+            // non-bool flag is malformed config, so drop the whole entry (like a
+            // malformed URL) rather than silently coerce it to `true`.
+            let flag = |k: &str| -> Option<bool> {
+                match obj.get(k) {
+                    None => Some(true),
+                    Some(b) => b.as_bool(),
+                }
+            };
             Self {
                 url,
-                post_rip: flag("post_rip"),
-                post_mux: flag("post_mux"),
-                post_move: flag("post_move"),
+                post_rip: flag("post_rip")?,
+                post_mux: flag("post_mux")?,
+                post_move: flag("post_move")?,
             }
         };
         (!entry.url.trim().is_empty()).then_some(entry)
@@ -625,9 +633,9 @@ fn load_saved(mut cfg: Config) -> Config {
         }
     }
     if let Some(arr) = saved.get("webhook_urls").and_then(|v| v.as_array()) {
-        // Accept both the legacy bare-string form and the modern
-        // {url, post_rip, post_mux, post_move} object form; a bare string (or an object
-        // missing a flag) fires on both events, preserving pre-1.6.7 behaviour.
+        // Accept the legacy bare-string form and the modern {url, post_rip,
+        // post_mux, post_move} object; a bare string (or an object missing a flag)
+        // fires on ALL THREE stages (rip, mux, move), preserving prior behaviour.
         cfg.webhook_urls = arr.iter().filter_map(WebhookEntry::from_json).collect();
     }
     cfg

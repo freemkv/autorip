@@ -233,10 +233,7 @@ fn undismiss(path: &str) {
 fn prune_stale_errors() {
     let stale: Vec<String> = {
         let Ok(m) = MUX_ERRORS.lock() else { return };
-        m.keys()
-            .filter(|p| !Path::new(p).exists())
-            .cloned()
-            .collect()
+        m.keys().filter(|p| definitely_absent(p)).cloned().collect()
     };
     if stale.is_empty() {
         return;
@@ -247,8 +244,20 @@ fn prune_stale_errors() {
         }
     }
     if let Ok(mut d) = MUX_DISMISSED.lock() {
-        d.retain(|p| Path::new(p).exists());
+        d.retain(|p| !definitely_absent(p));
     }
+}
+
+/// True only when the staging dir is DEFINITIVELY gone (stat returned NotFound).
+/// `Path::exists()` collapses every stat error — EACCES, EIO, ESTALE on an NFS
+/// blip — into `false`, which would evict a still-live error card the moment the
+/// mount hiccups. Prune only on a real NotFound; treat any other error as
+/// "still there, unknown" and keep the card.
+fn definitely_absent(path: &str) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 /// Worker entry point — spawn from `main` alongside the mover thread.

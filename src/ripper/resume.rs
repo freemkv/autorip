@@ -97,9 +97,9 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
         // `.muxing` mux worker holds it) — the live worker owns the
         // transition; treat as NotEligible and leave it alone.
         ResumeAction::InProgress => return ResumeClass::NotEligible,
-        // Both ResumePreserved and ResumeAbortedLoss carry an intact ISO +
-        // mapfile and must be re-checked for `Remux` eligibility against the
-        // the abort write site, eventually promotes it to terminal `.failed`).
+        // Both ResumePreserved and ResumeAbortedLoss carry an intact ISO + mapfile
+        // and must be re-checked for `Remux` eligibility against the current loss
+        // threshold (a repeated over-threshold result eventually goes `.failed`).
         ResumeAction::ResumePreserved { .. } | ResumeAction::ResumeAbortedLoss { .. } => {}
     }
     let (has_iso, has_mapfile) = match &hint.action {
@@ -153,7 +153,7 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
 
     // ISO-size validation. The `bytes_pending==0` and coverage gates below both
     // trust the mapfile's `bytes_total`. If that total is short of the real
-    // truncated/incomplete — reject and re-sweep fresh.
+    // on-disk ISO size, the image is truncated/incomplete — reject and re-sweep fresh.
     match std::fs::metadata(&iso_path) {
         Ok(meta) if meta.len() < stats.bytes_total => {
             tracing::warn!(
@@ -556,9 +556,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         return;
     };
 
-    // Archive the prior session's per-device log so the live log shows
-    // only this resumed-mux operation. Mirrors what scan_disc and
-    // prior scan's log, making errors hard to correlate.
+    // Archive the prior session's per-device log so the live log shows only this
+    // resumed-mux operation (as scan_disc / fresh-rip do); otherwise it interleaves
+    // with the prior scan's log, making errors hard to correlate.
     crate::log::archive_device_log(device);
 
     let cfg_read = match cfg.read() {
@@ -589,9 +589,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     }
 
     // The deliverable plan the rip recorded in `state.json` (movie = 1 output;
-    // TV = one per episode title). `is_fanout` (len > 1) is the ONLY thing that
-    // unchanged.
-    let plan_outputs: Vec<staging::Output> = staging::read_state(&staging_dir)
+    // TV = one per episode). Use the warn-on-corrupt reader: a corrupt state.json
+    // would otherwise read as an empty plan and mis-deliver a TV fanout as a movie.
+    let plan_outputs: Vec<staging::Output> = staging::read_state_or_warn_corrupt(&staging_dir)
         .map(|s| s.outputs)
         .unwrap_or_default();
     let is_fanout = plan_outputs.len() > 1;
@@ -607,14 +607,14 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // 1. Delete the partial MKV/m2ts if present.
     delete_partial_output(&staging_dir, &display_name);
 
-    // Acquire the `.muxing` exclusion lock for the duration of this mux. On the
-    // cold operator-resume path the staging dir otherwise carries only the ISO
-    // also clear it.
+    // Acquire the `.muxing` exclusion lock for this mux. On the cold
+    // operator-resume path the dir carries only the ISO and no live worker, so
+    // this guard serializes the mux; its Drop clears the marker when done.
     let _muxing_guard = ResumeMuxingGuard::acquire(device, &staging_dir);
 
     // 2. Open + scan the ISO via the library's `scan_iso` entry point (opens a
-    //    FileSectorSource, reads capacity, runs the structure scan). A
-    //    own handle for ciphertext sampling.
+    //    FileSectorSource, reads capacity, runs the structure scan). A later
+    //    key-fetch closure opens its own handle for ciphertext sampling.
     let struct_opts = crate::keysource::iso_scan_opts();
     let disc = match libfreemkv::scan_iso(&iso_path, struct_opts) {
         Ok((d, _reader)) => d,
@@ -626,9 +626,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
                     super::format_lib_error("reading the saved disc image", &e)
                 ),
             );
-            // The live-device dispatch (`handle_rip_request` → `scan_disc`)
-            // already moved this device to status="scanning". Bailing here
-            // device this is a harmless no-op — nothing gates on it.)
+            // scan_disc already moved this device to status="scanning"; bailing
+            // without the reset below would strand that row. For a later
+            // re-dispatch the reset is a harmless no-op — nothing gates on it.
             super::update_state(
                 device,
                 super::RipState {
@@ -810,9 +810,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let keys = disc.decrypt_keys();
     let batch = libfreemkv::disc::detect_max_batch_sectors(DEFAULT_BATCH_PROBE_PATH);
 
-    // Keyless-capture deferral: the ISO was swept raw (no keys needed),
-    // but the MUX needs decryption keys. If this encrypted disc still has
-    // half of the no-keys capture flow started in `rip_disc`.
+    // Keyless-capture deferral: the ISO was swept raw (no keys), but the MUX
+    // needs keys. If this encrypted disc still has none, resume the second half
+    // of the no-keys capture flow started in `rip_disc`.
     if disc.encrypted
         && matches!(keys, libfreemkv::decrypt::DecryptKeys::None)
         && !super::output_is_iso_image(&cfg_read.output_format)
@@ -984,12 +984,14 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     };
 
     // TMDB metadata source of truth: the DURABLE on-disk `.ripped` marker, NOT
-    // in-memory STATE. STATE is populated by the fresh-rip scan and is EMPTY on a
-    // artifact, not a value relayed through ephemeral in-memory state.)
+    // in-memory STATE. STATE is populated by the fresh-rip scan and is EMPTY on
+    // a cold operator-resume, so the marker is the durable artifact we read
+    // from, not a value relayed through ephemeral in-memory state.
     let state_tmdb = super::STATE
         .lock()
-        .ok()
-        .and_then(|s| s.get(device).cloned());
+        .unwrap_or_else(|e| e.into_inner())
+        .get(device)
+        .cloned();
     let marker_tmdb = crate::muxer::read_marker(&staging_dir).ok();
     let state_codecs = state_tmdb
         .as_ref()
@@ -1023,7 +1025,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
 
     // Title-confidence gate — routes through the SAME `title_is_confident`
     // (mod.rs) the fresh-rip completion path uses (the Done/Review hand-off is
-    // concept, so confidence is purely the match check.
+    // the same concept), so confidence is purely the match check.
     let disc_label = disc
         .meta_title
         .as_deref()
@@ -1046,7 +1048,8 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     );
 
     // ISO output: deliver the whole-disc image, don't re-mux a title. Mirrors
-    // validates + moves `.iso` and the prune below retains it for ISO output.
+    // the fresh-rip ISO terminal: the mover validates + moves `.iso`, and the
+    // prune below retains it for ISO output.
     if super::output_is_iso_image(&output_format) {
         if !staging::durability_gate_passes(false, || staging::fsync_output_file(&iso_path)) {
             let quarantined = handle_resume_fsync_failure(device, &staging_dir, "ISO image output");
@@ -1114,6 +1117,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         }
         staging::write_completed_marker(&staging_dir);
         staging::clear_restart_count(&staging_dir);
+        if accept_loss {
+            // Consume the one-shot override on this success path too (like the MKV
+            // hand-off below): the ISO reached the operator, so don't let a stale
+            // `.accept-loss` raise the threshold on a future re-run.
+            staging::clear_accept_loss_marker(&staging_dir);
+        }
         let iso_name = iso_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1285,8 +1294,8 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             ui_failure_reason,
         );
         // Record the structural-finalize distinction on the (just-reset) `_mux`
-        // state AFTER the reset wipes it, mirroring `defer_status_after_ripping`
-        // and re-surface — so the bit is set even then.
+        // state AFTER the reset wipes it (mirroring `defer_status_after_ripping`):
+        // a later tick may re-surface the row, so set the bit here to survive it.
         if is_finalize {
             super::update_state_with(device, |s| s.failure_finalize = true);
         }
@@ -1294,7 +1303,8 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     }
 
     // A loss is a loss. Mux-time (decrypt/codec) loss is missing in-title data
-    // sweep §3 gate can only see mapfile-Unreadable loss, not decrypt/codec loss.
+    // the sweep never saw: the sweep §3 gate can only see mapfile-Unreadable
+    // loss, not decrypt/codec loss.
     let demux_lost_secs = mux_outcome.lost_video_secs;
 
     // Operator-facing loss for a resume = sweep loss + demux loss. A resume can
@@ -1380,6 +1390,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     }
     // TV fan-out: the primary episode is muxed + durable above. Now mux the
     // REMAINING episodes from the same ISO, one file each, reusing the disc's
+    // already-loaded structure. The primary episode is seeded first (muxed +
     // durable above) and becomes the hand-off `outputs[]`. No-op for movies.
     let mut delivered: Vec<staging::Output> = plan_outputs.first().cloned().into_iter().collect();
     // Network output streams to a SINGLE sink — it can't take N distinct episode
@@ -1494,9 +1505,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     }
 
     let marker_name = staging::handoff_label(title_confident);
-    // One `state.json` hand-off transition — the dir-fsync inside it is the
-    // crash barrier (the durable hand-off is observed before the later
-    // `state: Ripped` the sweep recorded (a resume must not drop TV routing).
+    // One `state.json` hand-off transition — the dir-fsync inside it is the crash
+    // barrier: the durable hand-off is observed before the later transition
+    // overwrites the sweep's `Ripped` state, so a resume must not drop TV routing.
     let mkv_leaf = filename.clone();
     if let Err(e) = staging::mark_handoff(&staging_dir, title_confident, |s| {
         s.title = display_name.clone();
@@ -1558,8 +1569,8 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     }
 
     // Prune the disc-sized intermediate ISO + its mapfile unless keep_iso is
-    // set, mirroring rip_disc's inline terminal path. The mover normally frees
-    // completion routes; both now share `prune_intermediate_iso`.
+    // set, mirroring rip_disc's inline terminal path. The inline resume terminal
+    // and the fresh-rip completion routes both now share `prune_intermediate_iso`.
     super::prune_intermediate_iso(
         device,
         &iso_path,
@@ -1577,8 +1588,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let done_codecs = resolve_done_codecs(
         super::STATE
             .lock()
-            .ok()
-            .and_then(|s| s.get(device).map(|rs| rs.codecs.clone())),
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .map(|rs| rs.codecs.clone()),
         state_codecs,
     );
 
@@ -1752,10 +1764,11 @@ pub(crate) fn remux_from_ripped_marker(
             );
         }
     }
-    // Read the synthetic `_mux` state BEFORE removing the entry. On success
-    // we carry the mux-derived display fields (codecs filled by the frame
-    // failure leaves it "error"/"failed".
-    if let Ok(mut s) = super::STATE.lock() {
+    // Read the synthetic `_mux` state BEFORE removing the entry (success carries
+    // the mux-derived display fields; failure applies the failure fields). Recover
+    // on poison — a guarded `.ok()` would leak the ghost `_mux` entry and skip cleanup.
+    let mut s = super::STATE.lock().unwrap_or_else(|e| e.into_inner());
+    {
         if let Some(rs) = s.get(mux_device) {
             if success {
                 outcome.codecs = rs.codecs.clone();
@@ -3589,9 +3602,9 @@ mod accept_loss_override_tests {
         );
     }
 
-    // Catches the mutation that moves .accept-loss consumption back to
-    // resume_remux's ENTRY: it must be read at entry but CLEARED only at
-    // the hand-off, once the override is spent. See docs/resume.md.
+    // `.accept-loss` is READ at entry but CLEARED only at a hand-off. Both
+    // delivery paths (raw-ISO branch and MKV mux) consume it, so there may be >1
+    // clear site — but every one must sit after delivery, never at entry.
     #[test]
     fn the_accept_loss_marker_is_consumed_only_once_the_rip_is_delivered() {
         let src = crate::util::source_lf(include_str!("resume.rs"));
@@ -3607,6 +3620,9 @@ mod accept_loss_override_tests {
         let read_at = code
             .find("staging::accept_loss_requested(")
             .expect("resume_remux must read the marker");
+        // The FIRST completion-marker write (the raw-ISO branch) is the earliest
+        // delivery point; every clear must sit at or after a delivery, so all of
+        // them come after this.
         let delivered_at = code
             .find("staging::write_completed_marker(")
             .expect("resume_remux must write the completion marker");
@@ -3614,13 +3630,12 @@ mod accept_loss_override_tests {
             .match_indices("staging::clear_accept_loss_marker(")
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(
-            cleared.len(),
-            1,
-            "the override must be consumed in exactly one place"
+        assert!(
+            !cleared.is_empty(),
+            "the override must be consumed on delivery, in at least one place"
         );
         assert!(
-            cleared[0] > read_at && cleared[0] > delivered_at,
+            cleared.iter().all(|&c| c > read_at && c > delivered_at),
             "`.accept-loss` must be cleared only AFTER the rip has been \
              delivered (after write_completed_marker), never at entry — an \
              unrelated transient failure must not spend the operator's consent"

@@ -419,22 +419,26 @@ fn device_key(path: &str) -> String {
 // enumeration (hot-unplug); deferred while its worker is still live.
 // See docs/ripper-mod-notes.md — forget_removed_device.
 fn forget_removed_device(device: &str) -> bool {
-    if is_busy(device) || rip_thread_running(device) {
-        tracing::warn!(
-            device = %device,
-            "drive vanished from enumeration while a worker still holds it — \
-             deferring teardown to preserve the double-rip guard"
-        );
-        return false;
+    // TOCTOU fix: re-check liveness and drop the STATE row in ONE critical
+    // section (the old split check→remove let a rip dispatched in the gap lose its
+    // live row). `rip_thread_running` locks RIP_THREADS not STATE, so this is safe.
+    {
+        let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let status_busy = s
+            .get(device)
+            .map(|r| r.status == "scanning" || r.status == "ripping")
+            .unwrap_or(false);
+        if status_busy || rip_thread_running(device) {
+            tracing::warn!(
+                device = %device,
+                "drive vanished from enumeration while a worker still holds it — \
+                 deferring teardown to preserve the double-rip guard"
+            );
+            return false;
+        }
+        s.remove(device);
     }
     drop_session(device);
-    // Recover-and-proceed on poison, like every other STATE/HALTS/RIP_THREADS
-    // site: `if let Ok(..)` used to silently skip the removal on a poisoned
-    // lock, leaving a phantom drive row for the container's lifetime.
-    STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(device);
     // No eject/scan boundary fires here, so the device's in-memory log
     // ring would otherwise linger for the container's lifetime. Evict it
     // like archive_device_log does on the planned-eject path.
@@ -614,6 +618,20 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         p
                     }
                     Err(e) => {
+                        // Distinguish a firmware wedge from a plain hot-unplug: a
+                        // drive gone from the fresh enumeration is just removed, not
+                        // unresponsive — skip the tile, let the next rescan clean up.
+                        let still_enumerated =
+                            libfreemkv::list_drives().iter().any(|d| d.path == *path);
+                        if !still_enumerated {
+                            tracing::debug!(
+                                device = %device,
+                                path = %path,
+                                error = %e,
+                                "drive_has_disc failed and drive is absent from enumeration — hot-unplug, not a firmware wedge; deferring to rescan"
+                            );
+                            continue;
+                        }
                         if warned_probe_fail.insert(device.clone()) {
                             tracing::warn!(
                                 device = %device,

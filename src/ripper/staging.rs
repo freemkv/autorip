@@ -278,7 +278,7 @@ pub fn read_state(staging_disc_dir: &Path) -> Option<DiscState> {
 // Like `read_state`, but logs loudly if the file exists but fails to parse,
 // so read-modify-write callers' `unwrap_or_else(DiscState::new)` fallback
 // doesn't silently discard accumulated data on external corruption.
-fn read_state_or_warn_corrupt(staging_disc_dir: &Path) -> Option<DiscState> {
+pub(crate) fn read_state_or_warn_corrupt(staging_disc_dir: &Path) -> Option<DiscState> {
     let p = state_path(staging_disc_dir);
     let Ok(bytes) = std::fs::read(&p) else {
         return None; // absent — the normal first-write case.
