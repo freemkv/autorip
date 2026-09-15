@@ -70,7 +70,8 @@ pub fn device_log(device: &str, msg: &str) {
     // In-memory ring (last RING_CAP lines/device, O(1) VecDeque eviction).
     // `new_session` = first line since the ring was empty; the file gets a
     // build banner then so redeploy mid-session doesn't mix builds' lines.
-    let new_session = if let Ok(mut logs) = LOGS.lock() {
+    let new_session = {
+        let mut logs = LOGS.lock().unwrap_or_else(|e| e.into_inner());
         let log = logs.entry(device.to_string()).or_default();
         let was_empty = log.is_empty();
         log.push_back(line.clone());
@@ -78,8 +79,6 @@ pub fn device_log(device: &str, msg: &str) {
             log.pop_front();
         }
         was_empty
-    } else {
-        false
     };
 
     // File log — per-device, append-only between archive points. Disk-full
@@ -117,15 +116,13 @@ pub fn device_log(device: &str, msg: &str) {
 
 /// Get the most recent `lines` log lines for a device, oldest-first.
 pub fn get_device_log(device: &str, lines: usize) -> Vec<String> {
-    LOGS.lock()
-        .ok()
-        .and_then(|logs| {
-            logs.get(device).map(|log| {
-                // Single allocation of just the tail slice, computed while
-                // holding the lock — no intermediate double-reverse Vecs.
-                let start = log.len().saturating_sub(lines);
-                log.iter().skip(start).cloned().collect()
-            })
+    let logs = LOGS.lock().unwrap_or_else(|e| e.into_inner());
+    logs.get(device)
+        .map(|log| {
+            // Single allocation of just the tail slice, computed while
+            // holding the lock — no intermediate double-reverse Vecs.
+            let start = log.len().saturating_sub(lines);
+            log.iter().skip(start).cloned().collect()
         })
         .unwrap_or_default()
 }
@@ -180,8 +177,10 @@ pub fn archive_device_log(device: &str) {
     // Only clear the in-memory ring once the live file is safely archived
     // (or there was nothing to archive). On a rename failure we leave the
     // ring so the live view still reflects the on-disk log.
-    if archived_ok && let Ok(mut logs) = LOGS.lock() {
-        logs.remove(device);
+    if archived_ok {
+        LOGS.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device);
     }
 }
 
@@ -194,9 +193,9 @@ pub fn archive_device_log(device: &str) {
 /// on the next scan's `archive_device_log` if the device returns; this
 /// only evicts the live UI ring for a device that is gone.
 pub fn forget_device(device: &str) {
-    if let Ok(mut logs) = LOGS.lock() {
-        logs.remove(device);
-    }
+    LOGS.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(device);
 }
 
 /// Log to system log (not device-specific).

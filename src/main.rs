@@ -132,7 +132,8 @@ fn main() {
     // Fail-loud-EARLY destination check: warn if a configured movie/tv/output
     // dir is missing/not writable (e.g. a lost NAS bind-mount). Non-blocking —
     // finished rips stay in staging meanwhile — but surfaces the problem at boot.
-    if let Ok(c) = cfg.read() {
+    {
+        let c = cfg.read().unwrap_or_else(|e| e.into_inner());
         for (root, reason) in mover::check_configured_destinations(&c) {
             log::syslog(&format!(
                 "WARNING: configured destination '{root}' is not usable at startup: {reason}. \
@@ -145,28 +146,19 @@ fn main() {
     // The local KEYDB only matters for the `local` key source. In `online`
     // mode keys come from the key service and a local keydb would only shadow
     // it (libfreemkv default-search), so skip the download entirely.
-    let online_keys = cfg
-        .read()
-        .ok()
-        .map(|c| c.key_source == "online")
-        .unwrap_or(false);
+    let online_keys = cfg.read().unwrap_or_else(|e| e.into_inner()).key_source == "online";
 
     // Ensure KEYDB exists — download on first boot if URL is configured
     if online_keys {
         log::syslog("Online key source — skipping local KEYDB download");
-    } else if cfg
-        .read()
-        .ok()
-        .map(|c| keysource::keydb_exists(&c))
-        .unwrap_or(false)
-    {
+    } else if keysource::keydb_exists(&cfg.read().unwrap_or_else(|e| e.into_inner())) {
         log::syslog("KEYDB found");
     } else {
         let url = cfg
             .read()
-            .ok()
-            .map(|c| c.keydb_url.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|e| e.into_inner())
+            .keydb_url
+            .clone();
         if !url.is_empty() {
             log::syslog("KEYDB not found, downloading...");
             // Route through the SSRF guard (validate_fetch_url + pinned
@@ -179,12 +171,10 @@ fn main() {
                         web::KEYDB_MAX_BYTES,
                     ) {
                         Ok(buf) => {
-                            let saved = cfg
-                                .read()
-                                .map_err(|_| libfreemkv::Error::KeydbWrite {
-                                    path: "<config lock poisoned>".into(),
-                                })
-                                .and_then(|c| keysource::save_keydb(&c, &buf));
+                            let saved = keysource::save_keydb(
+                                &cfg.read().unwrap_or_else(|e| e.into_inner()),
+                                &buf,
+                            );
                             match saved {
                                 Ok(r) => log::syslog(&format!(
                                     "KEYDB downloaded: {} entries -> {}",
@@ -246,11 +236,10 @@ fn main() {
                 }
                 // Online key source resolves out-of-band; no local keydb to keep
                 // fresh (and refreshing one would only shadow the service).
-                let (online, url) = cfg2
-                    .read()
-                    .ok()
-                    .map(|c| (c.key_source == "online", c.keydb_url.clone()))
-                    .unwrap_or((false, String::new()));
+                let (online, url) = {
+                    let c = cfg2.read().unwrap_or_else(|e| e.into_inner());
+                    (c.key_source == "online", c.keydb_url.clone())
+                };
                 if online || url.is_empty() {
                     continue;
                 }
@@ -265,12 +254,10 @@ fn main() {
                             web::KEYDB_MAX_BYTES,
                         ) {
                             Ok(buf) => {
-                                let saved = cfg2
-                                    .read()
-                                    .map_err(|_| libfreemkv::Error::KeydbWrite {
-                                        path: "<config lock poisoned>".into(),
-                                    })
-                                    .and_then(|c| keysource::save_keydb(&c, &buf));
+                                let saved = keysource::save_keydb(
+                                    &cfg2.read().unwrap_or_else(|e| e.into_inner()),
+                                    &buf,
+                                );
                                 match saved {
                                     Ok(r) => log::syslog(&format!(
                                         "KEYDB updated: {} entries -> {}",
@@ -314,11 +301,10 @@ fn main() {
                         break 'outer;
                     }
                 }
-                let (log_dir, retention_days) = cfg
-                    .read()
-                    .ok()
-                    .map(|c| (c.log_dir(), c.log_retention_days))
-                    .unwrap_or_default();
+                let (log_dir, retention_days) = {
+                    let c = cfg.read().unwrap_or_else(|e| e.into_inner());
+                    (c.log_dir(), c.log_retention_days)
+                };
                 // Re-check the live system log too — the mtime-based prune
                 // above can't reclaim a file still being written.
                 log::rotate_system_log_if_large();
@@ -337,7 +323,8 @@ fn main() {
     // Graceful shutdown is NOT a failure: clear in-progress markers up front
     // so the next start resumes cleanly. Robust even if the drain below is
     // SIGKILLed mid-drain by docker's stop-grace — markers are gone by then.
-    if let Ok(c) = cfg.read() {
+    {
+        let c = cfg.read().unwrap_or_else(|e| e.into_inner());
         ripper::staging::clear_inprogress_markers(std::path::Path::new(&c.staging_dir));
     }
 
@@ -1052,6 +1039,239 @@ mod tests {
         assert!(
             waited >= Duration::from_millis(100),
             "must actually give the worker its timeout: waited {waited:?}"
+        );
+    }
+
+    // Regression guard (round-4 net): fail if ANY fail-open lock-poison form
+    // reappears in non-test code. Each prior audit pass converted the obvious
+    // form of the day and missed another SYNTACTIC form — `.lock().ok()`, then
+    // `match … Err(_) => <default>`, then `if let Ok(..) = X.lock()`, then
+    // `.map(…).unwrap_or_default()`. This greps every non-test `.rs` under
+    // `src/` for all of them at once so the next form can't slip through.
+    //
+    // Correct handling is recover-via-`unwrap_or_else(|e| e.into_inner())`.
+    // The surfaced-HTTP-500 / logged-retry handlers use `match … Err(_) => …`
+    // (no `let Ok`, no `.ok()`), which is deliberately NOT matched here. Test
+    // code is stripped first, so a `#[cfg(test)]` block that mirrors a
+    // production `if let Ok` for a poison-recovery unit test is exempt.
+    #[test]
+    fn no_fail_open_lock_poison_forms_in_src() {
+        use std::path::{Path, PathBuf};
+
+        // Blank comments and string/char literals (replaced by spaces, newlines
+        // preserved) so a needle quoted in a comment (e.g. the `.lock().ok()?`
+        // named in a doc comment) or in a string is never mistaken for a real
+        // call site, and so braces inside strings can't skew the test-module
+        // brace match below.
+        fn blank_comments_and_strings(src: &str) -> String {
+            let b = src.as_bytes();
+            let mut out = vec![b' '; b.len()];
+            let mut i = 0;
+            while i < b.len() {
+                let c = b[i];
+                if c == b'\n' {
+                    out[i] = b'\n';
+                    i += 1;
+                    continue;
+                }
+                if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        if b[i] == b'\n' {
+                            out[i] = b'\n';
+                        }
+                        i += 1;
+                    }
+                    i = (i + 2).min(b.len());
+                    continue;
+                }
+                if c == b'r' && i + 1 < b.len() && (b[i + 1] == b'"' || b[i + 1] == b'#') {
+                    let mut j = i + 1;
+                    let mut hashes = 0;
+                    while j < b.len() && b[j] == b'#' {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if j < b.len() && b[j] == b'"' {
+                        j += 1;
+                        while j < b.len() {
+                            if b[j] == b'"' {
+                                let mut k = 0;
+                                while k < hashes && j + 1 + k < b.len() && b[j + 1 + k] == b'#' {
+                                    k += 1;
+                                }
+                                if k == hashes {
+                                    j += 1 + hashes;
+                                    break;
+                                }
+                            }
+                            if b[j] == b'\n' {
+                                out[j] = b'\n';
+                            }
+                            j += 1;
+                        }
+                        i = j;
+                        continue;
+                    }
+                }
+                if c == b'b' && i + 1 < b.len() && b[i + 1] == b'"' {
+                    i += 1; // fall through to the normal-string handler at the quote
+                }
+                if b[i] == b'"' {
+                    let mut j = i + 1;
+                    while j < b.len() {
+                        if b[j] == b'\\' {
+                            j += 2;
+                            continue;
+                        }
+                        if b[j] == b'"' {
+                            j += 1;
+                            break;
+                        }
+                        if b[j] == b'\n' {
+                            out[j] = b'\n';
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                if c == b'\'' {
+                    let mut j = i + 1;
+                    if j < b.len() && b[j] == b'\\' {
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                    if j < b.len() && b[j] == b'\'' {
+                        i = j + 1; // char literal — blanked
+                        continue;
+                    }
+                    out[i] = c; // lifetime tick — keep
+                    i += 1;
+                    continue;
+                }
+                out[i] = c;
+                i += 1;
+            }
+            String::from_utf8(out).expect("ascii-preserving transform")
+        }
+
+        // Remove every `#[cfg(test)]` item (blanked, newlines preserved) so
+        // test code is never scanned. Runs on the already-blanked text, so the
+        // brace match sees only structural braces.
+        fn strip_test_items(src: &str) -> String {
+            let b = src.as_bytes();
+            let needle = b"#[cfg(test)]";
+            let mut out = src.as_bytes().to_vec();
+            let mut i = 0;
+            while i + needle.len() <= b.len() {
+                if &b[i..i + needle.len()] == needle {
+                    let mut j = i + needle.len();
+                    while j < b.len() && b[j] != b'{' && b[j] != b';' {
+                        j += 1;
+                    }
+                    if j < b.len() && b[j] == b'{' {
+                        let mut depth = 0i32;
+                        let mut k = j;
+                        while k < b.len() {
+                            if b[k] == b'{' {
+                                depth += 1;
+                            } else if b[k] == b'}' {
+                                depth -= 1;
+                                if depth == 0 {
+                                    k += 1;
+                                    break;
+                                }
+                            }
+                            k += 1;
+                        }
+                        for m in i..k.min(out.len()) {
+                            if out[m] != b'\n' {
+                                out[m] = b' ';
+                            }
+                        }
+                        i = k;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            String::from_utf8(out).unwrap()
+        }
+
+        fn violations(path: &Path, code: &str) -> Vec<String> {
+            // Join method-chain line breaks so multiline forms
+            // (`cfg\n.read()\n.map(..)\n.unwrap_or_default()`) collapse onto one
+            // line and match the same needles as the inline forms.
+            let mut joined: Vec<String> = Vec::new();
+            for raw in code.lines() {
+                let t = raw.trim_start();
+                if t.starts_with('.') && !joined.is_empty() {
+                    joined.last_mut().unwrap().push_str(t);
+                } else {
+                    joined.push(raw.to_string());
+                }
+            }
+            let locks = [".lock()", ".read()", ".write()"];
+            let mut hits = Vec::new();
+            for line in &joined {
+                if !locks.iter().any(|m| line.contains(m)) {
+                    continue;
+                }
+                // A: `.lock().ok()` and friends (`.ok()?`, `.ok().and_then`, `.ok().map`).
+                let a = locks.iter().any(|m| line.contains(&format!("{m}.ok()")));
+                // B: `if let Ok(..)`/`while let Ok(..)`/`let Ok(..) = .. else` on a lock.
+                let b = line.contains("let Ok(");
+                // C: `.map(..).unwrap_or*` that discards the poison. The recover
+                //    form keeps `into_inner`, so it is allowed.
+                let c = locks.iter().any(|m| line.contains(&format!("{m}.map(")))
+                    && line.contains(".unwrap_or")
+                    && !line.contains("into_inner");
+                if a || b || c {
+                    hits.push(format!("{}: {}", path.display(), line.trim()));
+                }
+            }
+            hits
+        }
+
+        fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    collect(&p, files);
+                } else if p.extension().map(|x| x == "rs").unwrap_or(false) {
+                    files.push(p);
+                }
+            }
+        }
+
+        let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect(&src_root, &mut files);
+        files.sort();
+        assert!(!files.is_empty(), "no .rs files found under {src_root:?}");
+
+        let mut all = Vec::new();
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap();
+            let src = crate::util::source_lf(&src).into_owned();
+            let code = strip_test_items(&blank_comments_and_strings(&src));
+            all.extend(violations(f, &code));
+        }
+
+        assert!(
+            all.is_empty(),
+            "fail-open lock-poison form(s) reintroduced in non-test code — \
+             recover via `unwrap_or_else(|e| e.into_inner())` (or surface an \
+             HTTP 500 / logged retry via `match … Err(_) => …`):\n{}",
+            all.join("\n")
         );
     }
 }

@@ -162,8 +162,8 @@ pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
     // operator cleared). Lifted on a fresh dispatch / prune (see MUX_DISMISSED).
     if MUX_DISMISSED
         .lock()
-        .map(|d| d.contains(path))
-        .unwrap_or(false)
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(path)
     {
         return;
     }
@@ -171,9 +171,7 @@ pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
     // guard before the syslog write (syslog does blocking NFS I/O) so it
     // doesn't block other record_error/clear_error calls or the System page.
     let same_reason = {
-        let Ok(mut m) = MUX_ERRORS.lock() else {
-            return;
-        };
+        let mut m = MUX_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
         let same_reason = m.get(path).map(|e| e.reason == reason).unwrap_or(false);
         m.insert(
             path.to_string(),
@@ -191,9 +189,10 @@ pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
 }
 
 pub(crate) fn clear_error(path: &str) {
-    if let Ok(mut m) = MUX_ERRORS.lock() {
-        m.remove(path);
-    }
+    MUX_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
 }
 
 /// Operator-initiated clear of a single mux error (the System-tab ✕). Removes
@@ -202,29 +201,31 @@ pub(crate) fn clear_error(path: &str) {
 /// fresh dispatch (or when it's pruned from staging).
 pub fn clear_mux_error(path: &str) {
     clear_error(path);
-    if let Ok(mut d) = MUX_DISMISSED.lock() {
-        d.insert(path.to_string());
-    }
+    MUX_DISMISSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_string());
 }
 
 /// Operator-initiated clear of ALL mux errors (the System-tab "Clear all").
 pub fn clear_all_mux_errors() {
-    if let Ok(mut m) = MUX_ERRORS.lock() {
-        if let Ok(mut d) = MUX_DISMISSED.lock() {
-            for k in m.keys() {
-                d.insert(k.clone());
-            }
+    let mut m = MUX_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut d = MUX_DISMISSED.lock().unwrap_or_else(|e| e.into_inner());
+        for k in m.keys() {
+            d.insert(k.clone());
         }
-        m.clear();
     }
+    m.clear();
 }
 
 /// Lift any dismissal for `path` — called when the dir is freshly dispatched so
 /// a NEW mux attempt's error (if any) can surface again.
 fn undismiss(path: &str) {
-    if let Ok(mut d) = MUX_DISMISSED.lock() {
-        d.remove(path);
-    }
+    MUX_DISMISSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
 }
 
 /// Drop error cards (and dismissals) whose staging dir no longer exists — an
@@ -232,20 +233,22 @@ fn undismiss(path: &str) {
 /// moved out of staging. Keeps the System page showing only live jobs.
 fn prune_stale_errors() {
     let stale: Vec<String> = {
-        let Ok(m) = MUX_ERRORS.lock() else { return };
+        let m = MUX_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
         m.keys().filter(|p| definitely_absent(p)).cloned().collect()
     };
     if stale.is_empty() {
         return;
     }
-    if let Ok(mut m) = MUX_ERRORS.lock() {
+    {
+        let mut m = MUX_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
         for p in &stale {
             m.remove(p);
         }
     }
-    if let Ok(mut d) = MUX_DISMISSED.lock() {
-        d.retain(|p| !definitely_absent(p));
-    }
+    MUX_DISMISSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|p| !definitely_absent(p));
 }
 
 /// True only when the staging dir is DEFINITIVELY gone (stat returned NotFound).

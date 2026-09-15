@@ -1414,7 +1414,7 @@ fetch('/api/state').then(r=>r.json()).then(data=>{handleState(data);connectSSE()
 </html>"##;
 
 pub fn run(cfg: &Arc<RwLock<Config>>) {
-    let port = cfg.read().map(|c| c.port).unwrap_or(8080);
+    let port = cfg.read().unwrap_or_else(|e| e.into_inner()).port;
     let addr = format!("0.0.0.0:{}", port);
     let server = match Server::http(&addr) {
         Ok(s) => Arc::new(s),
@@ -1599,8 +1599,9 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     } else if is_get && url == "/api/state" {
         let staging_dir = cfg
             .read()
-            .map(|c| c.staging_dir.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|e| e.into_inner())
+            .staging_dir
+            .clone();
         json_response(request, 200, &get_state_json(&staging_dir));
     } else if is_get && url == "/api/version" {
         json_response(
@@ -1715,8 +1716,9 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     } else if is_get && url == "/api/review" {
         let staging = cfg
             .read()
-            .map(|c| c.staging_dir.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|e| e.into_inner())
+            .staging_dir
+            .clone();
         let items = crate::review::list_held(&staging);
         json_response(
             request,
@@ -1851,8 +1853,9 @@ fn handle_review_resolve(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>)
     let dir = clamp_chars(v["dir"].as_str().unwrap_or("").trim(), 300);
     let staging = cfg
         .read()
-        .map(|c| c.staging_dir.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|e| e.into_inner())
+        .staging_dir
+        .clone();
     let action = match v["action"].as_str().unwrap_or("") {
         "proceed" => crate::review::Resolve::Proceed,
         "cancel" => crate::review::Resolve::Cancel,
@@ -1912,8 +1915,9 @@ fn handle_tmdb_search(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, ur
     }
     let key = cfg
         .read()
-        .map(|c| c.tmdb_api_key.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|e| e.into_inner())
+        .tmdb_api_key
+        .clone();
     let results = crate::tmdb::search(q, &key, 8);
     json_response(
         request,
@@ -6413,8 +6417,8 @@ const QUEUE_DISPLAY_CAP: usize = 100;
 fn build_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usize) {
     let active_move_dir = crate::mover::ACTIVE_MOVE_DIR
         .lock()
-        .ok()
-        .and_then(|d| d.clone());
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     // Move queue: staging dirs handed off to the mover (`state == Done`),
     // minus the one actively being moved (shown as live bars, not a queue row).
     let mut move_queue: Vec<String> = std::fs::read_dir(staging_dir)
@@ -6476,15 +6480,19 @@ fn handle_system_info(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // Mover errors: stuck staging dirs the user needs to act on.
     let move_errors: Vec<crate::mover::MoverError> = crate::mover::MOVE_ERRORS
         .lock()
-        .map(|m| m.values().cloned().collect())
-        .unwrap_or_default();
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
 
     let truncation_count = move_full_count.saturating_sub(QUEUE_DISPLAY_CAP)
         + mux_full_count.saturating_sub(QUEUE_DISPLAY_CAP);
     let mux_errors: Vec<crate::muxer::MuxerError> = crate::muxer::MUX_ERRORS
         .lock()
-        .map(|m| m.values().cloned().collect())
-        .unwrap_or_default();
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
 
     // System log: last 50 lines. Tail from the end with a bounded read
     // rather than slurping the whole file — device_system.log is never
@@ -7298,8 +7306,9 @@ fn handle_sse(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // the staging path is reflected without restarting the SSE stream.
     let staging_dir = || {
         cfg.read()
-            .map(|c| c.staging_dir.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|e| e.into_inner())
+            .staging_dir
+            .clone()
     };
 
     let initial = format!("data: {}\n\n", get_state_json(&staging_dir()));
@@ -7859,9 +7868,9 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 
     let keydb_url = cfg
         .read()
-        .ok()
-        .map(|c| c.keydb_url.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|e| e.into_inner())
+        .keydb_url
+        .clone();
     if keydb_url.is_empty() {
         json_response(
             request,
@@ -7956,12 +7965,7 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // Write to the service-canonical keydb path, NOT libfreemkv's exe-local
     // default — otherwise "Update KEYDB" reports success while every AACS
     // rip keeps failing because the read side looks elsewhere.
-    let saved = cfg
-        .read()
-        .map_err(|_| libfreemkv::Error::KeydbWrite {
-            path: "<config lock poisoned>".into(),
-        })
-        .and_then(|c| crate::keysource::save_keydb(&c, &body));
+    let saved = crate::keysource::save_keydb(&cfg.read().unwrap_or_else(|e| e.into_inner()), &body);
     match saved {
         Ok(result) => {
             let body = serde_json::json!({
