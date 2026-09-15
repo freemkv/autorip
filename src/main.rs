@@ -1229,11 +1229,13 @@ mod tests {
                 let a = locks.iter().any(|m| line.contains(&format!("{m}.ok()")));
                 // B: `if let Ok(..)`/`while let Ok(..)`/`let Ok(..) = .. else` on a lock.
                 let b = line.contains("let Ok(");
-                // C: `.map(..).unwrap_or*` that discards the poison. The recover
-                //    form keeps `into_inner`, so it is allowed.
-                let c = locks.iter().any(|m| line.contains(&format!("{m}.map(")))
-                    && line.contains(".unwrap_or")
-                    && !line.contains("into_inner");
+                // C: ANY `.lock()`/`.read()`/`.write()` followed by an
+                //    `.unwrap_or*` that discards the poison — covering the bare
+                //    `.lock().unwrap_or_default()` / `.unwrap_or_else(|_| ..)` /
+                //    `.unwrap_or(default)` / `.map_err(|_| ()).unwrap_or_default()`
+                //    forms as well as the `.map(..).unwrap_or*` form. The recover
+                //    form keeps `into_inner`, so lines with it are allowed.
+                let c = line.contains(".unwrap_or") && !line.contains("into_inner");
                 if a || b || c {
                     hits.push(format!("{}: {}", path.display(), line.trim()));
                 }
