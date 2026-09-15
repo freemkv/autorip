@@ -1253,7 +1253,11 @@ pub fn handle_rip_request(
                     device,
                     "Disc already ripped (.completed marker present) — skipping unattended re-rip. Click Rip to force a fresh rip.",
                 );
-                let prev = STATE.lock().ok().and_then(|s| s.get(device).cloned());
+                let prev = STATE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(device)
+                    .cloned();
                 update_state(
                     device,
                     RipState {
@@ -1424,13 +1428,10 @@ fn disc_loss_aborted(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
 // dir? Gates the unattended auto-rip path so a container restart
 // doesn't re-rip a disc. See docs/ripper-mod-notes.md.
 fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
-    let cfg_read = match cfg.read() {
-        Ok(c) => c.clone(),
-        Err(_) => return false,
-    };
     // Recover from a poisoned mutex rather than silently returning false
     // (would re-rip a completed disc). Basename is disc-specific, not just
     // title-specific — disc 2 of a boxset shares disc 1's TMDB title.
+    let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
     let Some(sanitized) = staging_basename_for_device(&cfg_read, device) else {
         return false;
     };
@@ -1586,9 +1587,9 @@ fn end_of_recovery_loss(
 // sanitized display_name of the currently-scanned disc; returns the
 // `ResumeClass::Remux` payload if found, else None. See docs/ripper-mod-notes.md.
 fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<resume::ResumeClass> {
-    let cfg_read = cfg.read().ok()?.clone();
     // Recover from a poisoned mutex rather than silently returning None (which
     // would fail to resume a valid staged ISO). Matches disc_already_completed.
+    let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
     let sanitized = staging_basename_for_device(&cfg_read, device)?;
     // NFS-resilient listing, not `read_dir(...).flatten()`, which would
     // silently drop the disc's dir on a cold-cache error and fall through
@@ -1790,9 +1791,9 @@ fn resumable_for_disc(cfg: &Config, display_name: &str, disc_label: &str) -> Opt
 /// STATE-reading wrapper of [`resumable_for_disc`] used by the `?resume=yes`
 /// action (the disc has been scanned, so its name is in STATE).
 fn resumable_for_device(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<Resumable> {
-    let cfg_read = cfg.read().ok()?.clone();
+    let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
     let (display_name, disc_label) = {
-        let s = STATE.lock().ok()?;
+        let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
         let rs = s.get(device)?;
         (rs.disc_name.clone(), rs.disc_label.clone())
     };
