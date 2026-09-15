@@ -9,6 +9,7 @@ pub enum WebhookEvent {
     Rip,
     /// `.mkv` produced from the staged ISO (`mux_complete`).
     Mux,
+    /// Delivered file moved to its final library destination (`move_complete`).
     Move,
 }
 

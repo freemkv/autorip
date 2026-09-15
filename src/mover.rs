@@ -541,6 +541,25 @@ pub(crate) fn check_post_copy(src: &Path, dst: &Path) -> Result<(), MoveError> {
     }
 }
 
+/// The structural half of `check_post_copy` for a dest whose SOURCE is gone
+/// (the src-missing idempotent fast path). Runs the format-aware structural
+/// check (EBML head/tail for mkv/mk3d, TS sync for m2ts) WITHOUT the size
+/// compare — there is no src left to compare against. A foreign or garbage
+/// file at the dest path fails this, so it isn't mislabelled as our already-
+/// moved output. Formats without a structural check (iso, unknown) can't be
+/// distinguished from a foreign file this way, so they pass on non-empty.
+fn dest_structural_ok(dst: &Path) -> bool {
+    let ext = dst
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("mkv") | Some("mk3d") => check_post_copy_mkv(dst).is_ok(),
+        Some("m2ts") => check_post_copy_m2ts(dst).is_ok(),
+        _ => true,
+    }
+}
+
 // One pass of the mover loop: take a config SNAPSHOT, release the lock, then
 // move. Returns false if the config could not be read. The move is injected
 // so this is testable. See docs/mover.md — mover_tick.
@@ -1273,7 +1292,10 @@ where
         };
         if p.extension()
             .and_then(|x| x.to_str())
-            .map(|ext| match ext {
+            // Match case-insensitively: a disc labelled `.MKV`/`.ISO` (or any
+            // mixed case from an external tool) is the same deliverable and must
+            // not be silently skipped by an exact-case compare.
+            .map(|ext| match ext.to_ascii_lowercase().as_str() {
                 // mk3d is byte-identical Matroska (3D main feature) —
                 // deliver it exactly like mkv.
                 "mkv" | "mk3d" | "m2ts" => true,
@@ -1409,9 +1431,12 @@ fn tv_episode_leaf(
     if out.episode_name.is_empty() {
         Some(format!("{safe_title} S{season:02}E{episode:02}.{ext}"))
     } else {
+        // Sanitize the episode name too: it comes from TMDB and can carry path
+        // separators / reserved chars (e.g. "Part 1/2", ":") that would escape
+        // the season folder or break the write, just like the title.
+        let safe_episode = crate::util::sanitize_path_display(&out.episode_name);
         Some(format!(
-            "{safe_title} S{season:02}E{episode:02} - {}.{ext}",
-            out.episode_name
+            "{safe_title} S{season:02}E{episode:02} - {safe_episode}.{ext}"
         ))
     }
 }
@@ -1441,7 +1466,7 @@ fn build_destination(
             // no-tmdb fall-through the movie/tv branches use.
             None => crate::util::sanitize_path_display(filename),
         };
-        return format!("{root}/{leaf}");
+        return join_path(&root, &leaf);
     }
     // Source extension wins. Pre-0.25.7 this hardcoded ".mkv", which collided when
     // keep_iso=true left the mux output and source ISO both planning to the same path,
@@ -1463,12 +1488,12 @@ fn build_destination(
                 // onto output_dir, absolute wins (back-compat). Pre-fix a relative "movies"
                 // resolved against container root / — the 2026-06 "Mercy" incident.
                 let root = resolve_media_root(&cfg.output_dir, &cfg.movie_dir);
-                let dir = format!("{root}/{safe_title}{year_str}");
+                let dir = join_path(&root, &format!("{safe_title}{year_str}"));
                 // Filename carries the year too, matching the folder and the Plex/Jellyfin
                 // `Title (Year)/Title (Year).ext` convention (pre-fix the file was bare
                 // `Title.ext`).
                 let name = format!("{safe_title}{year_str}.{src_ext}");
-                format!("{dir}/{name}")
+                join_path(&dir, &name)
             }
             "tv" if !cfg.tv_dir.is_empty() => {
                 // Same join fix as the movie branch: `tv_dir` resolved under
@@ -1482,34 +1507,37 @@ fn build_destination(
                 } else {
                     String::new()
                 };
-                let dir = format!(
-                    "{root}/{safe_title}{year_str}/Season {:02}",
-                    season.unwrap_or(1)
-                );
+                let show_dir = join_path(&root, &format!("{safe_title}{year_str}"));
+                let dir = join_path(&show_dir, &format!("Season {:02}", season.unwrap_or(1)));
                 // Sanitize the leaf too: the movie branch derives its leaf from a sanitized
                 // title, but this branch used the RAW source filename, so a path separator or
                 // traversal sequence could escape tv_dir.
                 let safe_filename = crate::util::sanitize_path_display(filename);
-                format!("{}/{}", dir, safe_filename)
+                join_path(&dir, &safe_filename)
             }
             _ => {
                 // Sanitize the leaf for consistency with the movie/tv
                 // branches (they sanitize; this fallback used the raw leaf,
                 // so e.g. "..mkv" would reach output_dir verbatim).
-                format!(
-                    "{}/{}",
-                    cfg.output_dir,
-                    crate::util::sanitize_path_display(filename)
+                join_path(
+                    &cfg.output_dir,
+                    &crate::util::sanitize_path_display(filename),
                 )
             }
         }
     } else {
-        format!(
-            "{}/{}",
-            cfg.output_dir,
-            crate::util::sanitize_path_display(filename)
+        join_path(
+            &cfg.output_dir,
+            &crate::util::sanitize_path_display(filename),
         )
     }
+}
+
+// Join a leaf (or relative subpath) onto a base dir via Path::join, so the OS
+// path separator is used and a trailing slash on the base can't produce a `//`
+// in the delivered path. Replaces the old `format!("{base}/{leaf}")` joins.
+fn join_path(base: &str, leaf: &str) -> String {
+    Path::new(base).join(leaf).to_string_lossy().into_owned()
 }
 
 // Resolve a media subdirectory (movie_dir/tv_dir/iso_dir) UNDER output_dir
@@ -1717,6 +1745,10 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
         && e.kind() == std::io::ErrorKind::NotFound
         && d.is_file()
         && d.len() > 0
+        // A non-empty dest alone isn't proof it's OUR output — a foreign file can
+        // sit here, and with src gone we can't content-compare. A structural check
+        // rejects garbage/foreign non-media rather than falsely reporting Moved.
+        && dest_structural_ok(dest)
     {
         return MoveOutcome::Moved;
     }
@@ -2673,9 +2705,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("a.mkv");
         let dest = tmp.path().join("b.mkv");
-        std::fs::write(&dest, b"already there").unwrap();
+        // Dest must be a structurally-valid mkv: the src-missing fast path now
+        // rejects a foreign/garbage dest rather than mislabelling it Moved.
+        write_minimal_mkv(&dest, &vec![0xAA; 256]);
         let outcome = move_file(&src, &dest, &noop_progress);
         assert_eq!(outcome, MoveOutcome::Moved);
+    }
+
+    #[test]
+    fn move_file_does_not_report_moved_on_foreign_dest_when_src_missing() {
+        // src is gone and the dest is a NON-media/foreign file: the idempotent
+        // fast path must NOT claim Moved for it (it isn't our output).
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("a.mkv");
+        let dest = tmp.path().join("b.mkv");
+        std::fs::write(&dest, b"foreign non-media file, not our rip output").unwrap();
+        let outcome = move_file(&src, &dest, &noop_progress);
+        assert_ne!(
+            outcome,
+            MoveOutcome::Moved,
+            "a foreign non-media dest is not proof of a completed move; got {outcome:?}"
+        );
     }
 
     // The pre-flight "src missing, dest present" branch must require a

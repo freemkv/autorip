@@ -740,15 +740,31 @@ fn prune_old_logs(log_dir: &str, retention_days: u64) {
     let Some(cutoff) = cutoff else {
         return;
     };
+    // The tracing daily appender holds `autorip.log.<today>` (UTC) open; if the
+    // daemon logged nothing for > retention_days its mtime can fall before the
+    // cutoff, so never prune the active appender file (see active_log_filenames).
+    let active = active_log_filenames();
     // Recurse so the archive subdir (logs/rips/, where archive_device_log
     // writes per-rip files — the dir that actually grows over time) is
     // pruned too, not just the top-level live logs.
-    let pruned = prune_dir_recursive(std::path::Path::new(log_dir), cutoff);
+    let pruned = prune_dir_recursive(std::path::Path::new(log_dir), cutoff, &active);
     if pruned > 0 {
         log::syslog(&format!(
             "log prune: removed {pruned} files older than {retention_days}d from {log_dir}"
         ));
     }
+}
+
+/// The log filenames the tracing appenders are actively writing to, which
+/// retention must never delete out from under an open FD. The human log rolls
+/// daily as `autorip.log.<UTC-date>`; its bare base is included for the not-yet-
+/// rolled case. (`autorip.jsonl` is non-rolling and already excluded by
+/// `is_prunable_log_name`.)
+fn active_log_filenames() -> Vec<String> {
+    vec![
+        "autorip.log".to_string(),
+        format!("autorip.log.{}", crate::util::format_date()),
+    ]
 }
 
 // Whether a filename is one of the log files retention applies to.
@@ -763,7 +779,11 @@ fn is_prunable_log_name(path: &std::path::Path) -> bool {
 // Recursively delete log files under `dir` older than `cutoff` (descends into
 // subdirs, e.g. logs/rips/), returning the count removed. IO errors on
 // entries are swallowed — pruning is best-effort, must never break the daemon.
-fn prune_dir_recursive(dir: &std::path::Path, cutoff: std::time::SystemTime) -> u32 {
+fn prune_dir_recursive(
+    dir: &std::path::Path,
+    cutoff: std::time::SystemTime,
+    active: &[String],
+) -> u32 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -772,10 +792,18 @@ fn prune_dir_recursive(dir: &std::path::Path, cutoff: std::time::SystemTime) -> 
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
-            pruned += prune_dir_recursive(&path, cutoff);
+            pruned += prune_dir_recursive(&path, cutoff, active);
             continue;
         }
         if !is_prunable_log_name(&path) {
+            continue;
+        }
+        // Never delete the file an appender currently holds open.
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| active.iter().any(|a| a == n))
+        {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -925,12 +953,46 @@ mod tests {
         filetime_set(&old, old_time);
 
         let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
-        let pruned = prune_dir_recursive(&d, cutoff);
+        let pruned = prune_dir_recursive(&d, cutoff, &[]);
 
         assert_eq!(pruned, 1, "only the old archived log should be pruned");
         assert!(!old.exists(), "old archived log should be gone");
         assert!(keep_nonlog.exists(), "non-.log file must be kept");
         assert!(fresh.exists(), "fresh log must be kept");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // The active tracing appender file must survive a prune even when its mtime
+    // is well past the cutoff — deleting it would orphan the open FD.
+    #[cfg(unix)]
+    #[test]
+    fn prune_never_deletes_the_active_appender_log() {
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!("autorip-prune-active-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        // Today's rolled human log — the file the daily appender holds open.
+        let active_name = format!("autorip.log.{}", crate::util::format_date());
+        let active = d.join(&active_name);
+        std::fs::write(&active, b"x").unwrap();
+        // A stale rolled log from a prior day — a legitimate prune target.
+        let stale = d.join("autorip.log.1999-01-01");
+        std::fs::write(&stale, b"x").unwrap();
+
+        // Backdate BOTH well past the cutoff so only the active-name skip saves it.
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        filetime_set(&active, old_time);
+        filetime_set(&stale, old_time);
+
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        let pruned = prune_dir_recursive(&d, cutoff, &active_log_filenames());
+
+        assert_eq!(pruned, 1, "only the stale rolled log should be pruned");
+        assert!(active.exists(), "the active appender log must be kept");
+        assert!(!stale.exists(), "the stale rolled log should be gone");
         let _ = std::fs::remove_dir_all(&d);
     }
 

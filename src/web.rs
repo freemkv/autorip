@@ -6283,12 +6283,12 @@ fn get_state_json(staging_dir: &str) -> String {
     // a blank dashboard with a permanently green HEALTHCHECK; it's still readable.
     let state = ripper::STATE.lock().unwrap_or_else(|e| e.into_inner());
     // `_move` is now an ARRAY of per-artifact bars (movie file + companion ISO
-    // get one each), so clone the whole Vec; empty means nothing is moving.
+    // get one each); clone the whole Vec (empty = nothing moving). Recover on
+    // poison (MOVE_STATE convention) — `.ok()` would drop live bars process-wide.
     let move_state = crate::mover::MOVE_STATE
         .lock()
-        .ok()
-        .map(|ms| ms.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     // Mux progress rides on the synthetic `_mux` device key in STATE (a
     // RipState seeded by the mux worker), serialized as part of `state`.
     // There is no separate live MuxState struct.
@@ -6770,12 +6770,20 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
                     })
                 } else if let Some(obj) = v.as_object() {
                     let url = obj.get("url").and_then(|u| u.as_str())?.to_string();
-                    let flag = |k: &str| obj.get(k).and_then(|b| b.as_bool()).unwrap_or(true);
+                    // Distinguish ABSENT (→ default true) from PRESENT-BUT-WRONG-TYPE:
+                    // a non-bool flag is malformed, so drop the whole entry rather than
+                    // silently coercing it to true (matches the config loader).
+                    let flag = |k: &str| -> Option<bool> {
+                        match obj.get(k) {
+                            None => Some(true),
+                            Some(b) => b.as_bool(),
+                        }
+                    };
                     Some(IncomingWebhook {
                         url,
-                        post_rip: flag("post_rip"),
-                        post_mux: flag("post_mux"),
-                        post_move: flag("post_move"),
+                        post_rip: flag("post_rip")?,
+                        post_mux: flag("post_mux")?,
+                        post_move: flag("post_move")?,
                     })
                 } else {
                     None

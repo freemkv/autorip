@@ -9,7 +9,6 @@
 //! via [`resolve_and_apply_traced`] — the first source whose Unit Keys
 //! validate wins. The only drive-vs-ISO difference is the [`DiscKeyAccess`] impl.
 
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use freemkv_keysources::{KeySource, KeydbSource, OnlineSource};
@@ -19,113 +18,9 @@ use libfreemkv::read_encrypted_units;
 
 use crate::config::Config;
 
-// Is this resolved address one a key-service request must never reach?
-// Blocks loopback, link-local/metadata, RFC1918/ULA, and other non-global
-// ranges; defense-in-depth since `keyserver_url` is POSTed verbatim at rip time.
-fn is_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local() // 169.254.0.0/16 — cloud metadata lives here
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.octets()[0] == 0 // 0.0.0.0/8
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40) // 100.64/10 CGNAT
-                || v4.octets()[0] >= 240 // 240.0.0.0/4 Class-E reserved
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-                // to_ipv4() catches both ::ffff:a.b.c.d (mapped) AND ::a.b.c.d
-                // (compatible); to_ipv4_mapped() misses the deprecated :: form.
-                || v6.to_ipv4().map(|v4| is_blocked_ip(IpAddr::V4(v4))).unwrap_or(false)
-        }
-    }
-}
-
-// Validate a key-service base URL before handing it to `OnlineSource`.
-// Requires http(s); rejects a host that is (or resolves to) a blocked IP
-// (SSRF / cloud-metadata exfiltration guard).
-fn validate_keyserver_url(raw: &str) -> Result<(), String> {
-    let url = raw.trim();
-    // Log/error identifier for `url`: origin only, never the raw string.
-    // `keyserver_url` can carry a bearer token (like a webhook URL), and
-    // unauthenticated GET /api/debug serves this fn's ERROR log verbatim.
-    let safe_ref = crate::webhook::webhook_url_origin(url);
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .ok_or_else(|| format!("keyserver URL must be http(s): {safe_ref}"))?;
-
-    // host[:port] is everything before the first '/', '?' or '#'.
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .rsplit('@') // drop any userinfo
-        .next()
-        .unwrap_or("");
-    if authority.is_empty() {
-        return Err(format!("keyserver URL has no host: {safe_ref}"));
-    }
-
-    // Split host / port, handling bracketed IPv6 literals ([::1]:443).
-    let (host, port): (String, u16) = if let Some(end) = authority.strip_prefix('[') {
-        let (h, tail) = end
-            .split_once(']')
-            .ok_or_else(|| format!("malformed IPv6 host: {authority}"))?;
-        let port = tail
-            .strip_prefix(':')
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(443);
-        (h.to_string(), port)
-    } else if let Some((h, p)) = authority.rsplit_once(':') {
-        // Only treat the trailing segment as a port if it parses; otherwise
-        // it's part of a bare IPv6 (which would have been bracketed) — fall
-        // back to treating the whole thing as the host.
-        match p.parse::<u16>() {
-            Ok(port) => (h.to_string(), port),
-            Err(_) => (authority.to_string(), 443),
-        }
-    } else {
-        (authority.to_string(), 443)
-    };
-
-    // Literal IP? classify directly — no DNS, no rebind window.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return if is_blocked_ip(ip) {
-            Err(format!(
-                "keyserver host {host} is a blocked/internal address"
-            ))
-        } else {
-            Ok(())
-        };
-    }
-    // Hostname — resolve (with a bounded deadline so a hung resolver can't
-    // freeze the rip thread) and reject if ANY resolved address is blocked.
-    let addrs = crate::web::resolve_with_timeout(&host, port)
-        .map_err(|e| format!("keyserver host {host} did not resolve: {e}"))?;
-    let mut saw_any = false;
-    for sa in addrs {
-        saw_any = true;
-        if is_blocked_ip(sa.ip()) {
-            return Err(format!(
-                "keyserver host {host} resolves to a blocked/internal address ({})",
-                sa.ip()
-            ));
-        }
-    }
-    if !saw_any {
-        return Err(format!("keyserver host {host} resolved to no addresses"));
-    }
-    Ok(())
-}
+// The SSRF classifier + keyserver-URL validator live ONCE, in the keysources
+// crate. Both `build_sources` and the reachability probe gate on
+// `freemkv_keysources::validate_keyserver_url`, so their verdicts can't diverge.
 
 /// How many 6144-byte aligned encrypted units a sample-needing source is given.
 ///
@@ -246,7 +141,7 @@ pub fn iso_scan_opts() -> libfreemkv::ScanOptions {
 pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
     let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
     match cfg.key_source.as_str() {
-        "online" => match validate_keyserver_url(&cfg.keyserver_url) {
+        "online" => match freemkv_keysources::validate_keyserver_url(cfg.keyserver_url.trim()) {
             Ok(()) => sources.push(Box::new(OnlineSource::new(
                 cfg.keyserver_url.clone(),
                 cfg.keyserver_secret.clone(),
@@ -451,6 +346,15 @@ pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
     if url.is_empty() {
         return ServiceReachability::Up;
     }
+    // SSRF gate: the SAME validator `build_sources` gates the online source on,
+    // so the probe and the key-resolve path can never disagree about whether a
+    // URL is allowed. (The classifier lives once, in the keysources crate.)
+    if let Err(e) = freemkv_keysources::validate_keyserver_url(url) {
+        return reachability_for_unprobeable_url(&e);
+    }
+    // Pin DNS for the probe POST itself (anti-rebind between validate and
+    // connect); `validate_fetch_url` re-resolves and returns the addresses to
+    // pin the guarded agent to.
     let pinned = match crate::web::validate_fetch_url(url) {
         Ok(addrs) => addrs,
         Err(e) => return reachability_for_unprobeable_url(&e),
@@ -697,35 +601,40 @@ mod tests {
     #[test]
     fn ssrf_guard_blocks_metadata_and_internal_hosts() {
         // Cloud metadata endpoint — the canonical SSRF target.
-        assert!(validate_keyserver_url("http://169.254.169.254/latest/meta-data").is_err());
+        assert!(
+            freemkv_keysources::validate_keyserver_url("http://169.254.169.254/latest/meta-data")
+                .is_err()
+        );
         // Loopback and RFC1918.
-        assert!(validate_keyserver_url("https://127.0.0.1:8443/keys").is_err());
+        assert!(freemkv_keysources::validate_keyserver_url("https://127.0.0.1:8443/keys").is_err());
         // RFC1918 ranges (10/8, 192.168/16, 172.16/12). Built from octets so the
         // literal dotted-quads don't trip the public leak-guard — these are
         // generic examples, not infrastructure.
         for oct in [[10u8, 0, 0, 1], [192, 168, 1, 5], [172, 20, 4, 4]] {
             let url = format!("https://{}.{}.{}.{}/keys", oct[0], oct[1], oct[2], oct[3]);
             assert!(
-                validate_keyserver_url(&url).is_err(),
+                freemkv_keysources::validate_keyserver_url(&url).is_err(),
                 "RFC1918 {url} must be rejected"
             );
         }
         // IPv6 loopback / link-local (bracketed).
-        assert!(validate_keyserver_url("https://[::1]:443/k").is_err());
-        assert!(validate_keyserver_url("https://[fe80::1]/k").is_err());
+        assert!(freemkv_keysources::validate_keyserver_url("https://[::1]:443/k").is_err());
+        assert!(freemkv_keysources::validate_keyserver_url("https://[fe80::1]/k").is_err());
         // IPv4-mapped IPv6 loopback.
-        assert!(validate_keyserver_url("https://[::ffff:127.0.0.1]/k").is_err());
+        assert!(
+            freemkv_keysources::validate_keyserver_url("https://[::ffff:127.0.0.1]/k").is_err()
+        );
         // Non-http scheme rejected.
-        assert!(validate_keyserver_url("ftp://example.com/keys").is_err());
+        assert!(freemkv_keysources::validate_keyserver_url("ftp://example.com/keys").is_err());
         // No host.
-        assert!(validate_keyserver_url("https:///keys").is_err());
+        assert!(freemkv_keysources::validate_keyserver_url("https:///keys").is_err());
     }
 
     #[test]
     fn ssrf_guard_allows_public_literal_ip() {
         // A public literal IP must pass (no DNS needed, deterministic).
-        assert!(validate_keyserver_url("https://8.8.8.8/keys").is_ok());
-        assert!(validate_keyserver_url("https://1.1.1.1:443").is_ok());
+        assert!(freemkv_keysources::validate_keyserver_url("https://8.8.8.8/keys").is_ok());
+        assert!(freemkv_keysources::validate_keyserver_url("https://1.1.1.1:443").is_ok());
     }
 
     // The two rejection arms that fire BEFORE a host is extracted must never
@@ -734,7 +643,8 @@ mod tests {
     #[test]
     fn validate_keyserver_url_error_never_echoes_raw_token() {
         let scheme_missing =
-            validate_keyserver_url("keys.example.org/decode?token=SUPERSECRET").unwrap_err();
+            freemkv_keysources::validate_keyserver_url("keys.example.org/decode?token=SUPERSECRET")
+                .unwrap_err();
         assert!(
             !scheme_missing.contains("SUPERSECRET"),
             "scheme-missing error leaked the token: {scheme_missing}"
@@ -744,7 +654,9 @@ mod tests {
             "scheme-missing error leaked the query string: {scheme_missing}"
         );
 
-        let no_host = validate_keyserver_url("https:///decode?token=SUPERSECRET").unwrap_err();
+        let no_host =
+            freemkv_keysources::validate_keyserver_url("https:///decode?token=SUPERSECRET")
+                .unwrap_err();
         assert!(
             !no_host.contains("SUPERSECRET"),
             "no-host error leaked the token: {no_host}"
@@ -753,125 +665,6 @@ mod tests {
             !no_host.contains("token="),
             "no-host error leaked the query string: {no_host}"
         );
-    }
-
-    #[test]
-    fn ssrf_classifier_ranges() {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-        assert!(is_blocked_ip(Ipv4Addr::new(169, 254, 169, 254).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(10, 0, 0, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(127, 0, 0, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(100, 64, 0, 1).into())); // CGNAT
-        assert!(is_blocked_ip(Ipv4Addr::new(0, 0, 0, 0).into()));
-        assert!(!is_blocked_ip(Ipv4Addr::new(8, 8, 8, 8).into()));
-        assert!(!is_blocked_ip(Ipv4Addr::new(1, 1, 1, 1).into()));
-        assert!(is_blocked_ip(Ipv6Addr::LOCALHOST.into()));
-        assert!(!is_blocked_ip(
-            "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap().into()
-        ));
-    }
-
-    // Regression: to_ipv4_mapped() missed the deprecated IPv4-compatible form
-    // (::a.b.c.d), and v4+v6 multicast / Class-E were absent — divergence from
-    // web.rs's is_blocked_ip would be a SSRF middle-layer gap.
-    #[test]
-    fn ssrf_classifier_ipv4_compat_multicast_class_e() {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-
-        // IPv4-compatible ::127.0.0.1 (deprecated form, segments 0:0:0:0:0:0:7f00:1).
-        // to_ipv4_mapped() returns None for this; to_ipv4() returns Some(127.0.0.1).
-        let ipv4_compat_loopback = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001);
-        assert!(
-            is_blocked_ip(ipv4_compat_loopback.into()),
-            "::127.0.0.1 (IPv4-compatible) must be blocked"
-        );
-
-        // IPv4-compatible mapping of an RFC1918 address (deprecated ::a.b.c.d form).
-        let ipv4_compat_private = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 0x0001);
-        assert!(
-            is_blocked_ip(ipv4_compat_private.into()),
-            "IPv4-compatible RFC1918 address must be blocked"
-        );
-
-        // IPv4 multicast 224.0.0.1.
-        assert!(
-            is_blocked_ip(Ipv4Addr::new(224, 0, 0, 1).into()),
-            "IPv4 multicast must be blocked"
-        );
-        // IPv4 multicast 239.255.255.255 (upper boundary).
-        assert!(
-            is_blocked_ip(Ipv4Addr::new(239, 255, 255, 255).into()),
-            "IPv4 multicast upper boundary must be blocked"
-        );
-
-        // IPv6 multicast ff02::1.
-        assert!(
-            is_blocked_ip(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1).into()),
-            "IPv6 multicast must be blocked"
-        );
-
-        // Class-E 240.0.0.0/4 (reserved, not public).
-        assert!(
-            is_blocked_ip(Ipv4Addr::new(240, 0, 0, 1).into()),
-            "Class-E 240.0.0.1 must be blocked"
-        );
-        assert!(
-            is_blocked_ip(Ipv4Addr::new(255, 255, 255, 254).into()),
-            "Class-E 255.255.255.254 must be blocked"
-        );
-
-        // Sanity: public addresses must still be allowed.
-        assert!(!is_blocked_ip(Ipv4Addr::new(8, 8, 8, 8).into()));
-        assert!(!is_blocked_ip(
-            "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap().into()
-        ));
-    }
-
-    // IPv6 Unique-Local-Address range (`fc00::/7`) — IPv6's rough RFC1918
-    // equivalent — has no dedicated coverage elsewhere; a keyserver_url pointed
-    // at a bare ULA literal must still be rejected.
-    #[test]
-    fn ssrf_classifier_ipv6_unique_local_address() {
-        use std::net::Ipv6Addr;
-        assert!(is_blocked_ip("fc00::1".parse::<Ipv6Addr>().unwrap().into()));
-        // fd00::/8 is the "locally assigned" half of fc00::/7.
-        assert!(is_blocked_ip(
-            "fd12:3456::1".parse::<Ipv6Addr>().unwrap().into()
-        ));
-        // Sanity: a real global-unicast address just outside the range.
-        assert!(!is_blocked_ip(
-            "2001:4860:4860::8888".parse::<Ipv6Addr>().unwrap().into()
-        ));
-    }
-
-    // TEST-NET ranges (RFC 5737: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
-    // are `Ipv4Addr::is_documentation()` — defense-in-depth with no dedicated
-    // test elsewhere; the guard should still actually block them.
-    #[test]
-    fn ssrf_classifier_test_net_documentation_ranges() {
-        use std::net::Ipv4Addr;
-        assert!(is_blocked_ip(Ipv4Addr::new(192, 0, 2, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(198, 51, 100, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(203, 0, 113, 1).into()));
-    }
-
-    // CGNAT (100.64.0.0/10) is an AND of two conditions on DIFFERENT octets.
-    // A public address with second-octet in 64-127 but first octet != 100 must
-    // NOT be blocked — catches a regression that widened this check to an OR.
-    #[test]
-    fn ssrf_classifier_cgnat_does_not_overreach_public_space() {
-        use std::net::Ipv4Addr;
-        // Public IP with second-octet in the CGNAT-shaped bit pattern
-        // (64..127) but a first octet that is NOT 100 — must be allowed.
-        assert!(!is_blocked_ip(Ipv4Addr::new(93, 64, 0, 1).into()));
-        assert!(!is_blocked_ip(Ipv4Addr::new(8, 100, 0, 1).into()));
-        // Real CGNAT must still be blocked.
-        assert!(is_blocked_ip(Ipv4Addr::new(100, 64, 0, 1).into()));
-        assert!(is_blocked_ip(Ipv4Addr::new(100, 127, 255, 255).into()));
-        // Just outside the CGNAT /10 (100.128.0.0) must NOT be blocked by
-        // this term (first octet matches but second-octet bit pattern
-        // doesn't).
-        assert!(!is_blocked_ip(Ipv4Addr::new(100, 128, 0, 1).into()));
     }
 
     // Cross-side agreement: autorip's sample selector (`read_encrypted_units`)

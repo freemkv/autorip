@@ -489,7 +489,14 @@ pub(super) fn forget_device_session_state(device: &str) -> bool {
 /// `rediscover_drive` to verify a re-enumerated candidate carries the
 /// SAME disc, not an unrelated one in a neighbouring drive.
 pub(super) fn expected_volume_id(device: &str) -> Option<String> {
-    DISC_IDENTITY.lock().ok()?.get(device).cloned()
+    // Recover-and-proceed on poison (module convention): `.ok()?` would return
+    // None on a poisoned lock, driving `rediscover_drive` into its UNVERIFIED
+    // branch where it can latch the wrong disc in a neighbouring drive.
+    DISC_IDENTITY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(device)
+        .cloned()
 }
 
 // True iff `device` has a stored `DriveSession` with `scanned == true`. Lets
