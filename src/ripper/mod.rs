@@ -1581,6 +1581,18 @@ fn end_of_recovery_loss(
     }
 }
 
+/// Loop-top convergence gate for the patch retry loop, guarding the fail-open
+/// case the bare [`patch_pass_decision`] can't see: `Converged` fires on
+/// `scope_bad == 0`, but an EMPTY mapfile (0 sectors ripped) ALSO has zero bad
+/// bytes. "Nothing bad recorded" is not "everything good", so require that we
+/// actually read something (`bytes_good > 0`) first. A genuinely-complete rip
+/// (good spans the scope, zero bad) still converges; an empty mapfile falls
+/// through to run the pass rather than falsely reporting "100% recovered".
+/// See docs/ripper-mod-notes.md.
+fn pre_pass_converged(mux_scope_bad: u64, bytes_good: u64) -> bool {
+    bytes_good > 0 && patch_pass_decision(mux_scope_bad, None) == PatchDecision::Converged
+}
+
 // Look at the staging dirs for a Remux-eligible entry matching the
 // sanitized display_name of the currently-scanned disc; returns the
 // `ResumeClass::Remux` payload if found, else None. See docs/ripper-mod-notes.md.
@@ -3259,10 +3271,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                         bytes_pending + bytes_unreadable
                     }
                 };
-            // Loop-top convergence gate, via the unified strategy decision
-            // (`None` recovery ⇒ this is the pre-pass evaluation): Converged
-            // means the muxable scope is 100% recovered — stop and mux.
-            if patch_pass_decision(mux_scope_bad, None) == PatchDecision::Converged {
+            // Loop-top convergence gate (`None` recovery ⇒ pre-pass): Converged
+            // means the muxable scope is 100% recovered. Guarded by `bytes_good
+            // > 0` so an EMPTY mapfile (0 good, 0 bad) isn't mistaken for done.
+            if pre_pass_converged(mux_scope_bad, bytes_good) {
                 let scope_label = if output_is_iso_image(&cfg_read.output_format) {
                     "whole disc"
                 } else {
@@ -5799,10 +5811,10 @@ mod tests {
         end_of_recovery_promotion, fmts_gate_decision, fmts_gate_plan, format_lib_error,
         format_pass_error, header_phase_outcome_is_failure, incomplete_mux_status,
         is_fmts_key_missing_error, is_safe_staging_segment, list_staging_basenames,
-        patch_made_progress, patch_pass_decision, plan_passes, prune_intermediate_iso,
-        register_halt, resumable_dir_blocked, resumable_for_disc, scope_bad_bytes, scope_converged,
-        staging_dir_matches_disc, staging_disc_completed, staging_disc_owned_by_worker,
-        staging_free_bytes, sweep_transport_retry,
+        patch_made_progress, patch_pass_decision, plan_passes, pre_pass_converged,
+        prune_intermediate_iso, register_halt, resumable_dir_blocked, resumable_for_disc,
+        scope_bad_bytes, scope_converged, staging_dir_matches_disc, staging_disc_completed,
+        staging_disc_owned_by_worker, staging_free_bytes, sweep_transport_retry,
     };
     use crate::ripper::session::device_halt;
     use crate::ripper::staging;
@@ -6475,6 +6487,29 @@ mod tests {
             patch_pass_decision(2048, Some(4096)),
             PatchDecision::Continue
         );
+    }
+
+    // FAIL-OPEN GUARD: an empty mapfile (0 good, 0 bad) has zero bad bytes but
+    // must NOT read as a complete rip; `pre_pass_converged` adds `bytes_good > 0`
+    // on top of the bare decision. See docs/ripper-mod-notes.md.
+    #[test]
+    fn char_pre_pass_converged_requires_real_coverage() {
+        // Empty mapfile: 0 good, 0 bad. Bare decision says Converged, but the
+        // guarded gate must NOT — nothing was read, so run the pass.
+        assert_eq!(patch_pass_decision(0, None), PatchDecision::Converged);
+        assert!(
+            !pre_pass_converged(0, 0),
+            "empty mapfile (0 good, 0 bad) must NOT be treated as converged"
+        );
+        // Genuinely-complete scope: good spans the scope, zero bad → converged,
+        // so redundant passes are still skipped.
+        assert!(
+            pre_pass_converged(0, 4096),
+            "complete scope (good>0, bad==0) must still converge"
+        );
+        // Scope still bad → never converged regardless of good coverage.
+        assert!(!pre_pass_converged(2048, 4096));
+        assert!(!pre_pass_converged(2048, 0));
     }
 
     // PROMOTION DECISION: end-of-recovery promotes NonTrimmed →
