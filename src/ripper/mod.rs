@@ -1413,10 +1413,9 @@ pub fn staging_basename_for_device(cfg: &Config, device: &str) -> Option<String>
 // staging dir? Stops the unattended Default path from re-sweeping
 // over an ISO awaiting an operator Accept / run-another-pass decision.
 fn disc_loss_aborted(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
-    let cfg_read = match cfg.read() {
-        Ok(c) => c.clone(),
-        Err(_) => return false,
-    };
+    // Recover a poisoned lock instead of failing open: returning false here
+    // re-sweeps an ISO awaiting an operator Accept / run-another-pass decision.
+    let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
     let Some(sanitized) = staging_basename_for_device(&cfg_read, device) else {
         return false;
     };
@@ -1474,10 +1473,9 @@ fn staging_disc_completed(staging_root: &std::path::Path, sanitized: &str) -> bo
 // worker (`.ripped` pending, or `.muxing` held)? Refuses a fresh sweep
 // that would truncate the ISO the worker is reading. See docs/ripper-mod-notes.md.
 fn disc_owned_by_worker(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
-    let cfg_read = match cfg.read() {
-        Ok(c) => c.clone(),
-        Err(_) => return false,
-    };
+    // Recover a poisoned lock instead of failing open: returning false here
+    // risks a fresh sweep truncating an in-flight mux ISO the worker is reading.
+    let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
     let Some(sanitized) = staging_basename_for_device(&cfg_read, device) else {
         return false;
     };
@@ -1678,10 +1676,9 @@ fn is_safe_staging_segment(seg: &str) -> bool {
 /// `/api/rip?resume=no` to give the user an explicit clean slate
 /// before a fresh sweep.
 fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
-    let cfg_read = match cfg.read() {
-        Ok(c) => c.clone(),
-        Err(_) => return,
-    };
+    // Recover a poisoned lock instead of silently no-op'ing the user's explicit
+    // clean-slate request: bailing here leaves stale staging for the fresh sweep.
+    let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
     // Wipe THIS disc's dir, not merely the one its title names: with a boxset
     // in the drive, `Movie` may belong to disc 1 while disc 2 owns `Movie_2`,
     // and wiping by title would destroy the wrong disc's staging.
@@ -1955,8 +1952,14 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         }
     };
 
-    // Preserve UI state
-    let prev = STATE.lock().ok().and_then(|s| s.get(device).cloned());
+    // Preserve UI state. Recover a poisoned STATE lock rather than dropping it
+    // (`.ok()` → None): the paired `update_state` below already recovers via
+    // into_inner, so this reader must too or poison blanks the disc-card metadata.
+    let prev = STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(device)
+        .cloned();
     update_state(
         device,
         RipState {
@@ -9253,6 +9256,44 @@ mod tests {
 
         forget_device(device);
         forget_device(unscanned);
+    }
+
+    // Regression: the resume-gate config reads must poison-recover, not
+    // fail open. Before the round-2 sweep, `disc_loss_aborted` and
+    // `disc_owned_by_worker` did `match cfg.read() { Err(_) => return false }`
+    // — a poisoned lock made them re-sweep an ISO awaiting Accept / truncate
+    // the mux worker's in-flight ISO. See docs/ripper-mod-notes.md.
+    #[test]
+    fn resume_gates_recover_from_a_poisoned_config_lock() {
+        let device = "sg_resume_gate_poison_test";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = seed_scanned_disc(device, "Poisoned Disc", tmp.path());
+        let sanitized = crate::util::sanitize_path_compact("Poisoned Disc");
+
+        // Arm both markers the gates protect.
+        staging_disc_with_markers(tmp.path(), &sanitized, &[staging::ABORTED_LOSS_MARKER]);
+        std::fs::write(tmp.path().join(&sanitized).join(".ripped"), b"{}").unwrap();
+
+        // Poison the CONFIG lock by panicking while its write guard is held.
+        let cfg_poison = cfg.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cfg_poison.write().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(cfg.is_poisoned(), "cfg lock must be poisoned for the test");
+
+        // Both gates must still SEE the markers — a fail-open `false` here
+        // would clobber the parked ISO / truncate the worker's read.
+        assert!(
+            super::disc_loss_aborted(&cfg, device),
+            "disc_loss_aborted must recover the poisoned lock, not re-sweep the .aborted-loss ISO"
+        );
+        assert!(
+            super::disc_owned_by_worker(&cfg, device),
+            "disc_owned_by_worker must recover the poisoned lock, not truncate the mux worker's ISO"
+        );
+
+        forget_device(device);
     }
 
     // A drive that is mid-rip must NOT have its STATE entry deleted just
