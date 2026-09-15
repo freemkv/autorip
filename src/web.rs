@@ -2271,6 +2271,11 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                     (((seg[6] ^ 0xffff) as u32) << 16) | ((seg[7] ^ 0xffff) as u32),
                 )
             });
+            // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) embeds the IPv4
+            // target in the last 32 bits; re-check it or an internal address
+            // slips through a NAT64 translator.
+            let nat64 = (seg[0] == 0x0064 && seg[1] == 0xff9b)
+                .then(|| std::net::Ipv4Addr::from(((seg[6] as u32) << 16) | (seg[7] as u32)));
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -2283,6 +2288,7 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                 || v6.to_ipv4().map(|m| is_blocked_ip(&IpAddr::V4(m))) == Some(true)
                 || sixtofour.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
                 || teredo.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
+                || nat64.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
         }
     }
 }
@@ -4313,6 +4319,24 @@ mod web_tests {
         // A 6to4 wrapping a PUBLIC IPv4 (8.8.8.8 → 2002:0808:0808::) is allowed.
         assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
             0x2002, 0x0808, 0x0808, 0, 0, 0, 0, 0
+        ))));
+    }
+
+    #[test]
+    fn ssrf_guard_blocks_embedded_ipv4_via_nat64() {
+        use std::net::Ipv6Addr;
+        // NAT64 well-known prefix 64:ff9b::/96 embeds the IPv4 in the last 32
+        // bits. 127.0.0.1 → 64:ff9b::7f00:0001.
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 0, 0, 0, 0, 0x7f00, 0x0001
+        ))));
+        // 169.254.169.254 (cloud metadata) → 64:ff9b::a9fe:a9fe.
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe
+        ))));
+        // NAT64 wrapping a PUBLIC IPv4 (8.8.8.8 → 64:ff9b::0808:0808) is allowed.
+        assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808
         ))));
     }
 
@@ -6968,7 +6992,11 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     // basename round-trip (GET returns just the filename, which must survive).
     if let Some(v) = patch.get("keydb_path").and_then(|v| v.as_str()) {
         let is_redacted_roundtrip = !v.is_empty() && !v.contains('/') && {
-            let stored = cfg.read().ok().and_then(|c| c.keydb_path.clone());
+            let stored = cfg
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .keydb_path
+                .clone();
             stored.as_deref().is_some_and(|s| {
                 std::path::Path::new(s)
                     .file_name()
