@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- freemkv firmware drives now unlock via the freemkv route again (keyless, drive-level). A data-phase bug in the vendor SET command (freemkv-unlock) made the firmware unlock fail and silently fall back to the AACS host-cert / online-key route; the unlocker matrix now reports `freemkv: yes` on a freemkv-firmware drive (hardware-confirmed on BU40N fw 0.8.1).
+- Empty ISO on a transient drive size-query failure (via libfreemkv): the READ CAPACITY query now retries and the rip errors clearly if the disc size can't be determined, instead of producing a silent 0-byte ISO reported as success.
 - Online key service: after a real `/decode` POST returns a definitive answer for a disc (e.g. HTTP 422 "licensed but unresolved", or 404), autorip no longer fires a second, redundant reachability probe. That probe was an empty-body POST against the POST-only `/decode` endpoint, which the decode server logged as `reject: malformed JSON body … 404` after every genuine no-key. The ripper now classifies genuine-no-key vs transient outage directly from the decode's own HTTP outcome (recorded by the online source): a `422`/`404`/`200` answer is a genuine no-key decided immediately with no extra POST, while `5xx`/`429`/transport failures still classify as a transient outage and drive the existing bounded outage-retry. A probe is used only when no decode HTTP answer exists (the online source was not attempted, or a path that never POSTed).
 
 ## [1.7.1] — UNRELEASED
