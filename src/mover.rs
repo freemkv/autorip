@@ -1551,7 +1551,7 @@ fn join_path(base: &str, leaf: &str) -> String {
 // replaces it (back-compat). See docs/mover.md — resolve_media_root.
 fn resolve_media_root(output_dir: &str, sub: &str) -> String {
     if sub.is_empty() {
-        return output_dir.to_string();
+        return output_dir.replace('\\', "/");
     }
     Path::new(output_dir)
         .join(sub)
@@ -1675,7 +1675,7 @@ pub(crate) fn check_configured_destinations(cfg: &Config) -> Vec<(String, String
     // path as output_dir is common) so the operator doesn't see the same
     // warning twice.
     let mut seen: Vec<String> = Vec::new();
-    for root in [movie_root, tv_root, Some(cfg.output_dir.clone())]
+    for root in [movie_root, tv_root, Some(cfg.output_dir.replace('\\', "/"))]
         .into_iter()
         .flatten()
     {
@@ -2248,7 +2248,13 @@ mod tests {
 
         // A relative sub joins UNDER the base.
         let joined = resolve_media_root(base, "movies");
-        assert_eq!(joined, Path::new(base).join("movies").to_string_lossy());
+        assert_eq!(
+            joined,
+            Path::new(base)
+                .join("movies")
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
         assert!(
             Path::new(&joined).starts_with(base),
             "a relative sub must stay under output_dir: {joined}"
@@ -4925,7 +4931,7 @@ mod tests {
             1,
             "only the missing movie_dir should be flagged"
         );
-        assert_eq!(problems[0].0, missing.to_string_lossy());
+        assert_eq!(problems[0].0, missing.to_string_lossy().replace('\\', "/"));
 
         // All-good config → no problems.
         let cfg_ok = cfg_with_dirs(&good.to_string_lossy(), "", &good.to_string_lossy());
