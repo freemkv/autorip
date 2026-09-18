@@ -9293,11 +9293,9 @@ mod tests {
         forget_device(unscanned);
     }
 
-    // Regression: the resume-gate config reads must poison-recover, not
-    // fail open. Before the round-2 sweep, `disc_loss_aborted` and
-    // `disc_owned_by_worker` did `match cfg.read() { Err(_) => return false }`
-    // — a poisoned lock made them re-sweep an ISO awaiting Accept / truncate
-    // the mux worker's in-flight ISO. See docs/ripper-mod-notes.md.
+    // Regression: the resume-gate config reads (`disc_loss_aborted`,
+    // `disc_owned_by_worker`) must poison-RECOVER, not fail open — a bad-lock
+    // fail-open re-swept an ISO awaiting Accept / truncated the mux's live ISO.
     #[test]
     fn resume_gates_recover_from_a_poisoned_config_lock() {
         let device = "sg_resume_gate_poison_test";

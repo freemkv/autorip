@@ -2265,9 +2265,8 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
         IpAddr::V6(v6) => {
             let seg = v6.segments();
             // 6to4 (2002::/16) embeds an IPv4 in segments[1..3]; Teredo
-            // (2001:0000::/32) embeds the client IPv4 in the last two segments,
-            // each XOR 0xffff. Both must be re-checked as their embedded IPv4 or
-            // an internal target slips through the tunnel.
+            // (2001:0000::/32) embeds it in the last two segments, each XOR 0xffff.
+            // Re-check both as their embedded IPv4 or an internal target tunnels in.
             let sixtofour = (seg[0] == 0x2002)
                 .then(|| std::net::Ipv4Addr::from(((seg[1] as u32) << 16) | (seg[2] as u32)));
             let teredo = (seg[0] == 0x2001 && seg[1] == 0x0000).then(|| {

@@ -1042,27 +1042,16 @@ mod tests {
         );
     }
 
-    // Regression guard (round-4 net): fail if ANY fail-open lock-poison form
-    // reappears in non-test code. Each prior audit pass converted the obvious
-    // form of the day and missed another SYNTACTIC form — `.lock().ok()`, then
-    // `match … Err(_) => <default>`, then `if let Ok(..) = X.lock()`, then
-    // `.map(…).unwrap_or_default()`. This greps every non-test `.rs` under
-    // `src/` for all of them at once so the next form can't slip through.
-    //
-    // Correct handling is recover-via-`unwrap_or_else(|e| e.into_inner())`.
-    // The surfaced-HTTP-500 / logged-retry handlers use `match … Err(_) => …`
-    // (no `let Ok`, no `.ok()`), which is deliberately NOT matched here. Test
-    // code is stripped first, so a `#[cfg(test)]` block that mirrors a
-    // production `if let Ok` for a poison-recovery unit test is exempt.
+    // Round-4 regression net: greps every non-test `.rs` under `src/` for ALL
+    // known fail-open lock-poison forms at once, so the next syntactic variant
+    // can't slip through. Rationale + what's NOT matched: docs/lock-poison-guard.md.
     #[test]
     fn no_fail_open_lock_poison_forms_in_src() {
         use std::path::{Path, PathBuf};
 
-        // Blank comments and string/char literals (replaced by spaces, newlines
-        // preserved) so a needle quoted in a comment (e.g. the `.lock().ok()?`
-        // named in a doc comment) or in a string is never mistaken for a real
-        // call site, and so braces inside strings can't skew the test-module
-        // brace match below.
+        // Blanks comments and string/char literals (→ spaces, newlines kept) so a
+        // needle quoted in a comment or string is never mistaken for a real call
+        // site, and braces inside strings can't skew the test-module brace match.
         fn blank_comments_and_strings(src: &str) -> String {
             let b = src.as_bytes();
             let mut out = vec![b' '; b.len()];
@@ -1229,12 +1218,9 @@ mod tests {
                 let a = locks.iter().any(|m| line.contains(&format!("{m}.ok()")));
                 // B: `if let Ok(..)`/`while let Ok(..)`/`let Ok(..) = .. else` on a lock.
                 let b = line.contains("let Ok(");
-                // C: ANY `.lock()`/`.read()`/`.write()` followed by an
-                //    `.unwrap_or*` that discards the poison — covering the bare
-                //    `.lock().unwrap_or_default()` / `.unwrap_or_else(|_| ..)` /
-                //    `.unwrap_or(default)` / `.map_err(|_| ()).unwrap_or_default()`
-                //    forms as well as the `.map(..).unwrap_or*` form. The recover
-                //    form keeps `into_inner`, so lines with it are allowed.
+                // C: ANY `.lock()`/`.read()`/`.write()` then an `.unwrap_or*` that
+                //    discards the poison (bare / `_default` / `_else` / `_or(x)` /
+                //    `.map(..).unwrap_or*`); `into_inner` lines recover, so allowed.
                 let c = line.contains(".unwrap_or") && !line.contains("into_inner");
                 if a || b || c {
                     hits.push(format!("{}: {}", path.display(), line.trim()));
