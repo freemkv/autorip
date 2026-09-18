@@ -2108,7 +2108,7 @@ mod tests {
     fn build_destination_movie_with_year() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Aurora Drift Two", 2024));
-        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None);
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None).replace('\\', "/");
         assert_eq!(
             dest,
             "/out/Movies/Aurora Drift Two (2024)/Aurora Drift Two (2024).mkv"
@@ -2130,7 +2130,8 @@ mod tests {
             media_type: String::new(),
             tmdb_id: 0,
         });
-        let dest = build_destination(&cfg, &tmdb, "Drive (2011) - 4K Ultra HD.mkv", None);
+        let dest = build_destination(&cfg, &tmdb, "Drive (2011) - 4K Ultra HD.mkv", None)
+            .replace('\\', "/");
         // Files under the movie library in a per-title folder. (sanitize_path_display
         // strips the parens from the disc-label title — same reason the mis-filed
         // name lacked them — so the leaf is "Drive 2011 - 4K Ultra HD".)
@@ -2160,7 +2161,7 @@ mod tests {
         // Reproduces the Mercy incident config (relative movie_dir, NFS output_dir).
         let cfg = cfg_with_dirs("movies", "", "/mnt/media/");
         let tmdb = Some(tmdb_movie("Mercy", 2023));
-        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv", None);
+        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv", None).replace('\\', "/");
         assert_eq!(
             dest, "/mnt/media/movies/Mercy (2023)/Mercy (2023).mkv",
             "a relative movie_dir must resolve UNDER output_dir on the NFS mount"
@@ -2193,7 +2194,7 @@ mod tests {
             media_type: "tv".into(),
             tmdb_id: 0,
         });
-        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv", None);
+        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv", None).replace('\\', "/");
         // No season parsed → default Season 01; series folder carries the year.
         assert_eq!(
             dest,
@@ -2215,7 +2216,7 @@ mod tests {
     fn build_destination_absolute_movie_dir_overrides_output_dir() {
         let cfg = cfg_with_dirs("/srv/library/movies", "", "/mnt/media/");
         let tmdb = Some(tmdb_movie("Mercy", 2023));
-        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv", None);
+        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv", None).replace('\\', "/");
         assert_eq!(
             dest, "/srv/library/movies/Mercy (2023)/Mercy (2023).mkv",
             "an absolute movie_dir must override output_dir (Path::join semantics)"
@@ -2345,7 +2346,7 @@ mod tests {
     fn build_destination_movie_without_year_falls_through() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Unknown Year", 0));
-        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None);
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None).replace('\\', "/");
         // year=0 skips the "(YEAR)" suffix; mkv name derived from cleaned title.
         assert_eq!(dest, "/out/Movies/Unknown Year/Unknown Year.mkv");
     }
@@ -2361,14 +2362,14 @@ mod tests {
             media_type: "tv".into(),
             tmdb_id: 0,
         });
-        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv", None);
+        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv", None).replace('\\', "/");
         assert_eq!(dest, "/out/TV/Severance (2022)/Season 01/sev_s01e01.mkv");
     }
 
     #[test]
     fn build_destination_no_tmdb_falls_to_output_dir() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
-        let dest = build_destination(&cfg, &None, "disc.mkv", None);
+        let dest = build_destination(&cfg, &None, "disc.mkv", None).replace('\\', "/");
         assert_eq!(dest, "/out/disc.mkv");
     }
 
@@ -2376,7 +2377,7 @@ mod tests {
     fn build_destination_empty_movie_dir_falls_to_output_dir() {
         let cfg = cfg_with_dirs("", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Movie", 2020));
-        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None);
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None).replace('\\', "/");
         // movie_dir empty → fall-through to output_dir + filename.
         assert_eq!(dest, "/out/disc.mkv");
     }
@@ -2388,7 +2389,8 @@ mod tests {
     fn build_destination_empty_tv_dir_falls_to_output_dir() {
         let cfg = cfg_with_dirs("/out/Movies", "", "/out");
         let tv = tmdb_tv("Severance", 2022);
-        let dest = build_destination(&cfg, &Some(tv.clone()), "sev_s01e01.mkv", None);
+        let dest =
+            build_destination(&cfg, &Some(tv.clone()), "sev_s01e01.mkv", None).replace('\\', "/");
         assert_eq!(
             dest, "/out/sev_s01e01.mkv",
             "an empty tv_dir must fall through to the output root, not \
@@ -2418,7 +2420,7 @@ mod tests {
                 let mut r = tmdb_movie("Some Title", 2024);
                 r.media_type = media_type.to_string();
                 let root = destination_root(&cfg, &Some(r.clone()));
-                let dest = build_destination(&cfg, &Some(r), "Disc.mkv", None);
+                let dest = build_destination(&cfg, &Some(r), "Disc.mkv", None).replace('\\', "/");
                 assert!(
                     dest.starts_with(&format!("{root}/")),
                     "dest {dest} must live under the validated root {root} \
@@ -2468,7 +2470,7 @@ mod tests {
     fn build_destination_movie_preserves_m2ts_extension() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Movie", 2024));
-        let dest = build_destination(&cfg, &tmdb, "00800.m2ts", None);
+        let dest = build_destination(&cfg, &tmdb, "00800.m2ts", None).replace('\\', "/");
         assert_eq!(dest, "/out/Movies/Movie (2024)/Movie (2024).m2ts");
     }
 
