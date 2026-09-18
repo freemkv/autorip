@@ -131,7 +131,7 @@ fn warn_bad_key_throttled() {
 /// progressive-fallback trimming both live here so the lookup and the
 /// auto-file gate ([`is_confident_match`]) never disagree on what was
 /// searched. Queries the cleaned label, then on no confident match peels
-/// junk-shaped trailing tokens one at a time and re-queries ([`query_variants`]).
+/// junk-shaped trailing tokens one at a time and re-queries (`query_variants`).
 /// Returns the first confident match (exact title + year) across the
 /// variants, else the best non-exact guess. See docs/tmdb.md — lookup.
 pub fn lookup(label: &str, api_key: &str) -> Option<TmdbResult> {
@@ -358,7 +358,7 @@ fn strip_paren_year(s: &str) -> String {
 
 /// Clean a disc label for TMDB search: "AURORA_DRIFT_TWO" -> "Aurora Drift Two"
 /// Strips common disc suffixes like "4K Ultra HD", "Blu-ray", "DVD", etc., and
-/// a parenthesized release year (see [`strip_paren_year`]).
+/// a parenthesized release year (see `strip_paren_year`).
 pub fn clean_title(label: &str) -> String {
     let s = label.replace(['_', '-'], " ");
     let s = strip_paren_year(&s);
@@ -459,7 +459,7 @@ fn strip_trailing_season(s: &str) -> Option<&str> {
 ///
 /// A season marker is the signal that a disc is TV rather than a film, and the
 /// number is what the mover uses to place the rip under `Show (Year)/Season NN/`.
-/// Recognizes the spelled-out [`SEASON_WORDS`] followed by a number, or a
+/// Recognizes the spelled-out `SEASON_WORDS` followed by a number, or a
 /// compact `S<n>` token.
 pub fn season_from_label(label: &str) -> Option<u16> {
     number_after_word(label, SEASON_WORDS).or_else(|| compact_token_number(label, &["s"]))
@@ -647,8 +647,8 @@ pub struct EpisodeAssignment {
 
 /// Fetch a TV season's episode list from TMDB (`GET /3/tv/{id}/season/{n}`).
 ///
-/// Uses the same shared timeout-bounded [`AGENT`], size-capped JSON read, and
-/// no-redirect policy as [`fetch_multi`]. Returns an empty vec on ANY failure
+/// Uses the same shared timeout-bounded `AGENT`, size-capped JSON read, and
+/// no-redirect policy as `fetch_multi`. Returns an empty vec on ANY failure
 /// (bad id, no season, network, non-JSON) — the TV auto-naming path degrades to
 /// plain sequential numbering rather than blocking.
 pub fn season_episodes(tv_id: u64, season: u16, api_key: &str) -> Vec<Episode> {

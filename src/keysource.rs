@@ -340,7 +340,7 @@ const PROBE_TIMEOUT_SECS: u64 = 8;
 /// transport-fails (status `000`) and is misread as "DOWN", firing the pointless
 /// 3x outage-retry on every definitive 4xx. A POST gets a real status → answered
 /// → `Up`. Empty/SSRF-blocked URLs report [`ServiceReachability::Up`]; see
-/// [`reachability_for_unprobeable_url`].
+/// `reachability_for_unprobeable_url`.
 pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
     let url = cfg.keyserver_url.trim();
     if url.is_empty() {
@@ -386,7 +386,7 @@ pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
 /// genuine-no-key vs transient from THIS verdict instead of a second empty POST
 /// to the POST-only `/decode` (which logged a spurious `404` after every real
 /// no-key). Reading CONSUMES the value; the call site probes only on `None`.
-/// See [`reachability_from_decode`] for the mapping.
+/// See `reachability_from_decode` for the mapping.
 pub fn take_online_decode_reachability() -> Option<ServiceReachability> {
     freemkv_keysources::take_last_decode_reachability().map(reachability_from_decode)
 }
