@@ -2,6 +2,11 @@ name: doc-links
 
 # Fails on broken intra-doc links in `///`/`//!` doc comments (e.g. a `[Type]`
 # link to a renamed/removed item). Catches doc drift that `cargo build` misses.
+#
+# Resolves the freemkv siblings from their dev/qa tips exactly like ci.yml's
+# `lint` job — a plain `cargo doc` would resolve them from the committed
+# [patch.crates-io] GIT TAGS, which lag dev (e.g. an API added on dev but not
+# yet tagged), so the doc build would fail on symbols the real build sees fine.
 
 on: [push, pull_request]
 
@@ -9,10 +14,52 @@ jobs:
   doc-links:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/libfreemkv
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: libfreemkv
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-keysources
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-engine
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-engine
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-i18n
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-i18n
+      - uses: actions/checkout@v5
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: autorip
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: autorip
       - name: cargo doc (deny broken intra-doc links)
+        working-directory: autorip
         env:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
         run: cargo doc --no-deps --document-private-items --lib --bins
