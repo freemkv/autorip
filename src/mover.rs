@@ -1537,7 +1537,13 @@ fn build_destination(
 // path separator is used and a trailing slash on the base can't produce a `//`
 // in the delivered path. Replaces the old `format!("{base}/{leaf}")` joins.
 fn join_path(base: &str, leaf: &str) -> String {
-    Path::new(base).join(leaf).to_string_lossy().into_owned()
+    // POSIX '/' on every platform: autorip's library paths are Linux/NFS-style and
+    // Windows accepts '/' as a separator, so the output is stable across builds
+    // (Path::join would otherwise emit '\' on the Windows target).
+    Path::new(base)
+        .join(leaf)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 // Resolve a media subdirectory (movie_dir/tv_dir/iso_dir) UNDER output_dir
@@ -1550,7 +1556,7 @@ fn resolve_media_root(output_dir: &str, sub: &str) -> String {
     Path::new(output_dir)
         .join(sub)
         .to_string_lossy()
-        .into_owned()
+        .replace('\\', "/")
 }
 
 // The configured destination ROOT directory that governs a planned move,
