@@ -2263,12 +2263,12 @@ mod tests {
         // An absolute sub WINS outright — it must not be joined under base.
         assert_eq!(
             resolve_media_root(base, elsewhere),
-            elsewhere,
+            elsewhere.replace('\\', "/"),
             "an absolute media dir must override output_dir"
         );
 
         // An empty sub yields output_dir verbatim.
-        assert_eq!(resolve_media_root(base, ""), base);
+        assert_eq!(resolve_media_root(base, ""), base.replace('\\', "/"));
     }
 
     /// `absolute_for_log`'s actual invariant, on every platform: whatever goes
