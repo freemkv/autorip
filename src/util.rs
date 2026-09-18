@@ -87,7 +87,7 @@ fn ensure_safe_segment(s: String) -> String {
 ///
 /// Keeps `[A-Za-z0-9 \-_.]`, drops everything else, then collapses spaces
 /// to underscores. The result can never be empty, `.`, `..`, or all-dots —
-/// those collapse to a safe fallback (see [`ensure_safe_segment`]).
+/// those collapse to a safe fallback (see `ensure_safe_segment`).
 pub fn sanitize_path_compact(name: &str) -> String {
     let filtered = name
         .chars()
@@ -131,7 +131,7 @@ pub fn disc_variant_name(base: &str, variant: u32) -> String {
 /// kept (filesystems handle them, omitting them mangles "What's Up Doc").
 ///
 /// Same path-segment safety guarantee as [`sanitize_path_compact`]: the
-/// result is never empty, `.`, `..`, or all-dots (see [`ensure_safe_segment`]).
+/// result is never empty, `.`, `..`, or all-dots (see `ensure_safe_segment`).
 pub fn sanitize_path_display(name: &str) -> String {
     let filtered = name
         .chars()

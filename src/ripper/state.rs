@@ -202,7 +202,7 @@ pub struct RipState {
     #[serde(default)]
     pub started_epoch_secs: u64,
     /// Key readiness determined at scan time, for the dashboard tile:
-    /// "Ready to rip", "Missing keys — <reason>", or "" (unknown).
+    /// "Ready to rip", "Missing keys — `<reason>`", or "" (unknown).
     pub key_status: String,
 
     /// Resume affordance computed at scan time. `None` when there's no
