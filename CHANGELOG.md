@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.3] — UNRELEASED
+
+### Changed
+
+- Unified release with freemkv 1.7.3 (`info --share` disc-structure capture for bug reports + the multi-angle UHD main-title fix in libfreemkv; see the libfreemkv/freemkv 1.7.3 notes). No functional changes to this crate.
+
 ## [1.7.2] — UNRELEASED
 
 ### Fixed
