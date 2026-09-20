@@ -1531,11 +1531,11 @@ mod tests {
     #[test]
     fn resolve_keydb_no_legacy_when_home_absent() {
         let got = resolve_keydb(None, "/config", None, &none_exists);
+        // Lands on canonical AUTORIP_DIR path, NOT the bare relative "keydb.cfg"
+        // the HOME-less container collapsed to (#46). No is_absolute assert:
+        // "/config" isn't absolute on Windows; the equality already proves it.
         assert_eq!(got, PathBuf::from("/config/keydb.cfg"));
-        assert!(
-            got.is_absolute(),
-            "must be absolute, never a stray relative path"
-        );
+        assert_ne!(got, PathBuf::from("keydb.cfg"));
     }
 
     /// `keydb_path` honors an explicit config value end-to-end.
