@@ -1231,7 +1231,8 @@ function renderSettings(s){
     ]},
     {title:'Key Source',fields:[
       {key:'key_source',label:'AACS Key Source',type:'radio',options:[{value:'local',label:'Local KEYDB'},{value:'online',label:'Online Keyserver'}],hint:'Where per-disc AACS keys come from. Local uses a KEYDB.cfg on disk; Online queries a keyserver.'},
-      {key:'keydb_path',label:'KEYDB.cfg Location',type:'text',hint:'Path to KEYDB.cfg on disk (blank = default location).',indent:true,showIf:{key:'key_source',value:'local'}},
+      {key:'keydb_path',label:'KEYDB.cfg Location',type:'text',hint:'Path to KEYDB.cfg on disk. Blank = default: <AUTORIP_DIR>/keydb.cfg (normally /config/keydb.cfg in Docker).',placeholder:'/config/keydb.cfg',indent:true,showIf:{key:'key_source',value:'local'}},
+      {key:'keydb_resolved',label:'Resolved KEYDB path',type:'info',hint:'The exact file autorip reads keys from right now (after the box above + defaults). If it says NOT FOUND, place keydb.cfg there or set the location above.',indent:true,showIf:{key:'key_source',value:'local'}},
       {key:'keydb_url',label:'KEYDB Update URL',type:'text',hint:'HTTP URL to download KEYDB.cfg (zip, gz, or plain text).',indent:true,showIf:{key:'key_source',value:'local'}},
       {type:'action',action:"updateKeydb('keydb-status-settings')",button:'Update KEYDB',status:'keydb-status-settings',hint:'Download the KEYDB.cfg from the URL above into the configured location.',indent:true,showIf:{key:'key_source',value:'local'}},
       {key:'keyserver_url',label:'Keyserver URL',type:'text',hint:'Full keyserver endpoint URL — the decode request is POSTed here verbatim, so include the path (e.g. https://host/decode).',indent:true,showIf:{key:'key_source',value:'online'}},
@@ -1261,6 +1262,8 @@ function renderSettings(s){
         html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label>'+f.label+'</label><div style="margin-top:4px">'+opts+'</div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }else if(f.type==='bool'){
         html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label class="toggle"><input type="checkbox" data-key="'+f.key+'" '+(v?'checked':'')+'> '+f.label+'</label>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
+      }else if(f.type==='info'){
+        html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label>'+f.label+'</label><div style="margin-top:4px;font-family:monospace;font-size:.8rem;color:var(--text2);word-break:break-all">'+esc(String(v))+'</div>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }else{
         html+='<div class="setting" style="'+indent+hide+'"'+showAttr+'><label>'+f.label+'</label><input type="'+f.type+'" data-key="'+f.key+'" value="'+esc(String(v))+'"'+ph+'>'+(f.hint?'<div class="hint">'+f.hint+'</div>':'')+'</div>';
       }
@@ -2145,6 +2148,19 @@ fn settings_json_redacted(c: &Config) -> String {
             }
         }
     }
+    // Operator-facing, NOT persisted (serde drops it on POST): the ACTUAL path
+    // the keydb reads resolve to + whether a file is present there, so the
+    // Settings UI shows exactly where autorip looks for keys (issue #46).
+    let rp = crate::keysource::keydb_path(c);
+    v["keydb_resolved"] = serde_json::json!(format!(
+        "{}  —  {}",
+        rp.display(),
+        if rp.exists() {
+            "file present"
+        } else {
+            "NOT FOUND (autorip will report NO KEY here)"
+        }
+    ));
     v.to_string()
 }
 
@@ -3813,6 +3829,43 @@ mod web_tests {
         let json_empty: serde_json::Value =
             serde_json::from_str(&settings_json_redacted(&c_empty)).unwrap();
         assert_eq!(json_empty["keydb_path"], "");
+    }
+
+    // Operator-facing diagnostic (issue #46): GET /api/settings surfaces the
+    // ACTUAL resolved keydb path + present/absent status so the UI shows exactly
+    // where autorip reads keys — the missing signal that made #46 undiagnosable.
+    #[test]
+    fn settings_get_surfaces_resolved_keydb_path_and_status() {
+        // Present: canonical file exists at the resolved path.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            autorip_dir: tmp.path().to_string_lossy().into_owned(),
+            keydb_path: None,
+            ..Config::default()
+        };
+        let expected = tmp.path().join("keydb.cfg");
+        std::fs::write(&expected, "x").unwrap();
+        let json: serde_json::Value = serde_json::from_str(&settings_json_redacted(&cfg)).unwrap();
+        let resolved = json["keydb_resolved"].as_str().unwrap();
+        assert!(
+            resolved.contains(&expected.display().to_string()),
+            "resolved path must be shown for operator diagnosis: {resolved}"
+        );
+        assert!(resolved.contains("file present"));
+
+        // Absent: an explicit path with no file → NOT FOUND status.
+        let cfg2 = Config {
+            keydb_path: Some("/no/such/dir/keydb.cfg".into()),
+            ..Config::default()
+        };
+        let json2: serde_json::Value =
+            serde_json::from_str(&settings_json_redacted(&cfg2)).unwrap();
+        assert!(
+            json2["keydb_resolved"]
+                .as_str()
+                .unwrap()
+                .contains("NOT FOUND")
+        );
     }
 
     #[test]

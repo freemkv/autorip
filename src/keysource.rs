@@ -61,18 +61,47 @@ pub enum KeyOutcome {
 /// download, daily refresh, the web "Update KEYDB" button) MUST resolve through
 /// here so they agree. See [`save_keydb`] / [`keydb_exists`].
 pub fn keydb_path(cfg: &Config) -> PathBuf {
-    cfg.keydb_path
-        .clone()
-        .map(Into::into)
-        .or_else(service_default_keydb)
-        .unwrap_or_else(|| PathBuf::from("keydb.cfg"))
+    resolve_keydb(
+        cfg.keydb_path.as_deref(),
+        &cfg.autorip_dir,
+        legacy_home_keydb(),
+        &|p| p.exists(),
+    )
 }
 
-// autorip's default keydb location: `$HOME/.config/freemkv/keydb.cfg`.
-// The container bind-mounts the keydb there, so the service uses the
-// per-user config dir, not the CLI's exe-local default.
-fn service_default_keydb() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/freemkv/keydb.cfg"))
+/// Pure keydb-path resolution — injectable `exists`/`legacy` so the whole
+/// decision table is unit-testable with no env or filesystem. Order: (1) an
+/// explicit config path wins; (2) else the canonical `<autorip_dir>/keydb.cfg`
+/// (`/config/keydb.cfg` in Docker) — NOT `$HOME`-derived, which the HOME-less
+/// container collapsed to a stray relative path so `/config/keydb.cfg` was never
+/// read (issue #46); (3) else a pre-existing legacy `$HOME/.config/freemkv/
+/// keydb.cfg`, ONLY as an upgrade migration; (4) else canonical (write target).
+fn resolve_keydb(
+    configured: Option<&str>,
+    autorip_dir: &str,
+    legacy: Option<PathBuf>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+    if let Some(p) = configured.filter(|p| !p.is_empty()) {
+        return PathBuf::from(p);
+    }
+    let canonical = PathBuf::from(autorip_dir).join("keydb.cfg");
+    if exists(&canonical) {
+        return canonical;
+    }
+    if let Some(legacy) = legacy.filter(|l| exists(l)) {
+        return legacy;
+    }
+    canonical
+}
+
+// Legacy (pre-#46) default: `$HOME/.config/freemkv/keydb.cfg`. Consulted ONLY
+// as a migration fallback when the canonical AUTORIP_DIR path has no file yet.
+// An empty HOME (common in the container) yields None, never a stray relative path.
+fn legacy_home_keydb() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|home| PathBuf::from(home).join(".config/freemkv/keydb.cfg"))
 }
 
 /// Does autorip's keydb already exist at the service-canonical path?
@@ -157,7 +186,20 @@ pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
                 );
             }
         },
-        "local" => sources.push(Box::new(KeydbSource::new(keydb_path(cfg)))),
+        "local" => {
+            // Loud diagnostic when local keys are selected but no keydb exists at
+            // the resolved path — else every disc reports a bare "NO KEY" with no
+            // hint the file is just in the wrong place (issue #46).
+            let path = keydb_path(cfg);
+            if !path.exists() {
+                tracing::warn!(
+                    phase = "key_resolve",
+                    keydb_path = %path.display(),
+                    "local key source selected but NO keydb.cfg at the resolved path — every disc will report NO KEY until a keydb exists here; set 'KEYDB.cfg Location' or place the file at this path"
+                );
+            }
+            sources.push(Box::new(KeydbSource::new(path)));
+        }
         other => {
             // key_source is user-edited config; a typo ("onlnie") would
             // silently resolve keydb-only when the operator meant online.
@@ -837,39 +879,31 @@ mod tests {
         );
     }
 
-    // keydb path resolution (rc.6 WS3): with no explicit `keydb_path`, all
-    // resolvers fall through to the SAME service default (rc.6 bug: reads and
-    // writes disagreed). Reads the ambient $HOME rather than mutating it.
+    // keydb path resolution (#46): with no explicit `keydb_path`, reads/writes/
+    // gate all agree on canonical `<autorip_dir>/keydb.cfg`, NOT `$HOME`-derived.
+    // Deterministic — once the canonical file exists it wins over legacy/env.
     #[test]
-    fn keydb_resolvers_all_agree_on_service_default() {
-        let Some(home) = std::env::var_os("HOME") else {
-            // No HOME in this environment — the default falls back to a bare
-            // relative "keydb.cfg"; assert that fallback instead.
-            let cfg = Config::default();
-            assert_eq!(keydb_path(&cfg), PathBuf::from("keydb.cfg"));
-            return;
+    fn keydb_resolvers_agree_on_autorip_dir_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            autorip_dir: tmp.path().to_string_lossy().into_owned(),
+            keydb_path: None,
+            ..Config::default()
         };
+        let expected = tmp.path().join("keydb.cfg");
+        std::fs::write(&expected, "0xDEAD = t | U | 1-0x0000000000000000\n").unwrap();
 
-        let cfg = Config::default();
         assert_eq!(
             cfg.keydb_path, None,
-            "default config must carry no explicit keydb_path"
-        );
-
-        let expected = PathBuf::from(home).join(".config/freemkv/keydb.cfg");
-        assert_eq!(
-            service_default_keydb(),
-            Some(expected.clone()),
-            "service default must live under $HOME/.config/freemkv"
+            "default config carries no explicit keydb_path"
         );
         assert_eq!(
             keydb_path(&cfg),
             expected,
-            "keydb_path with no override must resolve to the service default, \
-             NOT a bare relative path or libfreemkv's exe-local default"
+            "no override → canonical <autorip_dir>/keydb.cfg, never $HOME-derived"
         );
         // The existence gate resolves through the same path the reads use.
-        assert_eq!(keydb_exists(&cfg), expected.exists());
+        assert!(keydb_exists(&cfg));
     }
 
     // An explicit `keydb_path` overrides the service default, and the existence
@@ -1430,5 +1464,87 @@ mod tests {
             ServiceReachability::Up,
             "an SSRF-blocked loopback URL is a permanent config verdict, not an outage"
         );
+    }
+
+    // ── keydb PATH resolution (issue #46) ── the full decision table, driven
+    //    through the pure `resolve_keydb` with an injected `exists` + `legacy`
+    //    so every branch is deterministic (no env, no filesystem). ──
+
+    fn none_exists(_: &std::path::Path) -> bool {
+        false
+    }
+
+    /// An explicit configured path always wins — even when the canonical file
+    /// also exists on disk.
+    #[test]
+    fn resolve_keydb_explicit_path_wins() {
+        let got = resolve_keydb(Some("/mnt/keys/keydb.cfg"), "/config", None, &|_| true);
+        assert_eq!(got, PathBuf::from("/mnt/keys/keydb.cfg"));
+    }
+
+    /// A blank configured path is treated as unset (the UI sends "" for empty).
+    #[test]
+    fn resolve_keydb_blank_config_falls_through_to_default() {
+        let got = resolve_keydb(Some(""), "/config", None, &none_exists);
+        assert_eq!(got, PathBuf::from("/config/keydb.cfg"));
+    }
+
+    /// Default with nothing on disk → the canonical AUTORIP_DIR path (the read +
+    /// write + download target). This is the #46 fix: `/config/keydb.cfg`, NOT a
+    /// `$HOME`-derived path.
+    #[test]
+    fn resolve_keydb_default_is_autorip_dir_when_nothing_exists() {
+        let got = resolve_keydb(None, "/config", None, &none_exists);
+        assert_eq!(got, PathBuf::from("/config/keydb.cfg"));
+    }
+
+    /// #46 scenario: a user drops keydb.cfg at /config/keydb.cfg → autorip now
+    /// resolves to exactly that file.
+    #[test]
+    fn resolve_keydb_finds_user_file_at_config() {
+        let canonical = PathBuf::from("/config/keydb.cfg");
+        let got = resolve_keydb(None, "/config", None, &|p| p == canonical);
+        assert_eq!(got, canonical);
+    }
+
+    /// Upgrade migration: canonical missing but a legacy $HOME keydb exists →
+    /// keep resolving to the legacy file (don't force a re-download).
+    #[test]
+    fn resolve_keydb_migrates_to_legacy_when_canonical_absent() {
+        let legacy = PathBuf::from("/root/.config/freemkv/keydb.cfg");
+        let lg = legacy.clone();
+        let got = resolve_keydb(None, "/config", Some(legacy.clone()), &move |p| p == lg);
+        assert_eq!(got, legacy);
+    }
+
+    /// Canonical present takes precedence over a legacy file (no accidental
+    /// migration once the new location is populated).
+    #[test]
+    fn resolve_keydb_canonical_beats_legacy_when_both_exist() {
+        let legacy = PathBuf::from("/root/.config/freemkv/keydb.cfg");
+        let got = resolve_keydb(None, "/config", Some(legacy), &|_| true);
+        assert_eq!(got, PathBuf::from("/config/keydb.cfg"));
+    }
+
+    /// Empty HOME (the container case that caused #46) yields no legacy path, so
+    /// resolution never collapses to a stray relative path — it lands on canonical.
+    #[test]
+    fn resolve_keydb_no_legacy_when_home_absent() {
+        let got = resolve_keydb(None, "/config", None, &none_exists);
+        assert_eq!(got, PathBuf::from("/config/keydb.cfg"));
+        assert!(
+            got.is_absolute(),
+            "must be absolute, never a stray relative path"
+        );
+    }
+
+    /// `keydb_path` honors an explicit config value end-to-end.
+    #[test]
+    fn keydb_path_uses_explicit_config_value() {
+        let cfg = Config {
+            keydb_path: Some("/mnt/archive/keydb.cfg".into()),
+            ..Config::default()
+        };
+        assert_eq!(keydb_path(&cfg), PathBuf::from("/mnt/archive/keydb.cfg"));
     }
 }
