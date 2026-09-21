@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.7.4]
+
+### Fixed
+
+- keydb verdicts are now actionable: a true miss is de-conflated from a matched-but-no-usable-VID result, with disc-hash and entry-shape logging (#46).
+- The keydb path default resolves to `<AUTORIP_DIR>/keydb.cfg`, and the resolved path is shown in the UI.
+- keydb fetch uses ureq 3.4.2 with a rolling-idle body timeout, so a slow-but-progressing download is no longer killed by an absolute deadline.
+
+### Maintenance
+
+- CI moved to the central reusable workflows; de-flaked a wall-clock-sensitive web timeout test.
+
 ## [1.7.3] — 2026-09-19
 
 ### Changed
