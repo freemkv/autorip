@@ -481,12 +481,24 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         tracing::warn!(phase = "key_resolve", "disc carries no AACS inputs");
         return (disc, KeyOutcome::MissingInputs);
     };
-    if inputs.volume_id == [0u8; 16] {
+    let vid_available = inputs.volume_id != [0u8; 16];
+    if !vid_available {
         tracing::warn!(
             phase = "key_resolve",
             "no Volume ID available; using all-zero VID — VID-keyed derivation may fail"
         );
     }
+
+    // Surface the exact identifier being looked up (issue #46): the library only
+    // logs it at debug on a `freemkv::*` target the default filter hides, so
+    // echo it here at info on autorip's own (visible) target.
+    tracing::info!(
+        phase = "key_resolve",
+        disc_hash = %inputs.disc_hash,
+        title = inputs.volume_label.as_deref().unwrap_or("<none>"),
+        vid_available,
+        "resolving keys for disc"
+    );
 
     // Read content samples for ciphertext validation, UNCONDITIONALLY — both
     // remaining sources need them (keydb UKs are only disproved by real
@@ -514,8 +526,29 @@ pub fn resolve_keys<A: DiscKeyAccess>(
     // Render the structured walk to the device log — ALWAYS, success or
     // failure: the "error-walk pillar". English lives here (app layer); the
     // library trace is typed enums only.
-    for line in render_resolution_trace(&trace) {
+    for line in render_resolution_trace(&trace, &inputs.disc_hash) {
         tracing::info!(phase = "key_resolve", "{line}");
+    }
+
+    // On a MATCHED entry, log its shape (booleans + lengths, no key material):
+    // WHICH material the found entry carried and whether a VID was available
+    // (issue #46) — turns a bare "matched disc > no key" into a report.
+    for step in &trace.keys {
+        if let Some(m) = step.matched_entry {
+            tracing::info!(
+                phase = "key_resolve",
+                source = %step.who,
+                disc_hash = %inputs.disc_hash,
+                has_vuk = m.has_vuk,
+                has_unit_keys = m.has_unit_keys,
+                unit_keys_len = m.unit_keys_len,
+                has_media_key = m.has_media_key,
+                has_keydb_vid = m.has_keydb_vid,
+                enc_title_keys_len = m.enc_title_keys_len,
+                vid_available = m.vid_available,
+                "matched keydb entry shape"
+            );
+        }
     }
 
     if resolved {
@@ -529,8 +562,11 @@ pub fn resolve_keys<A: DiscKeyAccess>(
 /// lines — one per unlocker and per key source consulted. The library trace is
 /// English-free typed enums; ALL English mapping lives here in the app layer.
 /// Shown on both success and failure so the operator always sees the walk.
-pub fn render_resolution_trace(trace: &ResolutionTrace) -> Vec<String> {
-    use libfreemkv::aacs::trace::{KeyNode, KeyOutcome as KO, UnlockOutcome};
+///
+/// `disc_hash` is the identifier being looked up, woven into a true-miss verdict
+/// so the line is self-diagnosing (issue #46).
+pub fn render_resolution_trace(trace: &ResolutionTrace, disc_hash: &str) -> Vec<String> {
+    use libfreemkv::aacs::trace::UnlockOutcome;
 
     let mkb = |m: Option<u32>| match m {
         Some(n) => format!(" (MKBv{n})"),
@@ -554,36 +590,76 @@ pub fn render_resolution_trace(trace: &ResolutionTrace) -> Vec<String> {
     }
 
     for step in &trace.keys {
-        // `who` is the source's own label() — printed verbatim (no enum to map).
-        let nodes: Vec<&str> = step
-            .path
-            .iter()
-            .map(|n| match n {
-                KeyNode::MatchedDisc => "matched disc",
-                KeyNode::NoEntry => "no entry",
-                KeyNode::FoundUnitKeys => "found unit keys",
-                KeyNode::FoundVuk => "found VUK",
-                KeyNode::FoundMediaKey => "found media key",
-                KeyNode::NeedVid => "need VID",
-                KeyNode::VidFromUnlock => "VID from drive",
-                KeyNode::VidFromKeydb => "VID from keydb",
-                KeyNode::NoVid => "no VID",
-                KeyNode::DerivedVuk => "derived VUK",
-                KeyNode::DerivedUnitKeys => "derived unit keys",
-            })
-            .collect();
-        let outcome = match step.outcome {
-            KO::Resolved => "RESOLVED",
-            KO::MissingVid => "MISSING VID",
-            KO::NoKey => "NO KEY",
-        };
-        let mut parts = vec![step.who.clone()];
-        parts.extend(nodes.into_iter().map(str::to_string));
-        parts.push(outcome.to_string());
-        lines.push(format!("key: {}", parts.join(" > ")));
+        lines.push(format!("key: {}", render_key_step(step, disc_hash)));
     }
 
     lines
+}
+
+/// Render one key source's step into an ACTIONABLE verdict (issue #46). Two
+/// de-conflated no-key shapes get a self-diagnosing line; everything else uses
+/// the generic typed-node join.
+fn render_key_step(step: &libfreemkv::aacs::trace::KeyStep, disc_hash: &str) -> String {
+    use libfreemkv::aacs::trace::{KeyNode, KeyOutcome as KO};
+
+    let who = &step.who;
+
+    // TRUE MISS: the disc hash was not in the store. Name the hash AND the store
+    // size so a reporter can confirm a wrong-pressing without extra logging.
+    if step.path.as_slice() == [KeyNode::NoEntry] {
+        return match step.store_entries {
+            Some(n) => {
+                format!(
+                    "{who} > no entry > disc hash {disc_hash} not in keydb ({n} entries loaded)"
+                )
+            }
+            None => format!("{who} > no entry > NO KEY"),
+        };
+    }
+
+    // MATCHED BUT NO KEY: the disc WAS found; say WHY nothing derived.
+    if step.outcome == KO::NoKey && step.path.first() == Some(&KeyNode::MatchedDisc) {
+        if step.path.contains(&KeyNode::NoVid) {
+            return format!("{who} > matched disc > no VID available > NO KEY");
+        }
+        if let Some(m) = step.matched_entry {
+            return format!(
+                "{who} > matched disc > entry has no usable keys \
+                 (vuk={} unit_keys={} enc_title_keys={} media_key={}) > NO KEY",
+                m.has_vuk, m.unit_keys_len, m.enc_title_keys_len, m.has_media_key
+            );
+        }
+        return format!("{who} > matched disc > entry has no usable keys > NO KEY");
+    }
+
+    // GENERIC: the typed-node walk (success paths, source failures, etc.).
+    let nodes: Vec<&str> = step
+        .path
+        .iter()
+        .map(|n| match n {
+            KeyNode::MatchedDisc => "matched disc",
+            KeyNode::NoEntry => "no entry",
+            KeyNode::NoDerivableKey => "no derivable key",
+            KeyNode::FoundUnitKeys => "found unit keys",
+            KeyNode::FoundVuk => "found VUK",
+            KeyNode::FoundMediaKey => "found media key",
+            KeyNode::NeedVid => "need VID",
+            KeyNode::VidFromUnlock => "VID from drive",
+            KeyNode::VidFromKeydb => "VID from keydb",
+            KeyNode::NoVid => "no VID",
+            KeyNode::DerivedVuk => "derived VUK",
+            KeyNode::DerivedUnitKeys => "derived unit keys",
+        })
+        .collect();
+    let outcome = match step.outcome {
+        KO::Resolved => "RESOLVED",
+        KO::MissingVid => "MISSING VID",
+        KO::NoKey => "NO KEY",
+    };
+    let mut parts = vec![who.clone()];
+    parts.extend(nodes.into_iter().map(str::to_string));
+    parts.push(outcome.to_string());
+    parts.join(" > ")
 }
 
 /// [`DiscKeyAccess`] backed by a live optical drive. Samples ciphertext
@@ -1400,6 +1476,7 @@ mod tests {
                 path: vec![
                     KeyNode::MatchedDisc,
                     KeyNode::NoEntry,
+                    KeyNode::NoDerivableKey,
                     KeyNode::FoundUnitKeys,
                     KeyNode::FoundVuk,
                     KeyNode::FoundMediaKey,
@@ -1411,21 +1488,27 @@ mod tests {
                     KeyNode::DerivedUnitKeys,
                 ],
                 outcome: KeyOutcome::Resolved,
+                matched_entry: None,
+                store_entries: None,
             },
             KeyStep {
                 who: "online".into(),
                 path: vec![KeyNode::NeedVid],
                 outcome: KeyOutcome::MissingVid,
+                matched_entry: None,
+                store_entries: None,
             },
             KeyStep {
                 who: "empty".into(),
                 path: vec![],
                 outcome: KeyOutcome::NoKey,
+                matched_entry: None,
+                store_entries: None,
             },
         ];
         let trace = ResolutionTrace { unlock, keys };
 
-        let lines = render_resolution_trace(&trace);
+        let lines = render_resolution_trace(&trace, "0xDEADBEEF");
         assert_eq!(
             lines,
             vec![
@@ -1435,12 +1518,86 @@ mod tests {
                 "unlock: u_rev > host cert revoked",
                 "unlock: u_hs > handshake rejected",
                 "unlock: u_vid > Volume ID unavailable",
-                "key: keydb > matched disc > no entry > found unit keys > found VUK > \
-                 found media key > need VID > VID from drive > VID from keydb > no VID > \
-                 derived VUK > derived unit keys > RESOLVED",
+                "key: keydb > matched disc > no entry > no derivable key > found unit keys > \
+                 found VUK > found media key > need VID > VID from drive > VID from keydb > \
+                 no VID > derived VUK > derived unit keys > RESOLVED",
                 "key: online > need VID > MISSING VID",
                 "key: empty > NO KEY",
             ]
+        );
+    }
+
+    /// Issue #46: a MATCHED-but-underivable (no VID) keydb hit renders the
+    /// actionable verdict `matched disc > no VID available > NO KEY`, never the
+    /// misleading `no entry`.
+    #[test]
+    fn matched_no_vid_renders_distinctly_from_a_true_miss() {
+        use libfreemkv::aacs::trace::{KeyNode, KeyOutcome, KeyStep, ResolutionTrace};
+
+        let trace = ResolutionTrace {
+            unlock: vec![],
+            keys: vec![KeyStep {
+                who: "keydb".into(),
+                path: vec![KeyNode::MatchedDisc, KeyNode::NoVid],
+                outcome: KeyOutcome::NoKey,
+                matched_entry: None,
+                store_entries: Some(500),
+            }],
+        };
+        assert_eq!(
+            render_resolution_trace(&trace, "0xABC"),
+            vec!["key: keydb > matched disc > no VID available > NO KEY"]
+        );
+    }
+
+    /// Issue #46: a matched entry with no usable keys dumps its shape, and a true
+    /// miss names the hash and the store size — the two are self-diagnosing and
+    /// clearly distinct.
+    #[test]
+    fn matched_no_material_and_true_miss_render_distinctly() {
+        use libfreemkv::aacs::trace::{
+            KeyNode, KeyOutcome, KeyStep, MatchedEntry, ResolutionTrace,
+        };
+
+        let matched = ResolutionTrace {
+            unlock: vec![],
+            keys: vec![KeyStep {
+                who: "keydb".into(),
+                path: vec![KeyNode::MatchedDisc, KeyNode::NoDerivableKey],
+                outcome: KeyOutcome::NoKey,
+                matched_entry: Some(MatchedEntry {
+                    has_vuk: false,
+                    has_unit_keys: false,
+                    unit_keys_len: 0,
+                    has_media_key: false,
+                    has_keydb_vid: false,
+                    enc_title_keys_len: 2,
+                    vid_available: false,
+                }),
+                store_entries: Some(500),
+            }],
+        };
+        assert_eq!(
+            render_resolution_trace(&matched, "0xABC"),
+            vec![
+                "key: keydb > matched disc > entry has no usable keys \
+                 (vuk=false unit_keys=0 enc_title_keys=2 media_key=false) > NO KEY"
+            ]
+        );
+
+        let miss = ResolutionTrace {
+            unlock: vec![],
+            keys: vec![KeyStep {
+                who: "keydb".into(),
+                path: vec![KeyNode::NoEntry],
+                outcome: KeyOutcome::NoKey,
+                matched_entry: None,
+                store_entries: Some(500),
+            }],
+        };
+        assert_eq!(
+            render_resolution_trace(&miss, "0x1234abcd"),
+            vec!["key: keydb > no entry > disc hash 0x1234abcd not in keydb (500 entries loaded)"]
         );
     }
 
