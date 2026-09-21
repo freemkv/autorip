@@ -19,10 +19,12 @@ arrives. Removal is caught by its sibling
 was proven red at 30s and green at 1s. This one guards the complementary
 property, and the two are only meaningful together.
 
-What this guards is the NEW idle knob: `timeout_recv_body` is ROLLING, so a
-body that keeps arriving must survive even when the transfer takes many
-times the idle bound. Wire it up as a total instead — the easy mistake —
-and this test fails. It is a guard on the fix, not a reproduction of the
+What this guards is the rolling idle bound (`STALL_TIMEOUT`, applied by
+`IdleReCapConnector` — see docs/web-ureq-agent.md), so a body that keeps
+arriving must survive even when the transfer takes many times the idle bound.
+Since ureq 3.4.1 (#1194) `timeout_recv_body` is a TOTAL body budget that no
+longer re-arms; wire the idle bound up as that total instead — the easy
+mistake — and this test fails. It is a guard on the fix, not a reproduction of the
 original defect: the budget change itself (`guarded_get`'s 30s →
 `KEYDB_TRANSFER_BUDGET`) has no automated proof here, because `guarded_get`
 resolves and rejects loopback before it connects, so no local listener can

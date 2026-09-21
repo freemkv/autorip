@@ -43,6 +43,34 @@ whatever it promised in its headers. This is the knob ureq 2's
 ROLLING, re-armed on every read that returns bytes, so it kills a stalled
 transfer without putting a ceiling on a slow-but-progressing one.
 
+## `IdleReCapConnector` (ureq 3.4.1+ rolling-idle restoration)
+
+ureq 3 has **no** config knob for a rolling idle bound. Early ureq 3
+(3.4.0) *appeared* to give one: `timeout_recv_body` was implemented by
+anchoring the active phase's deadline to `now` on every check, so it silently
+re-armed per read — exactly the rolling behaviour `STALL_TIMEOUT` wants, so
+autorip was built on it. ureq 3.4.1's "Fix timeout budgets restarting and
+applying to later phases" (#1194) corrected that bug: `timeout_recv_body` is
+now an ABSOLUTE deadline anchored at header completion — a TOTAL body budget
+that never re-arms — and (same fix) `timeout_recv_response` no longer caps
+the body at all. Under 3.4.2, then, a 20s `STALL_TIMEOUT` set as
+`timeout_recv_body` becomes a hard 20s ceiling on the WHOLE keydb download:
+a slow-but-progressing multi-MB body over a slow link is aborted mid-transfer.
+That is a real production regression, not just a test artifact.
+
+`IdleReCapConnector` reintroduces the rolling bound at the transport layer.
+Chained after `DefaultConnector` (which opens the TCP/TLS socket), it wraps
+the transport so every BODY `await_input` (the ones ureq tags
+`Timeout::RecvBody`) is capped to `idle`. ureq issues a fresh `await_input`
+per read and a read that returns bytes ends the wait, so capping each call to
+`idle` makes the bound roll: a byte resets the clock, a genuine `idle`-long
+stall trips it with `Error::Timeout(RecvBody)`. Connect and header phases are
+left on ureq's own timeouts (the cap is keyed on the `RecvBody` reason).
+
+With this in place `guarded_agent_with_timeouts` sets `timeout_recv_body =
+response` (the total-transfer ceiling) and layers `idle` on top as the rolling
+stall detector — restoring both properties the migration/3.4.1 took away.
+
 ## `guarded_agent_with_timeouts` (full detail)
 
 Builds a DNS-pinned, redirect-blocking ureq agent with caller-chosen
@@ -55,16 +83,19 @@ its socket) forever, so every caller must pass bounds. The key-service
 reachability probe wants to give up much sooner than a keydb download; the
 caller picks.
 
-`response` is NOT just a header timeout, despite ureq naming it
-`timeout_recv_response`. In ureq 3 the body read also checks its preceding
-timeout, and that deadline is absolute — `headers_complete + response` — so
-`response` is the ceiling on the WHOLE transfer. Measured against a real
-socket: with `response = 2s` a server that trickles one byte every 500 ms is
-killed at 2.0 s, four bytes in. Size it for the largest body this caller
-should ever accept, not for how long a header may take.
+`response` is the ceiling on the WHOLE transfer, not just header arrival.
+It is passed to BOTH `timeout_recv_response` (header wait) AND
+`timeout_recv_body` (the total body budget). The double wiring is deliberate:
+before ureq 3.4.1, `timeout_recv_response` alone capped the body too (the body
+read checked its preceding deadline), but #1194 stopped that — `recv_response`
+now bounds headers only, so the total-transfer ceiling has to be set as
+`timeout_recv_body` explicitly. Size `response` for the largest body this
+caller should ever accept, not for how long a header may take.
 
-`idle` is the rolling stall detector (`STALL_TIMEOUT`) — the one that
-catches a dead peer quickly regardless of how generous `response` is.
+`idle` is the rolling stall detector (`STALL_TIMEOUT`), applied by
+`IdleReCapConnector` (see above) — the one that catches a dead peer quickly
+regardless of how generous `response` is. ureq 3 no longer exposes it as a
+config knob, so it lives in the transport wrapper, not the `Config`.
 
 ## `ureq_error_kind`
 

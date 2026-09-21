@@ -2555,6 +2555,94 @@ pub(crate) fn ureq_error_kind(e: &ureq::Error) -> String {
 // timeout_read knob the 2→3 migration dropped. See docs/web-ureq-agent.md.
 pub(crate) const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+// Chained after DefaultConnector to re-arm a ROLLING per-read idle bound on
+// every body read, restoring the stall detection ureq 3.4.1 removed (#1194).
+// See docs/web-ureq-agent.md.
+#[derive(Debug)]
+struct IdleReCapConnector {
+    idle: std::time::Duration,
+}
+
+impl<In: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Connector<In>
+    for IdleReCapConnector
+{
+    type Out = IdleReCapTransport<In>;
+
+    fn connect(
+        &self,
+        _details: &ureq::unversioned::transport::ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| IdleReCapTransport {
+            inner,
+            idle: self.idle,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct IdleReCapTransport<In> {
+    inner: In,
+    idle: std::time::Duration,
+}
+
+impl<In> IdleReCapTransport<In> {
+    // Cap only BODY reads (reason RecvBody) at the idle bound; connect and
+    // header phases keep ureq's own timeouts. min keeps the tighter of a small
+    // total-body budget and idle. See docs/web-ureq-agent.md.
+    fn cap(
+        &self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> ureq::unversioned::transport::NextTimeout {
+        use ureq::unversioned::transport::time::Duration as UreqDuration;
+        if timeout.reason != ureq::Timeout::RecvBody {
+            return timeout;
+        }
+        let idle = UreqDuration::from_millis(self.idle.as_millis() as u64);
+        let after = if timeout.after < idle {
+            timeout.after
+        } else {
+            idle
+        };
+        ureq::unversioned::transport::NextTimeout {
+            after,
+            reason: ureq::Timeout::RecvBody,
+        }
+    }
+}
+
+impl<In: ureq::unversioned::transport::Transport> ureq::unversioned::transport::Transport
+    for IdleReCapTransport<In>
+{
+    fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<(), ureq::Error> {
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn await_input(
+        &mut self,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<bool, ureq::Error> {
+        let capped = self.cap(timeout);
+        self.inner.await_input(capped)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
+
 // Build the ONE DNS-pinned, redirect-blocking ureq agent, with caller-chosen
 // connect/response/idle timeouts (ureq sets no defaults, so an unresponsive
 // peer would otherwise block the thread forever). See docs/web-ureq-agent.md.
@@ -2564,16 +2652,22 @@ pub(crate) fn guarded_agent_with_timeouts(
     response: std::time::Duration,
     idle: std::time::Duration,
 ) -> ureq::Agent {
+    // response bounds header arrival and (as timeout_recv_body) the TOTAL body
+    // transfer; idle is the rolling stall bound, layered on by IdleReCapConnector
+    // since ureq 3 dropped it. See docs/web-ureq-agent.md.
     let config = ureq::config::Config::builder()
         .max_redirects(0)
         .timeout_connect(Some(connect))
         .timeout_recv_response(Some(response))
-        .timeout_recv_body(Some(idle))
+        .timeout_recv_body(Some(response))
         .build();
     // `with_parts`, never `new_with_config` — see [`PinnedResolver`].
+    // DefaultConnector opens the (TLS) socket; IdleReCapConnector wraps its
+    // transport to re-arm the rolling idle bound on every body read.
+    use ureq::unversioned::transport::Connector as _;
     ureq::Agent::with_parts(
         config,
-        ureq::unversioned::transport::DefaultConnector::new(),
+        ureq::unversioned::transport::DefaultConnector::new().chain(IdleReCapConnector { idle }),
         PinnedResolver(pinned),
     )
 }
@@ -4429,9 +4523,9 @@ mod web_tests {
         assert!(guarded_get("file:///etc/passwd").is_err());
     }
 
-    // A KEYDB body that is SLOW but PROGRESSING must finish — ureq 3's
-    // timeout_recv_response is an absolute header-anchored deadline that
-    // must not also cap a rolling-idle body. See docs/web-timeout-tests.md.
+    // A KEYDB body that is SLOW but PROGRESSING must finish. ureq 3.4.1 (#1194)
+    // made timeout_recv_body a TOTAL deadline that no longer re-arms; autorip
+    // restores the rolling idle bound itself. See docs/web-timeout-tests.md.
     #[test]
     fn a_slow_but_progressing_keydb_body_is_not_killed_by_the_header_deadline() {
         use std::io::{Read as _, Write as _};
