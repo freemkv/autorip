@@ -30,6 +30,20 @@ original defect: the budget change itself (`guarded_get`'s 30s →
 resolves and rejects loopback before it connects, so no local listener can
 stand in for a keydb mirror.
 
+### CI timing margins
+
+The stub server trickles 60 bytes 100ms apart (~6s total) against a 3s idle
+bound. Two ratios keep it both meaningful and robust on shared runners: the
+100ms per-gap sits 30x under the 3s idle bound, so a scheduling stall would have
+to balloon a single sleep 30-fold to spuriously trip it; and the ~6s total body
+runs 2x past that 3s bound, so a TOTAL (non-re-arming) interpretation of the
+idle bound would still fail. The pass condition asserts RELATIVE PROGRESS rather
+than a tight absolute deadline — the whole body arrives AND the transfer's
+elapsed time exceeds the idle bound, which is only possible if the bound
+re-armed. A slower runner only makes `elapsed` larger, so it cannot cause a
+false failure. (The earlier 100ms-vs-1s / ~4s-vs-1s numbers gave only 10x per-gap
+headroom and flaked when a runner stretched one sleep past the 1s bound.)
+
 ## `a_stalled_body_is_cut_off_by_the_idle_bound_not_the_total_budget`
 
 The other half: a peer that sends headers and then NOTHING must be cut off

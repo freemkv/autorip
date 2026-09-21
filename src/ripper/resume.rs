@@ -984,9 +984,8 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     };
 
     // TMDB metadata source of truth: the DURABLE on-disk `.ripped` marker, NOT
-    // in-memory STATE. STATE is populated by the fresh-rip scan and is EMPTY on
-    // a cold operator-resume, so the marker is the durable artifact we read
-    // from, not a value relayed through ephemeral in-memory state.
+    // in-memory STATE — STATE is populated by the fresh-rip scan and is EMPTY on
+    // a cold operator-resume, so the durable marker is what we read from.
     let state_tmdb = super::STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1388,10 +1387,9 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         );
         return;
     }
-    // TV fan-out: the primary episode is muxed + durable above. Now mux the
-    // REMAINING episodes from the same ISO, one file each, reusing the disc's
-    // already-loaded structure. The primary episode is seeded first (muxed +
-    // durable above) and becomes the hand-off `outputs[]`. No-op for movies.
+    // TV fan-out: the primary episode is muxed + durable above and seeds the
+    // hand-off `outputs[]`. Now mux the REMAINING episodes from the same ISO, one
+    // file each, reusing the disc's already-loaded structure. No-op for movies.
     let mut delivered: Vec<staging::Output> = plan_outputs.first().cloned().into_iter().collect();
     // Network output streams to a SINGLE sink — it can't take N distinct episode
     // files and there's no mover step to relocate local ones, so don't fan out

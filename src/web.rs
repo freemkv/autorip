@@ -2685,10 +2685,9 @@ pub(crate) fn webhook_agent() -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-// SSRF-guarded HTTP GET: the single entry point any code path fetching an
-// operator-supplied URL should use, instead of calling ureq::get directly
-// and bypassing the guard. `pub` because the lib facade re-exports this
-// module too and only the bin/tests call it. See docs/web-http-client.md.
+// SSRF-guarded HTTP GET: the single entry point for fetching an operator-
+// supplied URL, instead of ureq::get directly (which bypasses the guard).
+// `pub` for the lib facade re-export; only bin/tests call it. See docs/web-http-client.md.
 pub fn guarded_get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
     guarded_get_within(url, KEYDB_TRANSFER_BUDGET)
 }
@@ -4545,12 +4544,12 @@ mod web_tests {
                     Ok(_) => head.push(byte[0]),
                 }
             }
-            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n");
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 60\r\n\r\n");
             let _ = sock.flush();
-            // Forty bytes, 100 ms apart: ~4 s of body, with no single gap
+            // Sixty bytes, 100 ms apart: ~6 s of body, with no single gap
             // anywhere near the idle bound. The TOTAL is what matters — see
             // the timeout comment below.
-            for _ in 0..40 {
+            for _ in 0..60 {
                 if sock.write_all(b"k").is_err() {
                     return;
                 }
@@ -4559,21 +4558,24 @@ mod web_tests {
             }
         });
 
-        // Two numbers this test lives or dies by: 100ms per-gap vs 1s idle
-        // bound (10x CI margin), and ~4s total body vs that same 1s bound
-        // (4x, so a ROLLING bound passes and a TOTAL interpretation fails).
+        // 100ms per-gap vs a 3s idle bound (30x headroom, so a scheduling stall
+        // can't spuriously trip it), and ~6s total body vs that 3s bound (2x, so
+        // a TOTAL interpretation still fails). See docs/web-timeout-tests.md.
+        let idle = std::time::Duration::from_secs(3);
         let agent = guarded_agent_with_timeouts(
             vec![pinned],
             std::time::Duration::from_secs(5),
             std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(1),
+            idle,
         );
         let resp = agent
             .get("http://keydb-mirror.test/keydb.zip")
             .call()
             .expect("headers must arrive");
+        let started = std::time::Instant::now();
         let mut body = Vec::new();
         let read = resp.into_body().into_reader().read_to_end(&mut body);
+        let elapsed = started.elapsed();
         let _ = server.join();
 
         assert!(
@@ -4581,7 +4583,15 @@ mod web_tests {
             "a steadily-progressing body was aborted: {:?}",
             read.err()
         );
-        assert_eq!(body, vec![b'k'; 40], "the whole body must arrive");
+        assert_eq!(body, vec![b'k'; 60], "the whole body must arrive");
+        // Relative-progress proof, robust to runner speed: the transfer outlasted
+        // one idle window, so a TOTAL interpretation would have killed it — it did
+        // not, therefore the bound rolled (a slow runner only grows `elapsed`).
+        assert!(
+            elapsed > idle,
+            "body finished within a single idle window ({elapsed:?} <= {idle:?}); \
+             the rolling-vs-total distinction is no longer exercised"
+        );
     }
 
     // The other half: a peer sending headers then NOTHING must be cut off by

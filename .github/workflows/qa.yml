@@ -10,9 +10,10 @@ name: qa
 # that a commit is production worth: everything expensive that can run without
 # physical media. `main` only ever receives a qa that went green here.
 #
-# Sibling repos are checked out at `qa`, NOT `dev`. A qa run that resolved its
-# dependencies from dev tips would be validating a combination that is not the
-# one being released, which is the exact failure this branch exists to prevent.
+# Sibling repos are checked out at `qa`, NOT `dev`. The shared checkout-siblings
+# composite resolves the ref from the branch (qa->qa here, since this workflow
+# only ever runs on qa), so a qa run validates the exact combination being
+# released rather than dev tips.
 #
 # What this gate CANNOT cover: `disc://` and real `iso://` need physical media,
 # and no hosted runner has an optical drive or the image hoard. That leg is NOT
@@ -25,6 +26,11 @@ on:
   push:
     branches: [qa]
   workflow_dispatch:
+
+# A newer push to qa supersedes its own in-progress run instead of stacking.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # ── Name the candidate ────────────────────────────────────────────────
@@ -82,43 +88,11 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: actions/checkout@v5
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/libfreemkv
-          ref: qa
-          path: libfreemkv
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-keysources
-          ref: qa
-          path: freemkv-keysources
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-engine
-          ref: qa
-          path: freemkv-engine
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-i18n
-          ref: qa
-          path: freemkv-i18n
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-unlock
-          ref: qa
-          path: freemkv-unlock
-      - name: Resolve siblings from their qa tips
-        shell: bash
-        working-directory: autorip
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          libfreemkv = { path = "../libfreemkv" }
-          freemkv-keysources = { path = "../freemkv-keysources" }
-          freemkv-engine = { path = "../freemkv-engine" }
-          freemkv-i18n = { path = "../freemkv-i18n" }
-          EOF
+          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          self: autorip
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -164,43 +138,11 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: actions/checkout@v5
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/libfreemkv
-          ref: qa
-          path: libfreemkv
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-keysources
-          ref: qa
-          path: freemkv-keysources
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-engine
-          ref: qa
-          path: freemkv-engine
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-i18n
-          ref: qa
-          path: freemkv-i18n
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-unlock
-          ref: qa
-          path: freemkv-unlock
-      - name: Resolve siblings from their qa tips
-        shell: bash
-        working-directory: autorip
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          libfreemkv = { path = "../libfreemkv" }
-          freemkv-keysources = { path = "../freemkv-keysources" }
-          freemkv-engine = { path = "../freemkv-engine" }
-          freemkv-i18n = { path = "../freemkv-i18n" }
-          EOF
+          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          self: autorip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -217,43 +159,11 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: actions/checkout@v5
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/libfreemkv
-          ref: qa
-          path: libfreemkv
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-keysources
-          ref: qa
-          path: freemkv-keysources
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-engine
-          ref: qa
-          path: freemkv-engine
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-i18n
-          ref: qa
-          path: freemkv-i18n
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-unlock
-          ref: qa
-          path: freemkv-unlock
-      - name: Resolve siblings from their qa tips
-        shell: bash
-        working-directory: autorip
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          libfreemkv = { path = "../libfreemkv" }
-          freemkv-keysources = { path = "../freemkv-keysources" }
-          freemkv-engine = { path = "../freemkv-engine" }
-          freemkv-i18n = { path = "../freemkv-i18n" }
-          EOF
+          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          self: autorip
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -274,43 +184,11 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: actions/checkout@v5
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/libfreemkv
-          ref: qa
-          path: libfreemkv
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-keysources
-          ref: qa
-          path: freemkv-keysources
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-engine
-          ref: qa
-          path: freemkv-engine
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-i18n
-          ref: qa
-          path: freemkv-i18n
-      - uses: actions/checkout@v5
-        with:
-          repository: freemkv/freemkv-unlock
-          ref: qa
-          path: freemkv-unlock
-      - name: Resolve siblings from their qa tips
-        shell: bash
-        working-directory: autorip
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          libfreemkv = { path = "../libfreemkv" }
-          freemkv-keysources = { path = "../freemkv-keysources" }
-          freemkv-engine = { path = "../freemkv-engine" }
-          freemkv-i18n = { path = "../freemkv-i18n" }
-          EOF
+          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          self: autorip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
