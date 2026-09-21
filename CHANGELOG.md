@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.7.4] — UNRELEASED
+## [1.7.4] — 2026-09-21
 ### Fixed
 
 - keydb verdicts are now actionable: a true miss is de-conflated from a matched-but-no-usable-VID result, with disc-hash and entry-shape logging (#46).
