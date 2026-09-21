@@ -72,14 +72,14 @@ jobs:
           expected = f"?tag={tag}"
           if not lock_src or "git+https://github.com/freemkv/libfreemkv" not in lock_src:
               print(f"::error::Cargo.lock libfreemkv must come from the libfreemkv git repo, "
-                    f"not crates.io or a local path. Regenerate with the release script "
+                    f"not crates.io or a local path. Regenerate via release-orchestrate.yml "
                     f"(the committed [patch.crates-io] redirects it to the git tag). "
                     f"(saw source={lock_src!r})")
               sys.exit(1)
           if expected not in lock_src:
               print(f"::error::Cargo.lock libfreemkv git source is {lock_src!r} but this "
                     f"release tag is {tag}; expected the source to pin {expected}. "
-                    f"The release script must re-pin the [patch.crates-io] tag before regen.")
+                    f"release-orchestrate.yml must re-pin the [patch.crates-io] tag before regen.")
               sys.exit(1)
           print(f"Cargo.lock libfreemkv = {lock_ver} from {lock_src} (OK)")
           PY
@@ -87,8 +87,8 @@ jobs:
   # Tests run as a PARALLEL TRIPWIRE: they fail the run if they fail, but the
   # build/docker jobs do NOT `needs:` this job, so artifact build starts
   # immediately rather than serializing behind the test suite. The tag decision
-  # was already gated by the local precommit (same stable Rust this workflow
-  # pins below and in `build`, same commit) — CI
+  # was already gated by CI (ci.yml on dev, then a green qa.yml) on the same
+  # stable Rust this workflow pins below and in `build`, same commit — the CI
   # tests here are a safety net, not the gate.
   test:
     needs: verify

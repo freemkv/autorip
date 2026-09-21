@@ -18,7 +18,7 @@ concurrency:
 # WHY THE SIBLING CHECKOUTS — this is NOT a monorepo.
 #
 # The committed Cargo.toml resolves every freemkv crate from a git TAG, and one
-# of those tags (freemkv-engine v1.6.0) DOES NOT EXIST until release.sh creates
+# of those tags (freemkv-engine v1.6.0) DOES NOT EXIST until release-orchestrate.yml creates
 # it. So every job here failed at dependency resolution with "failed to find tag
 # v1.6.0" before compiling a line. Even once that tag exists, pinning it means
 # CI validates this branch against the last release of the libraries rather than
@@ -37,7 +37,7 @@ concurrency:
 # `--locked` is not used. The committed Cargo.lock resolves the freemkv crates
 # as path packages and carries [[patch.unused]] entries — artifacts of whichever
 # local cargo config last wrote it, describing a developer's machine rather than
-# a release. release.sh regenerates it with the real tags at ship time, which is
+# a release. release-orchestrate.yml regenerates it with the real tags at ship time, which is
 # where the pin has to hold.
 #
 # OS COVERAGE. autorip rips discs through /dev/sg*, so Linux is what it RUNS on
@@ -140,7 +140,7 @@ jobs:
   # same reason the rest of this file omits it (see the header note). No
   # `needs:`/aggregator wires this job into a required gate, and Codecov is
   # configured informational-only (see codecov.yml), so it never blocks a merge
-  # or the release.sh CI gate.
+  # or the release-orchestrate.yml preflight.
   coverage:
     runs-on: ubuntu-latest
     steps:
@@ -211,9 +211,8 @@ jobs:
     # to agree is what a release candidate is for.
     #
     # `if` SKIPS the job (it does not queue). A queued job would be far worse
-    # than a slow one: release.sh's CI gate refuses while any run for the
-    # commit is still in progress, so a never-scheduled job blocks releases
-    # silently -- see the note on real-media in qa.yml.
+    # than a slow one: a never-scheduled job leaves the run pending forever, so
+    # the branch's required checks never report complete.
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
     steps:
@@ -255,9 +254,8 @@ jobs:
     # to agree is what a release candidate is for.
     #
     # `if` SKIPS the job (it does not queue). A queued job would be far worse
-    # than a slow one: release.sh's CI gate refuses while any run for the
-    # commit is still in progress, so a never-scheduled job blocks releases
-    # silently -- see the note on real-media in qa.yml.
+    # than a slow one: a never-scheduled job leaves the run pending forever, so
+    # the branch's required checks never report complete.
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
     steps:
