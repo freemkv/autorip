@@ -45,12 +45,12 @@ pub enum KeyOutcome {
     Resolved,
     /// Couldn't read the disc's key files, or the disc reported no titles.
     MissingInputs,
-    /// No configured source produced a key that decrypts this disc. Since the
-    /// reshaped `KeySource` no longer reports a per-source `errored()` signal, a
-    /// source that *failed* (e.g. an unreachable key service) is no longer
-    /// distinguished from one that simply had no key — both land here. The
-    /// per-source [`ResolutionTrace`] (rendered to the device log) carries the
-    /// finer-grained walk for diagnosis.
+    /// No configured source produced a key that decrypts this disc. A source
+    /// that *failed* (e.g. an unreachable key service) is NOT distinguished
+    /// from one that simply had no key — both land here, so this is never
+    /// enough on its own to tell an operator why. For the online source pair it
+    /// with [`ServiceReachability`] (see [`take_online_decode_reachability`]);
+    /// the per-source [`ResolutionTrace`] carries the finer-grained walk.
     NoKey,
 }
 
@@ -297,38 +297,77 @@ pub fn uses_online(cfg: &Config) -> bool {
     cfg.key_source == "online"
 }
 
-/// Reachability verdict for the online key service, used to distinguish a
-/// *transient outage* (the service is down / throttled — a later attempt may
-/// succeed) from a *genuine no-key* (the service is up and simply has no key
-/// for this disc).
+/// What the online key service actually said about a disc — the verdict the
+/// operator-facing message is written from.
 ///
-/// A single bounded probe against the configured `keyserver_url` answers
-/// this; only the [`Up`](Self::Up) verdict means "no keys found" is final.
-/// See docs/keysource.md for the down-vs-no-key design rationale.
+/// The point of the enum is that "we never got an answer" and "we got a
+/// definitive answer of *no*" are DIFFERENT OUTCOMES and must never share a
+/// message: only [`Unreachable`](Self::Unreachable) / [`ServerError`](Self::ServerError)
+/// / [`RateLimited`](Self::RateLimited) are worth retrying, and only
+/// [`NoKeyForDisc`](Self::NoKeyForDisc) means the disc will never resolve from
+/// this service. See docs/keysource.md for the design rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceReachability {
-    /// The service answered with an HTTP status (any 2xx / 3xx / non-429 4xx).
-    /// It is UP — so a no-key result is a genuine missing key / auth rejection
-    /// for *this* disc, not an outage. Keep the existing behaviour.
-    Up,
-    /// Transport failure (connect refused / timeout / DNS / TLS) OR an HTTP
-    /// 5xx (502 / 503 / 504). The service is DOWN — a transient outage, NOT a
-    /// missing key. Retryable.
-    Down,
-    /// HTTP 429 — the service is up but rate-limiting us (quota). Transient;
-    /// a later attempt after backoff may succeed. Retryable.
+    /// The service answered normally (2xx / 3xx) and simply held no key — or
+    /// the verdict came from the bounded reachability probe, which proves the
+    /// service is up but says NOTHING about this particular disc. Either way
+    /// the ordinary "no key source has a key for this disc" text applies.
+    Answered,
+    /// Transport failure — connection refused, DNS failure, timeout, TLS error.
+    /// Nothing answered, so nothing is known about this disc. Retryable.
+    Unreachable,
+    /// HTTP 5xx — the service was reached but failed on its own side, so it
+    /// never got as far as an answer about this disc. Retryable.
+    ServerError(u16),
+    /// HTTP 429 — reached, but refusing requests for now (rate limit / quota).
+    /// It said nothing about this disc. Retryable, after a wait.
     RateLimited,
+    /// HTTP 422 — reached, licensed, and it DEFINITIVELY resolved no key for
+    /// this disc (it exhausted every candidate source before answering).
+    /// Terminal: retrying cannot change the answer.
+    NoKeyForDisc,
+    /// HTTP 404 — the request was refused as unlicensed / unknown, so the
+    /// service never looked for a key. Terminal until the licence or URL is
+    /// fixed; retrying unchanged cannot help.
+    NotLicensed,
+    /// Some other non-2xx status we have no specific meaning for. Terminal as
+    /// far as automatic retry goes — report the status rather than guess.
+    Unexpected(u16),
+    /// The configured key-service URL could not be used at all (empty, wrong
+    /// scheme, or blocked by the SSRF guard), so the service was never asked.
+    /// A standing misconfiguration, not an outage — terminal.
+    NotAsked,
 }
 
 impl ServiceReachability {
-    /// True for the retryable verdicts ([`Down`](Self::Down) /
-    /// [`RateLimited`](Self::RateLimited)) — the ones that must NOT be reported
-    /// as a permanent missing key.
+    /// True for the retryable verdicts — the ones where the service never
+    /// delivered a verdict about this disc and a later attempt genuinely may.
+    /// A definitive no-key ([`NoKeyForDisc`](Self::NoKeyForDisc)) is NOT
+    /// transient: retrying it is pointless work.
     pub fn is_transient(self) -> bool {
         matches!(
             self,
-            ServiceReachability::Down | ServiceReachability::RateLimited
+            ServiceReachability::Unreachable
+                | ServiceReachability::ServerError(_)
+                | ServiceReachability::RateLimited
         )
+    }
+
+    /// The HTTP status behind this verdict, when there was one. Carried so the
+    /// operator-facing message can quote it for support without the classifier
+    /// having to guess a cause. `None` when nothing answered.
+    pub fn http_status(self) -> Option<u16> {
+        match self {
+            ServiceReachability::ServerError(code) | ServiceReachability::Unexpected(code) => {
+                Some(code)
+            }
+            ServiceReachability::RateLimited => Some(429),
+            ServiceReachability::NoKeyForDisc => Some(422),
+            ServiceReachability::NotLicensed => Some(404),
+            ServiceReachability::Answered
+            | ServiceReachability::Unreachable
+            | ServiceReachability::NotAsked => None,
+        }
     }
 }
 
@@ -343,31 +382,32 @@ pub enum ProbeOutcome {
     Transport,
 }
 
-/// Map a probe outcome to a [`ServiceReachability`] verdict. Pure — the single
-/// source of truth for the down-vs-no-key decision, exercised directly by the
-/// unit tests.
-///
-/// * transport error, or HTTP 5xx (500-599)          → [`ServiceReachability::Down`]
-/// * HTTP 429                                         → [`ServiceReachability::RateLimited`]
-/// * any other HTTP status (2xx/3xx, and 4xx like 404/422) → [`ServiceReachability::Up`]
-///   — the service is reachable, so a no-key really is a missing key / auth wall.
+/// Map a **probe** outcome to a [`ServiceReachability`] verdict — transport →
+/// [`Unreachable`](ServiceReachability::Unreachable), 5xx →
+/// [`ServerError`](ServiceReachability::ServerError), 429 →
+/// [`RateLimited`](ServiceReachability::RateLimited), anything else →
+/// [`Answered`](ServiceReachability::Answered). DELIBERATELY coarser than the
+/// decode-side mapping: the probe carries no disc, so it can never yield a
+/// per-disc verdict. See docs/keysource.md.
 pub fn classify_reachability(outcome: ProbeOutcome) -> ServiceReachability {
     match outcome {
-        ProbeOutcome::Transport => ServiceReachability::Down,
+        ProbeOutcome::Transport => ServiceReachability::Unreachable,
         ProbeOutcome::Status(429) => ServiceReachability::RateLimited,
-        ProbeOutcome::Status(code) if (500..=599).contains(&code) => ServiceReachability::Down,
-        ProbeOutcome::Status(_) => ServiceReachability::Up,
+        ProbeOutcome::Status(code) if (500..=599).contains(&code) => {
+            ServiceReachability::ServerError(code)
+        }
+        ProbeOutcome::Status(_) => ServiceReachability::Answered,
     }
 }
 
-// What a URL we could not even validate says about the key SERVICE: a
-// permanent verdict (bad scheme/host/SSRF) means `Up` (genuine no-key), but
-// a failed DNS lookup means `Down` (transient). See docs/keysource.md.
+// What a URL we could not even validate says about the key SERVICE: a permanent
+// verdict (bad scheme/host/SSRF) means it was never asked, a failed DNS lookup
+// means it was unreachable (transient). See docs/keysource.md.
 fn reachability_for_unprobeable_url(err: &str) -> ServiceReachability {
     if crate::web::is_transient_resolve_error(err) {
-        ServiceReachability::Down
+        ServiceReachability::Unreachable
     } else {
-        ServiceReachability::Up
+        ServiceReachability::NotAsked
     }
 }
 
@@ -381,12 +421,12 @@ const PROBE_TIMEOUT_SECS: u64 = 8;
 /// POST (not GET) is load-bearing: the key service is POST-only, so a GET
 /// transport-fails (status `000`) and is misread as "DOWN", firing the pointless
 /// 3x outage-retry on every definitive 4xx. A POST gets a real status → answered
-/// → `Up`. Empty/SSRF-blocked URLs report [`ServiceReachability::Up`]; see
-/// `reachability_for_unprobeable_url`.
+/// → `Answered`. Empty/SSRF-blocked URLs report [`ServiceReachability::NotAsked`];
+/// see `reachability_for_unprobeable_url`.
 pub fn probe_online_reachability(cfg: &Config) -> ServiceReachability {
     let url = cfg.keyserver_url.trim();
     if url.is_empty() {
-        return ServiceReachability::Up;
+        return ServiceReachability::NotAsked;
     }
     // SSRF gate: the SAME validator `build_sources` gates the online source on,
     // so the probe and the key-resolve path can never disagree about whether a
@@ -434,19 +474,23 @@ pub fn take_online_decode_reachability() -> Option<ServiceReachability> {
 }
 
 /// Map a keysources [`DecodeReachability`](freemkv_keysources::DecodeReachability)
-/// — the raw outcome of the online source's real `/decode` POST — to a
-/// [`ServiceReachability`] verdict, routing through the SAME
-/// [`classify_reachability`] the probe uses (5xx/429/transport → transient;
-/// 200/404/422 → up/genuine-no-key). Pure, so the down-vs-no-key decision the
-/// ripper now makes from the real decode is unit-tested without a network.
+/// — the real `/decode` POST, which DID carry this disc — to a per-disc
+/// [`ServiceReachability`]. Unlike [`classify_reachability`], a 422 here is a
+/// DEFINITIVE no-key for this disc, not an outage. See docs/keysource.md for
+/// the full table and why the library's error code can't carry it.
 fn reachability_from_decode(
     outcome: freemkv_keysources::DecodeReachability,
 ) -> ServiceReachability {
-    let probe = match outcome {
-        freemkv_keysources::DecodeReachability::Status(code) => ProbeOutcome::Status(code),
-        freemkv_keysources::DecodeReachability::Transport => ProbeOutcome::Transport,
-    };
-    classify_reachability(probe)
+    use freemkv_keysources::DecodeReachability as D;
+    match outcome {
+        D::Transport => ServiceReachability::Unreachable,
+        D::Status(429) => ServiceReachability::RateLimited,
+        D::Status(422) => ServiceReachability::NoKeyForDisc,
+        D::Status(404) => ServiceReachability::NotLicensed,
+        D::Status(code) if (500..=599).contains(&code) => ServiceReachability::ServerError(code),
+        D::Status(code) if (200..=399).contains(&code) => ServiceReachability::Answered,
+        D::Status(code) => ServiceReachability::Unexpected(code),
+    }
 }
 
 /// How a disc's key-resolution inputs are obtained. Decouples [`resolve_keys`]
@@ -1265,88 +1309,145 @@ mod tests {
         assert!(!uses_online(&cfg), "a typo'd source is not 'online'");
     }
 
-    // reachability classification (v1.3.0): the core down-vs-no-key mapping is
-    // HTTP 5xx or a transport failure → DOWN (transient); 429 → rate-limited
-    // (transient); any other answer (incl. 404/422) → UP, so a no-key is genuine.
+    // The PROBE is disc-less (empty POST), so its classification stays coarse:
+    // transport/5xx/429 are transient and EVERY other status means only "the
+    // service is up" — never a per-disc no-key verdict.
     #[test]
     fn classify_reachability_down_vs_no_key() {
         use ProbeOutcome::{Status, Transport};
-        // 5xx outage → DOWN
+        for code in [500u16, 502, 503, 504] {
+            assert_eq!(
+                classify_reachability(Status(code)),
+                ServiceReachability::ServerError(code),
+                "HTTP {code} is the service failing on its own side"
+            );
+        }
+        // transport failure (timeout / connect refused) → never reached
         assert_eq!(
-            classify_reachability(Status(502)),
-            ServiceReachability::Down
+            classify_reachability(Transport),
+            ServiceReachability::Unreachable
         );
-        assert_eq!(
-            classify_reachability(Status(503)),
-            ServiceReachability::Down
-        );
-        assert_eq!(
-            classify_reachability(Status(504)),
-            ServiceReachability::Down
-        );
-        assert_eq!(
-            classify_reachability(Status(500)),
-            ServiceReachability::Down
-        );
-        // transport failure (timeout / connect refused) → DOWN
-        assert_eq!(classify_reachability(Transport), ServiceReachability::Down);
         // quota → RATE-LIMITED
         assert_eq!(
             classify_reachability(Status(429)),
             ServiceReachability::RateLimited
         );
-        // service reachable but rejects THIS disc → UP (genuine no-key)
-        assert_eq!(classify_reachability(Status(404)), ServiceReachability::Up);
-        assert_eq!(classify_reachability(Status(422)), ServiceReachability::Up);
-        assert_eq!(classify_reachability(Status(200)), ServiceReachability::Up);
-        assert_eq!(classify_reachability(Status(405)), ServiceReachability::Up);
+        // Everything else proves only reachability — the probe carried no disc.
+        for code in [200u16, 404, 405, 422] {
+            assert_eq!(
+                classify_reachability(Status(code)),
+                ServiceReachability::Answered,
+                "a disc-less probe must not produce a per-disc verdict from {code}"
+            );
+        }
     }
 
-    // v1.7.2: the ripper classifies a no-key from the REAL decode's HTTP outcome
-    // instead of a second empty probe. 422/404 → UP (genuine no-key, no extra
-    // POST); 5xx/429 → transient; transport → DOWN. Tests that outcome→verdict map.
+    // The REAL decode POST carried the disc, so its status IS a per-disc
+    // verdict. This is the mapping the operator-facing message is written from:
+    // every outcome in the bug report gets its own arm and none of them share.
     #[test]
     fn decode_outcome_drives_the_down_vs_no_key_verdict() {
         use freemkv_keysources::DecodeReachability::{Status, Transport};
-        // The bug's exact case: 422 "licensed but unresolved" → genuine no-key,
-        // classified from the decode itself with NO redundant probe.
+        // The bug's exact case: 422 "licensed but unresolved" is a DEFINITIVE
+        // no-key for this disc — reached, licensed, all candidates exhausted.
         assert_eq!(
             reachability_from_decode(Status(422)),
-            ServiceReachability::Up
+            ServiceReachability::NoKeyForDisc
         );
+        // 404 is a licence/wall verdict, NOT the same thing as 422.
         assert_eq!(
             reachability_from_decode(Status(404)),
-            ServiceReachability::Up
+            ServiceReachability::NotLicensed
         );
         assert_eq!(
             reachability_from_decode(Status(200)),
-            ServiceReachability::Up
+            ServiceReachability::Answered
         );
-        // A transport failure is still a transient outage (retryable), never a
-        // genuine no-key — the outage-retry loop must keep working.
+        assert_eq!(
+            reachability_from_decode(Status(304)),
+            ServiceReachability::Answered
+        );
+        // A transport failure is the ONLY "we never reached it" outcome.
         assert_eq!(
             reachability_from_decode(Transport),
-            ServiceReachability::Down
+            ServiceReachability::Unreachable
         );
-        // 5xx / 429 remain transient exactly as before.
+        // 5xx / 429 remain transient, each with its own verdict.
         assert_eq!(
             reachability_from_decode(Status(503)),
-            ServiceReachability::Down
+            ServiceReachability::ServerError(503)
         );
         assert_eq!(
             reachability_from_decode(Status(429)),
             ServiceReachability::RateLimited
         );
+        // Anything else keeps its status rather than being guessed at.
+        for code in [400u16, 401, 403, 418, 451] {
+            assert_eq!(
+                reachability_from_decode(Status(code)),
+                ServiceReachability::Unexpected(code)
+            );
+        }
     }
 
-    /// Only `Down` and `RateLimited` are transient/retryable; `Up` is terminal
-    /// (a genuine no-key). Regression guard so a refactor can't flip a genuine
-    /// no-key into an infinite retry (or vice-versa).
+    // No two of these outcomes may collapse to the same verdict — that
+    // collapse is the bug (a 422 reported as "the service was down").
+    #[test]
+    fn every_key_service_outcome_is_distinct() {
+        use freemkv_keysources::DecodeReachability::{Status, Transport};
+        let verdicts = [
+            reachability_from_decode(Transport),
+            reachability_from_decode(Status(503)),
+            reachability_from_decode(Status(429)),
+            reachability_from_decode(Status(422)),
+            reachability_from_decode(Status(404)),
+            reachability_from_decode(Status(400)),
+            reachability_from_decode(Status(200)),
+        ];
+        for (i, a) in verdicts.iter().enumerate() {
+            for b in &verdicts[i + 1..] {
+                assert_ne!(a, b, "distinct key-service outcomes share a verdict");
+            }
+        }
+    }
+
+    /// Only the "never got an answer about this disc" verdicts are
+    /// transient/retryable. A definitive 422 no-key is terminal — retrying it
+    /// is pointless work, and the 29-second server-side exhaustion behind it
+    /// makes that retry expensive. Regression guard both ways.
     #[test]
     fn reachability_transient_partition() {
-        assert!(ServiceReachability::Down.is_transient());
+        assert!(ServiceReachability::Unreachable.is_transient());
+        assert!(ServiceReachability::ServerError(502).is_transient());
         assert!(ServiceReachability::RateLimited.is_transient());
-        assert!(!ServiceReachability::Up.is_transient());
+        assert!(
+            !ServiceReachability::NoKeyForDisc.is_transient(),
+            "a definitive no-key must never be retried"
+        );
+        assert!(!ServiceReachability::NotLicensed.is_transient());
+        assert!(!ServiceReachability::Unexpected(400).is_transient());
+        assert!(!ServiceReachability::NotAsked.is_transient());
+        assert!(!ServiceReachability::Answered.is_transient());
+    }
+
+    /// The status is carried on the verdict so support can quote it — `None`
+    /// only where there genuinely was no HTTP answer.
+    #[test]
+    fn http_status_is_carried_where_one_exists() {
+        assert_eq!(ServiceReachability::NoKeyForDisc.http_status(), Some(422));
+        assert_eq!(ServiceReachability::NotLicensed.http_status(), Some(404));
+        assert_eq!(ServiceReachability::RateLimited.http_status(), Some(429));
+        assert_eq!(
+            ServiceReachability::ServerError(503).http_status(),
+            Some(503)
+        );
+        assert_eq!(
+            ServiceReachability::Unexpected(418).http_status(),
+            Some(418)
+        );
+        assert_eq!(ServiceReachability::Unreachable.http_status(), None);
+        assert_eq!(ServiceReachability::NotAsked.http_status(), None);
+        assert_eq!(ServiceReachability::Answered.http_status(), None);
     }
 
     // build_iso_key_fetch (rc.6 WS3 multi-CPS-unit recovery) needs a real UDF
@@ -1392,19 +1493,19 @@ mod tests {
     fn a_failed_lookup_is_an_outage_but_a_rejected_url_is_not() {
         assert_eq!(
             reachability_for_unprobeable_url(crate::web::RESOLVE_TIMEOUT_MSG),
-            ServiceReachability::Down,
+            ServiceReachability::Unreachable,
             "a DNS timeout is not evidence that the key service answered"
         );
         assert_eq!(
             reachability_for_unprobeable_url(crate::web::RESOLVE_NO_ADDRS_MSG),
-            ServiceReachability::Down
+            ServiceReachability::Unreachable
         );
         assert_eq!(
             reachability_for_unprobeable_url(&format!(
                 "{}Temporary failure in name resolution",
                 crate::web::RESOLVE_FAILED_PREFIX
             )),
-            ServiceReachability::Down
+            ServiceReachability::Unreachable
         );
 
         // Permanent verdicts on the URL itself: the online source was already
@@ -1417,7 +1518,7 @@ mod tests {
         ] {
             assert_eq!(
                 reachability_for_unprobeable_url(permanent),
-                ServiceReachability::Up,
+                ServiceReachability::NotAsked,
                 "{permanent:?} is a config verdict, not an outage"
             );
         }
@@ -1602,15 +1703,19 @@ mod tests {
     }
 
     // `probe_online_reachability`'s two non-network arms: an EMPTY keyserver URL
-    // can't be probed → `Up`; an SSRF-blocked URL is a config verdict, not an
-    // outage → also `Up`. Neither arm touches the network.
+    // and an SSRF-blocked one both mean the service was never ASKED — a config
+    // verdict, terminal like before, never an outage. Neither touches the network.
     #[test]
     fn probe_online_reachability_unprobeable_urls_report_up() {
         let empty = Config {
             keyserver_url: String::new(),
             ..Default::default()
         };
-        assert_eq!(probe_online_reachability(&empty), ServiceReachability::Up);
+        assert_eq!(
+            probe_online_reachability(&empty),
+            ServiceReachability::NotAsked
+        );
+        assert!(!probe_online_reachability(&empty).is_transient());
 
         let blocked = Config {
             keyserver_url: "http://127.0.0.1:9/keys".into(),
@@ -1618,7 +1723,7 @@ mod tests {
         };
         assert_eq!(
             probe_online_reachability(&blocked),
-            ServiceReachability::Up,
+            ServiceReachability::NotAsked,
             "an SSRF-blocked loopback URL is a permanent config verdict, not an outage"
         );
     }

@@ -193,6 +193,7 @@ fn key_readiness(
     disc: &libfreemkv::Disc,
     outcome: crate::keysource::KeyOutcome,
     capture_without_keys: bool,
+    online: Option<crate::keysource::ServiceReachability>,
 ) -> String {
     use crate::keysource::KeyOutcome;
     let no_keys =
@@ -202,6 +203,17 @@ fn key_readiness(
     }
     if capture_without_keys {
         return "Capture without keys — no decryption".to_string();
+    }
+    // What the service ACTUALLY said outranks everything below: the library
+    // funnels every non-2xx into one "could not be reached" code, which reported
+    // a definitive 422 no-key as an outage. See docs/ripper-mod-notes.md.
+    if let Some(reach) = online {
+        if let Some(status) = key_service_transient_status(reach) {
+            return status;
+        }
+        if let Some(reason) = key_service_no_key_reason(reach) {
+            return format!("Missing keys — {reason}");
+        }
     }
     // Prefer the disc's own AACS-resolution error (`disc.aacs_error`) over the
     // coarse `KeyOutcome`: it's the true cause (e.g. E7025 bus key unavailable)
@@ -285,13 +297,62 @@ fn fmts_gate_plan(gate: FmtsGate) -> FmtsGatePlan {
 // helpers classify DOWN vs genuine no-key and bounded-retry a transient outage.
 const KEY_SERVICE_RETRY_ATTEMPTS: u32 = 3;
 
-/// `key_status` / `last_error` text for a DOWN key service (transient outage).
-const KEY_SERVICE_DOWN_STATUS: &str = "Key service unavailable — the online key \
-    service is not responding. This is a temporary outage, not a missing key; \
-    will retry.";
+/// `key_status` / `last_error` text for a key service we never reached at all
+/// (connection refused, DNS failure, timeout, TLS error). The ONLY outcome for
+/// which "temporary, we'll retry" is an honest thing to say.
+const KEY_SERVICE_UNREACHABLE_STATUS: &str = "Key service unreachable — autorip could not \
+    connect to the online key service, so it never said anything about this disc. \
+    Nothing is known yet about whether this disc has a key. This is usually temporary; \
+    autorip will retry. (no reply received)";
 
 /// `key_status` / `last_error` text for a rate-limited (quota) key service.
-const KEY_SERVICE_QUOTA_STATUS: &str = "Key service rate-limited (quota) — will retry later.";
+const KEY_SERVICE_QUOTA_STATUS: &str = "Key service busy — the online key service is \
+    refusing requests for now because too many have been sent. It has not looked at this \
+    disc yet. Waiting and trying again should work. (service replied HTTP 429)";
+
+/// `key_status` / `last_error` text for HTTP 422: the service WAS reached, is
+/// licensed, and definitively resolved no key for this disc after exhausting
+/// every candidate source. Retrying cannot change the answer — saying "the
+/// service was down, wait a few minutes" here sends the operator into an
+/// endless retry on a disc that will never resolve.
+const KEY_SERVICE_NO_KEY_REASON: &str = "the online key service answered and has no key \
+    for this disc. It searched every source it has before answering, so trying again \
+    will not change the result. To keep a copy anyway, turn on \"capture without keys\" \
+    to save the disc as an encrypted image; otherwise try a different key source. \
+    (service replied HTTP 422)";
+
+/// `key_status` / `last_error` text for HTTP 404: the service refused the
+/// request as unlicensed / unknown, so it never looked for a key.
+const KEY_SERVICE_UNLICENSED_REASON: &str = "the online key service would not accept the \
+    request, so it never looked for a key for this disc. Check the key-service address \
+    and access token in Settings — trying again without changing them will not help. \
+    (service replied HTTP 404)";
+
+/// `key_status` / `last_error` text for a key service we never asked, because
+/// the configured URL is unusable (empty, wrong scheme, SSRF-blocked).
+const KEY_SERVICE_NOT_ASKED_REASON: &str = "the online key service was never contacted \
+    because the address configured for it cannot be used. Fix the key-service address in \
+    Settings. (no request was sent)";
+
+/// Reason text for an unexpected non-2xx status: say plainly that we do not
+/// know, and quote the status, rather than guessing at a cause.
+fn key_service_unexpected_reason(code: u16) -> String {
+    format!(
+        "the online key service replied with something autorip does not recognise, so \
+         nothing is known about this disc's key. Check the key-service address in Settings, \
+         and report this if it keeps happening. (service replied HTTP {code})"
+    )
+}
+
+/// Status text for a key service that failed on its own side (HTTP 5xx) — it
+/// was reached, but never got as far as an answer about this disc.
+fn key_service_server_error_status(code: u16) -> String {
+    format!(
+        "Key service error — the online key service is reachable but is failing on its own \
+         side, so it never said anything about this disc. This is usually temporary; autorip \
+         will retry. (service replied HTTP {code})"
+    )
+}
 
 // Should the rip re-attempt online key resolution before proceeding?
 // Fires only for an ENCRYPTED disc the online key service left with NO
@@ -311,22 +372,60 @@ fn key_service_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(8u64.saturating_mul(1u64 << shift))
 }
 
-/// Map a transient reachability verdict to its operator-facing status line.
-/// `None` for a reachable service (`Up`) — the caller keeps its no-key text.
-fn key_service_transient_status(
-    reach: crate::keysource::ServiceReachability,
-) -> Option<&'static str> {
+/// Map a TRANSIENT reachability verdict — one where the service never gave a
+/// verdict about this disc — to its own standalone operator-facing status line.
+/// `None` for every verdict that IS an answer about this disc (including the
+/// definitive 422 no-key): those are not outages and must not borrow outage
+/// wording. See [`key_service_no_key_reason`] for their text.
+fn key_service_transient_status(reach: crate::keysource::ServiceReachability) -> Option<String> {
     use crate::keysource::ServiceReachability;
     match reach {
-        ServiceReachability::Down => Some(KEY_SERVICE_DOWN_STATUS),
-        ServiceReachability::RateLimited => Some(KEY_SERVICE_QUOTA_STATUS),
-        ServiceReachability::Up => None,
+        ServiceReachability::Unreachable => Some(KEY_SERVICE_UNREACHABLE_STATUS.to_string()),
+        ServiceReachability::ServerError(code) => Some(key_service_server_error_status(code)),
+        ServiceReachability::RateLimited => Some(KEY_SERVICE_QUOTA_STATUS.to_string()),
+        ServiceReachability::Answered
+        | ServiceReachability::NoKeyForDisc
+        | ServiceReachability::NotLicensed
+        | ServiceReachability::Unexpected(_)
+        | ServiceReachability::NotAsked => None,
     }
 }
 
-// Given an online resolution that produced NO key for an encrypted
-// disc, classify the key service and bounded-retry on a transient
-// outage. See docs/ripper-mod-notes.md — retry_online_keys_on_outage.
+/// Map a TERMINAL verdict — the service delivered an answer (or was never
+/// askable) — to the reason clause shown after the "Missing keys — " prefix.
+/// `None` for an ordinary 2xx no-key (keep the generic text) and for the
+/// transient verdicts, which get [`key_service_transient_status`] instead.
+/// See docs/ripper-mod-notes.md for why the HTTP status beats the E-code.
+fn key_service_no_key_reason(reach: crate::keysource::ServiceReachability) -> Option<String> {
+    use crate::keysource::ServiceReachability;
+    match reach {
+        ServiceReachability::NoKeyForDisc => Some(KEY_SERVICE_NO_KEY_REASON.to_string()),
+        ServiceReachability::NotLicensed => Some(KEY_SERVICE_UNLICENSED_REASON.to_string()),
+        ServiceReachability::Unexpected(code) => Some(key_service_unexpected_reason(code)),
+        ServiceReachability::NotAsked => Some(KEY_SERVICE_NOT_ASKED_REASON.to_string()),
+        ServiceReachability::Answered
+        | ServiceReachability::Unreachable
+        | ServiceReachability::ServerError(_)
+        | ServiceReachability::RateLimited => None,
+    }
+}
+
+// Record a TERMINAL key-service verdict structurally, status code and all —
+// the machine-greppable copy of what the user-facing string carries in its
+// trailing parenthetical.
+fn log_terminal_key_verdict(reach: crate::keysource::ServiceReachability) {
+    tracing::info!(
+        phase = "key_resolve",
+        verdict = ?reach,
+        http_status = reach.http_status(),
+        retryable = false,
+        "online key service delivered a definitive verdict for this disc — not retrying"
+    );
+}
+
+// Classify the key service after a no-key online resolution and bounded-retry a
+// transient outage. The third return value is the final verdict whenever the
+// disc is still keyless. See docs/ripper-mod-notes.md.
 fn retry_online_keys_on_outage(
     device: &str,
     cfg: &Config,
@@ -344,7 +443,11 @@ fn retry_online_keys_on_outage(
     // real no-key). Probe only when the decode made no HTTP answer (`None`).
     let reach = decode_reach.unwrap_or_else(|| crate::keysource::probe_online_reachability(cfg));
     if !reach.is_transient() {
-        return (disc, KeyOutcome::NoKey, None);
+        // The service ANSWERED about this disc (or could never be asked). No
+        // retry — a 422 "no key for this disc" took the server ~30s of
+        // exhausting every candidate source; repeating it changes nothing.
+        log_terminal_key_verdict(reach);
+        return (disc, KeyOutcome::NoKey, Some(reach));
     }
     crate::log::device_log(
         device,
@@ -384,9 +487,10 @@ fn retry_online_keys_on_outage(
         if !last_reach.is_transient() {
             crate::log::device_log(
                 device,
-                "Key service reachable but returned no key — genuine missing key for this disc.",
+                "Key service answered but has no key — genuine missing key for this disc.",
             );
-            return (disc, KeyOutcome::NoKey, None);
+            log_terminal_key_verdict(last_reach);
+            return (disc, KeyOutcome::NoKey, Some(last_reach));
         }
     }
     crate::log::device_log(
@@ -1052,12 +1156,10 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     // Scan + resolve are done; stand the watchdog down explicitly (drop also
     // covers any early return above).
     drop(scan_wd);
-    // A transient key-service outage gets its own distinct tile text (temporary,
-    // will-retry) instead of the permanent "Missing keys — no key" message.
-    let key_status = match key_reach.and_then(key_service_transient_status) {
-        Some(msg) => msg.to_string(),
-        None => key_readiness(&disc, key_outcome, cfg_read.capture_without_keys),
-    };
+    // Every key-service outcome gets its OWN tile text — `key_readiness` picks
+    // it from the verdict (outage vs definitive no-key vs licence wall vs
+    // unexpected status) rather than from one collapsed error code.
+    let key_status = key_readiness(&disc, key_outcome, cfg_read.capture_without_keys, key_reach);
 
     // Update format from full scan (UHD vs BD now known)
     let disc_name = disc
@@ -2226,10 +2328,10 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let codecs = format_codecs(&disc.titles[0]);
     let title = disc.titles[0].clone();
 
-    // Down-vs-no-key (rip path): an online-keyless disc may just be a transient
-    // outage, not a missing key — bounded-retry before failing permanently.
-    // A persistent outage yields Some(reach), parked below as retryable/pending.
-    let mut key_outage: Option<crate::keysource::ServiceReachability> = None;
+    // Down-vs-no-key (rip path): the final key-service verdict. A TRANSIENT one
+    // bounded-retries then parks the disc below; a terminal one names what the
+    // service actually said instead of failing with a generic "no keys".
+    let mut key_verdict: Option<crate::keysource::ServiceReachability> = None;
     if should_retry_online_keys(
         crate::keysource::uses_online(&cfg_read),
         cfg_read.capture_without_keys,
@@ -2244,7 +2346,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             resume_decode_reach,
         );
         disc = rdisc;
-        key_outage = reach;
+        key_verdict = reach;
     }
 
     // Base decode keys; `mut` because the shared FMTS pre-decode step below
@@ -2257,19 +2359,24 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     let keys_missing = disc.encrypted && matches!(keys, libfreemkv::decrypt::DecryptKeys::None);
     if keys_missing {
         // A persistent outage is NOT a missing key: park in a retryable/pending
-        // state so a later insert/rescan retries — don't fail or eject.
-        if let Some(reach) = key_outage {
-            let status_msg = key_service_transient_status(reach).unwrap_or(KEY_SERVICE_DOWN_STATUS);
+        // state so a later insert/rescan retries. ONLY transient verdicts park —
+        // a definitive answer falls through below, re-asking cannot change it.
+        if let Some(status_msg) = key_verdict.and_then(key_service_transient_status) {
             crate::log::device_log(device, &format!("Not ripping now — {status_msg}"));
             update_state_with(device, |s| {
                 s.status = "idle".to_string();
-                s.key_status = status_msg.to_string();
-                s.last_error = status_msg.to_string();
+                s.key_status = status_msg.clone();
+                s.last_error = status_msg.clone();
             });
             unregister_halt(device);
             return;
         }
-        let msg = keyless_failure_message(&disc);
+        // What the service actually said beats the library's collapsed E7028
+        // "could not be reached" code, which is only true for an outage.
+        let msg = match key_verdict.and_then(key_service_no_key_reason) {
+            Some(reason) => format!("No keys — {reason}"),
+            None => keyless_failure_message(&disc),
+        };
         if cfg_read.capture_without_keys {
             crate::log::device_log(
                 device,
@@ -5231,11 +5338,17 @@ fn keyless_failure_message(disc: &libfreemkv::Disc) -> String {
 // the fresh-rip outage classifier: reports a transient key-service
 // outage instead of a permanent "no keys" line. See docs/ripper-mod-notes.md.
 pub(crate) fn deferred_keyless_message(cfg: &Config, disc: &libfreemkv::Disc) -> String {
-    if cfg.key_source == "online"
-        && let Some(status) =
-            key_service_transient_status(crate::keysource::probe_online_reachability(cfg))
-    {
-        return status.to_string();
+    if cfg.key_source == "online" {
+        let reach = crate::keysource::probe_online_reachability(cfg);
+        if let Some(status) = key_service_transient_status(reach) {
+            return status;
+        }
+        // The probe carries no disc, so it can only report a CONFIG verdict
+        // here ("never asked"), never a per-disc no-key — see
+        // `classify_reachability`. Anything else falls through unchanged.
+        if let Some(reason) = key_service_no_key_reason(reach) {
+            return format!("No keys — {reason}");
+        }
     }
     keyless_failure_message(disc)
 }
@@ -5381,6 +5494,29 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
             code,
             "This drive's profile has no Volume ID command (it is an older profile), \
              so the OEM Volume ID route cannot run.",
+        ),
+
+        // Key-SOURCE failures: the source never answered, so they must not read
+        // as "no key". The status-less residual — where autorip holds the HTTP
+        // status, `key_service_no_key_reason` reports that and beats these.
+        ec::E_KEY_SERVICE_UNAVAILABLE => error_line(
+            code,
+            "The online key service did not answer, so nothing is known yet about \
+             whether this disc has a key. Check the key-service address in Settings \
+             and your network connection, then try again.",
+        ),
+
+        ec::E_KEY_SERVICE_UNAUTHORIZED => error_line(
+            code,
+            "The online key service rejected the credentials configured for it, so it \
+             never looked for a key. Fix the key-service access token in Settings — \
+             waiting will not help.",
+        ),
+
+        ec::E_KEY_SERVICE_RATE_LIMITED => error_line(
+            code,
+            "The online key service is refusing requests for now because too many have \
+             been sent, so it never looked for a key. Wait a while and try again.",
         ),
 
         // Other 7xxx — known AACS category but unmapped. Use a
@@ -5844,6 +5980,15 @@ mod tests {
             css_error: None,
             content_format: libfreemkv::ContentFormat::BdTs,
         }
+    }
+
+    /// An encrypted disc with NO usable keys — the state `key_readiness` /
+    /// `keyless_failure_message` exist to describe. `aacs`/`css` are `None`, so
+    /// `decrypt_keys()` reports `None` and the "no keys" branches are taken.
+    fn encrypted_keyless_disc() -> libfreemkv::Disc {
+        let mut disc = disc_with_main_streams(vec![]);
+        disc.encrypted = true;
+        disc
     }
 
     /// A plain 2D H.264 base-view video stream (not MVC-dependent).
@@ -7211,30 +7356,231 @@ mod tests {
         assert!(!msg.contains('\n'), "CSS message must be one line: {msg}");
     }
 
-    // Reachability verdict → operator status-line mapping: Down/RateLimited
-    // map to a retryable message, Up maps to `None`. See docs/ripper-mod-notes.md.
+    // Reachability verdict → operator status-line mapping. ONLY the verdicts
+    // where the service never gave an answer about this disc may claim to be a
+    // temporary outage. See docs/ripper-mod-notes.md.
     #[test]
     fn key_service_transient_status_mapping() {
         use crate::keysource::ServiceReachability;
-        // DOWN (502 / timeout classified upstream) → transient outage message.
-        let down = super::key_service_transient_status(ServiceReachability::Down)
-            .expect("Down is transient");
+        // Never reached at all → the only honest "temporary, will retry".
+        let down = super::key_service_transient_status(ServiceReachability::Unreachable)
+            .expect("Unreachable is transient");
         assert!(
-            down.contains("temporary outage") && down.contains("not a missing key"),
-            "Down status must read as a transient outage, not a missing key: {down}"
+            down.contains("could not connect") && down.contains("usually temporary"),
+            "Unreachable must read as a connection failure we will retry: {down}"
         );
-        // 429 quota → rate-limited message.
+        // 5xx → reached, but it failed on its own side. Quotes the status.
+        let server = super::key_service_server_error_status(503);
+        assert!(
+            server.contains("503") && server.contains("usually temporary"),
+            "a 5xx must quote its status and read as temporary: {server}"
+        );
+        assert_eq!(
+            super::key_service_transient_status(ServiceReachability::ServerError(503)),
+            Some(server)
+        );
+        // 429 quota → its own message, not the transport-failure one.
         let quota = super::key_service_transient_status(ServiceReachability::RateLimited)
             .expect("RateLimited is transient");
         assert!(
-            quota.to_lowercase().contains("rate-limited"),
-            "RateLimited status must mention rate-limiting: {quota}"
+            quota.contains("too many") && quota.contains("429"),
+            "RateLimited status must explain the quota and quote its status: {quota}"
         );
-        // UP (404/422 — service reachable) → no override; keep no-key behaviour.
+        assert_ne!(
+            quota, down,
+            "rate limiting and an unreachable service are different situations"
+        );
+        // Everything the service DID answer is not an outage.
+        for answered in [
+            ServiceReachability::Answered,
+            ServiceReachability::NoKeyForDisc,
+            ServiceReachability::NotLicensed,
+            ServiceReachability::Unexpected(400),
+            ServiceReachability::NotAsked,
+        ] {
+            assert!(
+                super::key_service_transient_status(answered).is_none(),
+                "{answered:?} is an answer (or a config fault), not an outage"
+            );
+        }
+    }
+
+    // The bug: a 422 was reported with the "service could not be reached, wait
+    // and retry" wording. Each terminal verdict must say what happened, whether
+    // retrying helps, and carry its HTTP status — and none may claim an outage.
+    #[test]
+    fn terminal_key_service_verdicts_never_claim_an_outage() {
+        use crate::keysource::ServiceReachability;
+
+        let no_key = super::key_service_no_key_reason(ServiceReachability::NoKeyForDisc)
+            .expect("422 is a definitive answer with its own wording");
         assert!(
-            super::key_service_transient_status(ServiceReachability::Up).is_none(),
-            "a reachable service is a genuine no-key, not an outage"
+            no_key.contains("answered") && no_key.contains("has no key for this disc"),
+            "a 422 must say the service ANSWERED and has no key: {no_key}"
         );
+        assert!(
+            no_key.contains("will not change the result"),
+            "a 422 must tell the operator retrying is pointless: {no_key}"
+        );
+        assert!(
+            no_key.contains("capture without keys"),
+            "a 422 must offer a next step: {no_key}"
+        );
+        assert!(no_key.contains("422"), "the status is needed for support");
+        // The exact harm being fixed — none of the outage wording may appear.
+        for banned in [
+            "could not be reached",
+            "never said whether",
+            "the service was down",
+            "temporary outage",
+            "wait a few minutes",
+        ] {
+            assert!(
+                !no_key.to_lowercase().contains(banned),
+                "a definitive no-key must not borrow outage wording ({banned:?}): {no_key}"
+            );
+        }
+
+        // 404 is a licence/config wall, not the 422 no-key and not an outage.
+        let unlicensed = super::key_service_no_key_reason(ServiceReachability::NotLicensed)
+            .expect("404 has its own wording");
+        assert!(
+            unlicensed.contains("404") && unlicensed.contains("Settings"),
+            "a 404 must quote its status and point at the config: {unlicensed}"
+        );
+        assert_ne!(unlicensed, no_key, "404 and 422 must not share a message");
+
+        // An unrecognised status says so plainly, and quotes the status.
+        let odd = super::key_service_no_key_reason(ServiceReachability::Unexpected(418))
+            .expect("an unexpected status still gets a message");
+        assert!(
+            odd.contains("does not recognise") && odd.contains("418"),
+            "an unexpected status must be reported plainly, with the status: {odd}"
+        );
+        assert_ne!(odd, no_key);
+        assert_ne!(odd, unlicensed);
+
+        // Never-asked (bad/blocked URL) is a standing misconfiguration.
+        let not_asked = super::key_service_no_key_reason(ServiceReachability::NotAsked)
+            .expect("an unusable URL has its own wording");
+        assert!(
+            not_asked.contains("never contacted") && not_asked.contains("Settings"),
+            "an unusable key-service URL must name the config fault: {not_asked}"
+        );
+
+        // An ordinary 2xx no-key keeps the existing generic text.
+        assert!(
+            super::key_service_no_key_reason(ServiceReachability::Answered).is_none(),
+            "a plain 2xx no-key must keep the generic no-key message"
+        );
+        // Transient verdicts are handled by the other mapper, never this one.
+        for transient in [
+            ServiceReachability::Unreachable,
+            ServiceReachability::ServerError(502),
+            ServiceReachability::RateLimited,
+        ] {
+            assert!(super::key_service_no_key_reason(transient).is_none());
+        }
+    }
+
+    // The tile's action button keys off the "Missing keys" prefix; a terminal
+    // verdict must keep it (the disc really is unrippable) while a transient one
+    // must NOT (the disc is parked, not failed).
+    #[test]
+    fn key_readiness_reports_the_key_service_verdict() {
+        use crate::keysource::{KeyOutcome, ServiceReachability};
+        let mut disc = encrypted_keyless_disc();
+        // The precise shape of the bug: the library stamped E7028 ("could not be
+        // reached") on a disc the service definitively answered about.
+        disc.aacs_error = Some(libfreemkv::Error::KeyServiceUnavailable);
+
+        let tile = super::key_readiness(
+            &disc,
+            KeyOutcome::NoKey,
+            false,
+            Some(ServiceReachability::NoKeyForDisc),
+        );
+        assert!(
+            tile.starts_with("Missing keys — "),
+            "a definitive no-key is still missing keys: {tile}"
+        );
+        assert!(
+            tile.contains("422") && tile.contains("has no key for this disc"),
+            "the tile must report what the service said: {tile}"
+        );
+        assert!(
+            !tile.contains("could not be reached"),
+            "the E7028 outage wording must not survive a definitive answer: {tile}"
+        );
+
+        // Transient: standalone status line, no "Missing keys" prefix (the disc
+        // is parked and retryable, so the tile must not offer the failed action).
+        let down = super::key_readiness(
+            &disc,
+            KeyOutcome::NoKey,
+            false,
+            Some(ServiceReachability::Unreachable),
+        );
+        assert!(!down.starts_with("Missing keys"), "{down}");
+        assert!(down.contains("could not connect"), "{down}");
+
+        // No online verdict → unchanged: fall back to the disc's own error.
+        let local = super::key_readiness(&disc, KeyOutcome::NoKey, false, None);
+        assert!(local.starts_with("Missing keys — "), "{local}");
+
+        // capture-without-keys still overrides every verdict.
+        assert_eq!(
+            super::key_readiness(
+                &disc,
+                KeyOutcome::NoKey,
+                true,
+                Some(ServiceReachability::NoKeyForDisc)
+            ),
+            "Capture without keys — no decryption"
+        );
+    }
+
+    // The status-less fallback: with no HTTP status to hand, the three key-SOURCE
+    // codes must still say the source never answered — never "unrecognized stage"
+    // (the old 7000..=7999 catch-all) and never "this disc has no key".
+    #[test]
+    fn key_source_failure_codes_say_the_source_never_answered() {
+        use libfreemkv::error as ec;
+        let cases = [
+            (
+                libfreemkv::Error::KeyServiceUnavailable,
+                ec::E_KEY_SERVICE_UNAVAILABLE,
+            ),
+            (
+                libfreemkv::Error::KeyServiceUnauthorized,
+                ec::E_KEY_SERVICE_UNAUTHORIZED,
+            ),
+            (
+                libfreemkv::Error::KeyServiceRateLimited,
+                ec::E_KEY_SERVICE_RATE_LIMITED,
+            ),
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for (err, code) in cases {
+            let msg = super::aacs_failure_message(Some(&err));
+            assert!(
+                msg.starts_with(&format!("Error: E{code} ")),
+                "must keep the locked E-code format: {msg}"
+            );
+            assert!(
+                !msg.contains("unrecognized stage"),
+                "E{code} is a known key-SOURCE failure, not an unmapped AACS stage: {msg}"
+            );
+            assert!(
+                msg.contains("never looked for a key") || msg.contains("did not answer"),
+                "E{code} must say the source never answered: {msg}"
+            );
+            assert!(
+                !seen.contains(&msg),
+                "each key-source failure needs its own message: {msg}"
+            );
+            seen.push(msg);
+        }
     }
 
     /// Retry backoff is bounded and monotonic (8s, 16s, 32s, capped) — a small,

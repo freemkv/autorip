@@ -113,14 +113,52 @@ capture-without-keys loses its untouched ISO-now path.
 Given an online key resolution that produced NO key for an encrypted
 disc, classify the key service and — on a transient outage —
 bounded-retry the resolution. Returns the (possibly re-resolved) disc,
-its final `KeyOutcome`, and the reachability verdict when the disc is
-STILL keyless: `None` if the service was reachable (a genuine no-key —
-the caller keeps its existing behaviour), or `Some(transient)` when
-the service never recovered within the retries (the caller surfaces a
-retryable state instead of a permanent "no keys" error).
+its final `KeyOutcome`, and the key-service verdict whenever the disc
+is STILL keyless: `None` only when keys resolved.
+
+Retry eligibility is `ServiceReachability::is_transient()`, decided
+BEFORE any sleeping, and only the "we never got an answer about this
+disc" verdicts qualify (`Unreachable`, `ServerError`, `RateLimited`).
+A definitive `NoKeyForDisc` (HTTP 422) is terminal and returns
+immediately: the server reached that answer by exhausting every
+candidate source (~30s of work in the observed case), so re-asking is
+pointless and expensive.
+
+The verdict is returned for terminal outcomes too, which is what lets
+the caller report what the service actually SAID. It used to be
+returned only for a persisting outage, so every terminal outcome fell
+back to the library's `aacs_error` — and upstream funnels every
+non-2xx key-service reply into a single code (E7028, "could not be
+reached"), so a definitive 422 no-key was rendered to the operator as
+a temporary outage with "wait a few minutes and try again".
 
 Precondition: the caller has already resolved once and got `NoKey` on
 an encrypted, still-keyless disc with `key_source == "online"`.
+
+## `key_service_transient_status` / `key_service_no_key_reason`
+
+The two halves of the key-service message mapping, split by whether
+the service delivered a verdict about THIS disc.
+
+`key_service_transient_status` owns the outcomes where it did not:
+`Unreachable` (transport failure — the only case where "we could not
+reach it" is true), `ServerError(code)` (HTTP 5xx) and `RateLimited`
+(429). Each returns a standalone status line, without the "Missing
+keys" prefix, because the disc is parked and retryable rather than
+failed.
+
+`key_service_no_key_reason` owns the terminal ones: `NoKeyForDisc`
+(422 — it answered and has no key, retrying will not change that),
+`NotLicensed` (404), `Unexpected(code)` (say plainly that we do not
+know, and quote the status) and `NotAsked` (the configured URL is
+unusable, so nothing was sent). These render after the "Missing keys —"
+prefix so the dashboard tile still gates its action button correctly.
+
+`Answered` — an ordinary 2xx no-key, or a disc-less reachability probe
+that proved only that the service is up — maps to `None` in both, so
+the pre-existing generic no-key text is kept. Every message carries
+its HTTP status in a trailing parenthetical for support, and
+`log_terminal_key_verdict` records the same status structurally.
 
 ## `forget_removed_device`
 
