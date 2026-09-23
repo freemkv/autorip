@@ -5388,7 +5388,7 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
         7000..=7999 => error_line(
             code,
             "AACS key resolution failed at an unrecognized stage. Please report this \
-             at github.com/freemkv/freemkv/issues.",
+             at https://github.com/freemkv/freemkv/issues.",
         ),
 
         // Non-AACS code on the aacs_error slot — structurally
@@ -7056,7 +7056,12 @@ mod tests {
         let s = aacs_failure_message(Some(&e));
         assert!(s.starts_with("Error: E7002 "), "msg: {s}");
         assert!(s.contains("unrecognized stage"), "msg: {s}");
-        assert!(s.contains("github.com/freemkv/freemkv/issues"), "msg: {s}");
+        // Must carry the scheme: a schemeless host never linkifies in the
+        // web UI or in a terminal.
+        assert!(
+            s.contains("https://github.com/freemkv/freemkv/issues"),
+            "msg: {s}"
+        );
         // No debug-dump leak.
         assert!(!s.contains("AacsAgidAlloc"), "msg: {s}");
     }

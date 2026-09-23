@@ -218,6 +218,16 @@ function toggleTheme(){document.body.classList.toggle('dark');localStorage.setIt
 
 /* ---- Util ---- */
 function esc(s){if(s==null)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+/* esc(), then turn any bare https:// URL in the escaped text into a real
+   anchor. Error strings carry "report this at https://github.com/..."; in an
+   innerHTML surface a bare URL is dead text nobody can click. Escaping FIRST
+   is what keeps this safe: the regex only ever runs over text that already has
+   no raw <, > or ", so a hostile message cannot close the tag or the attribute.
+   Trailing sentence punctuation is left outside the link. */
+function escLinks(s){return esc(s).replace(/https:\/\/[^\s<>"']+/g,function(u){
+  let tail='';const m=u.match(/[.,;:)\]]+$/);if(m){tail=m[0];u=u.slice(0,-tail.length)}
+  return '<a href="'+u+'" target="_blank" rel="noopener noreferrer" style="color:inherit">'+u+'</a>'+tail;
+})}
 function upd(id,html){const el=document.getElementById(id);if(el&&el._last!==html){el.innerHTML=html;el._last=html}}
 /* Every device action button goes through this, and none of them may be
    fire-and-forget. The drive-card buttons used to call fetch() bare, with no
@@ -530,7 +540,7 @@ function renderSteps(steps,progress,eta,speed,s){
            visible width wobble as the rip moves through phases. */
         return '<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:.8rem"><span style="color:'+colors[st.status]+';font-size:.7rem;width:14px;text-align:center;flex-shrink:0;animation:p 1.5s infinite">'+icons[st.status]+'</span><span style="color:var(--text);flex:1;min-width:0">Rip'+header+detail+'</span></div>';
       }
-    }else if(detail){detail=' \u2014 '+esc(detail)}
+    }else if(detail){detail=' \u2014 '+escLinks(detail)}
     const anim=st.status==='active'?';animation:p 1.5s infinite':'';
     return '<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;font-size:.8rem"><span style="color:'+colors[st.status]+';font-size:.7rem;width:14px;text-align:center'+anim+'">'+icons[st.status]+'</span><span style="color:'+(st.status==='pending'?'var(--text3)':'var(--text)')+'">'+st.name+detail+'</span></div>';
   }).join('');
@@ -765,7 +775,7 @@ function renderCurrent(){
   /* Error + recovery banner */
   let errHtml='';
   if(s.errors>0&&s.last_error){
-    errHtml='<div style="background:var(--red);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u26a0 '+esc(s.last_error)+'</div>';
+    errHtml='<div style="background:var(--red);color:#fff;padding:8px 12px;border-radius:6px;font-size:.8rem;margin-bottom:8px">\u26a0 '+escLinks(s.last_error)+'</div>';
   }
   /* The old "N sectors skipped (X MB) — Y at risk" yellow box was removed
      (2026-06-05): it duplicated the Good/Maybe/No-chance pills (which already
@@ -3732,6 +3742,21 @@ mod web_tests {
         // The shipped JS must escape quotes and apostrophes, not just <>&.
         assert!(DASHBOARD_HTML.contains(r#"replace(/"/g,'&quot;')"#));
         assert!(DASHBOARD_HTML.contains(r"replace(/'/g,'&#39;')"));
+    }
+
+    // Error text reaches the dashboard through innerHTML, so a bare URL in a
+    // message is dead text unless something turns it into an anchor. Both
+    // error-render sites must go through escLinks(), and escLinks() must be
+    // built on esc() so escaping still happens first.
+    #[test]
+    fn dashboard_error_text_linkifies_urls() {
+        assert!(DASHBOARD_HTML.contains("function escLinks(s){return esc(s).replace("));
+        // The step detail line ("Error — <message>").
+        assert!(DASHBOARD_HTML.contains(r"'+escLinks(detail)}"));
+        // The red error banner.
+        assert!(DASHBOARD_HTML.contains("escLinks(s.last_error)"));
+        // Only https is linkified — no javascript:/data: anchors.
+        assert!(DASHBOARD_HTML.contains(r#"/https:\/\/[^\s<>"']+/g"#));
     }
 
     #[test]
