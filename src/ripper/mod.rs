@@ -2765,7 +2765,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         // an in-progress MKV, else a too-small disk ENOSPCs ~30 min in.
         // AUTORIP_SKIP_DISKCHECK=1 bypasses this for diagnostics only.
         if bytes_total_disc == 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
-            // read_capacity() returned 0/unknown, so the 2× requirement is
+            // read_capacity() returned 0/unknown, so the image size is
             // uncomputable; tell the operator why the check didn't run.
             crate::log::device_log(
                 device,
@@ -2774,17 +2774,35 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             );
         }
         if bytes_total_disc > 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
-            // A resumed sweep's partial ISO already consumes staging space.
-            // Keep a full disc capacity available for the in-progress MKV.
-            let existing_iso_bytes = if resume_sweep {
-                iso_path
-                    .metadata()
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0)
+            // The ISO is pre-sized to disc capacity, so metadata.len() cannot
+            // tell us how much data has actually been swept. Use the mapfile's
+            // NonTried bytes when this is a valid resume; already-written
+            // retry ranges are zero-filled and do not need extra image space.
+            let remaining_iso_bytes = if resume_sweep {
+                freemkv_engine::Mapfile::load(std::path::Path::new(&mapfile_path_str))
+                    .ok()
+                    .filter(|map| {
+                        map.total_size() == bytes_total_disc
+                            && iso_path
+                                .metadata()
+                                .is_ok_and(|metadata| metadata.len() >= bytes_total_disc)
+                    })
+                    .map(|map| map.stats().bytes_nontried)
             } else {
-                0
+                None
             };
-            let required = disk_space_required_bytes(bytes_total_disc, existing_iso_bytes);
+            // Mux output is bounded by the selected title's scanned byte size;
+            // reserving another whole-disc image was needlessly pessimistic.
+            let title_output_bytes = if output_is_iso_image(&output_format) {
+                0
+            } else {
+                title.size_bytes
+            };
+            let required = disk_space_required_bytes(
+                bytes_total_disc,
+                title_output_bytes,
+                remaining_iso_bytes,
+            );
             if let Some(avail) = staging_free_bytes(&staging) {
                 if avail < required {
                     let msg = disk_space_preflight_message(required, &staging, avail);
@@ -5492,17 +5510,22 @@ fn strip_error_prefix(s: &str) -> &str {
 // See docs/ripper-mod-notes.md — disk_space_preflight_message.
 fn disk_space_preflight_message(required: u64, staging: &str, avail: u64) -> String {
     format!(
-        "Insufficient staging disk space — need ≥ {:.1} GB free at {} (2× disc capacity), have {:.1} GB. Free up space or point STAGING_DIR at a larger volume.",
+        "Insufficient staging disk space — need ≥ {:.1} GiB free at {} (remaining disc image plus selected title estimate), have {:.1} GiB. Free up space or point STAGING_DIR at a larger volume.",
         required as f64 / BYTES_PER_GIB,
         staging,
         avail as f64 / BYTES_PER_GIB,
     )
 }
 
-fn disk_space_required_bytes(capacity_bytes: u64, existing_iso_bytes: u64) -> u64 {
-    capacity_bytes
-        .saturating_mul(2)
-        .saturating_sub(existing_iso_bytes.min(capacity_bytes))
+fn disk_space_required_bytes(
+    capacity_bytes: u64,
+    title_bytes: u64,
+    remaining_iso_bytes: Option<u64>,
+) -> u64 {
+    remaining_iso_bytes
+        .unwrap_or(capacity_bytes)
+        .min(capacity_bytes)
+        .saturating_add(title_bytes)
 }
 
 // Short English label for a non-SCSI libfreemkv error variant, used
@@ -7074,33 +7097,34 @@ mod tests {
             );
         }
         // Still reports both the requirement and the actual free space.
-        assert!(s.contains("100.0 GB"), "missing required figure: {s}");
-        assert!(s.contains("40.0 GB"), "missing available figure: {s}");
+        assert!(s.contains("100.0 GiB"), "missing required figure: {s}");
+        assert!(s.contains("40.0 GiB"), "missing available figure: {s}");
         assert!(s.contains("/staging-local"), "missing staging path: {s}");
     }
 
     #[test]
-    fn resumed_sweep_preflight_subtracts_space_already_used_by_iso() {
-        let capacity = 40 * 1_073_741_824u64;
+    fn disk_space_preflight_estimates_remaining_image_plus_selected_title() {
+        let capacity = 90 * 1_000_000_000u64;
+        let title = 10 * 1_000_000_000u64;
         assert_eq!(
-            disk_space_required_bytes(capacity, 0),
-            80 * 1_073_741_824,
-            "fresh rip still needs capacity for ISO plus mux output"
+            disk_space_required_bytes(capacity, title, None),
+            100 * 1_000_000_000,
+            "90 GB image plus 10 GB selected title uses a 100 GB estimate"
         );
         assert_eq!(
-            disk_space_required_bytes(capacity, capacity),
-            capacity,
-            "a complete-size resumed ISO is already consuming the first capacity"
+            disk_space_required_bytes(capacity, title, Some(20 * 1_000_000_000)),
+            30 * 1_000_000_000,
+            "resume needs the unswept image plus the selected title"
         );
         assert_eq!(
-            disk_space_required_bytes(capacity, capacity / 2),
-            capacity + capacity / 2,
-            "a partial ISO reduces the remaining requirement by its existing size"
+            disk_space_required_bytes(capacity, title, Some(capacity * 2)),
+            capacity + title,
+            "unswept bytes are capped at disc capacity"
         );
         assert_eq!(
-            disk_space_required_bytes(capacity, capacity * 2),
-            capacity,
-            "existing ISO size cannot reduce the requirement below the mux allowance"
+            disk_space_required_bytes(capacity, title, None),
+            disk_space_required_bytes(capacity, title, Some(capacity)),
+            "invalid resume state falls back to a fresh image estimate"
         );
     }
 
