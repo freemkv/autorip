@@ -2761,8 +2761,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         let iso_path = std::path::Path::new(&iso_path_str);
         let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
 
-        // Pre-flight: require 2× capacity_bytes free at staging (ISO + an
-        // in-progress MKV), else a too-small disk ENOSPCs ~30 min in.
+        // Pre-flight: require enough free space for the remaining ISO data and
+        // an in-progress MKV, else a too-small disk ENOSPCs ~30 min in.
         // AUTORIP_SKIP_DISKCHECK=1 bypasses this for diagnostics only.
         if bytes_total_disc == 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
             // read_capacity() returned 0/unknown, so the 2× requirement is
@@ -2774,7 +2774,17 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             );
         }
         if bytes_total_disc > 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
-            let required = bytes_total_disc.saturating_mul(2);
+            // A resumed sweep's partial ISO already consumes staging space.
+            // Keep a full disc capacity available for the in-progress MKV.
+            let existing_iso_bytes = if resume_sweep {
+                iso_path
+                    .metadata()
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let required = disk_space_required_bytes(bytes_total_disc, existing_iso_bytes);
             if let Some(avail) = staging_free_bytes(&staging) {
                 if avail < required {
                     let msg = disk_space_preflight_message(required, &staging, avail);
@@ -5489,6 +5499,12 @@ fn disk_space_preflight_message(required: u64, staging: &str, avail: u64) -> Str
     )
 }
 
+fn disk_space_required_bytes(capacity_bytes: u64, existing_iso_bytes: u64) -> u64 {
+    capacity_bytes
+        .saturating_mul(2)
+        .saturating_sub(existing_iso_bytes.min(capacity_bytes))
+}
+
 // Short English label for a non-SCSI libfreemkv error variant, used
 // in `format_pass_error`'s no-sense arm. Unmapped variants fall back
 // to a generic phrase so a new libfreemkv variant never breaks the build.
@@ -5865,13 +5881,14 @@ mod tests {
     use super::{
         FmtsGate, FmtsGatePlan, HaltGuard, PatchDecision, SweepReadAction, SweepingGuard,
         aacs_failure_message, bad_sector_statuses, disk_space_preflight_message,
-        end_of_recovery_promotion, fmts_gate_decision, fmts_gate_plan, format_lib_error,
-        format_pass_error, header_phase_outcome_is_failure, incomplete_mux_status,
-        is_fmts_key_missing_error, is_safe_staging_segment, list_staging_basenames,
-        patch_made_progress, patch_pass_decision, plan_passes, pre_pass_converged,
-        prune_intermediate_iso, register_halt, resumable_dir_blocked, resumable_for_disc,
-        scope_bad_bytes, scope_converged, staging_dir_matches_disc, staging_disc_completed,
-        staging_disc_owned_by_worker, staging_free_bytes, sweep_transport_retry,
+        disk_space_required_bytes, end_of_recovery_promotion, fmts_gate_decision, fmts_gate_plan,
+        format_lib_error, format_pass_error, header_phase_outcome_is_failure,
+        incomplete_mux_status, is_fmts_key_missing_error, is_safe_staging_segment,
+        list_staging_basenames, patch_made_progress, patch_pass_decision, plan_passes,
+        pre_pass_converged, prune_intermediate_iso, register_halt, resumable_dir_blocked,
+        resumable_for_disc, scope_bad_bytes, scope_converged, staging_dir_matches_disc,
+        staging_disc_completed, staging_disc_owned_by_worker, staging_free_bytes,
+        sweep_transport_retry,
     };
     use crate::ripper::session::device_halt;
     use crate::ripper::staging;
@@ -7060,6 +7077,31 @@ mod tests {
         assert!(s.contains("100.0 GB"), "missing required figure: {s}");
         assert!(s.contains("40.0 GB"), "missing available figure: {s}");
         assert!(s.contains("/staging-local"), "missing staging path: {s}");
+    }
+
+    #[test]
+    fn resumed_sweep_preflight_subtracts_space_already_used_by_iso() {
+        let capacity = 40 * 1_073_741_824u64;
+        assert_eq!(
+            disk_space_required_bytes(capacity, 0),
+            80 * 1_073_741_824,
+            "fresh rip still needs capacity for ISO plus mux output"
+        );
+        assert_eq!(
+            disk_space_required_bytes(capacity, capacity),
+            capacity,
+            "a complete-size resumed ISO is already consuming the first capacity"
+        );
+        assert_eq!(
+            disk_space_required_bytes(capacity, capacity / 2),
+            capacity + capacity / 2,
+            "a partial ISO reduces the remaining requirement by its existing size"
+        );
+        assert_eq!(
+            disk_space_required_bytes(capacity, capacity * 2),
+            capacity,
+            "existing ISO size cannot reduce the requirement below the mux allowance"
+        );
     }
 
     #[test]
