@@ -3744,10 +3744,8 @@ mod web_tests {
         assert!(DASHBOARD_HTML.contains(r"replace(/'/g,'&#39;')"));
     }
 
-    // Error text reaches the dashboard through innerHTML, so a bare URL in a
-    // message is dead text unless something turns it into an anchor. Both
-    // error-render sites must go through escLinks(), and escLinks() must be
-    // built on esc() so escaping still happens first.
+    // Error text reaches the dashboard via innerHTML — bare URLs need
+    // escLinks() (built on esc()) to become anchors while staying safe.
     #[test]
     fn dashboard_error_text_linkifies_urls() {
         assert!(DASHBOARD_HTML.contains("function escLinks(s){return esc(s).replace("));
