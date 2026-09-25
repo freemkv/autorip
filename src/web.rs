@@ -1197,7 +1197,7 @@ function renderSettings(s){
   }
   const groups=[
     {title:'Disc Lifecycle',fields:[
-      {key:'on_insert',label:'On Disc Insert',type:'radio',options:[{value:'nothing',label:'Do Nothing'},{value:'scan',label:'Scan'},{value:'rip',label:'Rip'}],hint:'What happens when a disc is inserted'},
+      {key:'on_insert',label:'On Disc Insert',type:'radio',options:[{value:'nothing',label:'Do Nothing'},{value:'scan',label:'Scan'},{value:'rip',label:'Rip'},{value:'resume',label:'Resume'}],hint:'Rip starts fresh each time. Resume continues a resumable rip, or starts fresh if none is available.'},
       {key:'auto_eject',label:'Auto Eject',type:'bool',hint:'Eject disc after rip completes'},
     ]},
     {title:'Ripping',fields:[
@@ -7091,7 +7091,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     // would load cleanly and misbehave downstream. Sets mirror `config::load_saved`.
     for (field, allowed) in [
         ("key_source", &["local", "online"][..]),
-        ("on_insert", &["nothing", "scan", "rip"][..]),
+        ("on_insert", &["nothing", "scan", "rip", "resume"][..]),
         ("on_read_error", &["stop", "skip"][..]),
         ("output_format", &["mkv", "m2ts", "iso", "network"][..]),
         ("rip_mode", &["single", "multi"][..]),
@@ -7727,6 +7727,8 @@ pub enum ResumeMode {
     /// `?resume=yes` — require an existing resumable staging dir,
     /// fail if none.
     Require,
+    /// Automatic insert: resume eligible state, otherwise wipe and start fresh.
+    Prefer,
     /// `?resume=no` — wipe any existing staging dir first.
     Wipe,
     /// no `resume=` query param — fresh sweep+mux; leave any existing

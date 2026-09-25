@@ -457,6 +457,42 @@ struct InsertTick {
     latch: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoResumeAction {
+    Fresh,
+    Sweep,
+    Remux,
+}
+
+fn auto_resume_action(resumable: Option<Resumable>) -> AutoResumeAction {
+    match resumable {
+        Some(Resumable::Sweep) => AutoResumeAction::Sweep,
+        Some(Resumable::Remux) => AutoResumeAction::Remux,
+        None => AutoResumeAction::Fresh,
+    }
+}
+
+fn auto_insert_rip_mode(on_insert: &str) -> Option<crate::web::ResumeMode> {
+    match on_insert {
+        "rip" => Some(crate::web::ResumeMode::Wipe),
+        "resume" => Some(crate::web::ResumeMode::Prefer),
+        _ => None,
+    }
+}
+
+fn auto_rip_fresh(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
+    if disc_owned_by_worker(cfg, device) {
+        crate::log::device_log(
+            device,
+            "Cannot start auto-rip: staging is owned by the mux worker",
+        );
+        drop_session(device);
+        return;
+    }
+    wipe_staging_for_disc(cfg, device);
+    rip_disc(cfg, device, device_path, false);
+}
+
 // Decide both halves of a tick's response to an observed disc; the two
 // answers must agree. `dispatch` is suppressed during the post-Stop
 // cooldown. See docs/ripper-mod-notes.md — insert_tick.
@@ -749,10 +785,10 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     // rip_disc and the cleanup paths unregister it on exit.
                     register_halt(&device, libfreemkv::Halt::new());
 
-                    // v0.25.7: restored on_insert=rip auto-rip; restart
-                    // flapping is now guarded by is_in_cooldown, .completed,
-                    // and .restart_count/RESTART_LIMIT instead.
-                    let do_auto_rip = on_insert == "rip";
+                    // Auto-rip may either force a fresh sweep or prefer
+                    // resumable staging state, as selected in settings.
+                    let auto_mode = auto_insert_rip_mode(&on_insert);
+                    let do_auto_rip = auto_mode.is_some();
                     let cfg_for_thread = cfg.clone();
                     let dev_path_for_thread = dev_path.clone();
                     if let Err(e) = spawn_rip_thread(&device, "rip", move || {
@@ -767,7 +803,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                                         &cfg_for_thread,
                                         &device_for_thread,
                                         &dev_path_for_thread,
-                                        crate::web::ResumeMode::Default,
+                                        auto_mode.expect("auto-rip mode checked above"),
                                     );
                                 }
                             }
@@ -1221,6 +1257,27 @@ pub fn handle_rip_request(
                     },
                 );
                 drop_session(device);
+            }
+        }
+        crate::web::ResumeMode::Prefer => {
+            match auto_resume_action(resumable_for_device(cfg, device)) {
+                AutoResumeAction::Sweep => {
+                    crate::log::device_log(
+                        device,
+                        "Auto-resume: continuing partial sweep from mapfile",
+                    );
+                    rip_disc(cfg, device, device_path, true);
+                }
+                AutoResumeAction::Remux => {
+                    if let Some(class) = find_resumable_for_disc(cfg, device) {
+                        crate::log::device_log(device, "Auto-resume: re-muxing existing ISO");
+                        resume::resume_remux(cfg, device, class);
+                        drop_session(device);
+                    } else {
+                        auto_rip_fresh(cfg, device, device_path);
+                    }
+                }
+                AutoResumeAction::Fresh => auto_rip_fresh(cfg, device, device_path),
             }
         }
         crate::web::ResumeMode::Wipe => {
@@ -9498,7 +9555,33 @@ mod tests {
 
 #[cfg(test)]
 mod insert_tick_tests {
-    use super::insert_tick;
+    use super::{AutoResumeAction, auto_insert_rip_mode, auto_resume_action, insert_tick};
+
+    #[test]
+    fn auto_resume_uses_partial_state_and_falls_back_to_fresh() {
+        assert_eq!(
+            auto_resume_action(Some(super::Resumable::Sweep)),
+            AutoResumeAction::Sweep
+        );
+        assert_eq!(
+            auto_resume_action(Some(super::Resumable::Remux)),
+            AutoResumeAction::Remux
+        );
+        assert_eq!(auto_resume_action(None), AutoResumeAction::Fresh);
+    }
+
+    #[test]
+    fn insert_rip_modes_distinguish_fresh_from_prefer_resume() {
+        assert_eq!(
+            auto_insert_rip_mode("rip"),
+            Some(crate::web::ResumeMode::Wipe)
+        );
+        assert_eq!(
+            auto_insert_rip_mode("resume"),
+            Some(crate::web::ResumeMode::Prefer)
+        );
+        assert_eq!(auto_insert_rip_mode("scan"), None);
+    }
 
     // A disc seen during the 5s post-Stop cooldown must still be ripped
     // once it expires — latching it early retires the only auto-rip

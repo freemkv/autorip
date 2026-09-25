@@ -148,7 +148,7 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub tv_auto: bool,
     pub auto_eject: bool,
-    pub on_insert: String,      // "nothing", "scan", "rip"
+    pub on_insert: String,      // "nothing", "scan", "rip", "resume"
     pub output_format: String,  // "mkv", "m2ts", "iso"
     pub network_target: String, // e.g. "nas.example.com:9000" for network output
     pub on_read_error: String,  // "stop", "skip"
@@ -560,7 +560,7 @@ fn load_saved(mut cfg: Config) -> Config {
     // numeric clamps: a corrupt value (e.g. output_format="garbage") would
     // otherwise load and misbehave downstream. Unknown values keep the default.
     if let Some(v) = saved.get("on_insert").and_then(|v| v.as_str()) {
-        if matches!(v, "nothing" | "scan" | "rip") {
+        if matches!(v, "nothing" | "scan" | "rip" | "resume") {
             cfg.on_insert = v.to_string();
         } else {
             tracing::warn!(value = %v, "settings.json on_insert has unknown value - using default");
@@ -971,6 +971,14 @@ mod tests {
         let d = scratch("no_legacy");
         let cfg = load_with(&d, r#"{}"#);
         assert_eq!(cfg.on_read_error, "stop");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn on_insert_resume_setting_is_loaded() {
+        let d = scratch("on_insert_resume");
+        let cfg = load_with(&d, r#"{"on_insert":"resume"}"#);
+        assert_eq!(cfg.on_insert, "resume");
         let _ = std::fs::remove_dir_all(&d);
     }
 
