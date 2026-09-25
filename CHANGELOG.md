@@ -8,6 +8,12 @@
 
 ## [1.7.5] — 2026-09-23
 
+### Fixed
+
+- **A definitive "no key for this disc" from the online key service is no longer reported as an outage.** When the service answered HTTP 422 ("licensed but unresolved") — which it does only after exhausting every candidate source, ~30s of server work — autorip showed "Missing keys — The online key service could not be reached, so it never said whether this disc has a key… wait a few minutes and try again… the service was down, not the disc." Every word of that was wrong: the service *was* reached and gave a final answer, and the message steered the operator away from the real cause and into an endless retry. The cause is upstream: `freemkv-keysources` collapses **every** non-2xx key-service reply into one error code (E7028, whose documented meaning is "the source never got as far as answering"), so the error type autorip receives cannot express the difference. autorip now classifies from the HTTP status it already holds (`DecodeReachability::Status`) and gives each outcome its own message: unreachable (transport failure), HTTP 5xx, 429 over-quota, 422 definitive no-key, 404 unlicensed, an unrecognised status (reported plainly, with the status), and an unusable key-service URL that was never contacted. Each says what happened, whether retrying helps, and what to do next, and carries its HTTP status for support.
+- Retry scope is unchanged and now explicit: only the outcomes where the service never delivered a verdict about the disc (transport failure, 5xx, 429) are retried. A 422 was already non-retryable and stays that way.
+- The three key-SOURCE error codes (E7028/E7029/E7030) reaching the keyless-failure renderer no longer fall through to "AACS key resolution failed at an unrecognized stage"; each now says the source never answered and what to do.
+
 ### Changed
 
 - Version aligned to 1.7.5 for the unified release. No functional changes to this crate; the release is driven by freemkv-unlock mirroring the freemkv-firmware 0.9.0 ABI (the drive's `Ake` and `Bus` levers retired into a single `Encryption` lever).

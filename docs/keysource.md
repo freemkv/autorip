@@ -42,9 +42,53 @@ rendering has no such race.
 This is the crux of the "down vs no-key" fix: when the online source
 resolves NO key, autorip alone can't tell whether the service HAD the key
 but was unreachable (a 502 outage, connect-refused, timeout) or genuinely
-has none. A single bounded probe against the configured `keyserver_url`
-answers that — and only the `Up` verdict keeps the pre-fix "no keys found"
-behaviour.
+has none. The real `/decode` POST's HTTP outcome answers that, with a single
+bounded probe as the fallback when no POST reached the network.
+
+The enum is per-OUTCOME, not a three-way up/down/quota, because the
+operator-facing message is written straight from it and the outcomes need
+different messages AND different retry decisions:
+
+| verdict | from | transient? |
+| --- | --- | --- |
+| `Unreachable` | transport failure (refused / DNS / timeout / TLS) | yes |
+| `ServerError(code)` | HTTP 5xx | yes |
+| `RateLimited` | HTTP 429 | yes |
+| `NoKeyForDisc` | HTTP 422 | **no** |
+| `NotLicensed` | HTTP 404 | no |
+| `Unexpected(code)` | any other non-2xx | no |
+| `Answered` | 2xx/3xx, or any probe that got a status | no |
+| `NotAsked` | URL empty / wrong scheme / SSRF-blocked | no |
+
+`NoKeyForDisc` is the one that motivated the split. The key service answers
+422 "licensed but unresolved" only after exhausting every candidate source
+(disc-keyed, device keys, brute UK/VK/MK/PK — ~30s in the observed case), so
+it is the most *definitive* answer the service can give. Reporting it as an
+outage ("the service was down, not the disc — wait a few minutes and try
+again") both misstates the cause and sends the operator into an endless
+retry on a disc that will never resolve.
+
+### Why the library's error code can't carry this
+
+`freemkv-keysources::classify_http_status` maps 401/403 to
+`KeyServiceUnauthorized`, 429 to `KeyServiceRateLimited`, and **everything
+else** — 400, 404, 422, 5xx alike — to `KeyServiceUnavailable` (E7028).
+E7028's own documentation says it means "the source never got as far as
+answering the question", which is precisely what a 422 is NOT. So the error
+type autorip receives cannot represent the distinction, and rendering
+E7028's catalog text is what produced the wrong message. `ServiceReachability`
+is built from `DecodeReachability::Status(u16)`, which DOES carry the status,
+so autorip classifies from that and only falls back to the error code when no
+HTTP status is available.
+
+### Probe verdicts are deliberately coarser than decode verdicts
+
+`classify_reachability` (the probe) never returns `NoKeyForDisc`,
+`NotLicensed` or `Unexpected`. The probe POSTs an EMPTY body and names no
+disc, so its 422/404 says only "the service is up"; reading a per-disc
+verdict out of a disc-less request would recreate the same conflation in
+mirror image. `reachability_from_decode` — describing a POST that DID carry
+the disc — owns the per-disc arms.
 
 ## `reachability_for_unprobeable_url`: two failure shapes, opposite verdicts
 
@@ -53,11 +97,13 @@ answer `Up` to both:
 
 * A permanent verdict on the URL — empty, not http(s), no host, or an
   address the SSRF guard blocks. The online source was already dropped for
-  such a URL, so a resulting no-key is genuine and `Up` is right: calling
-  it an outage would park every disc forever on a config mistake.
+  such a URL, so `NotAsked` is right: terminal (calling it an outage would
+  park every disc forever on a config mistake) but named for what actually
+  happened — nothing was ever sent — rather than borrowing "no key".
 * A failed LOOKUP — DNS timed out (including the `MAX_INFLIGHT` fail-fast),
   the resolver errored, or the host resolved to nothing. That is the same
   evidence `ProbeOutcome::Transport` is built from: we never reached the
-  service. Reporting `Up` here made a DNS blip finalise a rippable disc as
-  permanently keyless, which is precisely what the `Down` path exists to
-  prevent — the disc parks, retries, and rips when the network returns.
+  service, so it is `Unreachable`. Calling it terminal made a DNS blip
+  finalise a rippable disc as permanently keyless, which is precisely what
+  the transient path exists to prevent — the disc parks, retries, and rips
+  when the network returns.
