@@ -2774,10 +2774,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             );
         }
         if bytes_total_disc > 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
-            // The ISO is pre-sized to disc capacity, so metadata.len() cannot
-            // tell us how much data has actually been swept. Use the mapfile's
-            // NonTried bytes when this is a valid resume; already-written
-            // retry ranges are zero-filled and do not need extra image space.
+            // The ISO's logical length is pre-sized; mapfile NonTried bytes
+            // report remaining reads. Retried ranges are already zero-filled.
             let remaining_iso_bytes = if resume_sweep {
                 freemkv_engine::Mapfile::load(std::path::Path::new(&mapfile_path_str))
                     .ok()
