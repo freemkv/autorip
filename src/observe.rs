@@ -6,21 +6,19 @@
 //! `/api/debug`), and stderr (compact, captured by Docker).
 //!
 //! Filter level via `AUTORIP_LOG_LEVEL` (env-filter syntax). Default
-//! `autorip=info,libfreemkv=warn`. See docs/observe.md for rationale.
+//! `autorip=info,libfreemkv=warn`.
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling;
 use tracing_subscriber::reload;
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-// EnvFilter directive used when /api/debug is OFF (the normal state).
-// prod = warnings only; dev = full debug (see FILTER_ON).
-// See docs/observe.md — FILTER_OFF.
+// EnvFilter directive used when /api/debug is OFF (the normal state). prod = warnings only; dev
+// = full debug (see FILTER_ON).
 const FILTER_OFF: &str = "autorip=info,libfreemkv=warn,freemkv=warn";
 
-// EnvFilter directive used when /api/debug is ON: debug globally, plus
-// mux/stream/freemkv targets needed for drive + mux forensics.
-// See docs/observe.md — FILTER_ON.
+// EnvFilter directive used when /api/debug is ON: debug globally, plus mux/stream/freemkv
+// targets needed for drive + mux forensics.
 const FILTER_ON: &str = "autorip=debug,libfreemkv=debug,freemkv=debug,mux=debug,stream=debug";
 
 /// Worker guards for the non-blocking file appenders. Must outlive the
@@ -36,10 +34,8 @@ static RELOAD_HANDLE: once_cell::sync::OnceCell<reload::Handle<EnvFilter, Regist
 
 /// Initialize the tracing stack. Returns nothing.
 ///
-/// Contract: call exactly once, early in `main`, before any threads are
-/// spawned. A sequential second call is a no-op, but this is not a
-/// synchronization barrier — see docs/observe.md for the concurrency
-/// caveat and why this returns no `Result`.
+/// Contract: call exactly once, early in `main`, before any threads are spawned. A sequential
+/// second call is a no-op, but this is not a synchronization barrier.
 pub fn init() {
     if GUARDS.get().is_some() {
         return;

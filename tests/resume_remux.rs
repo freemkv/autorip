@@ -5,8 +5,7 @@
 //! built via libfreemkv's `Mapfile::create` + `record` + `flush` so
 //! we don't hand-roll the on-disk text format.
 //!
-//! Deliberate gap: `Disc::scan_image`/`run_mux` need a real UDF ISO —
-//! see docs/resume-remux-tests.md.
+//! Deliberate gap: `Disc::scan_image`/`run_mux` need a real UDF ISO.
 
 use std::path::{Path, PathBuf};
 
@@ -250,9 +249,8 @@ fn write_mapfile_with_unreadable(path: &Path, total_bytes: u64, unreadable_bytes
     map.flush().expect("mapfile flush");
 }
 
-// Regression: abort_on_lost_secs==0 with whole-disc unreadable bytes must
-// still classify as Remux — see docs/resume-remux-tests.md for the
-// pre-fix pre-filter bug this guards against.
+// Regression: abort_on_lost_secs==0 with whole-disc unreadable bytes must still classify as
+// Remux.
 #[test]
 fn classify_resume_allows_out_of_title_damage_when_abort_on_lost_secs_is_zero() {
     let td = tmpdir();
@@ -320,9 +318,8 @@ fn classify_resume_rejects_heavy_damage_when_abort_on_lost_secs_positive() {
     );
 }
 
-// Tight boundary check on the pre-filter's `lost_secs > abort_on_lost_secs`
-// gate — pins the exact arithmetic so a `/`→`%` or `/`→`*` mutant is caught.
-// See docs/resume-remux-tests.md for the full mutant analysis.
+// Tight boundary check on the pre-filter's `lost_secs > abort_on_lost_secs` gate — pins the
+// exact arithmetic so a `/`→`%` or `/`→`*` mutant is caught.
 #[test]
 fn classify_resume_pre_filter_boundary_is_strictly_greater_than() {
     const FALLBACK_BITRATE_BYTES_PER_SEC: u64 = 8_250_000;
@@ -362,9 +359,8 @@ fn classify_resume_pre_filter_boundary_is_strictly_greater_than() {
     );
 }
 
-// Cold resume must hand `resume_remux` a FILE basename, not the staging
-// DIRECTORY name (boxset dirs carry a `_2` suffix the files don't).
-// See docs/resume-remux-tests.md for the bug this regression-tests.
+// Cold resume must hand `resume_remux` a FILE basename, not the staging DIRECTORY name (boxset
+// dirs carry a `_2` suffix the files don't).
 #[test]
 fn cold_resume_of_a_boxset_variant_dir_uses_the_file_basename_not_the_dir_name() {
     let td = tmpdir();

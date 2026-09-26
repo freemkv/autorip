@@ -50,9 +50,8 @@ pub static ACTIVE_MOVE_DIR: once_cell::sync::Lazy<Mutex<Option<String>>> =
 #[cfg(test)]
 pub(crate) static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
 
-// Clears MOVE_STATE and ACTIVE_MOVE_DIR when the per-directory pass leaves
-// scope, by any path: normal completion, a failure continue, or an unwind.
-// See docs/mover.md — MoveStateGuard.
+// Clears MOVE_STATE and ACTIVE_MOVE_DIR when the per-directory pass leaves scope, by any path:
+// normal completion, a failure continue, or an unwind.
 struct MoveStateGuard;
 
 impl MoveStateGuard {
@@ -121,16 +120,14 @@ fn clear_error(path: &str) {
         .remove(path);
 }
 
-// Drop any MOVE_ERRORS row keyed by this DESTINATION path, on every exit
-// from move_file that leaves valid bytes at dest.
-// See docs/mover.md — clear_stale_dest_error.
+// Drop any MOVE_ERRORS row keyed by this DESTINATION path, on every exit from move_file that
+// leaves valid bytes at dest.
 fn clear_stale_dest_error(dest: &Path) {
     clear_error(&dest.to_string_lossy());
 }
 
-// Drop MOVE_ERRORS rows whose staging dir is gone. `seen` is every staging
-// child this pass listed; a key is dropped only if it is a direct child of
-// staging_root AND was absent. See docs/mover.md — prune_move_errors.
+// Drop MOVE_ERRORS rows whose staging dir is gone. `seen` is every staging child this pass
+// listed; a key is dropped only if it is a direct child of staging_root AND was absent.
 fn prune_move_errors(staging_root: &str, seen: &std::collections::HashSet<String>) {
     let root = Path::new(staging_root);
     // Recover-and-proceed on poison, matching record_error's peers: leaving
@@ -251,9 +248,8 @@ fn fresh_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
     f.metadata()
 }
 
-// Cheap content-identity probe for two files KNOWN to be the same length:
-// compares a fixed-size head/tail window from each; any read error
-// conservatively returns false. See docs/mover.md — same_head_and_tail.
+// Cheap content-identity probe for two files KNOWN to be the same length: compares a fixed-size
+// head/tail window from each; any read error conservatively returns false.
 fn same_head_and_tail(a: &Path, b: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     const WINDOW: u64 = 64 * 1024;
@@ -276,9 +272,8 @@ fn same_head_and_tail(a: &Path, b: &Path) -> bool {
     }
 }
 
-// Copy src -> dest in 4 MiB chunks, publishing the running bytes-written
-// count into `written` as we go, so the move loop can show real progress
-// without stat()-ing the destination. See docs/mover.md — copy_counting.
+// Copy src -> dest in 4 MiB chunks, publishing the running bytes-written count into `written`
+// as we go, so the move loop can show real progress without stat()-ing the destination.
 fn copy_counting(
     src: &Path,
     dest: &Path,
@@ -289,9 +284,8 @@ fn copy_counting(
     })
 }
 
-// copy_counting with the abort signal injected, for testability without
-// touching the process-global crate::SHUTDOWN (which every mover test
-// shares). See docs/mover.md — copy_counting_cancellable.
+// copy_counting with the abort signal injected, for testability without touching the
+// process-global crate::SHUTDOWN (which every mover test shares).
 fn copy_counting_cancellable(
     src: &Path,
     dest: &Path,
@@ -516,9 +510,8 @@ fn check_post_copy_size(src: &Path, dst: &Path) -> Result<(), MoveError> {
     Ok(())
 }
 
-// Format-aware post-cp validation: routes to a structural check (EBML
-// head/tail for .mkv; TS sync for .m2ts), falling back to a fresh-FD size
-// compare for .iso. See docs/mover.md — check_post_copy.
+// Format-aware post-cp validation: routes to a structural check (EBML head/tail for.mkv; TS
+// sync for.m2ts), falling back to a fresh-FD size compare for.iso.
 pub(crate) fn check_post_copy(src: &Path, dst: &Path) -> Result<(), MoveError> {
     let ext = dst
         .extension()
@@ -560,9 +553,8 @@ fn dest_structural_ok(dst: &Path) -> bool {
     }
 }
 
-// One pass of the mover loop: take a config SNAPSHOT, release the lock, then
-// move. Returns false if the config could not be read. The move is injected
-// so this is testable. See docs/mover.md — mover_tick.
+// One pass of the mover loop: take a config SNAPSHOT, release the lock, then move. Returns
+// false if the config could not be read. The move is injected so this is testable.
 fn mover_tick(cfg: &Arc<RwLock<Config>>, do_move: impl FnOnce(&Config)) -> bool {
     let snapshot = match cfg.read() {
         Ok(c) => c.clone(),
@@ -601,9 +593,8 @@ pub fn run(cfg: &Arc<RwLock<Config>>) {
 static STRANDED_WARNED: once_cell::sync::Lazy<Mutex<std::collections::HashSet<String>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
 
-// Drop STRANDED_WARNED entries whose staging dir is gone. Mirrors
-// prune_move_errors, same liveness guarantee. See docs/mover.md —
-// prune_stranded_warned.
+// Drop STRANDED_WARNED entries whose staging dir is gone. Mirrors prune_move_errors, same
+// liveness guarantee.
 fn prune_stranded_warned(seen: &std::collections::HashSet<String>) {
     let mut m = STRANDED_WARNED.lock().unwrap_or_else(|e| e.into_inner());
     m.retain(|key| seen.contains(key));
@@ -622,9 +613,8 @@ enum DoneAbsence {
     Fault,
 }
 
-// Classify a .done read error. NotFound + any governing marker present is
-// the by-design in-progress state; everything else is a fault.
-// See docs/mover.md — classify_done_absence.
+// Classify a.done read error. NotFound + any governing marker present is the by-design
+// in-progress state; everything else is a fault.
 fn classify_done_absence(err_kind: std::io::ErrorKind, dir: &Path) -> DoneAbsence {
     if err_kind == std::io::ErrorKind::NotFound {
         // The staging dir was removed between the `.done` read and now (move
@@ -1259,9 +1249,8 @@ fn check_and_move(cfg: &Config) {
     prune_stranded_warned(&seen_dirs);
 }
 
-// The deliverable files in one staging dir, and whether the listing was
-// COMPLETE (false on any per-entry error — must not count as a completed
-// move). See docs/mover.md — collect_ripped_files.
+// The deliverable files in one staging dir, and whether the listing was COMPLETE (false on any
+// per-entry error — must not count as a completed move).
 fn collect_ripped_files<I>(
     entries: I,
     move_iso: bool,
@@ -1310,9 +1299,8 @@ where
     (files, complete)
 }
 
-// The media type used to ROUTE a planned move, coalescing an empty
-// media_type to the "movie" default, matching how an absent one already
-// defaults. See docs/mover.md — routing_media_type.
+// The media type used to ROUTE a planned move, coalescing an empty media_type to the "movie"
+// default, matching how an absent one already defaults.
 fn routing_media_type(result: &tmdb::TmdbResult) -> &str {
     if result.media_type.is_empty() {
         "movie"
@@ -1352,9 +1340,8 @@ enum DestClaim {
     Unknown,
 }
 
-// Can this move claim `dest` — is it free, or already THIS rip's own
-// output? Uses the same size+content-probe evidence as the collision guard
-// so a retried move is idempotent. See docs/mover.md — dest_claim.
+// Can this move claim `dest` — is it free, or already THIS rip's own output? Uses the same
+// size+content-probe evidence as the collision guard so a retried move is idempotent.
 fn dest_claim(src: &Path, dest: &str) -> DestClaim {
     let d = match fresh_metadata(Path::new(dest)) {
         Ok(d) => d,
@@ -1546,9 +1533,8 @@ fn join_path(base: &str, leaf: &str) -> String {
         .replace('\\', "/")
 }
 
-// Resolve a media subdirectory (movie_dir/tv_dir/iso_dir) UNDER output_dir
-// via Path::join: a relative sub joins onto output_dir, an absolute sub
-// replaces it (back-compat). See docs/mover.md — resolve_media_root.
+// Resolve a media subdirectory (movie_dir/tv_dir/iso_dir) UNDER output_dir via Path::join: a
+// relative sub joins onto output_dir, an absolute sub replaces it (back-compat).
 fn resolve_media_root(output_dir: &str, sub: &str) -> String {
     if sub.is_empty() {
         return output_dir.replace('\\', "/");
@@ -1559,9 +1545,9 @@ fn resolve_media_root(output_dir: &str, sub: &str) -> String {
         .replace('\\', "/")
 }
 
-// The configured destination ROOT directory that governs a planned move,
-// mirroring build_destination's root selection exactly. Validated
-// present+writable BEFORE creating any subdir tree. See docs/mover.md.
+// The configured destination ROOT directory that governs a planned move, mirroring
+// build_destination's root selection exactly. Validated present+writable BEFORE creating any
+// subdir tree.
 fn destination_root(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>) -> String {
     if let Some(result) = tmdb {
         match routing_media_type(result) {
@@ -1577,9 +1563,8 @@ fn destination_root(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>) -> String {
     cfg.output_dir.clone()
 }
 
-// The configured root a given output FILE lands under: .iso uses iso_dir
-// when set, everything else uses destination_root. See docs/mover.md —
-// destination_root_for.
+// The configured root a given output FILE lands under:.iso uses iso_dir when set, everything
+// else uses destination_root.
 fn destination_root_for(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename: &str) -> String {
     if is_iso_file(filename) && !cfg.iso_dir.is_empty() {
         return resolve_media_root(&cfg.output_dir, &cfg.iso_dir);
@@ -1587,9 +1572,8 @@ fn destination_root_for(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>, filename:
     destination_root(cfg, tmdb)
 }
 
-// Fail-loud destination-root validation: the configured root must ALREADY
-// EXIST as a directory AND be writable, so the caller preserves output in
-// staging on failure. See docs/mover.md — validate_destination_root.
+// Fail-loud destination-root validation: the configured root must ALREADY EXIST as a directory
+// AND be writable, so the caller preserves output in staging on failure.
 fn validate_destination_root(root: &str) -> Result<(), String> {
     if root.is_empty() {
         // An empty root means "no configured dir". An empty string would
@@ -1653,9 +1637,8 @@ fn validate_destination_root(root: &str) -> Result<(), String> {
     }
 }
 
-// Fail-loud-EARLY destination check: validates every configured, non-empty
-// destination root (movie/tv/output). See docs/mover.md —
-// check_configured_destinations.
+// Fail-loud-EARLY destination check: validates every configured, non-empty destination root
+// (movie/tv/output).
 pub(crate) fn check_configured_destinations(cfg: &Config) -> Vec<(String, String)> {
     let mut problems = Vec::new();
     // Validate the RESOLVED roots — the same joined paths the move actually
@@ -1704,9 +1687,8 @@ fn absolute_for_log(dest: &str) -> String {
     }
 }
 
-// Move a file with idempotent retry semantics: pre-flight Skipped/Collision
-// check, then an atomic rename(2), falling back to a worker-thread
-// copy_counting + unlink. See docs/mover.md — move_file.
+// Move a file with idempotent retry semantics: pre-flight Skipped/Collision check, then an
+// atomic rename(2), falling back to a worker-thread copy_counting + unlink.
 fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -> MoveOutcome {
     // Fresh-FD stat on both sides: a cache-served stat on NFS can mis-size
     // either side, spuriously tripping the Skipped or src-missing Moved
@@ -1902,9 +1884,8 @@ fn move_file(src: &Path, dest: &Path, on_progress: &dyn Fn(u8, f64, f64, f64)) -
 #[cfg(test)]
 mod tests {
 
-    // The mover must not hold the config lock WHILE moving. Observes the
-    // lock from INSIDE the injected move — the only place this property is
-    // actually observable. See docs/mover.md — the_config_lock_is_free...
+    // The mover must not hold the config lock WHILE moving. Observes the lock from INSIDE the
+    // injected move — the only place this property is actually observable.
     #[test]
     fn the_config_lock_is_free_while_the_move_runs() {
         use std::sync::{Arc, RwLock};
@@ -2230,9 +2211,8 @@ mod tests {
         assert_eq!(destination_root(&cfg, &tmdb), "/srv/library/movies");
     }
 
-    // The media-root rules on NATIVE paths, so Windows exercises this logic
-    // instead of skipping it. See docs/mover.md —
-    // resolve_media_root_joins_natively.
+    // The media-root rules on NATIVE paths, so Windows exercises this logic instead of skipping
+    // it.
     #[test]
     fn resolve_media_root_joins_natively() {
         let base = if cfg!(windows) {
@@ -2333,9 +2313,8 @@ mod tests {
         );
     }
 
-    // resolve_media_root unit semantics: relative joins, absolute wins,
-    // trailing slashes normalize, empty sub -> output_dir. POSIX-only; see
-    // docs/mover.md — resolve_media_root_semantics.
+    // resolve_media_root unit semantics: relative joins, absolute wins, trailing slashes
+    // normalize, empty sub -> output_dir. POSIX-only.
     #[cfg(unix)]
     #[test]
     fn resolve_media_root_semantics() {
@@ -2394,9 +2373,8 @@ mod tests {
         assert_eq!(dest, "/out/disc.mkv");
     }
 
-    // Companion to build_destination_empty_movie_dir_falls_to_output_dir:
-    // the TV arm's !cfg.tv_dir.is_empty() guard is load-bearing the same
-    // way. See docs/mover.md — build_destination_empty_tv_dir...
+    // Companion to build_destination_empty_movie_dir_falls_to_output_dir: the TV arm's
+    // !cfg.tv_dir.is_empty() guard is load-bearing the same way.
     #[test]
     fn build_destination_empty_tv_dir_falls_to_output_dir() {
         let cfg = cfg_with_dirs("/out/Movies", "", "/out");
@@ -2415,9 +2393,8 @@ mod tests {
         assert_eq!(destination_root(&cfg, &Some(tv)), "/out");
     }
 
-    // The lock-step contract as a property over the whole configured-dir
-    // matrix, including empty-dir edges. See docs/mover.md —
-    // destination_root_and_build_destination_agree_including_empty_dirs.
+    // The lock-step contract as a property over the whole configured-dir matrix, including
+    // empty-dir edges.
     #[test]
     fn destination_root_and_build_destination_agree_including_empty_dirs() {
         for (movie_dir, tv_dir) in [
@@ -2598,9 +2575,8 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"new full content");
     }
 
-    // FIX 4 — STRANDED_WARNED was inserted-into but never pruned, growing
-    // unbounded (the same leak MOVE_ERRORS bounds via prune_move_errors).
-    // See docs/mover.md — prune_stranded_warned_drops_vanished_dirs...
+    // FIX 4 — STRANDED_WARNED was inserted-into but never pruned, growing unbounded (the same
+    // leak MOVE_ERRORS bounds via prune_move_errors).
     #[test]
     fn prune_stranded_warned_drops_vanished_dirs_keeps_present() {
         let _g = errors_guard();
@@ -2626,9 +2602,8 @@ mod tests {
         );
     }
 
-    // A destination-keyed MOVE_ERRORS row must clear itself once a later
-    // move to that same destination succeeds. See docs/mover.md —
-    // a_successful_move_clears_a_stale_destination_keyed_error.
+    // A destination-keyed MOVE_ERRORS row must clear itself once a later move to that same
+    // destination succeeds.
     #[test]
     fn a_successful_move_clears_a_stale_destination_keyed_error() {
         let _g = errors_guard();
@@ -2662,9 +2637,9 @@ mod tests {
         );
     }
 
-    // Partial-dest cleanup contract (already-landed fix): a failed copy
+    // Partial-dest cleanup contract: a failed copy
     // must NOT leave a partial/garbage dest, or the next tick sees a
-    // phantom Collision. See docs/mover.md — move_file_copy_failure...
+    // phantom Collision.
     #[test]
     fn move_file_copy_failure_leaves_no_partial_dest() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2742,9 +2717,8 @@ mod tests {
         );
     }
 
-    // The pre-flight "src missing, dest present" branch must require a
-    // genuine NotFound on the src stat, not just any error (EACCES/EIO/
-    // ESTALE prove nothing). See docs/mover.md — move_file_does_not_...
+    // The pre-flight "src missing, dest present" branch must require a genuine NotFound on the
+    // src stat, not just any error (EACCES/EIO/ ESTALE prove nothing).
     #[cfg(unix)]
     #[test]
     fn move_file_does_not_report_moved_on_non_notfound_src_stat_error() {
@@ -2824,9 +2798,8 @@ mod tests {
         });
     }
 
-    // Cross-device (EXDEV) copy+unlink SUCCESS path, driven end-to-end
-    // through move_file against a SEPARATE real filesystem; SKIPS when one
-    // isn't available. See docs/mover.md — cross_device_copy_and_unlink...
+    // Cross-device (EXDEV) copy+unlink SUCCESS path, driven end-to-end through move_file
+    // against a SEPARATE real filesystem; SKIPS when one isn't available.
     #[cfg(unix)]
     #[test]
     fn move_file_cross_device_copy_unlink_success_when_two_filesystems_exist() {
@@ -3256,9 +3229,7 @@ mod tests {
         assert!(movie_dir.join("Keepme (2024)/Keepme (2024).iso").exists());
     }
 
-    // A rip can deliver an MKV and its companion ISO; both must take the
-    // SAME `_2` suffix. See docs/mover.md —
-    // check_and_move_gives_a_discs_companion_files_the_same_variant.
+    // A rip can deliver an MKV and its companion ISO; both must take the SAME `_2` suffix.
     #[test]
     fn check_and_move_gives_a_discs_companion_files_the_same_variant() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3306,9 +3277,8 @@ mod tests {
         );
     }
 
-    // Regression: state.json's outputs[] is the AUTHORITATIVE deliverable
-    // list for a TV rip; a leftover partial not in outputs[] must not be
-    // promoted. See docs/mover.md — check_and_move_files_only_outputs...
+    // Regression: state.json's outputs[] is the AUTHORITATIVE deliverable list for a TV rip; a
+    // leftover partial not in outputs[] must not be promoted.
     #[test]
     fn check_and_move_files_only_outputs_for_a_tv_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3378,9 +3348,8 @@ mod tests {
         );
     }
 
-    // Regression: the TV outputs[] filter never listed the intermediate
-    // .iso, so a keep_iso=true TV rip's ISO was dropped then destroyed by
-    // teardown. See docs/mover.md — check_and_move_keeps_iso_for_a_tv_dir.
+    // Regression: the TV outputs[] filter never listed the intermediate.iso, so a keep_iso=true
+    // TV rip's ISO was dropped then destroyed by teardown.
     #[test]
     fn check_and_move_keeps_iso_for_a_tv_dir_with_keep_iso() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3456,9 +3425,8 @@ mod tests {
         out
     }
 
-    // POSIX-only: with_file_name re-renders the parent with the platform
-    // separator, so a POSIX fixture comes back mixed on Windows. See
-    // docs/mover.md — dest_with_variant_suffixes_the_stem_and_leaves...
+    // POSIX-only: with_file_name re-renders the parent with the platform separator, so a POSIX
+    // fixture comes back mixed on Windows.
     #[cfg(unix)]
     #[test]
     fn dest_with_variant_suffixes_the_stem_and_leaves_variant_one_alone() {
@@ -3517,9 +3485,8 @@ mod tests {
         assert!(copy_counting(&src, &dst, &written).is_err());
     }
 
-    // Regression (temp + rename atomicity): a failed/interrupted copy must
-    // NOT leave any file at the FINAL dest name. See docs/mover.md —
-    // copy_counting_failure_leaves_no_file_at_final_name.
+    // Regression (temp + rename atomicity): a failed/interrupted copy must NOT leave any file
+    // at the FINAL dest name.
     #[test]
     fn copy_counting_failure_leaves_no_file_at_final_name() {
         use std::sync::atomic::AtomicU64;
@@ -3607,8 +3574,6 @@ mod tests {
     }
 
     // SIGTERM must be observed BETWEEN CHUNKS, not at the end of the copy.
-    // See docs/mover.md —
-    // copy_counting_aborts_between_chunks_when_shutdown_is_requested.
     #[test]
     fn copy_counting_aborts_between_chunks_when_shutdown_is_requested() {
         use std::sync::atomic::AtomicU64;
@@ -3802,9 +3767,8 @@ mod tests {
         );
     }
 
-    // Two DIFFERENT discs route to the same Title (Year) path with the SAME
-    // byte length (the boxset case). See docs/mover.md —
-    // check_and_move_second_disc_of_a_title_is_filed_beside_the_first.
+    // Two DIFFERENT discs route to the same Title (Year) path with the SAME byte length (the
+    // boxset case).
     #[test]
     fn check_and_move_second_disc_of_a_title_is_filed_beside_the_first() {
         let dir = scratch_dir("collision");
@@ -3884,9 +3848,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // The collision guard's stat classification: ONLY NotFound means "safe
-    // to move". Any other stat error must defer to a later tick. See
-    // docs/mover.md — check_and_move_defers_on_non_notfound_dest_stat_error.
+    // The collision guard's stat classification: ONLY NotFound means "safe to move". Any other
+    // stat error must defer to a later tick.
     #[cfg(unix)]
     #[test]
     fn check_and_move_defers_on_non_notfound_dest_stat_error_and_never_clobbers() {
@@ -3956,9 +3919,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // The same-size content probe must compare a window large enough to be
-    // meaningful, or two distinct discs get called identical. See
-    // docs/mover.md — check_and_move_collision_probe_window_is_large_enough.
+    // The same-size content probe must compare a window large enough to be meaningful, or two
+    // distinct discs get called identical.
     #[test]
     fn check_and_move_collision_probe_window_is_large_enough_to_see_a_2kb_diff() {
         let dir = scratch_dir("windowprobe");
@@ -4016,9 +3978,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // A failed copy that left NOTHING at the destination must not raise a
-    // "partial copy could not be removed" error. See docs/mover.md —
-    // move_file_copy_failure_with_no_dest_records_no_partial_error.
+    // A failed copy that left NOTHING at the destination must not raise a "partial copy could
+    // not be removed" error.
     #[cfg(unix)]
     #[test]
     fn move_file_copy_failure_with_no_dest_records_no_partial_error() {
@@ -4072,9 +4033,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // DATA LOSS regression: a failed copy must never delete a destination
-    // that PRE-DATES the attempt (a legitimate MovedDirty leftover). See
-    // docs/mover.md — move_file_copy_failure_keeps_pre_existing_dest.
+    // DATA LOSS regression: a failed copy must never delete a destination that PRE-DATES the
+    // attempt (a legitimate MovedDirty leftover).
     #[cfg(unix)]
     #[test]
     fn move_file_copy_failure_keeps_pre_existing_dest() {
@@ -4267,9 +4227,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // A pass that ends in one of the four failure branches must still
-    // clear the move progress bar, not leave a stale one forever. See
-    // docs/mover.md — a_blocked_pass_clears_the_move_progress_bar.
+    // A pass that ends in one of the four failure branches must still clear the move progress
+    // bar, not leave a stale one forever.
     #[test]
     fn a_blocked_pass_clears_the_move_progress_bar() {
         // MOVE_STATE and MOVE_ERRORS are process-global; serialize with the
@@ -4346,7 +4305,7 @@ mod tests {
 
     // A per-entry listing error must mark the listing INCOMPLETE, not just
     // drop the entry, or the caller can remove_dir_all a file it never
-    // moved. See docs/mover.md — a_per_entry_listing_error_marks...
+    // moved.
     #[test]
     fn a_per_entry_listing_error_marks_the_listing_incomplete() {
         let _g = errors_guard();
@@ -4378,9 +4337,8 @@ mod tests {
         );
     }
 
-    // Inducing a real DirEntry error needs a fault-injecting filesystem, so
-    // this pins the guard wiring at source level instead. See
-    // docs/mover.md — the_teardown_is_gated_on_a_complete_listing.
+    // Inducing a real DirEntry error needs a fault-injecting filesystem, so this pins the guard
+    // wiring at source level instead.
     #[test]
     fn the_teardown_is_gated_on_a_complete_listing() {
         let src = crate::util::source_lf(include_str!("mover.rs"));
@@ -4397,9 +4355,8 @@ mod tests {
         );
     }
 
-    // MOVE_ERRORS rows for a staging dir the operator removed by hand must
-    // be pruned — the only clear_error call site needs a later pass over
-    // that same dir. See docs/mover.md — move_errors_for_a_vanished...
+    // MOVE_ERRORS rows for a staging dir the operator removed by hand must be pruned — the only
+    // clear_error call site needs a later pass over that same dir.
     #[test]
     fn move_errors_for_a_vanished_staging_dir_are_pruned() {
         let _g = errors_guard();
@@ -4468,9 +4425,8 @@ mod tests {
         LeftAlone,
     }
 
-    // Build a single staging disc dir, run the real check_and_move, and
-    // report whether the MKV reached the library and staging was cleaned.
-    // See docs/mover.md — mover_verdict.
+    // Build a single staging disc dir, run the real check_and_move, and report whether the MKV
+    // reached the library and staging was cleaned.
     fn mover_verdict(done_body: Option<&[u8]>, with_mkv: bool, extra: &[&str]) -> MoverVerdict {
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
@@ -4632,9 +4588,9 @@ mod tests {
         }
     }
 
-    // Convergence round 4 (M3): the governed-marker probe must route
-    // through snapshot_staging_disc, not bare exists(), so a cold-cache
-    // mount can't false-negative .sweeping. See docs/mover.md.
+    // Convergence round 4 (M3): the governed-marker probe must route through
+    // snapshot_staging_disc, not bare exists(), so a cold-cache mount can't
+    // false-negative.sweeping.
     #[test]
     fn done_absence_sweeping_governed_via_snapshot() {
         use std::io::ErrorKind;
@@ -4652,9 +4608,8 @@ mod tests {
         );
     }
 
-    // Regression: a staging dir that vanished between the .done read and
-    // the governing-marker probe must be InProgress, not a stranded-dir
-    // Fault. See docs/mover.md — done_absence_vanished_dir_is_in_progress.
+    // Regression: a staging dir that vanished between the.done read and the governing-marker
+    // probe must be InProgress, not a stranded-dir Fault.
     #[test]
     fn done_absence_vanished_dir_is_in_progress_not_fault() {
         use std::io::ErrorKind;
@@ -4677,9 +4632,9 @@ mod tests {
         );
     }
 
-    // Precedence guard for the TOCTOU fix: the vanished-dir check runs
-    // BEFORE the governing-marker probe, so a SIBLING dir's marker cannot
-    // leak into a vanished dir's classification. See docs/mover.md.
+    // Precedence guard for the TOCTOU fix: the vanished-dir check runs BEFORE the
+    // governing-marker probe, so a SIBLING dir's marker cannot leak into a vanished dir's
+    // classification.
     #[test]
     fn done_absence_vanished_dir_ignores_sibling_markers() {
         use std::io::ErrorKind;
@@ -4709,9 +4664,8 @@ mod tests {
         );
     }
 
-    // A dir that EXISTS but carries no governing marker is a genuine
-    // stranded Fault — the vanished-dir early-return must NOT swallow it.
-    // See docs/mover.md — done_absence_present_dir_without_marker_is_fault.
+    // A dir that EXISTS but carries no governing marker is a genuine stranded Fault — the
+    // vanished-dir early-return must NOT swallow it.
     #[test]
     fn done_absence_present_dir_without_marker_is_fault() {
         use std::io::ErrorKind;

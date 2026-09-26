@@ -1,5 +1,4 @@
 //! Regression tests for the v0.13.6 -> v0.13.7 stop-drain bug.
-//! See docs/spawn-registration-tests.md for the incident background.
 //!
 //! `spawn_rip_thread_registers_handle` asserts:
 //!   1. `spawn_rip_thread(dev, role, f)` returns Ok.
@@ -54,9 +53,8 @@ fn spawn_rip_thread_registers_handle() {
     );
 }
 
-// Catches the old spawn-then-check ordering bug where a duplicate spawn
-// could run its whole closure before rejection was noticed.
-// See docs/spawn-registration-tests.md for the full incident writeup.
+// Catches the old spawn-then-check ordering bug where a duplicate spawn could run its whole
+// closure before rejection was noticed.
 #[test]
 fn a_rejected_duplicate_spawn_never_runs_its_closure() {
     use std::sync::Arc;

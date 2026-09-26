@@ -4,9 +4,8 @@
 //! `AutoripMuxEvents` bridge that feeds those atomics + the per-frame UI
 //! state, and the `MuxOutcome` → staging/marker classification.
 //!
-//! Two entry points, one inner engine: [`mux_iso`] (multipass/resume) and
-//! [`mux_live`] (live single-pass), both mapped via `map_iso_mux_outcome`.
-//! See docs/mux.md for details.
+//! Two entry points, one inner engine: [`mux_iso`] (multipass/resume) and [`mux_live`] (live
+//! single-pass), both mapped via `map_iso_mux_outcome`.
 
 use crate::util::{BYTES_PER_GIB, BYTES_PER_MIB, MILLIS_PER_SEC};
 use std::path::PathBuf;
@@ -25,13 +24,10 @@ use super::state::{RipState, update_state};
 /// we exit the process and rely on Docker `restart: unless-stopped` to
 /// bring autorip back; `resume_or_quarantine_staging` then decides whether
 /// to retry or quarantine via `.failed`.
-///
-/// See docs/mux.md for why 20 minutes was chosen.
 pub const HARD_WATCHDOG_STALL_SECS: u64 = 1200;
 
-// Total Progress % during mux: same byte-weighted formula `state.rs` uses
-// for sweep/patch, so the bar progresses smoothly across the handoff.
-// See docs/mux.md for the total_work/total_done formulas and rationale.
+// Total Progress % during mux: same byte-weighted formula `state.rs` uses for sweep/patch, so
+// the bar progresses smoothly across the handoff.
 fn total_pct_byte_weight(
     bytes_total_disc: u64,
     max_retries: u8,
@@ -53,9 +49,8 @@ fn total_pct_byte_weight(
     ((total_done * 100 / total_work).min(100)) as u8
 }
 
-// Damage fields from the final sweep/patch pass, carried forward so they
-// stay visible in /api/state during mux instead of zeroing out.
-// See docs/mux.md for the MuxInputs/SweepDamageSnapshot design notes.
+// Damage fields from the final sweep/patch pass, carried forward so they stay visible in
+// /api/state during mux instead of zeroing out.
 #[derive(Default, Clone)]
 pub(crate) struct SweepDamageSnapshot {
     pub(crate) errors: u32,
@@ -121,14 +116,13 @@ pub(crate) struct MuxInputs<'a> {
     pub(crate) sweep_damage: SweepDamageSnapshot,
 }
 
-// Outcome of a mux driver, used by the orchestrator to drive the post-mux
-// history record + final state push. See docs/mux.md for the field notes.
+// Outcome of a mux driver, used by the orchestrator to drive the post-mux history record +
+// final state push.
 pub(crate) struct MuxOutcome {
     /// True iff the read loop drained `frame_rx` to EOF AND the post-loop
-    /// `pipe.finish_with_halt(...)` returned `Ok`. This is the orchestrator's
-    /// gate for writing `.done` / `.completed` markers in `staging` — the
-    /// on-disk success signal for the resume-on-startup detector and the
-    /// mover thread. See docs/mux.md for the full list of `false` cases.
+    /// `pipe.finish_with_halt(...)` returned `Ok`. This is the orchestrator's gate for writing
+    /// `.done` / `.completed` markers in `staging` — the on-disk success signal for the
+    /// resume-on-startup detector and the mover thread.
     pub(crate) completed: bool,
     pub(crate) bytes_done: u64,
     pub(crate) elapsed_secs: f64,
@@ -202,9 +196,8 @@ struct UiState {
     sweep_damage: SweepDamageSnapshot,
 }
 
-// Cross-thread atomics the consumer reads on every per-frame `update_state`;
-// producer writes from the reader thread, consumer + watchdog read them.
-// See docs/mux.md for the per-field notes.
+// Cross-thread atomics the consumer reads on every per-frame `update_state`; producer writes
+// from the reader thread, consumer + watchdog read them.
 #[derive(Clone)]
 struct SharedAtomics {
     /// Last byte position reported by the drive's BytesRead event.
@@ -233,9 +226,8 @@ struct SharedAtomics {
     input_lost_bytes: Arc<AtomicU64>,
 }
 
-// Build + push the per-frame mux `update_state` payload; shared by the live
-// `MuxSink` and the ISO/multipass `AutoripMuxEvents` bridge so both render
-// an identical `RipState`. See docs/mux.md.
+// Build + push the per-frame mux `update_state` payload; shared by the live `MuxSink` and the
+// ISO/multipass `AutoripMuxEvents` bridge so both render an identical `RipState`.
 #[allow(clippy::too_many_arguments)]
 fn push_mux_state(
     ui: &UiState,
@@ -317,9 +309,9 @@ fn push_mux_state(
     );
 }
 
-// Build the specific cause string for a hard producer `read()` error: a
-// coded `libfreemkv::Error` stringifies with a leading `E####:` prefix, so
-// we parse and re-surface it. See docs/mux.md for the full rationale.
+// Build the specific cause string for a hard producer `read()` error: a coded
+// `libfreemkv::Error` stringifies with a leading `E####:` prefix, so we parse and re-surface
+// it.
 fn producer_read_error_cause(e: &std::io::Error) -> String {
     match coded_prefix(&e.to_string()) {
         Some(code) if code != libfreemkv::error::E_IO_ERROR => {
@@ -335,9 +327,9 @@ fn producer_read_error_cause(e: &std::io::Error) -> String {
     }
 }
 
-// Short English label for a coded `libfreemkv` fault reaching the mux
-// producer as an `io::Error` (Display is code-only, so we map the code
-// here). Mirrors sweep/patch's `non_scsi_error_label`. See docs/mux.md.
+// Short English label for a coded `libfreemkv` fault reaching the mux producer as an
+// `io::Error` (Display is code-only, so we map the code here). Mirrors sweep/patch's
+// `non_scsi_error_label`.
 fn coded_error_label(code: u16) -> &'static str {
     use libfreemkv::error as ec;
     match code {
@@ -548,9 +540,9 @@ pub(crate) struct MuxAtomics {
     pub(crate) input_errors: Arc<AtomicU32>,
 }
 
-// ── ISO / multipass + resume mux via libfreemkv's `mux_stream` ───────────────
-// Drive loop lives in `mux_stream`/`drive_mux`; autorip keeps the watchdog,
-// `MuxAtomics`, staging/FMTS deferral, and `MuxOutcome` mapping (see docs/mux.md).
+// ── ISO / multipass + resume mux via libfreemkv's `mux_stream` ─────────────── Drive loop
+// lives in `mux_stream`/`drive_mux`; autorip keeps the watchdog, `MuxAtomics`, staging/FMTS
+// deferral, and `MuxOutcome` mapping.
 pub(crate) struct IsoMuxSource {
     /// Path to the staged ISO image. `mux_stream` opens its own
     /// `FileSectorSource` from this (the orchestrator's validation open is a
@@ -574,9 +566,8 @@ pub(crate) struct IsoMuxSource {
     pub(crate) skip_errors: bool,
 }
 
-// autorip's `libfreemkv::MuxEvents` bridge for the ISO/multipass + resume
-// mux: updates the same shared atomics + per-frame UI push the pre-migration
-// `stream_event_fn`/`MuxSink` did. See docs/mux.md for the per-callback feed.
+// autorip's `libfreemkv::MuxEvents` bridge for the ISO/multipass + resume mux: updates the same
+// shared atomics + per-frame UI push the pre-migration `stream_event_fn`/`MuxSink` did.
 struct AutoripMuxEvents {
     ui: UiState,
     atomics: SharedAtomics,
@@ -796,9 +787,9 @@ fn ui_state_from_inputs(inputs: &MuxInputs<'_>, total_bytes: u64) -> UiState {
     }
 }
 
-// The ONE wording for "this mux completed, and the file still does not
-// match the pre-mux plan" — `map_iso_mux_outcome` is the one emitter so this
-// wording doesn't diverge from `rip_disc`'s copy. See docs/mux.md.
+// The ONE wording for "this mux completed, and the file still does not match the pre-mux plan"
+// — `map_iso_mux_outcome` is the one emitter so this wording doesn't diverge from `rip_disc`'s
+// copy.
 fn undelivered_streams_note(streams: &[usize]) -> String {
     format!(
         "Mux completed but {} stream(s) could not be delivered into the output \
@@ -808,9 +799,8 @@ fn undelivered_streams_note(streams: &[usize]) -> String {
     )
 }
 
-// Map a `mux_stream` result into autorip's `MuxOutcome` + staging decisions,
-// preserving the pre-migration Err classification. See docs/mux.md for the
-// full halt/FMTS/header-phase/NoStreams/finalize/read-fault classification.
+// Map a `mux_stream` result into autorip's `MuxOutcome` + staging decisions, preserving the
+// pre-migration Err classification.
 #[allow(clippy::too_many_arguments)]
 fn map_iso_mux_outcome(
     result: std::io::Result<libfreemkv::MuxOutcome>,
@@ -966,9 +956,9 @@ fn map_iso_mux_outcome(
     }
 }
 
-// Run the ISO/multipass (and resume) mux via `libfreemkv::mux_stream`; live
-// single-pass sibling is `mux_live`. `Err` only for the two call-site
-// classifications; everything else maps into `MuxOutcome`. See docs/mux.md.
+// Run the ISO/multipass (and resume) mux via `libfreemkv::mux_stream`; live single-pass sibling
+// is `mux_live`. `Err` only for the two call-site classifications; everything else maps into
+// `MuxOutcome`.
 pub(crate) fn mux_iso(
     inputs: MuxInputs<'_>,
     src: IsoMuxSource,
@@ -1100,9 +1090,9 @@ pub(crate) struct LiveMuxSource {
     pub(crate) skip_errors: bool,
 }
 
-// Run the LIVE single-pass mux via `libfreemkv::mux_stream` on the inline
-// `DiscStream`. Mirrors `mux_iso` exactly, differing only in building a
-// `Live` source (drive reader + forensic key map). See docs/mux.md.
+// Run the LIVE single-pass mux via `libfreemkv::mux_stream` on the inline `DiscStream`. Mirrors
+// `mux_iso` exactly, differing only in building a `Live` source (drive reader + forensic key
+// map).
 pub(crate) fn mux_live(
     inputs: MuxInputs<'_>,
     src: LiveMuxSource,
@@ -1225,9 +1215,9 @@ mod tests {
 
     const DISC: u64 = 60_000_000_000; // 60 GB stand-in for a UHD
 
-    // Regression: a hard producer read error must surface the SPECIFIC coded
-    // cause, not a generic truncation string, so an operator sees the real
-    // fault (decrypt / DiscRead / AACS) in `last_error`. See docs/mux.md.
+    // Regression: a hard producer read error must surface the SPECIFIC coded cause, not a
+    // generic truncation string, so an operator sees the real fault (decrypt / DiscRead / AACS)
+    // in `last_error`.
     #[test]
     fn producer_read_error_cause_preserves_coded_root_cause() {
         // A decrypt failure manifesting mid-stream.
@@ -1258,9 +1248,8 @@ mod tests {
         );
     }
 
-    // Regression (rc4): the cause must carry an English description, not a
-    // bare duplicated `E####` (was `read error mid-stream (E7013): E7013`).
-    // See docs/mux.md for the full before/after.
+    // Regression (rc4): the cause must carry an English description, not a bare duplicated
+    // `E####` (was `read error mid-stream (E7013): E7013`).
     #[test]
     fn producer_read_error_cause_carries_english_label() {
         let decrypt_io: std::io::Error = libfreemkv::Error::DecryptFailed.into();
@@ -1507,9 +1496,8 @@ mod tests {
         }
     }
 
-    // `push_mux_state` is the only writer of live per-frame `RipState` during
-    // mux; a mutant that reverts status/disc_present to defaults would make
-    // a busy device look idle. See docs/mux.md for the full rationale.
+    // `push_mux_state` is the only writer of live per-frame `RipState` during mux; a mutant
+    // that reverts status/disc_present to defaults would make a busy device look idle.
     #[test]
     fn push_mux_state_reports_ripping_and_disc_present() {
         let device = "push_mux_state_test_device";
@@ -1533,9 +1521,8 @@ mod tests {
         super::super::STATE.lock().unwrap().remove(device);
     }
 
-    // THE watchdog preservation check: `on_write_progress` must feed
-    // `wd_bytes`/`wd_last_frame` even on the throttled early-return path, so
-    // a healthy mux never false-escalates. See docs/mux.md.
+    // THE watchdog preservation check: `on_write_progress` must feed `wd_bytes`/`wd_last_frame`
+    // even on the throttled early-return path, so a healthy mux never false-escalates.
     #[test]
     fn autorip_mux_events_feed_watchdog_byte_atomic() {
         use libfreemkv::MuxEvents;
@@ -1746,9 +1733,8 @@ mod tests {
         assert!(hdr.finalize_error.is_some());
     }
 
-    // `map_iso_mux_outcome` must not drop `undelivered_streams` on the floor
-    // even when `completed = true` — a lossy outcome is never silent. See
-    // docs/mux.md for the full libfreemkv contract.
+    // `map_iso_mux_outcome` must not drop `undelivered_streams` on the floor even when
+    // `completed = true` — a lossy outcome is never silent.
     #[test]
     fn map_iso_mux_outcome_surfaces_undelivered_streams_on_a_completed_run() {
         // The per-device log ring is a process-global static shared by sibling
@@ -1796,9 +1782,8 @@ mod tests {
         );
     }
 
-    // ONE event, ONE wording, ONE emitter — the note used to have two
-    // independently-maintained spellings across mux.rs and mod.rs. See
-    // docs/mux.md for the full history.
+    // ONE event, ONE wording, ONE emitter — the note used to have two independently-maintained
+    // spellings across mux.rs and mod.rs.
     #[test]
     fn the_undelivered_streams_note_has_a_single_emitter() {
         let mux_src = crate::util::source_lf(include_str!("mux.rs"));

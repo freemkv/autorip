@@ -1,13 +1,12 @@
-//! Auto-resume from a staged ISO (Minimal scope, 0.20.8).
+//! Resume incomplete muxing from a staged ISO.
 //!
 //! Companion to `staging::resume_or_quarantine_staging`: that pass
 //! classifies staging-dir state after a restart; this module decides
 //! what to do with it, remuxing straight from the ISO when Pass 1
 //! finished but mux never wrote the final MKV.
 //!
-//! `classify_resume` is a pure classifier; `resume_remux` is the actor
-//! that performs the side effects. See docs/resume.md for the full
-//! module design notes and counter-clearing semantics.
+//! `classify_resume` is a pure classifier; `resume_remux` is the actor that performs the side
+//! effects.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
@@ -17,13 +16,12 @@ use crate::config::Config;
 
 use super::staging::{self, ResumeAction, StagingResumeHint};
 
-// Fallback title bitrate (bytes/sec) for converting bad-byte counts to
-// lost title-seconds when the real per-title bitrate is unknown. Shared
-// by classify_resume and resume_remux — see docs/resume.md.
+// Fallback title bitrate (bytes/sec) for converting bad-byte counts to lost title-seconds when
+// the real per-title bitrate is unknown. Shared by classify_resume and resume_remux.
 pub(crate) const FALLBACK_BITRATE_BYTES_PER_SEC: f64 = 8_250_000.0;
 
-// No live drive at resume time (we mux from a staged ISO), so this
-// probes a non-optical, non-existent node on purpose; see docs/resume.md.
+// No live drive at resume time (we mux from a staged ISO), so this probes a non-optical,
+// non-existent node on purpose.
 const DEFAULT_BATCH_PROBE_PATH: &str = "/dev/null";
 
 /// Classification of a `ResumePreserved` staging hint. Anything that
@@ -76,10 +74,9 @@ pub enum ResumeClass {
 /// orchestrator was going to do at mux time anyway). Returns a
 /// verdict that fully describes what should happen next.
 ///
-/// `Remux` requires: hint is `ResumePreserved`/`ResumeAbortedLoss` with
-/// `has_iso && has_mapfile`, mapfile loads with `bytes_pending == 0`,
-/// and any bad bytes overlapping the muxable title fit within
-/// `abort_on_lost_secs`. See docs/resume.md for the full checklist.
+/// `Remux` requires: hint is `ResumePreserved`/`ResumeAbortedLoss` with `has_iso &&
+/// has_mapfile`, mapfile loads with `bytes_pending == 0`, and any bad bytes overlapping the
+/// muxable title fit within `abort_on_lost_secs`.
 pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> ResumeClass {
     match &hint.action {
         ResumeAction::AlreadyCompleted => return ResumeClass::AlreadyCompleted,
@@ -182,9 +179,9 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
         return ResumeClass::NotEligible;
     }
 
-    // No live coverage check here on purpose (see docs/resume.md).
-    // Bad-bytes pre-filter: at ==0, whole-disc bytes would over-block damage
-    // outside the title, so ALLOW and defer to the title-scoped re-check.
+    // No live coverage check here on purpose. Bad-bytes pre-filter: at ==0, whole-disc bytes
+    // would over-block damage outside the title, so ALLOW and defer to the title-scoped
+    // re-check.
     if abort_on_lost_secs > 0 {
         let bad_bytes = stats.bytes_unreadable;
         let lost_secs = bad_bytes as f64 / FALLBACK_BITRATE_BYTES_PER_SEC;
@@ -304,9 +301,8 @@ pub fn delete_partial_output(staging_disc_dir: &Path, sanitized_name: &str) {
     }
 }
 
-// Reset device to a terminal idle/error UI state at any early-return
-// site in resume_remux, before or after "ripping" was set (un-sticks the
-// "already ripping" API gate either way). See docs/resume.md for detail.
+// Reset device to a terminal idle/error UI state at any early-return site in resume_remux,
+// before or after "ripping" was set (un-sticks the "already ripping" API gate either way).
 fn reset_status_after_ripping(
     device: &str,
     terminal_status: &str,
@@ -331,9 +327,8 @@ fn reset_status_after_ripping(
     );
 }
 
-// Fill the NON-success half of a MuxHandoffOutcome from the terminal
-// `_mux` state. Retryability comes from the recorded `failure_deferred`
-// bit, never inferred from status text — see docs/resume.md for why.
+// Fill the NON-success half of a MuxHandoffOutcome from the terminal `_mux` state. Retryability
+// comes from the recorded `failure_deferred` bit, never inferred from status text.
 fn apply_failure_fields(outcome: &mut MuxHandoffOutcome, rs: &super::RipState) {
     if rs.last_error.is_empty() {
         return;
@@ -346,9 +341,8 @@ fn apply_failure_fields(outcome: &mut MuxHandoffOutcome, rs: &super::RipState) {
     outcome.failure_finalize = rs.failure_finalize;
 }
 
-// Quarantine an incomplete-mux staging dir iff the mux died on a
-// structural finalize failure (terminal; re-mux would reproduce it).
-// Returns whether the `.failed` write landed — see docs/resume.md.
+// Quarantine an incomplete-mux staging dir iff the mux died on a structural finalize failure
+// (terminal; re-mux would reproduce it). Returns whether the `.failed` write landed.
 fn quarantine_incomplete_mux(staging_dir: &Path, finalize_error: Option<&str>) -> bool {
     match finalize_error {
         Some(finalize) => staging::write_failed_marker(staging_dir, finalize),
@@ -356,9 +350,8 @@ fn quarantine_incomplete_mux(staging_dir: &Path, finalize_error: Option<&str>) -
     }
 }
 
-// reset_status_after_ripping for DEFERRAL exits (keys not available yet;
-// staging intact). Deferral is recorded on RipState::failure_deferred
-// rather than inferred from status text — see docs/resume.md.
+// reset_status_after_ripping for DEFERRAL exits (keys not available yet; staging intact).
+// Deferral is recorded on RipState::failure_deferred rather than inferred from status text.
 fn defer_status_after_ripping(
     device: &str,
     display_name: &str,
@@ -377,9 +370,7 @@ fn defer_status_after_ripping(
     super::update_state_with(device, |s| s.failure_deferred = true);
 }
 
-// resume_remux callers/behavior notes: see docs/resume.md.
-// Pick the codecs string for the resumed-rip done card: prefer the
-// post-mux STATE value, falling back to the pre-mux snapshot.
+// resume_remux callers/behavior notes:
 fn resolve_done_codecs(post_mux_state: Option<String>, pre_mux_snapshot: String) -> String {
     post_mux_state
         .filter(|c| !c.is_empty())
@@ -397,9 +388,9 @@ fn resolve_media_type(carried: &str) -> String {
     }
 }
 
-// Handle a durability-gate (fsync) failure on the resume mux output.
-// Caps the _mux worker's re-dispatch loop via .restart_count/RESTART_LIMIT
-// the same way resume_or_quarantine_staging does — see docs/resume.md.
+// Handle a durability-gate (fsync) failure on the resume mux output. Caps the _mux worker's
+// re-dispatch loop via.restart_count/RESTART_LIMIT the same way resume_or_quarantine_staging
+// does.
 fn handle_resume_fsync_failure(device: &str, staging_dir: &Path, output_desc: &str) -> bool {
     let count = staging::increment_restart_count(staging_dir).unwrap_or_else(|e| {
         // A failed counter bump must not green-light an infinite loop, but it
@@ -478,9 +469,8 @@ fn record_loss_abort_write_failure(device: &str, staging_dir: &Path, reason: &st
     }
 }
 
-// RAII exclusion lock for the cold operator-resume mux path: writes
-// .muxing so a concurrent ResumeMode::Wipe can't delete the ISO out from
-// under an in-flight mux. See docs/resume.md for the full data-loss story.
+// RAII exclusion lock for the cold operator-resume mux path: writes.muxing so a concurrent
+// ResumeMode::Wipe can't delete the ISO out from under an in-flight mux.
 struct ResumeMuxingGuard<'a> {
     dir: &'a Path,
     /// True when the synthetic `_mux` worker device already owns the lock — we
@@ -509,9 +499,8 @@ impl Drop for ResumeMuxingGuard<'_> {
     }
 }
 
-// Resume's call-site wiring into the shared title_is_confident policy,
-// pulled out so the argument plumbing is unit-testable without a real
-// Disc::scan_image. See docs/resume.md for the carried_confident detail.
+// Resume's call-site wiring into the shared title_is_confident policy, pulled out so the
+// argument plumbing is unit-testable without a real Disc::scan_image.
 fn resume_title_confident(
     tmdb_api_key: &str,
     carried_confident: Option<bool>,
@@ -528,9 +517,8 @@ fn resume_title_confident(
     )
 }
 
-// The loss threshold a resumed rip is judged against, shared by EVERY
-// loss gate in resume_remux so the two gates can't independently
-// recompute and diverge (the past bug this fixed — see docs/resume.md).
+// The loss threshold a resumed rip is judged against, shared by EVERY loss gate in resume_remux
+// so the two gates can't independently recompute and diverge.
 fn resume_effective_abort(accept_loss: bool, output_format: &str, configured: u64) -> u64 {
     if accept_loss {
         u64::MAX
@@ -1663,45 +1651,41 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     }
 }
 
-// Runs a mux-from-staging pass as if it were an auto-resume against a
-// synthetic "_mux" device key. Result carries mux-derived display
-// fields the origin device's done-state needs. See docs/resume.md.
+// Runs a mux-from-staging pass as if it were an auto-resume against a synthetic "_mux" device
+// key. Result carries mux-derived display fields the origin device's done-state needs.
 #[derive(Default)]
 pub(crate) struct MuxHandoffOutcome {
     pub success: bool,
     pub codecs: String,
     pub duration: String,
     pub output_file: String,
-    // Full bad-ranges drilldown (+ truncation count); see docs/resume.md.
+    // Full bad-ranges drilldown (+ truncation count).
     pub bad_ranges: Vec<super::state::BadRange>,
     pub bad_ranges_truncated: u32,
-    // Combined sweep + mux-time loss figures; see docs/resume.md.
+    // Combined sweep + mux-time loss figures.
     pub lost_video_secs: f64,
     pub errors: u32,
     pub total_lost_ms: f64,
     pub main_lost_ms: f64,
-    // Real non-success reason, read off _mux device state; empty on
-    // success. See docs/resume.md.
+    // Real non-success reason, read off _mux device state; empty on success.
     pub failure_reason: Option<String>,
     // True for a keyless DEFERRAL (retryable) vs a hard failure.
     pub failure_retryable: bool,
-    // True only for a structural FINALIZE failure — the sole class the
-    // mux worker may quarantine. See docs/resume.md.
+    // True only for a structural FINALIZE failure — the sole class the mux worker may
+    // quarantine.
     pub failure_finalize: bool,
 }
 
-// Whether resume_remux finished this staging dir cleanly (.completed
-// written). Probes via snapshot_staging_disc, not a bare Path::exists(),
-// to avoid an NFS cold-cache false-negative — see docs/resume.md.
+// Whether resume_remux finished this staging dir cleanly (.completed written). Probes via
+// snapshot_staging_disc, not a bare Path::exists(), to avoid an NFS cold-cache false-negative.
 pub(crate) fn mux_handoff_success(staging_dir: &std::path::Path) -> bool {
     crate::ripper::staging::snapshot_staging_disc(staging_dir)
         .map(|s| s.completed)
         .unwrap_or(false)
 }
 
-// Build the initial MuxHandoffOutcome from the success signal, pulled
-// out so the `success` field assignment is directly unit-testable.
-// See docs/resume.md for the mutant this guards against.
+// Build the initial MuxHandoffOutcome from the success signal, pulled out so the `success`
+// field assignment is directly unit-testable.
 fn build_mux_handoff_outcome(success: bool) -> MuxHandoffOutcome {
     MuxHandoffOutcome {
         success,
@@ -1908,9 +1892,7 @@ mod find_iso_tests {
     }
 }
 
-// A hard failure must not be advertised to the operator as a deferral
-// that will fix itself. See docs/resume.md for the bug this module of
-// tests reproduces (remux_from_ripped_marker grading `status == "idle"`).
+// A hard failure must not be advertised to the operator as a deferral that will fix itself.
 #[cfg(test)]
 mod failure_retryability_tests {
     use super::*;
@@ -2014,9 +1996,9 @@ mod failure_retryability_tests {
         assert!(!outcome.failure_retryable);
     }
 
-    // Pins remux_from_ripped_marker's source-level wiring to this grading
-    // (can't drive it directly without a full mux pipeline) — same
-    // technique used for resume_remux's webhook call sites. See docs/resume.md.
+    // Pins remux_from_ripped_marker's source-level wiring to this grading (can't drive it
+    // directly without a full mux pipeline) — same technique used for resume_remux's webhook
+    // call sites.
     #[test]
     fn the_non_success_branch_routes_through_apply_failure_fields() {
         let src = crate::util::source_lf(include_str!("resume.rs"));
@@ -2277,9 +2259,8 @@ mod resume_remux_log_archive_tests {
         p
     }
 
-    // Regression: resume_remux did not archive the prior session's
-    // per-device log on entry (unlike scan_disc/rip_disc), so "scan then
-    // resume" interleaved log entries. See docs/resume.md for the fixture.
+    // Regression: resume_remux did not archive the prior session's per-device log on entry
+    // (unlike scan_disc/rip_disc), so "scan then resume" interleaved log entries.
     #[test]
     fn resume_remux_archives_prior_device_log() {
         // Held for the whole test: AUTORIP_DIR is process-wide and cargo runs
@@ -2515,9 +2496,8 @@ mod resume_remux_scan_gate_tests {
 
 #[cfg(test)]
 mod resume_remux_webhook_tests {
-    // Regression: resume_remux's success path must fire the completion
-    // webhook like rip_disc does (both cold auto-resume and the _mux
-    // hand-off go through it). Pinned at source level — see docs/resume.md.
+    // Regression: resume_remux's success path must fire the completion webhook like rip_disc
+    // does (both cold auto-resume and the _mux hand-off go through it). Pinned at source level.
     #[test]
     fn success_path_fires_completion_webhook() {
         let src = crate::util::source_lf(include_str!("resume.rs"));
@@ -2548,9 +2528,8 @@ mod resume_remux_webhook_tests {
 
 #[cfg(test)]
 mod resume_iso_auto_eject_tests {
-    // Regression: resume_remux's ISO-output success path must honor
-    // auto_eject like the MKV terminal does (pre-fix it returned without
-    // ejecting). Pinned at source level — see docs/resume.md.
+    // Regression: resume_remux's ISO-output success path must honor auto_eject like the MKV
+    // terminal does (pre-fix it returned without ejecting). Pinned at source level.
     #[test]
     fn resume_iso_success_path_honors_auto_eject() {
         let src = crate::util::source_lf(include_str!("resume.rs"));
@@ -2711,9 +2690,8 @@ mod resume_handoff_contract_tests {
 // resume folds mux-time (demux/decrypt) loss into the operator-facing figures,
 // the PRE-mux threshold.)
 mod post_mux_loss_reporting_tests {
-    // Regression: a resume must report sweep loss + demux loss to the
-    // operator, not the sweep mapfile alone (previously demux-time loss
-    // was invisible). Pinned at source level — see docs/resume.md.
+    // Regression: a resume must report sweep loss + demux loss to the operator, not the sweep
+    // mapfile alone (previously demux-time loss was invisible). Pinned at source level.
     #[test]
     fn resume_reports_demux_loss_on_accepted_rip() {
         let src = crate::util::source_lf(include_str!("resume.rs"));
@@ -2860,9 +2838,8 @@ mod post_mux_loss_reporting_tests {
         );
     }
 
-    // FIX-4: quarantine_incomplete_mux returns whether the terminal write
-    // actually LANDED, not merely whether the failure was a finalize —
-    // an unwritable mount must return false. See docs/resume.md.
+    // quarantine_incomplete_mux returns whether the terminal write actually LANDED, not
+    // merely whether the failure was a finalize — an unwritable mount must return false.
     #[test]
     fn quarantine_incomplete_mux_returns_false_when_write_dropped() {
         use crate::ripper::staging::{self, StagingState};
@@ -2886,9 +2863,8 @@ mod post_mux_loss_reporting_tests {
         );
     }
 
-    // FIX-2/FIX-6 production wiring end to end: RipState.failure_finalize
-    // must thread through apply_failure_fields to the worker's terminal
-    // gate and a persisted Failed state. See docs/resume.md.
+    // production wiring end to end: RipState.failure_finalize must thread through
+    // apply_failure_fields to the worker's terminal gate and a persisted Failed state.
     #[test]
     fn finalize_finalize_threads_ripstate_to_worker_gate_and_persists_failed() {
         use crate::muxer::{MuxFailureClass, mux_failure_is_terminal};
@@ -2956,9 +2932,8 @@ mod post_mux_loss_reporting_tests {
         );
     }
 
-    // FIX-1: the sweep-loss abort path must quarantine to a resumable
-    // .aborted-loss like the mux-time loss gate does (else the worker
-    // re-dispatches the doomed dir forever). See docs/resume.md.
+    // the sweep-loss abort path must quarantine to a resumable.aborted-loss like the
+    // mux-time loss gate does (else the worker re-dispatches the doomed dir forever).
     #[test]
     fn sweep_loss_abort_quarantines_to_resumable_aborted_loss() {
         // (a) Source-level: the §3 sweep-loss abort block quarantines via the marker.
@@ -3004,9 +2979,8 @@ mod post_mux_loss_reporting_tests {
         );
     }
 
-    // v1.2.0 invariant ("a loss is a loss"): a COMPLETED mux carrying
-    // mux-time loss is gated on abort_on_lost_secs just like read-time
-    // loss, reported always, never silently dropped. See docs/resume.md.
+    // v1.2.0 invariant ("a loss is a loss"): a COMPLETED mux carrying mux-time loss is gated on
+    // abort_on_lost_secs just like read-time loss, reported always, never silently dropped.
     #[test]
     fn completed_mux_with_loss_gated_by_abort_on_lost_secs() {
         let src = crate::util::source_lf(include_str!("resume.rs"));
@@ -3145,9 +3119,8 @@ mod sweep_damage_marker_tests {
         );
     }
 
-    // Regression: an operator title override must survive the .ripped
-    // hand-off so resume_remux auto-files into .done. Before the fix
-    // RippedMarker didn't carry the verdict. See docs/resume.md.
+    // Regression: an operator title override must survive the.ripped hand-off so resume_remux
+    // auto-files into.done. Before the fix RippedMarker didn't carry the verdict.
     #[test]
     fn ripped_marker_title_confident_round_trips() {
         let mut marker = crate::muxer::RippedMarker {
@@ -3238,9 +3211,8 @@ mod sweep_damage_marker_tests {
         );
     }
 
-    // Regression: check_and_mux's secondary done-state update was
-    // dropping the codec/duration/output_file badges because
-    // remux_from_ripped_marker returned a bare bool. See docs/resume.md.
+    // Regression: check_and_mux's secondary done-state update was dropping the
+    // codec/duration/output_file badges because remux_from_ripped_marker returned a bare bool.
     #[test]
     fn mux_handoff_outcome_captures_mux_derived_fields() {
         // A private device key so this doesn't race the shared "_mux".
@@ -3447,9 +3419,9 @@ mod resume_lock_and_fsync_tests {
         );
     }
 
-    // FIX (fsync cap preservation): at RESTART_LIMIT, if the terminal
-    // .failed write does NOT land, handle_resume_fsync_failure must NOT
-    // tear down the restart cap or report quarantine. See docs/resume.md.
+    // FIX (fsync cap preservation): at RESTART_LIMIT, if the terminal.failed write does NOT
+    // land, handle_resume_fsync_failure must NOT tear down the restart cap or report
+    // quarantine.
     #[test]
     fn fsync_failure_at_limit_dropped_write_preserves_cap() {
         let d = tmpdir();
@@ -3479,9 +3451,8 @@ mod resume_lock_and_fsync_tests {
         );
     }
 
-    // OPERATOR-CARD PARITY: on the cold operator-resume path a dropped
-    // terminal write must raise an operator card (record_error) the
-    // same way the muxer site does — see docs/resume.md.
+    // OPERATOR-CARD PARITY: on the cold operator-resume path a dropped terminal write must
+    // raise an operator card (record_error) the same way the muxer site does.
     #[test]
     fn fsync_dropped_write_raises_operator_card() {
         let d = tmpdir();
@@ -3516,9 +3487,8 @@ mod resume_lock_and_fsync_tests {
         crate::muxer::clear_error(&path_key);
     }
 
-    // Mirrors `fsync_dropped_write_raises_operator_card`: a dropped
-    // `.aborted-loss` write must also raise an operator card, not just
-    // silently retry forever. See docs/resume.md.
+    // Mirrors `fsync_dropped_write_raises_operator_card`: a dropped `.aborted-loss` write must
+    // also raise an operator card, not just silently retry forever.
     #[test]
     fn loss_abort_dropped_write_raises_operator_card() {
         let d = tmpdir();
@@ -3547,9 +3517,8 @@ mod resume_lock_and_fsync_tests {
 mod accept_loss_override_tests {
     use super::resume_effective_abort;
 
-    // Catches the mutation that recomputes the abort threshold from raw
-    // config at one loss gate while the other honours .accept-loss — the
-    // two-gates-one-run disagreement. See docs/resume.md.
+    // Catches the mutation that recomputes the abort threshold from raw config at one loss gate
+    // while the other honours.accept-loss — the two-gates-one-run disagreement.
     #[test]
     fn the_accept_loss_override_raises_the_threshold_for_every_resume_gate() {
         assert_eq!(

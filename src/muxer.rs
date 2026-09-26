@@ -6,8 +6,6 @@
 //! `staging::mark_handoff`. On failure it records a `MuxerError` and leaves
 //! the dir `Ripped` for next-tick retry / operator inspection. Single-pass
 //! live-disc rips (`cfg.max_retries == 0`) stay inline; this worker no-ops.
-//!
-//! See docs/muxer.md for the full hand-off contract and design rationale.
 
 use crate::config::Config;
 use std::collections::BTreeMap;
@@ -60,11 +58,9 @@ pub struct RippedMarker {
     pub sweep_num_bad_ranges: u32,
     #[serde(default)]
     pub sweep_largest_gap_ms: f64,
-    /// Operator-confidence of the resolved title at hand-off time. True when
-    /// the fresh-rip path decided the title is trustworthy enough to
-    /// auto-file (`.done`) — an exact normalized match with a year, or an
-    /// explicit operator override via the '✎ change' picker. See
-    /// docs/muxer.md for how `resume_remux` uses this.
+    /// Operator-confidence of the resolved title at hand-off time. True when the fresh-rip path
+    /// decided the title is trustworthy enough to auto-file (`.done`) — an exact normalized
+    /// match with a year, or an explicit operator override via the '✎ change' picker.
     ///
     /// Optional (serde default `false`) for backward-compat with pre-rc.4
     /// markers that lack the field — those fall back to the match check alone.
@@ -143,12 +139,10 @@ pub struct MuxerError {
 pub static MUX_ERRORS: once_cell::sync::Lazy<Mutex<BTreeMap<String, MuxerError>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(BTreeMap::new()));
 
-/// Paths the operator has dismissed (the System-tab ✕ / Clear-all). A
-/// dismissed path is suppressed from re-recording, so a persistently-erroring
-/// dir stays cleared instead of reappearing every tick. Lifted when the dir is
-/// freshly DISPATCHED (a new mux attempt may produce a new error worth
-/// showing) or when the dir is pruned (gone from staging). See docs/muxer.md
-/// for the rationale.
+/// Paths the operator has dismissed (the System-tab ✕ / Clear-all). A dismissed path is
+/// suppressed from re-recording, so a persistently-erroring dir stays cleared instead of
+/// reappearing every tick. Lifted when the dir is freshly DISPATCHED (a new mux attempt may
+/// produce a new error worth showing) or when the dir is pruned (gone from staging).
 pub static MUX_DISMISSED: once_cell::sync::Lazy<Mutex<std::collections::BTreeSet<String>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::BTreeSet::new()));
 
@@ -317,9 +311,9 @@ pub(crate) enum MuxVerdict {
     SkipUnknown,
 }
 
-// Pure dispatch decider. `snap` is `snapshot_staging_disc` (`None` ⇒ UNKNOWN).
-// Order: None→SkipUnknown, terminal→SkipTerminal, aborted-loss→SkipAbortedLoss,
-// no marker→SkipNoMarker, else→Dispatch. See docs/muxer.md for the rationale.
+// Pure dispatch decider. `snap` is `snapshot_staging_disc` (`None` ⇒ UNKNOWN). Order:
+// None→SkipUnknown, terminal→SkipTerminal, aborted-loss→SkipAbortedLoss, no
+// marker→SkipNoMarker, else→Dispatch.
 pub(crate) fn mux_dispatch_verdict(
     snap: Option<&crate::ripper::staging::StagingSnapshot>,
 ) -> MuxVerdict {
@@ -355,9 +349,8 @@ impl Drop for MuxingGuard<'_> {
     }
 }
 
-// Whether a mux-worker failure is TERMINAL (state → Failed, so
-// `mux_dispatch_verdict` stops re-Dispatching) vs resumable. Terminal IFF a
-// structural FINALIZE failure. See docs/muxer.md#terminal-failure-class.
+// Whether a mux-worker failure is TERMINAL (state → Failed, so `mux_dispatch_verdict` stops
+// re-Dispatching) vs resumable. Terminal IFF a structural FINALIZE failure.
 pub(crate) struct MuxFailureClass {
     /// The mux completed but delivered loss exceeded threshold (`.aborted-loss`).
     /// It owns its own resumable state and must never be quarantined here.
@@ -374,9 +367,8 @@ pub(crate) fn mux_failure_is_terminal(class: MuxFailureClass) -> bool {
     !class.aborted_loss && class.has_worker_reason && class.is_finalize
 }
 
-// Persist the terminal `.failed` quarantine; if the state.json write does NOT
-// land, surface it LOUD (syslog + operator card) instead of silently leaving
-// the dir re-dispatching forever. See docs/muxer.md#quarantine-persistence.
+// Persist the terminal `.failed` quarantine; if the state.json write does NOT land, surface it
+// LOUD (syslog + operator card) instead of silently leaving the dir re-dispatching forever.
 pub(crate) fn persist_terminal_mux_quarantine(path_str: &str, dir: &Path, reason: &str) -> bool {
     let landed = crate::ripper::staging::write_failed_marker(dir, reason);
     if !landed {
@@ -611,9 +603,8 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
     }
 }
 
-// Should the mux worker drive the origin device to "done"? Only if it's
-// still "ripping" (the inline-mux fallback path) and not a synthetic
-// `_`-prefixed origin. See docs/muxer.md#origin-revert-rules.
+// Should the mux worker drive the origin device to "done"? Only if it's still "ripping" (the
+// inline-mux fallback path) and not a synthetic `_`-prefixed origin.
 pub(crate) fn should_revert_origin_to_done(origin: &str, status: Option<&str>) -> bool {
     !origin.is_empty() && !origin.starts_with('_') && status == Some("ripping")
 }
@@ -1421,7 +1412,7 @@ mod tests {
             }),
             "a structural finalize failure (E6008) MUST quarantine — this was the loop bug"
         );
-        // The load-bearing FIX-2 row: a resumable, NON-finalize failure (a
+        // The load-bearing row: a resumable, NON-finalize failure (a
         // mid-mux read error, fsync failure, mapfile TOCTOU) isn't a keyless
         // deferral, so the old `!failure_retryable` gate wrongly quarantined it.
         assert!(
@@ -1450,9 +1441,9 @@ mod tests {
         );
     }
 
-    // FIX 2 regression: the quarantine gate keys on `failure_finalize`, not the
-    // old `!failure_retryable` (false for both resumable and terminal cases,
-    // which false-quarantined resumable reads). See docs/muxer.md#fix-2.
+    // FIX 2 regression: the quarantine gate keys on `failure_finalize`, not the old
+    // `!failure_retryable` (false for both resumable and terminal cases, which
+    // false-quarantined resumable reads).
     #[test]
     fn resumable_worker_failure_not_quarantined_finalize_is() {
         use crate::ripper::resume::MuxHandoffOutcome;
@@ -1524,9 +1515,8 @@ mod tests {
         );
     }
 
-    // FIX (entry-side TOCTOU): `.muxing` must be stamped the INSTANT Dispatch
-    // commits, before `read_marker`, so a concurrent web entry's `is_muxing`
-    // guard covers the whole dispatch. See docs/muxer.md#muxing-toctou.
+    // FIX (entry-side TOCTOU): `.muxing` must be stamped the INSTANT Dispatch commits, before
+    // `read_marker`, so a concurrent web entry's `is_muxing` guard covers the whole dispatch.
     #[test]
     fn muxing_marker_stamped_before_marker_read() {
         let src = crate::util::source_lf(include_str!("muxer.rs"));
@@ -1551,9 +1541,9 @@ mod tests {
         );
     }
 
-    // FIX-3: the terminal-quarantine site consumes `write_failed_marker`'s
+    // the terminal-quarantine site consumes `write_failed_marker`'s
     // return — a failed write must raise a LOUD operator card instead of
-    // silently re-dispatching forever. See docs/muxer.md#fix-3.
+    // silently re-dispatching forever.
     #[test]
     fn persist_terminal_mux_quarantine_alarms_when_write_fails() {
         // Happy path: a writable dir goes terminal, returns true, raises no card.
@@ -1655,9 +1645,8 @@ mod tests {
         );
     }
 
-    // Catches the mutation that restores `pending_queue`'s silent
-    // `Err(_) => return Vec::new()`: an unreadable staging root is not an
-    // empty queue and must be logged. See docs/muxer.md#silent-empty-queue.
+    // Catches the mutation that restores `pending_queue`'s silent `Err(_) => return
+    // Vec::new()`: an unreadable staging root is not an empty queue and must be logged.
     #[test]
     fn pending_queue_logs_an_unreadable_staging_root() {
         use std::sync::{Arc, Mutex};
@@ -1711,9 +1700,8 @@ mod tests {
         );
     }
 
-    // Catches the mutation that restores `pending_queue`'s
-    // `.filter_map(|e| e.ok())`: a source-pin since an NFS ESTALE on one
-    // entry can't be synthesised locally. See docs/muxer.md#per-entry-error.
+    // Catches the mutation that restores `pending_queue`'s `.filter_map(|e| e.ok())`: a
+    // source-pin since an NFS ESTALE on one entry can't be synthesised locally.
     #[test]
     fn pending_queue_does_not_flatten_away_a_per_entry_error() {
         let src = crate::util::source_lf(include_str!("muxer.rs"));

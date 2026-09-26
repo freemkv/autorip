@@ -373,7 +373,6 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
 }
 
 // Probe the local HTTP API and exit 0 (healthy) or 1 (unhealthy).
-// See docs/healthcheck.md — why this replaces the curl-based HEALTHCHECK.
 fn run_healthcheck() -> i32 {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
@@ -422,9 +421,8 @@ fn run_healthcheck() -> i32 {
     }
 }
 
-// Container bootstrap — replaces the v0.25.5 entrypoint.sh (drops bash,
-// shadow, and the shell scripts). Linux-only; container-init concerns.
-// See docs/bootstrap.md — full step list and behaviour.
+// Container bootstrap — replaces the v0.25.5 entrypoint.sh (drops bash, shadow, and the shell
+// scripts). Linux-only; container-init concerns.
 #[cfg(unix)]
 fn run_bootstrap() {
     use std::io::Write;
@@ -755,7 +753,6 @@ fn active_log_filenames() -> Vec<String> {
 }
 
 // Whether a filename is one of the log files retention applies to.
-// See docs/log-retention.md — why this isn't `extension() == "log"`.
 fn is_prunable_log_name(path: &std::path::Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -998,9 +995,8 @@ mod tests {
         assert_eq!(rc, 0, "utimes failed");
     }
 
-    // Covers a wedged mover/muxer thread: shutdown must neither hang forever
-    // nor abandon an in-flight move too early.
-    // See docs/join-bounded-test.md — mutation-testing rationale.
+    // Covers a wedged mover/muxer thread: shutdown must neither hang forever nor abandon an
+    // in-flight move too early.
     #[test]
     fn join_bounded_waits_for_a_healthy_worker_but_abandons_a_wedged_one() {
         use std::sync::Arc;
@@ -1042,9 +1038,7 @@ mod tests {
         );
     }
 
-    // Round-4 regression net: greps every non-test `.rs` under `src/` for ALL
-    // known fail-open lock-poison forms at once, so the next syntactic variant
-    // can't slip through. Rationale + what's NOT matched: docs/lock-poison-guard.md.
+    // Reject fail-open lock-poison handling throughout production source.
     #[test]
     fn no_fail_open_lock_poison_forms_in_src() {
         use std::path::{Path, PathBuf};

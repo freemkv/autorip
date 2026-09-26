@@ -47,8 +47,7 @@ pub struct RipState {
     pub disc_name: String,
     /// The disc's RAW volume label (`DiscId::name()`), before the TMDB lookup.
     ///
-    /// Distinguishes discs of a boxset that share one [`Self::disc_name`]
-    /// (TMDB title). See docs/state.md#ripstatedisc_label for why.
+    /// Distinguishes discs of a boxset that share one [`Self::disc_name`] (TMDB title).
     ///
     /// Server-side bookkeeping only — not serialized, the UI shows the TMDB
     /// title. Carried forward across state pushes by [`update_state`] (see
@@ -59,8 +58,7 @@ pub struct RipState {
     /// stopped for a reason that fixes itself (keys arrive), staging is
     /// intact, and the next pass will pick it up unchanged.
     ///
-    /// Set only by the deferral exits themselves; NOT inferred from
-    /// `status == "idle"`. See docs/state.md#ripstatefailure_deferred.
+    /// Set only by the deferral exits themselves; NOT inferred from `status == "idle"`.
     ///
     /// Server-side bookkeeping only — not serialized. Deliberately NOT
     /// carried forward across state pushes: it describes one terminal push.
@@ -70,9 +68,7 @@ pub struct RipState {
     /// could not be finalized — e.g. E6008 no muxable frames / unseekable
     /// output), as opposed to a resumable mid-mux read error.
     ///
-    /// Set only by the mux-incomplete finalize exit in `resume_remux`. See
-    /// docs/state.md#ripstatefailure_finalize for why this can't be inferred
-    /// from `!failure_deferred`.
+    /// Set only by the mux-incomplete finalize exit in `resume_remux`.
     ///
     /// Server-side bookkeeping only — not serialized. Deliberately NOT
     /// carried forward across state pushes: it describes one terminal push.
@@ -131,12 +127,10 @@ pub struct RipState {
     /// scoped to the longest title only — enables the UI to render
     /// "(Xs in main movie)".
     pub main_lost_ms: f64,
-    /// **Main-feature time still AT RISK** — the honest live "Maybe" metric.
-    /// The duration of every not-yet-good range (`NonTrimmed` + `NonScraped` +
-    /// `Unreadable`) that falls within the main title's extents. Unlike
-    /// [`Self::main_lost_ms`], this is non-zero mid-rip and melts toward it as
-    /// retry passes resolve pending sectors. See
-    /// docs/state.md#ripstatemain_at_risk_ms for the full rationale.
+    /// **Main-feature time still AT RISK** — the honest live "Maybe" metric. The duration of
+    /// every not-yet-good range (`NonTrimmed` + `NonScraped` + `Unreadable`) that falls within
+    /// the main title's extents. Unlike [`Self::main_lost_ms`], this is non-zero mid-rip and
+    /// melts toward it as retry passes resolve pending sectors.
     pub main_at_risk_ms: f64,
     /// Largest single contiguous bad range's duration. Tells the difference
     /// between 1000 × 1ms gaps (unnoticeable) vs 1 × 1s gap (noticeable glitch).
@@ -323,9 +317,8 @@ pub fn take_title_override(device: &str) -> Option<crate::tmdb::TmdbResult> {
     m.remove(device)
 }
 
-// Stop cooldowns: device -> the MONOTONIC instant the cooldown expires.
-// `Instant`, not an `epoch_secs()` deadline, so it can't step backwards
-// (NTP/clock-reset/VM-resume). See docs/state.md#stop_cooldowns.
+// Stop cooldowns: device -> the MONOTONIC instant the cooldown expires. `Instant`, not an
+// `epoch_secs()` deadline, so it can't step backwards (NTP/clock-reset/VM-resume).
 pub(super) static STOP_COOLDOWNS: once_cell::sync::Lazy<
     Mutex<std::collections::HashMap<String, std::time::Instant>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -348,9 +341,8 @@ pub(super) fn is_in_cooldown(device: &str) -> bool {
     false
 }
 
-/// Drop the auxiliary per-device state on hot-unplug, so nothing accumulates
-/// as device paths churn over a long container lifetime. Poison-recovers like
-/// the rest of this module. Full per-device map inventory: docs/state.md#forget_device_state.
+/// Drop auxiliary per-device state on hot-unplug so changing device paths do not
+/// accumulate stale entries. Recovers poisoned locks before cleanup.
 pub(super) fn forget_device_state(device: &str) {
     TITLE_OVERRIDES
         .lock()
@@ -459,12 +451,10 @@ pub fn update_state_with<F: FnOnce(&mut RipState)>(device: &str, f: F) {
     entry.damage_severity = damage_severity_for(entry.errors, entry.total_lost_ms);
 }
 
-/// Atomically claim a device for active work. If it is already
-/// `scanning`/`ripping`, returns `None` (the caller should reject with 409);
-/// otherwise marks it `scanning` and returns the new `claim_gen`. Folds the
-/// busy-check and the status-set into ONE `STATE` lock, closing a TOCTOU
-/// between a separate check and a separate `update_state`; see
-/// docs/state.md#try_claim_active_checked.
+/// Atomically claim a device for active work. If it is already `scanning`/`ripping`, returns
+/// `None` (the caller should reject with 409); otherwise marks it `scanning` and returns the
+/// new `claim_gen`. Folds the busy-check and the status-set into ONE `STATE` lock, closing a
+/// TOCTOU between a separate check and a separate `update_state`
 ///
 /// Thin wrapper over [`try_claim_active_checked`] with `known = true` — see
 /// that function's doc for when a caller must pass `false` instead.
@@ -479,8 +469,7 @@ pub fn try_claim_active(device: &str) -> Option<u64> {
 /// resource-exhaustion path. Pass `true` only when `device` came from the
 /// poll loop's own enumerated drive list, or was cross-checked against it.
 ///
-/// Refuses the claim if EITHER the status is scanning/ripping OR the rip
-/// thread is still alive. See docs/state.md#try_claim_active_checked.
+/// Refuses the claim if EITHER the status is scanning/ripping OR the rip thread is still alive.
 pub fn try_claim_active_checked(device: &str, known: bool) -> Option<u64> {
     // Liveness first, and OUTSIDE the STATE lock (see the doc above for both
     // the why and the ordering argument).
@@ -663,9 +652,8 @@ pub(super) struct PassProgressState {
     /// Last `work_total` reported by libfreemkv's `Progress` trait — total
     /// bytes this pass will process. Drives `pass_progress_pct` denominator.
     pub(super) last_work_total: u64,
-    // `bytes_unreadable` snapshotted on this pass's first `push_pass_state`
-    // callback, frozen for the rest of the pass so the total-progress
-    // denominator doesn't inflate mid-pass. See docs/state.md#passprogressstatefrozen_bytes_lost.
+    // `bytes_unreadable` snapshotted on this pass's first `push_pass_state` callback, frozen
+    // for the rest of the pass so the total-progress denominator doesn't inflate mid-pass.
     pub(super) frozen_bytes_lost: Option<u64>,
 }
 
@@ -994,9 +982,8 @@ mod tests {
         (dir, map)
     }
 
-    /// Catches the mutation that feeds the done card the STARVED
-    /// single-pass `total_lost_ms` instead of the real in-title loss. See
-    /// docs/state.md#single_pass_done_card_total_lost_ms_drives_severity-test.
+    /// Catches the mutation that feeds the done card the STARVED single-pass `total_lost_ms`
+    /// instead of the real in-title loss.
     #[test]
     fn single_pass_done_card_total_lost_ms_drives_severity() {
         // 10 skipped sectors -> below the 51-sector Moderate threshold, so
@@ -1076,9 +1063,7 @@ mod tests {
     // into libfreemkv (`locate_ranges` tests, src/disc/mod.rs). The terminal
     // build_bad_ranges path (still autorip-side, done card) keeps coverage below.
 
-    /// The post-Stop cooldown must be measured on the monotonic clock, not
-    /// the wall clock (proven structurally; see docs/state.md
-    /// #the_stop_cooldown_is_not_measured_on_the_wall_clock-test).
+    /// The post-Stop cooldown must be measured on the monotonic clock, not the wall clock.
     #[test]
     fn the_stop_cooldown_is_not_measured_on_the_wall_clock() {
         let src = crate::util::source_lf(include_str!("state.rs"));
@@ -1089,8 +1074,8 @@ mod tests {
             .find("pub(super) static STOP_COOLDOWNS")
             .expect("the cooldown map must exist");
         let end = src
-            .find("/// Drop the auxiliary per-device state on hot-unplug")
-            .expect("forget_device_state's doc must follow the cooldown fns");
+            .find("pub(super) fn forget_device_state(")
+            .expect("forget_device_state must follow the cooldown fns");
         // Strip comment lines first: otherwise the pin could be satisfied (or
         // broken) by its own prose, since the doc comment names `epoch_secs()`.
         let region: String = src[start..end]
@@ -1159,9 +1144,8 @@ mod tests {
             .remove(dev);
     }
 
-    /// A disc-supplied extent (untrusted `start_lba`/`sector_count`) must
-    /// never be able to overflow-panic the rip thread. See docs/state.md
-    /// #byte_offset_in_title_survives_an_overflowing_extent-test.
+    /// A disc-supplied extent (untrusted `start_lba`/`sector_count`) must never be able to
+    /// overflow-panic the rip thread.
     #[test]
     fn byte_offset_in_title_survives_an_overflowing_extent() {
         let mut title = minimal_title();
@@ -1632,9 +1616,7 @@ mod tests {
         );
     }
 
-    /// Catches admitting a claim while a TERMINAL-status device's worker is
-    /// still unwinding. See docs/state.md
-    /// #try_claim_active_refuses_a_device_whose_worker_is_still_unwinding-test.
+    /// Catches admitting a claim while a TERMINAL-status device's worker is still unwinding.
     #[test]
     fn try_claim_active_refuses_a_device_whose_worker_is_still_unwinding() {
         let dev = format!("sg_claim_liveness_test_{}", std::process::id());
@@ -1695,9 +1677,8 @@ mod tests {
         STATE.lock().unwrap().remove(&dev);
     }
 
-    /// Catches the H1 duplicate-rip drain window; a claim must be refused for
-    /// the WHOLE life of the worker thread, even while another thread drains
-    /// it. See docs/state.md#a_drain_in_flight_never_makes_a_live_worker_claimable-test.
+    /// Catches the H1 duplicate-rip drain window; a claim must be refused for the WHOLE life of
+    /// the worker thread, even while another thread drains it.
     #[test]
     fn a_drain_in_flight_never_makes_a_live_worker_claimable() {
         let dev = format!("sg_claim_during_drain_test_{}", std::process::id());
@@ -1881,9 +1862,8 @@ mod tests {
         );
     }
 
-    /// `update_state` must carry `disc_label` forward across the
-    /// `..Default::default()` fresh-RipState pushes, but never onto a
-    /// different disc or an empty drive. See docs/state.md#ripstatedisc_label.
+    /// `update_state` must carry `disc_label` forward across the `..Default::default()`
+    /// fresh-RipState pushes, but never onto a different disc or an empty drive.
     #[test]
     fn update_state_carries_the_disc_label_but_never_onto_another_disc() {
         let dev = format!("test-disclabel-{}", std::process::id());

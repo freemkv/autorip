@@ -7,15 +7,13 @@ use std::sync::{Arc, RwLock};
 pub(crate) const OUTPUT_FORMAT_ISO: &str = "iso";
 pub(crate) const OUTPUT_FORMAT_NETWORK: &str = "network";
 
-// `#[serde(default)]` helper: an unspecified per-stage flag fires on that
-// stage, preserving pre-1.6.8 behaviour where every webhook fired on
-// completion. See docs/webhook-defaults.md for the full migration rationale.
+// `#[serde(default)]` helper: an unspecified per-stage flag fires on that stage, preserving
+// pre-1.6.8 behaviour where every webhook fired on completion.
 fn default_true() -> bool {
     true
 }
 
-// Per-stage selection is opt-out; a legacy bare-string entry fires on
-// every stage. See docs/webhook-defaults.md for the migration rationale.
+// Per-stage selection is opt-out; a legacy bare-string entry fires on every stage.
 /// One configured webhook: the destination URL plus which of the three
 /// pipeline stages (rip → mux → move) it fires on. The stages are distinct
 /// events:
@@ -120,11 +118,9 @@ impl<'de> Deserialize<'de> for WebhookEntry {
 /// Runtime config. Single source of truth is `settings.json` on disk;
 /// the UI POSTs updates to it via `/api/settings`.
 ///
-/// Only `PORT`, `AUTORIP_DIR`, `AUTORIP_LOG_LEVEL`, `RIP_USER`, and `NFS_*`
-/// are read from the environment (all bootstrap-only, needed before
-/// `settings.json` can be loaded). Every other field is operator-facing
-/// and UI-only, with no env-var fallback — see docs/config-env-vars.md
-/// for the full bootstrap-var list and the legacy env-var deprecation.
+/// Only `PORT`, `AUTORIP_DIR`, `AUTORIP_LOG_LEVEL`, `RIP_USER`, and `NFS_*` are read from the
+/// environment (all bootstrap-only, needed before `settings.json` can be loaded). Every other
+/// field is operator-facing and UI-only, with no env-var fallback.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Bootstrap-only (env `PORT`, set before the server binds). Never
@@ -339,7 +335,6 @@ fn dir_is_writable(p: &str) -> bool {
     }
 }
 
-// See docs/default-autorip-dir.md for the per-step OS rationale.
 /// Resolve where autorip keeps all its state (settings.json, logs, keys,
 /// staging, output). Identical logic on every OS, and always returns a
 /// real absolute path the UI/logs can show verbatim.
@@ -1226,9 +1221,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    // A realistic duration well under the 30-day ceiling must survive
-    // `load_saved` unclamped, pinned to an absolute value (not the
-    // production literal). See docs/config-tests.md for the full rationale.
+    // A realistic duration well under the 30-day ceiling must survive `load_saved` unclamped,
+    // pinned to an absolute value (not the production literal).
     #[test]
     fn realistic_mid_range_duration_survives_unclamped() {
         let d = scratch("mid_range_duration");

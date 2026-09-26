@@ -7,8 +7,6 @@
 //! mux). The HTTP `/api/stop/{device}` handler looks up the device's
 //! `Halt` and calls `.cancel()`; phase loops poll
 //! `halt.is_cancelled()` at their tops.
-//
-// See docs/ripper-session-notes.md — module history (0.18 round-2 halt rework)
 
 use libfreemkv::Halt;
 use std::sync::Mutex;
@@ -39,7 +37,6 @@ pub enum RegisterError {
     PriorThreadRunning(JoinHandle<()>),
 }
 
-// See docs/ripper-session-notes.md — register_rip_thread reap-or-reject semantics
 /// Register a rip-thread JoinHandle for `device`. The device map holds at
 /// most one handle: if the prior one has finished, it is reaped and the
 /// new one takes its place (`Ok(())`); if the prior one is still running,
@@ -90,7 +87,6 @@ pub fn take_rip_thread(device: &str) -> Option<JoinHandle<()>> {
         .remove(device)
 }
 
-// See docs/ripper-session-notes.md — spawn_rip_thread: register-before-run gate
 /// Spawn a rip-related worker thread and register its `JoinHandle` in
 /// `RIP_THREADS` atomically. Use this for every scan/rip code path —
 /// `handle_stop` relies on the registration to drain the thread before
@@ -154,7 +150,6 @@ where
     }
 }
 
-// See docs/ripper-session-notes.md — join_rip_thread: why the handle is polled in place
 /// Wait (up to `timeout`) for the rip thread for `device` to exit. Returns
 /// `Ok(())` if the thread finished within the window or no thread was
 /// registered; `Err(())` on timeout.
@@ -252,9 +247,8 @@ pub fn join_all_rip_threads(timeout: Duration) {
     }
 }
 
-// Per-device cooperative-cancel tokens; the rip thread spawn site allocates
-// one Halt per rip and stashes its clone here so the HTTP stop handler (and
-// `eject_drive`) can find it. See docs/ripper-session-notes.md — HALTS.
+// Per-device cooperative-cancel tokens; the rip thread spawn site allocates one Halt per rip
+// and stashes its clone here so the HTTP stop handler (and `eject_drive`) can find it.
 static HALTS: once_cell::sync::Lazy<Mutex<std::collections::HashMap<String, Halt>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -329,7 +323,6 @@ pub fn unregister_halt(device: &str) {
     halts.remove(device);
 }
 
-// See docs/ripper-session-notes.md — rollback_failed_spawn: why the generation, and not a liveness check
 /// Roll a device back to idle after a failed `spawn_rip_thread`, undoing
 /// the claim identified by `claim_gen` (the value the caller's own
 /// [`super::try_claim_active_checked`] returned) and nothing else. The
@@ -385,9 +378,8 @@ pub(super) struct DriveSession {
 static SESSIONS: once_cell::sync::Lazy<Mutex<std::collections::HashMap<String, DriveSession>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
-// Last-known disc identity per device (UDF Volume Identifier). Kept
-// separate from `DriveSession` so it OUTLIVES the session for
-// `rediscover_drive`. See docs/ripper-session-notes.md — DISC_IDENTITY.
+// Last-known disc identity per device (UDF Volume Identifier). Kept separate from
+// `DriveSession` so it OUTLIVES the session for `rediscover_drive`.
 static DISC_IDENTITY: once_cell::sync::Lazy<Mutex<std::collections::HashMap<String, String>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -401,9 +393,9 @@ pub(super) fn take_session(device: &str) -> Option<DriveSession> {
         .remove(device)
 }
 
-// Record (or clear) the device's cached disc identity for the rediscovery
-// path. An empty `volume_id` still CLEARS any previous entry (skipping the
-// write would leave a stale identity). See docs/ripper-session-notes.md — cache_disc_identity.
+// Record (or clear) the device's cached disc identity for the rediscovery path. An empty
+// `volume_id` still CLEARS any previous entry (skipping the write would leave a stale
+// identity).
 pub(super) fn cache_disc_identity(device: &str, volume_id: &str) {
     let vid = volume_id.trim();
     // Recover-and-proceed on poison (module convention): a skipped clear is
@@ -436,9 +428,8 @@ pub(super) fn store_session(device: &str, session: DriveSession) {
         .insert(device.to_string(), session);
 }
 
-// Is a rip/scan worker for `device` still running? A fact `is_busy` cannot
-// give: a worker writes its TERMINAL status, then keeps running its tail.
-// See docs/ripper-session-notes.md — rip_thread_running.
+// Is a rip/scan worker for `device` still running? A fact `is_busy` cannot give: a worker
+// writes its TERMINAL status, then keeps running its tail.
 pub(super) fn rip_thread_running(device: &str) -> bool {
     // Recover-and-proceed on poison (module convention): a poisoned map means
     // a worker panicked, and reporting "nothing is running" there is the
@@ -450,9 +441,8 @@ pub(super) fn rip_thread_running(device: &str) -> bool {
         .is_some_and(|h| !h.is_finished())
 }
 
-// Evict per-device state on hot-unplug teardown: DISC_IDENTITY always,
-// plus RIP_THREADS/HALTS only once the rip thread has exited. Returns
-// true if a finished handle was reaped. See docs/ripper-session-notes.md.
+// Evict per-device state on hot-unplug teardown: DISC_IDENTITY always, plus RIP_THREADS/HALTS
+// only once the rip thread has exited. Returns true if a finished handle was reaped.
 pub(super) fn forget_device_session_state(device: &str) -> bool {
     // Recover-and-proceed on poison (module convention): a skipped eviction
     // here is the unbounded growth this function exists to prevent.
@@ -500,8 +490,7 @@ pub(super) fn expected_volume_id(device: &str) -> Option<String> {
 }
 
 // True iff `device` has a stored `DriveSession` with `scanned == true`. Lets
-// `handle_rip_request` skip a redundant re-scan (which clears the TMDB
-// poster/title). See docs/ripper-session-notes.md — session_is_scanned.
+// `handle_rip_request` skip a redundant re-scan (which clears the TMDB poster/title).
 pub(super) fn session_is_scanned(device: &str) -> bool {
     // Recover-and-proceed on poison (module convention): `.ok()` alone would
     // abandon this check forever after any panic elsewhere under SESSIONS.
@@ -633,9 +622,8 @@ fn candidate_identity_confirmed(probed: Option<&str>, expected: &str) -> bool {
     probed == Some(expected)
 }
 
-// A disc-supplied UDF Volume Identifier, made safe to put in a log field —
-// these `tracing` fields reach `autorip.log`/stderr unescaped, so a crafted
-// disc could inject ANSI. See docs/ripper-session-notes.md — vid_for_log.
+// A disc-supplied UDF Volume Identifier, made safe to put in a log field — these `tracing`
+// fields reach `autorip.log`/stderr unescaped, so a crafted disc could inject ANSI.
 fn vid_for_log(vid: &str) -> String {
     crate::log::sanitize_log_msg(vid)
 }
@@ -664,9 +652,8 @@ fn probe_volume_id(path: &str) -> Option<String> {
 mod rollback_tests {
     use super::*;
 
-    // A disc-supplied volume-id must not carry terminal escapes into a log
-    // (rediscovery's `tracing` fields reach autorip.log/stderr unescaped).
-    // See docs/ripper-session-notes.md — a_volume_id_reaches_a_log_field_with_no_terminal_escapes.
+    // A disc-supplied volume-id must not carry terminal escapes into a log (rediscovery's
+    // `tracing` fields reach autorip.log/stderr unescaped).
     #[test]
     fn a_volume_id_reaches_a_log_field_with_no_terminal_escapes() {
         // ESC [ 2 J is "clear screen"; a bare CR hides the line before it.
@@ -683,9 +670,8 @@ mod rollback_tests {
         );
     }
 
-    // Catches the mutation dropping rollback_failed_spawn's generation check,
-    // and the one restoring the round-1 rip_thread_running early return.
-    // See docs/ripper-session-notes.md — rollback_scoped_to_its_own_claim_spares_the_winner_and_clears_the_loser.
+    // Catches the mutation dropping rollback_failed_spawn's generation check, and the one
+    // restoring the round-1 rip_thread_running early return.
     #[test]
     fn rollback_scoped_to_its_own_claim_spares_the_winner_and_clears_the_loser() {
         let dev = format!("rollback-live-worker-test-{}", std::process::id());
@@ -845,9 +831,8 @@ mod rollback_tests {
         assert!(!candidate_identity_confirmed(None, "DISC_VOL_123"));
     }
 
-    // Swapping in a disc with NO volume label must not leave the previous
-    // disc's identity cached (the old `filter`-and-skip form left it stale).
-    // See docs/ripper-session-notes.md — an_unlabelled_disc_clears_the_previous_discs_cached_identity.
+    // Swapping in a disc with NO volume label must not leave the previous disc's identity
+    // cached (the old `filter`-and-skip form left it stale).
     #[test]
     fn an_unlabelled_disc_clears_the_previous_discs_cached_identity() {
         let dev = format!("disc-identity-swap-{}", std::process::id());
@@ -875,9 +860,8 @@ mod rollback_tests {
         assert_eq!(expected_volume_id(&dev), None);
     }
 
-    // Regression: hot-unplug teardown must not leak this module's per-device
-    // maps (RIP_THREADS/DISC_IDENTITY/HALTS), as it used to.
-    // See docs/ripper-session-notes.md — forgetting_a_removed_device_reaps_its_finished_thread_and_identity.
+    // Regression: hot-unplug teardown must not leak this module's per-device maps
+    // (RIP_THREADS/DISC_IDENTITY/HALTS), as it used to.
     #[test]
     fn forgetting_a_removed_device_reaps_its_finished_thread_and_identity() {
         // Fixture name unique to this test: RIP_THREADS / DISC_IDENTITY /
@@ -931,9 +915,8 @@ mod rollback_tests {
         );
     }
 
-    // The other half of the contract: a still-RUNNING rip thread must keep
-    // its registration, or a later drain returns while it is mid-write.
-    // See docs/ripper-session-notes.md — forgetting_a_device_leaves_a_still_running_thread_registered.
+    // The other half of the contract: a still-RUNNING rip thread must keep its registration, or
+    // a later drain returns while it is mid-write.
     #[test]
     fn forgetting_a_device_leaves_a_still_running_thread_registered() {
         let dev = format!("forget-keep-running-{}", std::process::id());
@@ -971,9 +954,8 @@ mod rollback_tests {
         let _ = join_rip_thread(&dev, Duration::from_secs(5));
     }
 
-    // Regression: take_session/drop_session must recover from a poisoned
-    // SESSIONS lock, not silently no-op as the old `.lock().ok()?` form did.
-    // See docs/ripper-session-notes.md — session_helpers_recover_from_poison.
+    // Regression: take_session/drop_session must recover from a poisoned SESSIONS lock, not
+    // silently no-op as the old `.lock().ok()?` form did.
     #[test]
     fn session_helpers_recover_from_poison() {
         // Poison SESSIONS by panicking while the guard is held.
@@ -998,9 +980,8 @@ mod rollback_tests {
         );
     }
 
-    // Catches the mutation deleting join_rip_thread's self-join branch: it
-    // runs ON its own thread from eject_drive, where is_finished() can never
-    // become true. See docs/ripper-session-notes.md — join_rip_thread self-join.
+    // Catches the mutation deleting join_rip_thread's self-join branch: it runs ON its own
+    // thread from eject_drive, where is_finished() can never become true.
     #[test]
     fn join_rip_thread_called_on_its_own_thread_returns_at_once() {
         let dev = format!("self-join-test-{}", std::process::id());

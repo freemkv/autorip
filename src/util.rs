@@ -68,9 +68,6 @@ pub fn format_iso_datetime_filename() -> String {
 // filesystem-trivial, non-traversing segment callers always receive.
 const SAFE_FALLBACK: &str = "untitled";
 
-// See docs/util-safe-segment.md — makes a string safe as a single path
-// segment (input is attacker-controllable disc/TMDB text); rejects empty,
-// ".", "..", all-dots, and strips leading dots, falling back to a constant.
 fn ensure_safe_segment(s: String) -> String {
     // Strip leading dots (hidden-file / "." / ".." defense).
     let stripped = s.trim_start_matches('.');
@@ -103,7 +100,6 @@ pub fn sanitize_path_compact(name: &str) -> String {
 pub const MAX_DISC_VARIANTS: u32 = 64;
 
 /// THE "another disc of the same title" naming rule, in one place.
-/// See docs/util-disc-variant.md for why this is a single shared function.
 ///
 /// Yields the variant numbers (1, 2, 3, ... [`MAX_DISC_VARIANTS`]) and
 /// returns the first one `claimable` accepts. Callers supply what

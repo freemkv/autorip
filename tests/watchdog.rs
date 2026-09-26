@@ -4,10 +4,6 @@
 //! bounded-syscall pattern around `increment_restart_count` returns
 //! within its 5s deadline even when the underlying call would never
 //! complete, and increments the counter on the happy path.
-//!
-//! See docs/watchdog-tests.md for the settings-save coverage note and
-//! the hard-to-test-caveat rationale for how the wedged-NFS path is
-//! approximated here.
 
 use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
@@ -15,8 +11,8 @@ use tempfile::tempdir;
 
 use freemkv_autorip::ripper::staging;
 
-// Verbatim mirror of the bounded-syscall pattern inlined in mux.rs's
-// watchdog escalation closure. See docs/watchdog-tests.md.
+// Verbatim mirror of the bounded-syscall pattern inlined in mux.rs's watchdog escalation
+// closure.
 fn bounded_call<F>(timeout: Duration, op: F) -> Result<(), ()>
 where
     F: FnOnce() + Send + 'static,

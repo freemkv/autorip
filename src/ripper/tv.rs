@@ -19,7 +19,6 @@ pub fn select_episode_titles(titles: &[DiscTitle], min_len_secs: u64) -> Vec<usi
 }
 
 // Indices whose duration sits in the modal episode-length cluster.
-// See docs/tv-episode-cluster.md for the median/tolerance rationale.
 fn episode_cluster(durations: &[f64], min_len: f64) -> Vec<usize> {
     let cands: Vec<usize> = durations
         .iter()

@@ -7,14 +7,13 @@
 //! `pub mod` so external consumers (tests) can name the items.
 //!
 //! Keep this file purely declarative — no logic, almost no statics.
-//! See docs/lib-facade.md for why `SHUTDOWN` is duplicated here.
 
 use std::sync::atomic::AtomicBool;
 
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// Full build label (package version + git short hash, e.g. `1.1.1 (g2014a41)`).
-/// Built by `build.rs`. See docs/lib-facade.md for why this is duplicated.
+/// Full build label (package version + git short hash, e.g. `1.1.1 (g2014a41)`). Built by
+/// `build.rs`.
 pub const VERSION_LABEL: &str = concat!(env!("AUTORIP_VERSION"), env!("GIT_SUFFIX"));
 
 pub mod config;

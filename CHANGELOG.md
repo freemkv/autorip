@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.7] — 2026-09-26
+
+### Maintenance
+
+- Replace comment-overflow documentation with concise source contracts and README instructions; enforce the shared comment policy in CI.
+
 ## [1.7.6] — 2026-09-26
 
 ### Added

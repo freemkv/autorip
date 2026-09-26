@@ -6,8 +6,6 @@
 //! `eject_drive` — stays here. The `mux` sub-module holds the active
 //! parallel mux "highway" (consumer/producer split + watchdog); the
 //! multipass sweep loop still lives inline in `rip_disc`.
-//!
-//! See docs/ripper-mod-notes.md — module history.
 
 pub(crate) mod mux;
 pub mod resume;
@@ -52,9 +50,8 @@ pub(crate) fn scan_opts_for(cfg: &Config) -> libfreemkv::ScanOptions {
     crate::keysource::drive_scan_opts(cfg)
 }
 
-// Scan-phase watchdog: emits a WARN every 15s while structure scan /
-// key resolve are in flight, so a wedged drive is visible instead of
-// leaving the UI stuck silently. See docs/ripper-mod-notes.md.
+// Scan-phase watchdog: emits a WARN every 15s while structure scan / key resolve are in flight,
+// so a wedged drive is visible instead of leaving the UI stuck silently.
 struct ScanWatchdog {
     active: Arc<AtomicBool>,
     // Coarse phase marker the watcher reports: 0 = scan, 1 = resolve_keys.
@@ -134,18 +131,16 @@ pub(crate) fn disc_is_3d(disc: &libfreemkv::Disc) -> bool {
     })
 }
 
-// True when a mux-construction `io::Error` is a user Stop (E6010) vs a
-// structural failure. Match the leading `E<code>` token EXACTLY, never
-// a substring-scan. See docs/ripper-mod-notes.md — is_halt_error.
+// True when a mux-construction `io::Error` is a user Stop (E6010) vs a structural failure.
+// Match the leading `E<code>` token EXACTLY, never a substring-scan.
 pub(crate) fn is_halt_error(e: &std::io::Error) -> bool {
     let s = e.to_string();
     let code = s.split([':', ' ', '\n']).next().unwrap_or("");
     code == format!("E{}", libfreemkv::error::E_HALTED)
 }
 
-// True when a mux-construction `io::Error` is a missing-FMTS-forensic-key
-// error (E7026): base AACS keys resolved but online forensic keys did
-// not. See docs/ripper-mod-notes.md — is_fmts_key_missing_error.
+// True when a mux-construction `io::Error` is a missing-FMTS-forensic-key error (E7026): base
+// AACS keys resolved but online forensic keys did not.
 pub(crate) fn is_fmts_key_missing_error(e: &std::io::Error) -> bool {
     let s = e.to_string();
     let code = s.split([':', ' ', '\n']).next().unwrap_or("");
@@ -186,9 +181,9 @@ fn resolve_keys_from_drive(
     crate::keysource::resolve_keys(sources, &mut access, disc)
 }
 
-// Human-readable key readiness for the dashboard tile: "Ready to rip",
-// "Capture without keys — …", or "Missing keys — <reason>". The tile
-// keys its action button off the "Missing keys" prefix. See docs/ripper-mod-notes.md.
+// Human-readable key readiness for the dashboard tile: "Ready to rip", "Capture without keys —
+// …", or "Missing keys — <reason>". The tile keys its action button off the "Missing keys"
+// prefix.
 fn key_readiness(
     disc: &libfreemkv::Disc,
     outcome: crate::keysource::KeyOutcome,
@@ -204,9 +199,9 @@ fn key_readiness(
     if capture_without_keys {
         return "Capture without keys — no decryption".to_string();
     }
-    // What the service ACTUALLY said outranks everything below: the library
-    // funnels every non-2xx into one "could not be reached" code, which reported
-    // a definitive 422 no-key as an outage. See docs/ripper-mod-notes.md.
+    // What the service ACTUALLY said outranks everything below: the library funnels every
+    // non-2xx into one "could not be reached" code, which reported a definitive 422 no-key as
+    // an outage.
     if let Some(reach) = online {
         if let Some(status) = key_service_transient_status(reach) {
             return status;
@@ -241,9 +236,8 @@ fn key_readiness(
     format!("Missing keys — {reason}")
 }
 
-// What the pre-rip FMTS forensic-key gate should do, given whether the
-// complete map resolved and the operator's capture setting. See
-// docs/ripper-mod-notes.md — FmtsGate.
+// What the pre-rip FMTS forensic-key gate should do, given whether the complete map resolved
+// and the operator's capture setting.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum FmtsGate {
     /// Full map resolved — rip normally (forensic keys are proven + banked).
@@ -267,8 +261,7 @@ fn fmts_gate_decision(map_resolved: bool, capture_without_keys: bool) -> FmtsGat
     }
 }
 
-// Side-effect routing for each FMTS gate outcome, split out as a pure,
-// unit-testable function. See docs/ripper-mod-notes.md — FmtsGatePlan.
+// Side-effect routing for each FMTS gate outcome, split out as a pure, unit-testable function.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 struct FmtsGatePlan {
     defer_forensic_mux: bool,
@@ -354,9 +347,8 @@ fn key_service_server_error_status(code: u16) -> String {
     )
 }
 
-// Should the rip re-attempt online key resolution before proceeding?
-// Fires only for an ENCRYPTED disc the online key service left with NO
-// keys, with capture-without-keys off. See docs/ripper-mod-notes.md.
+// Should the rip re-attempt online key resolution before proceeding? Fires only for an
+// ENCRYPTED disc the online key service left with NO keys, with capture-without-keys off.
 fn should_retry_online_keys(
     uses_online: bool,
     capture_without_keys: bool,
@@ -391,11 +383,10 @@ fn key_service_transient_status(reach: crate::keysource::ServiceReachability) ->
     }
 }
 
-/// Map a TERMINAL verdict — the service delivered an answer (or was never
-/// askable) — to the reason clause shown after the "Missing keys — " prefix.
-/// `None` for an ordinary 2xx no-key (keep the generic text) and for the
-/// transient verdicts, which get [`key_service_transient_status`] instead.
-/// See docs/ripper-mod-notes.md for why the HTTP status beats the E-code.
+/// Map a TERMINAL verdict — the service delivered an answer (or was never askable) — to the
+/// reason clause shown after the "Missing keys — " prefix. `None` for an ordinary 2xx no-key
+/// (keep the generic text) and for the transient verdicts, which get
+/// [`key_service_transient_status`] instead.
 fn key_service_no_key_reason(reach: crate::keysource::ServiceReachability) -> Option<String> {
     use crate::keysource::ServiceReachability;
     match reach {
@@ -423,9 +414,8 @@ fn log_terminal_key_verdict(reach: crate::keysource::ServiceReachability) {
     );
 }
 
-// Classify the key service after a no-key online resolution and bounded-retry a
-// transient outage. The third return value is the final verdict whenever the
-// disc is still keyless. See docs/ripper-mod-notes.md.
+// Classify the key service after a no-key online resolution and bounded-retry a transient
+// outage. The third return value is the final verdict whenever the disc is still keyless.
 fn retry_online_keys_on_outage(
     device: &str,
     cfg: &Config,
@@ -519,9 +509,8 @@ fn device_key(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
-// Tear down per-device state for a drive that vanished from the
-// enumeration (hot-unplug); deferred while its worker is still live.
-// See docs/ripper-mod-notes.md — forget_removed_device.
+// Tear down per-device state for a drive that vanished from the enumeration (hot-unplug);
+// deferred while its worker is still live.
 fn forget_removed_device(device: &str) -> bool {
     // TOCTOU fix: re-check liveness and drop the STATE row in ONE critical
     // section (the old split check→remove let a rip dispatched in the gap lose its
@@ -597,9 +586,8 @@ fn auto_rip_fresh(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     rip_disc(cfg, device, device_path, false);
 }
 
-// Decide both halves of a tick's response to an observed disc; the two
-// answers must agree. `dispatch` is suppressed during the post-Stop
-// cooldown. See docs/ripper-mod-notes.md — insert_tick.
+// Decide both halves of a tick's response to an observed disc; the two answers must agree.
+// `dispatch` is suppressed during the post-Stop cooldown.
 fn insert_tick(is_new_insert: bool, in_cooldown: bool) -> InsertTick {
     let dispatch = is_new_insert && !in_cooldown;
     InsertTick {
@@ -614,12 +602,10 @@ fn insert_tick(is_new_insert: bool, in_cooldown: bool) -> InsertTick {
 /// Poll drives for disc insertion. Only triggers on state change
 /// (no disc → disc present), not on disc already being there.
 ///
-/// autorip never touches hardware paths, sysfs, SCSI, or USB directly;
-/// the lib's `list_drives()` / `drive_has_disc(path)` do the platform
-/// enumeration and disc-presence probe (with internal wedge-recovery).
-/// autorip just iterates the snapshot, tracks logical state
+/// autorip never touches hardware paths, sysfs, SCSI, or USB directly; the lib's
+/// `list_drives()` / `drive_has_disc(path)` do the platform enumeration and disc-presence probe
+/// (with internal wedge-recovery). autorip just iterates the snapshot, tracks logical state
 /// (idle/scanning/ripping/cooldown), and spawns rip threads.
-/// See docs/ripper-mod-notes.md — drive_poll_loop architectural note.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     // Re-enumerate drives every RESCAN_INTERVAL_SECS so a USB unplug+replug
     // (which may rename the device node) is detected without a container restart.
@@ -1140,9 +1126,8 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     };
     tracing::info!(device = %device, elapsed_ms = scan_t0.elapsed().as_millis() as u64, "scan: structure done");
 
-    // User-facing unlocker matrix — which unlockers RAN, emitted right after
-    // disc-identify and BEFORE the keyserver (depends only on drive-init + scan
-    // state, not key resolution). See docs/ripper-mod-notes.md.
+    // User-facing unlocker matrix — which unlockers RAN, emitted right after disc-identify and
+    // BEFORE the keyserver (depends only on drive-init + scan state, not key resolution).
     {
         let matrix = disc
             .unlocker_matrix(&drive)
@@ -1481,16 +1466,14 @@ pub fn handle_rip_request(
     }
 }
 
-// True if a staging-dir basename is the resume/completion match for a
-// sanitized disc name. EXACT equality only — a prefix match would
-// collide. See docs/ripper-mod-notes.md — staging_dir_matches_disc.
+// True if a staging-dir basename is the resume/completion match for a sanitized disc name.
+// EXACT equality only — a prefix match would collide.
 fn staging_dir_matches_disc(basename: &str, sanitized: &str) -> bool {
     basename == sanitized
 }
 
-// List the immediate-child basenames of the staging root with the
-// same NFS cold-cache discipline as staging::snapshot_staging_disc;
-// retries read_dir on error and unions results. See docs/ripper-mod-notes.md.
+// List the immediate-child basenames of the staging root with the same NFS cold-cache
+// discipline as staging::snapshot_staging_disc; retries read_dir on error and unions results.
 fn list_staging_basenames(staging_dir: &std::path::Path) -> Option<Vec<String>> {
     let mut saw_read_ok = false;
     // Insertion-ordered union of every basename observed across passes; the
@@ -1544,11 +1527,9 @@ fn list_staging_basenames(staging_dir: &std::path::Path) -> Option<Vec<String>> 
 /// when STATE has no disc name for it (nothing scanned — the sanitized
 /// empty name would otherwise point at the staging ROOT).
 ///
-/// The single entry point for every STATE-reading caller that needs a
-/// staging path. Reads both halves of the disc's identity (TMDB display
-/// title + raw volume label) and hands them to [`staging::staging_basename`],
-/// the one place the naming rule lives.
-/// See docs/ripper-mod-notes.md — staging_basename_for_device.
+/// The single entry point for every STATE-reading caller that needs a staging path. Reads both
+/// halves of the disc's identity (TMDB display title + raw volume label) and hands them to
+/// [`staging::staging_basename`], the one place the naming rule lives.
 pub fn staging_basename_for_device(cfg: &Config, device: &str) -> Option<String> {
     // Recover from a poisoned mutex rather than silently returning None:
     // callers read this to decide "already ripped?" / "resumable?", and a
@@ -1582,9 +1563,8 @@ fn disc_loss_aborted(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
     dir.join(staging::ABORTED_LOSS_MARKER).exists()
 }
 
-// Does the currently-scanned disc already have a `.completed` staging
-// dir? Gates the unattended auto-rip path so a container restart
-// doesn't re-rip a disc. See docs/ripper-mod-notes.md.
+// Does the currently-scanned disc already have a `.completed` staging dir? Gates the unattended
+// auto-rip path so a container restart doesn't re-rip a disc.
 fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
     // Recover from a poisoned mutex rather than silently returning false
     // (would re-rip a completed disc). Basename is disc-specific, not just
@@ -1600,9 +1580,8 @@ fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
     staging_disc_completed(staging_root, &sanitized)
 }
 
-// Pure core of `disc_already_completed`: does a staging dir whose
-// basename exactly matches `sanitized` carry `.completed` AND not
-// `.review` (M4 held-for-review gating)? See docs/ripper-mod-notes.md.
+// Pure core of `disc_already_completed`: does a staging dir whose basename exactly matches
+// `sanitized` carry `.completed` AND not `.review` (M4 held-for-review gating)?
 fn staging_disc_completed(staging_root: &std::path::Path, sanitized: &str) -> bool {
     let Some(basenames) = list_staging_basenames(staging_root) else {
         return false;
@@ -1628,9 +1607,9 @@ fn staging_disc_completed(staging_root: &std::path::Path, sanitized: &str) -> bo
     false
 }
 
-// Does the currently-scanned disc have a staging dir OWNED by the mux
-// worker (`.ripped` pending, or `.muxing` held)? Refuses a fresh sweep
-// that would truncate the ISO the worker is reading. See docs/ripper-mod-notes.md.
+// Does the currently-scanned disc have a staging dir OWNED by the mux worker (`.ripped`
+// pending, or `.muxing` held)? Refuses a fresh sweep that would truncate the ISO the worker is
+// reading.
 fn disc_owned_by_worker(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
     // Recover a poisoned lock instead of failing open: returning false here
     // risks a fresh sweep truncating an in-flight mux ISO the worker is reading.
@@ -1666,9 +1645,8 @@ fn staging_disc_owned_by_worker(staging_root: &std::path::Path, sanitized: &str)
     false
 }
 
-// Is this staging dir blocked from drive-resume (Remux) by an owner,
-// held, or terminal marker? Pure projection of the snapshot booleans
-// so the H1/M3 skip rules are unit-testable. See docs/ripper-mod-notes.md.
+// Is this staging dir blocked from drive-resume (Remux) by an owner, held, or terminal marker?
+// Pure projection of the snapshot booleans so the H1/M3 skip rules are unit-testable.
 fn resumable_dir_blocked(snap: &staging::StagingSnapshot) -> bool {
     // `completed` also blocks: with `keep_iso = true` the ISO survives past
     // completion, so a manual Require on a just-finished dir could otherwise
@@ -1676,9 +1654,8 @@ fn resumable_dir_blocked(snap: &staging::StagingSnapshot) -> bool {
     snap.has_ripped || snap.has_muxing || snap.has_review || snap.has_failed || snap.completed
 }
 
-// End-of-recovery loss figure in milliseconds, or NaN when untrustworthy
-// (`promotion_intact == false`, or real loss with no bitrate to convert
-// it with). Pure and unit-testable. See docs/ripper-mod-notes.md.
+// End-of-recovery loss figure in milliseconds, or NaN when untrustworthy (`promotion_intact ==
+// false`, or real loss with no bitrate to convert it with). Pure and unit-testable.
 pub(crate) fn end_of_recovery_lost_ms(
     promotion_intact: bool,
     title_bytes_per_sec: f64,
@@ -1709,9 +1686,8 @@ struct EndOfRecoveryLoss {
     lost_ms: f64,
 }
 
-// Measure the loss the end-of-recovery abort gate decides on, reading
-// the ALREADY-PROMOTED mapfile (Unreadable here means confirmed-lost).
-// Zero only when genuinely nothing to report. See docs/ripper-mod-notes.md.
+// Measure the loss the end-of-recovery abort gate decides on, reading the ALREADY-PROMOTED
+// mapfile (Unreadable here means confirmed-lost). Zero only when genuinely nothing to report.
 fn end_of_recovery_loss(
     map: &freemkv_engine::Mapfile,
     promotion_intact: bool,
@@ -1740,21 +1716,18 @@ fn end_of_recovery_loss(
     }
 }
 
-/// Loop-top convergence gate for the patch retry loop, guarding the fail-open
-/// case the bare [`patch_pass_decision`] can't see: `Converged` fires on
-/// `scope_bad == 0`, but an EMPTY mapfile (0 sectors ripped) ALSO has zero bad
-/// bytes. "Nothing bad recorded" is not "everything good", so require that we
-/// actually read something (`bytes_good > 0`) first. A genuinely-complete rip
-/// (good spans the scope, zero bad) still converges; an empty mapfile falls
-/// through to run the pass rather than falsely reporting "100% recovered".
-/// See docs/ripper-mod-notes.md.
+/// Loop-top convergence gate for the patch retry loop, guarding the fail-open case the bare
+/// [`patch_pass_decision`] can't see: `Converged` fires on `scope_bad == 0`, but an EMPTY
+/// mapfile (0 sectors ripped) ALSO has zero bad bytes. "Nothing bad recorded" is not
+/// "everything good", so require that we actually read something (`bytes_good > 0`) first. A
+/// genuinely-complete rip (good spans the scope, zero bad) still converges; an empty mapfile
+/// falls through to run the pass rather than falsely reporting "100% recovered".
 fn pre_pass_converged(mux_scope_bad: u64, bytes_good: u64) -> bool {
     bytes_good > 0 && patch_pass_decision(mux_scope_bad, None) == PatchDecision::Converged
 }
 
-// Look at the staging dirs for a Remux-eligible entry matching the
-// sanitized display_name of the currently-scanned disc; returns the
-// `ResumeClass::Remux` payload if found, else None. See docs/ripper-mod-notes.md.
+// Look at the staging dirs for a Remux-eligible entry matching the sanitized display_name of
+// the currently-scanned disc; returns the `ResumeClass::Remux` payload if found, else None.
 fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<resume::ResumeClass> {
     // Recover from a poisoned mutex rather than silently returning None (which
     // would fail to resume a valid staged ISO). Matches disc_already_completed.
@@ -1828,9 +1801,8 @@ fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<re
     None
 }
 
-// True if `seg` is safe to use as a single staging-directory path
-// segment: rejects empty, all-dots, path separators, absolute paths.
-// Independent of the sanitizer on purpose. See docs/ripper-mod-notes.md.
+// True if `seg` is safe to use as a single staging-directory path segment: rejects empty,
+// all-dots, path separators, absolute paths. Independent of the sanitizer on purpose.
 fn is_safe_staging_segment(seg: &str) -> bool {
     !seg.is_empty()
         && !seg.chars().all(|c| c == '.')
@@ -1895,9 +1867,8 @@ fn wipe_staging_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) {
     }
 }
 
-// Detect whether `display_name`'s disc has resumable staging state and
-// of what kind: `bytes_pending == 0` → Remux, `> 0` → Sweep. Pure (no
-// STATE, no side effects). See docs/ripper-mod-notes.md.
+// Detect whether `display_name`'s disc has resumable staging state and of what kind:
+// `bytes_pending == 0` → Remux, `> 0` → Sweep. Pure (no STATE, no side effects).
 fn resumable_for_disc(cfg: &Config, display_name: &str, disc_label: &str) -> Option<Resumable> {
     if display_name.is_empty() {
         return None;
@@ -1981,9 +1952,8 @@ impl Drop for HaltGuard {
     }
 }
 
-// RAII guard that clears the `.sweeping` in-progress marker on drop,
-// held for the whole `rip_disc` body so every early-return branch and
-// panic clears it. See docs/ripper-mod-notes.md — SweepingGuard.
+// RAII guard that clears the `.sweeping` in-progress marker on drop, held for the whole
+// `rip_disc` body so every early-return branch and panic clears it.
 struct SweepingGuard {
     staging: std::path::PathBuf,
 }
@@ -2021,16 +1991,14 @@ pub fn make_drive_event_fn(
     }
 }
 
-// Install this rip attempt's initial Halt, CARRYING the outgoing
-// token's cancel so a Stop landing between the pre-call cancel check
-// and this line isn't silently discarded. See docs/ripper-mod-notes.md.
+// Install this rip attempt's initial Halt, CARRYING the outgoing token's cancel so a Stop
+// landing between the pre-call cancel check and this line isn't silently discarded.
 fn install_rip_halt(device: &str) {
     swap_halt_carrying_cancel(device, libfreemkv::Halt::new());
 }
 
-// Report a post-mux failure that leaves the staging dir RESUMABLE (not
-// `.failed`), and set a terminal `status` so `is_busy()` doesn't stick
-// true forever. See docs/ripper-mod-notes.md — abort_post_mux_preserving_staging.
+// Report a post-mux failure that leaves the staging dir RESUMABLE (not `.failed`), and set a
+// terminal `status` so `is_busy()` doesn't stick true forever.
 fn abort_post_mux_preserving_staging(device: &str, log_line: &str, last_error: &str) {
     crate::log::device_log(device, log_line);
     update_state_with(device, |s| {
@@ -2044,9 +2012,8 @@ fn abort_post_mux_preserving_staging(device: &str, log_line: &str, last_error: &
     });
 }
 
-// Fire the drive-free `rip_complete` webhook: disc read finished, drive
-// free. FIRST of three pipeline hooks (rip → mux → move). See
-// docs/ripper-mod-notes.md — fire_rip_complete_webhook.
+// Fire the drive-free `rip_complete` webhook: disc read finished, drive free. FIRST of three
+// pipeline hooks (rip → mux → move).
 #[allow(clippy::too_many_arguments)]
 fn fire_rip_complete_webhook(
     cfg: &Config,
@@ -3727,9 +3694,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             }
         }
 
-        // End-of-recovery promotion (multi-pass only) happens below; a
-        // user STOP skips it so un-retried ranges stay resumable.
-        // See docs/ripper-mod-notes.md — end-of-recovery promotion.
+        // End-of-recovery promotion (multi-pass only) happens below; a user STOP skips it so
+        // un-retried ranges stay resumable.
         if user_halt.load(Ordering::Relaxed) {
             crate::log::device_log(
                 device,
@@ -4403,9 +4369,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Debug log reader type for mux - confirms ISO vs drive source
     tracing::debug!(target: "mux", " mux using reader: {}", if uses_multipass(cfg_read.max_retries) { "ISO file (multipass)" } else { "physical drive" });
 
-    // DiscStream gets the per-device `Halt` at construction; Stop interrupts
-    // `fill_extents` at the next retry boundary (dense bad-sector regions).
-    // See docs/ripper-mod-notes.md — mux reader/stream notes.
+    // DiscStream gets the per-device `Halt` at construction; Stop interrupts `fill_extents` at
+    // the next retry boundary (dense bad-sector regions).
     let mux_total_bytes = mux_progress_denominator(cfg_read.max_retries, total_bytes, &title);
 
     let _mux_span =
@@ -4949,9 +4914,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     }
 }
 
-// Pure decision: should this completion path auto-eject the drive?
-// Only when `auto_eject` is on AND the device is not a synthetic,
-// underscore-prefixed worker (`_mux`, etc). See docs/ripper-mod-notes.md.
+// Pure decision: should this completion path auto-eject the drive? Only when `auto_eject` is on
+// AND the device is not a synthetic, underscore-prefixed worker (`_mux`, etc).
 pub(crate) fn should_auto_eject(auto_eject: bool, device: &str) -> bool {
     auto_eject && !device.starts_with('_')
 }
@@ -5034,9 +4998,8 @@ fn audio_purpose_tag(p: libfreemkv::LabelPurpose) -> Option<&'static str> {
     }
 }
 
-// Pick the mux-phase progress denominator (percent + ETA). Multipass
-// reads whole disc capacity; single-pass scopes to the title's extent
-// sum instead, so its progress reaches 100%. See docs/ripper-mod-notes.md.
+// Pick the mux-phase progress denominator (percent + ETA). Multipass reads whole disc capacity;
+// single-pass scopes to the title's extent sum instead, so its progress reaches 100%.
 fn mux_progress_denominator(
     max_retries: u8,
     total_bytes: u64,
@@ -5057,9 +5020,8 @@ fn mux_progress_denominator(
     }
 }
 
-// Unreadable byte count the abort gate scopes to: whole-disc for ISO,
-// in-title only for MKV. RAW source the `abort_on_lost_secs == 0`
-// ("perfect") gate keys on — no bitrate/float. See docs/ripper-mod-notes.md.
+// Unreadable byte count the abort gate scopes to: whole-disc for ISO, in-title only for MKV.
+// RAW source the `abort_on_lost_secs == 0` ("perfect") gate keys on — no bitrate/float.
 pub(super) fn abort_lost_bytes(
     output_is_iso: bool,
     title: &libfreemkv::DiscTitle,
@@ -5068,9 +5030,8 @@ pub(super) fn abort_lost_bytes(
     freemkv_engine::abort_lost_bytes(output_is_iso, title, bad_ranges)
 }
 
-// Milliseconds of loss that the post-retry abort check should weigh:
-// whole-disc for a raw ISO, in-title only for an MKV/m2ts mux. See
-// docs/ripper-mod-notes.md — abort_lost_ms.
+// Milliseconds of loss that the post-retry abort check should weigh: whole-disc for a raw ISO,
+// in-title only for an MKV/m2ts mux.
 pub(super) fn abort_lost_ms(
     output_is_iso: bool,
     title: &libfreemkv::DiscTitle,
@@ -5080,9 +5041,8 @@ pub(super) fn abort_lost_ms(
     freemkv_engine::abort_lost_ms(output_is_iso, title, bad_ranges, title_bytes_per_sec)
 }
 
-// The flawless-rip loss gate: `abort_on_lost_secs == 0` means ZERO —
-// abort on ANY lost byte; `> 0` keeps a time-based tolerance. A NaN
-// `lost_ms` always aborts (fail-safe). See docs/ripper-mod-notes.md.
+// The flawless-rip loss gate: `abort_on_lost_secs == 0` means ZERO — abort on ANY lost byte; `>
+// 0` keeps a time-based tolerance. A NaN `lost_ms` always aborts (fail-safe).
 fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
     // Forward rather than re-implement: this was a full local copy of the
     // engine's body, hand-synced across crates, until the feeding code drifted
@@ -5090,9 +5050,8 @@ fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
     freemkv_engine::loss_aborts(lost_bytes, lost_ms, abort_on_lost_secs)
 }
 
-// Whether mux-time (decrypt/codec) loss must quarantine the rip. SOLE
-// enforcement point for mux-time loss (pre-mux gate only reads the
-// mapfile Unreadable set). See docs/ripper-mod-notes.md — mux_loss_aborts.
+// Whether mux-time (decrypt/codec) loss must quarantine the rip. SOLE enforcement point for
+// mux-time loss (pre-mux gate only reads the mapfile Unreadable set).
 fn mux_loss_aborts(
     completed: bool,
     is_iso: bool,
@@ -5114,16 +5073,14 @@ fn mux_loss_aborts(
     }
 }
 
-// Does this `max_retries` setting select the MULTI-PASS rip route? One
-// predicate for a decision taken in eight places along `rip_disc` that
-// must all agree. See docs/ripper-mod-notes.md — uses_multipass.
+// Does this `max_retries` setting select the MULTI-PASS rip route? One predicate for a decision
+// taken in eight places along `rip_disc` that must all agree.
 pub(crate) fn uses_multipass(max_retries: u8) -> bool {
     max_retries > 0
 }
 
-// The done card's `total_lost_ms` / `main_lost_ms`, in ONE place.
-// Single-pass has no mapfile, so it carries `final_lost_secs` instead.
-// See docs/ripper-mod-notes.md — done_card_lost_ms.
+// The done card's `total_lost_ms` / `main_lost_ms`, in ONE place. Single-pass has no mapfile,
+// so it carries `final_lost_secs` instead.
 pub(super) fn done_card_lost_ms(
     multipass: bool,
     final_lost_secs: f64,
@@ -5137,9 +5094,8 @@ pub(super) fn done_card_lost_ms(
     }
 }
 
-// Is the resolved title trustworthy enough to auto-file the finished
-// rip, or must it be HELD for operator review? One disjunction decides
-// `.done` vs `.review` for both routes. See docs/ripper-mod-notes.md.
+// Is the resolved title trustworthy enough to auto-file the finished rip, or must it be HELD
+// for operator review? One disjunction decides `.done` vs `.review` for both routes.
 fn title_is_confident(
     tmdb_api_key: &str,
     overridden: bool,
@@ -5160,9 +5116,8 @@ fn handoff_marker_name(title_confident: bool) -> &'static str {
     if title_confident { ".done" } else { ".review" }
 }
 
-// Decide the deliverables a captured disc produces: titles to mux out
-// of the ISO + staging filename of each. Movie → one output; TV under
-// `tv_auto` → one per episode, `S{NN}E{MM}`. See docs/ripper-mod-notes.md.
+// Decide the deliverables a captured disc produces: titles to mux out of the ISO + staging
+// filename of each. Movie → one output; TV under `tv_auto` → one per episode, `S{NN}E{MM}`.
 fn plan_mux_outputs(
     titles: &[libfreemkv::DiscTitle],
     cfg: &Config,
@@ -5223,16 +5178,14 @@ fn plan_mux_outputs(
         .collect()
 }
 
-// Whether the rip's deliverable is the whole-disc ISO itself rather
-// than a muxed MKV/M2TS title. Single predicate every deliverable /
-// prune / mux-skip decision keys off. See docs/ripper-mod-notes.md.
+// Whether the rip's deliverable is the whole-disc ISO itself rather than a muxed MKV/M2TS
+// title. Single predicate every deliverable / prune / mux-skip decision keys off.
 pub(crate) fn output_is_iso_image(output_format: &str) -> bool {
     output_format == crate::config::OUTPUT_FORMAT_ISO
 }
 
-// Effective main-movie-loss tolerance for the abort gate. ISO output
-// must be byte-complete, so `abort_on_lost_secs` is forced to 0
-// ("require 100%") for it. See docs/ripper-mod-notes.md.
+// Effective main-movie-loss tolerance for the abort gate. ISO output must be byte-complete, so
+// `abort_on_lost_secs` is forced to 0 ("require 100%") for it.
 fn effective_abort_secs(output_format: &str, configured: u64) -> u64 {
     freemkv_engine::effective_abort_secs(output_is_iso_image(output_format), configured)
 }
@@ -5267,9 +5220,8 @@ fn retain_intermediate_iso(keep_iso: bool, output_format: &str) -> bool {
     keep_iso || output_is_iso_image(output_format)
 }
 
-// Whether an `output_format == "iso"` rip must be rejected because it
-// was requested in single-pass mode: only multi-pass captures a real,
-// whole-disc-scoped ISO. See docs/ripper-mod-notes.md.
+// Whether an `output_format == "iso"` rip must be rejected because it was requested in
+// single-pass mode: only multi-pass captures a real, whole-disc-scoped ISO.
 fn iso_output_needs_multipass(output_format: &str, max_retries: u8) -> bool {
     output_is_iso_image(output_format) && !uses_multipass(max_retries)
 }
@@ -5283,8 +5235,7 @@ use freemkv_engine::{
     patch_pass_decision, plan_passes, scope_bad_bytes, scope_converged,
 };
 
-// Pass-1 transport-failure gating decision-MIRROR, not a wired gate;
-// `#[cfg(test)]` only. See docs/ripper-mod-notes.md — SweepReadAction.
+// Pass-1 transport-failure gating decision-MIRROR, not a wired gate; `#[cfg(test)]` only.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SweepReadAction {
@@ -5316,9 +5267,8 @@ fn sweep_transport_retry(
     }
 }
 
-// Prune the disc-sized intermediate ISO and mapfile sidecar on a
-// successful multipass completion, unless `keep_iso` is set. Shared by
-// both completion routes. See docs/ripper-mod-notes.md — prune_intermediate_iso.
+// Prune the disc-sized intermediate ISO and mapfile sidecar on a successful multipass
+// completion, unless `keep_iso` is set. Shared by both completion routes.
 fn prune_intermediate_iso(
     device: &str,
     iso_path: &std::path::Path,
@@ -5344,9 +5294,8 @@ fn prune_intermediate_iso(
     }
 }
 
-// Whether a `run_mux` outcome that never opened its output is a
-// terminal failure needing quarantine, vs a clean resumable stop.
-// See docs/ripper-mod-notes.md — header_phase_outcome_is_failure.
+// Whether a `run_mux` outcome that never opened its output is a terminal failure needing
+// quarantine, vs a clean resumable stop.
 fn header_phase_outcome_is_failure(output_opened: bool, finalize_error: Option<&str>) -> bool {
     !output_opened && finalize_error.is_some()
 }
@@ -5386,9 +5335,8 @@ fn skip_read_errors(on_read_error: &str) -> bool {
     on_read_error == "skip"
 }
 
-// Log prefix / status / last_error for a mux with `completed == false`:
-// finalize_error (failed) > read_error (error) > neither (idle).
-// See docs/ripper-mod-notes.md — incomplete_mux_status.
+// Log prefix / status / last_error for a mux with `completed == false`: finalize_error (failed)
+// > read_error (error) > neither (idle).
 fn incomplete_mux_status(
     finalize_error: Option<&str>,
     read_error: Option<&str>,
@@ -5410,16 +5358,14 @@ fn incomplete_mux_status(
     }
 }
 
-// Operator-facing message for the "encrypted disc, no usable keys"
-// failure, dispatched from the whole disc (prefers `css_error` over
-// `aacs_error` when both could apply). See docs/ripper-mod-notes.md.
+// Operator-facing message for the "encrypted disc, no usable keys" failure, dispatched from the
+// whole disc (prefers `css_error` over `aacs_error` when both could apply).
 fn keyless_failure_message(disc: &libfreemkv::Disc) -> String {
     keyless_failure_message_for(disc.css_error.as_ref(), disc.aacs_error.as_ref())
 }
 
-// Keyless-deferral message for the resume / deferred-mux path. Mirrors
-// the fresh-rip outage classifier: reports a transient key-service
-// outage instead of a permanent "no keys" line. See docs/ripper-mod-notes.md.
+// Keyless-deferral message for the resume / deferred-mux path. Mirrors the fresh-rip outage
+// classifier: reports a transient key-service outage instead of a permanent "no keys" line.
 pub(crate) fn deferred_keyless_message(cfg: &Config, disc: &libfreemkv::Disc) -> String {
     if cfg.key_source == "online" {
         let reach = crate::keysource::probe_online_reachability(cfg);
@@ -5446,9 +5392,8 @@ fn keyless_failure_message_for(
     aacs_failure_message(css_error.or(aacs_error))
 }
 
-// User-facing message for the "encrypted disc, no keys resolved"
-// failure, dispatched code-based on `Disc::aacs_error`. Render format:
-// `Error: E<code> <message>` via `error_line`. See docs/ripper-mod-notes.md.
+// User-facing message for the "encrypted disc, no keys resolved" failure, dispatched code-based
+// on `Disc::aacs_error`. Render format: `Error: E<code> <message>` via `error_line`.
 fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
     use libfreemkv::error as ec;
 
@@ -5639,9 +5584,8 @@ fn strip_error_prefix(s: &str) -> &str {
     after_code.strip_prefix(' ').unwrap_or(s)
 }
 
-// Operator-facing message for the multipass disk-space preflight
-// failure; NOT a libfreemkv `Error`, rendered as-is in the UI banner.
-// See docs/ripper-mod-notes.md — disk_space_preflight_message.
+// Operator-facing message for the multipass disk-space preflight failure; NOT a libfreemkv
+// `Error`, rendered as-is in the UI banner.
 fn disk_space_preflight_message(required: u64, staging: &str, avail: u64) -> String {
     format!(
         "Insufficient staging disk space — need ≥ {:.1} GiB free at {} (remaining disc image plus selected title estimate), have {:.1} GiB. Free up space or point STAGING_DIR at a larger volume.",
@@ -5680,9 +5624,8 @@ fn non_scsi_error_label(e: &libfreemkv::Error) -> &'static str {
     }
 }
 
-// Translate a libfreemkv read-error into a user-facing /api/state
-// last_error message (sector location + plain-English cause).
-// See docs/ripper-mod-notes.md — format_pass_error.
+// Translate a libfreemkv read-error into a user-facing /api/state last_error message (sector
+// location + plain-English cause).
 fn format_pass_error(pass_label: &str, e: &libfreemkv::Error) -> String {
     // Pull sector + sense out of the structured error variants.
     let sector = match e {
@@ -5762,9 +5705,8 @@ fn format_pass_error(pass_label: &str, e: &libfreemkv::Error) -> String {
     format!("{}{} failed: {} — {}", pass_label, location, cause, action)
 }
 
-// Render a libfreemkv setup/scan/mux error as a plain-English,
-// operator-facing line for `last_error`/the device log, without
-// leaking a raw `E####` code. See docs/ripper-mod-notes.md — format_lib_error.
+// Render a libfreemkv setup/scan/mux error as a plain-English, operator-facing line for
+// `last_error`/the device log, without leaking a raw `E####` code.
 fn format_lib_error(phase: &str, e: &libfreemkv::Error) -> String {
     use libfreemkv::Error;
 
@@ -5892,9 +5834,8 @@ fn format_lib_error(phase: &str, e: &libfreemkv::Error) -> String {
     format!("{phase} failed: {detail}")
 }
 
-// Open a drive during transport-failure recovery with exponential
-// backoff; `None` once exhausted. TODO(step1-followup): not yet folded
-// into DiscSession::recover. See docs/ripper-mod-notes.md — open_drive_with_backoff.
+// Open a drive during transport-failure recovery with exponential backoff; `None` once
+// exhausted. TODO(step1-followup): not yet folded into DiscSession::recover.
 fn open_drive_with_backoff(
     device: &str,
     attempt: u32,
@@ -5998,9 +5939,8 @@ mod tests {
     //! Tests for orchestrator-level helpers that live in this file.
     //! State-only helpers and their tests live in `state.rs`.
 
-    // An incomplete damage record must abort, not deliver: a failed
-    // record()/flush() leaves loss invisible to the abort gate. See
-    // docs/ripper-mod-notes.md — an_incomplete_damage_record test.
+    // An incomplete damage record must abort, not deliver: a failed record()/flush() leaves
+    // loss invisible to the abort gate.
     #[test]
     fn an_incomplete_damage_record_aborts_regardless_of_tolerance() {
         let bitrate = 8_250_000.0_f64;
@@ -6199,9 +6139,8 @@ mod tests {
         assert_eq!(fmts_gate_decision(false, false), FmtsGate::Skip);
     }
 
-    // The FMTS gate's side-effect routing (defects 1 + 2): pins
-    // CaptureOnly→defer, Skip→quarantine, Proceed→neither.
-    // See docs/ripper-mod-notes.md — fmts_gate_plan_routes_side_effects.
+    // The FMTS gate's side-effect routing (defects 1 + 2): pins CaptureOnly→defer,
+    // Skip→quarantine, Proceed→neither.
     #[test]
     fn fmts_gate_plan_routes_side_effects() {
         assert_eq!(
@@ -6230,9 +6169,8 @@ mod tests {
         );
     }
 
-    // The FMTS-forensic-key-missing error classifier (defect 1, resume
-    // half): must match only the leading `E<code>` token, never a
-    // substring. See docs/ripper-mod-notes.md.
+    // The FMTS-forensic-key-missing error classifier (defect 1, resume half): must match only
+    // the leading `E<code>` token, never a substring.
     #[test]
     fn is_fmts_key_missing_error_matches_only_the_leading_code_token() {
         let fmts: std::io::Error = libfreemkv::Error::FmtsKeyMissing.into();
@@ -6251,9 +6189,8 @@ mod tests {
         assert!(!is_fmts_key_missing_error(&other));
     }
 
-    // Convergence H1 regression: `SweepingGuard::drop` must clear
-    // `.sweeping` on every exit path, or a leaked marker strands the
-    // dir `InProgress` forever. See docs/ripper-mod-notes.md.
+    // Convergence H1 regression: `SweepingGuard::drop` must clear `.sweeping` on every exit
+    // path, or a leaked marker strands the dir `InProgress` forever.
     #[test]
     fn sweeping_guard_clears_marker_on_drop() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6312,9 +6249,8 @@ mod tests {
         );
     }
 
-    // Regression guard for the divergent disk-reclamation bug: inline
-    // and resume completion paths share `prune_intermediate_iso` so
-    // `keep_iso=false` frees the ISO on BOTH routes. See docs/ripper-mod-notes.md.
+    // Regression guard for the divergent disk-reclamation bug: inline and resume completion
+    // paths share `prune_intermediate_iso` so `keep_iso=false` frees the ISO on BOTH routes.
     #[test]
     fn prune_removes_iso_and_mapfile_when_keep_iso_false() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6378,9 +6314,8 @@ mod tests {
         assert!(!map.exists());
     }
 
-    // Resume/completion matching is EXACT, never prefix ("Redshift" vs
-    // "Redshift_2"). Locks in the already-fixed HIGH bug.
-    // See docs/ripper-mod-notes.md — staging_match_is_exact_not_prefix.
+    // Resume/completion matching is EXACT, never prefix ("Redshift" vs "Redshift_2"). Locks in
+    // the already-fixed HIGH bug.
     #[test]
     fn staging_match_is_exact_not_prefix() {
         // Direct predicate: exact equality only.
@@ -6414,9 +6349,8 @@ mod tests {
         );
     }
 
-    // Regression: `output_opened=false` + `finalize_error=Some` must
-    // classify as a terminal failure (quarantine); `None` stays
-    // resumable. See docs/ripper-mod-notes.md — header_phase_finalize_error test.
+    // Regression: `output_opened=false` + `finalize_error=Some` must classify as a terminal
+    // failure (quarantine); `None` stays resumable.
     #[test]
     fn header_phase_finalize_error_is_terminal_failure() {
         // finalize_error=Some → terminal failure (quarantine).
@@ -6444,9 +6378,8 @@ mod tests {
         ));
     }
 
-    // Regression: a hard read error must map to `status="error"` with a
-    // non-empty cause, not the silent "stopped → idle" halt path.
-    // See docs/ripper-mod-notes.md — read_error_surfaces_as_error test.
+    // Regression: a hard read error must map to `status="error"` with a non-empty cause, not
+    // the silent "stopped → idle" halt path.
     #[test]
     fn read_error_surfaces_as_error_status_not_silent_idle() {
         // A read-error truncation: status="error", reason names the cause.
@@ -6477,9 +6410,8 @@ mod tests {
         assert!(reason.unwrap().contains("cues seek-back failed"));
     }
 
-    // `staging_free_bytes`: a missing/unmounted path must yield `None`
-    // (diagnostic-log branch, not silent skip); a real path yields `Some`.
-    // See docs/ripper-mod-notes.md.
+    // `staging_free_bytes`: a missing/unmounted path must yield `None` (diagnostic-log branch,
+    // not silent skip); a real path yields `Some`.
     #[test]
     fn staging_free_bytes_none_for_missing_path_some_for_real() {
         // Nonexistent path → statvfs fails → None (drives the else/warn
@@ -6502,8 +6434,8 @@ mod tests {
         );
     }
 
-    // `HaltGuard` must unregister the device's halt-map entry on EVERY
-    // exit path (the v0.13.6 leak class). See docs/ripper-mod-notes.md.
+    // `HaltGuard` must unregister the device's halt-map entry on EVERY exit path (the v0.13.6
+    // leak class).
     #[test]
     fn halt_guard_unregisters_on_drop() {
         let device = "sg_haltguard_drop_test";
@@ -6614,9 +6546,7 @@ mod tests {
         assert!((lost_iso - 50_000.0).abs() < 1.0, "iso whole-disc sum");
     }
 
-    // CHARACTERIZATION TESTS pinning the multipass recovery loop's
-    // current behavior. See docs/ripper-mod-notes.md.
-    // PASS ORDERING: `max_retries=N>0` plans 1 sweep + N patch passes.
+    // CHARACTERIZATION TESTS pinning the multipass recovery loop's current behavior.
     #[test]
     fn char_pass_ordering_sweep_then_n_patch() {
         // Single-pass: direct disc→MKV, no ISO intermediate.
@@ -6643,9 +6573,8 @@ mod tests {
         }
     }
 
-    // SCOPE-AWARE CONVERGENCE — MKV: only bad bytes INSIDE the muxed
-    // title count; converges when in-title bad == 0 regardless of
-    // out-of-title damage. See docs/ripper-mod-notes.md.
+    // SCOPE-AWARE CONVERGENCE — MKV: only bad bytes INSIDE the muxed title count; converges
+    // when in-title bad == 0 regardless of out-of-title damage.
     #[test]
     fn char_convergence_mkv_scopes_to_title() {
         // Title covers bytes [0, 100 MB) — sectors [0, 48829).
@@ -6707,8 +6636,8 @@ mod tests {
         assert!(patch_made_progress(2048), "any recovery keeps retrying");
     }
 
-    // Unified convergence decision: scope_bad==0 ⇒ Converged; else
-    // recovered==Some(0) ⇒ NoProgress, else ⇒ Continue. See docs/ripper-mod-notes.md.
+    // Unified convergence decision: scope_bad==0 ⇒ Converged; else recovered==Some(0) ⇒
+    // NoProgress, else ⇒ Continue.
     #[test]
     fn char_patch_pass_decision_matrix() {
         // Converged dominates — scope clean means stop regardless of recovery.
@@ -6729,9 +6658,8 @@ mod tests {
         );
     }
 
-    // FAIL-OPEN GUARD: an empty mapfile (0 good, 0 bad) has zero bad bytes but
-    // must NOT read as a complete rip; `pre_pass_converged` adds `bytes_good > 0`
-    // on top of the bare decision. See docs/ripper-mod-notes.md.
+    // FAIL-OPEN GUARD: an empty mapfile (0 good, 0 bad) has zero bad bytes but must NOT read as
+    // a complete rip; `pre_pass_converged` adds `bytes_good > 0` on top of the bare decision.
     #[test]
     fn char_pre_pass_converged_requires_real_coverage() {
         // Empty mapfile: 0 good, 0 bad. Bare decision says Converged, but the
@@ -6752,8 +6680,8 @@ mod tests {
         assert!(!pre_pass_converged(2048, 0));
     }
 
-    // PROMOTION DECISION: end-of-recovery promotes NonTrimmed →
-    // Unreadable before the abort gate. See docs/ripper-mod-notes.md.
+    // PROMOTION DECISION: end-of-recovery promotes NonTrimmed → Unreadable before the abort
+    // gate.
     #[test]
     fn char_promotion_nontrimmed_to_unreadable() {
         use freemkv_engine::SectorStatus;
@@ -6776,9 +6704,8 @@ mod tests {
         );
     }
 
-    // PROMOTION end-to-end: drives a real mapfile through promotion so
-    // a NonTrimmed range becomes Unreadable and feeds the abort gate.
-    // No drive required. See docs/ripper-mod-notes.md.
+    // PROMOTION end-to-end: drives a real mapfile through promotion so a NonTrimmed range
+    // becomes Unreadable and feeds the abort gate. No drive required.
     #[test]
     fn char_promotion_finalizes_loss_for_abort_gate() {
         use freemkv_engine::Mapfile;
@@ -6833,9 +6760,8 @@ mod tests {
         );
     }
 
-    // PASS-1-ONLY TRANSPORT-RETRY GATING: halt cancels regardless;
-    // non-transport fails; transport retries until MAX_PASS1_ATTEMPTS.
-    // See docs/ripper-mod-notes.md.
+    // PASS-1-ONLY TRANSPORT-RETRY GATING: halt cancels regardless; non-transport fails;
+    // transport retries until MAX_PASS1_ATTEMPTS.
     #[test]
     fn char_pass1_transport_retry_gating() {
         const MAX: u32 = 10; // MAX_PASS1_ATTEMPTS in rip_disc
@@ -6877,8 +6803,8 @@ mod tests {
         );
     }
 
-    // PASS-1-ONLY (negative side): patch passes have no transport-retry
-    // concept — any patch error breaks the loop. See docs/ripper-mod-notes.md.
+    // PASS-1-ONLY (negative side): patch passes have no transport-retry concept — any patch
+    // error breaks the loop.
     #[test]
     fn char_patch_passes_have_no_transport_retry() {
         // The patch loop runs exactly `patch_passes` iterations with no inner
@@ -7218,9 +7144,8 @@ mod tests {
         assert!(s.contains("host certificate"), "msg: {s}");
     }
 
-    // The disk-space preflight message must NOT carry a raw "EXXXX:"
-    // code prefix (no libfreemkv Error is raised here). Guards against
-    // re-introducing it. See docs/ripper-mod-notes.md.
+    // The disk-space preflight message must NOT carry a raw "EXXXX:" code prefix (no libfreemkv
+    // Error is raised here). Guards against re-introducing it.
     #[test]
     fn disk_space_preflight_message_has_no_raw_error_code_prefix() {
         let required = 100u64 * 1_073_741_824; // 100 GiB
@@ -7482,9 +7407,8 @@ mod tests {
         assert!(!msg.contains('\n'), "CSS message must be one line: {msg}");
     }
 
-    // Reachability verdict → operator status-line mapping. ONLY the verdicts
-    // where the service never gave an answer about this disc may claim to be a
-    // temporary outage. See docs/ripper-mod-notes.md.
+    // Reachability verdict → operator status-line mapping. ONLY the verdicts where the service
+    // never gave an answer about this disc may claim to be a temporary outage.
     #[test]
     fn key_service_transient_status_mapping() {
         use crate::keysource::ServiceReachability;
@@ -7968,9 +7892,8 @@ mod tests {
         assert!(freemkv_engine::should_abort_for_loss(f64::NAN, 30_000.0));
     }
 
-    // ── final done-card uses in-title loss (telemetry audit Fix 3) ──
-    // The `status=done` update must report in-title-scoped loss, not
-    // whole-disc bytes_unreadable/bps. See docs/ripper-mod-notes.md.
+    // ── final done-card uses in-title loss (telemetry audit Fix 3) ── The `status=done` update
+    // must report in-title-scoped loss, not whole-disc bytes_unreadable/bps.
     #[test]
     fn final_done_card_uses_in_title_loss_not_whole_disc() {
         let bps = 8_250_000.0;
@@ -8024,9 +7947,8 @@ mod tests {
         );
     }
 
-    // Regression: single-pass has no mapfile, so done-state `main_lost_ms`
-    // must derive from `final_lost_secs`, not the zero snapshot.
-    // See docs/ripper-mod-notes.md.
+    // Regression: single-pass has no mapfile, so done-state `main_lost_ms` must derive from
+    // `final_lost_secs`, not the zero snapshot.
     #[test]
     fn single_pass_done_card_main_lost_ms_tracks_final_lost_secs() {
         // Snapshot is the all-zero Default in single-pass mode.
@@ -8062,8 +7984,8 @@ mod tests {
         );
     }
 
-    // Multipass keeps the snapshot's sweep loss AND folds in demux-time
-    // loss, matching single-pass and resume paths. See docs/ripper-mod-notes.md.
+    // Multipass keeps the snapshot's sweep loss AND folds in demux-time loss, matching
+    // single-pass and resume paths.
     #[test]
     fn multipass_done_card_main_lost_ms_uses_snapshot_plus_demux() {
         let snapshot = super::mux::SweepDamageSnapshot {
@@ -8099,9 +8021,8 @@ mod tests {
         );
     }
 
-    // Regression (cross-path-asymmetry bug): an ACCEPTED fresh multipass
-    // done card must fold demux-time loss into headline errors/lost_secs,
-    // matching resume and single-pass. See docs/ripper-mod-notes.md.
+    // Regression (cross-path-asymmetry bug): an ACCEPTED fresh multipass done card must fold
+    // demux-time loss into headline errors/lost_secs, matching resume and single-pass.
     #[test]
     fn accepted_done_card_folds_demux_loss_into_headline() {
         // Replicate the (done_errors, done_lost_secs, done_demux_extra_ms)
@@ -8162,9 +8083,8 @@ mod tests {
         assert!((extra - 0.0).abs() < 0.001, "no demux loss adds no extra");
     }
 
-    // ── loss-threshold decision (should_abort_for_loss) ──────────────
-    // Pins loss-from-skip-count → threshold math: lost_secs =
-    // skip_sectors*2048/bps. See docs/ripper-mod-notes.md.
+    // ── loss-threshold decision (should_abort_for_loss) ────────────── Pins
+    // loss-from-skip-count → threshold math: lost_secs = skip_sectors*2048/bps.
     fn single_pass_lost_secs(skip_sectors: u64, title_bytes_per_sec: f64) -> f64 {
         if title_bytes_per_sec > 0.0 {
             (skip_sectors as f64) * 2048.0 / title_bytes_per_sec
@@ -8222,8 +8142,8 @@ mod tests {
         );
     }
 
-    // Regression (bug #1/#2): `.ripped` hand-off must write status="done",
-    // not "ripping"/"idle". See docs/ripper-mod-notes.md — handoff_status test.
+    // Regression (bug #1/#2): `.ripped` hand-off must write status="done", not
+    // "ripping"/"idle".
     #[test]
     fn handoff_status_is_done_read_complete() {
         let device = "sg_handoff_status_test";
@@ -8286,9 +8206,8 @@ mod tests {
         assert!(!super::should_auto_eject(true, "_anything"));
     }
 
-    // Eject is "exactly once at read-complete": the `.ripped` hand-off
-    // ejects; the later mux worker (synthetic `_mux`) is refused.
-    // See docs/ripper-mod-notes.md — auto_eject_is_once_at_handoff test.
+    // Eject is "exactly once at read-complete": the `.ripped` hand-off ejects; the later mux
+    // worker (synthetic `_mux`) is refused.
     #[test]
     fn auto_eject_is_once_at_handoff_not_at_mux() {
         // Hand-off (real device, enabled): eject.
@@ -8303,9 +8222,8 @@ mod tests {
         );
     }
 
-    // Regression: a poisoned config `RwLock` must NOT leave the tile
-    // wedged in "scanning" — `mark_config_lock_poisoned` must flip it
-    // to "error" with a populated last_error. See docs/ripper-mod-notes.md.
+    // Regression: a poisoned config `RwLock` must NOT leave the tile wedged in "scanning" —
+    // `mark_config_lock_poisoned` must flip it to "error" with a populated last_error.
     #[test]
     fn config_lock_poisoned_marks_error_not_stuck_scanning() {
         let device = "sg_config_poison_test";
@@ -8344,9 +8262,8 @@ mod tests {
             .remove(device);
     }
 
-    // Regression: end-of-recovery promotion must flush the promoted
-    // mapfile so the abort check sees Unreadable, not stale NonTrimmed.
-    // See docs/ripper-mod-notes.md — promotion_uses_in_memory_map test.
+    // Regression: end-of-recovery promotion must flush the promoted mapfile so the abort check
+    // sees Unreadable, not stale NonTrimmed.
     #[test]
     fn promotion_uses_in_memory_map_and_flush_persists_to_disk() {
         use freemkv_engine::{Mapfile, SectorStatus};
@@ -8428,9 +8345,8 @@ mod tests {
         );
     }
 
-    // Regression: `.ripped` hand-off update_state must preserve non-zero
-    // damage fields (was zeroed by `..Default::default()`).
-    // See docs/ripper-mod-notes.md — handoff_update_state_carries_damage_fields.
+    // Regression: `.ripped` hand-off update_state must preserve non-zero damage fields (was
+    // zeroed by `..Default::default()`).
     #[test]
     fn handoff_update_state_carries_damage_fields() {
         let device = "sg_handoff_damage_test";
@@ -8572,9 +8488,8 @@ mod tests {
         assert!(got.contains(&"Wraithline_Part_Two".to_string()));
     }
 
-    // Regression: `resumable_for_disc` must find an existing resumable
-    // staging dir via `list_staging_basenames` (3-retry NFS defense),
-    // not a bare `read_dir().flatten()`. See docs/ripper-mod-notes.md.
+    // Regression: `resumable_for_disc` must find an existing resumable staging dir via
+    // `list_staging_basenames` (3-retry NFS defense), not a bare `read_dir().flatten()`.
     #[test]
     fn resumable_for_disc_detects_partial_sweep() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8601,9 +8516,8 @@ mod tests {
         );
     }
 
-    // R3 finding 1 regression: `resumable_for_disc` must return None
-    // when the dir carries a terminal `.failed` or held `.review`
-    // marker, even with pending bytes. See docs/ripper-mod-notes.md.
+    // R3 finding 1 regression: `resumable_for_disc` must return None when the dir carries a
+    // terminal `.failed` or held `.review` marker, even with pending bytes.
     #[test]
     fn resumable_for_disc_blocked_by_failed_or_review() {
         let display_name = "Stranded Disc";
@@ -8638,9 +8552,8 @@ mod tests {
         }
     }
 
-    // Owner decision #2 regression: `resumable_for_disc` must return
-    // None when the dir is owned by the mux worker (`.ripped`/`.muxing`).
-    // See docs/ripper-mod-notes.md.
+    // Owner decision #2 regression: `resumable_for_disc` must return None when the dir is owned
+    // by the mux worker (`.ripped`/`.muxing`).
     #[test]
     fn resumable_for_disc_blocked_when_owned_by_mux_worker() {
         let display_name = "Mid Mux Disc";
@@ -8712,9 +8625,8 @@ mod tests {
         );
     }
 
-    // R2 finding 2 regression: `staging_disc_completed` must read
-    // markers through NFS-resilient `snapshot_staging_disc`, not bare
-    // `.exists()`. See docs/ripper-mod-notes.md.
+    // R2 finding 2 regression: `staging_disc_completed` must read markers through NFS-resilient
+    // `snapshot_staging_disc`, not bare `.exists()`.
     #[test]
     fn staging_disc_completed_uses_snapshot_with_leftover_artifacts() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8812,9 +8724,8 @@ mod tests {
         );
     }
 
-    // A tolerance-configured rip must NOT accept loss it could not
-    // measure: an unmeasurable time reads as NaN, fail-safe to abort.
-    // See docs/ripper-mod-notes.md — unquantifiable_loss_aborts test.
+    // A tolerance-configured rip must NOT accept loss it could not measure: an unmeasurable
+    // time reads as NaN, fail-safe to abort.
     #[test]
     fn unquantifiable_loss_aborts_under_any_threshold() {
         use super::loss_aborts;
@@ -8968,9 +8879,8 @@ mod tests {
         );
     }
 
-    // Mux-time loss gate is the sole enforcement point for decrypt/codec
-    // loss; table-drives every axis after a mutation run flipped inline
-    // conditions unnoticed. See docs/ripper-mod-notes.md.
+    // Mux-time loss gate is the sole enforcement point for decrypt/codec loss; table-drives
+    // every axis after a mutation run flipped inline conditions unnoticed.
     #[test]
     fn mux_loss_gate_fires_only_on_mux_contributed_loss_over_threshold() {
         use super::mux_loss_aborts;
@@ -9162,8 +9072,8 @@ mod tests {
         );
     }
 
-    // Header-phase disposition: one predicate routes the mux outcome so
-    // `output_opened` is consulted exactly once. See docs/ripper-mod-notes.md.
+    // Header-phase disposition: one predicate routes the mux outcome so `output_opened` is
+    // consulted exactly once.
     #[test]
     fn header_phase_routes_opened_failed_and_clean_stop_apart() {
         use super::{HeaderPhase, header_phase_disposition};
@@ -9190,8 +9100,8 @@ mod tests {
         );
     }
 
-    // Single-pass vs multipass: the boundary at 0/1. Every route decision
-    // along `rip_disc` keys off this predicate. See docs/ripper-mod-notes.md.
+    // Single-pass vs multipass: the boundary at 0/1. Every route decision along `rip_disc` keys
+    // off this predicate.
     #[test]
     fn multipass_starts_at_one_retry() {
         use super::uses_multipass;
@@ -9321,9 +9231,8 @@ mod tests {
         assert!(iso.lost_ms > 0.0);
     }
 
-    // A failed promotion means the damage record is incomplete, so the
-    // figure must come back NaN — but a clean rip (nothing to promote)
-    // stays clean. Ordering is deliberate. See docs/ripper-mod-notes.md.
+    // A failed promotion means the damage record is incomplete, so the figure must come back
+    // NaN — but a clean rip (nothing to promote) stays clean. Ordering is deliberate.
     #[test]
     fn end_of_recovery_loss_distrusts_a_broken_promotion_only_when_damage_exists() {
         use super::end_of_recovery_loss;
@@ -9428,9 +9337,8 @@ mod tests {
         cfg
     }
 
-    // THE boxset bug: disc 2 shares disc 1's clean_title, so a title-only
-    // staging dir would wrongly read disc 2 as "already ripped".
-    // See docs/ripper-mod-notes.md — disc_two_of_a_boxset test.
+    // THE boxset bug: disc 2 shares disc 1's clean_title, so a title-only staging dir would
+    // wrongly read disc 2 as "already ripped".
     #[test]
     fn disc_two_of_a_boxset_is_not_skipped_as_already_ripped() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9490,8 +9398,8 @@ mod tests {
         forget_device(d2);
     }
 
-    // Upgrade path: a pre-`.disc-label` staging dir must keep reading as
-    // "this disc" until adopted, not re-rip or orphan. See docs/ripper-mod-notes.md.
+    // Upgrade path: a pre-`.disc-label` staging dir must keep reading as "this disc" until
+    // adopted, not re-rip or orphan.
     #[test]
     fn a_legacy_unlabelled_staging_dir_still_counts_as_the_inserted_disc() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9530,9 +9438,8 @@ mod tests {
             .remove(device);
     }
 
-    // A Stop landing in the gap between `handle_rip_request`'s
-    // is_cancelled() check and rip_disc's own halt registration must be
-    // honoured, not discarded. See docs/ripper-mod-notes.md — rip_entry_halt test.
+    // A Stop landing in the gap between `handle_rip_request`'s is_cancelled() check and
+    // rip_disc's own halt registration must be honoured, not discarded.
     #[test]
     fn rip_entry_halt_carries_a_stop_that_landed_in_the_dispatch_gap() {
         // Unique to this test: HALTS is a process-global registry.
@@ -9591,9 +9498,8 @@ mod tests {
         );
     }
 
-    // The fsync durability gate bails without writing `.done`; before the
-    // fix it left `status` stuck "ripping" so `is_busy()` never released
-    // the drive. See docs/ripper-mod-notes.md — post_mux_durability_abort test.
+    // The fsync durability gate bails without writing `.done`; before the fix it left `status`
+    // stuck "ripping" so `is_busy()` never released the drive.
     #[test]
     fn post_mux_durability_abort_releases_the_drive() {
         // Unique to this test: STATE is process-global and a shared fixture
@@ -9801,9 +9707,8 @@ mod tests {
         forget_device(device);
     }
 
-    // A drive that is mid-rip must NOT have its STATE entry deleted just
-    // because one enumeration pass missed it (double-rip guard).
-    // See docs/ripper-mod-notes.md — hot_unplug_teardown_keeps_the_double_rip_guard test.
+    // A drive that is mid-rip must NOT have its STATE entry deleted just because one
+    // enumeration pass missed it (double-rip guard).
     #[test]
     fn hot_unplug_teardown_keeps_the_double_rip_guard_for_a_busy_drive() {
         // Unique to this test: STATE is a process-global static and a shared
@@ -9858,9 +9763,8 @@ mod tests {
         forget_device(device);
     }
 
-    // The fresh-rip completion tail must log/notify BEFORE it ejects
-    // (eject_drive archives the log) and route the eject through
-    // should_auto_eject. See docs/ripper-mod-notes.md — completion_tail test.
+    // The fresh-rip completion tail must log/notify BEFORE it ejects (eject_drive archives the
+    // log) and route the eject through should_auto_eject.
     #[test]
     fn the_completion_tail_logs_and_notifies_before_ejecting() {
         let src = crate::util::source_lf(include_str!("mod.rs"));
@@ -9896,9 +9800,8 @@ mod tests {
         );
     }
 
-    // Teardown must be gated on the WORKER, not the status it already
-    // wrote: `is_busy` reads FALSE during the post-status tail while the
-    // worker is still alive. See docs/ripper-mod-notes.md.
+    // Teardown must be gated on the WORKER, not the status it already wrote: `is_busy` reads
+    // FALSE during the post-status tail while the worker is still alive.
     #[test]
     fn hot_unplug_teardown_defers_while_the_rip_thread_is_still_unwinding() {
         let device = "sg_hotplug_tail_liveness_test";
@@ -9998,9 +9901,8 @@ mod insert_tick_tests {
         assert_eq!(auto_insert_rip_mode("scan"), None);
     }
 
-    // A disc seen during the 5s post-Stop cooldown must still be ripped
-    // once it expires — latching it early retires the only auto-rip
-    // trigger the loop has. See docs/ripper-mod-notes.md.
+    // A disc seen during the 5s post-Stop cooldown must still be ripped once it expires —
+    // latching it early retires the only auto-rip trigger the loop has.
     #[test]
     fn a_disc_seen_during_the_stop_cooldown_is_still_ripped_once_it_expires() {
         // Tick 1 — new disc, device still cooling down after a Stop.
@@ -10037,9 +9939,8 @@ mod insert_tick_tests {
 
 #[cfg(test)]
 mod teardown_poison_tests {
-    // Catches the mutation that puts `if let Ok(mut s) = STATE.lock()`
-    // back into `forget_removed_device`, which silently skips removal on
-    // a poisoned STATE. See docs/ripper-mod-notes.md — teardown_poison test.
+    // Catches the mutation that puts `if let Ok(mut s) = STATE.lock()` back into
+    // `forget_removed_device`, which silently skips removal on a poisoned STATE.
     #[test]
     fn forget_removed_device_recovers_a_poisoned_state_lock() {
         let src = crate::util::source_lf(include_str!("mod.rs"));

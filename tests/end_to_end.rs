@@ -3,11 +3,8 @@
 //! This verifies that `RipState` round-trips through serde_json the way
 //! `get_state_json` produces it, and the UI's expected fields all survive.
 //!
-//! Route dispatch + device-name validation are NOT tested here: that
-//! coverage now lives against the real `handle_request` in the in-crate
-//! `web::web_tests::http` module instead. See
-//! docs/end-to-end-test-history.md for why this file's old dispatch replica
-//! was removed.
+//! Route dispatch + device-name validation are NOT tested here: that coverage now lives against
+//! the real `handle_request` in the in-crate `web::web_tests::http` module instead.
 
 use freemkv_autorip::ripper::{BadRange, RipState};
 

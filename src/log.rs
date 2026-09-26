@@ -21,9 +21,8 @@ fn log_dir() -> String {
     crate::config::default_autorip_dir()
 }
 
-// Neutralize a device string into a safe single path component for the
-// log filename, so no caller can escape `logs/` via `/`, `\`, or `..`.
-// See docs/log.md — sanitize_device invariant.
+// Neutralize a device string into a safe single path component for the log filename, so no
+// caller can escape `logs/` via `/`, `\`, or `..`.
 fn sanitize_device(device: &str) -> String {
     if device.is_empty()
         || device == "."
@@ -220,9 +219,8 @@ pub fn rotate_system_log_if_large() {
     }
 }
 
-// Serializes tests that manipulate the process-wide `AUTORIP_DIR` env var
-// (crate scope: racing writers live in other modules too, e.g.
-// `ripper::resume`). Acquire via [`env_guard`] — see docs/log.md.
+// Serializes tests that manipulate the process-wide `AUTORIP_DIR` env var (crate scope: racing
+// writers live in other modules too, e.g. `ripper::resume`). Acquire via [`env_guard`].
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

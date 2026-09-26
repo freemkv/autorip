@@ -79,9 +79,8 @@ pub fn send_rich(cfg: &Config, event: WebhookEvent, ev: &RipEvent) {
     fire(cfg, &payload, event);
 }
 
-// Return only the `scheme://host[:port]` portion of `url`, dropping any
-// userinfo, path, query, or fragment — the rest may carry a secret token.
-// See docs/webhook.md — webhook_url_origin
+// Return only the `scheme://host[:port]` portion of `url`, dropping any userinfo, path, query,
+// or fragment — the rest may carry a secret token.
 pub(crate) fn webhook_url_origin(url: &str) -> String {
     if let Some(scheme_end) = url.find("://") {
         let after = scheme_end + 3;
@@ -106,7 +105,6 @@ pub(crate) fn webhook_url_origin(url: &str) -> String {
 }
 
 // Return the non-blank webhook URLs that opted in to `event`, in order.
-// See docs/webhook.md — active_urls
 pub(crate) fn active_urls(entries: &[WebhookEntry], event: WebhookEvent) -> Vec<String> {
     entries
         .iter()
@@ -127,9 +125,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const MAX_INFLIGHT: usize = 8;
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-// Attempt to claim one slot of a bounded concurrency counter. Returns
-// `true` and increments `counter` if below `max`, else leaves it untouched
-// and returns `false`. See docs/webhook.md — try_acquire_slot
+// Attempt to claim one slot of a bounded concurrency counter. Returns `true` and increments
+// `counter` if below `max`, else leaves it untouched and returns `false`.
 pub(crate) fn try_acquire_slot(counter: &AtomicUsize, max: usize) -> bool {
     counter
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -188,9 +185,8 @@ fn fire(cfg: &Config, payload: &serde_json::Value, event: WebhookEvent) {
     }
 }
 
-// POST one payload to one URL. Split out of `fire` so the one HTTP call in
-// this module can be tested against a loopback stub.
-// See docs/webhook.md — deliver
+// POST one payload to one URL. Split out of `fire` so the one HTTP call in this module can be
+// tested against a loopback stub.
 fn deliver(url: &str, body: &str) -> bool {
     let agent = crate::web::webhook_agent();
     match agent
@@ -231,9 +227,8 @@ fn deliver(url: &str, body: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    // `send_rich` end-to-end through `fire`'s real spawn path to a loopback
-    // stub — the one rip-complete delivery this module exists for.
-    // See docs/webhook.md — send_rich_delivers_the_rip_complete_payload_end_to_end
+    // `send_rich` end-to-end through `fire`'s real spawn path to a loopback stub — the one
+    // rip-complete delivery this module exists for.
     #[test]
     fn send_rich_delivers_the_rip_complete_payload_end_to_end() {
         use std::io::{Read as _, Write as _};
@@ -326,9 +321,8 @@ mod tests {
         assert!(!delivered, "a refused connection is not a delivery");
     }
 
-    // A redirect is NOT a delivery: `webhook_agent` sets `max_redirects(0)`,
-    // and at zero ureq's `max_redirects_do_error` is false, so a 3xx used to
-    // log "Webhook sent". See docs/webhook.md — a_redirect_is_not_reported_as_a_delivered_webhook
+    // A redirect is NOT a delivery: `webhook_agent` sets `max_redirects(0)`, and at zero ureq's
+    // `max_redirects_do_error` is false, so a 3xx used to log "Webhook sent".
     #[test]
     fn a_redirect_is_not_reported_as_a_delivered_webhook() {
         use std::io::{Read as _, Write as _};
@@ -381,9 +375,8 @@ mod tests {
         );
     }
 
-    // The webhook POST itself, driven to a real socket — the request that
-    // actually carries the user's event was never exercised before this.
-    // See docs/webhook.md — deliver_posts_json_with_the_content_type_header
+    // The webhook POST itself, driven to a real socket — the request that actually carries the
+    // user's event was never exercised before this.
     #[test]
     fn deliver_posts_json_with_the_content_type_header() {
         use std::io::{Read as _, Write as _};
@@ -729,9 +722,8 @@ mod tests {
         assert!(active_urls(&entries, WebhookEvent::Move).is_empty());
     }
 
-    // Drives `try_acquire_slot`/`release_slot` directly against a private
-    // counter (not the shared `INFLIGHT` static) through full
-    // acquire/release cycles. See docs/webhook.md — inflight_slot_cap_and_release_cycle
+    // Drives `try_acquire_slot`/`release_slot` directly against a private counter (not the
+    // shared `INFLIGHT` static) through full acquire/release cycles.
     #[test]
     fn inflight_slot_cap_and_release_cycle() {
         let counter = AtomicUsize::new(0);

@@ -14,9 +14,8 @@ pub struct TmdbResult {
     pub tmdb_id: u64,
 }
 
-// Shared agent for all TMDB calls: ureq sets NO connect/read timeout by
-// default, so a hung connection would wedge the rip thread or a web handler
-// indefinitely. See docs/tmdb.md — AGENT: no pinned resolver.
+// Shared agent for all TMDB calls: ureq sets NO connect/read timeout by default, so a hung
+// connection would wedge the rip thread or a web handler indefinitely.
 static AGENT: once_cell::sync::Lazy<ureq::Agent> = once_cell::sync::Lazy::new(|| {
     let config = ureq::config::Config::builder()
         .timeout_connect(Some(std::time::Duration::from_secs(5)))
@@ -45,9 +44,8 @@ fn search_multi_url(query: &str, api_key: &str) -> String {
 // broken endpoint from streaming an unbounded body into memory (DoS).
 const MAX_TMDB_BYTES: u64 = 2 * 1024 * 1024;
 
-// Read at most `cap` bytes, rejecting anything over: an oversized body reads
-// `cap+1` bytes successfully then fails the boundary check below, rather
-// than being silently truncated. See docs/tmdb.md — read_capped_bytes.
+// Read at most `cap` bytes, rejecting anything over: an oversized body reads `cap+1` bytes
+// successfully then fails the boundary check below, rather than being silently truncated.
 fn read_capped_bytes(reader: impl std::io::Read, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut buf = Vec::new();
@@ -128,12 +126,11 @@ fn warn_bad_key_throttled() {
 /// Resolve a disc `label` to a TMDB movie/TV entry.
 ///
 /// Takes the RAW disc volume label (not a pre-cleaned string): cleaning and
-/// progressive-fallback trimming both live here so the lookup and the
-/// auto-file gate ([`is_confident_match`]) never disagree on what was
-/// searched. Queries the cleaned label, then on no confident match peels
-/// junk-shaped trailing tokens one at a time and re-queries (`query_variants`).
-/// Returns the first confident match (exact title + year) across the
-/// variants, else the best non-exact guess. See docs/tmdb.md — lookup.
+/// progressive-fallback trimming both live here so the lookup and the auto-file gate
+/// ([`is_confident_match`]) never disagree on what was searched. Queries the cleaned label,
+/// then on no confident match peels junk-shaped trailing tokens one at a time and re-queries
+/// (`query_variants`). Returns the first confident match (exact title + year) across the
+/// variants, else the best non-exact guess.
 pub fn lookup(label: &str, api_key: &str) -> Option<TmdbResult> {
     if api_key.is_empty() {
         return None;
@@ -188,12 +185,11 @@ fn norm(s: &str) -> String {
 
 /// Is the resolved `title`/`year` a CONFIDENT match for the disc `label`?
 ///
-/// Confident = the title carries a year AND exactly matches (normalized) the
-/// cleaned label OR any of the same progressively-trimmed variants that
-/// [`lookup`] searches. Takes the RAW label (cleaning happens inside),
-/// matching `lookup`. Rips whose match is NOT confident (or that would
-/// overwrite an existing file) are held for operator review rather than
-/// auto-filed under a guessed name. See docs/tmdb.md — is_confident_match.
+/// Confident = the title carries a year AND exactly matches (normalized) the cleaned label OR
+/// any of the same progressively-trimmed variants that [`lookup`] searches. Takes the RAW label
+/// (cleaning happens inside), matching `lookup`. Rips whose match is NOT confident (or that
+/// would overwrite an existing file) are held for operator review rather than auto-filed under
+/// a guessed name.
 pub fn is_confident_match(label: &str, title: &str, year: u16) -> bool {
     year > 0 && query_variants(label).iter().any(|v| norm(v) == norm(title))
 }
@@ -213,9 +209,8 @@ pub fn search(query: &str, api_key: &str, limit: usize) -> Vec<TmdbResult> {
     rank_search_results(query, results, limit)
 }
 
-// The pure ranking half of `search`: parse every movie/tv entry, sort
-// exact-dated-match first, dated second, popularity as tiebreaker, cap at
-// `limit`. See docs/tmdb.md — rank_search_results: why it's pulled out.
+// The pure ranking half of `search`: parse every movie/tv entry, sort exact-dated-match first,
+// dated second, popularity as tiebreaker, cap at `limit`.
 fn rank_search_results(
     query: &str,
     results: &[serde_json::Value],
@@ -238,9 +233,8 @@ fn rank_search_results(
     parsed.into_iter().take(limit).map(|(r, _, _)| r).collect()
 }
 
-// Choose the best entry from a TMDB `search/multi` response: keep only
-// movie/TV entries, prefer ones with a release year, break ties on
-// popularity. See docs/tmdb.md — pick_best: the Wraithline bug.
+// Choose the best entry from a TMDB `search/multi` response: keep only movie/TV entries, prefer
+// ones with a release year, break ties on popularity.
 fn pick_best(query: &str, results: &[serde_json::Value], prefer_tv: bool) -> Option<TmdbResult> {
     let want = norm(query);
     // Ranking key, lexicographic, highest wins: (exact, dated, tv_preferred,
@@ -333,9 +327,8 @@ fn parse_result(v: &serde_json::Value) -> Option<(TmdbResult, f64)> {
     ))
 }
 
-// Remove a parenthesized 4-digit release year, e.g. "Drive (2011)" -> "Drive ".
-// A BARE year is left untouched ("Blade Runner 2049"). Char-based so a
-// multibyte label never panics. See docs/tmdb.md — strip_paren_year.
+// Remove a parenthesized 4-digit release year, e.g. "Drive (2011)" -> "Drive ". A BARE year is
+// left untouched ("Blade Runner 2049"). Char-based so a multibyte label never panics.
 fn strip_paren_year(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -428,9 +421,8 @@ pub fn clean_title(label: &str) -> String {
         .join(" ")
 }
 
-// Unambiguous TV season markers. A trailing "<word> <number>" of one of
-// these is peeled by `clean_title` so a series disc resolves to the base
-// show title. See docs/tmdb.md — SEASON_WORDS: why Volume/Vol/Part excluded.
+// Unambiguous TV season markers. A trailing "<word> <number>" of one of these is peeled by
+// `clean_title` so a series disc resolves to the base show title.
 const SEASON_WORDS: &[&str] = &["season", "series", "saison", "staffel", "seizoen"];
 
 // If `s` (lowercased, trailing-junk-trimmed) ends with a season marker like
@@ -557,9 +549,9 @@ fn is_roman_numeral(s: &str) -> bool {
             .all(|c| matches!(c, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'))
 }
 
-// May this TRAILING token be safely peeled off a disc label? Edition/region/
-// format words and obvious codes — but NEVER a bare number or roman numeral,
-// which are sequel markers ("Alien 3", "Rocky II"). See docs/tmdb.md — is_trailing_junk.
+// May this TRAILING token be safely peeled off a disc label? Edition/region/ format words and
+// obvious codes — but NEVER a bare number or roman numeral, which are sequel markers ("Alien
+// 3", "Rocky II").
 fn is_trailing_junk(tok: &str) -> bool {
     if tok.is_empty() {
         return false;
@@ -590,9 +582,9 @@ fn is_trailing_junk(tok: &str) -> bool {
     tok.len() <= 4 && tok.chars().all(|c| c.is_ascii_uppercase())
 }
 
-// Progressively-trimmed TMDB query variants for a disc `label`, most specific
-// first. Variant 0 is `clean_title(label)`; each next variant peels one more
-// junk-shaped trailing token (`is_trailing_junk`). See docs/tmdb.md — query_variants.
+// Progressively-trimmed TMDB query variants for a disc `label`, most specific first. Variant 0
+// is `clean_title(label)`; each next variant peels one more junk-shaped trailing token
+// (`is_trailing_junk`).
 fn query_variants(label: &str) -> Vec<String> {
     const MAX_QUERY_VARIANTS: usize = 5;
     // Same separator/year normalization clean_title applies, but WITHOUT the
@@ -742,14 +734,11 @@ fn runtime_plausible(secs: f64, ep_min: u16) -> bool {
     (title_min - ep_min as f64).abs() <= tol
 }
 
-/// Choose the starting episode number for a disc by aligning its title
-/// runtimes against the TMDB season's episode runtimes (instead of counting
-/// an offset), so a disc with any distinctively-timed episode is pinned to
-/// its true position regardless of how earlier discs split. Returns
-/// `fallback` on any absence of signal (no episodes/runtimes, a disc that
-/// can't fit, or a tie) — see docs/tmdb.md — align_disc_offset.
-/// `title_secs`/`episodes`/`fallback`: this disc's runtimes (secs, disc
-/// order), the TMDB season listing, and the caller's default start.
+/// Choose the starting episode number for a disc by aligning its title runtimes against the
+/// TMDB season's episode runtimes (instead of counting an offset), so a disc with any
+/// distinctively-timed episode is pinned to its true position regardless of how earlier discs
+/// split. Returns `fallback` on any absence of signal (no episodes/runtimes, a disc that can't
+/// fit, or a tie).
 pub fn align_disc_offset(title_secs: &[f64], episodes: &[Episode], fallback: u16) -> u16 {
     let count = title_secs.len();
     if count == 0 || episodes.is_empty() {

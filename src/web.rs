@@ -1556,18 +1556,17 @@ fn normalize_authority(authority: &str, default_port: u16) -> Option<String> {
     }
 }
 
-// Lightweight CSRF defense for state-changing POSTs: reject only when an
-// Origin/Referer header is present and disagrees with Host (403); an absent
-// header is allowed so curl/monitoring keep working. See docs/web-csrf.md.
+// Lightweight CSRF defense for state-changing POSTs: reject only when an Origin/Referer header
+// is present and disagrees with Host (403); an absent header is allowed so curl/monitoring keep
+// working.
 fn is_cross_origin_post(request: &tiny_http::Request) -> bool {
     let origin = header_value(request, "Origin").or_else(|| header_value(request, "Referer"));
     let host = header_value(request, "Host");
     is_cross_origin(origin, host)
 }
 
-// Pure cross-origin decision over raw Origin/Referer + Host header values;
-// `true` means reject. Absent/unparseable input can't prove cross-origin, so
-// it's allowed. See docs/web-csrf.md for the full policy rationale.
+// Pure cross-origin decision over raw Origin/Referer + Host header values; `true` means reject.
+// Absent/unparseable input can't prove cross-origin, so it's allowed.
 fn is_cross_origin(origin: Option<&str>, host: Option<&str>) -> bool {
     let origin = match origin {
         None => return false,
@@ -2058,9 +2057,8 @@ struct IncomingWebhook {
     post_move: bool,
 }
 
-// Resolve an incoming webhook_urls array against stored entries, unmasking
-// each placeholder by stable #idx (falling back to origin) — never by array
-// position, since rows can be reordered. See docs/web-webhooks.md.
+// Resolve an incoming webhook_urls array against stored entries, unmasking each placeholder by
+// stable #idx (falling back to origin) — never by array position, since rows can be reordered.
 fn resolve_webhook_entries(
     incoming: &[IncomingWebhook],
     existing: &[WebhookEntry],
@@ -2322,25 +2320,23 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
     }
 }
 
-// The three "could not find out" failure strings, as opposed to "this URL
-// is not allowed"; kept as constants so is_transient_resolve_error can
-// classify without duplicated literals. See docs/web-ssrf.md.
+// The three "could not find out" failure strings, as opposed to "this URL is not allowed"; kept
+// as constants so is_transient_resolve_error can classify without duplicated literals.
 pub(crate) const RESOLVE_TIMEOUT_MSG: &str = "DNS resolution timed out";
 pub(crate) const RESOLVE_FAILED_PREFIX: &str = "could not resolve host: ";
 pub(crate) const RESOLVE_NO_ADDRS_MSG: &str = "host did not resolve to any address";
 
-// True when the error means the host could not be looked up right now (DNS
-// blip), not a permanent verdict on the URL — a resolver blip is not
-// evidence the remote service is down. See docs/web-ssrf.md.
+// True when the error means the host could not be looked up right now (DNS blip), not a
+// permanent verdict on the URL — a resolver blip is not evidence the remote service is down.
 pub(crate) fn is_transient_resolve_error(msg: &str) -> bool {
     msg == RESOLVE_TIMEOUT_MSG
         || msg == RESOLVE_NO_ADDRS_MSG
         || msg.starts_with(RESOLVE_FAILED_PREFIX)
 }
 
-// Resolve host:port with a bounded deadline: ToSocketAddrs blocks and can
-// hang for the OS resolver timeout, freezing the calling handler thread.
-// Runs on a spawned thread, joined with a short deadline. See docs/web-ssrf.md.
+// Resolve host:port with a bounded deadline: ToSocketAddrs blocks and can hang for the OS
+// resolver timeout, freezing the calling handler thread. Runs on a spawned thread, joined with
+// a short deadline.
 pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -2379,9 +2375,9 @@ pub(crate) fn resolve_with_timeout(host: &str, port: u16) -> Result<Vec<SocketAd
     }
 }
 
-// Validate an operator-supplied fetch/POST URL against the SSRF guard:
-// requires http(s), resolves the host once, and rejects blocked addresses.
-// Returns resolved sockets so the caller can pin the connection. See docs/web-ssrf.md.
+// Validate an operator-supplied fetch/POST URL against the SSRF guard: requires http(s),
+// resolves the host once, and rejects blocked addresses. Returns resolved sockets so the caller
+// can pin the connection.
 pub(crate) fn validate_fetch_url(url: &str) -> Result<Vec<SocketAddr>, String> {
     let url = url.trim();
     if url.is_empty() {
@@ -2497,21 +2493,20 @@ pub(crate) fn validate_network_target(target: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Cap on pinned addresses: ureq's fixed 16-slot ResolvedSocketAddrs panics
-// (out-of-bounds) on a 17th push, so cap to the first 16 validate_fetch_url
-// already vetted. See docs/web-ureq-agent.md.
+// Cap on pinned addresses: ureq's fixed 16-slot ResolvedSocketAddrs panics (out-of-bounds) on a
+// 17th push, so cap to the first 16 validate_fetch_url already vetted.
 const MAX_PINNED_ADDRS: usize = 16;
 
-// The addresses a resolve may actually hand back, capped at MAX_PINNED_ADDRS.
-// Separated from the Resolver impl so the cap is testable — ureq's resolver
-// types aren't nameable outside the crate. See docs/web-ureq-agent.md.
+// The addresses a resolve may actually hand back, capped at MAX_PINNED_ADDRS. Separated from
+// the Resolver impl so the cap is testable — ureq's resolver types aren't nameable outside the
+// crate.
 fn pinned_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
     addrs.iter().copied().take(MAX_PINNED_ADDRS).collect()
 }
 
-// Pinned-address resolver behind guarded_agent_with_timeouts. Must be wired
-// via Agent::with_parts — Agent::new_with_config compiles but silently uses
-// the default (re-resolving) resolver. See docs/web-ureq-agent.md.
+// Pinned-address resolver behind guarded_agent_with_timeouts. Must be wired via
+// Agent::with_parts — Agent::new_with_config compiles but silently uses the default
+// (re-resolving) resolver.
 #[derive(Debug)]
 struct PinnedResolver(Vec<SocketAddr>);
 
@@ -2535,8 +2530,8 @@ impl ureq::unversioned::resolver::Resolver for PinnedResolver {
 }
 
 // A short, URL-FREE description of a ureq failure: these summaries reach
-// syslog/autorip.jsonl/unauthenticated endpoints, so each variant maps to a
-// fixed label instead of ever formatting the error. See docs/web-ureq-agent.md.
+// syslog/autorip.jsonl/unauthenticated endpoints, so each variant maps to a fixed label instead
+// of ever formatting the error.
 pub(crate) fn ureq_error_kind(e: &ureq::Error) -> String {
     match e {
         ureq::Error::StatusCode(code) => format!("HTTP {code}"),
@@ -2560,14 +2555,12 @@ pub(crate) fn ureq_error_kind(e: &ureq::Error) -> String {
     }
 }
 
-// Rolling stall detector (re-armed on every read that returns bytes): no
-// progress for this long means the peer is dead. Replaces the ureq 2
-// timeout_read knob the 2→3 migration dropped. See docs/web-ureq-agent.md.
+// Rolling stall detector (re-armed on every read that returns bytes): no progress for this long
+// means the peer is dead. Replaces the ureq 2 timeout_read knob the 2→3 migration dropped.
 pub(crate) const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-// Chained after DefaultConnector to re-arm a ROLLING per-read idle bound on
-// every body read, restoring the stall detection ureq 3.4.1 removed (#1194).
-// See docs/web-ureq-agent.md.
+// Chained after DefaultConnector to re-arm a ROLLING per-read idle bound on every body read,
+// restoring the stall detection ureq 3.4.1 removed (#1194).
 #[derive(Debug)]
 struct IdleReCapConnector {
     idle: std::time::Duration,
@@ -2597,9 +2590,8 @@ struct IdleReCapTransport<In> {
 }
 
 impl<In> IdleReCapTransport<In> {
-    // Cap only BODY reads (reason RecvBody) at the idle bound; connect and
-    // header phases keep ureq's own timeouts. min keeps the tighter of a small
-    // total-body budget and idle. See docs/web-ureq-agent.md.
+    // Cap only BODY reads (reason RecvBody) at the idle bound; connect and header phases keep
+    // ureq's own timeouts. min keeps the tighter of a small total-body budget and idle.
     fn cap(
         &self,
         timeout: ureq::unversioned::transport::NextTimeout,
@@ -2654,17 +2646,16 @@ impl<In: ureq::unversioned::transport::Transport> ureq::unversioned::transport::
 }
 
 // Build the ONE DNS-pinned, redirect-blocking ureq agent, with caller-chosen
-// connect/response/idle timeouts (ureq sets no defaults, so an unresponsive
-// peer would otherwise block the thread forever). See docs/web-ureq-agent.md.
+// connect/response/idle timeouts (ureq sets no defaults, so an unresponsive peer would
+// otherwise block the thread forever).
 pub(crate) fn guarded_agent_with_timeouts(
     pinned: Vec<SocketAddr>,
     connect: std::time::Duration,
     response: std::time::Duration,
     idle: std::time::Duration,
 ) -> ureq::Agent {
-    // response bounds header arrival and (as timeout_recv_body) the TOTAL body
-    // transfer; idle is the rolling stall bound, layered on by IdleReCapConnector
-    // since ureq 3 dropped it. See docs/web-ureq-agent.md.
+    // response bounds header arrival and (as timeout_recv_body) the TOTAL body transfer; idle
+    // is the rolling stall bound, layered on by IdleReCapConnector since ureq 3 dropped it.
     let config = ureq::config::Config::builder()
         .max_redirects(0)
         .timeout_connect(Some(connect))
@@ -2682,9 +2673,9 @@ pub(crate) fn guarded_agent_with_timeouts(
     )
 }
 
-// Agent for webhook delivery: a plain outbound POST with the standard
-// resolver, deliberately NOT SSRF-guarded — a webhook targeting a LAN
-// service (Home Assistant, a NAS) is the intended use. See docs/web-http-client.md.
+// Agent for webhook delivery: a plain outbound POST with the standard resolver, deliberately
+// NOT SSRF-guarded — a webhook targeting a LAN service (Home Assistant, a NAS) is the intended
+// use.
 pub(crate) fn webhook_agent() -> ureq::Agent {
     let config = ureq::config::Config::builder()
         .max_redirects(0)
@@ -2695,21 +2686,20 @@ pub(crate) fn webhook_agent() -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-// SSRF-guarded HTTP GET: the single entry point for fetching an operator-
-// supplied URL, instead of ureq::get directly (which bypasses the guard).
-// `pub` for the lib facade re-export; only bin/tests call it. See docs/web-http-client.md.
+// SSRF-guarded HTTP GET: the single entry point for fetching an operator- supplied URL, instead
+// of ureq::get directly (which bypasses the guard). `pub` for the lib facade re-export; only
+// bin/tests call it.
 pub fn guarded_get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
     guarded_get_within(url, KEYDB_TRANSFER_BUDGET)
 }
 
 // End-to-end ceiling on the unauthenticated /api KEYDB update; tighter than
-// KEYDB_TRANSFER_BUDGET because this path holds an in-flight handler slot
-// and the update flag that 429s everyone else. See docs/web-http-client.md.
+// KEYDB_TRANSFER_BUDGET because this path holds an in-flight handler slot and the update flag
+// that 429s everyone else.
 pub(crate) const KEYDB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-// How long a KEYDB body may take IN TOTAL once headers are in — sized to a
-// real single-digit-MB keydb export, not to KEYDB_MAX_BYTES's defensive
-// 100 MiB DoS cap. See docs/web-http-client.md.
+// How long a KEYDB body may take IN TOTAL once headers are in — sized to a real single-digit-MB
+// keydb export, not to KEYDB_MAX_BYTES's defensive 100 MiB DoS cap.
 pub(crate) const KEYDB_TRANSFER_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// [`guarded_get`] with an explicit total-transfer budget.
@@ -2732,22 +2722,20 @@ pub(crate) fn guarded_get_within(
     .map_err(|e| format!("fetch failed: {}", ureq_error_kind(&e)))
 }
 
-// ── Connection caps: run() spawns one OS thread per connection and /events
-// holds its thread until disconnect, so without a cap a LAN client can pin
-// N threads and exhaust the container. See docs/web-connection-caps.md.
+// ── Connection caps: run() spawns one OS thread per connection and /events holds its thread
+// until disconnect, so without a cap a LAN client can pin N threads and exhaust the container.
 const MAX_INFLIGHT_HANDLERS: usize = 64;
 
-// Lower than MAX_INFLIGHT_HANDLERS on purpose: the gap is reserved for
-// bodyless requests so stalled POSTs can never starve the healthcheck
-// (GET /api/state). See docs/web-connection-caps.md.
+// Lower than MAX_INFLIGHT_HANDLERS on purpose: the gap is reserved for bodyless requests so
+// stalled POSTs can never starve the healthcheck (GET /api/state).
 const MAX_INFLIGHT_BODY_HANDLERS: usize = 48;
 
-// The gap is what the healthcheck survives on, checked at compile time
-// since equalising the caps cannot even build. See docs/web-connection-caps.md.
+// The gap is what the healthcheck survives on, checked at compile time since equalising the
+// caps cannot even build.
 const _: () = assert!(MAX_INFLIGHT_BODY_HANDLERS < MAX_INFLIGHT_HANDLERS);
 
-// Whether a request will make its handler read a body off the socket; read
-// from headers tiny_http already parsed, so this is free. See docs/web-connection-caps.md.
+// Whether a request will make its handler read a body off the socket; read from headers
+// tiny_http already parsed, so this is free.
 fn carries_body(request: &tiny_http::Request) -> bool {
     match request.body_length() {
         Some(0) => false,
@@ -2797,7 +2785,7 @@ impl Drop for ConnGuard {
 mod web_tests {
     use super::*;
 
-    // FIX-5: handle_accept_loss refuses (409) while the mux worker owns the
+    // handle_accept_loss refuses (409) while the mux worker owns the
     // dir (.muxing), else a lock-free state.json write could clobber the
     // worker's terminal quarantine and silently drop the operator's Accept.
     #[test]
@@ -4545,9 +4533,9 @@ mod web_tests {
         assert!(guarded_get("file:///etc/passwd").is_err());
     }
 
-    // A KEYDB body that is SLOW but PROGRESSING must finish. ureq 3.4.1 (#1194)
-    // made timeout_recv_body a TOTAL deadline that no longer re-arms; autorip
-    // restores the rolling idle bound itself. See docs/web-timeout-tests.md.
+    // A KEYDB body that is SLOW but PROGRESSING must finish. ureq 3.4.1 (#1194) made
+    // timeout_recv_body a TOTAL deadline that no longer re-arms; autorip restores the rolling
+    // idle bound itself.
     #[test]
     fn a_slow_but_progressing_keydb_body_is_not_killed_by_the_header_deadline() {
         use std::io::{Read as _, Write as _};
@@ -4581,9 +4569,9 @@ mod web_tests {
             }
         });
 
-        // 100ms per-gap vs a 3s idle bound (30x headroom, so a scheduling stall
-        // can't spuriously trip it), and ~6s total body vs that 3s bound (2x, so
-        // a TOTAL interpretation still fails). See docs/web-timeout-tests.md.
+        // 100ms per-gap vs a 3s idle bound (30x headroom, so a scheduling stall can't
+        // spuriously trip it), and ~6s total body vs that 3s bound (2x, so a TOTAL
+        // interpretation still fails).
         let idle = std::time::Duration::from_secs(3);
         let agent = guarded_agent_with_timeouts(
             vec![pinned],
@@ -4617,9 +4605,8 @@ mod web_tests {
         );
     }
 
-    // The other half: a peer sending headers then NOTHING must be cut off by
-    // the rolling idle bound, not held for the whole total budget — the
-    // protection ureq 2's timeout_read gave. See docs/web-timeout-tests.md.
+    // The other half: a peer sending headers then NOTHING must be cut off by the rolling idle
+    // bound, not held for the whole total budget — the protection ureq 2's timeout_read gave.
     #[test]
     fn a_stalled_body_is_cut_off_by_the_idle_bound_not_the_total_budget() {
         use std::io::{Read as _, Write as _};
@@ -4989,9 +4976,9 @@ mod web_tests {
         );
     }
 
-    // Catches the mutation restoring get_state_json's Err(_) => return "{}"
-    // bail-out on a poisoned STATE; source-pinned since poisoning a real
-    // Mutex would break every other STATE-locking test. See docs/web-state-lock-tests.md.
+    // Catches the mutation restoring get_state_json's Err(_) => return "{}" bail-out on a
+    // poisoned STATE; source-pinned since poisoning a real Mutex would break every other
+    // STATE-locking test.
     #[test]
     fn get_state_json_recovers_a_poisoned_state_lock() {
         let src = crate::util::source_lf(include_str!("web.rs"));
@@ -6211,12 +6198,10 @@ impl QueueViewSnapshot {
 }
 
 struct QueueViewCache {
-    // None only between a key's first scan starting and finishing — nothing
-    // to serve yet. See docs/web-queue-view-cache.md.
+    // None only between a key's first scan starting and finishing — nothing to serve yet.
     snapshot: Option<QueueViewSnapshot>,
-    // Single-flight marker: a timestamp (not a bool, which only the setter
-    // could clear) for when the owning scan started; trusted for
-    // QUEUE_VIEW_REFRESH_DEADLINE. See docs/web-queue-view-cache.md.
+    // Single-flight marker: a timestamp (not a bool, which only the setter could clear) for
+    // when the owning scan started; trusted for QUEUE_VIEW_REFRESH_DEADLINE.
     refresh_started: Option<std::time::Instant>,
     // Threads inside scan_queue_views for this key now; maintained by
     // RefreshGuard and capped at QUEUE_VIEW_MAX_REFRESHERS.
@@ -6249,9 +6234,8 @@ impl Drop for RefreshGuard {
     }
 }
 
-// Keyed by staging_dir rather than a single slot, since the path can change
-// at runtime and two different staging dirs must not evict each other's
-// cached scan. See docs/web-queue-view-cache.md.
+// Keyed by staging_dir rather than a single slot, since the path can change at runtime and two
+// different staging dirs must not evict each other's cached scan.
 static QUEUE_VIEW_CACHE: Lazy<std::sync::Mutex<std::collections::HashMap<String, QueueViewCache>>> =
     Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -6259,14 +6243,12 @@ static QUEUE_VIEW_CACHE: Lazy<std::sync::Mutex<std::collections::HashMap<String,
 // snapshot at all) waits on it — any stale snapshot is served immediately.
 static QUEUE_VIEW_REFRESHED: Lazy<std::sync::Condvar> = Lazy::new(std::sync::Condvar::new);
 
-// Safety valve for the cold-start wait: gives up after this long rather than
-// parking forever. Deliberately does NOT scan for itself (that abandons
-// single-flight). See docs/web-queue-view-cache.md.
+// Safety valve for the cold-start wait: gives up after this long rather than parking forever.
+// Deliberately does NOT scan for itself (that abandons single-flight).
 const QUEUE_VIEW_COLD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-// How long the per-key single-flight marker is TRUSTED before a refresher is
-// presumed dead (panicked/wedged) and the next caller may take it over.
-// See docs/web-queue-view-cache.md.
+// How long the per-key single-flight marker is TRUSTED before a refresher is presumed dead
+// (panicked/wedged) and the next caller may take it over.
 const QUEUE_VIEW_REFRESH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 // Hard ceiling on threads inside scan_queue_views for ONE key: the original
@@ -6277,14 +6259,12 @@ const QUEUE_VIEW_MAX_REFRESHERS: usize = 2;
 // fresh scan; kept under the ~1s SSE tick so staleness stays invisible.
 const QUEUE_VIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(750);
 
-// How long an idle key is RETAINED, far longer than QUEUE_VIEW_CACHE_TTL, so
-// the Phase-3 prune doesn't evict a still-active key mid-stale-while-revalidate.
-// See docs/web-queue-view-cache.md.
+// How long an idle key is RETAINED, far longer than QUEUE_VIEW_CACHE_TTL, so the Phase-3 prune
+// doesn't evict a still-active key mid-stale-while-revalidate.
 const QUEUE_VIEW_CACHE_RETAIN: std::time::Duration = std::time::Duration::from_secs(300);
 
-// Test-only seam around the staging-dir scan a cache miss performs, keyed by
-// staging dir so tests stay isolated. Lets a test slow one dir's scan and
-// count how many scans it received. See docs/web-queue-view-cache.md.
+// Test-only seam around the staging-dir scan a cache miss performs, keyed by staging dir so
+// tests stay isolated. Lets a test slow one dir's scan and count how many scans it received.
 #[cfg(test)]
 pub(crate) mod queue_scan_probe {
     use std::collections::HashMap;
@@ -6401,9 +6381,9 @@ fn scan_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usiz
     build_queue_views(staging_dir)
 }
 
-// build_queue_views, shared across callers within QUEUE_VIEW_CACHE_TTL,
-// single-flighted with no lock held across the scan so a slow staging dir
-// can't park /api/state (the HEALTHCHECK probe). See docs/web-queue-view-cache.md.
+// build_queue_views, shared across callers within QUEUE_VIEW_CACHE_TTL, single-flighted with no
+// lock held across the scan so a slow staging dir can't park /api/state (the HEALTHCHECK
+// probe).
 fn build_queue_views_cached(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usize) {
     // Phase 1 — decide, under the lock, whether THIS caller scans. The lock
     // is never held across `scan_queue_views`: a slow-to-enumerate staging
@@ -6590,9 +6570,9 @@ fn get_state_json(staging_dir: &str) -> String {
 // math so the list and its overflow count can never drift apart.
 const QUEUE_DISPLAY_CAP: usize = 100;
 
-// Builds the Mux-queue and Move-queue display lists, shared by
-// get_state_json and handle_system_info so both derive from one place.
-// Mutual exclusion comes from state.json itself. See docs/web-queue-view-cache.md.
+// Builds the Mux-queue and Move-queue display lists, shared by get_state_json and
+// handle_system_info so both derive from one place. Mutual exclusion comes from state.json
+// itself.
 fn build_queue_views(staging_dir: &str) -> (Vec<String>, Vec<String>, usize, usize) {
     let active_move_dir = crate::mover::ACTIVE_MOVE_DIR
         .lock()

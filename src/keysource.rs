@@ -217,10 +217,9 @@ pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
 /// Build the fresh-key-on-decrypt-failure closure ([`libfreemkv::sector::KeyFetch`])
 /// for an ISO mux.
 ///
-/// The library owns the recovery loop: when the mux hits an AACS unit no held
-/// key decrypts, it hands the ciphertext to this closure, which forwards it to
-/// the configured key source(s); derived Unit Keys are added to the pool and
-/// the unit re-decrypted. See docs/keysource.md for why this seam exists.
+/// The library owns the recovery loop: when the mux hits an AACS unit no held key decrypts, it
+/// hands the ciphertext to this closure, which forwards it to the configured key source(s);
+/// derived Unit Keys are added to the pool and the unit re-decrypted.
 ///
 /// Returns `None` for a non-AACS ISO, or when its AACS inputs can't be read.
 pub fn build_iso_key_fetch(cfg: &Config, iso_path: &Path) -> Option<libfreemkv::sector::KeyFetch> {
@@ -241,11 +240,10 @@ pub fn build_iso_key_fetch(cfg: &Config, iso_path: &Path) -> Option<libfreemkv::
 
 /// Why [`build_iso_key_fetch`] did or did not produce a fetch seam.
 ///
-/// Both negative arms collapse to `None` at the call site, but only one of
-/// them is normal: a non-AACS ISO has nothing to fetch, whereas an ISO that
-/// could not be READ (ESTALE, truncated, EACCES) is a fault. This is an enum
-/// rather than a log line alone so the distinction can be asserted directly
-/// in tests, independent of log rendering. See docs/keysource.md for why.
+/// Both negative arms collapse to `None` at the call site, but only one of them is normal: a
+/// non-AACS ISO has nothing to fetch, whereas an ISO that could not be READ (ESTALE, truncated,
+/// EACCES) is a fault. This is an enum rather than a log line alone so the distinction can be
+/// asserted directly in tests, independent of log rendering.
 pub enum IsoKeyFetch {
     /// AACS inputs read; mid-mux CPS-unit key recovery is available.
     Ready(libfreemkv::sector::KeyFetch),
@@ -300,12 +298,11 @@ pub fn uses_online(cfg: &Config) -> bool {
 /// What the online key service actually said about a disc — the verdict the
 /// operator-facing message is written from.
 ///
-/// The point of the enum is that "we never got an answer" and "we got a
-/// definitive answer of *no*" are DIFFERENT OUTCOMES and must never share a
-/// message: only [`Unreachable`](Self::Unreachable) / [`ServerError`](Self::ServerError)
-/// / [`RateLimited`](Self::RateLimited) are worth retrying, and only
-/// [`NoKeyForDisc`](Self::NoKeyForDisc) means the disc will never resolve from
-/// this service. See docs/keysource.md for the design rationale.
+/// The point of the enum is that "we never got an answer" and "we got a definitive answer of
+/// *no*" are DIFFERENT OUTCOMES and must never share a message: only
+/// [`Unreachable`](Self::Unreachable) / [`ServerError`](Self::ServerError) /
+/// [`RateLimited`](Self::RateLimited) are worth retrying, and only
+/// [`NoKeyForDisc`](Self::NoKeyForDisc) means the disc will never resolve from this service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceReachability {
     /// The service answered normally (2xx / 3xx) and simply held no key — or
@@ -386,9 +383,8 @@ pub enum ProbeOutcome {
 /// [`Unreachable`](ServiceReachability::Unreachable), 5xx →
 /// [`ServerError`](ServiceReachability::ServerError), 429 →
 /// [`RateLimited`](ServiceReachability::RateLimited), anything else →
-/// [`Answered`](ServiceReachability::Answered). DELIBERATELY coarser than the
-/// decode-side mapping: the probe carries no disc, so it can never yield a
-/// per-disc verdict. See docs/keysource.md.
+/// [`Answered`](ServiceReachability::Answered). DELIBERATELY coarser than the decode-side
+/// mapping: the probe carries no disc, so it can never yield a per-disc verdict.
 pub fn classify_reachability(outcome: ProbeOutcome) -> ServiceReachability {
     match outcome {
         ProbeOutcome::Transport => ServiceReachability::Unreachable,
@@ -400,9 +396,9 @@ pub fn classify_reachability(outcome: ProbeOutcome) -> ServiceReachability {
     }
 }
 
-// What a URL we could not even validate says about the key SERVICE: a permanent
-// verdict (bad scheme/host/SSRF) means it was never asked, a failed DNS lookup
-// means it was unreachable (transient). See docs/keysource.md.
+// What a URL we could not even validate says about the key SERVICE: a permanent verdict (bad
+// scheme/host/SSRF) means it was never asked, a failed DNS lookup means it was unreachable
+// (transient).
 fn reachability_for_unprobeable_url(err: &str) -> ServiceReachability {
     if crate::web::is_transient_resolve_error(err) {
         ServiceReachability::Unreachable
@@ -473,11 +469,9 @@ pub fn take_online_decode_reachability() -> Option<ServiceReachability> {
     freemkv_keysources::take_last_decode_reachability().map(reachability_from_decode)
 }
 
-/// Map a keysources [`DecodeReachability`](freemkv_keysources::DecodeReachability)
-/// — the real `/decode` POST, which DID carry this disc — to a per-disc
-/// [`ServiceReachability`]. Unlike [`classify_reachability`], a 422 here is a
-/// DEFINITIVE no-key for this disc, not an outage. See docs/keysource.md for
-/// the full table and why the library's error code can't carry it.
+/// Map a keysources [`DecodeReachability`](freemkv_keysources::DecodeReachability) — the real
+/// `/decode` POST, which DID carry this disc — to a per-disc [`ServiceReachability`]. Unlike
+/// [`classify_reachability`], a 422 here is a DEFINITIVE no-key for this disc, not an outage.
 fn reachability_from_decode(
     outcome: freemkv_keysources::DecodeReachability,
 ) -> ServiceReachability {
@@ -1460,9 +1454,9 @@ mod tests {
         assert!(build_iso_key_fetch(&cfg, missing).is_none());
     }
 
-    // An ISO we could not READ must not vanish silently — a staging mount
-    // ESTALE or truncated ISO used to disable mid-mux key recovery with no
-    // visible cause. Asserted on the decision, not captured logs (see docs/keysource.md).
+    // An ISO we could not READ must not vanish silently — a staging mount ESTALE or truncated
+    // ISO used to disable mid-mux key recovery with no visible cause. Asserted on the decision,
+    // not captured logs.
     #[test]
     fn an_unreadable_iso_is_distinguishable_from_a_non_aacs_one() {
         let cfg = Config::default();

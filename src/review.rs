@@ -291,8 +291,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // See docs/review-mutation-tests.md — proves the OR-guard excludes a
-    // dir with no markers, not just fixtures where two terms coincide.
     #[test]
     fn list_held_excludes_dir_with_neither_review_nor_done() {
         let tmp = std::env::temp_dir().join(format!(
@@ -338,9 +336,6 @@ mod tests {
         assert_eq!(err, "not a held rip", "dotted title must clear the guard");
     }
 
-    // See docs/review-mutation-tests.md — the test above can't distinguish
-    // a real guard rejection from "dir doesn't exist"; this one uses a
-    // real staging_root with a `.review` marker planted in its parent.
     #[test]
     fn traversal_guard_rejects_escapes_against_a_real_existing_parent() {
         let tmp = std::env::temp_dir().join(format!(

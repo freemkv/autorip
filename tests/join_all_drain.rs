@@ -1,17 +1,15 @@
 //! Coverage for the shutdown drain, `ripper::join_all_rip_threads`.
 //!
-//! Runs in its own integration binary because the function is process-global
-//! (cancels every registered device's `Halt`, joins every registered thread)
-//! and would drain other tests' fixtures out from under them if shared.
-//! See docs/join-all-drain.md for the full rationale and incident history.
+//! Runs in its own integration binary because the function is process-global (cancels every
+//! registered device's `Halt`, joins every registered thread) and would drain other tests'
+//! fixtures out from under them if shared.
 
 use std::time::{Duration, Instant};
 
 use freemkv_autorip::ripper;
 
-// Catches missing halt.cancel() (workers never exit, joins time out) and a
-// per-device timeout regression (N-drive shutdown blocking N×timeout).
-// See docs/join-all-drain.md for the full rationale.
+// Catches missing halt.cancel() (workers never exit, joins time out) and a per-device timeout
+// regression (N-drive shutdown blocking N×timeout).
 #[test]
 fn join_all_cancels_every_halt_and_shares_one_budget() {
     let devs: Vec<String> = (0..3)
