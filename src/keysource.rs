@@ -569,6 +569,9 @@ pub fn resolve_keys<A: DiscKeyAccess>(
     access: &mut A,
     mut disc: libfreemkv::Disc,
 ) -> (libfreemkv::Disc, KeyOutcome) {
+    // Drain any earlier decode verdict on this thread (e.g. a mux-time key fetch) so
+    // the caller's take after this resolve can only see THIS resolve's POST.
+    let _ = take_online_decode_reachability();
     // ALL AACS inputs come from the keyless scan via `disc.inputs()` — the
     // single source of truth. `access` is used ONLY to sample ciphertext,
     // which the scan doesn't retain (the old out-of-band re-read is gone).
@@ -1527,6 +1530,62 @@ mod tests {
             assert_eq!(v.http_status(), Some(code));
             assert!(!v.is_transient());
         }
+    }
+
+    // A resolve must never hand back a PREVIOUS resolve's decode verdict: plant a
+    // real one (a POST to an unresolvable host records Transport), then resolve
+    // with no sources / no AACS inputs — both return before any online query.
+    #[test]
+    fn resolve_keys_drains_a_stale_decode_verdict() {
+        struct PlantCtx;
+        impl freemkv_keysources::ResolveCtx for PlantCtx {
+            fn disc_hash(&self) -> &str {
+                "0xabc"
+            }
+            fn title(&self) -> Option<&str> {
+                None
+            }
+            fn vid(&self) -> Option<libfreemkv::aacs::types::Vid> {
+                None
+            }
+            fn mkb(&self) -> Result<&[u8], libfreemkv::Error> {
+                Ok(&[])
+            }
+            fn enc_title_keys(&self) -> Result<&[[u8; 16]], libfreemkv::Error> {
+                Ok(&[])
+            }
+            fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, libfreemkv::Error> {
+                Ok(vec![vec![0u8; 6144]; freemkv_keysources::MIN_SAMPLE_UNITS])
+            }
+        }
+        let plant = || {
+            let online =
+                freemkv_keysources::OnlineSource::new("https://keys.example.test/decode", "");
+            let _ = online.get_unit_keys(&PlantCtx);
+        };
+        plant();
+        assert!(
+            freemkv_keysources::take_last_decode_reachability().is_some(),
+            "fixture must plant a verdict"
+        );
+        plant();
+        let _ = resolve_keys(
+            Vec::new(),
+            &mut FixtureAccess,
+            keyless_encrypted_disc_with_aacs(),
+        );
+        assert_eq!(
+            take_online_decode_reachability(),
+            None,
+            "no-sources resolve"
+        );
+        plant();
+        let _ = resolve_keys(Vec::new(), &mut FixtureAccess, keyless_encrypted_disc());
+        assert_eq!(
+            take_online_decode_reachability(),
+            None,
+            "missing-inputs resolve"
+        );
     }
 
     // No two of these outcomes may collapse to the same verdict — that

@@ -839,24 +839,12 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         && matches!(keys, libfreemkv::decrypt::DecryptKeys::None)
         && !super::output_is_iso_image(&cfg_read.output_format)
     {
-        let msg = super::deferred_keyless_message(&cfg_read, &disc, decode_reach);
-        crate::log::device_log(
-            device,
-            &format!(
-                "{msg}\nRipped to ISO — no keys, mux deferred. \
-                 Staging preserved; will mux automatically once keys are available."
-            ),
-        );
+        let (log_line, reason) = super::deferred_keyless_texts(&cfg_read, &disc, decode_reach);
+        crate::log::device_log(device, &log_line);
         // We have not set status="ripping" yet (that happens via the
         // update_state call further below). reset_status_after_ripping
         // deferral reason without flagging a hard failure.
-        defer_status_after_ripping(
-            device,
-            &display_name,
-            &disc_format,
-            &duration,
-            format!("Ripped to ISO — no keys, mux deferred. {msg}"),
-        );
+        defer_status_after_ripping(device, &display_name, &disc_format, &duration, reason);
         return;
     }
 

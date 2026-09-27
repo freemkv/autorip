@@ -319,8 +319,8 @@ const KEY_SERVICE_NO_KEY_REASON: &str = "the online key service answered and has
 /// `key_status` / `last_error` text for HTTP 404: the service refused the
 /// request as unlicensed / unknown, so it never looked for a key.
 const KEY_SERVICE_UNLICENSED_REASON: &str = "the online key service would not accept the \
-    request, so it never looked for a key for this disc. Check the key-service address \
-    and access token in Settings — trying again without changing them will not help. \
+    request, so it never looked for a key for this disc. Check the Keyserver URL \
+    and Keyserver API Secret in Settings — trying again without changing them will not help. \
     (service replied HTTP 404)";
 
 /// `key_status` / `last_error` text for a key service we never asked, because
@@ -333,7 +333,7 @@ const KEY_SERVICE_NOT_ASKED_REASON: &str = "the online key service was never con
 fn key_service_unauthorized_reason(code: u16) -> String {
     format!(
         "the online key service rejected the credentials configured for it, so it never \
-         looked for a key for this disc. Fix the key-service access token in Settings — \
+         looked for a key for this disc. Fix the Keyserver API Secret in Settings — \
          trying again without changing it will not help. (service replied HTTP {code})"
     )
 }
@@ -511,6 +511,16 @@ fn rip_seed_verdict(
     scanned: Option<crate::keysource::ServiceReachability>,
 ) -> Option<crate::keysource::ServiceReachability> {
     fresh_decode.or(scanned)
+}
+
+// Does a seeded verdict call for one fresh resolve before classifying? True for the
+// config-class verdicts an operator fixes in Settings without re-inserting the disc.
+fn seed_needs_reresolve(seed: Option<crate::keysource::ServiceReachability>) -> bool {
+    use crate::keysource::ServiceReachability as R;
+    matches!(
+        seed,
+        Some(R::Unauthorized(_) | R::NotAsked | R::NotLicensed | R::Unexpected(_))
+    )
 }
 
 // `last_error` for a keyless disc not ripped with capture-without-keys off.
@@ -2456,7 +2466,19 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Down-vs-no-key (rip path): the final key-service verdict. A TRANSIENT one
     // bounded-retries then parks the disc below; a terminal one names what the
     // service actually said instead of failing with a generic "no keys".
-    let seed_verdict = rip_seed_verdict(resume_decode_reach, session.key_verdict.take());
+    let mut seed_verdict = rip_seed_verdict(resume_decode_reach, session.key_verdict.take());
+    let keyless =
+        disc.encrypted && matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None);
+    if seed_needs_reresolve(seed_verdict) && keyless && crate::keysource::uses_online(&cfg_read) {
+        // The operator may have fixed Settings since the scan: resolve once with the current config.
+        crate::log::device_log(
+            device,
+            "Re-resolving keys with the current key-service settings...",
+        );
+        let (rdisc, _outcome) = resolve_keys_from_drive(&cfg_read, &mut session.drive, disc);
+        disc = rdisc;
+        seed_verdict = crate::keysource::take_online_decode_reachability();
+    }
     let mut key_verdict: Option<crate::keysource::ServiceReachability> = None;
     if should_retry_online_keys(
         crate::keysource::uses_online(&cfg_read),
@@ -4449,7 +4471,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                          Enable multi-pass mode to capture a deferred-mux ISO. {msg}"
                     ),
                     format!(
-                        "No keys — cannot mux. {msg} (multi-pass mode captures an ISO for deferred mux.)"
+                        "Cannot mux without keys. {msg} (multi-pass mode captures an ISO for deferred mux.)"
                     ),
                 )
             };
@@ -5461,26 +5483,35 @@ fn keyless_failure_message(disc: &libfreemkv::Disc) -> String {
     keyless_failure_message_for(disc.css_error.as_ref(), disc.aacs_error.as_ref())
 }
 
-// Keyless-deferral message for the resume / deferred-mux path, from the resume decode's
-// verdict (`decode_reach`); probes only when that decode made no HTTP answer.
-pub(crate) fn deferred_keyless_message(
+// (log line, state reason) for the resume path's keyless mux deferral, from the resume
+// decode's verdict (`decode_reach`); probes only when that decode made no HTTP answer.
+// A terminal verdict won't clear by waiting, so it must not promise an automatic mux.
+pub(crate) fn deferred_keyless_texts(
     cfg: &Config,
     disc: &libfreemkv::Disc,
     decode_reach: Option<crate::keysource::ServiceReachability>,
-) -> String {
-    if cfg.key_source == "online" {
-        let reach =
-            decode_reach.unwrap_or_else(|| crate::keysource::probe_online_reachability(cfg));
-        if let Some(status) = key_service_transient_status(reach) {
-            return status;
-        }
-        // The resume decode's verdict is per-disc (422 = definitive no-key); the
-        // fallback probe carries no disc, so it can only yield a config verdict.
-        if let Some(reason) = key_service_no_key_reason(reach) {
-            return format!("No keys — {reason}");
-        }
+) -> (String, String) {
+    const LEAD: &str = "Ripped to ISO — no keys, mux deferred";
+    let reach = (cfg.key_source == "online")
+        .then(|| decode_reach.unwrap_or_else(|| crate::keysource::probe_online_reachability(cfg)));
+    if let Some(reason) = reach.and_then(key_service_no_key_reason) {
+        return (
+            format!(
+                "{LEAD}: {reason}\nStaging preserved; resume the rip to mux once the cause \
+                 above is fixed."
+            ),
+            format!("{LEAD}: {reason}"),
+        );
     }
-    keyless_failure_message(disc)
+    let msg = reach
+        .and_then(key_service_transient_status)
+        .unwrap_or_else(|| keyless_failure_message(disc));
+    (
+        format!(
+            "{msg}\n{LEAD}. Staging preserved; will mux automatically once keys are available."
+        ),
+        format!("{LEAD}. {msg}"),
+    )
 }
 
 /// CSS-over-AACS priority dispatch, split out from [`keyless_failure_message`]
@@ -7654,7 +7685,7 @@ mod tests {
     // the deferred/resume path must report the resume decode's verdict, not a
     // probe's. Empty keyserver_url makes the probe say NotAsked, so a 422 is visible.
     #[test]
-    fn deferred_keyless_message_uses_the_decode_verdict() {
+    fn deferred_keyless_texts_use_the_decode_verdict() {
         use crate::keysource::ServiceReachability as R;
         let cfg = crate::config::Config {
             key_source: "online".into(),
@@ -7662,15 +7693,15 @@ mod tests {
             ..Default::default()
         };
         let disc = encrypted_keyless_disc();
-        let msg = super::deferred_keyless_message(&cfg, &disc, Some(R::NoKeyForDisc));
+        let (_, msg) = super::deferred_keyless_texts(&cfg, &disc, Some(R::NoKeyForDisc));
         assert!(
             msg.contains("HTTP 422") && msg.contains("has no key for this disc"),
             "the resume decode's 422 must be reported: {msg}"
         );
-        let down = super::deferred_keyless_message(&cfg, &disc, Some(R::Unreachable));
+        let (_, down) = super::deferred_keyless_texts(&cfg, &disc, Some(R::Unreachable));
         assert!(down.contains("could not connect"), "{down}");
         // No decode verdict → probe fallback (NotAsked for an empty URL).
-        let probed = super::deferred_keyless_message(&cfg, &disc, None);
+        let (_, probed) = super::deferred_keyless_texts(&cfg, &disc, None);
         assert!(probed.contains("never contacted"), "{probed}");
     }
 
@@ -7683,7 +7714,8 @@ mod tests {
             let reason = super::key_service_no_key_reason(R::Unauthorized(code))
                 .expect("401/403 has its own wording");
             assert!(
-                reason.contains("rejected the credentials") && reason.contains("access token"),
+                reason.contains("rejected the credentials")
+                    && reason.contains("Keyserver API Secret"),
                 "{code}: {reason}"
             );
             assert!(reason.contains(&format!("HTTP {code}")), "{reason}");
@@ -7705,6 +7737,83 @@ mod tests {
         // A disc-error fallback message (no prefix) is kept whole.
         let fb = super::keyless_not_ripping_error("Error: E7000 No keys are available.");
         assert!(fb.ends_with("Error: E7000 No keys are available."), "{fb}");
+    }
+
+    // Config-class verdicts (fixable in Settings without re-inserting the disc) must
+    // trigger one fresh resolve; per-disc answers and outages must not.
+    #[test]
+    fn config_class_seed_verdicts_reresolve_once() {
+        use crate::keysource::ServiceReachability as R;
+        for v in [
+            R::Unauthorized(401),
+            R::NotAsked,
+            R::NotLicensed,
+            R::Unexpected(400),
+        ] {
+            assert!(super::seed_needs_reresolve(Some(v)), "{v:?}");
+        }
+        for v in [
+            R::NoKeyForDisc,
+            R::Answered,
+            R::Unreachable,
+            R::ServerError(503),
+            R::RateLimited,
+        ] {
+            assert!(!super::seed_needs_reresolve(Some(v)), "{v:?}");
+        }
+        assert!(!super::seed_needs_reresolve(None));
+    }
+
+    // Wiring guard: scan_disc banks its verdict on the session, rip_disc reads it,
+    // and a config-class seed re-resolves before the outage classifier runs.
+    #[test]
+    fn scan_verdict_is_banked_and_read_by_rip() {
+        let all = crate::util::source_lf(include_str!("mod.rs"));
+        let src = &all[..all.find("mod tests {").expect("test module")];
+        assert!(
+            src.contains("key_verdict: key_reach,"),
+            "scan_disc must bank key_reach"
+        );
+        let seed = src
+            .find("rip_seed_verdict(resume_decode_reach, session.key_verdict.take())")
+            .expect("rip_disc must read the banked verdict");
+        let reresolve = src[seed..]
+            .find("if seed_needs_reresolve(seed_verdict)")
+            .expect("rip_disc must re-resolve a config-class seed");
+        let classify = src[seed..]
+            .find("retry_online_keys_on_outage(")
+            .expect("rip_disc must classify via the outage retry");
+        assert!(
+            reresolve < classify,
+            "re-resolve must precede classification"
+        );
+    }
+
+    // The resume deferral's composed texts: one "no keys" lead, and a terminal
+    // verdict must not promise an automatic mux that waiting can never deliver.
+    #[test]
+    fn deferred_keyless_texts_match_the_verdict() {
+        use crate::keysource::ServiceReachability as R;
+        let cfg = crate::config::Config {
+            key_source: "online".into(),
+            keyserver_url: String::new(),
+            ..Default::default()
+        };
+        let disc = encrypted_keyless_disc();
+        for v in [R::NoKeyForDisc, R::Unauthorized(403), R::NotLicensed] {
+            let (log, state) = super::deferred_keyless_texts(&cfg, &disc, Some(v));
+            for t in [&log, &state] {
+                assert_eq!(t.to_lowercase().matches("no keys").count(), 1, "{v:?}: {t}");
+                assert!(!t.contains("will mux automatically"), "{v:?}: {t}");
+            }
+            assert!(
+                state.starts_with("Ripped to ISO — no keys, mux deferred"),
+                "{state}"
+            );
+        }
+        let (log, state) = super::deferred_keyless_texts(&cfg, &disc, Some(R::Unreachable));
+        assert!(log.contains("will mux automatically"), "{log}");
+        assert!(state.contains("could not connect"), "{state}");
     }
 
     // The tile's action button keys off the "Missing keys" prefix; a terminal
