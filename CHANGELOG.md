@@ -10,11 +10,11 @@
 
 ### Added
 
-- **Resume partial rips on disc insert.** If a rip is interrupted (crash, power loss, eject), re-inserting the same disc now picks up where it left off instead of restarting from title 1.
-- Staging-space estimate: the UI shows the disk space the currently-selected title(s) will consume during ripping before starting, so out-of-space failures are caught up front.
+- **Resume partial rips on disc insert (opt-in).** New `on_insert` option **Resume**: on insert, autorip continues an interrupted multi-pass sweep from its mapfile, or re-muxes an already-captured ISO, and starts fresh when nothing is resumable. The existing **Rip** option still starts fresh every time.
 
 ### Fixed
 
+- The multi-pass disk-space preflight now reserves the remaining disc image plus the selected title's size, instead of a second whole-disc image (no UI estimate; the check runs when the rip starts).
 - Resume preflight now accounts for the already-staged ISO fragment when computing free space required, so a resume no longer fails the space check when it would actually succeed.
 - The "report this on the tracker" URL in the AACS-failure message is now a real clickable link.
 - A definitive "no key for this disc" from the online key service is no longer reported as an outage. When the service answered HTTP 422 ("licensed but unresolved") — its final answer after ~30s of exhausting every source — autorip used to show the outage message ("service could not be reached… try again in a few minutes"), steering operators into pointless retries. Autorip now classifies from the HTTP status directly and gives each outcome its own message: transport failure, HTTP 5xx, 429 over-quota, 422 definitive no-key, 404 unlicensed, unrecognised status, and unusable key-service URL. Each explains what happened, whether retrying helps, and what to do next.
