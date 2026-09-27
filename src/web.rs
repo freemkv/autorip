@@ -8083,13 +8083,15 @@ pub enum ResumeMode {
     /// `?resume=yes` — require an existing resumable staging dir,
     /// fail if none.
     Require,
-    /// Automatic insert: resume eligible state, otherwise wipe and start fresh.
+    /// `on_insert=resume` — Default's guards, then resume eligible state, else as `Fresh`.
     Prefer,
-    /// `?resume=no` — wipe any existing staging dir first.
+    /// `?resume=no` — operator clean slate: wipe any existing staging dir first.
     Wipe,
-    /// no `resume=` query param — fresh sweep+mux; leave any existing
-    /// staging dir alone (libfreemkv's sweep-resume path handles it).
+    /// no `resume=` query param — fresh sweep+mux in place, unless the disc's
+    /// staging is finished, held, loss-aborted or mux-owned.
     Default,
+    /// `on_insert=rip` — Default's guards, then wipe stale partial/failed staging and sweep.
+    Fresh,
 }
 
 fn parse_resume_param(query: &str) -> ResumeMode {
