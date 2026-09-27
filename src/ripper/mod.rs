@@ -316,6 +316,11 @@ const KEY_SERVICE_NO_KEY_REASON: &str = "the online key service answered and has
     to save the disc as an encrypted image; otherwise try a different key source. \
     (service replied HTTP 422)";
 
+/// Resume-path text for HTTP 422: the ISO is already captured, so no capture advice.
+const KEY_SERVICE_NO_KEY_DEFERRED: &str = "The online key service answered and has no key \
+    for this disc yet; the ISO is kept for when one becomes available, e.g. through a key \
+    database update. (service replied HTTP 422)";
+
 /// `key_status` / `last_error` text for HTTP 404: the service refused the
 /// request as unlicensed / unknown, so it never looked for a key.
 const KEY_SERVICE_UNLICENSED_REASON: &str = "the online key service would not accept the \
@@ -513,14 +518,18 @@ fn rip_seed_verdict(
     fresh_decode.or(scanned)
 }
 
-// Does a seeded verdict call for one fresh resolve before classifying? True for the
-// config-class verdicts an operator fixes in Settings without re-inserting the disc.
-fn seed_needs_reresolve(seed: Option<crate::keysource::ServiceReachability>) -> bool {
+// Does the rip need one fresh resolve before classifying? Only for a config-class verdict
+// BANKED by the scan (Settings may have changed since); never after rip_disc's own resolve.
+fn seed_needs_reresolve(
+    fresh_decode: Option<crate::keysource::ServiceReachability>,
+    banked: Option<crate::keysource::ServiceReachability>,
+) -> bool {
     use crate::keysource::ServiceReachability as R;
-    matches!(
-        seed,
-        Some(R::Unauthorized(_) | R::NotAsked | R::NotLicensed | R::Unexpected(_))
-    )
+    fresh_decode.is_none()
+        && matches!(
+            banked,
+            Some(R::Unauthorized(_) | R::NotAsked | R::NotLicensed | R::Unexpected(_))
+        )
 }
 
 // `last_error` for a keyless disc not ripped with capture-without-keys off.
@@ -2466,18 +2475,26 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Down-vs-no-key (rip path): the final key-service verdict. A TRANSIENT one
     // bounded-retries then parks the disc below; a terminal one names what the
     // service actually said instead of failing with a generic "no keys".
-    let mut seed_verdict = rip_seed_verdict(resume_decode_reach, session.key_verdict.take());
+    let banked_verdict = session.key_verdict.take();
+    let reresolve = seed_needs_reresolve(resume_decode_reach, banked_verdict);
+    let mut seed_verdict = rip_seed_verdict(resume_decode_reach, banked_verdict);
     let keyless =
         disc.encrypted && matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None);
-    if seed_needs_reresolve(seed_verdict) && keyless && crate::keysource::uses_online(&cfg_read) {
+    // Runs under capture-without-keys too: the fixed setting may still find the key.
+    if reresolve && keyless && crate::keysource::uses_online(&cfg_read) {
         // The operator may have fixed Settings since the scan: resolve once with the current config.
         crate::log::device_log(
             device,
             "Re-resolving keys with the current key-service settings...",
         );
-        let (rdisc, _outcome) = resolve_keys_from_drive(&cfg_read, &mut session.drive, disc);
+        update_state_with(device, |s| {
+            s.key_status = "Communicating with online keyserver…".to_string();
+        });
+        let (rdisc, outcome) = resolve_keys_from_drive(&cfg_read, &mut session.drive, disc);
         disc = rdisc;
         seed_verdict = crate::keysource::take_online_decode_reachability();
+        let status = key_readiness(&disc, outcome, cfg_read.capture_without_keys, seed_verdict);
+        update_state_with(device, |s| s.key_status = status);
     }
     let mut key_verdict: Option<crate::keysource::ServiceReachability> = None;
     if should_retry_online_keys(
@@ -5494,7 +5511,11 @@ pub(crate) fn deferred_keyless_texts(
     const LEAD: &str = "Ripped to ISO — no keys, mux deferred";
     let reach = (cfg.key_source == "online")
         .then(|| decode_reach.unwrap_or_else(|| crate::keysource::probe_online_reachability(cfg)));
-    if let Some(reason) = reach.and_then(key_service_no_key_reason) {
+    // A 422 here is not terminal: the ISO is kept, and a later key-DB update may bring the key.
+    let terminal = reach
+        .filter(|r| *r != crate::keysource::ServiceReachability::NoKeyForDisc)
+        .and_then(key_service_no_key_reason);
+    if let Some(reason) = terminal {
         return (
             format!(
                 "{LEAD}: {reason}\nStaging preserved; resume the rip to mux once the cause \
@@ -5503,9 +5524,14 @@ pub(crate) fn deferred_keyless_texts(
             format!("{LEAD}: {reason}"),
         );
     }
-    let msg = reach
-        .and_then(key_service_transient_status)
-        .unwrap_or_else(|| keyless_failure_message(disc));
+    let msg = match reach {
+        Some(crate::keysource::ServiceReachability::NoKeyForDisc) => {
+            KEY_SERVICE_NO_KEY_DEFERRED.to_string()
+        }
+        r => r
+            .and_then(key_service_transient_status)
+            .unwrap_or_else(|| keyless_failure_message(disc)),
+    };
     (
         format!(
             "{msg}\n{LEAD}. Staging preserved; will mux automatically once keys are available."
@@ -7750,7 +7776,9 @@ mod tests {
             R::NotLicensed,
             R::Unexpected(400),
         ] {
-            assert!(super::seed_needs_reresolve(Some(v)), "{v:?}");
+            assert!(super::seed_needs_reresolve(None, Some(v)), "{v:?}");
+            // rip_disc's own fresh resolve just used the current Settings: no re-run.
+            assert!(!super::seed_needs_reresolve(Some(v), None), "fresh {v:?}");
         }
         for v in [
             R::NoKeyForDisc,
@@ -7759,9 +7787,9 @@ mod tests {
             R::ServerError(503),
             R::RateLimited,
         ] {
-            assert!(!super::seed_needs_reresolve(Some(v)), "{v:?}");
+            assert!(!super::seed_needs_reresolve(None, Some(v)), "{v:?}");
         }
-        assert!(!super::seed_needs_reresolve(None));
+        assert!(!super::seed_needs_reresolve(None, None));
     }
 
     // Wiring guard: scan_disc banks its verdict on the session, rip_disc reads it,
@@ -7775,10 +7803,10 @@ mod tests {
             "scan_disc must bank key_reach"
         );
         let seed = src
-            .find("rip_seed_verdict(resume_decode_reach, session.key_verdict.take())")
+            .find("let banked_verdict = session.key_verdict.take();")
             .expect("rip_disc must read the banked verdict");
         let reresolve = src[seed..]
-            .find("if seed_needs_reresolve(seed_verdict)")
+            .find("seed_needs_reresolve(resume_decode_reach, banked_verdict)")
             .expect("rip_disc must re-resolve a config-class seed");
         let classify = src[seed..]
             .find("retry_online_keys_on_outage(")
@@ -7800,7 +7828,17 @@ mod tests {
             ..Default::default()
         };
         let disc = encrypted_keyless_disc();
-        for v in [R::NoKeyForDisc, R::Unauthorized(403), R::NotLicensed] {
+        // 422 on the resume path: the ISO is already captured and a key may appear
+        // later, so no capture advice, no "fix the cause", and the auto-mux tail.
+        let (log, state) = super::deferred_keyless_texts(&cfg, &disc, Some(R::NoKeyForDisc));
+        for t in [&log, &state] {
+            assert_eq!(t.to_lowercase().matches("no keys").count(), 1, "{t}");
+            assert!(!t.contains("capture without keys"), "{t}");
+            assert!(!t.contains("fixed"), "{t}");
+            assert!(t.contains("HTTP 422"), "{t}");
+        }
+        assert!(log.contains("will mux automatically"), "{log}");
+        for v in [R::Unauthorized(403), R::NotLicensed] {
             let (log, state) = super::deferred_keyless_texts(&cfg, &disc, Some(v));
             for t in [&log, &state] {
                 assert_eq!(t.to_lowercase().matches("no keys").count(), 1, "{v:?}: {t}");
