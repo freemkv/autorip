@@ -281,13 +281,16 @@ pub const STATE_HELD_PREFIX: &str = "Auto-resume held: ";
 pub struct StateUnreadable {
     pub reason: String,
     pub transient: bool,
+    /// Raw error text for logs; kept out of `reason` (the card de-dupe key).
+    pub detail: String,
 }
 
 impl StateUnreadable {
     pub fn io(e: &io::Error) -> Self {
         StateUnreadable {
-            reason: format!("state.json could not be read: {e}"),
+            reason: "state.json could not be read (I/O error)".to_string(),
             transient: true,
+            detail: e.to_string(),
         }
     }
 
@@ -295,6 +298,16 @@ impl StateUnreadable {
         StateUnreadable {
             reason,
             transient: false,
+            detail: String::new(),
+        }
+    }
+
+    /// Reason plus the raw error detail, for logs.
+    pub fn log_text(&self) -> String {
+        if self.detail.is_empty() {
+            self.reason.clone()
+        } else {
+            format!("{} ({})", self.reason, self.detail)
         }
     }
 
@@ -306,7 +319,7 @@ impl StateUnreadable {
     /// Operator-card hint: retry for an I/O error, repair for bad contents.
     pub fn hint(&self) -> &'static str {
         if self.transient {
-            "state.json in this staging dir exists but could not be read (I/O error, e.g. a staging/NFS mount problem), so the rip is held and the ISO kept; check the staging mount, then retry the resume — it is re-checked automatically"
+            "state.json in this staging dir exists but could not be read (I/O error, e.g. a staging/NFS mount problem), so the rip is held and the ISO kept; check the staging mount; this card clears once state.json reads again, then click Resume (or re-insert the disc) to retry"
         } else {
             "state.json in this staging dir is corrupt or from another autorip version, so the deliverable plan (movie vs. TV episodes) is unknown; the rip is held and the ISO kept. Restore or repair state.json to resume. Deleting it instead delivers the disc as ONE title — a TV disc's episodes would not be split"
         }
@@ -339,21 +352,23 @@ pub(crate) fn read_state_checked(staging_disc_dir: &Path) -> StateRead {
     }
 }
 
-// Like `read_state`, but logs loudly if the file exists but can't be read, so
-// read-modify-write callers' `unwrap_or_else(DiscState::new)` fallback doesn't
-// silently discard accumulated data on external corruption.
-pub(crate) fn read_state_or_warn_corrupt(staging_disc_dir: &Path) -> Option<DiscState> {
+// Load state for a read-modify-write: the existing state, or a fresh `default`
+// when absent. REFUSES (Err) when state.json exists but is unreadable, so a
+// writer never replaces a held (e.g. TV) plan with an empty valid one.
+pub(crate) fn state_for_write(
+    staging_disc_dir: &Path,
+    default: StagingState,
+) -> io::Result<DiscState> {
     match read_state_checked(staging_disc_dir) {
-        StateRead::Valid(st) => Some(*st),
-        StateRead::Absent => None, // the normal first-write case.
+        StateRead::Valid(st) => Ok(*st),
+        StateRead::Absent => Ok(DiscState::new(default)),
         StateRead::Unreadable(u) => {
             tracing::error!(
                 path = %state_path(staging_disc_dir).display(),
-                "{} — a transition is starting from empty state, which drops \
-                 accumulated title/season/outputs metadata for this dir",
-                u.reason
+                "{} — refusing to overwrite it; the dir is held for the operator",
+                u.log_text()
             );
-            None
+            Err(io::Error::new(io::ErrorKind::InvalidData, u.held_reason()))
         }
     }
 }
@@ -393,16 +408,15 @@ pub fn try_write_state(staging_disc_dir: &Path, st: &DiscState) -> io::Result<()
 /// one writer owns a staging dir at a time (the sweeping/muxing
 /// ownership rules, now fields).
 ///
-/// Lock-free.
+/// Lock-free. Errs (writing nothing) on an unreadable state.json or a failed write.
 pub fn mutate_state(
     staging_disc_dir: &Path,
     default_state: StagingState,
     f: impl FnOnce(&mut DiscState),
-) {
-    let mut st = read_state_or_warn_corrupt(staging_disc_dir)
-        .unwrap_or_else(|| DiscState::new(default_state));
+) -> io::Result<()> {
+    let mut st = state_for_write(staging_disc_dir, default_state)?;
     f(&mut st);
-    write_state(staging_disc_dir, &st);
+    try_write_state(staging_disc_dir, &st)
 }
 
 /// The one-shot accept-loss REOPEN transition: move a terminal/abort dir back to
@@ -689,8 +703,9 @@ pub fn write_failed_marker(staging_disc_dir: &Path, reason: &str) -> bool {
     // Terminal transition → `state: Failed`. This atomic rewrite supersedes
     // any in-progress `.sweeping`/`.muxing` ownership so `disc_owned_by_worker`
     // can't stay true on a now-terminal dir.
-    let mut st = read_state_or_warn_corrupt(staging_disc_dir)
-        .unwrap_or_else(|| DiscState::new(StagingState::Failed));
+    let Ok(mut st) = state_for_write(staging_disc_dir, StagingState::Failed) else {
+        return false;
+    };
     st.state = StagingState::Failed;
     st.failure_reason = Some(reason.to_string());
     st.muxing = false;
@@ -740,8 +755,9 @@ pub fn read_failed_reason(staging_disc_dir: &Path) -> Option<String> {
 pub fn write_aborted_loss_marker(staging_disc_dir: &Path, reason: &str, attempt: u64) -> bool {
     // Resumable-failure transition → `state: AbortedLoss`, carrying the reason
     // and attempt count. Releases in-progress ownership like `.failed` does.
-    let mut st = read_state_or_warn_corrupt(staging_disc_dir)
-        .unwrap_or_else(|| DiscState::new(StagingState::AbortedLoss));
+    let Ok(mut st) = state_for_write(staging_disc_dir, StagingState::AbortedLoss) else {
+        return false;
+    };
     st.state = StagingState::AbortedLoss;
     st.failure_reason = Some(reason.to_string());
     st.aborted_loss_attempt = attempt;
@@ -874,9 +890,11 @@ pub fn mark_aborted_on_loss_reporting_landed(staging_disc_dir: &Path, reason: &s
 pub fn write_sweeping_marker(staging_disc_dir: &Path) {
     // Owned-in-progress transition → `state: Sweeping`. Seeds `state.json` at
     // staging-dir creation (preserving any data from a prior resume attempt).
-    mutate_state(staging_disc_dir, StagingState::Sweeping, |s| {
+    if let Err(e) = mutate_state(staging_disc_dir, StagingState::Sweeping, |s| {
         s.state = StagingState::Sweeping;
-    });
+    }) {
+        tracing::error!(path = %staging_disc_dir.display(), error = %e, "failed to record .sweeping in state.json");
+    }
 }
 
 /// Write the `.muxing` exclusion lock durably. Called by the mux worker when
@@ -962,12 +980,15 @@ pub fn write_completed_marker(staging_disc_dir: &Path) {
     // Clean-completion → `state: Completed`, releasing `.muxing`. Must NOT
     // downgrade an existing `Done`/`Review` hand-off state, so this only
     // advances an as-yet-uncompleted dir (a no-op after a hand-off write).
-    mutate_state(staging_disc_dir, StagingState::Completed, |s| {
+    if let Err(e) = mutate_state(staging_disc_dir, StagingState::Completed, |s| {
         if !matches!(s.state, StagingState::Done | StagingState::Review) {
             s.state = StagingState::Completed;
         }
         s.muxing = false;
-    });
+    }) {
+        tracing::error!(path = %staging_disc_dir.display(), error = %e, "failed to record completion in state.json");
+        return;
+    }
     remove_legacy_marker(staging_disc_dir, SWEEPING_MARKER);
     remove_legacy_marker(staging_disc_dir, MUXING_MARKER);
 }
@@ -984,7 +1005,7 @@ pub fn write_handoff_marker(marker_path: &Path, contents: &[u8]) -> io::Result<(
 /// Hand-off transition: a completed mux moves the dir to `state: Done` (title confident → the
 /// mover auto-files it) or `state: Review` (held for operator confirmation). `apply` populates
 /// the mover-facing metadata + `outputs` (title, year, media_type, tmdb_id, season, poster,
-/// overview, …). Always returns `Ok`; kept infallible so callers gate on `true`.
+/// overview, …). Errs when state.json is unreadable (nothing written) or the write fails.
 pub fn mark_handoff(
     staging_disc_dir: &Path,
     title_confident: bool,
@@ -995,8 +1016,7 @@ pub fn mark_handoff(
     } else {
         StagingState::Review
     };
-    let mut st =
-        read_state_or_warn_corrupt(staging_disc_dir).unwrap_or_else(|| DiscState::new(state));
+    let mut st = state_for_write(staging_disc_dir, state)?;
     st.state = state;
     st.title_confident = title_confident;
     if st.date.is_empty() {
@@ -1777,6 +1797,19 @@ pub fn resume_or_quarantine_staging(staging_dir: &str) -> Vec<StagingResumeHint>
             });
             continue;
         }
+        // Unreadable state.json: hold for the operator — never wipe (G5) or
+        // restart-loop-quarantine over it (G6). The mux worker keeps the card.
+        if let Some(u) = &snap.state_unreadable {
+            tracing::error!(path = %path.display(), reason = %u.log_text(), "staging entry has an unreadable state.json — held for operator");
+            crate::muxer::record_error(&path.to_string_lossy(), &u.held_reason(), u.hint());
+            hints.push(StagingResumeHint {
+                dir: snap.dir,
+                action: ResumeAction::HeldUnreadableState {
+                    reason: u.held_reason(),
+                },
+            });
+            continue;
+        }
         // `.sweeping`/`.muxing` means the dir is actively owned, not orphaned;
         // still bump `.restart_count` on the skip and promote to `.failed`
         // at RESTART_LIMIT so a wedging sweep/mux doesn't spin forever.
@@ -1910,6 +1943,10 @@ pub enum ResumeAction {
     RestartLoopFailed {
         reason: String,
     },
+    /// state.json exists but can't be read; left untouched for the operator.
+    HeldUnreadableState {
+        reason: String,
+    },
     ResumePreserved {
         attempt: u64,
         has_iso: bool,
@@ -1974,6 +2011,102 @@ mod tests {
             read_state(&dir).is_none(),
             "a foreign-schema state.json must not resume as unified state",
         );
+    }
+
+    // Every read-modify-write writer must REFUSE to replace an unreadable
+    // state.json (corrupt, foreign, or an I/O error) with a fresh default: that
+    // would silently turn a held TV plan into an empty, valid movie plan.
+    #[test]
+    fn rmw_writers_refuse_to_overwrite_an_unreadable_state_json() {
+        const BAD: &[u8] = b"{ torn";
+        let seed = || {
+            let d = tmpdir();
+            fs::write(state_path(&d), BAD).unwrap();
+            d
+        };
+        let untouched = |d: &Path, who: &str| {
+            assert_eq!(
+                fs::read(state_path(d)).unwrap(),
+                BAD,
+                "{who} overwrote state.json"
+            );
+        };
+
+        let d = seed();
+        assert!(mutate_state(&d, StagingState::Sweeping, |_| {}).is_err());
+        untouched(&d, "mutate_state");
+        let d = seed();
+        assert!(!write_failed_marker(&d, "boom"), "must report not-landed");
+        untouched(&d, "write_failed_marker");
+        let d = seed();
+        assert!(
+            !write_aborted_loss_marker(&d, "loss", 1),
+            "must report not-landed"
+        );
+        untouched(&d, "write_aborted_loss_marker");
+        let d = seed();
+        assert!(mark_handoff(&d, true, |_| {}).is_err());
+        untouched(&d, "mark_handoff");
+        let d = seed();
+        write_completed_marker(&d);
+        untouched(&d, "write_completed_marker");
+        let d = seed();
+        write_sweeping_marker(&d);
+        untouched(&d, "write_sweeping_marker");
+        let d = seed();
+        let m = DiscState::new(StagingState::Ripped).to_ripped_marker();
+        assert!(crate::muxer::write_marker(&d, &m).is_err());
+        untouched(&d, "muxer::write_marker");
+    }
+
+    // G5/G6: startup must hold (not wipe, not quarantine over) a dir whose
+    // state.json is unreadable, and raise the operator card.
+    #[test]
+    fn startup_holds_a_dir_with_an_unreadable_state_json() {
+        let root = tmpdir();
+        let bare = root.join("Only_State");
+        let looping = root.join("Looping");
+        for d in [&bare, &looping] {
+            fs::create_dir_all(d).unwrap();
+            fs::write(state_path(d), b"{ torn").unwrap();
+        }
+        fs::write(looping.join("Looping.iso"), b"x").unwrap();
+        fs::write(looping.join(RESTART_COUNT_FILE), b"99\n").unwrap();
+
+        let hints = resume_or_quarantine_staging(&root.to_string_lossy());
+        for d in [&bare, &looping] {
+            assert!(d.is_dir(), "{} must not be wiped", d.display());
+            assert_eq!(
+                fs::read(state_path(d)).unwrap(),
+                b"{ torn",
+                "{}",
+                d.display()
+            );
+            let h = hints.iter().find(|h| &h.dir == d).expect("a hint per dir");
+            assert!(
+                matches!(h.action, ResumeAction::HeldUnreadableState { .. }),
+                "{}: {:?}",
+                d.display(),
+                h.action
+            );
+            let path = d.to_string_lossy().to_string();
+            assert!(
+                crate::muxer::MUX_ERRORS.lock().unwrap().contains_key(&path),
+                "{} must raise the held card",
+                d.display()
+            );
+            crate::muxer::clear_error_with_prefix(&path, STATE_HELD_PREFIX);
+        }
+    }
+
+    // N2: the card reason is the de-dupe key, so an I/O hold's reason must
+    // not carry the raw (flapping EIO/ESTALE) error text.
+    #[test]
+    fn io_hold_reason_is_stable_across_errnos() {
+        let a = StateUnreadable::io(&io::Error::other("Input/output error"));
+        let b = StateUnreadable::io(&io::Error::other("Stale file handle"));
+        assert_eq!(a.held_reason(), b.held_reason());
+        assert!(a.hint().contains("click Resume"), "{}", a.hint());
     }
 
     #[test]
@@ -2928,6 +3061,7 @@ mod tests {
             ResumeAction::ResumePreserved { .. } => Verdict::ResumePreserved,
             ResumeAction::ResumeAbortedLoss { .. } => Verdict::ResumeAbortedLoss,
             ResumeAction::InProgress => Verdict::InProgress,
+            ResumeAction::HeldUnreadableState { .. } => panic!("matrix never corrupts state.json"),
         }
     }
 

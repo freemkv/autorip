@@ -75,8 +75,7 @@ pub fn write_marker(staging_dir: &Path, marker: &RippedMarker) -> std::io::Resul
     // The `.ripped` hand-off is now `state: Ripped` in `state.json`. Fold the
     // marker in (preserving accumulated data / a TV caller's `outputs`) and
     // persist; propagate I/O errors so eject can be refused on a failed hand-off.
-    let mut st = crate::ripper::staging::read_state(staging_dir)
-        .unwrap_or_else(|| crate::ripper::staging::DiscState::new(RIPPED_STATE));
+    let mut st = crate::ripper::staging::state_for_write(staging_dir, RIPPED_STATE)?;
     st.state = RIPPED_STATE;
     st.apply_ripped(marker);
     crate::ripper::staging::try_write_state(staging_dir, &st)?;
@@ -1520,7 +1519,8 @@ mod tests {
                             s.failure_reason = None;
                             s.muxing = false;
                         },
-                    );
+                    )
+                    .unwrap();
                 }
                 M::Done => std::fs::write(dir.join(".done"), b"{}").unwrap(),
                 M::Review => std::fs::write(dir.join(".review"), b"{}").unwrap(),

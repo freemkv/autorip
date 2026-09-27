@@ -85,7 +85,8 @@ pub fn classify_resume(hint: &StagingResumeHint, abort_on_lost_secs: u64) -> Res
                 reason: reason.clone(),
             };
         }
-        ResumeAction::RestartLoopFailed { reason } => {
+        ResumeAction::RestartLoopFailed { reason }
+        | ResumeAction::HeldUnreadableState { reason } => {
             return ResumeClass::AlreadyFailed {
                 reason: reason.clone(),
             };
@@ -483,7 +484,9 @@ fn hold_unreadable_plan(
     crate::log::device_log(
         device,
         &format!(
-            "{reason} — not re-muxing, since the deliverable plan (movie vs. TV episodes) is unknown. Staging and the ISO are kept ({}).",
+            "{}{} — not re-muxing, since the deliverable plan (movie vs. TV episodes) is unknown. Staging and the ISO are kept ({}).",
+            staging::STATE_HELD_PREFIX,
+            why.log_text(),
             staging_dir.display()
         ),
     );
