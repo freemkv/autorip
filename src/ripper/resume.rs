@@ -690,6 +690,8 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     // mapfile) + on-disc samples (from the ISO), resolve a Unit Key, and re-scan
     // with it so decryption keys populate. No-op for a local source.
     let (disc, _key_outcome) = resolve_keys_from_iso(&cfg_read, &iso_path, &mapfile_path, disc);
+    // Consume the real decode's verdict now; the keyless deferral below reports it.
+    let decode_reach = crate::keysource::take_online_decode_reachability();
 
     // Real-bitrate re-validation: recompute bytes-bad-in-title (vs the
     // classifier's whole-disc estimate) and re-check abort_on_lost_secs.
@@ -837,7 +839,7 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         && matches!(keys, libfreemkv::decrypt::DecryptKeys::None)
         && !super::output_is_iso_image(&cfg_read.output_format)
     {
-        let msg = super::deferred_keyless_message(&cfg_read, &disc);
+        let msg = super::deferred_keyless_message(&cfg_read, &disc, decode_reach);
         crate::log::device_log(
             device,
             &format!(

@@ -329,6 +329,15 @@ const KEY_SERVICE_NOT_ASKED_REASON: &str = "the online key service was never con
     because the address configured for it cannot be used. Fix the key-service address in \
     Settings. (no request was sent)";
 
+/// Reason text for HTTP 401 / 403: the service rejected the configured credentials.
+fn key_service_unauthorized_reason(code: u16) -> String {
+    format!(
+        "the online key service rejected the credentials configured for it, so it never \
+         looked for a key for this disc. Fix the key-service access token in Settings — \
+         trying again without changing it will not help. (service replied HTTP {code})"
+    )
+}
+
 /// Reason text for an unexpected non-2xx status: say plainly that we do not
 /// know, and quote the status, rather than guessing at a cause.
 fn key_service_unexpected_reason(code: u16) -> String {
@@ -380,6 +389,7 @@ fn key_service_transient_status(reach: crate::keysource::ServiceReachability) ->
         ServiceReachability::Answered
         | ServiceReachability::NoKeyForDisc
         | ServiceReachability::NotLicensed
+        | ServiceReachability::Unauthorized(_)
         | ServiceReachability::Unexpected(_)
         | ServiceReachability::NotAsked => None,
     }
@@ -394,6 +404,7 @@ fn key_service_no_key_reason(reach: crate::keysource::ServiceReachability) -> Op
     match reach {
         ServiceReachability::NoKeyForDisc => Some(KEY_SERVICE_NO_KEY_REASON.to_string()),
         ServiceReachability::NotLicensed => Some(KEY_SERVICE_UNLICENSED_REASON.to_string()),
+        ServiceReachability::Unauthorized(code) => Some(key_service_unauthorized_reason(code)),
         ServiceReachability::Unexpected(code) => Some(key_service_unexpected_reason(code)),
         ServiceReachability::NotAsked => Some(KEY_SERVICE_NOT_ASKED_REASON.to_string()),
         ServiceReachability::Answered
@@ -491,6 +502,24 @@ fn retry_online_keys_on_outage(
          (a later insert / rescan will pick it up). Not ejecting.",
     );
     (disc, KeyOutcome::NoKey, Some(last_reach))
+}
+
+// Verdict rip_disc seeds the outage classifier with: this rip's fresh decode verdict, else
+// the one scan_disc banked on the reused session. `None` makes the classifier probe.
+fn rip_seed_verdict(
+    fresh_decode: Option<crate::keysource::ServiceReachability>,
+    scanned: Option<crate::keysource::ServiceReachability>,
+) -> Option<crate::keysource::ServiceReachability> {
+    fresh_decode.or(scanned)
+}
+
+// `last_error` for a keyless disc not ripped with capture-without-keys off.
+// `msg` may already carry the "No keys — " lead; drop it rather than print it twice.
+fn keyless_not_ripping_error(msg: &str) -> String {
+    match msg.strip_prefix("No keys — ") {
+        Some(reason) => format!("No keys — not ripping: {reason}"),
+        None => format!("No keys — not ripping. {msg}"),
+    }
 }
 
 use session::{
@@ -1297,6 +1326,7 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
             probed: false,
             tmdb: tmdb.clone(),
             device_path: device_path.to_string(),
+            key_verdict: key_reach,
         },
     );
 
@@ -2201,8 +2231,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     );
 
     // Reachability of the fresh-scan decode POST, set below when this rip
-    // resolves keys just now. `None` for a reused session — the outage retry
-    // then falls back to a probe, as before.
+    // resolves keys just now. A reused session carries scan_disc's verdict instead.
     let mut resume_decode_reach: Option<crate::keysource::ServiceReachability> = None;
     // Take the existing session, or open fresh
     let mut session = match take_session(device) {
@@ -2301,6 +2330,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 probed: false,
                 tmdb,
                 device_path: device_path.to_string(),
+                key_verdict: None,
             }
         }
     };
@@ -2426,6 +2456,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Down-vs-no-key (rip path): the final key-service verdict. A TRANSIENT one
     // bounded-retries then parks the disc below; a terminal one names what the
     // service actually said instead of failing with a generic "no keys".
+    let seed_verdict = rip_seed_verdict(resume_decode_reach, session.key_verdict.take());
     let mut key_verdict: Option<crate::keysource::ServiceReachability> = None;
     if should_retry_online_keys(
         crate::keysource::uses_online(&cfg_read),
@@ -2433,13 +2464,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         disc.encrypted,
         matches!(disc.decrypt_keys(), libfreemkv::decrypt::DecryptKeys::None),
     ) {
-        let (rdisc, _outcome, reach) = retry_online_keys_on_outage(
-            device,
-            &cfg_read,
-            &mut session.drive,
-            disc,
-            resume_decode_reach,
-        );
+        let (rdisc, _outcome, reach) =
+            retry_online_keys_on_outage(device, &cfg_read, &mut session.drive, disc, seed_verdict);
         disc = rdisc;
         key_verdict = reach;
     }
@@ -2488,7 +2514,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             );
             update_state_with(device, |s| {
                 s.status = "error".to_string();
-                s.last_error = format!("No keys — not ripping. {msg}");
+                s.last_error = keyless_not_ripping_error(&msg);
             });
             unregister_halt(device);
             return;
@@ -5435,17 +5461,21 @@ fn keyless_failure_message(disc: &libfreemkv::Disc) -> String {
     keyless_failure_message_for(disc.css_error.as_ref(), disc.aacs_error.as_ref())
 }
 
-// Keyless-deferral message for the resume / deferred-mux path. Mirrors the fresh-rip outage
-// classifier: reports a transient key-service outage instead of a permanent "no keys" line.
-pub(crate) fn deferred_keyless_message(cfg: &Config, disc: &libfreemkv::Disc) -> String {
+// Keyless-deferral message for the resume / deferred-mux path, from the resume decode's
+// verdict (`decode_reach`); probes only when that decode made no HTTP answer.
+pub(crate) fn deferred_keyless_message(
+    cfg: &Config,
+    disc: &libfreemkv::Disc,
+    decode_reach: Option<crate::keysource::ServiceReachability>,
+) -> String {
     if cfg.key_source == "online" {
-        let reach = crate::keysource::probe_online_reachability(cfg);
+        let reach =
+            decode_reach.unwrap_or_else(|| crate::keysource::probe_online_reachability(cfg));
         if let Some(status) = key_service_transient_status(reach) {
             return status;
         }
-        // The probe carries no disc, so it can only report a CONFIG verdict
-        // here ("never asked"), never a per-disc no-key — see
-        // `classify_reachability`. Anything else falls through unchanged.
+        // The resume decode's verdict is per-disc (422 = definitive no-key); the
+        // fallback probe carries no disc, so it can only yield a config verdict.
         if let Some(reason) = key_service_no_key_reason(reach) {
             return format!("No keys — {reason}");
         }
@@ -7602,6 +7632,79 @@ mod tests {
         ] {
             assert!(super::key_service_no_key_reason(transient).is_none());
         }
+    }
+
+    // a reused (scanned) session must hand rip_disc the scan's real /decode
+    // verdict; dropping it re-fires the empty probe, which reads a 422 as Answered.
+    #[test]
+    fn rip_seed_verdict_carries_the_scan_verdict_for_a_reused_session() {
+        use crate::keysource::ServiceReachability as R;
+        assert_eq!(
+            super::rip_seed_verdict(None, Some(R::NoKeyForDisc)),
+            Some(R::NoKeyForDisc),
+            "reused session: the scan's 422 must reach the rip classifier"
+        );
+        assert_eq!(
+            super::rip_seed_verdict(Some(R::Unreachable), None),
+            Some(R::Unreachable)
+        );
+        assert_eq!(super::rip_seed_verdict(None, None), None);
+    }
+
+    // the deferred/resume path must report the resume decode's verdict, not a
+    // probe's. Empty keyserver_url makes the probe say NotAsked, so a 422 is visible.
+    #[test]
+    fn deferred_keyless_message_uses_the_decode_verdict() {
+        use crate::keysource::ServiceReachability as R;
+        let cfg = crate::config::Config {
+            key_source: "online".into(),
+            keyserver_url: String::new(),
+            ..Default::default()
+        };
+        let disc = encrypted_keyless_disc();
+        let msg = super::deferred_keyless_message(&cfg, &disc, Some(R::NoKeyForDisc));
+        assert!(
+            msg.contains("HTTP 422") && msg.contains("has no key for this disc"),
+            "the resume decode's 422 must be reported: {msg}"
+        );
+        let down = super::deferred_keyless_message(&cfg, &disc, Some(R::Unreachable));
+        assert!(down.contains("could not connect"), "{down}");
+        // No decode verdict → probe fallback (NotAsked for an empty URL).
+        let probed = super::deferred_keyless_message(&cfg, &disc, None);
+        assert!(probed.contains("never contacted"), "{probed}");
+    }
+
+    // 401/403 is a credential rejection — it must get the credential text,
+    // not the "does not recognise ... check the key-service address" wording.
+    #[test]
+    fn unauthorized_decode_verdict_names_the_credentials() {
+        use crate::keysource::ServiceReachability as R;
+        for code in [401u16, 403] {
+            let reason = super::key_service_no_key_reason(R::Unauthorized(code))
+                .expect("401/403 has its own wording");
+            assert!(
+                reason.contains("rejected the credentials") && reason.contains("access token"),
+                "{code}: {reason}"
+            );
+            assert!(reason.contains(&format!("HTTP {code}")), "{reason}");
+            assert!(!reason.contains("does not recognise"), "{reason}");
+            assert!(super::key_service_transient_status(R::Unauthorized(code)).is_none());
+        }
+    }
+
+    // last_error must not double the "No keys — " prefix.
+    #[test]
+    fn keyless_not_ripping_error_has_one_prefix() {
+        let reason =
+            super::key_service_no_key_reason(crate::keysource::ServiceReachability::NoKeyForDisc)
+                .expect("422 reason");
+        let err = super::keyless_not_ripping_error(&format!("No keys — {reason}"));
+        assert_eq!(err.matches("No keys").count(), 1, "doubled prefix: {err}");
+        assert!(err.starts_with("No keys — not ripping"), "{err}");
+        assert!(err.contains("HTTP 422"), "{err}");
+        // A disc-error fallback message (no prefix) is kept whole.
+        let fb = super::keyless_not_ripping_error("Error: E7000 No keys are available.");
+        assert!(fb.ends_with("Error: E7000 No keys are available."), "{fb}");
     }
 
     // The tile's action button keys off the "Missing keys" prefix; a terminal

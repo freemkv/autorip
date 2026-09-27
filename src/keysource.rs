@@ -372,6 +372,9 @@ pub enum ServiceReachability {
     /// service never looked for a key. Terminal until the licence or URL is
     /// fixed; retrying unchanged cannot help.
     NotLicensed,
+    /// HTTP 401 / 403 — the service rejected the configured credentials, so it
+    /// never looked for a key. Terminal until the access token is fixed.
+    Unauthorized(u16),
     /// Some other non-2xx status we have no specific meaning for. Terminal as
     /// far as automatic retry goes — report the status rather than guess.
     Unexpected(u16),
@@ -400,9 +403,9 @@ impl ServiceReachability {
     /// having to guess a cause. `None` when nothing answered.
     pub fn http_status(self) -> Option<u16> {
         match self {
-            ServiceReachability::ServerError(code) | ServiceReachability::Unexpected(code) => {
-                Some(code)
-            }
+            ServiceReachability::ServerError(code)
+            | ServiceReachability::Unauthorized(code)
+            | ServiceReachability::Unexpected(code) => Some(code),
             ServiceReachability::RateLimited => Some(429),
             ServiceReachability::NoKeyForDisc => Some(422),
             ServiceReachability::NotLicensed => Some(404),
@@ -535,6 +538,7 @@ fn reachability_from_decode(
         D::Status(429) => ServiceReachability::RateLimited,
         D::Status(422) => ServiceReachability::NoKeyForDisc,
         D::Status(404) => ServiceReachability::NotLicensed,
+        D::Status(code @ (401 | 403)) => ServiceReachability::Unauthorized(code),
         D::Status(code) if (500..=599).contains(&code) => ServiceReachability::ServerError(code),
         D::Status(code) if (200..=399).contains(&code) => ServiceReachability::Answered,
         D::Status(code) => ServiceReachability::Unexpected(code),
@@ -1504,11 +1508,24 @@ mod tests {
             ServiceReachability::RateLimited
         );
         // Anything else keeps its status rather than being guessed at.
-        for code in [400u16, 401, 403, 418, 451] {
+        for code in [400u16, 418, 451] {
             assert_eq!(
                 reachability_from_decode(Status(code)),
                 ServiceReachability::Unexpected(code)
             );
+        }
+    }
+
+    // 401/403 is a credential rejection (keysources' KeyServiceUnauthorized),
+    // terminal, and must not collapse into the generic Unexpected(code).
+    #[test]
+    fn decode_401_403_is_unauthorized() {
+        use freemkv_keysources::DecodeReachability::Status;
+        for code in [401u16, 403] {
+            let v = reachability_from_decode(Status(code));
+            assert_ne!(v, ServiceReachability::Unexpected(code), "{code}");
+            assert_eq!(v.http_status(), Some(code));
+            assert!(!v.is_transient());
         }
     }
 
@@ -1524,6 +1541,7 @@ mod tests {
             reachability_from_decode(Status(422)),
             reachability_from_decode(Status(404)),
             reachability_from_decode(Status(400)),
+            reachability_from_decode(Status(401)),
             reachability_from_decode(Status(200)),
         ];
         for (i, a) in verdicts.iter().enumerate() {

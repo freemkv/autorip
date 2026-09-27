@@ -372,6 +372,9 @@ pub(super) struct DriveSession {
     pub(super) probed: bool,
     pub(super) tmdb: Option<crate::tmdb::TmdbResult>,
     pub(super) device_path: String,
+    /// scan_disc's final key-service verdict for a still-keyless disc, so rip_disc
+    /// classifies from the real `/decode` answer instead of re-probing.
+    pub(super) key_verdict: Option<crate::keysource::ServiceReachability>,
 }
 
 /// Global drive sessions — one per device.
