@@ -201,13 +201,16 @@ pub(crate) fn clear_error_with_prefix(path: &str, prefix: &str) {
 /// Operator-initiated clear of a single mux error (the System-tab ✕). Removes
 /// the card AND marks the path dismissed so a persistently-erroring dir doesn't
 /// re-surface it on the next tick; the dismissal is lifted on the dir's next
-/// fresh dispatch (or when it's pruned from staging).
+/// fresh dispatch (or when it's pruned from staging). Only a path with a recorded error is
+/// dismissed, so arbitrary `?path=` values can't grow MUX_DISMISSED.
 pub fn clear_mux_error(path: &str) {
-    clear_error(path);
-    MUX_DISMISSED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(path.to_string());
+    let mut m = MUX_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    if m.remove(path).is_some() {
+        MUX_DISMISSED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_string());
+    }
 }
 
 /// Operator-initiated clear of ALL mux errors (the System-tab "Clear all").
@@ -952,6 +955,38 @@ mod tests {
             "a repaired dir's held card must clear"
         );
         MUX_DISMISSED.lock().unwrap().remove(&path);
+    }
+
+    // A dismiss for a path with no recorded error must not grow MUX_DISMISSED.
+    #[test]
+    fn clearing_an_unrecorded_path_does_not_dismiss_it() {
+        let _g = crate::mover::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let junk = "/etc/hostname/not-a-staging-dir-webcaps-l2";
+        clear_mux_error(junk);
+        assert!(
+            !MUX_DISMISSED.lock().unwrap().contains(junk),
+            "an arbitrary path was added to MUX_DISMISSED"
+        );
+    }
+
+    // The legitimate System-tab dismiss still suppresses re-recording. A real dir, so a
+    // concurrent prune can't lift the dismissal mid-test.
+    #[test]
+    fn dismissing_a_recorded_error_suppresses_rerecording() {
+        let _g = crate::mover::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().to_string_lossy().to_string();
+        record_error(&p, "r", "h");
+        clear_mux_error(&p);
+        record_error(&p, "r", "h");
+        let rerecorded = MUX_ERRORS.lock().unwrap().contains_key(&p);
+        undismiss(&p);
+        clear_error(&p);
+        assert!(!rerecorded, "a dismissed error re-surfaced");
     }
 
     fn sample_marker() -> RippedMarker {
