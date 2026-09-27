@@ -141,7 +141,7 @@ pub fn keyserver_url_startup_warning(cfg: &Config) -> Option<String> {
         return None;
     }
     Some(format!(
-        "WARNING: the stored Keyserver URL ({}) is not https://, so the online key source is          DISABLED for every rip. Re-enter an https:// URL in Settings.",
+        "WARNING: the stored Keyserver URL ({}) is not https://, so the online key source is DISABLED for every rip. Re-enter an https:// URL in Settings.",
         crate::webhook::webhook_url_origin(url)
     ))
 }
@@ -1671,6 +1671,7 @@ mod tests {
         let w = keyserver_url_startup_warning(&cfg("online", " http://keys.example.org/t0k/d"))
             .expect("http:// must warn");
         assert!(w.contains("https://") && !w.contains("t0k"), "{w}");
+        assert!(!w.contains("  "), "no stray whitespace runs: {w:?}");
         assert!(keyserver_url_startup_warning(&cfg("online", "https://k.example.org/d")).is_none());
         assert!(keyserver_url_startup_warning(&cfg("online", "")).is_none());
         assert!(keyserver_url_startup_warning(&cfg("local", "http://k.example.org/d")).is_none());
