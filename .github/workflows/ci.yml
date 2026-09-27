@@ -205,10 +205,10 @@ jobs:
     # dev is the FAST lane: this job still runs, but on the release-candidate
     # branches rather than on every push to dev. Nothing is deleted and no
     # platform stops being checked before a release -- qa.yml independently
-    # covers macOS and Windows, and the jobs unique to this file (the Intel
-    # macOS build, the Windows release build) run here on qa and main. A push
-    # to dev is meant to be cheap and frequent; waiting on three runner pools
-    # to agree is what a release candidate is for.
+    # covers macOS and Windows via its release-tests (macOS leg) and
+    # windows-build jobs, which run on qa and main. A push to dev is meant to
+    # be cheap and frequent; waiting on three runner pools to agree is what a
+    # release candidate is for.
     #
     # `if` SKIPS the job (it does not queue). A queued job would be far worse
     # than a slow one: a never-scheduled job leaves the run pending forever, so
@@ -248,10 +248,10 @@ jobs:
     # dev is the FAST lane: this job still runs, but on the release-candidate
     # branches rather than on every push to dev. Nothing is deleted and no
     # platform stops being checked before a release -- qa.yml independently
-    # covers macOS and Windows, and the jobs unique to this file (the Intel
-    # macOS build, the Windows release build) run here on qa and main. A push
-    # to dev is meant to be cheap and frequent; waiting on three runner pools
-    # to agree is what a release candidate is for.
+    # covers macOS and Windows via its release-tests (macOS leg) and
+    # windows-build jobs, which run on qa and main. A push to dev is meant to
+    # be cheap and frequent; waiting on three runner pools to agree is what a
+    # release candidate is for.
     #
     # `if` SKIPS the job (it does not queue). A queued job would be far worse
     # than a slow one: a never-scheduled job leaves the run pending forever, so

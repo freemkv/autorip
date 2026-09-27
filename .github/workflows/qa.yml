@@ -45,7 +45,9 @@ jobs:
   # Red on qa is a working gate, not an incident — it is the branch saying this
   # is not production worth yet. Fix on dev, get dev green, push qa again.
   #
-  # release.yml excludes v*-rc* so a candidate never publishes a release.
+  # release.yml also runs on this rc tag, but marks the GitHub release a
+  # prerelease and skips the :latest Docker tag — a candidate is published,
+  # never promoted to production.
   rc-tag:
     runs-on: ubuntu-latest
     permissions:
@@ -72,11 +74,14 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "### Candidate \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
 
-  # Build+push the candidate's Docker image — the SAME image release.yml would
-  # publish (identical Dockerfile.ci + qa source), tagged rc-only so it can be
-  # deployed and tested before promotion; :latest is never touched here. This
-  # exists because a GITHUB_TOKEN-pushed tag cannot trigger release.yml, so the
-  # rc tag alone would produce no image. Mirrors release.yml's build+docker jobs.
+  # Build+push the candidate's Docker image — the same Dockerfile.ci and qa
+  # source release.yml would use, tagged rc-only so it can be deployed and
+  # tested before promotion; :latest is never touched here. Not byte-identical
+  # to release.yml's image: this build skips --locked and CC=x86_64-linux-gnu-gcc,
+  # and its siblings are checked out at qa's branch tips rather than the
+  # Cargo.lock-pinned tags release.yml builds against. This exists because a
+  # GITHUB_TOKEN-pushed tag cannot trigger release.yml, so the rc tag alone
+  # would produce no image. Mirrors release.yml's build+docker jobs.
   rc-image:
     needs: rc-tag
     runs-on: ubuntu-latest
@@ -119,8 +124,9 @@ jobs:
           context: autorip
           file: autorip/Dockerfile.ci
           push: true
-          # rc-only tag — never :latest. Identical bytes to what release.yml
-          # would publish for the promoted version.
+          # rc-only tag — never :latest. NOT byte-identical to what release.yml
+          # would publish (no --locked, different CC, siblings at qa tips) —
+          # see the job-level comment above.
           tags: ghcr.io/freemkv/autorip:${{ needs.rc-tag.outputs.tag }}
 
   # The debug suite runs on every dev push. Release is a DIFFERENT build:
@@ -173,10 +179,10 @@ jobs:
       - run: cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
         working-directory: autorip
 
-  # Windows compiles the tests but does not run them, matching the policy
-  # ci.yml already set. The value here is codegen: the #[cfg(windows)] halves
-  # of the SCSI transport and platform layers compile on no other runner, so
-  # without this they are first built at release time.
+  # Windows compiles the tests in release mode but does not run them (unlike
+  # ci.yml's check-windows, which does run them in debug on qa/main). The
+  # value here is release-profile codegen coverage for the #[cfg(windows)]
+  # halves of the SCSI transport and platform layers.
   windows-build:
     runs-on: windows-latest
     steps:
