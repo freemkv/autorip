@@ -5552,6 +5552,40 @@ mod web_tests {
         }
 
         #[test]
+        fn settings_post_http_keyserver_url_is_rejected_like_the_rip_path() {
+            // The rip gates on keysources' https-only validator; save must use the
+            // same one, or an http:// URL saves fine and every rip has no online source.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            cfg.write().unwrap().keyserver_url = "https://8.8.8.8/keep/decode".to_string();
+
+            let (code, body) = roundtrip(
+                &cfg,
+                "POST",
+                "/api/settings",
+                Some(r#"{"keyserver_url": "http://8.8.8.8/decode"}"#),
+                &[],
+            );
+            assert_eq!(code, 400, "http:// keyserver_url must be rejected at save");
+            assert!(body.contains("https://"), "error must say why: {body}");
+            assert_eq!(
+                cfg.read().unwrap().keyserver_url,
+                "https://8.8.8.8/keep/decode"
+            );
+        }
+
+        #[test]
+        fn settings_post_keyserver_url_is_stored_trimmed() {
+            // Validation runs on the trimmed URL, so the trimmed URL is what is stored.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let patch = r#"{"keyserver_url": "  https://1.1.1.1/decode \n"}"#;
+            let (code, _) = roundtrip(&cfg, "POST", "/api/settings", Some(patch), &[]);
+            assert_eq!(code, 200);
+            assert_eq!(cfg.read().unwrap().keyserver_url, "https://1.1.1.1/decode");
+        }
+
+        #[test]
         fn settings_post_unresolvable_masked_webhook_leaves_output_dir_unmutated() {
             // Red/green regression for the write-guard early-return defect:
             // resolution runs INSIDE `cfg.write()` after ~20 fields have
@@ -6973,12 +7007,12 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         }
     }
     if let Some(v) = patch.get("keyserver_url").and_then(|v| v.as_str()) {
-        // SSRF guard: keysource.rs OnlineSource POSTs this URL verbatim at
-        // rip time, so a LAN client must not aim it at internal hosts. Empty
-        // disables the online source; a sentinel value skips re-validation.
+        // The SAME gate the rip applies (https-only + SSRF), so a URL that saves
+        // is one the rip will use. Empty disables the online source; a sentinel
+        // value skips re-validation.
         if !v.trim().is_empty()
             && !v.contains(SECRET_SENTINEL)
-            && let Err(e) = validate_fetch_url(v)
+            && let Err(e) = freemkv_keysources::validate_keyserver_url(v.trim())
         {
             return json_response(
                 request,
@@ -7245,7 +7279,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             // containing the sentinel — it is the masked form from GET
             // /api/settings and must not clobber the stored token-bearing URL.
             if !v.contains(SECRET_SENTINEL) {
-                c.keyserver_url = v.to_string();
+                c.keyserver_url = v.trim().to_string();
             }
         }
         if let Some(v) = patch.get("keyserver_secret").and_then(|v| v.as_str())
