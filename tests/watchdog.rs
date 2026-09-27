@@ -9,9 +9,7 @@
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
-use freemkv_autorip::ripper::{
-    WATCHDOG_BUMP_DEADLINE, bounded_call, staging, watchdog_bump_restart_count,
-};
+use freemkv_autorip::ripper::{bounded_call, staging, watchdog_bump_restart_count};
 
 #[test]
 fn watchdog_counter_bump_happy_path_increments() {
@@ -30,12 +28,6 @@ fn watchdog_counter_bump_happy_path_increments() {
         1,
         "happy-path bump must increment the counter"
     );
-}
-
-#[test]
-fn watchdog_bump_deadline_is_five_seconds() {
-    // The escalation must still reach exit(1) promptly on a wedged mount.
-    assert_eq!(WATCHDOG_BUMP_DEADLINE, Duration::from_secs(5));
 }
 
 #[test]

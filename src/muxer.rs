@@ -189,6 +189,15 @@ pub(crate) fn clear_error(path: &str) {
         .remove(path);
 }
 
+/// Clear `path`'s card only if its reason starts with `prefix` (a condition
+/// that has since resolved), leaving any other failure's card in place.
+pub(crate) fn clear_error_with_prefix(path: &str, prefix: &str) {
+    let mut m = MUX_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+    if m.get(path).is_some_and(|e| e.reason.starts_with(prefix)) {
+        m.remove(path);
+    }
+}
+
 /// Operator-initiated clear of a single mux error (the System-tab ✕). Removes
 /// the card AND marks the path dismissed so a persistently-erroring dir doesn't
 /// re-surface it on the next tick; the dismissal is lifted on the dir's next
@@ -303,6 +312,9 @@ pub(crate) enum MuxVerdict {
     /// drive-side classifier in `staging.rs`. The worker surfaces the reason and
     /// stops re-dispatching.
     SkipAbortedLoss,
+    /// `state.json` exists but can't be used, so the deliverable plan is unknown.
+    /// Held for the operator (one card, no re-dispatch, state.json untouched).
+    SkipUnreadableState,
     /// No `.ripped` hand-off marker — nothing for the worker to do here.
     SkipNoMarker,
     /// Snapshot is `None` — the dir's contents are UNKNOWN (read_dir / DirEntry
@@ -312,8 +324,8 @@ pub(crate) enum MuxVerdict {
 }
 
 // Pure dispatch decider. `snap` is `snapshot_staging_disc` (`None` ⇒ UNKNOWN). Order:
-// None→SkipUnknown, terminal→SkipTerminal, aborted-loss→SkipAbortedLoss, no
-// marker→SkipNoMarker, else→Dispatch.
+// None→SkipUnknown, terminal→SkipTerminal, unreadable state.json→SkipUnreadableState,
+// aborted-loss→SkipAbortedLoss, no marker→SkipNoMarker, else→Dispatch.
 pub(crate) fn mux_dispatch_verdict(
     snap: Option<&crate::ripper::staging::StagingSnapshot>,
 ) -> MuxVerdict {
@@ -325,6 +337,9 @@ pub(crate) fn mux_dispatch_verdict(
     // on `failed_reason.is_some()` would re-dispatch that dir forever.
     if snap.completed || snap.has_failed {
         return MuxVerdict::SkipTerminal;
+    }
+    if snap.state_unreadable.is_some() {
+        return MuxVerdict::SkipUnreadableState;
     }
     // A loss-abort is deterministic media damage — retrying re-muxes the whole
     // ISO every tick for the same result. Stop and surface the reason for the
@@ -441,7 +456,17 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         // post-mux delete, `.completed` (via the primed/retried
         // `snapshot_staging_disc`) still breaks the loop, per `mux_dispatch_verdict`.
         let snap = crate::ripper::staging::snapshot_staging_disc(&dir);
-        match mux_dispatch_verdict(snap.as_ref()) {
+        let verdict = mux_dispatch_verdict(snap.as_ref());
+        if !matches!(
+            verdict,
+            MuxVerdict::SkipUnreadableState | MuxVerdict::SkipUnknown
+        ) {
+            clear_error_with_prefix(
+                &dir.to_string_lossy(),
+                crate::ripper::staging::STATE_HELD_PREFIX,
+            );
+        }
+        match verdict {
             MuxVerdict::Dispatch => {
                 // Stamp `.muxing` the INSTANT Dispatch commits (before reading the
                 // marker) so `is_muxing` covers the whole dispatch — writing it later
@@ -457,6 +482,14 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                     .and_then(|s| s.aborted_loss_reason.clone())
                     .unwrap_or_else(|| "aborted: loss exceeded threshold".to_string());
                 record_error(&dir.to_string_lossy(), &reason, ABORTED_LOSS_HINT);
+                continue;
+            }
+            MuxVerdict::SkipUnreadableState => {
+                // Hold like SkipAbortedLoss: one de-duped card, no dispatch (so no
+                // undismiss, no mux-log spam) and state.json left for the operator.
+                if let Some(u) = snap.as_ref().and_then(|s| s.state_unreadable.as_ref()) {
+                    record_error(&dir.to_string_lossy(), &u.held_reason(), u.hint());
+                }
                 continue;
             }
             MuxVerdict::SkipTerminal | MuxVerdict::SkipNoMarker | MuxVerdict::SkipUnknown => {
@@ -696,6 +729,89 @@ mod tests {
         clear_error("/x/staging/Foo");
         let m = MUX_ERRORS.lock().unwrap();
         assert!(!m.contains_key("/x/staging/Foo"));
+    }
+
+    // A present-but-unreadable state.json must be held ONCE by the worker: one
+    // actionable card, no re-dispatch (so an operator dismissal sticks), and the
+    // bad state.json left untouched — with or without a legacy `.ripped` remnant.
+    #[test]
+    fn unreadable_state_json_is_held_once_not_redispatched() {
+        let _guard = crate::log::env_guard();
+        let tmp = TempDir::new().unwrap();
+        // SAFETY: env access in tests, serialized by env_guard.
+        unsafe {
+            std::env::set_var("AUTORIP_DIR", tmp.path());
+        }
+        let root = tmp.path().join("staging");
+        let legacy = root.join("Legacy_Show");
+        let bare = root.join("Bare_Show");
+        for d in [&legacy, &bare] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(crate::ripper::staging::STATE_FILE), b"{ torn").unwrap();
+        }
+        std::fs::write(
+            legacy.join(RIPPED_MARKER_NAME),
+            serde_json::to_vec(&sample_marker()).unwrap(),
+        )
+        .unwrap();
+        for d in [&legacy, &bare] {
+            let snap = crate::ripper::staging::snapshot_staging_disc(d);
+            assert_eq!(
+                mux_dispatch_verdict(snap.as_ref()),
+                MuxVerdict::SkipUnreadableState,
+                "{}",
+                d.display()
+            );
+        }
+
+        let cfg = Arc::new(RwLock::new(Config {
+            staging_dir: root.to_string_lossy().to_string(),
+            ..Config::default()
+        }));
+        check_and_mux(&cfg);
+        let path = legacy.to_string_lossy().to_string();
+        let card = MUX_ERRORS.lock().unwrap().get(&path).cloned();
+        let card = card.expect("the held dir must raise an operator card");
+        assert!(
+            card.reason
+                .starts_with(crate::ripper::staging::STATE_HELD_PREFIX)
+        );
+        assert!(card.hint.contains("state.json"), "hint: {}", card.hint);
+        assert!(
+            MUX_ERRORS
+                .lock()
+                .unwrap()
+                .contains_key(&bare.to_string_lossy().to_string()),
+            "the snapshot-fallback (no .ripped) case must surface too"
+        );
+
+        // Operator dismisses; the next tick must not re-dispatch and undo that.
+        clear_mux_error(&path);
+        check_and_mux(&cfg);
+        assert!(
+            !MUX_ERRORS.lock().unwrap().contains_key(&path),
+            "a held dir must not be re-dispatched (which undismisses the card)"
+        );
+        assert_eq!(
+            std::fs::read(legacy.join(crate::ripper::staging::STATE_FILE)).unwrap(),
+            b"{ torn",
+            "the unreadable state.json must be left for the operator"
+        );
+
+        // Repaired state.json → the held card clears on the next tick.
+        crate::ripper::staging::write_state(
+            &bare,
+            &crate::ripper::staging::DiscState::new(crate::ripper::staging::StagingState::Sweeping),
+        );
+        check_and_mux(&cfg);
+        assert!(
+            !MUX_ERRORS
+                .lock()
+                .unwrap()
+                .contains_key(&bare.to_string_lossy().to_string()),
+            "a repaired dir's held card must clear"
+        );
+        MUX_DISMISSED.lock().unwrap().remove(&path);
     }
 
     fn sample_marker() -> RippedMarker {
@@ -1521,7 +1637,7 @@ mod tests {
     fn muxing_marker_stamped_before_marker_read() {
         let src = crate::util::source_lf(include_str!("muxer.rs"));
         let start = src
-            .find("match mux_dispatch_verdict(snap.as_ref())")
+            .find("let verdict = mux_dispatch_verdict(snap.as_ref());")
             .expect("muxer.rs should dispatch on the verdict");
         let end = src[start..]
             .find("let outcome = crate::ripper::resume::remux_from_ripped_marker")

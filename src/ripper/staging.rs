@@ -271,27 +271,71 @@ pub fn read_state(staging_disc_dir: &Path) -> Option<DiscState> {
     (st.schema == DISC_STATE_SCHEMA).then_some(st)
 }
 
+/// Prefix of the reason on every "held: state.json unreadable" operator card, so
+/// the card can be cleared (and only it) once the file reads again.
+pub const STATE_HELD_PREFIX: &str = "Auto-resume held: ";
+
+/// Why an existing `state.json` can't be used. `transient` = an I/O error
+/// (EIO/ESTALE: retry may succeed); otherwise the bytes are corrupt or foreign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateUnreadable {
+    pub reason: String,
+    pub transient: bool,
+}
+
+impl StateUnreadable {
+    pub fn io(e: &io::Error) -> Self {
+        StateUnreadable {
+            reason: format!("state.json could not be read: {e}"),
+            transient: true,
+        }
+    }
+
+    pub fn invalid(reason: String) -> Self {
+        StateUnreadable {
+            reason,
+            transient: false,
+        }
+    }
+
+    /// Operator-card reason (starts with [`STATE_HELD_PREFIX`]).
+    pub fn held_reason(&self) -> String {
+        format!("{STATE_HELD_PREFIX}{}", self.reason)
+    }
+
+    /// Operator-card hint: retry for an I/O error, repair for bad contents.
+    pub fn hint(&self) -> &'static str {
+        if self.transient {
+            "state.json in this staging dir exists but could not be read (I/O error, e.g. a staging/NFS mount problem), so the rip is held and the ISO kept; check the staging mount, then retry the resume — it is re-checked automatically"
+        } else {
+            "state.json in this staging dir is corrupt or from another autorip version, so the deliverable plan (movie vs. TV episodes) is unknown; the rip is held and the ISO kept. Restore or repair state.json to resume. Deleting it instead delivers the disc as ONE title — a TV disc's episodes would not be split"
+        }
+    }
+}
+
 /// `state.json` read that tells a missing file (normal) apart from one that
 /// exists but can't be trusted (I/O error, unparseable, or a foreign schema).
 pub(crate) enum StateRead {
     Absent,
     Valid(Box<DiscState>),
-    Unreadable(String),
+    Unreadable(StateUnreadable),
 }
 
 pub(crate) fn read_state_checked(staging_disc_dir: &Path) -> StateRead {
     let bytes = match std::fs::read(state_path(staging_disc_dir)) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return StateRead::Absent,
-        Err(e) => return StateRead::Unreadable(format!("state.json could not be read: {e}")),
+        Err(e) => return StateRead::Unreadable(StateUnreadable::io(&e)),
     };
     match serde_json::from_slice::<DiscState>(&bytes) {
         Ok(st) if st.schema == DISC_STATE_SCHEMA => StateRead::Valid(Box::new(st)),
-        Ok(st) => StateRead::Unreadable(format!(
+        Ok(st) => StateRead::Unreadable(StateUnreadable::invalid(format!(
             "state.json is schema {} (expected {DISC_STATE_SCHEMA})",
             st.schema
-        )),
-        Err(e) => StateRead::Unreadable(format!("state.json is unparseable: {e}")),
+        ))),
+        Err(e) => StateRead::Unreadable(StateUnreadable::invalid(format!(
+            "state.json is unparseable: {e}"
+        ))),
     }
 }
 
@@ -302,11 +346,12 @@ pub(crate) fn read_state_or_warn_corrupt(staging_disc_dir: &Path) -> Option<Disc
     match read_state_checked(staging_disc_dir) {
         StateRead::Valid(st) => Some(*st),
         StateRead::Absent => None, // the normal first-write case.
-        StateRead::Unreadable(why) => {
+        StateRead::Unreadable(u) => {
             tracing::error!(
                 path = %state_path(staging_disc_dir).display(),
-                "{why} — a transition is starting from empty state, which drops \
-                 accumulated title/season/outputs metadata for this dir"
+                "{} — a transition is starting from empty state, which drops \
+                 accumulated title/season/outputs metadata for this dir",
+                u.reason
             );
             None
         }
@@ -1078,6 +1123,9 @@ pub struct StagingSnapshot {
     /// (partial NFS degradation). When true the snapshot must NOT be
     /// classified as empty, because the artifact counts may be undercounts.
     pub had_entry_error: bool,
+    /// `state.json` exists but can't be used (lifecycle fields above then come
+    /// from the legacy markers). The mux worker holds such a dir for the operator.
+    pub state_unreadable: Option<StateUnreadable>,
 }
 
 impl StagingSnapshot {
@@ -1563,13 +1611,17 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
     // Lifecycle projection: unified `state.json` wins; legacy markers are a
     // one-time migration fallback. It was read from the same primed listing,
     // so a cold-cache miss can't race it to "absent".
+    let mut state_unreadable = None;
     let life = if obs.has_state_file {
-        // A corrupt/torn `state.json` (parse fails) falls back to the legacy
-        // view rather than crashing — safe, since a torn write reads as the
-        // prior on-disk markers.
-        match read_state(dir) {
-            Some(st) => Lifecycle::from_state(&st),
-            None => Lifecycle::from_legacy(dir, &obs),
+        // A corrupt/torn `state.json` falls back to the legacy view rather than
+        // crashing, and is flagged so the mux worker holds instead of guessing.
+        match read_state_checked(dir) {
+            StateRead::Valid(st) => Lifecycle::from_state(&st),
+            StateRead::Absent => Lifecycle::from_legacy(dir, &obs),
+            StateRead::Unreadable(u) => {
+                state_unreadable = Some(u);
+                Lifecycle::from_legacy(dir, &obs)
+            }
         }
     } else if obs.has_any_lifecycle_marker() {
         // Legacy dir: derive the view now, then upgrade it in place so every
@@ -1599,6 +1651,7 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
         has_mapfile: obs.has_mapfile,
         has_mkv: obs.has_mkv,
         had_entry_error: obs.had_entry_error,
+        state_unreadable,
     })
 }
 

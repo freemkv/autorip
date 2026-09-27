@@ -472,8 +472,13 @@ fn record_loss_abort_write_failure(device: &str, staging_dir: &Path, reason: &st
 // Hold a dir whose state.json exists but can't be read: leave staging (ISO, partial
 // output, the bad state.json) untouched and surface it, since the recorded deliverable
 // plan (movie vs. TV episodes) is unknown and a guess would prune the ISO.
-fn hold_unreadable_plan(device: &str, staging_dir: &Path, display_name: &str, why: &str) {
-    let reason = format!("Auto-resume held: {why}");
+fn hold_unreadable_plan(
+    device: &str,
+    staging_dir: &Path,
+    display_name: &str,
+    why: &staging::StateUnreadable,
+) {
+    let reason = why.held_reason();
     crate::log::device_log(
         device,
         &format!(
@@ -482,11 +487,7 @@ fn hold_unreadable_plan(device: &str, staging_dir: &Path, display_name: &str, wh
         ),
     );
     if device != "_mux" {
-        crate::muxer::record_error(
-            &staging_dir.to_string_lossy(),
-            &reason,
-            "state.json in this staging dir is corrupt or from another version, so the rip is held (ISO kept) rather than delivered in a possibly wrong shape; restore or repair state.json, or delete it to deliver the disc as a single title",
-        );
+        crate::muxer::record_error(&staging_dir.to_string_lossy(), &reason, why.hint());
     }
     reset_status_after_ripping(device, "error", display_name, "", "", Some(reason));
 }
@@ -593,11 +594,15 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
     let plan_outputs: Vec<staging::Output> = match staging::read_state_checked(&staging_dir) {
         staging::StateRead::Valid(s) => s.outputs,
         staging::StateRead::Absent => Vec::new(),
-        staging::StateRead::Unreadable(why) => {
-            hold_unreadable_plan(device, &staging_dir, &display_name, &why);
+        staging::StateRead::Unreadable(u) => {
+            hold_unreadable_plan(device, &staging_dir, &display_name, &u);
             return;
         }
     };
+    crate::muxer::clear_error_with_prefix(
+        &staging_dir.to_string_lossy(),
+        staging::STATE_HELD_PREFIX,
+    );
     let is_fanout = plan_outputs.len() > 1;
 
     // One-shot operator override: `.accept-loss` makes the abort gates below
@@ -2406,11 +2411,34 @@ mod resume_remux_unreadable_plan_tests {
         assert_eq!(rs.status, "error");
         assert!(rs.last_error.contains("state.json"), "{}", rs.last_error);
         let path = staging.to_string_lossy().to_string();
-        assert!(
-            crate::muxer::MUX_ERRORS.lock().unwrap().contains_key(&path),
-            "an operator error card must be raised for the held dir"
+        let card = crate::muxer::MUX_ERRORS.lock().unwrap().get(&path).cloned();
+        let card = card.expect("an operator error card must be raised for the held dir");
+        // A parse/schema failure is not transient: point at repair, and warn
+        // that deleting state.json delivers a TV disc as one title.
+        assert!(card.hint.contains("ONE title"), "hint: {}", card.hint);
+        assert!(!card.hint.contains("retry"), "hint: {}", card.hint);
+
+        // Repaired: the next resume clears the held card (then fails on the
+        // missing ISO, which is fine here).
+        staging::write_state(
+            &staging,
+            &staging::DiscState::new(staging::StagingState::Ripped),
         );
-        crate::muxer::clear_mux_error(&path);
+        resume_remux(
+            &cfg,
+            &dev,
+            ResumeClass::Remux {
+                iso_path: staging.join("Show_S01D1.iso"),
+                mapfile_path: staging.join("Show_S01D1.iso.mapfile"),
+                display_name: "Show_S01D1".to_string(),
+                title_confident: None,
+            },
+        );
+        crate::ripper::STATE.lock().unwrap().remove(&dev);
+        assert!(
+            !crate::muxer::MUX_ERRORS.lock().unwrap().contains_key(&path),
+            "a readable state.json must clear the held card"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2422,6 +2450,19 @@ mod resume_remux_unreadable_plan_tests {
     #[test]
     fn foreign_schema_state_json_holds_instead_of_delivering() {
         assert_held(br#"{"schema": 1, "state": "ripped"}"#, "foreign");
+    }
+
+    // A transient read error (EIO/ESTALE) is not corruption: its hint must say
+    // retry, never "delete state.json".
+    #[test]
+    fn transient_read_error_hint_says_retry_not_delete() {
+        let io = staging::StateUnreadable::io(&std::io::Error::other("Stale file handle"));
+        assert!(io.transient);
+        assert!(io.hint().contains("retry"), "{}", io.hint());
+        assert!(!io.hint().contains("delete"), "{}", io.hint());
+        let bad = staging::StateUnreadable::invalid("state.json is unparseable".into());
+        assert!(!bad.transient);
+        assert!(bad.hint().contains("ONE title"), "{}", bad.hint());
     }
 }
 

@@ -42,7 +42,7 @@ pub fn bounded_call(name: &str, deadline: Duration, op: impl FnOnce() + Send + '
     rx.recv_timeout(deadline).is_ok()
 }
 
-/// The hard watchdog's `.restart_count` bump, bounded by [`WATCHDOG_BUMP_DEADLINE`]
+/// The hard watchdog's `.restart_count` bump, bounded by `WATCHDOG_BUMP_DEADLINE`
 /// so a wedged NFS syscall can't block the `exit(1)` that follows.
 pub fn watchdog_bump_restart_count(device: &str, staging_disc_dir: &std::path::Path) -> bool {
     let bump_dir = staging_disc_dir.to_path_buf();
@@ -1233,6 +1233,30 @@ pub(crate) fn mux_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The hard escalation must bump through the bounded production helper
+    // (tests/watchdog.rs covers its timeout) before `exit(1)`, never inline.
+    #[test]
+    fn hard_watchdog_bumps_via_the_bounded_helper_before_exit() {
+        let src = crate::util::source_lf(include_str!("mux.rs"));
+        let start = src
+            .find("fn spawn_mux_watchdog(")
+            .expect("watchdog spawner");
+        let body = &src[start..];
+        let esc = body
+            .find("if stall_secs >= HARD_WATCHDOG_STALL_SECS {")
+            .expect("hard escalation branch");
+        let exit = esc + body[esc..].find("std::process::exit(1)").expect("exit(1)");
+        let region = &body[esc..exit];
+        assert!(
+            region.contains("watchdog_bump_restart_count(&wd_device, &wd_staging_disc_dir)"),
+            "the hard watchdog must call watchdog_bump_restart_count before exit(1)"
+        );
+        assert!(
+            !region.contains("increment_restart_count("),
+            "the counter bump must not be inlined (unbounded) in the escalation"
+        );
+    }
 
     const DISC: u64 = 60_000_000_000; // 60 GB stand-in for a UHD
 
