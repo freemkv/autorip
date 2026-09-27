@@ -1762,6 +1762,10 @@ fn is_valid_poster_url(url: &str) -> bool {
         .any(|c| c.is_control() || c == '"' || c == '\'' || c == '<' || c == '>')
 }
 
+// 404 body for per-device routes naming a drive the poll loop never enumerated (no STATE
+// entry). The claim (known=false) refuses these too; this makes the rejection a 404, not 409.
+const UNKNOWN_DEVICE_BODY: &str = r#"{"ok":false,"error":"unknown device"}"#;
+
 // POST /api/title/<device>: operator's TMDB pick for the active disc.
 // Body: {"title","year","poster_url","overview"}. Stored as a one-shot
 // override `rip_disc` consumes; also reflected on the live card immediately.
@@ -1770,7 +1774,7 @@ fn handle_title_override(request: tiny_http::Request, device: &str) {
     // would persist orphaned; reject before reading the body, matching
     // how other per-device routes validate (404 unknown).
     if !ripper::device_known(device) {
-        return json_response(request, 404, r#"{"ok":false,"error":"unknown device"}"#);
+        return json_response(request, 404, UNKNOWN_DEVICE_BODY);
     }
     let (request, body) = match read_json_body(request) {
         Ok(rb) => rb,
@@ -5543,6 +5547,19 @@ mod web_tests {
             );
         }
 
+        // Unknown (never-enumerated) drives get 404 on every state-creating route, not 409 "busy".
+        #[test]
+        fn state_creating_routes_404_an_unknown_device() {
+            let cfg = Arc::new(RwLock::new(Config::default()));
+            for route in ["scan", "rip", "eject"] {
+                let dev = format!("zzunknown{route}");
+                let (code, body) =
+                    roundtrip(&cfg, "POST", &format!("/api/{route}/{dev}"), None, &[]);
+                assert_eq!(code, 404, "/api/{route} on an unknown device: {body}");
+                assert!(!crate::ripper::device_known(&dev));
+            }
+        }
+
         #[test]
         fn stop_route_rejects_invalid_device_name() {
             let cfg = Arc::new(RwLock::new(Config::default()));
@@ -7793,6 +7810,9 @@ fn handle_sse(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 }
 
 fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str) {
+    if !ripper::device_known(device) {
+        return json_response(request, 404, UNKNOWN_DEVICE_BODY);
+    }
     // Check-and-claim: `try_claim_active_checked` reads thread liveness
     // FIRST outside the STATE lock, then folds status-check+set into a
     // single STATE lock, closing the TOCTOU of two concurrent scan POSTs.
@@ -7854,6 +7874,9 @@ fn handle_scan(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &
 // work. resume=yes re-muxes an existing staging ISO (404 if none); resume=no
 // wipes staging first; no param does a fresh sweep+mux, keeping any staging dir.
 fn handle_rip(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, device: &str, query: &str) {
+    if !ripper::device_known(device) {
+        return json_response(request, 404, UNKNOWN_DEVICE_BODY);
+    }
     let resume_mode = parse_resume_param(query);
 
     // Check-and-claim — see `handle_scan` for the ordering. Closes the TOCTOU
@@ -8471,6 +8494,9 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
 }
 
 fn handle_eject(request: tiny_http::Request, device: &str) {
+    if !ripper::device_known(device) {
+        return json_response(request, 404, UNKNOWN_DEVICE_BODY);
+    }
     // Gate on rip status (BU40N is slot-loading; eject mid-rip is
     // irreversible), enforced server-side since POST is unauthenticated.
     // Claim first, closing the busy-check/eject TOCTOU via one STATE lock.
