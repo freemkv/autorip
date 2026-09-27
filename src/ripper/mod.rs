@@ -1259,7 +1259,20 @@ pub fn scan_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
     }
     // Decompose the session into the owned disc + live drive the rest of
     // scan_disc (resolve_keys_from_drive, unlocker matrix, store_session) uses.
-    let disc = session.take_disc().expect("scan populated the disc");
+    let Some(disc) = session.take_disc() else {
+        let msg = "Disc scan failed: the scan produced no disc".to_string();
+        crate::log::device_log(device, &msg);
+        update_state(
+            device,
+            RipState {
+                device: device.to_string(),
+                status: "error".to_string(),
+                last_error: msg,
+                ..Default::default()
+            },
+        );
+        return;
+    };
     // into_drive is fallible: stage_drive_as_reader moves the drive out, so an
     // empty slot is reachable through ordinary API use rather than being a
     // caller error. Report it the same way a failed scan is reported.
@@ -4809,13 +4822,9 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         mux_outcome.output_opened,
         mux_outcome.finalize_error.as_deref(),
     );
-    if let HeaderPhase::ResumableStop | HeaderPhase::Failed = header_phase {
+    if let HeaderPhase::ResumableStop | HeaderPhase::Failed(_) = header_phase {
         unregister_halt(device);
-        if let HeaderPhase::Failed = header_phase {
-            let reason = mux_outcome
-                .finalize_error
-                .as_ref()
-                .expect("finalize_error is Some when the header phase is HeaderPhase::Failed");
+        if let HeaderPhase::Failed(reason) = header_phase {
             crate::log::device_log(device, &format!("Mux failed: {reason}"));
             let staging_disc_path = std::path::Path::new(&staging);
             quarantine_or_log(
@@ -5651,16 +5660,10 @@ fn prune_intermediate_iso(
     }
 }
 
-// Whether a `run_mux` outcome that never opened its output is a terminal failure needing
-// quarantine, vs a clean resumable stop.
-fn header_phase_outcome_is_failure(output_opened: bool, finalize_error: Option<&str>) -> bool {
-    !output_opened && finalize_error.is_some()
-}
-
 /// What the orchestrator must do with a mux outcome, decided from the header
 /// phase alone.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum HeaderPhase {
+enum HeaderPhase<'a> {
     /// An output file was opened — carry on to the normal completion path
     /// (loss gate, fsync, `.done` / `.review`, `.completed`).
     Produced,
@@ -5669,19 +5672,17 @@ enum HeaderPhase {
     ResumableStop,
     /// No output was opened and the mux recorded why: the stream is
     /// structurally unusable. Quarantine (`.failed`) and surface it.
-    Failed,
+    Failed(&'a str),
 }
 
 // Route a mux outcome by its header phase. Folded into one predicate
 // so `output_opened` is consulted EXACTLY once (a double-test bug
 // previously sent a successful mux down the no-output path — rule 1).
-fn header_phase_disposition(output_opened: bool, finalize_error: Option<&str>) -> HeaderPhase {
-    if output_opened {
-        HeaderPhase::Produced
-    } else if header_phase_outcome_is_failure(output_opened, finalize_error) {
-        HeaderPhase::Failed
-    } else {
-        HeaderPhase::ResumableStop
+fn header_phase_disposition(output_opened: bool, finalize_error: Option<&str>) -> HeaderPhase<'_> {
+    match finalize_error {
+        _ if output_opened => HeaderPhase::Produced,
+        Some(reason) => HeaderPhase::Failed(reason),
+        None => HeaderPhase::ResumableStop,
     }
 }
 
@@ -6384,13 +6385,13 @@ mod tests {
         FmtsGate, FmtsGatePlan, HaltGuard, PatchDecision, SweepReadAction, SweepingGuard,
         aacs_failure_message, bad_sector_statuses, disk_space_preflight_message,
         disk_space_required_bytes, end_of_recovery_promotion, fmts_gate_decision, fmts_gate_plan,
-        format_lib_error, format_pass_error, header_phase_outcome_is_failure,
-        incomplete_mux_status, is_fmts_key_missing_error, is_safe_staging_segment,
-        list_staging_basenames, patch_made_progress, patch_pass_decision, plan_passes,
-        pre_pass_converged, prune_intermediate_iso, register_halt, resumable_dir_blocked,
-        resumable_for_disc, resume_remaining_iso_bytes, scope_bad_bytes, scope_converged,
-        skip_diskcheck_value, staging_dir_matches_disc, staging_disc_owned_by_worker,
-        staging_free_bytes, sweep_transport_retry,
+        format_lib_error, format_pass_error, header_phase_disposition, incomplete_mux_status,
+        is_fmts_key_missing_error, is_safe_staging_segment, list_staging_basenames,
+        patch_made_progress, patch_pass_decision, plan_passes, pre_pass_converged,
+        prune_intermediate_iso, register_halt, resumable_dir_blocked, resumable_for_disc,
+        resume_remaining_iso_bytes, scope_bad_bytes, scope_converged, skip_diskcheck_value,
+        staging_dir_matches_disc, staging_disc_owned_by_worker, staging_free_bytes,
+        sweep_transport_retry,
     };
     use crate::ripper::session::device_halt;
     use crate::ripper::staging;
@@ -6755,32 +6756,28 @@ mod tests {
     }
 
     // Regression: `output_opened=false` + `finalize_error=Some` must classify as a terminal
-    // failure (quarantine); `None` stays resumable.
+    // failure (quarantine) carrying its reason; `None` stays resumable.
     #[test]
     fn header_phase_finalize_error_is_terminal_failure() {
-        // finalize_error=Some → terminal failure (quarantine).
-        assert!(
-            header_phase_outcome_is_failure(false, Some("header buffer exceeded cap")),
-            "output never opened with a finalize_error must be a terminal failure"
-        );
-        assert!(
-            header_phase_outcome_is_failure(false, Some("header resolution incomplete")),
-            "header-resolution-incomplete must be a terminal failure"
-        );
-
-        // finalize_error=None → clean stop, stays resumable (not a failure).
-        assert!(
-            !header_phase_outcome_is_failure(false, None),
+        use super::HeaderPhase;
+        for reason in ["header buffer exceeded cap", "header resolution incomplete"] {
+            assert_eq!(
+                header_phase_disposition(false, Some(reason)),
+                HeaderPhase::Failed(reason),
+                "output never opened with a finalize_error must be a terminal failure"
+            );
+        }
+        assert_eq!(
+            header_phase_disposition(false, None),
+            HeaderPhase::ResumableStop,
             "a clean header-phase stop (halt) must stay resumable, not quarantined"
         );
-
-        // output_opened=true → not a header-phase failure (handled by the
-        // post-finalize path further down rip_disc, never this branch).
-        assert!(!header_phase_outcome_is_failure(true, None));
-        assert!(!header_phase_outcome_is_failure(
-            true,
-            Some("post-mux finalize error")
-        ));
+        // output_opened=true is handled by the post-finalize path, never this branch.
+        assert_eq!(header_phase_disposition(true, None), HeaderPhase::Produced);
+        assert_eq!(
+            header_phase_disposition(true, Some("post-mux finalize error")),
+            HeaderPhase::Produced
+        );
     }
 
     // Regression: a hard read error must map to `status="error"` with a non-empty cause, not
@@ -9738,7 +9735,7 @@ mod tests {
         );
         assert_eq!(
             header_phase_disposition(false, Some("header buffer cap exceeded")),
-            HeaderPhase::Failed,
+            HeaderPhase::Failed("header buffer cap exceeded"),
             "no output plus a recorded reason is terminal — quarantine it"
         );
         assert_eq!(
