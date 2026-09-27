@@ -538,35 +538,70 @@ fn forget_removed_device(device: &str) -> bool {
     true
 }
 
-/// Why a drive's disc probe failed, as the poll loop reacts to it.
+/// How the poll loop reacts to a failed disc probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeFailure {
     /// Absent from the enumeration: unplugged, left for the next rescan.
     HotUnplug,
-    /// Still enumerated but not answering: firmware wedge, surfaced in the UI.
-    Wedged,
+    /// Newly found enumerated but not answering: warn and surface the wedge in the UI.
+    NewWedge,
+    /// Already reported wedged: stay quiet until it answers or is removed.
+    KnownWedge,
 }
 
-// Classify a failed probe. A classification made since the last rescan is reused and the
-// enumeration runs at most once per tick (`tick_enum`), so a failing drive can't force a full
-// `list_drives` (INQUIRY to every drive, busy ones included) on every tick.
-fn classify_probe_failure(
-    path: &str,
-    prior: Option<ProbeFailure>,
-    tick_enum: &mut Option<Vec<String>>,
-    enumerate: impl FnOnce() -> Vec<String>,
-) -> ProbeFailure {
-    if let Some(p) = prior {
-        return p;
+// Probe-failure bookkeeping for the poll loop. A wedge is remembered until the drive answers or
+// is removed, an unplug suspect until the next rescan; neither is re-enumerated meanwhile, so a
+// failing drive can't force `list_drives` (INQUIRY to every drive, busy ones too) every tick.
+#[derive(Default)]
+struct ProbeFailTracker {
+    wedged: std::collections::HashSet<String>,
+    unplug_suspect: std::collections::HashSet<String>,
+    /// This tick's latest enumeration, always taken before the probe being classified.
+    tick_enum: Option<Vec<String>>,
+}
+
+impl ProbeFailTracker {
+    fn begin_tick(&mut self) {
+        self.tick_enum = None;
     }
-    if tick_enum
-        .get_or_insert_with(enumerate)
-        .iter()
-        .any(|p| p == path)
-    {
-        ProbeFailure::Wedged
-    } else {
-        ProbeFailure::HotUnplug
+
+    fn on_rescan(&mut self, fresh: Vec<String>) {
+        self.unplug_suspect.clear();
+        self.tick_enum = Some(fresh);
+    }
+
+    /// The drive answered, or it was torn down: forget any failure recorded for it.
+    fn clear(&mut self, device: &str) {
+        self.wedged.remove(device);
+        self.unplug_suspect.remove(device);
+    }
+
+    fn on_probe_err(
+        &mut self,
+        device: &str,
+        path: &str,
+        enumerate: impl FnOnce() -> Vec<String>,
+    ) -> ProbeFailure {
+        if self.wedged.contains(device) {
+            return ProbeFailure::KnownWedge;
+        }
+        if self.unplug_suspect.contains(device) {
+            return ProbeFailure::HotUnplug;
+        }
+        // An older snapshot proves absence, but only one taken after this failed probe may
+        // declare a wedge: the drive could have been unplugged in between.
+        let listed = |snap: &Vec<String>| snap.iter().any(|p| p == path);
+        let present = match self.tick_enum.as_ref().map(listed) {
+            Some(false) => false,
+            _ => listed(self.tick_enum.insert(enumerate())),
+        };
+        if present {
+            self.wedged.insert(device.to_string());
+            ProbeFailure::NewWedge
+        } else {
+            self.unplug_suspect.insert(device.to_string());
+            ProbeFailure::HotUnplug
+        }
     }
 }
 
@@ -679,9 +714,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     let mut last_rescan = std::time::Instant::now();
 
     let mut had_disc: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut warned_probe_fail: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Failed-probe drives found absent from the enumeration; the next rescan settles them.
-    let mut unplug_suspect: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut probe_fail = ProbeFailTracker::default();
     let mut device_first_seen: std::collections::HashMap<String, std::time::Instant> =
         std::collections::HashMap::new();
     for d in &initial_drives {
@@ -699,7 +732,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     );
 
     while !crate::SHUTDOWN.load(Ordering::Relaxed) {
-        let mut tick_enum: Option<Vec<String>> = None;
+        probe_fail.begin_tick();
         // Periodic hot-plug reconcile: re-enumerate drives and diff against
         // the cached path list. New devices start being polled; removed devices
         // have their session cleared so the UI doesn't show a phantom drive.
@@ -707,8 +740,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
             last_rescan = std::time::Instant::now();
             let fresh = libfreemkv::list_drives();
             let fresh_paths: Vec<String> = fresh.iter().map(|d| d.path.clone()).collect();
-            tick_enum = Some(fresh_paths.clone());
-            unplug_suspect.clear();
+            probe_fail.on_rescan(fresh_paths.clone());
             // Added: in fresh but not in drive_paths.
             for d in &fresh {
                 if !drive_paths.contains(&d.path) {
@@ -739,7 +771,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                         continue;
                     }
                     had_disc.remove(&device);
-                    warned_probe_fail.remove(&device);
+                    probe_fail.clear(&device);
                     device_first_seen.remove(&device);
                 }
             }
@@ -774,29 +806,20 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 // failed (drive permanently bricked).
                 let disc_present = match libfreemkv::drive_has_disc(std::path::Path::new(path)) {
                     Ok(p) => {
-                        warned_probe_fail.remove(&device);
-                        unplug_suspect.remove(&device);
+                        probe_fail.clear(&device);
                         p
                     }
                     Err(e) => {
                         // A drive gone from the enumeration is unplugged, not wedged: skip
                         // the tile and let the next rescan clean up.
-                        let prior = if warned_probe_fail.contains(&device) {
-                            Some(ProbeFailure::Wedged)
-                        } else if unplug_suspect.contains(&device) {
-                            Some(ProbeFailure::HotUnplug)
-                        } else {
-                            None
-                        };
                         let enumerate = || {
                             libfreemkv::list_drives()
                                 .into_iter()
                                 .map(|d| d.path)
                                 .collect()
                         };
-                        let class = classify_probe_failure(path, prior, &mut tick_enum, enumerate);
+                        let class = probe_fail.on_probe_err(&device, path, enumerate);
                         if class == ProbeFailure::HotUnplug {
-                            unplug_suspect.insert(device.clone());
                             tracing::debug!(
                                 device = %device,
                                 path = %path,
@@ -805,7 +828,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                             );
                             continue;
                         }
-                        if warned_probe_fail.insert(device.clone()) {
+                        if class == ProbeFailure::NewWedge {
                             tracing::warn!(
                                 device = %device,
                                 path = %path,
@@ -10136,67 +10159,135 @@ mod tv_plan_tests {
 
 #[cfg(test)]
 mod probe_failure_tests {
-    use super::{ProbeFailure, classify_probe_failure};
+    use super::{ProbeFailTracker, ProbeFailure};
     use std::cell::Cell;
 
     fn paths(p: &[&str]) -> Vec<String> {
         p.iter().map(|s| s.to_string()).collect()
     }
 
-    #[test]
-    fn enumeration_membership_separates_unplug_from_wedge() {
-        let mut tick = None;
-        let r = classify_probe_failure("/dev/sg1", None, &mut tick, || paths(&["/dev/sg2"]));
-        assert_eq!(r, ProbeFailure::HotUnplug);
-        let mut tick = None;
-        let r = classify_probe_failure("/dev/sg1", None, &mut tick, || paths(&["/dev/sg1"]));
-        assert_eq!(r, ProbeFailure::Wedged);
+    fn no_enum() -> Vec<String> {
+        panic!("must not enumerate here")
     }
 
     #[test]
-    fn already_classified_drive_is_not_re_enumerated() {
-        let calls = Cell::new(0);
-        let enumerate = || {
-            calls.set(calls.get() + 1);
-            paths(&["/dev/sg1"])
-        };
-        for prior in [ProbeFailure::Wedged, ProbeFailure::HotUnplug] {
-            let mut tick = None;
-            let r = classify_probe_failure("/dev/sg1", Some(prior), &mut tick, enumerate);
-            assert_eq!(r, prior);
-        }
+    fn enumeration_membership_separates_unplug_from_wedge() {
+        let mut t = ProbeFailTracker::default();
+        let r = t.on_probe_err("sg1", "/dev/sg1", || paths(&["/dev/sg2"]));
+        assert_eq!(r, ProbeFailure::HotUnplug);
+        let mut t = ProbeFailTracker::default();
+        let r = t.on_probe_err("sg1", "/dev/sg1", || paths(&["/dev/sg1"]));
+        assert_eq!(r, ProbeFailure::NewWedge);
+    }
+
+    #[test]
+    fn a_reported_wedge_is_not_re_enumerated_across_ticks_and_rescans() {
+        let mut t = ProbeFailTracker::default();
+        t.begin_tick();
         assert_eq!(
-            calls.get(),
-            0,
-            "a drive classified since the last rescan must not trigger list_drives every tick"
+            t.on_probe_err("sg1", "/dev/sg1", || paths(&["/dev/sg1"])),
+            ProbeFailure::NewWedge
+        );
+        for _ in 0..3 {
+            t.begin_tick();
+            assert_eq!(
+                t.on_probe_err("sg1", "/dev/sg1", no_enum),
+                ProbeFailure::KnownWedge
+            );
+        }
+        t.on_rescan(paths(&["/dev/sg1"]));
+        assert_eq!(
+            t.on_probe_err("sg1", "/dev/sg1", no_enum),
+            ProbeFailure::KnownWedge
         );
     }
 
     #[test]
-    fn enumeration_runs_at_most_once_per_tick() {
+    fn an_unplug_suspect_waits_for_the_rescan() {
+        let mut t = ProbeFailTracker::default();
+        assert_eq!(
+            t.on_probe_err("sg1", "/dev/sg1", Vec::new),
+            ProbeFailure::HotUnplug
+        );
+        t.begin_tick();
+        assert_eq!(
+            t.on_probe_err("sg1", "/dev/sg1", no_enum),
+            ProbeFailure::HotUnplug
+        );
+        // Still listed at the rescan: re-check once against a post-probe enumeration.
+        t.on_rescan(paths(&["/dev/sg1"]));
+        let r = t.on_probe_err("sg1", "/dev/sg1", || paths(&["/dev/sg1"]));
+        assert_eq!(r, ProbeFailure::NewWedge);
+    }
+
+    #[test]
+    fn recovery_or_teardown_rearms_the_warning() {
+        let mut t = ProbeFailTracker::default();
+        t.on_probe_err("sg1", "/dev/sg1", || paths(&["/dev/sg1"]));
+        t.clear("sg1");
+        t.begin_tick();
+        let r = t.on_probe_err("sg1", "/dev/sg1", || paths(&["/dev/sg1"]));
+        assert_eq!(
+            r,
+            ProbeFailure::NewWedge,
+            "a drive that recovered then re-wedged warns again"
+        );
+    }
+
+    #[test]
+    fn a_stale_snapshot_cannot_declare_a_wedge() {
+        // The rescan listed sg1, then it was unplugged before its probe failed.
+        let calls = Cell::new(0);
+        let mut t = ProbeFailTracker::default();
+        t.on_rescan(paths(&["/dev/sg1"]));
+        let r = t.on_probe_err("sg1", "/dev/sg1", || {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        });
+        assert_eq!(r, ProbeFailure::HotUnplug);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_snapshot_proves_absence_without_re_enumerating() {
+        let mut t = ProbeFailTracker::default();
+        t.on_rescan(paths(&["/dev/sg2"]));
+        assert_eq!(
+            t.on_probe_err("sg1", "/dev/sg1", no_enum),
+            ProbeFailure::HotUnplug
+        );
+    }
+
+    #[test]
+    fn enumeration_is_bounded_per_tick() {
         let calls = Cell::new(0);
         let enumerate = || {
             calls.set(calls.get() + 1);
             paths(&["/dev/sg1"])
         };
-        let mut tick = None;
-        let a = classify_probe_failure("/dev/sg1", None, &mut tick, enumerate);
-        let b = classify_probe_failure("/dev/sg2", None, &mut tick, enumerate);
-        assert_eq!((a, b), (ProbeFailure::Wedged, ProbeFailure::HotUnplug));
+        let mut t = ProbeFailTracker::default();
+        t.begin_tick();
+        assert_eq!(
+            t.on_probe_err("sg1", "/dev/sg1", enumerate),
+            ProbeFailure::NewWedge
+        );
+        assert_eq!(
+            t.on_probe_err("sg2", "/dev/sg2", enumerate),
+            ProbeFailure::HotUnplug
+        );
         assert_eq!(
             calls.get(),
             1,
-            "two failing drives in one tick must share one enumeration"
+            "an absent drive reuses this tick's enumeration"
         );
-    }
-
-    #[test]
-    fn rescan_snapshot_is_reused_within_the_tick() {
-        let mut tick = Some(paths(&["/dev/sg1"]));
-        let r = classify_probe_failure("/dev/sg1", None, &mut tick, || {
-            panic!("the rescan already enumerated this tick")
-        });
-        assert_eq!(r, ProbeFailure::Wedged);
+        t.begin_tick();
+        t.on_probe_err("sg1", "/dev/sg1", enumerate);
+        t.on_probe_err("sg2", "/dev/sg2", enumerate);
+        assert_eq!(
+            calls.get(),
+            1,
+            "classified drives cost nothing on later ticks"
+        );
     }
 
     #[test]
