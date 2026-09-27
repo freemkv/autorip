@@ -6318,6 +6318,56 @@ mod web_tests {
         // ── SSE first frame (GET /events): it loops forever, so roundtrip
         // (reads to EOF) would hang. Run the handler on its own thread, read
         // the first SSE frame, then drop the socket so the next write fails.
+
+        fn read_first_sse_frame(r: &mut impl Read) -> Vec<u8> {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = r.read(&mut chunk).expect("read first frame");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let find = |hay: &[u8], pat: &[u8]| hay.windows(pat.len()).position(|w| w == pat);
+                if let Some(h) = find(&buf, b"\r\n\r\n") {
+                    let body = h + 4;
+                    // An SSE frame ends at its blank line, never at a `}`.
+                    if let Some(end) = find(&buf[body..], b"\n\n") {
+                        buf.truncate(body + end + 2);
+                        break;
+                    }
+                }
+            }
+            buf
+        }
+
+        // Global STATE grows under parallel tests, so the frame can span reads; a read ending
+        // on a nested `}` must not be taken as the end of the frame.
+        #[test]
+        fn read_first_sse_frame_waits_for_the_frame_terminator() {
+            struct Chunks(Vec<&'static [u8]>);
+            impl Read for Chunks {
+                fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                    if self.0.is_empty() {
+                        return Ok(0);
+                    }
+                    let c = self.0.remove(0);
+                    out[..c.len()].copy_from_slice(c);
+                    Ok(c.len())
+                }
+            }
+            let mut r = Chunks(vec![
+                b"HTTP/1.1 200 OK\r\n\r\ndata: {\"a\":{\"b\":1}",
+                b",\"c\":2}\n\n",
+                b"data: {}\n\n",
+            ]);
+            let buf = read_first_sse_frame(&mut r);
+            assert_eq!(
+                String::from_utf8_lossy(&buf),
+                "HTTP/1.1 200 OK\r\n\r\ndata: {\"a\":{\"b\":1},\"c\":2}\n\n"
+            );
+        }
+
         #[test]
         fn sse_emits_a_json_state_first_frame() {
             let cfg = Arc::new(RwLock::new(Config::default()));
@@ -6338,20 +6388,7 @@ mod web_tests {
                 .expect("write request");
             stream.flush().ok();
 
-            // Read until we have headers + the first complete SSE frame.
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 1024];
-            loop {
-                let n = stream.read(&mut chunk).expect("read first frame");
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                let s = String::from_utf8_lossy(&buf);
-                if s.contains("\r\n\r\ndata: ") && s.trim_end().ends_with('}') {
-                    break;
-                }
-            }
+            let buf = read_first_sse_frame(&mut stream);
             drop(stream);
             handler.join().expect("handler thread");
 
