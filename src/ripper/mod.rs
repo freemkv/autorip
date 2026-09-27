@@ -2995,17 +2995,13 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             } else {
                 None
             };
-            let title_output_bytes = if output_is_iso_image(&output_format) {
-                0
-            } else {
-                mux_output_reserve_bytes(
-                    &disc.titles,
-                    &cfg_read,
-                    &tmdb_media_type,
-                    &disc_name,
-                    title.size_bytes,
-                )
-            };
+            let title_output_bytes = mux_output_reserve_bytes(
+                &disc.titles,
+                &cfg_read,
+                &tmdb_media_type,
+                &disc_name,
+                title.size_bytes,
+            );
             let required = disk_space_required_bytes(
                 bytes_total_disc,
                 title_output_bytes,
@@ -5273,8 +5269,7 @@ fn fanout_episode_indices(
     indices
 }
 
-// Staging bytes the mux phase writes before the ISO is pruned: every planned output
-// (one per episode under TV fan-out), never less than the selected title.
+// Staging bytes the mux phase writes before the ISO is pruned, for a fresh rip's plan.
 fn mux_output_reserve_bytes(
     titles: &[libfreemkv::DiscTitle],
     cfg: &Config,
@@ -5282,11 +5277,30 @@ fn mux_output_reserve_bytes(
     disc_name: &str,
     selected_title_bytes: u64,
 ) -> u64 {
-    fanout_episode_indices(titles, cfg, media_type, disc_name)
+    let fanout = fanout_episode_indices(titles, cfg, media_type, disc_name);
+    mux_reserve_for(cfg, titles, &fanout, selected_title_bytes)
+}
+
+// Bytes muxed into staging for `fanout` episode titles (empty = one selected-title output).
+// ISO output is the image itself; a network sink never lands in staging.
+pub(super) fn mux_reserve_for(
+    cfg: &Config,
+    titles: &[libfreemkv::DiscTitle],
+    fanout: &[usize],
+    selected_title_bytes: u64,
+) -> u64 {
+    if output_is_iso_image(&cfg.output_format)
+        || staging::is_network_output(&cfg.output_format, &cfg.network_target)
+    {
+        return 0;
+    }
+    if fanout.is_empty() {
+        return selected_title_bytes;
+    }
+    fanout
         .iter()
         .filter_map(|&i| titles.get(i))
         .fold(0u64, |acc, t| acc.saturating_add(t.size_bytes))
-        .max(selected_title_bytes)
 }
 
 // Decide the deliverables a captured disc produces: titles to mux out of the ISO + staging
@@ -10512,14 +10526,31 @@ mod tv_plan_tests {
             planned,
             "reserve equals the sum of planned outputs"
         );
-        // Play-all selected: never reserve less than the selected title.
+        // Play-all selected: the plan never muxes it, so reserve the episode sum.
         let mut with_playall = vec![title(ep * 7.0, 50)];
         with_playall.extend(titles.iter().cloned());
         let big = with_playall[0].size_bytes;
+        assert!(big > sum);
         assert_eq!(
             mux_output_reserve_bytes(&with_playall, &cfg, "tv", "Show Season 1", big),
-            big.max(sum)
+            sum
         );
+        // ISO output / network sink: nothing muxed lands in staging.
+        for (fmt, target) in [
+            (crate::config::OUTPUT_FORMAT_ISO, ""),
+            (crate::config::OUTPUT_FORMAT_NETWORK, "sink.example:9000"),
+        ] {
+            let c = Config {
+                output_format: fmt.to_string(),
+                network_target: target.to_string(),
+                ..Config::default()
+            };
+            assert_eq!(
+                mux_output_reserve_bytes(&titles, &c, "tv", "Show Season 1", selected),
+                0,
+                "{fmt}"
+            );
+        }
         // Movie / tv_auto off: one output, the selected title.
         assert_eq!(
             mux_output_reserve_bytes(&titles, &cfg, "movie", "Some Film", selected),

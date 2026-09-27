@@ -550,6 +550,27 @@ fn resume_effective_abort(accept_loss: bool, output_format: &str, configured: u6
     }
 }
 
+// Refusal message when staging can't hold the re-mux outputs. Outputs left by an earlier
+// attempt are overwritten, so their bytes count as free; unknown free space is not a refusal.
+fn remux_space_shortfall(
+    required: u64,
+    existing_output_bytes: u64,
+    avail: Option<u64>,
+    staging: &str,
+) -> Option<String> {
+    let avail = avail?;
+    if avail.saturating_add(existing_output_bytes) >= required {
+        return None;
+    }
+    let gib = |b: u64| b as f64 / crate::util::BYTES_PER_GIB;
+    Some(format!(
+        "Not enough staging disk space to mux the saved disc image — need ≥ {:.1} GiB free at {} for the planned outputs, have {:.1} GiB. Free up space or set Staging Directory in Settings to a larger volume; the disc image is kept for a retry.",
+        gib(required.saturating_sub(existing_output_bytes)),
+        staging,
+        gib(avail),
+    ))
+}
+
 pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: ResumeClass) {
     let ResumeClass::Remux {
         iso_path,
@@ -845,6 +866,32 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // update_state call further below). reset_status_after_ripping
         // deferral reason without flagging a hard failure.
         defer_status_after_ripping(device, &display_name, &disc_format, &duration, reason);
+        return;
+    }
+
+    // Space preflight: the ISO is already staged, so only the planned outputs need room.
+    let fanout: Vec<usize> = if is_fanout {
+        plan_outputs.iter().map(|o| o.title_index).collect()
+    } else {
+        Vec::new()
+    };
+    let required = super::mux_reserve_for(&cfg_read, &disc.titles, &fanout, title.size_bytes);
+    let existing: u64 = plan_outputs
+        .iter()
+        .filter_map(|o| staging_dir.join(&o.filename).metadata().ok())
+        .fold(0u64, |acc, m| acc.saturating_add(m.len()));
+    let staging_label = staging_dir.to_string_lossy();
+    let avail = staging::staging_free_bytes(&staging_label);
+    if let Some(msg) = remux_space_shortfall(required, existing, avail, &staging_label) {
+        crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
+        reset_status_after_ripping(
+            device,
+            "error",
+            &display_name,
+            &disc_format,
+            &duration,
+            Some(msg),
+        );
         return;
     }
 
@@ -1833,6 +1880,30 @@ fn resolve_keys_from_iso(
 // Tests live in `tests/resume_remux.rs` (integration tests) — they
 // pattern-match on `ResumeClass` and exercise `classify_resume`. But
 // `find_iso_and_mapfile` is `pub(super)`, so it's unit-tested in-module here.
+
+#[cfg(test)]
+mod remux_space_tests {
+    use super::remux_space_shortfall;
+
+    const GB: u64 = 1_000_000_000;
+
+    #[test]
+    fn remux_refuses_when_staging_cannot_hold_the_planned_outputs() {
+        let msg = remux_space_shortfall(30 * GB, 0, Some(10 * GB), "/staging/sr0")
+            .expect("10 GB free cannot hold 30 GB of episodes");
+        assert!(msg.contains("/staging/sr0"), "{msg}");
+        assert!(msg.contains("Staging Directory"), "{msg}");
+        assert!(!msg.contains("STAGING_DIR"), "{msg}");
+        // Earlier-attempt outputs get overwritten, so they count toward free space.
+        assert_eq!(
+            remux_space_shortfall(30 * GB, 20 * GB, Some(10 * GB), "/s"),
+            None
+        );
+        assert_eq!(remux_space_shortfall(30 * GB, 0, Some(30 * GB), "/s"), None);
+        assert_eq!(remux_space_shortfall(0, 0, Some(0), "/s"), None);
+        assert_eq!(remux_space_shortfall(30 * GB, 0, None, "/s"), None);
+    }
+}
 
 #[cfg(test)]
 mod find_iso_tests {
