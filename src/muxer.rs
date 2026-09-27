@@ -266,6 +266,8 @@ fn prune_stale_errors_with(absent: impl Fn(&str) -> bool) {
             m.remove(p);
         }
     }
+    // Removal trusts the unlocked probe (re-probing here would be I/O under the lock). Worst
+    // case, a dir recreated mid-prune loses its dismissal and its next error card shows once.
     let mut d = MUX_DISMISSED.lock().unwrap_or_else(|e| e.into_inner());
     for p in &stale {
         d.remove(p);
@@ -746,21 +748,13 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    // Retry briefly so a parallel test's momentary lock isn't mistaken for OUR thread holding it.
-    fn lock_is_free<T>(m: &Mutex<T>) -> bool {
-        (0..200).any(|_| {
-            let free = m.try_lock().is_ok();
-            if !free {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            free
-        })
-    }
-
     // The absence probe is a stat that can block on a hung NFS mount; neither error map may be
     // locked while it runs.
     #[test]
     fn prune_stale_errors_probes_without_holding_locks() {
+        let _g = crate::mover::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let err_path = "/x/staging/prune-lock-err";
         let dis_path = "/x/staging/prune-lock-dismissed";
         record_error(err_path, "r", "h");
@@ -771,8 +765,8 @@ mod tests {
         let probed = Mutex::new(Vec::<(String, bool, bool)>::new());
         prune_stale_errors_with(|p| {
             if p == err_path || p == dis_path {
-                let e = lock_is_free(&MUX_ERRORS);
-                let d = lock_is_free(&MUX_DISMISSED);
+                let e = crate::mover::test_lock_is_free(&MUX_ERRORS);
+                let d = crate::mover::test_lock_is_free(&MUX_DISMISSED);
                 probed.lock().unwrap().push((p.to_string(), e, d));
                 return true;
             }
@@ -794,9 +788,13 @@ mod tests {
         assert!(!dis_left, "an absent dir's dismissal must be pruned");
     }
 
-    // End to end on a real filesystem: gone dirs are pruned, a live dir keeps its card.
+    // Real-filesystem probe: gone dirs are pruned, a live dir keeps its card. Filtered to this
+    // test's own paths so it can't prune other tests' fake /x/staging entries.
     #[test]
     fn prune_stale_errors_drops_only_absent_dirs() {
+        let _g = crate::mover::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let live = tmp.path().join("Live").to_string_lossy().to_string();
         let gone = tmp.path().join("Gone").to_string_lossy().to_string();
@@ -809,7 +807,8 @@ mod tests {
         record_error(&live, "r", "h");
         record_error(&gone, "r", "h");
         MUX_DISMISSED.lock().unwrap().insert(gone_dismissed.clone());
-        prune_stale_errors();
+        let root = tmp.path().to_string_lossy().to_string();
+        prune_stale_errors_with(|p| p.starts_with(&root) && definitely_absent(p));
         let live_kept = MUX_ERRORS.lock().unwrap().contains_key(&live);
         let gone_kept = MUX_ERRORS.lock().unwrap().contains_key(&gone);
         let dismissed_kept = MUX_DISMISSED.lock().unwrap().contains(&gone_dismissed);

@@ -50,6 +50,19 @@ pub static ACTIVE_MOVE_DIR: once_cell::sync::Lazy<Mutex<Option<String>>> =
 #[cfg(test)]
 pub(crate) static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
 
+// Whether another thread can take `m`. Retries briefly so a parallel test's momentary lock
+// isn't mistaken for the CALLING thread holding it (which never frees within the window).
+#[cfg(test)]
+pub(crate) fn test_lock_is_free<T>(m: &Mutex<T>) -> bool {
+    (0..200).any(|_| {
+        let free = m.try_lock().is_ok();
+        if !free {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        free
+    })
+}
+
 // Clears MOVE_STATE and ACTIVE_MOVE_DIR when the per-directory pass leaves scope, by any path:
 // normal completion, a failure continue, or an unwind.
 struct MoveStateGuard;
@@ -3153,7 +3166,7 @@ mod tests {
         let mut lock_free = false;
         record_error_with(path, "stuck", "hint", |_| {
             logged = true;
-            lock_free = MOVE_ERRORS.try_lock().is_ok();
+            lock_free = test_lock_is_free(&MOVE_ERRORS);
         });
         let recorded = error_snapshot(path).is_some();
         clear_error(path);
