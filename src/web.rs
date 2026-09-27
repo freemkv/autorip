@@ -1762,9 +1762,9 @@ fn is_valid_poster_url(url: &str) -> bool {
         .any(|c| c.is_control() || c == '"' || c == '\'' || c == '<' || c == '>')
 }
 
-// 404 body for per-device routes naming a drive the poll loop never enumerated (no STATE
-// entry). The claim (known=false) refuses these too; this makes the rejection a 404, not 409.
-const UNKNOWN_DEVICE_BODY: &str = r#"{"ok":false,"error":"unknown device"}"#;
+// 404 body for per-device routes naming a device with no STATE entry: never enumerated, or a
+// hot-plugged drive still in the poll loop's 60s first-seen settle window.
+const UNKNOWN_DEVICE_BODY: &str = r#"{"ok":false,"error":"unknown or not yet initialized device"}"#;
 
 // POST /api/title/<device>: operator's TMDB pick for the active disc.
 // Body: {"title","year","poster_url","overview"}. Stored as a one-shot
@@ -2593,9 +2593,9 @@ struct IdleReCapTransport<In> {
 }
 
 impl<In> IdleReCapTransport<In> {
-    // Cap body reads at the idle bound. A Global/PerCall ceiling masks the phase (ureq reports
-    // whichever deadline is earliest), so those are capped too; header waits then get the idle
-    // bound only under a request ceiling. min keeps the tighter of the budget and idle.
+    // Cap body reads at the idle bound. Global/PerCall mask the phase (ureq reports the earliest
+    // deadline), so they are capped too: any caller setting timeout_global/timeout_per_call on a
+    // guarded agent also gets its header wait clamped to idle. min keeps the tighter bound.
     fn cap(
         &self,
         timeout: ureq::unversioned::transport::NextTimeout,
