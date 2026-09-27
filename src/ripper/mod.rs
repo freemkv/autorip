@@ -18,6 +18,8 @@ pub mod tv;
 // `#[allow(unused_imports)]` stays: the binary build doesn't use every
 // re-export, but `lib.rs` and `tests/` do.
 #[allow(unused_imports)]
+pub use mux::{WATCHDOG_BUMP_DEADLINE, bounded_call, watchdog_bump_restart_count};
+#[allow(unused_imports)]
 pub use session::{
     RegisterError, device_halt, join_all_rip_threads, join_rip_thread, register_halt,
     register_rip_thread, rollback_failed_spawn, spawn_rip_thread, stop_and_drain,

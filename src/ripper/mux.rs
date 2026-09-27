@@ -26,6 +26,47 @@ use super::state::{RipState, update_state};
 /// to retry or quarantine via `.failed`.
 pub const HARD_WATCHDOG_STALL_SECS: u64 = 1200;
 
+/// Deadline for the hard watchdog's pre-exit `.restart_count` bump.
+pub const WATCHDOG_BUMP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Run `op` on a named helper thread and wait at most `deadline` for it.
+/// Returns `true` if it finished in time; `false` on timeout or spawn failure.
+pub fn bounded_call(name: &str, deadline: Duration, op: impl FnOnce() + Send + 'static) -> bool {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+    let _ = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            op();
+            let _ = tx.send(());
+        });
+    rx.recv_timeout(deadline).is_ok()
+}
+
+/// The hard watchdog's `.restart_count` bump, bounded by [`WATCHDOG_BUMP_DEADLINE`]
+/// so a wedged NFS syscall can't block the `exit(1)` that follows.
+pub fn watchdog_bump_restart_count(device: &str, staging_disc_dir: &std::path::Path) -> bool {
+    let bump_dir = staging_disc_dir.to_path_buf();
+    let done = bounded_call(
+        "autorip-watchdog-counter-bump",
+        WATCHDOG_BUMP_DEADLINE,
+        move || {
+            let _ = crate::ripper::staging::increment_restart_count(&bump_dir);
+        },
+    );
+    if !done {
+        eprintln!(
+            "[mux/{}] watchdog: counter bump timed out; proceeding to exit anyway",
+            device
+        );
+        tracing::error!(
+            target: "mux",
+            device = %device,
+            "watchdog: counter bump timed out; proceeding to exit anyway"
+        );
+    }
+    done
+}
+
 // Total Progress % during mux: same byte-weighted formula `state.rs` uses for sweep/patch, so
 // the bar progresses smoothly across the handoff.
 fn total_pct_byte_weight(
@@ -430,29 +471,9 @@ fn spawn_mux_watchdog(
                     "hard watchdog escalating; exiting process for container restart"
                 );
                 // Best-effort: bump the restart counter (errors ignored, exiting
-                // anyway) so RESTART_LIMIT can engage, with a 5 s bounded
-                // deadline so a wedged NFS mount still lets us `exit(1)`.
-                {
-                    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
-                    let bump_dir = wd_staging_disc_dir.clone();
-                    let _ = std::thread::Builder::new()
-                        .name("autorip-watchdog-counter-bump".into())
-                        .spawn(move || {
-                            let _ = crate::ripper::staging::increment_restart_count(&bump_dir);
-                            let _ = tx.send(());
-                        });
-                    if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
-                        eprintln!(
-                            "[mux/{}] watchdog: counter bump timed out; proceeding to exit anyway",
-                            wd_device
-                        );
-                        tracing::error!(
-                            target: "mux",
-                            device = %wd_device,
-                            "watchdog: counter bump timed out; proceeding to exit anyway"
-                        );
-                    }
-                }
+                // anyway) so RESTART_LIMIT can engage, bounded so a wedged NFS
+                // mount still lets us `exit(1)`.
+                watchdog_bump_restart_count(&wd_device, &wd_staging_disc_dir);
                 // No `drop(_wd_guard)` — that's the producer's
                 // local; we're a detached watchdog thread. The
                 // OS will tear down every thread on exit(1).
