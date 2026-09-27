@@ -689,7 +689,7 @@ fn auto_insert_rip_mode(on_insert: &str) -> Option<crate::web::ResumeMode> {
 // Fresh unattended rip: unless the staging guards hold the disc, discard its stale partial /
 // terminal staging, then sweep.
 fn auto_rip_fresh(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
-    if staging_hold_stands_down(cfg, device, false) {
+    if staging_hold_stands_down(cfg, device, GuardFor::Wipe) {
         return;
     }
     wipe_staging_for_disc(cfg, device);
@@ -1437,6 +1437,9 @@ fn dispatch_rip_request(
 ) {
     match mode {
         crate::web::ResumeMode::Require => {
+            if resume_refused_by_staging(cfg, device) {
+                return;
+            }
             if resumable_for_device(cfg, device) == Some(Resumable::Sweep) {
                 // Continue Pass N from the mapfile, re-reading only not-good
                 // ranges instead of the whole disc; `passes = N` is the
@@ -1475,7 +1478,12 @@ fn dispatch_rip_request(
             // A loss-aborted disc may take another (non-destructive) resume pass;
             // every fresh fallback below re-guards without that allowance.
             let resumable = resumable_for_device(cfg, device);
-            if staging_hold_stands_down(cfg, device, resumable.is_some()) {
+            let purpose = if resumable.is_some() {
+                GuardFor::Resume
+            } else {
+                GuardFor::InPlace
+            };
+            if staging_hold_stands_down(cfg, device, purpose) {
                 return;
             }
             match auto_resume_action(resumable) {
@@ -1521,7 +1529,7 @@ fn dispatch_rip_request(
         }
         crate::web::ResumeMode::Fresh => auto_rip_fresh(cfg, device, device_path),
         crate::web::ResumeMode::Default => {
-            if !staging_hold_stands_down(cfg, device, false) {
+            if !staging_hold_stands_down(cfg, device, GuardFor::InPlace) {
                 rip_disc(cfg, device, device_path, false);
             }
         }
@@ -1545,13 +1553,23 @@ enum StagingHold {
     LiveSweep,
 }
 
-// Guards shared by every non-destructive rip mode (Default, Fresh, Prefer). Returns true, after
-// surfacing why, when this disc's staging must not be re-swept. `resume_loss` lets a
-// loss-aborted disc through to a resume pass.
-fn staging_hold_stands_down(cfg: &Arc<RwLock<Config>>, device: &str, resume_loss: bool) -> bool {
-    let hold = match disc_staging_hold(cfg, device) {
+/// What the caller of [`staging_hold_stands_down`] is about to do to the staging dir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardFor {
+    /// Sweep in place (Default).
+    InPlace,
+    /// Resume sweep / remux: a loss-aborted disc may take another pass.
+    Resume,
+    /// `remove_dir_all` then sweep: an empty-looking listing is not trusted.
+    Wipe,
+}
+
+// Guards shared by every non-destructive rip mode (Default, Fresh, Prefer). Returns true,
+// after surfacing why, when this disc's staging must not be re-swept.
+fn staging_hold_stands_down(cfg: &Arc<RwLock<Config>>, device: &str, purpose: GuardFor) -> bool {
+    let hold = match disc_staging_hold(cfg, device, purpose == GuardFor::Wipe) {
         None => return false,
-        Some(StagingHold::LossAborted) if resume_loss => return false,
+        Some(StagingHold::LossAborted) if purpose == GuardFor::Resume => return false,
         Some(hold) => hold,
     };
     let why = match hold {
@@ -1616,9 +1634,35 @@ fn staging_hold_stands_down(cfg: &Arc<RwLock<Config>>, device: &str, resume_loss
     true
 }
 
+// The operator's Resume skips the insert guards (A6 covers finished dirs) but must not sweep
+// over staging it can't read or another drive is sweeping. True after reporting why.
+fn resume_refused_by_staging(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
+    let why = match disc_staging_hold(cfg, device, false) {
+        Some(StagingHold::Unreadable) => {
+            "Cannot read this disc's staging dir cleanly (staging share degraded?) — not resuming. Retry once staging is readable."
+        }
+        Some(StagingHold::LiveSweep) => {
+            "Another drive is sweeping this disc's staging dir right now — not resuming."
+        }
+        _ => return false,
+    };
+    crate::log::device_log(device, why);
+    update_state_with(device, |s| {
+        s.status = "error".to_string();
+        s.last_error = why.to_string();
+    });
+    drop_session(device);
+    true
+}
+
 // The hold on the scanned disc's own staging dir, read fail-closed: a dir that exists but
-// can't be snapshotted cleanly is `Unreadable`, never "nothing staged".
-fn disc_staging_hold(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<StagingHold> {
+// can't be snapshotted cleanly is `Unreadable`, never "nothing staged". `for_wipe` also
+// distrusts a listing that saw no entries at all.
+fn disc_staging_hold(
+    cfg: &Arc<RwLock<Config>>,
+    device: &str,
+    for_wipe: bool,
+) -> Option<StagingHold> {
     // Recover a poisoned lock instead of failing open.
     let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
     let sanitized = staging_basename_for_device(&cfg_read, device)?;
@@ -1647,7 +1691,13 @@ fn disc_staging_hold(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<StagingH
         Err(_) => return Some(StagingHold::Unreadable),
     }
     let snap = match staging::snapshot_staging_disc(&dir) {
-        Some(s) if !s.had_entry_error => s,
+        Some(s)
+            if !s.had_entry_error
+                && s.state_unreadable.is_none()
+                && !(for_wipe && s.saw_no_entries) =>
+        {
+            s
+        }
         _ => return Some(StagingHold::Unreadable),
     };
     snapshot_hold(&snap).or_else(|| {
@@ -9129,7 +9179,7 @@ mod tests {
     // M4: a rip HELD for review writes BOTH `.review` and `.completed`;
     // "already ripped" must gate on `.completed` AND NOT `.review`.
     #[test]
-    fn staging_disc_completed_excludes_held_for_review() {
+    fn snapshot_hold_does_not_read_held_for_review_as_completed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let san = "Held_Movie";
         let dir = tmp.path().join(san);
@@ -9149,10 +9199,10 @@ mod tests {
         );
     }
 
-    // R2 finding 2 regression: `staging_disc_completed` must read markers through NFS-resilient
+    // R2 finding 2 regression: `snapshot_hold` must read markers through NFS-resilient
     // `snapshot_staging_disc`, not bare `.exists()`.
     #[test]
-    fn staging_disc_completed_uses_snapshot_with_leftover_artifacts() {
+    fn snapshot_hold_sees_completed_with_leftover_artifacts() {
         let tmp = tempfile::TempDir::new().unwrap();
         let san = "Finished_Movie";
         // Completed rip whose ISO/mapfile haven't been pruned yet (crash
@@ -9819,9 +9869,6 @@ mod tests {
     // STATE/Config wrappers it calls. `→ false` re-rips a finished disc and
     // O_TRUNCs the staged ISO still being read; `→ true` wedges every disc as done.
 
-    /// Seed `STATE[device].disc_name` and hand back a `Config` pointing at
-    /// `staging_root`, exactly as the drive thread sees them after a scan.
-    // Does the pure hold projection read `root/san` as a finished rip?
     fn completed_hold(root: &std::path::Path, san: &str) -> bool {
         staging::snapshot_staging_disc(&root.join(san)).and_then(|s| super::snapshot_hold(&s))
             == Some(super::StagingHold::Completed)
@@ -9831,16 +9878,18 @@ mod tests {
         cfg: &std::sync::Arc<std::sync::RwLock<crate::config::Config>>,
         device: &str,
     ) -> bool {
-        super::disc_staging_hold(cfg, device) == Some(super::StagingHold::Completed)
+        super::disc_staging_hold(cfg, device, false) == Some(super::StagingHold::Completed)
     }
 
     fn loss_aborted(
         cfg: &std::sync::Arc<std::sync::RwLock<crate::config::Config>>,
         device: &str,
     ) -> bool {
-        super::disc_staging_hold(cfg, device) == Some(super::StagingHold::LossAborted)
+        super::disc_staging_hold(cfg, device, false) == Some(super::StagingHold::LossAborted)
     }
 
+    /// Seed `STATE[device].disc_name` and hand back a `Config` pointing at
+    /// `staging_root`, exactly as the drive thread sees them after a scan.
     fn seed_scanned_disc(
         device: &str,
         disc_name: &str,
@@ -10112,7 +10161,7 @@ mod tests {
     }
 
     #[test]
-    fn disc_loss_aborted_sees_the_scanned_discs_quarantine() {
+    fn disc_staging_hold_sees_the_scanned_discs_loss_abort() {
         let device = "sg_loss_aborted_wrapper_test";
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg = seed_scanned_disc(device, "Damaged Disc", tmp.path());
@@ -10146,7 +10195,7 @@ mod tests {
     }
 
     #[test]
-    fn disc_already_completed_reads_state_and_staging_together() {
+    fn disc_staging_hold_reads_state_and_staging_together() {
         let device = "sg_already_completed_wrapper_test";
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg = seed_scanned_disc(device, "Finished Disc", tmp.path());
@@ -10215,7 +10264,7 @@ mod tests {
         forget_device(unscanned);
     }
 
-    // Regression: the resume-gate config reads (`disc_loss_aborted`,
+    // Regression: the resume-gate config reads (`disc_staging_hold`,
     // `disc_owned_by_worker`) must poison-RECOVER, not fail open — a bad-lock
     // fail-open re-swept an ISO awaiting Accept / truncated the mux's live ISO.
     #[test]
@@ -10242,7 +10291,7 @@ mod tests {
         // Both gates must still SEE the markers — a fail-open `false` here
         // would clobber the parked ISO / truncate the worker's read.
         assert_eq!(
-            super::disc_staging_hold(&cfg, device),
+            super::disc_staging_hold(&cfg, device, false),
             Some(super::StagingHold::OwnedByWorker),
             "disc_staging_hold must recover the poisoned lock, not re-sweep the held ISO"
         );
@@ -10385,7 +10434,14 @@ mod tests {
             let unreadable = std::fs::read_dir(&dir).is_err();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
             if !unreadable {
-                eprintln!("skipping: running with CAP_DAC_OVERRIDE, chmod 000 is still readable");
+                // Root ignores chmod 000; never let CI pass this test vacuously.
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "chmod-000 staging test cannot run as root on CI"
+                );
+                eprintln!(
+                    "SKIPPED insert_dispatch_stands_down_on_unreadable_staging: running as root"
+                );
                 return;
             }
             assert!(
@@ -10447,6 +10503,129 @@ mod tests {
             });
         assert!(!dead.exists(), "a dead sweep's leftover must start fresh");
         assert_eq!(st.status, "error", "and the fresh rip must be attempted");
+    }
+
+    // A listing that saw no entries at all is the cold-cache NFS signature: never wipe on
+    // it. Only the wipe path stands down; Default's in-place rip still proceeds.
+    #[test]
+    fn fresh_insert_does_not_wipe_a_staging_dir_that_listed_empty() {
+        for (label, mode, stands_down) in [
+            (
+                "rip",
+                super::auto_insert_rip_mode("rip").expect("mode"),
+                true,
+            ),
+            (
+                "resume",
+                super::auto_insert_rip_mode("resume").expect("mode"),
+                true,
+            ),
+            ("default", crate::web::ResumeMode::Default, false),
+        ] {
+            let device = format!("sg_insert_empty_listing_{label}_test");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = seed_scanned_disc(&device, "Empty Disc", tmp.path());
+            super::update_state_with(&device, |s| s.status = "scanning".to_string());
+            let dir = tmp
+                .path()
+                .join(crate::util::sanitize_path_compact("Empty Disc"));
+            std::fs::create_dir_all(&dir).unwrap();
+            super::dispatch_rip_request(&cfg, &device, "/nonexistent/autorip-test-drive", mode);
+            let status = super::STATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&device)
+                .map(|s| s.status.clone());
+            forget_device(&device);
+            if stands_down {
+                assert!(
+                    dir.exists(),
+                    "{label}: an empty-listing dir must not be wiped"
+                );
+                assert_eq!(status.as_deref(), Some("idle"), "{label} must stand down");
+            } else {
+                assert_eq!(
+                    status.as_deref(),
+                    Some("error"),
+                    "Default still rips in place"
+                );
+            }
+        }
+    }
+
+    // An unusable `state.json` hides the lifecycle (the mux worker holds such a dir): stand down.
+    #[test]
+    fn insert_dispatch_stands_down_on_an_unusable_state_file() {
+        let mode = super::auto_insert_rip_mode("rip").expect("an auto-rip mode");
+        let (_tmp, dir, st) =
+            dispatch_over_staged_disc("sg_insert_corrupt_state_test", "Torn Disc", mode, |d| {
+                std::fs::write(d.join(staging::STATE_FILE), b"{not json").unwrap()
+            });
+        assert!(
+            dir.join("Sentinel.iso").exists(),
+            "a dir with unusable state.json was wiped"
+        );
+        assert_eq!(st.status, "idle", "must stand down: {st:?}");
+    }
+
+    // A7: an operator Resume must not sweep over another drive's live sweep or unreadable
+    // staging; it reports why instead.
+    #[test]
+    fn operator_resume_refuses_a_live_sweep_and_unreadable_staging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let other = "sg_require_live_sweep_other_test";
+        seed_scanned_disc(other, "Busy Disc", tmp.path());
+        let handle = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        super::register_rip_thread(other, handle).expect("register the other drive's rip");
+        let device = "sg_require_live_sweep_test";
+        let cfg = seed_scanned_disc(device, "Busy Disc", tmp.path());
+        let dir = tmp
+            .path()
+            .join(crate::util::sanitize_path_compact("Busy Disc"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Sentinel.iso"), b"precious").unwrap();
+        stage_partial_sweep(&dir);
+        staging::write_sweeping_marker(&dir);
+        let mode = crate::web::ResumeMode::Require;
+        super::dispatch_rip_request(&cfg, device, "/nonexistent/autorip-test-drive", mode);
+        let st = super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .cloned()
+            .unwrap_or_default();
+        drop(tx);
+        forget_device(other);
+        forget_device(device);
+        assert_eq!(st.status, "error", "{st:?}");
+        assert!(
+            st.last_error.contains("Another drive"),
+            "Resume must explain the live sweep, not attempt it: {:?}",
+            st.last_error
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = crate::web::ResumeMode::Require;
+            let (_tmp, dir, st) =
+                dispatch_over_staged_disc("sg_require_unreadable_test", "Cold Disc", mode, |d| {
+                    stage_partial_sweep(d);
+                    std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o000)).unwrap();
+                });
+            let unreadable = std::fs::read_dir(&dir).is_err();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if unreadable {
+                assert!(
+                    st.last_error.contains("Cannot read"),
+                    "Resume must explain unreadable staging: {:?}",
+                    st.last_error
+                );
+            }
+        }
     }
 
     // A6: an explicit Resume must not sweep over a finished rip the mover may be copying.

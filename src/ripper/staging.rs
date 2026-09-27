@@ -1137,6 +1137,9 @@ pub struct StagingSnapshot {
     /// (partial NFS degradation). When true the snapshot must NOT be
     /// classified as empty, because the artifact counts may be undercounts.
     pub had_entry_error: bool,
+    /// Every `read_dir` pass returned zero entries: genuinely empty, or the
+    /// cold-cache NFS miss that once wiped an 85 GB ISO. Never wipe on it.
+    pub saw_no_entries: bool,
     /// `state.json` exists but can't be used (lifecycle fields above then come
     /// from the legacy markers). The mux worker holds such a dir for the operator.
     pub state_unreadable: Option<StateUnreadable>,
@@ -1665,6 +1668,7 @@ pub fn snapshot_staging_disc(dir: &Path) -> Option<StagingSnapshot> {
         has_mapfile: obs.has_mapfile,
         has_mkv: obs.has_mkv,
         had_entry_error: obs.had_entry_error,
+        saw_no_entries: !obs.saw_any_entries,
         state_unreadable,
     })
 }
