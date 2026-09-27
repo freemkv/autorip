@@ -2972,9 +2972,11 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
         let bytes_total_disc = (session.drive.read_capacity().unwrap_or(0) as u64) * 2048;
 
         // Pre-flight: require enough free space for the remaining ISO data and
-        // an in-progress MKV, else a too-small disk ENOSPCs ~30 min in.
+        // the planned mux outputs, else a too-small disk ENOSPCs mid-rip.
         // AUTORIP_SKIP_DISKCHECK=1 bypasses this for diagnostics only.
-        if bytes_total_disc == 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
+        let skip_diskcheck =
+            skip_diskcheck_value(std::env::var("AUTORIP_SKIP_DISKCHECK").ok().as_deref());
+        if bytes_total_disc == 0 && !skip_diskcheck {
             // read_capacity() returned 0/unknown, so the image size is
             // uncomputable; tell the operator why the check didn't run.
             crate::log::device_log(
@@ -2983,28 +2985,26 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                  a too-small staging volume will ENOSPC mid-rip",
             );
         }
-        if bytes_total_disc > 0 && std::env::var("AUTORIP_SKIP_DISKCHECK").is_err() {
-            // The ISO's logical length is pre-sized; mapfile NonTried bytes
-            // report remaining reads. Retried ranges are already zero-filled.
+        if bytes_total_disc > 0 && !skip_diskcheck {
             let remaining_iso_bytes = if resume_sweep {
-                freemkv_engine::Mapfile::load(std::path::Path::new(&mapfile_path_str))
-                    .ok()
-                    .filter(|map| {
-                        map.total_size() == bytes_total_disc
-                            && iso_path
-                                .metadata()
-                                .is_ok_and(|metadata| metadata.len() >= bytes_total_disc)
-                    })
-                    .map(|map| map.stats().bytes_nontried)
+                resume_remaining_iso_bytes(
+                    std::path::Path::new(&mapfile_path_str),
+                    iso_path,
+                    bytes_total_disc,
+                )
             } else {
                 None
             };
-            // Mux output is bounded by the selected title's scanned byte size;
-            // reserving another whole-disc image was needlessly pessimistic.
             let title_output_bytes = if output_is_iso_image(&output_format) {
                 0
             } else {
-                title.size_bytes
+                mux_output_reserve_bytes(
+                    &disc.titles,
+                    &cfg_read,
+                    &tmdb_media_type,
+                    &disc_name,
+                    title.size_bytes,
+                )
             };
             let required = disk_space_required_bytes(
                 bytes_total_disc,
@@ -5252,6 +5252,43 @@ fn handoff_marker_name(title_confident: bool) -> &'static str {
     if title_confident { ".done" } else { ".review" }
 }
 
+// Episode titles a TV disc fans out to under `tv_auto`; empty = one movie-style output.
+// Pure (no TMDB): the preflight sizes the same plan `plan_mux_outputs` later names.
+fn fanout_episode_indices(
+    titles: &[libfreemkv::DiscTitle],
+    cfg: &Config,
+    media_type: &str,
+    disc_name: &str,
+) -> Vec<usize> {
+    let is_tv = media_type == "tv" || crate::tmdb::season_from_label(disc_name).is_some();
+    if !cfg.tv_auto || !is_tv {
+        return Vec::new();
+    }
+    // The episode cluster: drops the play-all sum-title, extras/menus, dupes.
+    let indices = tv::select_episode_titles(titles, cfg.min_length_secs);
+    // A single feature that merely carries a TV label (e.g. a TV movie) is one output.
+    if indices.len() <= 1 {
+        return Vec::new();
+    }
+    indices
+}
+
+// Staging bytes the mux phase writes before the ISO is pruned: every planned output
+// (one per episode under TV fan-out), never less than the selected title.
+fn mux_output_reserve_bytes(
+    titles: &[libfreemkv::DiscTitle],
+    cfg: &Config,
+    media_type: &str,
+    disc_name: &str,
+    selected_title_bytes: u64,
+) -> u64 {
+    fanout_episode_indices(titles, cfg, media_type, disc_name)
+        .iter()
+        .filter_map(|&i| titles.get(i))
+        .fold(0u64, |acc, t| acc.saturating_add(t.size_bytes))
+        .max(selected_title_bytes)
+}
+
 // Decide the deliverables a captured disc produces: titles to mux out of the ISO + staging
 // filename of each. Movie → one output; TV under `tv_auto` → one per episode, `S{NN}E{MM}`.
 fn plan_mux_outputs(
@@ -5268,19 +5305,11 @@ fn plan_mux_outputs(
             ..Default::default()
         }]
     };
-    let season = crate::tmdb::season_from_label(disc_name);
-    let is_tv = media_type == "tv" || season.is_some();
-    if !cfg.tv_auto || !is_tv {
+    let indices = fanout_episode_indices(titles, cfg, media_type, disc_name);
+    if indices.is_empty() {
         return one_output();
     }
-    // The episode cluster: drops the play-all sum-title, extras/menus, dupes.
-    let indices = tv::select_episode_titles(titles, cfg.min_length_secs);
-    if indices.len() <= 1 {
-        // A single feature that merely carries a TV media_type / season label
-        // (e.g. a TV movie) — one output, movie-identical naming.
-        return one_output();
-    }
-    let season_num = season.unwrap_or(1);
+    let season_num = crate::tmdb::season_from_label(disc_name).unwrap_or(1);
     let title_secs: Vec<f64> = indices.iter().map(|&i| titles[i].duration_secs).collect();
     // Multi-disc offset: start from the uniform-split guess `(disc-1)*count+1`,
     // then let `align_disc_offset` repair uneven splits when runtimes carry
@@ -5746,11 +5775,37 @@ fn strip_error_prefix(s: &str) -> &str {
 // `Error`, rendered as-is in the UI banner.
 fn disk_space_preflight_message(required: u64, staging: &str, avail: u64) -> String {
     format!(
-        "Insufficient staging disk space — need ≥ {:.1} GiB free at {} (remaining disc image plus selected title estimate), have {:.1} GiB. Free up space or point STAGING_DIR at a larger volume.",
+        "Insufficient staging disk space — need ≥ {:.1} GiB free at {} (remaining disc image plus planned mux output estimate), have {:.1} GiB. Free up space or set Staging Directory in Settings to a larger volume.",
         required as f64 / BYTES_PER_GIB,
         staging,
         avail as f64 / BYTES_PER_GIB,
     )
+}
+
+// Truthy-only opt-out for AUTORIP_SKIP_DISKCHECK: `0`/`false`/empty keep the check on.
+fn skip_diskcheck_value(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.trim();
+        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+    })
+}
+
+// Unswept bytes of a resumable image, or None (fresh estimate) when the mapfile is
+// missing/unreadable, sized for another disc, or the ISO on disk is truncated.
+fn resume_remaining_iso_bytes(
+    mapfile_path: &std::path::Path,
+    iso_path: &std::path::Path,
+    bytes_total_disc: u64,
+) -> Option<u64> {
+    freemkv_engine::Mapfile::load(mapfile_path)
+        .ok()
+        .filter(|map| {
+            map.total_size() == bytes_total_disc
+                && iso_path
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.len() >= bytes_total_disc)
+        })
+        .map(|map| map.stats().bytes_nontried)
 }
 
 fn disk_space_required_bytes(
@@ -6141,9 +6196,9 @@ mod tests {
         incomplete_mux_status, is_fmts_key_missing_error, is_safe_staging_segment,
         list_staging_basenames, patch_made_progress, patch_pass_decision, plan_passes,
         pre_pass_converged, prune_intermediate_iso, register_halt, resumable_dir_blocked,
-        resumable_for_disc, scope_bad_bytes, scope_converged, staging_dir_matches_disc,
-        staging_disc_completed, staging_disc_owned_by_worker, staging_free_bytes,
-        sweep_transport_retry,
+        resumable_for_disc, resume_remaining_iso_bytes, scope_bad_bytes, scope_converged,
+        skip_diskcheck_value, staging_dir_matches_disc, staging_disc_completed,
+        staging_disc_owned_by_worker, staging_free_bytes, sweep_transport_retry,
     };
     use crate::ripper::session::device_halt;
     use crate::ripper::staging;
@@ -7347,10 +7402,90 @@ mod tests {
             capacity + title,
             "unswept bytes are capped at disc capacity"
         );
+    }
+
+    // The real resume filter: a valid mapfile yields its unswept bytes; a mapfile
+    // sized for another disc, a truncated ISO, or no mapfile falls back (None).
+    #[test]
+    fn resume_remaining_iso_bytes_rejects_mismatched_or_truncated_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "autorip-preflight-resume-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let total = 64 * 2048u64;
+        let map_path = dir.join("disc.iso.mapfile");
+        let iso_path = dir.join("disc.iso");
+        let mut map = freemkv_engine::Mapfile::create(&map_path, total, "test").unwrap();
+        map.record(0, 16 * 2048, freemkv_engine::SectorStatus::Finished)
+            .unwrap();
+        drop(map);
+        let remaining = total - 16 * 2048;
+
         assert_eq!(
-            disk_space_required_bytes(capacity, title, None),
-            disk_space_required_bytes(capacity, title, Some(capacity)),
-            "invalid resume state falls back to a fresh image estimate"
+            resume_remaining_iso_bytes(&map_path, &iso_path, total),
+            None,
+            "missing ISO: fresh estimate"
+        );
+        std::fs::File::create(&iso_path)
+            .unwrap()
+            .set_len(total - 2048)
+            .unwrap();
+        assert_eq!(
+            resume_remaining_iso_bytes(&map_path, &iso_path, total),
+            None,
+            "truncated ISO: fresh estimate"
+        );
+        std::fs::File::create(&iso_path)
+            .unwrap()
+            .set_len(total)
+            .unwrap();
+        assert_eq!(
+            resume_remaining_iso_bytes(&map_path, &iso_path, total),
+            Some(remaining),
+            "valid resume state reports only the unswept bytes"
+        );
+        // ISO long enough for the other disc, so only the total_size check rejects it.
+        std::fs::File::create(&iso_path)
+            .unwrap()
+            .set_len(total * 2)
+            .unwrap();
+        assert_eq!(
+            resume_remaining_iso_bytes(&map_path, &iso_path, total * 2),
+            None,
+            "mapfile total_size mismatch (another disc): fresh estimate"
+        );
+        assert_eq!(
+            resume_remaining_iso_bytes(&dir.join("absent.mapfile"), &iso_path, total),
+            None,
+            "no mapfile: fresh estimate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skip_diskcheck_is_truthy_only() {
+        for v in ["1", "true", "TRUE", "yes", " Yes "] {
+            assert!(skip_diskcheck_value(Some(v)), "{v:?} must skip");
+        }
+        for v in ["0", "false", "no", "", "off"] {
+            assert!(
+                !skip_diskcheck_value(Some(v)),
+                "{v:?} must keep the check on"
+            );
+        }
+        assert!(!skip_diskcheck_value(None), "unset keeps the check on");
+    }
+
+    #[test]
+    fn disk_space_preflight_message_points_at_the_settings_field() {
+        let s = disk_space_preflight_message(1 << 30, "/staging", 0);
+        assert!(!s.contains("STAGING_DIR"), "no such env var: {s}");
+        assert!(
+            s.contains("Staging Directory"),
+            "names the Settings field: {s}"
         );
     }
 
@@ -10355,6 +10490,48 @@ mod tv_plan_tests {
         assert_eq!(
             plan.iter().map(|o| o.title_index).collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    // Preflight must reserve every fanned-out episode MKV (all written to staging
+    // before the ISO is pruned), not just the selected title (issue: ENOSPC mid-mux).
+    #[test]
+    fn mux_reserve_sums_every_planned_episode() {
+        let cfg = Config::default(); // tv_auto = true
+        let ep = 44.0 * 60.0;
+        let titles: Vec<_> = (0..6)
+            .map(|k| title(ep + k as f64, 1000 + k * 100))
+            .collect();
+        let sum: u64 = titles.iter().map(|t| t.size_bytes).sum();
+        let selected = titles[0].size_bytes;
+        let plan = plan_mux_outputs(&titles, &cfg, "tv", "Show Season 1", 0, "Show.mkv");
+        let planned: u64 = plan.iter().map(|o| titles[o.title_index].size_bytes).sum();
+        assert_eq!(planned, sum, "plan muxes all six episodes");
+        assert_eq!(
+            mux_output_reserve_bytes(&titles, &cfg, "tv", "Show Season 1", selected),
+            planned,
+            "reserve equals the sum of planned outputs"
+        );
+        // Play-all selected: never reserve less than the selected title.
+        let mut with_playall = vec![title(ep * 7.0, 50)];
+        with_playall.extend(titles.iter().cloned());
+        let big = with_playall[0].size_bytes;
+        assert_eq!(
+            mux_output_reserve_bytes(&with_playall, &cfg, "tv", "Show Season 1", big),
+            big.max(sum)
+        );
+        // Movie / tv_auto off: one output, the selected title.
+        assert_eq!(
+            mux_output_reserve_bytes(&titles, &cfg, "movie", "Some Film", selected),
+            selected
+        );
+        let off = Config {
+            tv_auto: false,
+            ..Config::default()
+        };
+        assert_eq!(
+            mux_output_reserve_bytes(&titles, &off, "tv", "Show Season 1", selected),
+            selected
         );
     }
 

@@ -78,7 +78,7 @@ Only these environment variables are read:
 | `AUTORIP_DIR` | `/config` | Config, logs and state directory |
 | `PORT` | `8080` | Web UI port |
 | `AUTORIP_LOG_LEVEL` | | Log verbosity override |
-| `AUTORIP_SKIP_DISKCHECK` | | Skip the startup free-space check |
+| `AUTORIP_SKIP_DISKCHECK` | | Set to `1`/`true`/`yes` to skip the per-rip staging free-space check (multi-pass rips; diagnostics only) |
 | `RIP_USER` | | User to drop privileges to |
 | `NFS_HOST`, `NFS_EXPORT`, `NFS_MOUNTPOINT`, `NFS_OPTS` | | Optional NFS mount for final output |
 
