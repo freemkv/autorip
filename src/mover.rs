@@ -98,18 +98,27 @@ pub static MOVE_ERRORS: once_cell::sync::Lazy<Mutex<BTreeMap<String, MoverError>
     once_cell::sync::Lazy::new(|| Mutex::new(BTreeMap::new()));
 
 fn record_error(path: &str, reason: &str, hint: &str) {
-    let mut m = MOVE_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
-    let same_reason = m.get(path).map(|e| e.reason == reason).unwrap_or(false);
-    m.insert(
-        path.to_string(),
-        MoverError {
-            path: path.to_string(),
-            reason: reason.to_string(),
-            hint: hint.to_string(),
-        },
-    );
+    record_error_with(path, reason, hint, crate::log::syslog);
+}
+
+// record_error with the log sink injected. The MOVE_ERRORS guard is dropped
+// before `log` runs: syslog does blocking (NFS) I/O, mirroring muxer::record_error.
+fn record_error_with(path: &str, reason: &str, hint: &str, log: impl FnOnce(&str)) {
+    let same_reason = {
+        let mut m = MOVE_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
+        let same_reason = m.get(path).map(|e| e.reason == reason).unwrap_or(false);
+        m.insert(
+            path.to_string(),
+            MoverError {
+                path: path.to_string(),
+                reason: reason.to_string(),
+                hint: hint.to_string(),
+            },
+        );
+        same_reason
+    };
     if !same_reason {
-        crate::log::syslog(&format!("Move blocked: {} — {}", path, reason));
+        log(&format!("Move blocked: {} — {}", path, reason));
     }
 }
 
@@ -510,47 +519,42 @@ fn check_post_copy_size(src: &Path, dst: &Path) -> Result<(), MoveError> {
     Ok(())
 }
 
-// Format-aware post-cp validation: routes to a structural check (EBML head/tail for.mkv; TS
-// sync for.m2ts), falling back to a fresh-FD size compare for.iso.
-pub(crate) fn check_post_copy(src: &Path, dst: &Path) -> Result<(), MoveError> {
+type StructuralCheck = fn(&Path) -> Result<(), MoveError>;
+
+// The format-aware structural check for a destination, routed by extension
+// (case-insensitive). None for formats without one (iso, unknown).
+fn structural_check(dst: &Path) -> Option<StructuralCheck> {
     let ext = dst
         .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    // Structural checks only inspect a fixed head/tail window, so a cp
-    // truncated beyond it still passes (DATA-LOSS: move_file then unlinks
-    // the source). Always pair with the fresh-FD size compare too.
-    match ext.as_deref() {
-        // mk3d is byte-identical Matroska — same structural + size checks as mkv.
-        Some("mkv") | Some("mk3d") => {
-            check_post_copy_mkv(dst)?;
-            check_post_copy_size(src, dst)
-        }
-        Some("m2ts") => {
-            check_post_copy_m2ts(dst)?;
-            check_post_copy_size(src, dst)
-        }
-        _ => check_post_copy_size(src, dst),
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        // mk3d is byte-identical Matroska — same check as mkv.
+        "mkv" | "mk3d" => Some(check_post_copy_mkv),
+        "m2ts" => Some(check_post_copy_m2ts),
+        _ => None,
     }
 }
 
-/// The structural half of `check_post_copy` for a dest whose SOURCE is gone
-/// (the src-missing idempotent fast path). Runs the format-aware structural
-/// check (EBML head/tail for mkv/mk3d, TS sync for m2ts) WITHOUT the size
-/// compare — there is no src left to compare against. A foreign or garbage
-/// file at the dest path fails this, so it isn't mislabelled as our already-
-/// moved output. Formats without a structural check (iso, unknown) can't be
-/// distinguished from a foreign file this way, so they pass on non-empty.
-fn dest_structural_ok(dst: &Path) -> bool {
-    let ext = dst
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("mkv") | Some("mk3d") => check_post_copy_mkv(dst).is_ok(),
-        Some("m2ts") => check_post_copy_m2ts(dst).is_ok(),
-        _ => true,
+// Format-aware post-cp validation: the structural check (when the format has one), then a
+// fresh-FD size compare.
+pub(crate) fn check_post_copy(src: &Path, dst: &Path) -> Result<(), MoveError> {
+    // Structural checks only inspect a fixed head/tail window, so a cp
+    // truncated beyond it still passes (DATA-LOSS: move_file then unlinks
+    // the source). Always pair with the fresh-FD size compare too.
+    if let Some(check) = structural_check(dst) {
+        check(dst)?;
     }
+    check_post_copy_size(src, dst)
+}
+
+/// The structural half of `check_post_copy` for a dest whose SOURCE is gone
+/// (the src-missing idempotent fast path) — there is no src left to size-compare.
+/// A format without a structural check (iso, unknown) can't be told apart from a
+/// foreign file at that path, so it is NOT accepted: reporting Moved would tear
+/// down staging and announce a delivery we cannot vouch for.
+fn dest_structural_ok(dst: &Path) -> bool {
+    structural_check(dst).is_some_and(|check| check(dst).is_ok())
 }
 
 // One pass of the mover loop: take a config SNAPSHOT, release the lock, then move. Returns
@@ -1560,7 +1564,7 @@ fn destination_root(cfg: &Config, tmdb: &Option<tmdb::TmdbResult>) -> String {
             _ => {}
         }
     }
-    cfg.output_dir.clone()
+    resolve_media_root(&cfg.output_dir, "")
 }
 
 // The configured root a given output FILE lands under:.iso uses iso_dir when set, everything
@@ -2021,6 +2025,56 @@ mod tests {
         assert_eq!(leaf, "RogueOne S01E02.mkv");
     }
 
+    // TMDB episode names are untrusted: whatever they contain, the leaf must stay ONE plain
+    // path component, so the file can't escape (or break) the Season folder.
+    #[test]
+    fn tv_episode_leaf_neutralises_hostile_episode_names() {
+        let tmdb = Some(tmdb_tv("Show", 2020));
+        let cfg = cfg_with_dirs("", "/lib/tv", "/lib");
+        let season_dir = "/lib/tv/Show (2020)/Season 01";
+        for hostile in [
+            "..",
+            ".",
+            "../../../etc/passwd",
+            "..\\..\\Windows\\System32",
+            "Part 1/2",
+            "C:\\evil",
+            "Title: Subtitle",
+            "/abs/path",
+            "\\\\server\\share",
+            "a\0b",
+            "Who? *What* <Where> |When| \"Why\"",
+            "   ",
+            "日本語",
+        ] {
+            let outputs = vec![ep_output("ep.mkv", Some(2), hostile)];
+            let leaf = tv_episode_leaf(&tmdb, &outputs, "ep.mkv", Some(1))
+                .expect("a TV episode must still get a leaf");
+            for bad in ['/', '\\', ':', '\0', '*', '?', '"', '<', '>', '|'] {
+                assert!(
+                    !leaf.contains(bad),
+                    "leaf {leaf:?} keeps {bad:?} from {hostile:?}"
+                );
+            }
+            let mut comps = Path::new(&leaf).components();
+            assert!(
+                matches!(comps.next(), Some(std::path::Component::Normal(_)))
+                    && comps.next().is_none(),
+                "leaf {leaf:?} from {hostile:?} must be a single normal component"
+            );
+            assert!(
+                leaf.starts_with("Show S01E02 - ") && leaf.ends_with(".mkv"),
+                "leaf {leaf:?} must keep the episode prefix and extension"
+            );
+            let dest = build_destination(&cfg, &tmdb, &leaf, Some(1));
+            assert_eq!(
+                dest,
+                format!("{season_dir}/{leaf}"),
+                "a hostile episode name must land directly in the Season folder"
+            );
+        }
+    }
+
     /// `MOVE_ERRORS` is process-global. Tests that assert on its contents (or
     /// that clear it wholesale) serialize on this so a parallel test thread
     /// can't wipe or observe another's entries mid-assertion.
@@ -2095,7 +2149,7 @@ mod tests {
     fn build_destination_movie_with_year() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Aurora Drift Two", 2024));
-        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None).replace('\\', "/");
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None);
         assert_eq!(
             dest,
             "/out/Movies/Aurora Drift Two (2024)/Aurora Drift Two (2024).mkv"
@@ -2117,8 +2171,7 @@ mod tests {
             media_type: String::new(),
             tmdb_id: 0,
         });
-        let dest = build_destination(&cfg, &tmdb, "Drive (2011) - 4K Ultra HD.mkv", None)
-            .replace('\\', "/");
+        let dest = build_destination(&cfg, &tmdb, "Drive (2011) - 4K Ultra HD.mkv", None);
         // Files under the movie library in a per-title folder. (sanitize_path_display
         // strips the parens from the disc-label title — same reason the mis-filed
         // name lacked them — so the leaf is "Drive 2011 - 4K Ultra HD".)
@@ -2148,7 +2201,7 @@ mod tests {
         // Reproduces the Mercy incident config (relative movie_dir, NFS output_dir).
         let cfg = cfg_with_dirs("movies", "", "/mnt/media/");
         let tmdb = Some(tmdb_movie("Mercy", 2023));
-        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv", None).replace('\\', "/");
+        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv", None);
         assert_eq!(
             dest, "/mnt/media/movies/Mercy (2023)/Mercy (2023).mkv",
             "a relative movie_dir must resolve UNDER output_dir on the NFS mount"
@@ -2181,7 +2234,7 @@ mod tests {
             media_type: "tv".into(),
             tmdb_id: 0,
         });
-        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv", None).replace('\\', "/");
+        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv", None);
         // No season parsed → default Season 01; series folder carries the year.
         assert_eq!(
             dest,
@@ -2203,7 +2256,7 @@ mod tests {
     fn build_destination_absolute_movie_dir_overrides_output_dir() {
         let cfg = cfg_with_dirs("/srv/library/movies", "", "/mnt/media/");
         let tmdb = Some(tmdb_movie("Mercy", 2023));
-        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv", None).replace('\\', "/");
+        let dest = build_destination(&cfg, &tmdb, "Mercy.mkv", None);
         assert_eq!(
             dest, "/srv/library/movies/Mercy (2023)/Mercy (2023).mkv",
             "an absolute movie_dir must override output_dir (Path::join semantics)"
@@ -2249,6 +2302,35 @@ mod tests {
 
         // An empty sub yields output_dir verbatim.
         assert_eq!(resolve_media_root(base, ""), base.replace('\\', "/"));
+    }
+
+    // The POSIX-separator contract on NATIVE config paths (a Windows drive root on the Windows
+    // leg): every destination and root is '/'-separated, and each dest lives under its root.
+    #[test]
+    fn destinations_and_roots_emit_posix_separators_natively() {
+        let base = if cfg!(windows) {
+            r"D:\media"
+        } else {
+            "/mnt/media"
+        };
+        let mut cfg = cfg_with_dirs("movies", "tv", base);
+        cfg.iso_dir = "isos".into();
+        let cases = [
+            (Some(tmdb_movie("Lumina", 2023)), "Lumina.mkv"),
+            (Some(tmdb_movie("Lumina", 2023)), "Lumina.iso"),
+            (Some(tmdb_tv("Severance", 2022)), "sev_s01e01.mkv"),
+            (None, "disc.mkv"),
+        ];
+        for (tmdb, file) in cases {
+            let dest = build_destination(&cfg, &tmdb, file, Some(1));
+            let root = destination_root_for(&cfg, &tmdb, file);
+            assert!(!dest.contains('\\'), "dest {dest:?} has a backslash");
+            assert!(!root.contains('\\'), "root {root:?} has a backslash");
+            assert!(
+                dest.starts_with(&format!("{root}/")),
+                "dest {dest} must live under its validated root {root}"
+            );
+        }
     }
 
     /// `absolute_for_log`'s actual invariant, on every platform: whatever goes
@@ -2337,7 +2419,7 @@ mod tests {
     fn build_destination_movie_without_year_falls_through() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Unknown Year", 0));
-        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None).replace('\\', "/");
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None);
         // year=0 skips the "(YEAR)" suffix; mkv name derived from cleaned title.
         assert_eq!(dest, "/out/Movies/Unknown Year/Unknown Year.mkv");
     }
@@ -2353,14 +2435,14 @@ mod tests {
             media_type: "tv".into(),
             tmdb_id: 0,
         });
-        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv", None).replace('\\', "/");
+        let dest = build_destination(&cfg, &tmdb, "sev_s01e01.mkv", None);
         assert_eq!(dest, "/out/TV/Severance (2022)/Season 01/sev_s01e01.mkv");
     }
 
     #[test]
     fn build_destination_no_tmdb_falls_to_output_dir() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
-        let dest = build_destination(&cfg, &None, "disc.mkv", None).replace('\\', "/");
+        let dest = build_destination(&cfg, &None, "disc.mkv", None);
         assert_eq!(dest, "/out/disc.mkv");
     }
 
@@ -2368,7 +2450,7 @@ mod tests {
     fn build_destination_empty_movie_dir_falls_to_output_dir() {
         let cfg = cfg_with_dirs("", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Movie", 2020));
-        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None).replace('\\', "/");
+        let dest = build_destination(&cfg, &tmdb, "disc.mkv", None);
         // movie_dir empty → fall-through to output_dir + filename.
         assert_eq!(dest, "/out/disc.mkv");
     }
@@ -2379,8 +2461,7 @@ mod tests {
     fn build_destination_empty_tv_dir_falls_to_output_dir() {
         let cfg = cfg_with_dirs("/out/Movies", "", "/out");
         let tv = tmdb_tv("Severance", 2022);
-        let dest =
-            build_destination(&cfg, &Some(tv.clone()), "sev_s01e01.mkv", None).replace('\\', "/");
+        let dest = build_destination(&cfg, &Some(tv.clone()), "sev_s01e01.mkv", None);
         assert_eq!(
             dest, "/out/sev_s01e01.mkv",
             "an empty tv_dir must fall through to the output root, not \
@@ -2409,7 +2490,7 @@ mod tests {
                 let mut r = tmdb_movie("Some Title", 2024);
                 r.media_type = media_type.to_string();
                 let root = destination_root(&cfg, &Some(r.clone()));
-                let dest = build_destination(&cfg, &Some(r), "Disc.mkv", None).replace('\\', "/");
+                let dest = build_destination(&cfg, &Some(r), "Disc.mkv", None);
                 assert!(
                     dest.starts_with(&format!("{root}/")),
                     "dest {dest} must live under the validated root {root} \
@@ -2459,7 +2540,7 @@ mod tests {
     fn build_destination_movie_preserves_m2ts_extension() {
         let cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         let tmdb = Some(tmdb_movie("Movie", 2024));
-        let dest = build_destination(&cfg, &tmdb, "00800.m2ts", None).replace('\\', "/");
+        let dest = build_destination(&cfg, &tmdb, "00800.m2ts", None);
         assert_eq!(dest, "/out/Movies/Movie (2024)/Movie (2024).m2ts");
     }
 
@@ -2467,12 +2548,12 @@ mod tests {
     fn iso_dir_routes_iso_flat_to_its_own_root_relative() {
         // A RELATIVE iso_dir joins under output_dir; the ISO lands FLAT while
         // the MKV companion still files into the movie tree — must not
-        // collide. Path::join yields a backslash on Windows CI; normalise.
+        // collide. Raw output: '/' is the contract on every platform.
         let mut cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         cfg.iso_dir = "isos".into();
         let tmdb = Some(tmdb_movie("Lumina", 2023));
-        let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso", None).replace('\\', "/");
-        let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv", None).replace('\\', "/");
+        let dest_iso = build_destination(&cfg, &tmdb, "Lumina.iso", None);
+        let dest_mkv = build_destination(&cfg, &tmdb, "Lumina.mkv", None);
         assert_eq!(dest_iso, "/out/isos/Lumina (2023).iso");
         assert_eq!(dest_mkv, "/out/Movies/Lumina (2023)/Lumina (2023).mkv");
     }
@@ -2509,10 +2590,9 @@ mod tests {
         let mut cfg = cfg_with_dirs("/out/Movies", "/out/TV", "/out");
         cfg.iso_dir = "isos".into();
         let tmdb = Some(tmdb_movie("Lumina", 2023));
-        // Native Path::join → normalise the separator for the Windows CI leg
-        // (production is always Linux/forward-slash).
+        // Raw output, no normalising: destination_root_for emits '/' on every platform.
         assert_eq!(
-            destination_root_for(&cfg, &tmdb, "Lumina.iso").replace('\\', "/"),
+            destination_root_for(&cfg, &tmdb, "Lumina.iso"),
             "/out/isos",
             "iso files route to the iso root"
         );
@@ -2522,10 +2602,7 @@ mod tests {
             "non-iso files keep the movie/tv root"
         );
         // Case-insensitive extension match.
-        assert_eq!(
-            destination_root_for(&cfg, &tmdb, "Lumina.ISO").replace('\\', "/"),
-            "/out/isos"
-        );
+        assert_eq!(destination_root_for(&cfg, &tmdb, "Lumina.ISO"), "/out/isos");
     }
 
     fn noop_progress(_: u8, _: f64, _: f64, _: f64) {}
@@ -2715,6 +2792,29 @@ mod tests {
             MoveOutcome::Moved,
             "a foreign non-media dest is not proof of a completed move; got {outcome:?}"
         );
+    }
+
+    // An ISO (or any format with no structural check) at dest can't be told apart from a foreign
+    // file once src is gone, so it must not be reported Moved; the foreign file stays untouched.
+    #[test]
+    fn move_file_does_not_report_moved_on_unverifiable_dest_when_src_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["b.iso", "b.ISO", "b.txt", "b"] {
+            let src = tmp.path().join(format!("src-{name}"));
+            let dest = tmp.path().join(name);
+            std::fs::write(&dest, b"somebody else's file").unwrap();
+            let outcome = move_file(&src, &dest, &noop_progress);
+            assert_ne!(
+                outcome,
+                MoveOutcome::Moved,
+                "unverifiable dest {name} reported Moved with src missing"
+            );
+            assert_eq!(
+                std::fs::read(&dest).unwrap(),
+                b"somebody else's file",
+                "the foreign dest {name} must be left untouched"
+            );
+        }
     }
 
     // The pre-flight "src missing, dest present" branch must require a genuine NotFound on the
@@ -3040,6 +3140,29 @@ mod tests {
         drop(m);
         clear_error(path);
         assert!(MOVE_ERRORS.lock().unwrap().get(path).is_none());
+    }
+
+    // The syslog write is blocking (NFS) I/O: MOVE_ERRORS must be free while it runs, or the
+    // System page and every other record/clear stall behind it.
+    #[test]
+    fn record_error_does_not_hold_move_errors_while_logging() {
+        let _g = errors_guard();
+        let path = "/tmp/fakemover-lock-across-log";
+        clear_error(path);
+        let mut logged = false;
+        let mut lock_free = false;
+        record_error_with(path, "stuck", "hint", |_| {
+            logged = true;
+            lock_free = MOVE_ERRORS.try_lock().is_ok();
+        });
+        let recorded = error_snapshot(path).is_some();
+        clear_error(path);
+        assert!(logged, "a new reason must be logged");
+        assert!(recorded, "the error must still be recorded");
+        assert!(
+            lock_free,
+            "MOVE_ERRORS was held across the blocking syslog write"
+        );
     }
 
     // 0.25.10 fixes regression tests.
@@ -4334,6 +4457,44 @@ mod tests {
             "a listing that dropped an entry must report itself INCOMPLETE — \
              reporting it complete is what lets the caller tear the staging \
              dir down over a file it never moved"
+        );
+    }
+
+    // Upper/mixed-case deliverable extensions must be planned; a case-sensitive compare would
+    // silently strand them in staging (and the teardown would then delete them).
+    #[test]
+    fn collect_ripped_files_matches_extensions_case_insensitively() {
+        let dir = Path::new("/staging/CaseDisc");
+        let names = [
+            "a.MKV",
+            "b.Mk3D",
+            "c.M2TS",
+            "d.ISO",
+            "e.iso",
+            "f.TXT",
+            "g.mkv.part",
+            "noext",
+        ];
+        let entries = || names.iter().map(|n| Ok(dir.join(n)));
+        let leafs = |files: Vec<std::path::PathBuf>| -> Vec<String> {
+            files
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let (with_iso, complete) = collect_ripped_files(entries(), true, dir);
+        assert!(complete);
+        assert_eq!(
+            leafs(with_iso),
+            ["a.MKV", "b.Mk3D", "c.M2TS", "d.ISO", "e.iso"],
+            "every deliverable extension must match regardless of case"
+        );
+        let (without_iso, _) = collect_ripped_files(entries(), false, dir);
+        assert_eq!(
+            leafs(without_iso),
+            ["a.MKV", "b.Mk3D", "c.M2TS"],
+            "move_iso=false must drop .iso in any case"
         );
     }
 
