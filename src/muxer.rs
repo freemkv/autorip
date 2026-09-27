@@ -152,6 +152,12 @@ pub static MUX_DISMISSED: once_cell::sync::Lazy<Mutex<std::collections::BTreeSet
 pub(crate) const ABORTED_LOSS_HINT: &str = "the delivered title lost more data than 'abort_on_lost_secs' allows, so this rip will NOT auto-retry (an identical re-mux reproduces the same loss). Re-insert the disc to Accept & deliver it as-is or run another recovery pass — or raise 'abort_on_lost_secs' in Settings first, then re-insert to deliver it automatically.";
 
 pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
+    record_error_announced(path, reason, hint, true);
+}
+
+// `record_error`, but `announce = false` suppresses the syslog line (a repeat the
+// dispatch-time clear would otherwise re-announce every tick).
+fn record_error_announced(path: &str, reason: &str, hint: &str, announce: bool) {
     // Operator dismissed this path — honor it (don't re-surface a card the
     // operator cleared). Lifted on a fresh dispatch / prune (see MUX_DISMISSED).
     if MUX_DISMISSED
@@ -177,9 +183,18 @@ pub(crate) fn record_error(path: &str, reason: &str, hint: &str) {
         );
         same_reason
     };
-    if !same_reason {
+    if announce && !same_reason {
         crate::log::syslog(&format!("Mux blocked: {} — {}", path, reason));
     }
+}
+
+// Whether `path`'s current card carries `hint` (identifies a repeat of the same cause).
+fn error_hint_is(path: &str, hint: &str) -> bool {
+    MUX_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .is_some_and(|e| e.hint == hint)
 }
 
 pub(crate) fn clear_error(path: &str) {
@@ -552,6 +567,7 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         // Exclusion lock for the mux duration (stamped at verdict-commit, owned
         // by `_guard`) blocks concurrent re-inserts/double-mux until `.completed`/
         // `.failed`/`.ripped` take over; also clear any stale error card now.
+        let prior_space_refusal = error_hint_is(&dir.to_string_lossy(), STAGING_SPACE_HINT);
         clear_error(&dir.to_string_lossy());
         // A fresh dispatch may produce a new/different error — lift any prior
         // operator dismissal so a genuinely new failure can surface again.
@@ -587,14 +603,7 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             let (reason, hint) = if let Some((r, _)) = &aborted_loss {
                 (r.clone(), ABORTED_LOSS_HINT.to_string())
             } else if let Some(r) = outcome.failure_reason.clone() {
-                let hint = if outcome.failure_retryable {
-                    // Keyless deferral: retryable, no operator action needed
-                    // unless it persists (the ISO stays staged and re-muxes
-                    // automatically once keys land / the key service recovers).
-                    "no decryption keys yet — the disc stays staged and will mux automatically once keys are available; if this persists, check the key source in Settings"
-                } else {
-                    "the mux failed to finalize/write the output — staging is preserved; check the _mux device log for the failure detail and re-run the mux"
-                };
+                let hint = worker_failure_hint(outcome.failure_retryable, outcome.failure_space);
                 (r, hint.to_string())
             } else {
                 // Defensive fallback (no reason came back from the worker):
@@ -619,7 +628,8 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                 // re-Dispatching forever; a resumable read error stays re-muxable.
                 persist_terminal_mux_quarantine(&path_str, &dir, &reason);
             }
-            record_error(&path_str, &reason, &hint);
+            let repeat = outcome.failure_space && prior_space_refusal;
+            record_error_announced(&path_str, &reason, &hint, !repeat);
         }
     }
 }
@@ -666,6 +676,20 @@ fn origin_done_state(
         // it on a disc with accepted mux-phase decrypt loss.
         lost_video_secs: outcome.lost_video_secs,
         ..Default::default()
+    }
+}
+
+pub(crate) const STAGING_SPACE_HINT: &str = "staging is too full to hold this disc's mux outputs — free space on the staging volume or set Staging Directory in Settings to a larger volume; the disc image stays staged and the mux retries automatically";
+
+// Operator hint for a worker-reported mux failure, by cause.
+fn worker_failure_hint(retryable: bool, space: bool) -> &'static str {
+    if space {
+        STAGING_SPACE_HINT
+    } else if retryable {
+        // Keyless deferral: re-muxes automatically once keys land.
+        "no decryption keys yet — the disc stays staged and will mux automatically once keys are available; if this persists, check the key source in Settings"
+    } else {
+        "the mux failed to finalize/write the output — staging is preserved; check the _mux device log for the failure detail and re-run the mux"
     }
 }
 
@@ -749,6 +773,17 @@ pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn space_refusal_gets_a_staging_space_hint() {
+        assert_eq!(
+            super::worker_failure_hint(false, true),
+            super::STAGING_SPACE_HINT
+        );
+        assert!(super::STAGING_SPACE_HINT.contains("Staging Directory in Settings"));
+        assert!(super::worker_failure_hint(false, false).contains("finalize"));
+        assert!(super::worker_failure_hint(true, false).contains("decryption keys"));
+    }
     use tempfile::TempDir;
 
     // The absence probe is a stat that can block on a hung NFS mount; neither error map may be

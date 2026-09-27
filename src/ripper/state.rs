@@ -74,6 +74,10 @@ pub struct RipState {
     /// carried forward across state pushes: it describes one terminal push.
     #[serde(skip)]
     pub failure_finalize: bool,
+    /// The re-mux was refused up front because staging lacks space for its outputs
+    /// (retryable; staging intact). Server-side only; not carried across pushes.
+    #[serde(skip)]
+    pub failure_space: bool,
     pub disc_format: String, // "uhd", "bluray", "dvd"
     pub progress_pct: u8,
     pub progress_gb: f64,
@@ -227,6 +231,7 @@ impl Default for RipState {
             disc_label: String::new(),
             failure_deferred: false,
             failure_finalize: false,
+            failure_space: false,
             disc_format: String::new(),
             progress_pct: 0,
             progress_gb: 0.0,

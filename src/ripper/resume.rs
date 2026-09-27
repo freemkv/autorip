@@ -339,6 +339,7 @@ fn apply_failure_fields(outcome: &mut MuxHandoffOutcome, rs: &super::RipState) {
     // on: a deferral is never a finalize failure, and a resumable read error
     // sets neither, leaving it re-muxable.
     outcome.failure_finalize = rs.failure_finalize;
+    outcome.failure_space = rs.failure_space;
 }
 
 // Quarantine an incomplete-mux staging dir iff the mux died on a structural finalize failure
@@ -571,6 +572,51 @@ fn remux_space_shortfall(
     ))
 }
 
+// The re-mux space check: planned outputs (ISO already staged) vs free space at the dir.
+// Returns (required bytes, operator message) when staging is too full.
+fn remux_space_refusal(
+    cfg: &Config,
+    staging_dir: &Path,
+    titles: &[libfreemkv::DiscTitle],
+    plan_outputs: &[staging::Output],
+) -> Option<(u64, String)> {
+    let fanout: Vec<usize> = if plan_outputs.len() > 1 {
+        plan_outputs.iter().map(|o| o.title_index).collect()
+    } else {
+        Vec::new()
+    };
+    let primary = titles.first().map(|t| t.size_bytes).unwrap_or(0);
+    let required = super::mux_reserve_for(cfg, titles, &fanout, primary);
+    let existing: u64 = plan_outputs
+        .iter()
+        .filter_map(|o| staging_dir.join(&o.filename).metadata().ok())
+        .fold(0u64, |acc, m| acc.saturating_add(m.len()));
+    let label = staging_dir.to_string_lossy();
+    let avail = staging::staging_free_bytes(&label);
+    remux_space_shortfall(required, existing, avail, &label).map(|msg| (required, msg))
+}
+
+// Last refused `required` per staging dir, so a persistently full disk logs once.
+static SPACE_REFUSED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, u64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+// True when this refusal is new for the dir (first, or a different requirement).
+fn note_space_refusal(staging_dir: &Path, required: u64) -> bool {
+    SPACE_REFUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(staging_dir.to_path_buf(), required)
+        != Some(required)
+}
+
+fn forget_space_refusal(staging_dir: &Path) {
+    SPACE_REFUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(staging_dir);
+}
+
 pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: ResumeClass) {
     let ResumeClass::Remux {
         iso_path,
@@ -706,6 +752,20 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         );
         return;
     }
+
+    // Space preflight before the key round-trip: a full staging volume must not cost a
+    // key-service call per worker tick. Logged once per (dir, required) until it clears.
+    if let Some((required, msg)) =
+        remux_space_refusal(&cfg_read, &staging_dir, &disc.titles, &plan_outputs)
+    {
+        if note_space_refusal(&staging_dir, required) {
+            crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
+        }
+        reset_status_after_ripping(device, "error", &display_name, "", "", Some(msg));
+        super::update_state_with(device, |s| s.failure_space = true);
+        return;
+    }
+    forget_space_refusal(&staging_dir);
 
     // Sample-based key source: read the disc's files + Volume ID (from the
     // mapfile) + on-disc samples (from the ISO), resolve a Unit Key, and re-scan
@@ -866,32 +926,6 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         // update_state call further below). reset_status_after_ripping
         // deferral reason without flagging a hard failure.
         defer_status_after_ripping(device, &display_name, &disc_format, &duration, reason);
-        return;
-    }
-
-    // Space preflight: the ISO is already staged, so only the planned outputs need room.
-    let fanout: Vec<usize> = if is_fanout {
-        plan_outputs.iter().map(|o| o.title_index).collect()
-    } else {
-        Vec::new()
-    };
-    let required = super::mux_reserve_for(&cfg_read, &disc.titles, &fanout, title.size_bytes);
-    let existing: u64 = plan_outputs
-        .iter()
-        .filter_map(|o| staging_dir.join(&o.filename).metadata().ok())
-        .fold(0u64, |acc, m| acc.saturating_add(m.len()));
-    let staging_label = staging_dir.to_string_lossy();
-    let avail = staging::staging_free_bytes(&staging_label);
-    if let Some(msg) = remux_space_shortfall(required, existing, avail, &staging_label) {
-        crate::log::device_log(device, &format!("Auto-resume aborted: {msg}"));
-        reset_status_after_ripping(
-            device,
-            "error",
-            &display_name,
-            &disc_format,
-            &duration,
-            Some(msg),
-        );
         return;
     }
 
@@ -1743,6 +1777,8 @@ pub(crate) struct MuxHandoffOutcome {
     // True only for a structural FINALIZE failure — the sole class the mux worker may
     // quarantine.
     pub failure_finalize: bool,
+    // True when the re-mux was refused up front for lack of staging space (retryable).
+    pub failure_space: bool,
 }
 
 // Whether resume_remux finished this staging dir cleanly (.completed written). Probes via
@@ -1902,6 +1938,60 @@ mod remux_space_tests {
         assert_eq!(remux_space_shortfall(30 * GB, 0, Some(30 * GB), "/s"), None);
         assert_eq!(remux_space_shortfall(0, 0, Some(0), "/s"), None);
         assert_eq!(remux_space_shortfall(30 * GB, 0, None, "/s"), None);
+    }
+
+    #[test]
+    fn repeated_identical_space_refusal_is_noted_once() {
+        let dir = std::path::PathBuf::from(format!("/nonexistent/space-{}", std::process::id()));
+        assert!(
+            super::note_space_refusal(&dir, 30 * GB),
+            "first refusal logs"
+        );
+        assert!(
+            !super::note_space_refusal(&dir, 30 * GB),
+            "identical repeat is quiet"
+        );
+        assert!(
+            super::note_space_refusal(&dir, 31 * GB),
+            "a changed need logs again"
+        );
+        super::forget_space_refusal(&dir);
+        assert!(
+            super::note_space_refusal(&dir, 31 * GB),
+            "logs again after clearing"
+        );
+        super::forget_space_refusal(&dir);
+    }
+
+    #[test]
+    fn space_refusal_threads_ripstate_to_the_worker_outcome() {
+        let rs = crate::ripper::RipState {
+            last_error: "Not enough staging disk space".to_string(),
+            failure_space: true,
+            ..crate::ripper::RipState::default()
+        };
+        let mut outcome = super::MuxHandoffOutcome::default();
+        super::apply_failure_fields(&mut outcome, &rs);
+        assert!(outcome.failure_space, "space bit must reach the mux worker");
+        assert!(!outcome.failure_finalize && !outcome.failure_retryable);
+    }
+
+    // Wiring pin: resume_remux runs the space check (sized by mux_reserve_for) before
+    // the key round-trip, and flags the refusal on RipState.
+    #[test]
+    fn resume_remux_checks_space_before_key_resolution() {
+        let src = crate::util::source_lf(include_str!("resume.rs"));
+        let body = &src[src.find("\nfn remux_space_refusal(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("super::mux_reserve_for(cfg, titles, &fanout, primary)"));
+        assert!(body.contains("remux_space_shortfall(required, existing, avail, &label)"));
+        let f = &src[src.find("\npub fn resume_remux(").unwrap()..];
+        let check = f
+            .find("remux_space_refusal(&cfg_read, &staging_dir")
+            .unwrap();
+        let keys = f.find("resolve_keys_from_iso(&cfg_read").unwrap();
+        assert!(check < keys, "space check must precede key resolution");
+        assert!(f[check..keys].contains("s.failure_space = true"));
     }
 }
 
