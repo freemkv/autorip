@@ -2589,14 +2589,18 @@ struct IdleReCapTransport<In> {
 }
 
 impl<In> IdleReCapTransport<In> {
-    // Cap only BODY reads (reason RecvBody) at the idle bound; connect and header phases keep
-    // ureq's own timeouts. min keeps the tighter of a small total-body budget and idle.
+    // Cap body reads at the idle bound. A Global/PerCall ceiling masks the phase (ureq reports
+    // whichever deadline is earliest), so those are capped too; header waits then get the idle
+    // bound only under a request ceiling. min keeps the tighter of the budget and idle.
     fn cap(
         &self,
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> ureq::unversioned::transport::NextTimeout {
         use ureq::unversioned::transport::time::Duration as UreqDuration;
-        if timeout.reason != ureq::Timeout::RecvBody {
+        if !matches!(
+            timeout.reason,
+            ureq::Timeout::RecvBody | ureq::Timeout::Global | ureq::Timeout::PerCall
+        ) {
             return timeout;
         }
         let idle = UreqDuration::from_millis(self.idle.as_millis() as u64);
@@ -2607,7 +2611,7 @@ impl<In> IdleReCapTransport<In> {
         };
         ureq::unversioned::transport::NextTimeout {
             after,
-            reason: ureq::Timeout::RecvBody,
+            reason: timeout.reason,
         }
     }
 }
@@ -2696,6 +2700,22 @@ pub fn guarded_get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String
 // KEYDB_TRANSFER_BUDGET because this path holds an in-flight handler slot and the update flag
 // that 429s everyone else.
 pub(crate) const KEYDB_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+// The /api/update-keydb fetch: guarded agent plus a request-level end-to-end ceiling, which
+// keeps this LAN-facing path at KEYDB_FETCH_TIMEOUT rather than KEYDB_TRANSFER_BUDGET.
+fn keydb_update_call(
+    pinned: Vec<SocketAddr>,
+    url: &str,
+    ceiling: std::time::Duration,
+    idle: std::time::Duration,
+) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    guarded_agent_with_timeouts(pinned, std::time::Duration::from_secs(5), ceiling, idle)
+        .get(url)
+        .config()
+        .timeout_global(Some(ceiling))
+        .build()
+        .call()
+}
 
 // How long a KEYDB body may take IN TOTAL once headers are in — sized to a real single-digit-MB
 // keydb export, not to KEYDB_MAX_BYTES's defensive 100 MiB DoS cap.
@@ -4794,6 +4814,55 @@ mod web_tests {
         // Joinable because the stub ends on client disconnect; `drop` on a
         // JoinHandle only detaches, it does not stop the thread.
         let _ = server.join();
+    }
+
+    // The real /api/update-keydb call path sets a request-level ceiling (timeout_global);
+    // a peer that sends headers then stalls must still be cut off by the idle bound.
+    #[test]
+    fn keydb_update_stalled_body_is_cut_off_by_idle_bound_under_a_global_ceiling() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener =
+            TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
+        let pinned = listener.local_addr().expect("stub listener address");
+        let server = std::thread::spawn(move || {
+            let (mut sock, _peer) = listener.accept().expect("accept failed");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match sock.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
+            let _ = sock.flush();
+            let mut sink = [0u8; 1];
+            let _ = sock.read(&mut sink);
+        });
+
+        // Same 3:1 ceiling:idle ratio as production (60s:20s), scaled down.
+        let idle = std::time::Duration::from_secs(1);
+        let ceiling = std::time::Duration::from_secs(8);
+        let started = std::time::Instant::now();
+        let resp = keydb_update_call(
+            vec![pinned],
+            "http://keydb-mirror.test/k.zip",
+            ceiling,
+            idle,
+        )
+        .expect("headers must arrive");
+        let mut body = Vec::new();
+        let read = resp.into_body().into_reader().read_to_end(&mut body);
+        let elapsed = started.elapsed();
+        let _ = server.join();
+
+        assert!(read.is_err(), "a stalled body must not read as success");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "stalled keydb update held for {elapsed:?}: the global ceiling, not the idle bound, ended it"
+        );
     }
 
     // The rejection tests above never connect, so they'd still pass if the
@@ -8317,28 +8386,12 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             return;
         }
     };
-    // NOT the plain guarded_agent (its 30s ceiling would override the budget
-    // below); this LAN-facing unauthenticated path keeps the tighter 60s
-    // KEYDB_FETCH_TIMEOUT rather than KEYDB_TRANSFER_BUDGET.
-    let agent = guarded_agent_with_timeouts(
-        pinned,
-        std::time::Duration::from_secs(5),
-        KEYDB_FETCH_TIMEOUT,
-        STALL_TIMEOUT,
-    );
-
     // Cap is the shared KEYDB_MAX_BYTES (100 MiB); read_capped_keydb_body
     // returns 413 on an oversized body rather than silently truncating.
     let keydb_cap = KEYDB_MAX_BYTES;
 
     // Download via ureq (supports HTTPS) then save via libfreemkv
-    let body = match agent
-        .get(&keydb_url)
-        .config()
-        .timeout_global(Some(KEYDB_FETCH_TIMEOUT))
-        .build()
-        .call()
-    {
+    let body = match keydb_update_call(pinned, &keydb_url, KEYDB_FETCH_TIMEOUT, STALL_TIMEOUT) {
         Ok(resp) => match read_capped_keydb_body(resp.into_body().into_reader(), keydb_cap) {
             Ok(buf) => buf,
             Err(KeydbReadError::Io) => {
