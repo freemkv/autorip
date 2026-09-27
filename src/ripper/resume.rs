@@ -469,6 +469,28 @@ fn record_loss_abort_write_failure(device: &str, staging_dir: &Path, reason: &st
     }
 }
 
+// Hold a dir whose state.json exists but can't be read: leave staging (ISO, partial
+// output, the bad state.json) untouched and surface it, since the recorded deliverable
+// plan (movie vs. TV episodes) is unknown and a guess would prune the ISO.
+fn hold_unreadable_plan(device: &str, staging_dir: &Path, display_name: &str, why: &str) {
+    let reason = format!("Auto-resume held: {why}");
+    crate::log::device_log(
+        device,
+        &format!(
+            "{reason} — not re-muxing, since the deliverable plan (movie vs. TV episodes) is unknown. Staging and the ISO are kept ({}).",
+            staging_dir.display()
+        ),
+    );
+    if device != "_mux" {
+        crate::muxer::record_error(
+            &staging_dir.to_string_lossy(),
+            &reason,
+            "state.json in this staging dir is corrupt or from another version, so the rip is held (ISO kept) rather than delivered in a possibly wrong shape; restore or repair state.json, or delete it to deliver the disc as a single title",
+        );
+    }
+    reset_status_after_ripping(device, "error", display_name, "", "", Some(reason));
+}
+
 // RAII exclusion lock for the cold operator-resume mux path: writes.muxing so a concurrent
 // ResumeMode::Wipe can't delete the ISO out from under an in-flight mux.
 struct ResumeMuxingGuard<'a> {
@@ -565,6 +587,19 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from(&cfg_read.staging_dir));
 
+    // The deliverable plan the rip recorded in `state.json` (movie = 1 output;
+    // TV = one per episode). Absent = legacy/movie; present-but-unreadable is
+    // held, else a TV fanout would deliver as one movie and prune the ISO.
+    let plan_outputs: Vec<staging::Output> = match staging::read_state_checked(&staging_dir) {
+        staging::StateRead::Valid(s) => s.outputs,
+        staging::StateRead::Absent => Vec::new(),
+        staging::StateRead::Unreadable(why) => {
+            hold_unreadable_plan(device, &staging_dir, &display_name, &why);
+            return;
+        }
+    };
+    let is_fanout = plan_outputs.len() > 1;
+
     // One-shot operator override: `.accept-loss` makes the abort gates below
     // treat the threshold as unlimited and re-mux the EXISTING ISO. Consumed
     // only at the hand-off (not at entry) so a transient failure doesn't lose it.
@@ -575,14 +610,6 @@ pub fn resume_remux(cfg: &Arc<RwLock<Config>>, device: &str, classification: Res
             "Operator accepted the recorded loss — delivering the existing rip despite over-threshold damage.",
         );
     }
-
-    // The deliverable plan the rip recorded in `state.json` (movie = 1 output;
-    // TV = one per episode). Use the warn-on-corrupt reader: a corrupt state.json
-    // would otherwise read as an empty plan and mis-deliver a TV fanout as a movie.
-    let plan_outputs: Vec<staging::Output> = staging::read_state_or_warn_corrupt(&staging_dir)
-        .map(|s| s.outputs)
-        .unwrap_or_default();
-    let is_fanout = plan_outputs.len() > 1;
 
     crate::log::device_log(
         device,
@@ -2315,6 +2342,90 @@ mod resume_remux_log_archive_tests {
 }
 
 #[cfg(test)]
+mod resume_remux_unreadable_plan_tests {
+    use super::*;
+
+    fn tmpdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join(format!(
+                "autorip-resume-unreadable-plan-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+            ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(p.join("logs")).unwrap();
+        p
+    }
+
+    // A state.json that EXISTS but can't be trusted must hold the dir: no mux, no
+    // partial-output delete, state.json left for the operator, an error surfaced.
+    fn assert_held(state_bytes: &[u8], tag: &str) {
+        let _guard = crate::log::env_guard();
+        let d = tmpdir();
+        // SAFETY: env access in tests, serialized by env_guard.
+        unsafe {
+            std::env::set_var("AUTORIP_DIR", &d);
+        }
+        let staging = d.join("Show_S01D1");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(staging::STATE_FILE), state_bytes).unwrap();
+        let partial = staging.join("Show_S01D1.mkv");
+        std::fs::write(&partial, b"partial").unwrap();
+
+        let dev = format!("test_resume_unreadable_{tag}_{}", std::process::id());
+        let class = ResumeClass::Remux {
+            iso_path: staging.join("Show_S01D1.iso"),
+            mapfile_path: staging.join("Show_S01D1.iso.mapfile"),
+            display_name: "Show_S01D1".to_string(),
+            title_confident: None,
+        };
+        let cfg = Arc::new(RwLock::new(Config::default()));
+        resume_remux(&cfg, &dev, class);
+
+        let live = crate::log::get_device_log(&dev, 200);
+        assert!(
+            !live.iter().any(|l| l.contains("Auto-resume: re-muxing")),
+            "an unreadable plan must not proceed to the mux, got: {live:?}"
+        );
+        assert!(
+            live.iter().any(|l| l.contains("Auto-resume held")),
+            "the hold must be explained in the device log, got: {live:?}"
+        );
+        assert!(partial.exists(), "held dir must be left untouched");
+        assert_eq!(
+            std::fs::read(staging.join(staging::STATE_FILE)).unwrap(),
+            state_bytes,
+            "the unreadable state.json must be preserved for the operator"
+        );
+        let rs = crate::ripper::STATE.lock().unwrap().remove(&dev);
+        let rs = rs.expect("device state must be set");
+        assert_eq!(rs.status, "error");
+        assert!(rs.last_error.contains("state.json"), "{}", rs.last_error);
+        let path = staging.to_string_lossy().to_string();
+        assert!(
+            crate::muxer::MUX_ERRORS.lock().unwrap().contains_key(&path),
+            "an operator error card must be raised for the held dir"
+        );
+        crate::muxer::clear_mux_error(&path);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn corrupt_state_json_holds_instead_of_delivering() {
+        assert_held(b"{ this is not json", "corrupt");
+    }
+
+    #[test]
+    fn foreign_schema_state_json_holds_instead_of_delivering() {
+        assert_held(br#"{"schema": 1, "state": "ripped"}"#, "foreign");
+    }
+}
+
+#[cfg(test)]
 mod resume_remux_scan_gate_tests {
     //! Drive `resume_remux` through the real `libfreemkv::scan_iso` seam with a
     //! synthetic minimal UDF image (an empty root directory, so `scan_iso`
@@ -3569,9 +3680,9 @@ mod accept_loss_override_tests {
         );
     }
 
-    // `.accept-loss` is READ at entry but CLEARED only at a hand-off. Both
-    // delivery paths (raw-ISO branch and MKV mux) consume it, so there may be >1
-    // clear site — but every one must sit after delivery, never at entry.
+    // `.accept-loss` is READ at entry but CLEARED only at a hand-off. Each
+    // delivery path (raw-ISO branch, MKV mux) consumes it, so each clear must
+    // follow ITS OWN path's completion-marker write, with nothing risky between.
     #[test]
     fn the_accept_loss_marker_is_consumed_only_once_the_rip_is_delivered() {
         let src = crate::util::source_lf(include_str!("resume.rs"));
@@ -3587,12 +3698,6 @@ mod accept_loss_override_tests {
         let read_at = code
             .find("staging::accept_loss_requested(")
             .expect("resume_remux must read the marker");
-        // The FIRST completion-marker write (the raw-ISO branch) is the earliest
-        // delivery point; every clear must sit at or after a delivery, so all of
-        // them come after this.
-        let delivered_at = code
-            .find("staging::write_completed_marker(")
-            .expect("resume_remux must write the completion marker");
         let cleared: Vec<usize> = code
             .match_indices("staging::clear_accept_loss_marker(")
             .map(|(i, _)| i)
@@ -3601,11 +3706,27 @@ mod accept_loss_override_tests {
             !cleared.is_empty(),
             "the override must be consumed on delivery, in at least one place"
         );
-        assert!(
-            cleared.iter().all(|&c| c > read_at && c > delivered_at),
-            "`.accept-loss` must be cleared only AFTER the rip has been \
-             delivered (after write_completed_marker), never at entry — an \
-             unrelated transient failure must not spend the operator's consent"
-        );
+        let mut delivered_by: Vec<usize> = Vec::new();
+        for &c in &cleared {
+            let w = code[..c]
+                .rfind("staging::write_completed_marker(")
+                .expect("every `.accept-loss` clear must follow a completion-marker write");
+            assert!(w > read_at, "a clear's delivery must come after the read");
+            let between = &code[w..c];
+            for risky in ["mux_iso(", "mark_handoff(", "return"] {
+                assert!(
+                    !between.contains(risky),
+                    "`.accept-loss` must be cleared right after its own path's \
+                     write_completed_marker, but `{risky}` sits between them — a \
+                     transient failure there would spend the operator's consent"
+                );
+            }
+            assert!(
+                !delivered_by.contains(&w),
+                "two `.accept-loss` clears share one completion-marker write: one \
+                 of them has moved ahead of its own path's delivery"
+            );
+            delivered_by.push(w);
+        }
     }
 }

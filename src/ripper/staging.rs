@@ -271,31 +271,42 @@ pub fn read_state(staging_disc_dir: &Path) -> Option<DiscState> {
     (st.schema == DISC_STATE_SCHEMA).then_some(st)
 }
 
-// Like `read_state`, but logs loudly if the file exists but fails to parse,
-// so read-modify-write callers' `unwrap_or_else(DiscState::new)` fallback
-// doesn't silently discard accumulated data on external corruption.
-pub(crate) fn read_state_or_warn_corrupt(staging_disc_dir: &Path) -> Option<DiscState> {
-    let p = state_path(staging_disc_dir);
-    let Ok(bytes) = std::fs::read(&p) else {
-        return None; // absent — the normal first-write case.
+/// `state.json` read that tells a missing file (normal) apart from one that
+/// exists but can't be trusted (I/O error, unparseable, or a foreign schema).
+pub(crate) enum StateRead {
+    Absent,
+    Valid(Box<DiscState>),
+    Unreadable(String),
+}
+
+pub(crate) fn read_state_checked(staging_disc_dir: &Path) -> StateRead {
+    let bytes = match std::fs::read(state_path(staging_disc_dir)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return StateRead::Absent,
+        Err(e) => return StateRead::Unreadable(format!("state.json could not be read: {e}")),
     };
     match serde_json::from_slice::<DiscState>(&bytes) {
-        Ok(st) if st.schema == DISC_STATE_SCHEMA => Some(st),
-        Ok(st) => {
+        Ok(st) if st.schema == DISC_STATE_SCHEMA => StateRead::Valid(Box::new(st)),
+        Ok(st) => StateRead::Unreadable(format!(
+            "state.json is schema {} (expected {DISC_STATE_SCHEMA})",
+            st.schema
+        )),
+        Err(e) => StateRead::Unreadable(format!("state.json is unparseable: {e}")),
+    }
+}
+
+// Like `read_state`, but logs loudly if the file exists but can't be read, so
+// read-modify-write callers' `unwrap_or_else(DiscState::new)` fallback doesn't
+// silently discard accumulated data on external corruption.
+pub(crate) fn read_state_or_warn_corrupt(staging_disc_dir: &Path) -> Option<DiscState> {
+    match read_state_checked(staging_disc_dir) {
+        StateRead::Valid(st) => Some(*st),
+        StateRead::Absent => None, // the normal first-write case.
+        StateRead::Unreadable(why) => {
             tracing::error!(
-                path = %p.display(),
-                found_schema = st.schema,
-                expected_schema = DISC_STATE_SCHEMA,
-                "state.json is a different schema — starting from empty state"
-            );
-            None
-        }
-        Err(e) => {
-            tracing::error!(
-                path = %p.display(),
-                error = %e,
-                "state.json exists but is unparseable — a transition is starting from empty state, \
-                 which drops accumulated title/season/outputs metadata for this dir"
+                path = %state_path(staging_disc_dir).display(),
+                "{why} — a transition is starting from empty state, which drops \
+                 accumulated title/season/outputs metadata for this dir"
             );
             None
         }
@@ -1892,6 +1903,19 @@ mod tests {
             read_state(&dir).is_none(),
             "a foreign-schema state.json must not resume as unified state",
         );
+    }
+
+    #[test]
+    fn read_state_checked_separates_absent_from_unreadable() {
+        let dir = tmpdir();
+        assert!(matches!(read_state_checked(&dir), StateRead::Absent));
+        write_state(&dir, &DiscState::new(StagingState::Ripped));
+        assert!(matches!(read_state_checked(&dir), StateRead::Valid(_)));
+        let p = state_path(&dir);
+        fs::write(&p, br#"{"schema": 1, "state": "ripped"}"#).unwrap();
+        assert!(matches!(read_state_checked(&dir), StateRead::Unreadable(_)));
+        fs::write(&p, b"{ torn").unwrap();
+        assert!(matches!(read_state_checked(&dir), StateRead::Unreadable(_)));
     }
 
     #[test]
