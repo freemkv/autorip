@@ -1541,6 +1541,8 @@ fn dispatch_rip_request(
 enum StagingHold {
     /// The dir exists but could not be read cleanly: its lifecycle is unknown.
     Unreadable,
+    /// Listed empty, but a non-recursive rmdir refused: the listing may be hiding files.
+    UnconfirmedEmpty,
     /// Finished (`.completed` / `.done`): awaiting or past the mover.
     Completed,
     /// `.ripped` / `.muxing`: the mux worker is reading this ISO.
@@ -1627,6 +1629,9 @@ fn staging_hold_stands_down(cfg: &Arc<RwLock<Config>>, device: &str, purpose: Gu
         StagingHold::Unreadable => {
             "Cannot read this disc's staging dir cleanly (staging share degraded?) — NOT re-ripping, so a finished rip can't be destroyed. Retry once staging is readable."
         }
+        StagingHold::UnconfirmedEmpty => {
+            "This disc's staging dir lists as empty but could not be removed (stale network-share listing?) — NOT wiping it. Retry once staging is readable, or use Rip to start over."
+        }
     };
     crate::log::device_log(device, why);
     // The UI renders Accept/Resume on loss_aborted && !active.
@@ -1656,8 +1661,8 @@ fn resume_refused_by_staging(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
 }
 
 // The hold on the scanned disc's own staging dir, read fail-closed: a dir that exists but
-// can't be snapshotted cleanly is `Unreadable`, never "nothing staged". `for_wipe` also
-// distrusts a listing that saw no entries at all.
+// can't be snapshotted cleanly is `Unreadable`, never "nothing staged". `for_wipe` removes a
+// dir that listed empty only if a non-recursive rmdir confirms it.
 fn disc_staging_hold(
     cfg: &Arc<RwLock<Config>>,
     device: &str,
@@ -1691,15 +1696,16 @@ fn disc_staging_hold(
         Err(_) => return Some(StagingHold::Unreadable),
     }
     let snap = match staging::snapshot_staging_disc(&dir) {
-        Some(s)
-            if !s.had_entry_error
-                && s.state_unreadable.is_none()
-                && !(for_wipe && s.saw_no_entries) =>
-        {
-            s
-        }
+        Some(s) if !s.had_entry_error && s.state_unreadable.is_none() => s,
         _ => return Some(StagingHold::Unreadable),
     };
+    // An empty listing can be a cold-cache lie; only a non-recursive rmdir proves it empty.
+    if for_wipe && snap.saw_no_entries {
+        return match std::fs::remove_dir(&dir) {
+            Ok(()) => None,
+            Err(_) => Some(StagingHold::UnconfirmedEmpty),
+        };
+    }
     snapshot_hold(&snap).or_else(|| {
         (snap.has_sweeping && another_drive_sweeping(&cfg_read, device, &sanitized))
             .then_some(StagingHold::LiveSweep)
@@ -10505,52 +10511,72 @@ mod tests {
         assert_eq!(st.status, "error", "and the fresh rip must be attempted");
     }
 
-    // A listing that saw no entries at all is the cold-cache NFS signature: never wipe on
-    // it. Only the wipe path stands down; Default's in-place rip still proceeds.
+    // Run `mode` over an existing but EMPTY staging dir; returns (dir, status).
+    fn dispatch_over_empty_dir(
+        device: &str,
+        root: &std::path::Path,
+        mode: crate::web::ResumeMode,
+    ) -> (std::path::PathBuf, Option<String>) {
+        let cfg = seed_scanned_disc(device, "Empty Disc", root);
+        super::update_state_with(device, |s| s.status = "scanning".to_string());
+        let dir = root.join(crate::util::sanitize_path_compact("Empty Disc"));
+        std::fs::create_dir_all(&dir).unwrap();
+        super::dispatch_rip_request(&cfg, device, "/nonexistent/autorip-test-drive", mode);
+        let status = super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .map(|s| s.status.clone());
+        forget_device(device);
+        (dir, status)
+    }
+
+    // A genuinely empty dir (e.g. a rip that bailed right after create_dir_all) must not
+    // wedge unattended inserts: the wipe path proves emptiness with a non-recursive rmdir.
     #[test]
-    fn fresh_insert_does_not_wipe_a_staging_dir_that_listed_empty() {
-        for (label, mode, stands_down) in [
-            (
-                "rip",
-                super::auto_insert_rip_mode("rip").expect("mode"),
-                true,
-            ),
+    fn fresh_insert_starts_over_a_genuinely_empty_staging_dir() {
+        for (label, mode) in [
+            ("rip", super::auto_insert_rip_mode("rip").expect("mode")),
             (
                 "resume",
                 super::auto_insert_rip_mode("resume").expect("mode"),
-                true,
             ),
-            ("default", crate::web::ResumeMode::Default, false),
+            ("default", crate::web::ResumeMode::Default),
         ] {
-            let device = format!("sg_insert_empty_listing_{label}_test");
             let tmp = tempfile::TempDir::new().unwrap();
-            let cfg = seed_scanned_disc(&device, "Empty Disc", tmp.path());
-            super::update_state_with(&device, |s| s.status = "scanning".to_string());
-            let dir = tmp
-                .path()
-                .join(crate::util::sanitize_path_compact("Empty Disc"));
-            std::fs::create_dir_all(&dir).unwrap();
-            super::dispatch_rip_request(&cfg, &device, "/nonexistent/autorip-test-drive", mode);
-            let status = super::STATE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&device)
-                .map(|s| s.status.clone());
-            forget_device(&device);
-            if stands_down {
-                assert!(
-                    dir.exists(),
-                    "{label}: an empty-listing dir must not be wiped"
-                );
-                assert_eq!(status.as_deref(), Some("idle"), "{label} must stand down");
-            } else {
-                assert_eq!(
-                    status.as_deref(),
-                    Some("error"),
-                    "Default still rips in place"
-                );
-            }
+            let device = format!("sg_insert_empty_dir_{label}_test");
+            let (_dir, status) = dispatch_over_empty_dir(&device, tmp.path(), mode);
+            assert_eq!(status.as_deref(), Some("error"), "{label} must rip fresh");
         }
+    }
+
+    // An empty listing the rmdir can't confirm (the cold-cache NFS signature) stands down.
+    #[cfg(unix)]
+    #[test]
+    fn fresh_insert_stands_down_when_an_empty_listing_cannot_be_confirmed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("Empty_Disc")).unwrap();
+        // Read-only root: the listing works but rmdir fails, as it would on a hidden entry.
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::create_dir(root.join("probe")).is_ok() {
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "read-only staging test cannot run as root on CI"
+            );
+            eprintln!("SKIPPED empty-listing rmdir test: running as root");
+            return;
+        }
+        let mode = super::auto_insert_rip_mode("rip").expect("mode");
+        let (dir, status) = dispatch_over_empty_dir("sg_insert_empty_unconfirmed_test", root, mode);
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            dir.exists(),
+            "an unconfirmed empty listing must not be wiped"
+        );
+        assert_eq!(status.as_deref(), Some("idle"), "and must stand down");
     }
 
     // An unusable `state.json` hides the lifecycle (the mux worker holds such a dir): stand down.
@@ -10618,6 +10644,10 @@ mod tests {
                 });
             let unreadable = std::fs::read_dir(&dir).is_err();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                unreadable || std::env::var_os("CI").is_none(),
+                "chmod-000 staging test cannot run as root on CI"
+            );
             if unreadable {
                 assert!(
                     st.last_error.contains("Cannot read"),
