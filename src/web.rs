@@ -2833,6 +2833,17 @@ mod web_tests {
             AcceptLossEntry::StagingUnreadable,
             "EACCES on the staging dir must not be treated as 'no staging dir'"
         );
+        // An unreadable state.json must not read as "not muxing" either.
+        let state = dir.join(crate::ripper::staging::STATE_FILE);
+        std::fs::write(&state, b"{}").unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let verdict = accept_loss_entry_for(&dir);
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            verdict,
+            AcceptLossEntry::StagingUnreadable,
+            "an unreadable state.json must fail closed, not proceed as 'not muxing'"
+        );
     }
 
     // Regression (bug #3): the Mux and Move queues must be mutually
@@ -3782,6 +3793,11 @@ mod web_tests {
             .output()
             .is_err()
         {
+            // Skip for local dev only; CI must actually execute the JS.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "node not found on PATH but CI is set: the escLinks test must run on CI"
+            );
             eprintln!("skipped: node not found on PATH");
             return;
         }
@@ -3915,8 +3931,8 @@ mod web_tests {
 
         let save = guard_end
             + body[guard_end..]
-                .find("config::save_ordered(")
-                .expect("handle_settings_post must call config::save_ordered");
+                .find("config::save_coalesced(snapshot, save_gen)")
+                .expect("handle_settings_post must queue the snapshot with its generation");
 
         // Nothing may re-take the write guard between the snapshot block and
         // the save — that is the whole ordering.
@@ -3925,12 +3941,27 @@ mod web_tests {
             "the config write guard must not be held across config::save; \
              re-taking it before the save reintroduces the 0.20.8 lock stall"
         );
-        // And the save must be handed to the bounded-syscall worker, which
-        // owns the snapshot — a guard cannot travel with it.
+        // H9: the generation is allocated INSIDE the guard, after the write
+        // lock, so save order matches in-memory mutation order.
+        let write_at = snap + body[snap..].find("cfg.write()").unwrap_or(usize::MAX);
+        let gen_at = body[snap..guard_end]
+            .find("save_gen = config::next_save_generation();")
+            .map(|i| snap + i)
+            .expect("save_gen must be allocated inside the snapshot (write-guard) block");
         assert!(
-            body[guard_end..save].contains("std::thread::Builder::new()"),
-            "config::save must run on the bounded save worker, not inline on \
-             the handler thread"
+            gen_at > write_at,
+            "save_gen must be taken after cfg.write()"
+        );
+        let fn_end = body[1..].find("\nfn ").map_or(body.len(), |i| i + 1);
+        assert_eq!(
+            body[..fn_end].matches("next_save_generation()").count(),
+            1,
+            "exactly one generation allocation in handle_settings_post"
+        );
+        // Awaited with a deadline, never inline-blocking on the save.
+        assert!(
+            body[save..].contains("rx.recv_timeout("),
+            "the handler must await the queued save with a deadline"
         );
     }
 
@@ -5902,7 +5933,7 @@ mod web_tests {
             st.muxing = true;
             write_state(&muxing_dir, &st);
             assert!(
-                ripper::staging::is_muxing(&muxing_dir),
+                ripper::staging::muxing_status(&muxing_dir).unwrap(),
                 "an actively-muxing dir must report is_muxing so accept-loss refuses (409)"
             );
 
@@ -5911,7 +5942,7 @@ mod web_tests {
             std::fs::create_dir_all(&failed_dir).unwrap();
             assert!(ripper::staging::write_failed_marker(&failed_dir, "E6008"));
             assert!(
-                !ripper::staging::is_muxing(&failed_dir),
+                !ripper::staging::muxing_status(&failed_dir).unwrap(),
                 "a settled (non-muxing) dir must NOT report is_muxing; accept-loss proceeds"
             );
         }
@@ -7540,31 +7571,23 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         ));
     }
 
-    // Bounded-syscall pattern, hand-rolled since `bounded_syscall` is
-    // `pub(crate)` in libfreemkv: spawn a worker, await a 0-capacity channel.
-    // On timeout it leaks; save writes+renames atomically, leaving the prior file intact.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<()>>(0);
-    // Capture the spawn Result: a discarded Err would mean the worker never
-    // ran, and `recv_timeout` below would block the full deadline reporting a
-    // misleading "timed out" 503 instead of "couldn't fork a thread".
-    if let Err(e) = std::thread::Builder::new()
-        .name("autorip-settings-save".into())
-        .spawn(move || {
-            let result = config::save_ordered(&snapshot, save_gen);
-            let _ = tx.send(result);
-        })
-    {
-        tracing::error!(
-            target: "web",
-            error = %e,
-            "failed to spawn settings-save thread; on-disk settings.json unchanged"
-        );
-        return json_response(
-            request,
-            500,
-            r#"{"ok":false,"error":"settings save failed: could not spawn save thread"}"#,
-        );
-    }
+    // Queue on the coalescing writer and await it with a deadline: a hung
+    // write (NFS) parks only that writer, and later saves supersede it.
+    let rx = match config::save_coalesced(snapshot, save_gen) {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::error!(
+                target: "web",
+                error = %e,
+                "failed to spawn settings-save thread; on-disk settings.json unchanged"
+            );
+            return json_response(
+                request,
+                500,
+                r#"{"ok":false,"error":"settings save failed: could not spawn save thread"}"#,
+            );
+        }
+    };
     match rx.recv_timeout(std::time::Duration::from_secs(SETTINGS_SAVE_DEADLINE_SECS)) {
         Ok(Ok(())) => json_response(request, 200, r#"{"ok":true}"#),
         Ok(Err(e)) => {
@@ -7583,12 +7606,13 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             tracing::error!(
                 target: "web",
                 "settings save timed out after {SETTINGS_SAVE_DEADLINE_SECS}s; \
-                 in-memory config updated, on-disk settings.json unchanged"
+                 in-memory config updated, on-disk result unknown (the queued \
+                 save persists if storage recovers)"
             );
             json_response(
                 request,
                 503,
-                r#"{"ok":false,"error":"settings save timed out"}"#,
+                r#"{"ok":false,"error":"settings save timed out; on-disk result unknown, it will be written if storage recovers"}"#,
             )
         }
     }
@@ -7794,15 +7818,19 @@ enum AcceptLossEntry {
     MuxInProgress,
     /// Present and unowned — proceed to arm the override.
     Proceed,
-    /// stat failed with something other than NotFound (EACCES, ESTALE) — 503.
+    /// Dir or .muxing state unreadable (not NotFound: EACCES, ESTALE) — 503.
     StagingUnreadable,
 }
 
-// Only a real NotFound is "gone": `Path::exists()` folds EACCES/ESTALE into
-// false (same rule as the muxer's `definitely_absent`).
+// Only a real NotFound is "gone" (symlink_metadata, as the muxer's
+// `definitely_absent`); any other stat/read error, including on the
+// .muxing state, fails closed as StagingUnreadable (503, retry).
 fn accept_loss_entry_for(dir: &std::path::Path) -> AcceptLossEntry {
-    match std::fs::metadata(dir) {
-        Ok(_) => accept_loss_entry_verdict(true, crate::ripper::staging::is_muxing(dir)),
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => match crate::ripper::staging::muxing_status(dir) {
+            Ok(muxing) => accept_loss_entry_verdict(true, muxing),
+            Err(_) => AcceptLossEntry::StagingUnreadable,
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             accept_loss_entry_verdict(false, false)
         }

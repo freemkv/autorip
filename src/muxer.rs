@@ -489,7 +489,7 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
         match verdict {
             MuxVerdict::Dispatch => {
                 // Stamp `.muxing` the INSTANT Dispatch commits (before reading the
-                // marker) so `is_muxing` covers the whole dispatch — writing it later
+                // marker) so `muxing_status` covers the whole dispatch — writing it later
                 // left a TOCTOU where a web entry raced the state.json read-modify-write.
                 crate::ripper::staging::write_muxing_marker(&dir);
             }
@@ -1753,7 +1753,7 @@ mod tests {
     }
 
     // FIX (entry-side TOCTOU): `.muxing` must be stamped the INSTANT Dispatch commits, before
-    // `read_marker`, so a concurrent web entry's `is_muxing` guard covers the whole dispatch.
+    // `read_marker`, so a concurrent web entry's `muxing_status` guard covers the whole dispatch.
     #[test]
     fn muxing_marker_stamped_before_marker_read() {
         let src = crate::util::source_lf(include_str!("muxer.rs"));

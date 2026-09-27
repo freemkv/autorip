@@ -893,14 +893,28 @@ pub fn write_muxing_marker(staging_disc_dir: &Path) {
 /// Whether the dir is currently held by the mux worker's `.muxing` exclusion
 /// lock. Reads the marker DIRECTLY (state.json `muxing` field, or a legacy
 /// `.muxing` file) without going through `snapshot_staging_disc`, so it does not
-/// migrate a legacy dir as a side effect — safe to call on a read-only request
-/// path (`handle_accept_loss`'s ownership guard). A dir with no state.json and
-/// no legacy marker reads `false`.
-pub fn is_muxing(staging_disc_dir: &Path) -> bool {
-    if let Some(st) = read_state(staging_disc_dir) {
-        return st.muxing;
+/// migrate a legacy dir as a side effect — safe on a read-only request path
+/// (`handle_accept_loss`'s ownership guard). No state.json and no legacy marker
+/// reads `Ok(false)`; a stat/read error other than NotFound (EACCES, ESTALE) is
+/// `Err`, so callers fail closed instead of reading "not muxing".
+pub(crate) fn muxing_status(staging_disc_dir: &Path) -> std::io::Result<bool> {
+    let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    match std::fs::read(state_path(staging_disc_dir)) {
+        Ok(bytes) => {
+            if let Ok(st) = serde_json::from_slice::<DiscState>(&bytes)
+                && st.schema == DISC_STATE_SCHEMA
+            {
+                return Ok(st.muxing);
+            }
+        }
+        Err(e) if not_found(&e) => {}
+        Err(e) => return Err(e),
     }
-    staging_disc_dir.join(MUXING_MARKER).exists()
+    match std::fs::symlink_metadata(staging_disc_dir.join(MUXING_MARKER)) {
+        Ok(_) => Ok(true),
+        Err(e) if not_found(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Release the `.muxing` exclusion lock (a field). Called when the mux worker

@@ -710,20 +710,109 @@ pub fn next_save_generation() -> u64 {
     GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// [`save`], but ordered by `generation` (from [`next_save_generation`]):
-/// saves are serialised per file and a snapshot older than the last one
-/// persisted is skipped (`Ok`), so an older snapshot can never land last.
-pub fn save_ordered(cfg: &Config, generation: u64) -> std::io::Result<()> {
-    static PERSISTED: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
-        std::sync::Mutex::new(std::collections::BTreeMap::new());
-    let mut persisted = PERSISTED.lock().unwrap_or_else(|e| e.into_inner());
-    let path = cfg.settings_file();
-    if persisted.get(&path).is_some_and(|&g| g > generation) {
-        return Ok(());
+type SaveWaiter = std::sync::mpsc::Sender<std::io::Result<()>>;
+
+struct PendingSave {
+    generation: u64,
+    cfg: Config,
+    waiters: Vec<SaveWaiter>,
+}
+
+#[derive(Default)]
+struct SaveSlot {
+    pending: Option<PendingSave>,
+    writer_active: bool,
+    persisted: u64,
+}
+
+// Per settings file: the newest snapshot not yet written, plus writer state.
+static SAVE_SLOTS: std::sync::Mutex<std::collections::BTreeMap<String, SaveSlot>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn copy_io_result(r: &std::io::Result<()>) -> std::io::Result<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
     }
-    save(cfg)?;
-    persisted.insert(path, generation);
-    Ok(())
+}
+
+/// Queue `cfg` (tagged with a [`next_save_generation`] value) for [`save`].
+///
+/// One writer thread per settings file; snapshots queued while it is busy
+/// coalesce so only the newest is written, and a snapshot older than one
+/// already persisted is acknowledged `Ok` without writing. A hung write
+/// parks only that writer. The receiver yields the result covering this
+/// snapshot; `Err` only when the writer thread could not be spawned.
+pub fn save_coalesced(
+    cfg: Config,
+    generation: u64,
+) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = cfg.settings_file();
+    let mut slots = SAVE_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = slots.entry(path.clone()).or_default();
+    if generation <= slot.persisted {
+        let _ = tx.send(Ok(()));
+        return Ok(rx);
+    }
+    match slot.pending.as_mut() {
+        Some(p) => {
+            if generation > p.generation {
+                p.generation = generation;
+                p.cfg = cfg;
+            }
+            p.waiters.push(tx);
+        }
+        None => {
+            slot.pending = Some(PendingSave {
+                generation,
+                cfg,
+                waiters: vec![tx],
+            });
+        }
+    }
+    if !slot.writer_active {
+        let writer_path = path.clone();
+        std::thread::Builder::new()
+            .name("autorip-settings-save".into())
+            .spawn(move || run_save_writer(&writer_path))
+            .inspect_err(|_| {
+                slot.pending = None;
+            })?;
+        slot.writer_active = true;
+    }
+    Ok(rx)
+}
+
+fn run_save_writer(path: &str) {
+    loop {
+        let job = {
+            let mut slots = SAVE_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+            let slot = slots.entry(path.to_string()).or_default();
+            match slot.pending.take() {
+                Some(job) if job.generation <= slot.persisted => {
+                    for w in job.waiters {
+                        let _ = w.send(Ok(()));
+                    }
+                    continue;
+                }
+                Some(job) => job,
+                None => {
+                    slot.writer_active = false;
+                    return;
+                }
+            }
+        };
+        let result = save(&job.cfg);
+        if result.is_ok() {
+            let mut slots = SAVE_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+            let slot = slots.entry(path.to_string()).or_default();
+            slot.persisted = slot.persisted.max(job.generation);
+        }
+        for w in job.waiters {
+            let _ = w.send(copy_io_result(&result));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -756,25 +845,43 @@ mod tests {
         }
     }
 
-    // H9: saves finishing out of order must not let an older snapshot land last.
+    // H9: an older snapshot queued after a newer one must never land last.
     #[test]
-    fn save_ordered_never_lets_an_older_snapshot_land_last() {
+    fn save_coalesced_never_lets_an_older_snapshot_land_last() {
         let d = scratch("save_order");
         let mut older = cfg_in(&d);
         older.tmdb_api_key = "older".into();
         let mut newer = cfg_in(&d);
         newer.tmdb_api_key = "newer".into();
+        let path = newer.settings_file();
         let g_old = next_save_generation();
         let g_new = next_save_generation();
-        save_ordered(&newer, g_new).expect("newer save");
-        save_ordered(&older, g_old).expect("a superseded save is not an error");
-        let data = std::fs::read_to_string(newer.settings_file()).unwrap();
+        let rx_new = save_coalesced(newer, g_new).expect("spawn writer");
+        let rx_old = save_coalesced(older, g_old).expect("spawn writer");
+        let wait = std::time::Duration::from_secs(10);
+        rx_new.recv_timeout(wait).unwrap().expect("newer save");
+        rx_old
+            .recv_timeout(wait)
+            .unwrap()
+            .expect("a superseded save is acknowledged Ok");
+        let data = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(
             parsed["tmdb_api_key"].as_str(),
             Some("newer"),
             "an older snapshot finishing last must not overwrite the newest one"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A failed write reports Err to its waiter and does not mark it persisted.
+    #[test]
+    fn save_coalesced_reports_write_failure() {
+        let d = scratch("save_fail");
+        let cfg = cfg_in(&d.join("missing-dir"));
+        let rx = save_coalesced(cfg, next_save_generation()).expect("spawn writer");
+        let r = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(r.is_err(), "a save into a missing dir must report Err");
         let _ = std::fs::remove_dir_all(&d);
     }
 

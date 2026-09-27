@@ -129,9 +129,18 @@ pub fn save_keydb(
     cfg: &std::sync::RwLock<Config>,
     data: &[u8],
 ) -> std::result::Result<freemkv_keysources::UpdateResult, libfreemkv::Error> {
-    // Resolve the path, then drop the guard: the save (decompress + parse +
-    // fsync, up to 100 MiB) must not block config writers.
-    let path = keydb_path(&cfg.read().unwrap_or_else(|e| e.into_inner()));
+    // Copy the inputs out under the guard; resolving (stats) and the save
+    // (decompress + parse + fsync, up to 100 MiB) run after it is dropped.
+    let (configured, autorip_dir) = {
+        let c = cfg.read().unwrap_or_else(|e| e.into_inner());
+        (c.keydb_path.clone(), c.autorip_dir.clone())
+    };
+    let path = resolve_keydb(
+        configured.as_deref(),
+        &autorip_dir,
+        legacy_home_keydb(),
+        &|p| p.exists(),
+    );
     KeydbSource::new(path).save(data)
 }
 
