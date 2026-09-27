@@ -141,6 +141,9 @@ fn main() {
                  (check the directory exists and its bind-mount/NAS share is present and writable)."
             ));
         }
+        if let Some(msg) = keysource::keyserver_url_startup_warning(&c) {
+            log::syslog(&msg);
+        }
     }
 
     // The local KEYDB only matters for the `local` key source. In `online`

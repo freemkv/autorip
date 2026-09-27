@@ -132,6 +132,20 @@ pub fn save_keydb(
     KeydbSource::new(keydb_path(cfg)).save(data)
 }
 
+/// A boot-time warning for a stored online `keyserver_url` the rip will refuse
+/// on scheme alone (e.g. an `http://` URL saved before https became mandatory).
+/// Pure — no DNS — so it is safe on the startup path.
+pub fn keyserver_url_startup_warning(cfg: &Config) -> Option<String> {
+    let url = cfg.keyserver_url.trim();
+    if cfg.key_source != "online" || url.is_empty() || url.starts_with("https://") {
+        return None;
+    }
+    Some(format!(
+        "WARNING: the stored Keyserver URL ({}) is not https://, so the online key source is          DISABLED for every rip. Re-enter an https:// URL in Settings.",
+        crate::webhook::webhook_url_origin(url)
+    ))
+}
+
 /// ScanOptions for a **live-drive** structure scan. Lookup-free (the library
 /// resolves no keys), plus the AACS host credentials for the authenticated
 /// handshake — sourced from the keydb, *independent of `key_source`* (a locked
@@ -169,12 +183,20 @@ pub fn iso_scan_opts() -> libfreemkv::ScanOptions {
 /// `.map` recovery-state file itself is unaffected — autorip still loads it for
 /// sector status via `IsoAccess`.
 pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
+    build_sources_with(cfg, &freemkv_keysources::validate_keyserver_url)
+}
+
+// `build_sources` with the keyserver-URL validator injected, so tests need no live DNS.
+fn build_sources_with(
+    cfg: &Config,
+    validate: &dyn Fn(&str) -> Result<(), String>,
+) -> Vec<Box<dyn KeySource>> {
     let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
     match cfg.key_source.as_str() {
         "online" => {
             let url = cfg.keyserver_url.trim();
             let online = || Box::new(OnlineSource::new(url, cfg.keyserver_secret.clone()));
-            match freemkv_keysources::validate_keyserver_url(url) {
+            match validate(url) {
                 Ok(()) => sources.push(online()),
                 // DNS blip: keep the source; its per-POST re-guard retries the
                 // lookup and records a real (transient) reachability verdict.
@@ -559,7 +581,7 @@ pub fn resolve_keys<A: DiscKeyAccess>(
 
     // Content samples for ciphertext validation, UNCONDITIONALLY (keydb UKs are only disproved
     // by real ciphertext; online validates server-side), drawn by the library from the main
-    // feature — the largest title WITH video, so a streamless decoy is never sampled.
+    // feature, which prefers the largest title WITH video over a streamless decoy.
     let inputs = if sources.is_empty() {
         inputs
     } else if disc.titles.is_empty() {
@@ -1588,29 +1610,22 @@ mod tests {
         }
     }
 
-    // A failed lookup from the REAL keysources producer (RFC 6761 `.test` never
-    // resolves) is an outage: nothing answered, so nothing is known about the disc.
+    // keysources' GuardFail::Unreachable texts (online.rs resolve_and_guard). They need
+    // live DNS to produce, so are pinned verbatim until keysources exports a typed kind.
     #[test]
-    fn keysources_failed_lookup_is_unreachable() {
-        let err = freemkv_keysources::validate_keyserver_url("https://keys.autorip.test/keys")
-            .expect_err(".test must not resolve");
-        assert_eq!(
-            reachability_for_unprobeable_url(&err),
-            ServiceReachability::Unreachable,
-            "{err:?} is a DNS failure, not a config verdict"
-        );
-    }
-
-    // keysources' per-host DNS-cap (GuardFail::Unreachable) cannot be triggered
-    // deterministically, so its producer text is pinned here verbatim.
-    #[test]
-    fn keysources_dns_cap_is_unreachable() {
-        assert_eq!(
-            reachability_for_unprobeable_url(
-                "too many concurrent DNS resolutions in flight for this host"
-            ),
-            ServiceReachability::Unreachable
-        );
+    fn keysources_lookup_failures_are_unreachable() {
+        for msg in [
+            "too many concurrent DNS resolutions in flight for this host",
+            "could not resolve host: failed to lookup address information",
+            "DNS resolution timed out",
+            "host did not resolve to any address",
+        ] {
+            assert_eq!(
+                reachability_for_unprobeable_url(msg),
+                ServiceReachability::Unreachable,
+                "{msg:?} is a DNS failure, not a config verdict"
+            );
+        }
     }
 
     // web's own resolver failures (the probe's pinning step) stay transient.
@@ -1634,12 +1649,31 @@ mod tests {
     fn build_sources_keeps_online_source_on_transient_lookup_failure() {
         let cfg = Config {
             key_source: "online".into(),
-            keyserver_url: "https://keys.autorip.test/decode".into(),
+            keyserver_url: "https://keys.example.org/decode".into(),
             ..Config::default()
         };
-        let sources = build_sources(&cfg);
+        let dns_down =
+            |_: &str| Err("too many concurrent DNS resolutions in flight for this host".into());
+        let sources = build_sources_with(&cfg, &dns_down);
         assert_eq!(sources.len(), 1, "a DNS failure is not a config verdict");
         assert_eq!(sources[0].label(), "online");
+    }
+
+    // A stored pre-upgrade http:// keyserver URL is named at boot; https and
+    // non-online configs are silent.
+    #[test]
+    fn keyserver_url_startup_warning_flags_only_non_https_online() {
+        let cfg = |src: &str, url: &str| Config {
+            key_source: src.into(),
+            keyserver_url: url.into(),
+            ..Config::default()
+        };
+        let w = keyserver_url_startup_warning(&cfg("online", " http://keys.example.org/t0k/d"))
+            .expect("http:// must warn");
+        assert!(w.contains("https://") && !w.contains("t0k"), "{w}");
+        assert!(keyserver_url_startup_warning(&cfg("online", "https://k.example.org/d")).is_none());
+        assert!(keyserver_url_startup_warning(&cfg("online", "")).is_none());
+        assert!(keyserver_url_startup_warning(&cfg("local", "http://k.example.org/d")).is_none());
     }
 
     // Cleartext http:// is a standing config fault: the online source is dropped.
