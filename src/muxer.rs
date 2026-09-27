@@ -235,10 +235,28 @@ fn undismiss(path: &str) {
 /// "old error hanging around" for a disc that has been delivered, deleted, or
 /// moved out of staging. Keeps the System page showing only live jobs.
 fn prune_stale_errors() {
-    let stale: Vec<String> = {
-        let m = MUX_ERRORS.lock().unwrap_or_else(|e| e.into_inner());
-        m.keys().filter(|p| definitely_absent(p)).cloned().collect()
-    };
+    prune_stale_errors_with(definitely_absent);
+}
+
+// prune_stale_errors with the absence probe injected. Neither lock is held while probing:
+// the probe is a stat, which blocks on a hung NFS mount and would stall every mux error reader.
+fn prune_stale_errors_with(absent: impl Fn(&str) -> bool) {
+    let mut candidates: Vec<String> = MUX_ERRORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    candidates.extend(
+        MUX_DISMISSED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned(),
+    );
+    candidates.sort();
+    candidates.dedup();
+    let stale: Vec<String> = candidates.into_iter().filter(|p| absent(p)).collect();
     if stale.is_empty() {
         return;
     }
@@ -248,10 +266,10 @@ fn prune_stale_errors() {
             m.remove(p);
         }
     }
-    MUX_DISMISSED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|p| !definitely_absent(p));
+    let mut d = MUX_DISMISSED.lock().unwrap_or_else(|e| e.into_inner());
+    for p in &stale {
+        d.remove(p);
+    }
 }
 
 /// True only when the staging dir is DEFINITIVELY gone (stat returned NotFound).
@@ -551,42 +569,7 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
                 if should_revert_origin_to_done(origin, origin_status.as_deref()) {
                     crate::ripper::update_state(
                         origin,
-                        crate::ripper::RipState {
-                            device: origin.clone(),
-                            status: "done".to_string(),
-                            disc_present: true,
-                            disc_name: marker.display_name.clone(),
-                            disc_format: marker.disc_format.clone(),
-                            progress_pct: 100,
-                            // Combined sweep + mux-time loss (the `_mux`
-                            // done-state folds decrypt skips into mapfile totals);
-                            // `marker.sweep_*` alone would understate it.
-                            errors: outcome.errors,
-                            total_lost_ms: outcome.total_lost_ms,
-                            main_lost_ms: outcome.main_lost_ms,
-                            num_bad_ranges: marker.sweep_num_bad_ranges,
-                            largest_gap_ms: marker.sweep_largest_gap_ms,
-                            // Bad-ranges drilldown isn't in the marker (summary
-                            // counts only) so plumb it from the mux outcome;
-                            // otherwise the tile shows a count but an empty list.
-                            bad_ranges: outcome.bad_ranges.clone(),
-                            bad_ranges_truncated: outcome.bad_ranges_truncated,
-                            tmdb_title: marker.tmdb_title.clone(),
-                            tmdb_year: marker.tmdb_year,
-                            tmdb_poster: marker.tmdb_poster.clone(),
-                            tmdb_overview: marker.tmdb_overview.clone(),
-                            // Carry mux-derived display fields (codecs, duration,
-                            // output_file) so the origin device's done card matches
-                            // the inline fresh-rip card instead of dropping them.
-                            codecs: outcome.codecs.clone(),
-                            duration: outcome.duration.clone(),
-                            output_file: outcome.output_file.clone(),
-                            // Combined sweep + mux-time loss (see `errors` above);
-                            // `marker.rip_lost_video_secs` alone would understate
-                            // it on a disc with accepted mux-phase decrypt loss.
-                            lost_video_secs: outcome.lost_video_secs,
-                            ..Default::default()
-                        },
+                        origin_done_state(origin, &marker, &outcome),
                     );
                 }
             }
@@ -633,6 +616,51 @@ fn check_and_mux(cfg_arc: &Arc<RwLock<Config>>) {
             }
             record_error(&path_str, &reason, &hint);
         }
+    }
+}
+
+// The origin device's "done" tile after a successful worker mux: loss totals and display
+// fields come from the mux outcome (sweep + mux-time), identity/TMDB from the marker.
+fn origin_done_state(
+    origin: &str,
+    marker: &RippedMarker,
+    outcome: &crate::ripper::resume::MuxHandoffOutcome,
+) -> crate::ripper::RipState {
+    crate::ripper::RipState {
+        device: origin.to_string(),
+        status: "done".to_string(),
+        disc_present: true,
+        disc_name: marker.display_name.clone(),
+        disc_format: marker.disc_format.clone(),
+        progress_pct: 100,
+        // Combined sweep + mux-time loss (the `_mux`
+        // done-state folds decrypt skips into mapfile totals);
+        // `marker.sweep_*` alone would understate it.
+        errors: outcome.errors,
+        total_lost_ms: outcome.total_lost_ms,
+        main_lost_ms: outcome.main_lost_ms,
+        num_bad_ranges: marker.sweep_num_bad_ranges,
+        largest_gap_ms: marker.sweep_largest_gap_ms,
+        // Bad-ranges drilldown isn't in the marker (summary
+        // counts only) so plumb it from the mux outcome;
+        // otherwise the tile shows a count but an empty list.
+        bad_ranges: outcome.bad_ranges.clone(),
+        bad_ranges_truncated: outcome.bad_ranges_truncated,
+        tmdb_title: marker.tmdb_title.clone(),
+        tmdb_year: marker.tmdb_year,
+        tmdb_poster: marker.tmdb_poster.clone(),
+        tmdb_overview: marker.tmdb_overview.clone(),
+        // Carry mux-derived display fields (codecs, duration,
+        // output_file) so the origin device's done card matches
+        // the inline fresh-rip card instead of dropping them.
+        codecs: outcome.codecs.clone(),
+        duration: outcome.duration.clone(),
+        output_file: outcome.output_file.clone(),
+        // Combined sweep + mux-time loss (see `errors` above);
+        // `marker.rip_lost_video_secs` alone would understate
+        // it on a disc with accepted mux-phase decrypt loss.
+        lost_video_secs: outcome.lost_video_secs,
+        ..Default::default()
     }
 }
 
@@ -717,6 +745,116 @@ pub fn pending_queue(staging_dir: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // Retry briefly so a parallel test's momentary lock isn't mistaken for OUR thread holding it.
+    fn lock_is_free<T>(m: &Mutex<T>) -> bool {
+        (0..200).any(|_| {
+            let free = m.try_lock().is_ok();
+            if !free {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            free
+        })
+    }
+
+    // The absence probe is a stat that can block on a hung NFS mount; neither error map may be
+    // locked while it runs.
+    #[test]
+    fn prune_stale_errors_probes_without_holding_locks() {
+        let err_path = "/x/staging/prune-lock-err";
+        let dis_path = "/x/staging/prune-lock-dismissed";
+        record_error(err_path, "r", "h");
+        MUX_DISMISSED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(dis_path.to_string());
+        let probed = Mutex::new(Vec::<(String, bool, bool)>::new());
+        prune_stale_errors_with(|p| {
+            if p == err_path || p == dis_path {
+                let e = lock_is_free(&MUX_ERRORS);
+                let d = lock_is_free(&MUX_DISMISSED);
+                probed.lock().unwrap().push((p.to_string(), e, d));
+                return true;
+            }
+            false
+        });
+        let probed = probed.into_inner().unwrap();
+        let err_left = MUX_ERRORS.lock().unwrap().contains_key(err_path);
+        let dis_left = MUX_DISMISSED.lock().unwrap().contains(dis_path);
+        assert_eq!(
+            probed.len(),
+            2,
+            "both maps' keys must be probed: {probed:?}"
+        );
+        for (p, e, d) in &probed {
+            assert!(*e, "MUX_ERRORS held while probing {p}");
+            assert!(*d, "MUX_DISMISSED held while probing {p}");
+        }
+        assert!(!err_left, "an absent dir's error card must be pruned");
+        assert!(!dis_left, "an absent dir's dismissal must be pruned");
+    }
+
+    // End to end on a real filesystem: gone dirs are pruned, a live dir keeps its card.
+    #[test]
+    fn prune_stale_errors_drops_only_absent_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let live = tmp.path().join("Live").to_string_lossy().to_string();
+        let gone = tmp.path().join("Gone").to_string_lossy().to_string();
+        let gone_dismissed = tmp
+            .path()
+            .join("GoneDismissed")
+            .to_string_lossy()
+            .to_string();
+        std::fs::create_dir_all(&live).unwrap();
+        record_error(&live, "r", "h");
+        record_error(&gone, "r", "h");
+        MUX_DISMISSED.lock().unwrap().insert(gone_dismissed.clone());
+        prune_stale_errors();
+        let live_kept = MUX_ERRORS.lock().unwrap().contains_key(&live);
+        let gone_kept = MUX_ERRORS.lock().unwrap().contains_key(&gone);
+        let dismissed_kept = MUX_DISMISSED.lock().unwrap().contains(&gone_dismissed);
+        clear_error(&live);
+        assert!(
+            live_kept,
+            "a still-present staging dir must keep its error card"
+        );
+        assert!(!gone_kept, "a vanished staging dir's card must be pruned");
+        assert!(
+            !dismissed_kept,
+            "a vanished staging dir's dismissal must be pruned"
+        );
+    }
+
+    #[test]
+    fn definitely_absent_only_on_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let present = tmp.path().join("present");
+        std::fs::create_dir_all(&present).unwrap();
+        assert!(!definitely_absent(&present.to_string_lossy()));
+        assert!(definitely_absent(
+            &tmp.path().join("missing").to_string_lossy()
+        ));
+    }
+
+    // EACCES (or an NFS EIO/ESTALE) proves nothing about the dir: the card must survive it.
+    #[cfg(unix)]
+    #[test]
+    fn definitely_absent_false_on_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let locked = tmp.path().join("locked");
+        let inner = locked.join("Disc");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let enforced = std::fs::symlink_metadata(&inner).is_err();
+        let absent = definitely_absent(&inner.to_string_lossy());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !enforced {
+            eprintln!("SKIP definitely_absent_false_on_permission_error: running as root");
+            return;
+        }
+        assert!(!absent, "a permission error must not count as absent");
+    }
 
     #[test]
     fn record_and_clear_error_round_trip() {
@@ -1149,73 +1287,54 @@ mod tests {
         );
     }
 
-    // Regression: origin device must reach a terminal non-"ripping" status
-    // after mux success. The hand-off in rip_disc leaves the origin device
-    // frozen at "ripping"; check_and_mux must flip it to "done".
+    // Regression: after a worker mux success the origin tile must reach "done" carrying the
+    // mux outcome's COMBINED loss/display fields, not the marker's sweep-only figures.
     #[test]
     fn origin_device_reaches_done_after_mux_success() {
         let device = "_test_origin_mux_done";
-        // Simulate the hand-off state: origin device stuck at "ripping".
-        crate::ripper::update_state(
-            device,
-            crate::ripper::RipState {
-                device: device.to_string(),
-                status: "ripping".to_string(),
-                disc_name: "Border Town".to_string(),
-                disc_format: "uhd".to_string(),
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            crate::ripper::STATE
-                .lock()
-                .unwrap()
-                .get(device)
-                .map(|s| s.status.as_str()),
-            Some("ripping"),
-            "precondition: device should be ripping before mux completes"
-        );
+        let mut marker = sample_marker();
+        marker.sweep_errors = 1;
+        marker.sweep_total_lost_ms = 10.0;
+        marker.sweep_num_bad_ranges = 3;
+        marker.sweep_largest_gap_ms = 7.0;
+        let outcome = crate::ripper::resume::MuxHandoffOutcome {
+            success: true,
+            errors: 42,
+            total_lost_ms: 3500.0,
+            main_lost_ms: 2000.0,
+            lost_video_secs: 3.5,
+            codecs: "HEVC / TrueHD".into(),
+            duration: "2h 01m".into(),
+            output_file: "Border Town.mkv".into(),
+            ..Default::default()
+        };
 
-        // Simulate what check_and_mux does on success for this origin device.
-        let marker = sample_marker();
-        let origin = &marker.origin_device;
-        let still_ripping = crate::ripper::STATE
-            .lock()
-            .ok()
-            .and_then(|s| s.get(origin.as_str()).map(|rs| rs.status == "ripping"))
-            .unwrap_or(false);
-        // In this test the marker's origin_device is "sg0" not `device`,
-        // so we drive `device` directly to verify the logic.
-        let _ = still_ripping;
-        crate::ripper::update_state(
-            device,
-            crate::ripper::RipState {
-                device: device.to_string(),
-                status: "done".to_string(),
-                disc_present: true,
-                disc_name: marker.display_name.clone(),
-                disc_format: marker.disc_format.clone(),
-                progress_pct: 100,
-                errors: marker.sweep_errors,
-                total_lost_ms: marker.sweep_total_lost_ms,
-                main_lost_ms: marker.sweep_main_lost_ms,
-                num_bad_ranges: marker.sweep_num_bad_ranges,
-                largest_gap_ms: marker.sweep_largest_gap_ms,
-                tmdb_title: marker.tmdb_title.clone(),
-                tmdb_year: marker.tmdb_year,
-                tmdb_poster: marker.tmdb_poster.clone(),
-                tmdb_overview: marker.tmdb_overview.clone(),
-                ..Default::default()
-            },
-        );
+        let rs = origin_done_state(device, &marker, &outcome);
+        crate::ripper::update_state(device, rs);
+        let got = crate::ripper::STATE.lock().unwrap().remove(device);
 
-        let s = crate::ripper::STATE.lock().unwrap();
-        let rs = s.get(device).expect("device state must exist");
+        let rs = got.expect("device state must exist");
         assert_eq!(
             rs.status, "done",
             "origin device must be 'done' after mux success"
         );
+        assert_eq!(rs.device, device);
         assert_eq!(rs.progress_pct, 100, "progress must be 100 on done");
+        assert!(rs.disc_present);
+        assert_eq!(rs.disc_name, marker.display_name);
+        assert_eq!(rs.tmdb_title, marker.tmdb_title);
+        assert_eq!(
+            rs.errors, 42,
+            "errors must be the combined mux outcome, not the sweep's"
+        );
+        assert_eq!(rs.total_lost_ms, 3500.0);
+        assert_eq!(rs.main_lost_ms, 2000.0);
+        assert_eq!(rs.lost_video_secs, 3.5);
+        assert_eq!(rs.num_bad_ranges, 3, "range count comes from the marker");
+        assert_eq!(rs.largest_gap_ms, 7.0);
+        assert_eq!(rs.codecs, "HEVC / TrueHD");
+        assert_eq!(rs.duration, "2h 01m");
+        assert_eq!(rs.output_file, "Border Town.mkv");
     }
 
     // Regression: done-card damage telemetry must not be zeroed. A marker
