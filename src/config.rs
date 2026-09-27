@@ -47,32 +47,41 @@ impl WebhookEntry {
         }
     }
 
-    // Parses either the legacy bare string or the object form; a missing
-    // flag on the object form defaults to `true`. Returns `None` for a
-    // malformed element or blank/whitespace URL so the caller drops it.
-    fn from_json(v: &serde_json::Value) -> Option<Self> {
-        let entry = if let Some(s) = v.as_str() {
-            Self::both(s.to_string())
-        } else {
-            let obj = v.as_object()?;
-            let url = obj.get("url").and_then(|u| u.as_str())?.to_string();
-            // Distinguish ABSENT (→ default true) from PRESENT-BUT-WRONG-TYPE: a
-            // non-bool flag is malformed config, so drop the whole entry (like a
-            // malformed URL) rather than silently coerce it to `true`.
-            let flag = |k: &str| -> Option<bool> {
-                match obj.get(k) {
-                    None => Some(true),
-                    Some(b) => b.as_bool(),
-                }
-            };
-            Self {
-                url,
-                post_rip: flag("post_rip")?,
-                post_mux: flag("post_mux")?,
-                post_move: flag("post_move")?,
-            }
+    /// Parse one `webhook_urls` element: a legacy bare string or the object
+    /// form, where an ABSENT flag defaults to `true`. `Err` names the offending
+    /// field (`webhook_urls[i]` or `webhook_urls[i].<flag>`); blank URLs pass.
+    pub(crate) fn parse(i: usize, v: &serde_json::Value) -> Result<Self, String> {
+        if let Some(s) = v.as_str() {
+            return Ok(Self::both(s.to_string()));
+        }
+        let malformed = || format!("webhook_urls[{i}]");
+        let obj = v.as_object().ok_or_else(malformed)?;
+        let url = obj
+            .get("url")
+            .and_then(|u| u.as_str())
+            .ok_or_else(malformed)?;
+        let flag = |k: &str| match obj.get(k) {
+            None => Ok(true),
+            Some(b) => b.as_bool().ok_or_else(|| format!("webhook_urls[{i}].{k}")),
         };
-        (!entry.url.trim().is_empty()).then_some(entry)
+        Ok(Self {
+            url: url.to_string(),
+            post_rip: flag("post_rip")?,
+            post_mux: flag("post_mux")?,
+            post_move: flag("post_move")?,
+        })
+    }
+
+    // Loader form: a malformed element is dropped (with a warning), as is a
+    // blank URL.
+    fn from_json(i: usize, v: &serde_json::Value) -> Option<Self> {
+        match Self::parse(i, v) {
+            Ok(entry) => (!entry.url.trim().is_empty()).then_some(entry),
+            Err(field) => {
+                tracing::warn!(%field, "settings.json webhook entry malformed (non-bool flag or missing url) - dropped");
+                None
+            }
+        }
     }
 }
 
@@ -631,7 +640,11 @@ fn load_saved(mut cfg: Config) -> Config {
         // Accept the legacy bare-string form and the modern {url, post_rip,
         // post_mux, post_move} object; a bare string (or an object missing a flag)
         // fires on ALL THREE stages (rip, mux, move), preserving prior behaviour.
-        cfg.webhook_urls = arr.iter().filter_map(WebhookEntry::from_json).collect();
+        cfg.webhook_urls = arr
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| WebhookEntry::from_json(i, v))
+            .collect();
     }
     cfg
 }
@@ -690,6 +703,29 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Allocate the generation for a settings snapshot. Take it while holding the
+/// config write guard so generation order matches in-memory mutation order.
+pub fn next_save_generation() -> u64 {
+    static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`save`], but ordered by `generation` (from [`next_save_generation`]):
+/// saves are serialised per file and a snapshot older than the last one
+/// persisted is skipped (`Ok`), so an older snapshot can never land last.
+pub fn save_ordered(cfg: &Config, generation: u64) -> std::io::Result<()> {
+    static PERSISTED: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut persisted = PERSISTED.lock().unwrap_or_else(|e| e.into_inner());
+    let path = cfg.settings_file();
+    if persisted.get(&path).is_some_and(|&g| g > generation) {
+        return Ok(());
+    }
+    save(cfg)?;
+    persisted.insert(path, generation);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +754,91 @@ mod tests {
             autorip_dir: dir.to_string_lossy().to_string(),
             ..Config::default()
         }
+    }
+
+    // H9: saves finishing out of order must not let an older snapshot land last.
+    #[test]
+    fn save_ordered_never_lets_an_older_snapshot_land_last() {
+        let d = scratch("save_order");
+        let mut older = cfg_in(&d);
+        older.tmdb_api_key = "older".into();
+        let mut newer = cfg_in(&d);
+        newer.tmdb_api_key = "newer".into();
+        let g_old = next_save_generation();
+        let g_new = next_save_generation();
+        save_ordered(&newer, g_new).expect("newer save");
+        save_ordered(&older, g_old).expect("a superseded save is not an error");
+        let data = std::fs::read_to_string(newer.settings_file()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            parsed["tmdb_api_key"].as_str(),
+            Some("newer"),
+            "an older snapshot finishing last must not overwrite the newest one"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // H5/H10: a webhook entry with a non-bool flag is dropped AND reported.
+    #[test]
+    fn load_saved_warns_on_non_bool_webhook_flag() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let d = scratch("webhook_flag");
+        let base = cfg_in(&d);
+        std::fs::write(
+            base.settings_file(),
+            serde_json::json!({
+                "webhook_urls": [
+                    {"url": "https://example.com/bad", "post_mux": "yes"},
+                    {"url": "https://example.com/good", "post_rip": false},
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(buf.clone())
+                .with_ansi(false),
+        );
+        let cfg = tracing::subscriber::with_default(subscriber, || load_saved(base));
+        assert_eq!(
+            cfg.webhook_urls,
+            vec![WebhookEntry {
+                url: "https://example.com/good".into(),
+                post_rip: false,
+                post_mux: true,
+                post_move: true,
+            }],
+            "the malformed entry is dropped; the valid one (absent flags -> true) is kept"
+        );
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("webhook_urls[0].post_mux"),
+            "dropping a webhook with a non-bool flag must be logged, naming the field; logs:\n{out}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

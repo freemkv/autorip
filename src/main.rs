@@ -174,10 +174,7 @@ fn main() {
                         web::KEYDB_MAX_BYTES,
                     ) {
                         Ok(buf) => {
-                            let saved = keysource::save_keydb(
-                                &cfg.read().unwrap_or_else(|e| e.into_inner()),
-                                &buf,
-                            );
+                            let saved = keysource::save_keydb(&cfg, &buf);
                             match saved {
                                 Ok(r) => log::syslog(&format!(
                                     "KEYDB downloaded: {} entries -> {}",
@@ -257,10 +254,7 @@ fn main() {
                             web::KEYDB_MAX_BYTES,
                         ) {
                             Ok(buf) => {
-                                let saved = keysource::save_keydb(
-                                    &cfg2.read().unwrap_or_else(|e| e.into_inner()),
-                                    &buf,
-                                );
+                                let saved = keysource::save_keydb(&cfg2, &buf);
                                 match saved {
                                     Ok(r) => log::syslog(&format!(
                                         "KEYDB updated: {} entries -> {}",

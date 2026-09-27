@@ -45,7 +45,7 @@ pub static ACTIVE_MOVE_DIR: once_cell::sync::Lazy<Mutex<Option<String>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 // Serializes tests that mutate/observe the process-global move statics
-// (MOVE_STATE, ACTIVE_MOVE_DIR, MOVE_ERRORS). pub(crate) + crate-level so
+// (MOVE_STATE, ACTIVE_MOVE_DIR, MOVE_ERRORS, MUX_ERRORS). pub(crate) + crate-level so
 // tests here and in web.rs lock the SAME mutex and cannot race each other.
 #[cfg(test)]
 pub(crate) static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());

@@ -3607,6 +3607,9 @@ mod resume_lock_and_fsync_tests {
     // raise an operator card (record_error) the same way the muxer site does.
     #[test]
     fn fsync_dropped_write_raises_operator_card() {
+        let _g = crate::mover::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let d = tmpdir();
         std::fs::write(d.join(".ripped"), b"{}").unwrap();
         // Force the terminal state.json write to fail (a dir can't be renamed
@@ -3643,6 +3646,9 @@ mod resume_lock_and_fsync_tests {
     // also raise an operator card, not just silently retry forever.
     #[test]
     fn loss_abort_dropped_write_raises_operator_card() {
+        let _g = crate::mover::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let d = tmpdir();
         // Force the state.json write to fail (a dir can't be renamed over).
         std::fs::create_dir(d.join(staging::STATE_FILE)).unwrap();

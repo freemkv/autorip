@@ -126,10 +126,13 @@ pub fn keydb_exists(cfg: &Config) -> bool {
 ///
 /// Returns the `UpdateResult` (from `freemkv-keysources`) describing the write.
 pub fn save_keydb(
-    cfg: &Config,
+    cfg: &std::sync::RwLock<Config>,
     data: &[u8],
 ) -> std::result::Result<freemkv_keysources::UpdateResult, libfreemkv::Error> {
-    KeydbSource::new(keydb_path(cfg)).save(data)
+    // Resolve the path, then drop the guard: the save (decompress + parse +
+    // fsync, up to 100 MiB) must not block config writers.
+    let path = keydb_path(&cfg.read().unwrap_or_else(|e| e.into_inner()));
+    KeydbSource::new(path).save(data)
 }
 
 /// A boot-time warning for a stored online `keyserver_url` the rip will refuse
@@ -1009,7 +1012,8 @@ mod tests {
         // matching the parser's real rule that a `0x` line is an entry only if it
         // also contains ` = `.
         let body = b"0xDEADBEEFDEADBEEFDEADBEEFDEADBEEF = Test\n";
-        let result = save_keydb(&cfg, body).expect("save_keydb must succeed");
+        let result = save_keydb(&std::sync::RwLock::new(cfg.clone()), body)
+            .expect("save_keydb must succeed");
 
         // It wrote straight to the service path.
         assert_eq!(result.path, dest, "save must target the service path");
@@ -1103,9 +1107,16 @@ mod tests {
             ..Config::default()
         };
 
-        save_keydb(&cfg, b"0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA = Test\n").expect("first save");
-        let result =
-            save_keydb(&cfg, b"0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB = Test\n").expect("second save");
+        save_keydb(
+            &std::sync::RwLock::new(cfg.clone()),
+            b"0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA = Test\n",
+        )
+        .expect("first save");
+        let result = save_keydb(
+            &std::sync::RwLock::new(cfg.clone()),
+            b"0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB = Test\n",
+        )
+        .expect("second save");
 
         assert_eq!(result.path, dest, "save always targets the service path");
         let written = std::fs::read_to_string(&dest).unwrap();

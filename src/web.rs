@@ -218,16 +218,13 @@ function toggleTheme(){document.body.classList.toggle('dark');localStorage.setIt
 
 /* ---- Util ---- */
 function esc(s){if(s==null)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
-/* esc(), then turn any bare https:// URL in the escaped text into a real
-   anchor. Error strings carry "report this at https://github.com/..."; in an
-   innerHTML surface a bare URL is dead text nobody can click. Escaping FIRST
-   is what keeps this safe: the regex only ever runs over text that already has
-   no raw <, > or ", so a hostile message cannot close the tag or the attribute.
-   Trailing sentence punctuation is left outside the link. */
-function escLinks(s){return esc(s).replace(/https:\/\/[^\s<>"']+/g,function(u){
-  let tail='';const m=u.match(/[.,;:)\]]+$/);if(m){tail=m[0];u=u.slice(0,-tail.length)}
-  return '<a href="'+u+'" target="_blank" rel="noopener noreferrer" style="color:inherit">'+u+'</a>'+tail;
-})}
+/* Turn bare https:// URLs into anchors. Matched on the RAW text and each
+   piece escaped separately, so a URL next to a quote can't swallow its
+   &#39;/&quot; entity. Trailing sentence punctuation stays outside the link. */
+function escLinks(s){if(s==null)return'';s=String(s);let out='',last=0,m;const re=/https:\/\/[^\s<>"']+/g;
+  while((m=re.exec(s))!==null){let u=m[0],tail='';const t=u.match(/[.,;:)\]]+$/);if(t){tail=t[0];u=u.slice(0,-tail.length)}
+    out+=esc(s.slice(last,m.index))+'<a href="'+esc(u)+'" target="_blank" rel="noopener noreferrer" style="color:inherit">'+esc(u)+'</a>'+esc(tail);last=m.index+m[0].length}
+  return out+esc(s.slice(last))}
 function upd(id,html){const el=document.getElementById(id);if(el&&el._last!==html){el.innerHTML=html;el._last=html}}
 /* Every device action button goes through this, and none of them may be
    fire-and-forget. The drive-card buttons used to call fetch() bare, with no
@@ -1622,8 +1619,10 @@ fn handle_request(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
             &format!("{{\"version\":\"{}\"}}", crate::VERSION_LABEL),
         );
     } else if is_get && url == "/api/settings" {
+        // Snapshot and drop the guard: rendering stats the keydb path, and
+        // filesystem I/O (NFS) must not stall config writers.
         let c = match cfg.read() {
-            Ok(c) => c,
+            Ok(c) => c.clone(),
             Err(_) => {
                 return json_response(
                     request,
@@ -2807,6 +2806,35 @@ mod web_tests {
         );
     }
 
+    // H6: only a real NotFound means "gone"; EACCES/ESTALE must not read as a
+    // missing staging dir (the muxer's definitely_absent rule).
+    #[cfg(unix)]
+    #[test]
+    fn accept_loss_entry_unreadable_dir_is_not_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            accept_loss_entry_for(&tmp.path().join("missing")),
+            AcceptLossEntry::NoStagingDir
+        );
+        let parent = tmp.path().join("locked");
+        let dir = parent.join("Disc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let bypass = std::fs::metadata(&dir).is_ok();
+        let verdict = accept_loss_entry_for(&dir);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if bypass {
+            eprintln!("skipped: running with permission bypass (root)");
+            return;
+        }
+        assert_eq!(
+            verdict,
+            AcceptLossEntry::StagingUnreadable,
+            "EACCES on the staging dir must not be treated as 'no staging dir'"
+        );
+    }
+
     // Regression (bug #3): the Mux and Move queues must be mutually
     // exclusive — a disc can never appear in both. Walk a staging dir
     // through the post-mux marker sequence and assert that at each step.
@@ -3736,13 +3764,79 @@ mod web_tests {
     // escLinks() (built on esc()) to become anchors while staying safe.
     #[test]
     fn dashboard_error_text_linkifies_urls() {
-        assert!(DASHBOARD_HTML.contains("function escLinks(s){return esc(s).replace("));
+        assert!(DASHBOARD_HTML.contains("function escLinks(s){"));
         // The step detail line ("Error — <message>").
         assert!(DASHBOARD_HTML.contains(r"'+escLinks(detail)}"));
         // The red error banner.
         assert!(DASHBOARD_HTML.contains("escLinks(s.last_error)"));
         // Only https is linkified — no javascript:/data: anchors.
         assert!(DASHBOARD_HTML.contains(r#"/https:\/\/[^\s<>"']+/g"#));
+    }
+
+    // H7: executes the shipped esc/escLinks JS under node (skipped when node
+    // is absent). A URL next to a quote must not swallow the escaped entity.
+    #[test]
+    fn dashboard_esc_links_executes_correctly_under_node() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: node not found on PATH");
+            return;
+        }
+        let esc_at = DASHBOARD_HTML.find("function esc(s){").unwrap();
+        let esc_end = esc_at + DASHBOARD_HTML[esc_at..].find('\n').unwrap();
+        let links_at = DASHBOARD_HTML.find("function escLinks(s){").unwrap();
+        let links_end = links_at + DASHBOARD_HTML[links_at..].find("\nfunction ").unwrap();
+        let a = |u: &str| {
+            format!(
+                r#"<a href="{u}" target="_blank" rel="noopener noreferrer" style="color:inherit">{u}</a>"#
+            )
+        };
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "see 'https://example.com/x' now",
+                format!("see &#39;{}&#39; now", a("https://example.com/x")),
+            ),
+            (
+                r#"at "https://example.com/y"."#,
+                format!("at &quot;{}&quot;.", a("https://example.com/y")),
+            ),
+            (
+                "https://example.com/q?a=1&b=2.",
+                format!("{}.", a("https://example.com/q?a=1&amp;b=2")),
+            ),
+            (
+                "<b>https://example.com/z</b>",
+                format!("&lt;b&gt;{}&lt;/b&gt;", a("https://example.com/z")),
+            ),
+            (
+                "no link & 'quotes'",
+                "no link &amp; &#39;quotes&#39;".into(),
+            ),
+        ];
+        let inputs: Vec<&str> = cases.iter().map(|c| c.0).collect();
+        let script = format!(
+            "{}\n{}\nconsole.log(JSON.stringify({}.map(escLinks)));",
+            &DASHBOARD_HTML[esc_at..esc_end],
+            &DASHBOARD_HTML[links_at..links_end],
+            serde_json::to_string(&inputs).unwrap()
+        );
+        let out = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .expect("run node");
+        assert!(
+            out.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got: Vec<String> = serde_json::from_slice(&out.stdout).expect("node JSON output");
+        for ((input, want), got) in cases.iter().zip(&got) {
+            assert_eq!(got, want, "escLinks({input:?})");
+        }
     }
 
     #[test]
@@ -3821,8 +3915,8 @@ mod web_tests {
 
         let save = guard_end
             + body[guard_end..]
-                .find("config::save(")
-                .expect("handle_settings_post must call config::save");
+                .find("config::save_ordered(")
+                .expect("handle_settings_post must call config::save_ordered");
 
         // Nothing may re-take the write guard between the snapshot block and
         // the save — that is the whole ordering.
@@ -5485,6 +5579,48 @@ mod web_tests {
             );
         }
 
+        // H4/H10: a non-bool webhook flag (or a malformed element) is a 400
+        // naming the field; nothing in the patch may land.
+        #[test]
+        fn settings_post_rejects_non_bool_webhook_flag() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = cfg_in_tempdir(tmp.path());
+            let stored = vec![crate::config::WebhookEntry {
+                url: "https://discord.com/api/webhooks/1/secretA".into(),
+                post_rip: true,
+                post_mux: true,
+                post_move: true,
+            }];
+            cfg.write().unwrap().webhook_urls = stored.clone();
+            for (patch, field) in [
+                (
+                    r#"{"tmdb_api_key":"changed","webhook_urls":[{"url":"https://example.com/h","post_rip":"yes"}]}"#,
+                    "webhook_urls[0].post_rip",
+                ),
+                (
+                    r#"{"tmdb_api_key":"changed","webhook_urls":["https://example.com/a",{"url":"https://example.com/h","post_move":1}]}"#,
+                    "webhook_urls[1].post_move",
+                ),
+                (
+                    r#"{"tmdb_api_key":"changed","webhook_urls":[42]}"#,
+                    "webhook_urls[0]",
+                ),
+            ] {
+                let (code, body) = roundtrip(&cfg, "POST", "/api/settings", Some(patch), &[]);
+                assert_eq!(code, 400, "{patch} must be rejected, got {code}: {body}");
+                assert!(body.contains(field), "error must name {field}, got: {body}");
+                let c = cfg.read().unwrap();
+                assert_eq!(
+                    c.webhook_urls, stored,
+                    "stored webhooks must survive a rejected POST"
+                );
+                assert_ne!(
+                    c.tmdb_api_key, "changed",
+                    "no field may land on a rejected POST"
+                );
+            }
+        }
+
         #[test]
         fn settings_post_real_keyserver_url_replaces_stored() {
             // The secret-sentinel guard, REAL-VALUE half: a POST with a genuine
@@ -6123,6 +6259,11 @@ mod web_tests {
 
         #[test]
         fn error_clear_endpoints_dispatch() {
+            // Clear-all wipes process-global MOVE_ERRORS/MUX_ERRORS; hold the
+            // shared lock so parallel mover/muxer/resume tests aren't wiped.
+            let _g = crate::mover::TEST_STATE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let cfg = Arc::new(RwLock::new(Config::default()));
             let (c1, b1) = roundtrip(&cfg, "POST", "/api/move-errors/clear-all", None, &[]);
             assert_eq!(c1, 200);
@@ -7049,41 +7190,31 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     let webhook_urls_resolved: Option<Vec<WebhookEntry>> = if let Some(arr) =
         patch.get("webhook_urls").and_then(|v| v.as_array())
     {
-        // Each element is the modern object, or a bare string (legacy
-        // client) treated as fire-on-all. A missing flag defaults to true,
-        // matching the config loader's backward-compat rule.
-        let incoming: Vec<IncomingWebhook> = arr
-            .iter()
-            .filter_map(|v| {
-                if let Some(s) = v.as_str() {
-                    Some(IncomingWebhook {
-                        url: s.to_string(),
-                        post_rip: true,
-                        post_mux: true,
-                        post_move: true,
-                    })
-                } else if let Some(obj) = v.as_object() {
-                    let url = obj.get("url").and_then(|u| u.as_str())?.to_string();
-                    // Distinguish ABSENT (→ default true) from PRESENT-BUT-WRONG-TYPE:
-                    // a non-bool flag is malformed, so drop the whole entry rather than
-                    // silently coercing it to true (matches the config loader).
-                    let flag = |k: &str| -> Option<bool> {
-                        match obj.get(k) {
-                            None => Some(true),
-                            Some(b) => b.as_bool(),
-                        }
-                    };
-                    Some(IncomingWebhook {
-                        url,
-                        post_rip: flag("post_rip")?,
-                        post_mux: flag("post_mux")?,
-                        post_move: flag("post_move")?,
-                    })
-                } else {
-                    None
+        // Each element is the modern object, or a bare string (legacy client)
+        // treated as fire-on-all; a missing flag defaults to true. A malformed
+        // element or non-bool flag is a 400, never a silent drop.
+        let mut incoming: Vec<IncomingWebhook> = Vec::with_capacity(arr.len());
+        for (i, v) in arr.iter().enumerate() {
+            match WebhookEntry::parse(i, v) {
+                Ok(e) => incoming.push(IncomingWebhook {
+                    url: e.url,
+                    post_rip: e.post_rip,
+                    post_mux: e.post_mux,
+                    post_move: e.post_move,
+                }),
+                Err(field) => {
+                    return json_response(
+                        request,
+                        400,
+                        &serde_json::json!({
+                            "ok": false,
+                            "error": format!("{field}: flags must be booleans and url a string")
+                        })
+                        .to_string(),
+                    );
                 }
-            })
-            .collect();
+            }
+        }
         let existing = match cfg.read() {
             Ok(c) => c.webhook_urls.clone(),
             Err(_) => {
@@ -7227,9 +7358,10 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     const MAX_DURATION_SECS: u64 = 30 * 24 * 3600; // 30 days
     const MAX_RETENTION_DAYS: u64 = 3650; // 10 years
 
-    // Mutate the Config inside the write guard, then snapshot+drop it
-    // BEFORE calling `config::save`: the old code held the guard across
-    // `fs::write`+`fs::rename`, which can hang on NFS and block every reader.
+    // Mutate inside the write guard, then snapshot+drop it BEFORE the save
+    // (fs I/O can hang on NFS). `save_gen` is taken under the guard so save
+    // order follows mutation order.
+    let save_gen: u64;
     let snapshot: Config = {
         let mut c = match cfg.write() {
             Ok(c) => c,
@@ -7390,6 +7522,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
         if let Some(v) = patch.get("log_retention_days").and_then(|v| v.as_u64()) {
             c.log_retention_days = v.min(MAX_RETENTION_DAYS);
         }
+        save_gen = config::next_save_generation();
         c.clone()
     }; // <-- write guard dropped here; readers unblock immediately
 
@@ -7417,7 +7550,7 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
     if let Err(e) = std::thread::Builder::new()
         .name("autorip-settings-save".into())
         .spawn(move || {
-            let result = config::save(&snapshot);
+            let result = config::save_ordered(&snapshot, save_gen);
             let _ = tx.send(result);
         })
     {
@@ -7661,6 +7794,20 @@ enum AcceptLossEntry {
     MuxInProgress,
     /// Present and unowned — proceed to arm the override.
     Proceed,
+    /// stat failed with something other than NotFound (EACCES, ESTALE) — 503.
+    StagingUnreadable,
+}
+
+// Only a real NotFound is "gone": `Path::exists()` folds EACCES/ESTALE into
+// false (same rule as the muxer's `definitely_absent`).
+fn accept_loss_entry_for(dir: &std::path::Path) -> AcceptLossEntry {
+    match std::fs::metadata(dir) {
+        Ok(_) => accept_loss_entry_verdict(true, crate::ripper::staging::is_muxing(dir)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            accept_loss_entry_verdict(false, false)
+        }
+        Err(_) => AcceptLossEntry::StagingUnreadable,
+    }
 }
 
 fn accept_loss_entry_verdict(dir_exists: bool, is_muxing: bool) -> AcceptLossEntry {
@@ -7702,7 +7849,15 @@ fn handle_accept_loss(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>, de
     // Ownership gates factored into pure accept_loss_entry_verdict above;
     // refusing on .muxing avoids clobbering a just-written quarantine, since
     // this handler isn't otherwise serialized against the mux worker's RMWs.
-    match accept_loss_entry_verdict(dir.exists(), crate::ripper::staging::is_muxing(dir)) {
+    match accept_loss_entry_for(dir) {
+        AcceptLossEntry::StagingUnreadable => {
+            json_response(
+                request,
+                503,
+                r#"{"ok":false,"error":"staging dir unreadable; retry"}"#,
+            );
+            return;
+        }
         AcceptLossEntry::NoStagingDir => {
             json_response(
                 request,
@@ -8160,7 +8315,7 @@ fn handle_update_keydb(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) {
     // Write to the service-canonical keydb path, NOT libfreemkv's exe-local
     // default — otherwise "Update KEYDB" reports success while every AACS
     // rip keeps failing because the read side looks elsewhere.
-    let saved = crate::keysource::save_keydb(&cfg.read().unwrap_or_else(|e| e.into_inner()), &body);
+    let saved = crate::keysource::save_keydb(cfg, &body);
     match saved {
         Ok(result) => {
             let body = serde_json::json!({

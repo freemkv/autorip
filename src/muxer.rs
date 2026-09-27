@@ -857,6 +857,9 @@ mod tests {
 
     #[test]
     fn record_and_clear_error_round_trip() {
+        let _g = crate::mover::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         record_error("/x/staging/Foo", "test reason", "test hint");
         {
             let m = MUX_ERRORS.lock().unwrap();
@@ -1780,6 +1783,9 @@ mod tests {
     // silently re-dispatching forever.
     #[test]
     fn persist_terminal_mux_quarantine_alarms_when_write_fails() {
+        let _g = crate::mover::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Happy path: a writable dir goes terminal, returns true, raises no card.
         let ok_tmp = TempDir::new().unwrap();
         let ok_dir = ok_tmp.path().join("Writable");
