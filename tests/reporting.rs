@@ -6,7 +6,7 @@
 //! reading back the shared atomics proves the BytesRead→`latest_bytes_read`
 //! wiring the `/api/state` speed meter depends on is actually connected.
 //!
-//! Mux/sweep stream event coverage and this file's history:
+//! Mux/sweep stream event coverage lives in `src/ripper/mux.rs`'s own unit tests.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

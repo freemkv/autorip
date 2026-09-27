@@ -727,8 +727,8 @@ fn prune_old_logs(log_dir: &str, retention_days: u64) {
     };
     // The tracing daily appender holds `autorip.log.<today>` (UTC) open; if the
     // daemon logged nothing for > retention_days its mtime can fall before the
-    // cutoff, so never prune the active appender file (see active_log_filenames).
-    let active = active_log_filenames();
+    // cutoff, so never prune it (see active_log_filenames). Read "today" once here.
+    let active = active_log_filenames(&crate::util::format_date());
     // Recurse so the archive subdir (logs/rips/, where archive_device_log
     // writes per-rip files — the dir that actually grows over time) is
     // pruned too, not just the top-level live logs.
@@ -744,12 +744,10 @@ fn prune_old_logs(log_dir: &str, retention_days: u64) {
 /// retention must never delete out from under an open FD. The human log rolls
 /// daily as `autorip.log.<UTC-date>`; its bare base is included for the not-yet-
 /// rolled case. (`autorip.jsonl` is non-rolling and already excluded by
-/// `is_prunable_log_name`.)
-fn active_log_filenames() -> Vec<String> {
-    vec![
-        "autorip.log".to_string(),
-        format!("autorip.log.{}", crate::util::format_date()),
-    ]
+/// `is_prunable_log_name`.) `today` is the caller's UTC date, read once and
+/// passed in rather than re-read here, so it can't drift from a sibling call.
+fn active_log_filenames(today: &str) -> Vec<String> {
+    vec!["autorip.log".to_string(), format!("autorip.log.{today}")]
 }
 
 // Whether a filename is one of the log files retention applies to.
@@ -946,6 +944,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    // active_log_filenames must use the caller's injected date, not re-read the
+    // clock itself — otherwise two calls straddling UTC midnight could disagree.
+    #[test]
+    fn active_log_filenames_uses_the_injected_date_not_the_clock() {
+        let names = active_log_filenames("2000-01-01");
+        assert_eq!(
+            names,
+            vec![
+                "autorip.log".to_string(),
+                "autorip.log.2000-01-01".to_string()
+            ]
+        );
+    }
+
     // The active tracing appender file must survive a prune even when its mtime
     // is well past the cutoff — deleting it would orphan the open FD.
     #[cfg(unix)]
@@ -958,8 +970,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
 
+        // Read the clock exactly once: reusing crate::util::format_date() here
+        // and again for active_log_filenames() could straddle a UTC-midnight
+        // rollover and disagree on "today", flaking the assertions below.
+        let today = crate::util::format_date();
+
         // Today's rolled human log — the file the daily appender holds open.
-        let active_name = format!("autorip.log.{}", crate::util::format_date());
+        let active_name = format!("autorip.log.{today}");
         let active = d.join(&active_name);
         std::fs::write(&active, b"x").unwrap();
         // A stale rolled log from a prior day — a legitimate prune target.
@@ -972,7 +989,7 @@ mod tests {
         filetime_set(&stale, old_time);
 
         let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
-        let pruned = prune_dir_recursive(&d, cutoff, &active_log_filenames());
+        let pruned = prune_dir_recursive(&d, cutoff, &active_log_filenames(&today));
 
         assert_eq!(pruned, 1, "only the stale rolled log should be pruned");
         assert!(active.exists(), "the active appender log must be kept");

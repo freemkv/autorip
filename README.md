@@ -66,7 +66,7 @@ instead is done via a gitignored `.cargo/config.toml` path patch.
 ## Configuration
 
 Almost everything is configured in the **web UI** (Settings) or by editing
-`config.json` in `AUTORIP_DIR` — *not* by environment variable. Output and
+`settings.json` in `AUTORIP_DIR` — *not* by environment variable. Output and
 library paths, the TMDB key, `min_length`, `main_feature`, `auto_eject`,
 `on_insert`, `on_read_error`, `max_retries` and `keep_iso` are all config
 fields; setting them in the environment has no effect.

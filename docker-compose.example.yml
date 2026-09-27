@@ -23,9 +23,9 @@ services:
       - PORT=8080                        # web bind port (can't change at runtime)
       # Tracing filter (env-filter syntax). Default `autorip=info,libfreemkv=warn`.
       # Crank to debug for deep-dives: `AUTORIP_LOG_LEVEL=autorip=debug`. The
-      # JSON stream lands in /config/logs/autorip.jsonl, human-readable in
-      # /config/logs/autorip.log, both daily-rolled. Env-only because the
-      # tracing filter is built at startup, before the web server is up.
+      # JSON stream lands in /config/logs/autorip.jsonl (never rolled), human-
+      # readable in /config/logs/autorip.log.<UTC-date> (daily-rolled). Env-only
+      # because the tracing filter is built at startup, before the web server is up.
       - AUTORIP_LOG_LEVEL=autorip=info,libfreemkv=warn
       #
       # OPTIONAL: in-container NFS mount (v0.25.4+). Use this instead of
