@@ -2817,6 +2817,13 @@ mod web_tests {
             accept_loss_entry_for(&tmp.path().join("missing")),
             AcceptLossEntry::NoStagingDir
         );
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &dangling).unwrap();
+        assert_eq!(
+            accept_loss_entry_for(&dangling),
+            AcceptLossEntry::NoStagingDir,
+            "a dangling symlink is gone (404), not a present dir"
+        );
         let parent = tmp.path().join("locked");
         let dir = parent.join("Disc");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7606,13 +7613,13 @@ fn handle_settings_post(request: tiny_http::Request, cfg: &Arc<RwLock<Config>>) 
             tracing::error!(
                 target: "web",
                 "settings save timed out after {SETTINGS_SAVE_DEADLINE_SECS}s; \
-                 in-memory config updated, on-disk result unknown (the queued \
-                 save persists if storage recovers)"
+                 in-memory config updated, on-disk result unknown (written only \
+                 if storage recovers before autorip restarts)"
             );
             json_response(
                 request,
                 503,
-                r#"{"ok":false,"error":"settings save timed out; on-disk result unknown, it will be written if storage recovers"}"#,
+                r#"{"ok":false,"error":"settings save timed out; on-disk result unknown, it is written only if storage recovers before autorip restarts"}"#,
             )
         }
     }
@@ -7822,11 +7829,11 @@ enum AcceptLossEntry {
     StagingUnreadable,
 }
 
-// Only a real NotFound is "gone" (symlink_metadata, as the muxer's
-// `definitely_absent`); any other stat/read error, including on the
-// .muxing state, fails closed as StagingUnreadable (503, retry).
+// Only NotFound is "gone" (metadata follows links, so a dangling symlink is
+// 404); any other stat/read error, including on the .muxing state, fails
+// closed as StagingUnreadable (503, retry).
 fn accept_loss_entry_for(dir: &std::path::Path) -> AcceptLossEntry {
-    match std::fs::symlink_metadata(dir) {
+    match std::fs::metadata(dir) {
         Ok(_) => match crate::ripper::staging::muxing_status(dir) {
             Ok(muxing) => accept_loss_entry_verdict(true, muxing),
             Err(_) => AcceptLossEntry::StagingUnreadable,
