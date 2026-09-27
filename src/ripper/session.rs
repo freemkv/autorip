@@ -519,6 +519,29 @@ pub(super) fn drop_session(device: &str) {
 /// change. Probe the original path and its neighbors to find the drive
 /// that still has the disc. Returns the new device path (e.g. "/dev/sg5").
 pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<String> {
+    rediscover_drive_with(
+        device,
+        original_path,
+        expected_volume_id(device).as_deref(),
+        |p| libfreemkv::disc_presence(std::path::Path::new(p)),
+        probe_volume_id,
+        || std::thread::sleep(SETTLE_PAUSE),
+    )
+}
+
+// Pause between re-probes of a candidate whose presence is still settling.
+const SETTLE_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+const SETTLE_RETRIES: u32 = 10;
+
+// `rediscover_drive` with its hardware I/O injected (`presence`, `volume_id`, `pause`).
+fn rediscover_drive_with(
+    device: &str,
+    original_path: &str,
+    expected_vid: Option<&str>,
+    mut presence: impl FnMut(&str) -> libfreemkv::Result<libfreemkv::DiscPresence>,
+    mut volume_id: impl FnMut(&str) -> Option<String>,
+    mut pause: impl FnMut(),
+) -> Option<String> {
     // TODO(step1-followup): not moved into DiscSession — entangled with
     // disc-identity/device_log/sg-shift logic; left per contract Q3. Only
     // valid for /dev/sgN; bail rather than risk latching a wrong drive.
@@ -542,15 +565,21 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
     // Stable disc identifier from the last scan. A candidate at a SHIFTED sg
     // number must carry the same disc before we accept it, else a neighbour
     // with an unrelated disc could win; when absent, fall back unverified.
-    let expected_vid = expected_volume_id(device);
-
     for delta in [0i32, -1, 1, -2, 2, -3, 3] {
         let probe_num = sg_num + delta;
         if probe_num < 0 {
             continue;
         }
         let path = format!("/dev/sg{probe_num}");
-        if !libfreemkv::drive_has_disc(std::path::Path::new(&path)).unwrap_or(false) {
+        // A settling node is neither accepted nor rejected until it settles (bounded).
+        let mut answer = presence(&path);
+        let mut retries = 0;
+        while matches!(answer, Ok(libfreemkv::DiscPresence::Settling)) && retries < SETTLE_RETRIES {
+            pause();
+            retries += 1;
+            answer = presence(&path);
+        }
+        if !matches!(answer, Ok(libfreemkv::DiscPresence::Present)) {
             continue;
         }
 
@@ -569,7 +598,7 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
         // Shifted sg number — could be the intended drive or a neighbour.
         // Verify the candidate's disc identity if known; with no stored
         // identity, keep the legacy disc-present behaviour but flag unverified.
-        let Some(expected) = expected_vid.as_deref() else {
+        let Some(expected) = expected_vid else {
             tracing::warn!(
                 device = %device,
                 new_path = %path,
@@ -578,7 +607,7 @@ pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<Stri
             return Some(path);
         };
 
-        let probed = probe_volume_id(&path);
+        let probed = volume_id(&path);
         if candidate_identity_confirmed(probed.as_deref(), expected) {
             let vid = probed.as_deref().unwrap_or_default();
             tracing::info!(
@@ -648,6 +677,73 @@ fn probe_volume_id(path: &str) -> Option<String> {
         None
     } else {
         Some(vid.to_string())
+    }
+}
+
+#[cfg(test)]
+mod rediscover_tests {
+    use super::rediscover_drive_with;
+    use libfreemkv::DiscPresence::{self, Absent, Present, Settling};
+    use std::collections::HashMap;
+
+    // Rediscovery from /dev/sg4 against scripted per-path presence answers (the last
+    // answer repeats); returns the result and how often each path was probed.
+    fn rediscover(
+        script: &[(&str, &[DiscPresence])],
+        expected: Option<&str>,
+        vids: &[(&str, &str)],
+    ) -> (Option<String>, HashMap<String, usize>) {
+        let mut probes: HashMap<String, usize> = HashMap::new();
+        let found = rediscover_drive_with(
+            "sg4",
+            "/dev/sg4",
+            expected,
+            |p| {
+                let n = probes.entry(p.to_string()).or_default();
+                *n += 1;
+                let seq = script.iter().find(|(q, _)| *q == p).map(|(_, s)| *s);
+                Ok(seq.map_or(Absent, |s| s[(*n - 1).min(s.len() - 1)]))
+            },
+            |p| {
+                vids.iter()
+                    .find(|(q, _)| *q == p)
+                    .map(|(_, v)| v.to_string())
+            },
+            || {},
+        );
+        (found, probes)
+    }
+
+    #[test]
+    fn a_drive_spinning_up_after_a_usb_reset_is_rediscovered_once_present() {
+        let (found, probes) =
+            rediscover(&[("/dev/sg4", &[Settling, Settling, Present])], None, &[]);
+        assert_eq!(found.as_deref(), Some("/dev/sg4"));
+        assert_eq!(
+            probes["/dev/sg4"], 3,
+            "a settling node must be re-probed, not accepted"
+        );
+    }
+
+    #[test]
+    fn a_settling_node_that_turns_out_empty_is_not_accepted() {
+        let (found, _) = rediscover(
+            &[("/dev/sg4", &[Settling, Absent]), ("/dev/sg5", &[Present])],
+            Some("VID"),
+            &[("/dev/sg5", "VID")],
+        );
+        assert_eq!(found.as_deref(), Some("/dev/sg5"));
+    }
+
+    #[test]
+    fn a_node_that_never_settles_is_retried_a_bounded_number_of_times() {
+        let (found, probes) = rediscover(&[("/dev/sg4", &[Settling])], None, &[]);
+        assert_eq!(found, None, "a never-settling node must not be accepted");
+        assert!(
+            (2..=super::SETTLE_RETRIES as usize + 1).contains(&probes["/dev/sg4"]),
+            "bounded re-probing; got {}",
+            probes["/dev/sg4"]
+        );
     }
 }
 

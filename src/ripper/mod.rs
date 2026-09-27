@@ -656,6 +656,7 @@ impl ProbeFailTracker {
 }
 
 /// What one poll tick does about a disc it can see in a drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InsertTick {
     /// Run the auto-scan / auto-rip trigger for this disc now.
     dispatch: bool,
@@ -709,12 +710,49 @@ fn insert_tick(is_new_insert: bool, in_cooldown: bool) -> InsertTick {
     }
 }
 
+/// A poll tick's reaction to one drive's presence answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollAction {
+    /// No disc: drop a known session (`removed`) and show the drive idle.
+    Absent { removed: bool },
+    /// Presence not settled: neither an insert nor a removal.
+    Hold { latch: bool },
+    /// A disc is loaded.
+    Present(InsertTick),
+}
+
+impl PollAction {
+    /// Carry this device into the next tick's "already seen" set.
+    fn latch(self) -> bool {
+        match self {
+            PollAction::Absent { .. } => false,
+            PollAction::Hold { latch } => latch,
+            PollAction::Present(t) => t.latch,
+        }
+    }
+}
+
+fn poll_action(
+    presence: libfreemkv::DiscPresence,
+    had_disc: bool,
+    in_cooldown: bool,
+) -> PollAction {
+    match presence {
+        libfreemkv::DiscPresence::Present => {
+            PollAction::Present(insert_tick(!had_disc, in_cooldown))
+        }
+        libfreemkv::DiscPresence::Absent => PollAction::Absent { removed: had_disc },
+        // Settling (a disc re-spinning, or a tray closing empty): keep whatever we had.
+        _ => PollAction::Hold { latch: had_disc },
+    }
+}
+
 /// Poll drives for disc insertion. Only triggers on state change
 /// (no disc → disc present), not on disc already being there.
 ///
 /// autorip never touches hardware paths, sysfs, SCSI, or USB directly; the lib's
-/// `list_drives()` / `drive_has_disc(path)` do the platform enumeration and disc-presence probe
-/// (with internal wedge-recovery). autorip just iterates the snapshot, tracks logical state
+/// `list_drives()` / `disc_presence(path)` do the platform enumeration and disc-presence probe
+/// (no internal recovery). autorip just iterates the snapshot, tracks logical state
 /// (idle/scanning/ripping/cooldown), and spawns rip threads.
 pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     // Re-enumerate drives every RESCAN_INTERVAL_SECS so a USB unplug+replug
@@ -848,10 +886,9 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                     continue;
                 }
 
-                // The whole hardware probe (discovery, wedge detection, SCSI/
-                // USB reset) is one lib call; `Err` means recovery itself
-                // failed (drive permanently bricked).
-                let disc_present = match libfreemkv::drive_has_disc(std::path::Path::new(path)) {
+                // One TUR per drive; `Err` is an unresponsive or unplugged drive,
+                // `Settling` (spin-up, tray closing) changes nothing this tick.
+                let presence = match libfreemkv::disc_presence(std::path::Path::new(path)) {
                     Ok(p) => {
                         probe_fail.clear(&device);
                         p
@@ -871,7 +908,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                                 device = %device,
                                 path = %path,
                                 error = %e,
-                                "drive_has_disc failed and drive is absent from enumeration — hot-unplug, not a firmware wedge; deferring to rescan"
+                                "disc_presence failed and drive is absent from enumeration — hot-unplug, not a firmware wedge; deferring to rescan"
                             );
                             continue;
                         }
@@ -880,7 +917,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                                 device = %device,
                                 path = %path,
                                 error = %e,
-                                "drive_has_disc failed — drive firmware unresponsive; physical reconnect or host reboot required"
+                                "disc_presence failed — drive firmware unresponsive; physical reconnect or host reboot required"
                             );
                             // Surface the wedge in the UI (pre-fix this just
                             // `continue`d, so /api/state looked empty); the
@@ -901,40 +938,44 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                             tracing::debug!(
                                 device = %device,
                                 error = %e,
-                                "drive_has_disc still failing"
+                                "disc_presence still failing"
                             );
                         }
                         continue;
                     }
                 };
 
-                if !disc_present {
-                    // Disc removed — clean up session
-                    if had_disc.contains(&device) {
-                        tracing::info!(device = %device, "disc removed");
-                        drop_session(&device);
-                    }
-                    if !is_busy(&device) {
-                        update_state(
-                            &device,
-                            RipState {
-                                device: device.clone(),
-                                status: "idle".to_string(),
-                                ..Default::default()
-                            },
-                        );
-                    }
-                    continue;
-                }
-
                 let is_new_insert = !had_disc.contains(&device);
                 // One is_in_cooldown read for both halves: asking twice could
                 // straddle the expiry and dispatch without latching.
-                let tick = insert_tick(is_new_insert, is_in_cooldown(&device));
-
-                if tick.latch {
+                let action = poll_action(presence, !is_new_insert, is_in_cooldown(&device));
+                if action.latch() {
                     current_with_disc.insert(device.clone());
                 }
+                let tick = match action {
+                    PollAction::Present(tick) => tick,
+                    PollAction::Hold { .. } => {
+                        tracing::debug!(device = %device, "disc presence settling; no state change");
+                        continue;
+                    }
+                    PollAction::Absent { removed } => {
+                        if removed {
+                            tracing::info!(device = %device, "disc removed");
+                            drop_session(&device);
+                        }
+                        if !is_busy(&device) {
+                            update_state(
+                                &device,
+                                RipState {
+                                    device: device.clone(),
+                                    status: "idle".to_string(),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        continue;
+                    }
+                };
 
                 if is_new_insert && tick.dispatch {
                     tracing::info!(device = %device, "disc inserted");
@@ -11006,6 +11047,50 @@ mod insert_tick_tests {
             t.latch,
             "and it stays latched so it keeps not re-triggering"
         );
+    }
+}
+
+#[cfg(test)]
+mod poll_presence_tests {
+    use super::{PollAction, poll_action};
+    use libfreemkv::DiscPresence::{self, Absent, Present, Settling};
+
+    // Feeds a presence sequence for one drive through the poll loop's per-tick decision;
+    // returns (dispatches, session removals).
+    fn run(seq: &[DiscPresence]) -> (usize, usize) {
+        let (mut had, mut dispatched, mut removed) = (false, 0, 0);
+        for &p in seq {
+            let a = poll_action(p, had, false);
+            match a {
+                PollAction::Present(t) if t.dispatch => dispatched += 1,
+                PollAction::Absent { removed: true } => removed += 1,
+                _ => {}
+            }
+            had = a.latch();
+        }
+        (dispatched, removed)
+    }
+
+    #[test]
+    fn a_disc_spinning_up_after_a_usb_reset_keeps_its_session() {
+        let (dispatched, removed) = run(&[Present, Settling, Settling, Present, Present]);
+        assert_eq!(dispatched, 1, "the re-spin must not re-trigger a rip");
+        assert_eq!(removed, 0, "the re-spin must not drop the session");
+    }
+
+    #[test]
+    fn an_empty_tray_closing_never_dispatches_a_rip() {
+        assert_eq!(run(&[Absent, Settling, Settling, Absent, Absent]), (0, 0));
+    }
+
+    #[test]
+    fn a_cleaning_cartridge_never_rips() {
+        assert_eq!(run(&[Absent, Absent, Absent]), (0, 0));
+    }
+
+    #[test]
+    fn a_disc_that_settles_into_present_is_ripped_once() {
+        assert_eq!(run(&[Absent, Settling, Present, Present]), (1, 0));
     }
 }
 
