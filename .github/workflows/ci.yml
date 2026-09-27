@@ -206,7 +206,7 @@ jobs:
     # branches rather than on every push to dev. Nothing is deleted and no
     # platform stops being checked before a release -- qa.yml independently
     # covers macOS and Windows via its release-tests (macOS leg) and
-    # windows-build jobs, which run on qa and main. A push to dev is meant to
+    # windows-build jobs, which run on qa. A push to dev is meant to
     # be cheap and frequent; waiting on three runner pools to agree is what a
     # release candidate is for.
     #
@@ -249,7 +249,7 @@ jobs:
     # branches rather than on every push to dev. Nothing is deleted and no
     # platform stops being checked before a release -- qa.yml independently
     # covers macOS and Windows via its release-tests (macOS leg) and
-    # windows-build jobs, which run on qa and main. A push to dev is meant to
+    # windows-build jobs, which run on qa. A push to dev is meant to
     # be cheap and frequent; waiting on three runner pools to agree is what a
     # release candidate is for.
     #
