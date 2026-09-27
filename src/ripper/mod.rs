@@ -517,11 +517,7 @@ fn forget_removed_device(device: &str) -> bool {
     // live row). `rip_thread_running` locks RIP_THREADS not STATE, so this is safe.
     {
         let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        let status_busy = s
-            .get(device)
-            .map(|r| r.status == "scanning" || r.status == "ripping")
-            .unwrap_or(false);
-        if status_busy || rip_thread_running(device) {
+        if s.get(device).is_some_and(state::row_is_busy) || rip_thread_running(device) {
             tracing::warn!(
                 device = %device,
                 "drive vanished from enumeration while a worker still holds it — \
@@ -540,6 +536,38 @@ fn forget_removed_device(device: &str) -> bool {
     // paths churn; `forget_device_state`'s doc has the authoritative inventory.
     state::forget_device_state(device);
     true
+}
+
+/// Why a drive's disc probe failed, as the poll loop reacts to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeFailure {
+    /// Absent from the enumeration: unplugged, left for the next rescan.
+    HotUnplug,
+    /// Still enumerated but not answering: firmware wedge, surfaced in the UI.
+    Wedged,
+}
+
+// Classify a failed probe. A classification made since the last rescan is reused and the
+// enumeration runs at most once per tick (`tick_enum`), so a failing drive can't force a full
+// `list_drives` (INQUIRY to every drive, busy ones included) on every tick.
+fn classify_probe_failure(
+    path: &str,
+    prior: Option<ProbeFailure>,
+    tick_enum: &mut Option<Vec<String>>,
+    enumerate: impl FnOnce() -> Vec<String>,
+) -> ProbeFailure {
+    if let Some(p) = prior {
+        return p;
+    }
+    if tick_enum
+        .get_or_insert_with(enumerate)
+        .iter()
+        .any(|p| p == path)
+    {
+        ProbeFailure::Wedged
+    } else {
+        ProbeFailure::HotUnplug
+    }
 }
 
 /// What one poll tick does about a disc it can see in a drive.
@@ -652,6 +680,8 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
 
     let mut had_disc: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut warned_probe_fail: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Failed-probe drives found absent from the enumeration; the next rescan settles them.
+    let mut unplug_suspect: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut device_first_seen: std::collections::HashMap<String, std::time::Instant> =
         std::collections::HashMap::new();
     for d in &initial_drives {
@@ -669,6 +699,7 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
     );
 
     while !crate::SHUTDOWN.load(Ordering::Relaxed) {
+        let mut tick_enum: Option<Vec<String>> = None;
         // Periodic hot-plug reconcile: re-enumerate drives and diff against
         // the cached path list. New devices start being polled; removed devices
         // have their session cleared so the UI doesn't show a phantom drive.
@@ -676,6 +707,8 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
             last_rescan = std::time::Instant::now();
             let fresh = libfreemkv::list_drives();
             let fresh_paths: Vec<String> = fresh.iter().map(|d| d.path.clone()).collect();
+            tick_enum = Some(fresh_paths.clone());
+            unplug_suspect.clear();
             // Added: in fresh but not in drive_paths.
             for d in &fresh {
                 if !drive_paths.contains(&d.path) {
@@ -742,15 +775,28 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 let disc_present = match libfreemkv::drive_has_disc(std::path::Path::new(path)) {
                     Ok(p) => {
                         warned_probe_fail.remove(&device);
+                        unplug_suspect.remove(&device);
                         p
                     }
                     Err(e) => {
-                        // Distinguish a firmware wedge from a plain hot-unplug: a
-                        // drive gone from the fresh enumeration is just removed, not
-                        // unresponsive — skip the tile, let the next rescan clean up.
-                        let still_enumerated =
-                            libfreemkv::list_drives().iter().any(|d| d.path == *path);
-                        if !still_enumerated {
+                        // A drive gone from the enumeration is unplugged, not wedged: skip
+                        // the tile and let the next rescan clean up.
+                        let prior = if warned_probe_fail.contains(&device) {
+                            Some(ProbeFailure::Wedged)
+                        } else if unplug_suspect.contains(&device) {
+                            Some(ProbeFailure::HotUnplug)
+                        } else {
+                            None
+                        };
+                        let enumerate = || {
+                            libfreemkv::list_drives()
+                                .into_iter()
+                                .map(|d| d.path)
+                                .collect()
+                        };
+                        let class = classify_probe_failure(path, prior, &mut tick_enum, enumerate);
+                        if class == ProbeFailure::HotUnplug {
+                            unplug_suspect.insert(device.clone());
                             tracing::debug!(
                                 device = %device,
                                 path = %path,
@@ -10085,5 +10131,85 @@ mod tv_plan_tests {
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].filename, "Endeavour.mkv");
+    }
+}
+
+#[cfg(test)]
+mod probe_failure_tests {
+    use super::{ProbeFailure, classify_probe_failure};
+    use std::cell::Cell;
+
+    fn paths(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn enumeration_membership_separates_unplug_from_wedge() {
+        let mut tick = None;
+        let r = classify_probe_failure("/dev/sg1", None, &mut tick, || paths(&["/dev/sg2"]));
+        assert_eq!(r, ProbeFailure::HotUnplug);
+        let mut tick = None;
+        let r = classify_probe_failure("/dev/sg1", None, &mut tick, || paths(&["/dev/sg1"]));
+        assert_eq!(r, ProbeFailure::Wedged);
+    }
+
+    #[test]
+    fn already_classified_drive_is_not_re_enumerated() {
+        let calls = Cell::new(0);
+        let enumerate = || {
+            calls.set(calls.get() + 1);
+            paths(&["/dev/sg1"])
+        };
+        for prior in [ProbeFailure::Wedged, ProbeFailure::HotUnplug] {
+            let mut tick = None;
+            let r = classify_probe_failure("/dev/sg1", Some(prior), &mut tick, enumerate);
+            assert_eq!(r, prior);
+        }
+        assert_eq!(
+            calls.get(),
+            0,
+            "a drive classified since the last rescan must not trigger list_drives every tick"
+        );
+    }
+
+    #[test]
+    fn enumeration_runs_at_most_once_per_tick() {
+        let calls = Cell::new(0);
+        let enumerate = || {
+            calls.set(calls.get() + 1);
+            paths(&["/dev/sg1"])
+        };
+        let mut tick = None;
+        let a = classify_probe_failure("/dev/sg1", None, &mut tick, enumerate);
+        let b = classify_probe_failure("/dev/sg2", None, &mut tick, enumerate);
+        assert_eq!((a, b), (ProbeFailure::Wedged, ProbeFailure::HotUnplug));
+        assert_eq!(
+            calls.get(),
+            1,
+            "two failing drives in one tick must share one enumeration"
+        );
+    }
+
+    #[test]
+    fn rescan_snapshot_is_reused_within_the_tick() {
+        let mut tick = Some(paths(&["/dev/sg1"]));
+        let r = classify_probe_failure("/dev/sg1", None, &mut tick, || {
+            panic!("the rescan already enumerated this tick")
+        });
+        assert_eq!(r, ProbeFailure::Wedged);
+    }
+
+    #[test]
+    fn forget_removed_device_shares_the_busy_predicate() {
+        let src = crate::util::source_lf(include_str!("mod.rs"));
+        let start = src
+            .find("fn forget_removed_device(device: &str) -> bool {")
+            .expect("forget_removed_device must exist");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}\n").expect("function must end")];
+        assert!(
+            !body.contains("\"scanning\"") && body.contains("row_is_busy"),
+            "forget_removed_device must use state::row_is_busy, not an inline copy of is_busy's predicate"
+        );
     }
 }

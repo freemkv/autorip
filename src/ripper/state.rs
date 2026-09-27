@@ -375,9 +375,12 @@ pub fn is_busy(device: &str) -> bool {
     // this is the double-rip guard, and swallowing the error would let a
     // second rip launch concurrently on the same drive. See log.rs convention.
     let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    s.get(device)
-        .map(|r| r.status == "scanning" || r.status == "ripping")
-        .unwrap_or(false)
+    s.get(device).is_some_and(row_is_busy)
+}
+
+/// The double-rip guard's predicate over a STATE row, for callers already holding the lock.
+pub fn row_is_busy(row: &RipState) -> bool {
+    row.status == "scanning" || row.status == "ripping"
 }
 
 pub fn update_state(device: &str, mut state: RipState) {
@@ -970,7 +973,21 @@ mod tests {
     //! right thing for the right status" check.
 
     use super::*;
+
     use freemkv_engine::{Mapfile, SectorStatus};
+
+    #[test]
+    fn row_is_busy_matches_scanning_and_ripping_only() {
+        let row = |st: &str| RipState {
+            status: st.to_string(),
+            ..Default::default()
+        };
+        assert!(row_is_busy(&row("scanning")));
+        assert!(row_is_busy(&row("ripping")));
+        for st in ["idle", "done", "error", "", "waiting"] {
+            assert!(!row_is_busy(&row(st)), "{st} must not count as busy");
+        }
+    }
 
     /// Create a throwaway mapfile inside a fresh `TempDir`. Caller must hold
     /// the `TempDir` guard for the test's lifetime so its Drop cleans up the
