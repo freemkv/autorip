@@ -686,9 +686,12 @@ fn auto_insert_rip_mode(on_insert: &str) -> Option<crate::web::ResumeMode> {
     }
 }
 
-// Fresh unattended rip: discard this disc's stale partial / terminal staging, then sweep.
-// Only reached after `staging_hold_stands_down` cleared the disc.
+// Fresh unattended rip: unless the staging guards hold the disc, discard its stale partial /
+// terminal staging, then sweep.
 fn auto_rip_fresh(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str) {
+    if staging_hold_stands_down(cfg, device, false) {
+        return;
+    }
     wipe_staging_for_disc(cfg, device);
     rip_disc(cfg, device, device_path, false);
 }
@@ -1469,10 +1472,13 @@ fn dispatch_rip_request(
             }
         }
         crate::web::ResumeMode::Prefer => {
-            if staging_hold_stands_down(cfg, device) {
+            // A loss-aborted disc may take another (non-destructive) resume pass;
+            // every fresh fallback below re-guards without that allowance.
+            let resumable = resumable_for_device(cfg, device);
+            if staging_hold_stands_down(cfg, device, resumable.is_some()) {
                 return;
             }
-            match auto_resume_action(resumable_for_device(cfg, device)) {
+            match auto_resume_action(resumable) {
                 AutoResumeAction::Sweep => {
                     crate::log::device_log(
                         device,
@@ -1513,91 +1519,172 @@ fn dispatch_rip_request(
             wipe_staging_for_disc(cfg, device);
             rip_disc(cfg, device, device_path, false);
         }
-        crate::web::ResumeMode::Fresh => {
-            if !staging_hold_stands_down(cfg, device) {
-                auto_rip_fresh(cfg, device, device_path);
-            }
-        }
+        crate::web::ResumeMode::Fresh => auto_rip_fresh(cfg, device, device_path),
         crate::web::ResumeMode::Default => {
-            if !staging_hold_stands_down(cfg, device) {
+            if !staging_hold_stands_down(cfg, device, false) {
                 rip_disc(cfg, device, device_path, false);
             }
         }
     }
 }
 
-// Guards shared by every non-destructive rip mode (Default, Fresh, Prefer). Returns true,
-// after surfacing why in the log and live state, when this disc's staging must not be re-swept.
-fn staging_hold_stands_down(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
-    // `.completed` is authoritative: a restart + insert must not re-rip a finished disc.
-    if disc_already_completed(cfg, device) {
-        crate::log::device_log(
-            device,
-            "Disc already ripped (.completed marker present) — skipping unattended re-rip. Click Rip to force a fresh rip.",
-        );
-        let prev = STATE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(device)
-            .cloned();
-        update_state(
-            device,
-            RipState {
-                device: device.to_string(),
-                status: "idle".to_string(),
-                disc_present: true,
-                disc_name: prev
-                    .as_ref()
-                    .map(|p| p.disc_name.clone())
-                    .unwrap_or_default(),
-                disc_format: prev
-                    .as_ref()
-                    .map(|p| p.disc_format.clone())
-                    .unwrap_or_default(),
-                tmdb_title: prev
-                    .as_ref()
-                    .map(|p| p.tmdb_title.clone())
-                    .unwrap_or_default(),
-                tmdb_year: prev.as_ref().map(|p| p.tmdb_year).unwrap_or(0),
-                tmdb_poster: prev
-                    .as_ref()
-                    .map(|p| p.tmdb_poster.clone())
-                    .unwrap_or_default(),
-                ..Default::default()
-            },
-        );
-        drop_session(device);
-        return true;
+/// Why a non-destructive rip must leave this disc's existing staging dir alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingHold {
+    /// The dir exists but could not be read cleanly: its lifecycle is unknown.
+    Unreadable,
+    /// Finished (`.completed` / `.done`): awaiting or past the mover.
+    Completed,
+    /// `.ripped` / `.muxing`: the mux worker is reading this ISO.
+    OwnedByWorker,
+    /// `.review`: finished output held for operator title confirmation.
+    HeldForReview,
+    /// `.aborted-loss`: swept ISO awaiting the operator's Accept / another pass.
+    LossAborted,
+    /// `.sweeping` by another drive's live rip of the same disc.
+    LiveSweep,
+}
+
+// Guards shared by every non-destructive rip mode (Default, Fresh, Prefer). Returns true, after
+// surfacing why, when this disc's staging must not be re-swept. `resume_loss` lets a
+// loss-aborted disc through to a resume pass.
+fn staging_hold_stands_down(cfg: &Arc<RwLock<Config>>, device: &str, resume_loss: bool) -> bool {
+    let hold = match disc_staging_hold(cfg, device) {
+        None => return false,
+        Some(StagingHold::LossAborted) if resume_loss => return false,
+        Some(hold) => hold,
+    };
+    let why = match hold {
+        StagingHold::Completed => {
+            crate::log::device_log(
+                device,
+                "Disc already ripped (.completed marker present) — skipping unattended re-rip. Click Rip to force a fresh rip.",
+            );
+            let prev = STATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(device)
+                .cloned();
+            update_state(
+                device,
+                RipState {
+                    device: device.to_string(),
+                    status: "idle".to_string(),
+                    disc_present: true,
+                    disc_name: prev
+                        .as_ref()
+                        .map(|p| p.disc_name.clone())
+                        .unwrap_or_default(),
+                    disc_format: prev
+                        .as_ref()
+                        .map(|p| p.disc_format.clone())
+                        .unwrap_or_default(),
+                    tmdb_title: prev
+                        .as_ref()
+                        .map(|p| p.tmdb_title.clone())
+                        .unwrap_or_default(),
+                    tmdb_year: prev.as_ref().map(|p| p.tmdb_year).unwrap_or(0),
+                    tmdb_poster: prev
+                        .as_ref()
+                        .map(|p| p.tmdb_poster.clone())
+                        .unwrap_or_default(),
+                    ..Default::default()
+                },
+            );
+            drop_session(device);
+            return true;
+        }
+        StagingHold::OwnedByWorker => {
+            "Disc rip already staged and owned by the mux worker (.ripped/.muxing) — skipping unattended re-sweep."
+        }
+        StagingHold::LossAborted => {
+            "Disc has a loss-aborted staged ISO awaiting an operator decision — NOT re-ripping. Use 'Accept damage' to deliver it, or 'Resume' to run another recovery pass."
+        }
+        StagingHold::HeldForReview => {
+            "Disc has a finished rip held for title review — NOT re-ripping. Confirm or cancel it under Review first."
+        }
+        StagingHold::LiveSweep => {
+            "Another drive is sweeping this disc's staging dir right now — NOT re-ripping."
+        }
+        StagingHold::Unreadable => {
+            "Cannot read this disc's staging dir cleanly (staging share degraded?) — NOT re-ripping, so a finished rip can't be destroyed. Retry once staging is readable."
+        }
+    };
+    crate::log::device_log(device, why);
+    // The UI renders Accept/Resume on loss_aborted && !active.
+    stand_down_idle(device, hold == StagingHold::LossAborted);
+    true
+}
+
+// The hold on the scanned disc's own staging dir, read fail-closed: a dir that exists but
+// can't be snapshotted cleanly is `Unreadable`, never "nothing staged".
+fn disc_staging_hold(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<StagingHold> {
+    // Recover a poisoned lock instead of failing open.
+    let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let sanitized = staging_basename_for_device(&cfg_read, device)?;
+    let root = std::path::Path::new(&cfg_read.staging_dir);
+    let dir = root.join(&sanitized);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => {}
+        // A cold-cache lookup can miss an existing dir: confirm with the retrying listing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match list_staging_basenames(root) {
+                Some(names)
+                    if !names
+                        .iter()
+                        .any(|b| staging_dir_matches_disc(b, &sanitized)) =>
+                {
+                    None
+                }
+                None if std::fs::symlink_metadata(root)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    None
+                }
+                _ => Some(StagingHold::Unreadable),
+            };
+        }
+        Err(_) => return Some(StagingHold::Unreadable),
     }
-    // A `.ripped`/`.muxing` dir is the mux worker's; a sweep would truncate the ISO it reads.
-    if disc_owned_by_worker(cfg, device) {
-        crate::log::device_log(
-            device,
-            "Disc rip already staged and owned by the mux worker (.ripped/.muxing) — skipping unattended re-sweep.",
-        );
-        stand_down_idle(device, false);
-        return true;
+    let snap = match staging::snapshot_staging_disc(&dir) {
+        Some(s) if !s.had_entry_error => s,
+        _ => return Some(StagingHold::Unreadable),
+    };
+    snapshot_hold(&snap).or_else(|| {
+        (snap.has_sweeping && another_drive_sweeping(&cfg_read, device, &sanitized))
+            .then_some(StagingHold::LiveSweep)
+    })
+}
+
+// Pure: the hold a cleanly-read snapshot imposes. `.done` counts on its own for old-format
+// dirs that crashed between the `.done` and `.completed` writes.
+fn snapshot_hold(snap: &staging::StagingSnapshot) -> Option<StagingHold> {
+    if snap.has_ripped || snap.has_muxing {
+        Some(StagingHold::OwnedByWorker)
+    } else if snap.has_review {
+        Some(StagingHold::HeldForReview)
+    } else if snap.completed || snap.has_done {
+        Some(StagingHold::Completed)
+    } else if snap.has_aborted_loss {
+        Some(StagingHold::LossAborted)
+    } else {
+        None
     }
-    // `.aborted-loss` holds a swept ISO awaiting the operator's Accept / another pass.
-    if disc_loss_aborted(cfg, device) {
-        crate::log::device_log(
-            device,
-            "Disc has a loss-aborted staged ISO awaiting an operator decision — NOT re-ripping. Use 'Accept damage' to deliver it, or 'Resume' to run another recovery pass.",
-        );
-        // The UI renders Accept/Resume on loss_aborted && !active.
-        stand_down_idle(device, true);
-        return true;
-    }
-    // A held `.review` rip is finished output awaiting title confirmation, not partial state.
-    if disc_held_for_review(cfg, device) {
-        crate::log::device_log(
-            device,
-            "Disc has a finished rip held for title review — NOT re-ripping. Confirm or cancel it under Review first.",
-        );
-        stand_down_idle(device, false);
-        return true;
-    }
-    false
+}
+
+// Is another drive's live rip thread working in the same staging dir (same disc in two drives)?
+// A `.sweeping` dir no thread owns is a crash leftover.
+fn another_drive_sweeping(cfg: &Config, device: &str, sanitized: &str) -> bool {
+    let others: Vec<String> = STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .filter(|d| d.as_str() != device)
+        .cloned()
+        .collect();
+    others.iter().any(|d| {
+        rip_thread_running(d) && staging_basename_for_device(cfg, d).as_deref() == Some(sanitized)
+    })
 }
 
 // Leave a skipped disc idle (not stuck "scanning") and release its drive session.
@@ -1691,76 +1778,6 @@ pub fn staging_basename_for_device(cfg: &Config, device: &str) -> Option<String>
         &display_name,
         &disc_label,
     ))
-}
-
-// Does the currently-scanned disc have a resumable `.aborted-loss` staging dir? Reads the
-// snapshot (state.json-aware), not the legacy marker file, which upgraded dirs no longer carry.
-fn disc_loss_aborted(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
-    scanned_disc_snapshot(cfg, device).is_some_and(|s| s.has_aborted_loss)
-}
-
-// Does the currently-scanned disc have a finished rip held for operator title review?
-fn disc_held_for_review(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
-    scanned_disc_snapshot(cfg, device).is_some_and(|s| s.has_review)
-}
-
-// NFS-resilient snapshot of the currently-scanned disc's own staging dir (exact name match).
-fn scanned_disc_snapshot(
-    cfg: &Arc<RwLock<Config>>,
-    device: &str,
-) -> Option<staging::StagingSnapshot> {
-    // Recover a poisoned lock instead of failing open (a `None` here lets a re-sweep through).
-    let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
-    let sanitized = staging_basename_for_device(&cfg_read, device)?;
-    let staging_root = std::path::Path::new(&cfg_read.staging_dir);
-    let basename = list_staging_basenames(staging_root)?
-        .into_iter()
-        .find(|b| staging_dir_matches_disc(b, &sanitized))?;
-    staging::snapshot_staging_disc(&staging_root.join(basename))
-}
-
-// Does the currently-scanned disc already have a `.completed` staging dir? Gates the unattended
-// auto-rip path so a container restart doesn't re-rip a disc.
-fn disc_already_completed(cfg: &Arc<RwLock<Config>>, device: &str) -> bool {
-    // Recover from a poisoned mutex rather than silently returning false
-    // (would re-rip a completed disc). Basename is disc-specific, not just
-    // title-specific — disc 2 of a boxset shares disc 1's TMDB title.
-    let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
-    let Some(sanitized) = staging_basename_for_device(&cfg_read, device) else {
-        return false;
-    };
-    // NFS-resilient listing (retries + surfaces per-entry errors) instead of
-    // `read_dir(...).flatten()`, which would silently drop the disc's own dir
-    // on a cold-cache DirEntry error and wrongly re-rip a completed disc.
-    let staging_root = std::path::Path::new(&cfg_read.staging_dir);
-    staging_disc_completed(staging_root, &sanitized)
-}
-
-// Pure core of `disc_already_completed`: does a staging dir whose basename exactly matches
-// `sanitized` carry `.completed` AND not `.review` (M4 held-for-review gating)?
-fn staging_disc_completed(staging_root: &std::path::Path, sanitized: &str) -> bool {
-    let Some(basenames) = list_staging_basenames(staging_root) else {
-        return false;
-    };
-    for basename in basenames {
-        let path = staging_root.join(&basename);
-        // EXACT match only: a prefix match would collide where a shorter
-        // title's sanitized name is a prefix of a longer one's (e.g.
-        // "Redshift" vs "Redshift_2"). Exact equality is collision-free.
-        if !staging_dir_matches_disc(&basename, sanitized) {
-            continue;
-        }
-        // NFS-resilient snapshot, not a bare `.exists()`: on a cold attribute
-        // cache `.exists()` can false-negative right after the marker write,
-        // letting Default auto-insert re-rip a finished disc mid-mux.
-        if let Some(snap) = staging::snapshot_staging_disc(&path)
-            && snap.completed
-            && !snap.has_review
-        {
-            return true;
-        }
-    }
-    false
 }
 
 // Does the currently-scanned disc have a staging dir OWNED by the mux worker (`.ripped`
@@ -1886,7 +1903,7 @@ fn pre_pass_converged(mux_scope_bad: u64, bytes_good: u64) -> bool {
 // the currently-scanned disc; returns the `ResumeClass::Remux` payload if found, else None.
 fn find_resumable_for_disc(cfg: &Arc<RwLock<Config>>, device: &str) -> Option<resume::ResumeClass> {
     // Recover from a poisoned mutex rather than silently returning None (which
-    // would fail to resume a valid staged ISO). Matches disc_already_completed.
+    // would fail to resume a valid staged ISO). Matches disc_staging_hold.
     let cfg_read = cfg.read().unwrap_or_else(|e| e.into_inner()).clone();
     let sanitized = staging_basename_for_device(&cfg_read, device)?;
     // NFS-resilient listing, not `read_dir(...).flatten()`, which would
@@ -2038,7 +2055,7 @@ fn resumable_for_disc(cfg: &Config, display_name: &str, disc_label: &str) -> Opt
     );
     // NFS-resilient listing, not `read_dir(...).flatten()`, which could hide
     // an existing resumable dir and make the operator re-sweep instead of
-    // resuming. Mirrors disc_already_completed.
+    // resuming. Mirrors disc_staging_hold.
     let staging_root = std::path::Path::new(&cfg.staging_dir);
     let basenames = list_staging_basenames(staging_root)?;
     for basename in basenames {
@@ -2052,7 +2069,8 @@ fn resumable_for_disc(cfg: &Config, display_name: &str, disc_label: &str) -> Opt
         // re-rip wouldn't clear stale `.failed`, and the mux worker would
         // skip it forever. Mirrors resumable_dir_blocked; forces a Wipe.
         if let Some(snap) = staging::snapshot_staging_disc(&path) {
-            if snap.has_failed || snap.has_review {
+            // Nor a finished rip (`.completed`/`.done`): the mover may be copying it.
+            if snap.has_failed || snap.has_review || snap.completed || snap.has_done {
                 return None;
             }
             // A dir the mux worker owns (.ripped/.muxing) must NOT be offered
@@ -2636,7 +2654,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
 
     // `disc_name` is the RAW volume label, the only thing distinguishing two
     // discs of a boxset behind one shared TMDB title. Must resolve to the
-    // same dir disc_already_completed/find_resumable_for_disc just checked.
+    // same dir disc_staging_hold/find_resumable_for_disc just checked.
     let staging = cfg_read.staging_device_dir(&staging::staging_basename(
         std::path::Path::new(&cfg_read.staging_dir),
         &display_name,
@@ -6247,8 +6265,8 @@ mod tests {
         list_staging_basenames, patch_made_progress, patch_pass_decision, plan_passes,
         pre_pass_converged, prune_intermediate_iso, register_halt, resumable_dir_blocked,
         resumable_for_disc, resume_remaining_iso_bytes, scope_bad_bytes, scope_converged,
-        skip_diskcheck_value, staging_dir_matches_disc, staging_disc_completed,
-        staging_disc_owned_by_worker, staging_free_bytes, sweep_transport_retry,
+        skip_diskcheck_value, staging_dir_matches_disc, staging_disc_owned_by_worker,
+        staging_free_bytes, sweep_transport_retry,
     };
     use crate::ripper::session::device_halt;
     use crate::ripper::staging;
@@ -9119,14 +9137,14 @@ mod tests {
         // .completed alone → already ripped.
         staging::write_completed_marker(&dir);
         assert!(
-            staging_disc_completed(tmp.path(), san),
+            completed_hold(tmp.path(), san),
             ".completed alone must count as already-ripped"
         );
         // Hold for review → NO longer "already ripped" (state becomes Review,
         // which still counts as `completed` but is excluded by `!has_review`).
         staging::mark_handoff(&dir, false, |_| {}).unwrap();
         assert!(
-            !staging_disc_completed(tmp.path(), san),
+            !completed_hold(tmp.path(), san),
             ".completed + review-hold must NOT count as already-ripped (M4)"
         );
     }
@@ -9149,7 +9167,7 @@ mod tests {
             ],
         );
         assert!(
-            staging_disc_completed(tmp.path(), san),
+            completed_hold(tmp.path(), san),
             ".completed must be detected via snapshot even with leftover ISO/mapfile"
         );
         // No .completed at all → not completed (snapshot agrees).
@@ -9160,7 +9178,7 @@ mod tests {
             &["Unfinished_Movie.iso", "Unfinished_Movie.iso.mapfile"],
         );
         assert!(
-            !staging_disc_completed(tmp.path(), other),
+            !completed_hold(tmp.path(), other),
             "no .completed → not already-completed"
         );
     }
@@ -9803,6 +9821,26 @@ mod tests {
 
     /// Seed `STATE[device].disc_name` and hand back a `Config` pointing at
     /// `staging_root`, exactly as the drive thread sees them after a scan.
+    // Does the pure hold projection read `root/san` as a finished rip?
+    fn completed_hold(root: &std::path::Path, san: &str) -> bool {
+        staging::snapshot_staging_disc(&root.join(san)).and_then(|s| super::snapshot_hold(&s))
+            == Some(super::StagingHold::Completed)
+    }
+
+    fn already_completed(
+        cfg: &std::sync::Arc<std::sync::RwLock<crate::config::Config>>,
+        device: &str,
+    ) -> bool {
+        super::disc_staging_hold(cfg, device) == Some(super::StagingHold::Completed)
+    }
+
+    fn loss_aborted(
+        cfg: &std::sync::Arc<std::sync::RwLock<crate::config::Config>>,
+        device: &str,
+    ) -> bool {
+        super::disc_staging_hold(cfg, device) == Some(super::StagingHold::LossAborted)
+    }
+
     fn seed_scanned_disc(
         device: &str,
         disc_name: &str,
@@ -9872,7 +9910,7 @@ mod tests {
         // Same disc back in the drive (container restart, disc still loaded):
         // it must find ITS OWN dir and still be recognised as finished.
         assert!(
-            super::disc_already_completed(&cfg1, d1),
+            already_completed(&cfg1, d1),
             "re-inserting the SAME disc must still resolve to its own completed \
              dir — otherwise every restart re-sweeps a finished rip"
         );
@@ -9880,7 +9918,7 @@ mod tests {
         // ── Disc 2 goes in ───────────────────────────────────────────────
         let cfg2 = seed_scanned_disc_labelled(d2, title, "BOXSET_DISC_2", root);
         assert!(
-            !super::disc_already_completed(&cfg2, d2),
+            !already_completed(&cfg2, d2),
             "disc 2 of a boxset shares disc 1's TMDB title but is a DIFFERENT \
              disc: it must be ripped, not skipped as already completed"
         );
@@ -9919,7 +9957,7 @@ mod tests {
 
         let cfg = seed_scanned_disc_labelled(device, title, "LEGACY_DISC_1", root);
         assert!(
-            super::disc_already_completed(&cfg, device),
+            already_completed(&cfg, device),
             "an unlabelled legacy dir must still stop the unattended path \
              re-ripping a disc it already finished"
         );
@@ -9929,7 +9967,7 @@ mod tests {
         let other = "sg_boxset_legacy_sibling_test";
         let cfg2 = seed_scanned_disc_labelled(other, title, "LEGACY_DISC_2", root);
         assert!(
-            !super::disc_already_completed(&cfg2, other),
+            !already_completed(&cfg2, other),
             "after adoption, a different disc of the same title must rip"
         );
 
@@ -10082,7 +10120,7 @@ mod tests {
 
         // No staging dir at all → nothing to protect.
         assert!(
-            !super::disc_loss_aborted(&cfg, device),
+            !loss_aborted(&cfg, device),
             "a disc with no staging dir has not aborted on loss"
         );
 
@@ -10090,7 +10128,7 @@ mod tests {
         // Accept or run another pass. Re-sweeping would clobber it.
         staging_disc_with_markers(tmp.path(), &sanitized, &[staging::ABORTED_LOSS_MARKER]);
         assert!(
-            super::disc_loss_aborted(&cfg, device),
+            loss_aborted(&cfg, device),
             "an .aborted-loss staging dir for the scanned disc must be recognised"
         );
 
@@ -10099,7 +10137,7 @@ mod tests {
         let unscanned = "sg_loss_aborted_unscanned_test";
         let cfg2 = seed_scanned_disc(unscanned, "", tmp.path());
         assert!(
-            !super::disc_loss_aborted(&cfg2, unscanned),
+            !loss_aborted(&cfg2, unscanned),
             "an unscanned device must not match anything"
         );
 
@@ -10115,14 +10153,14 @@ mod tests {
         let sanitized = crate::util::sanitize_path_compact("Finished Disc");
 
         assert!(
-            !super::disc_already_completed(&cfg, device),
+            !already_completed(&cfg, device),
             "an untouched disc is not already completed"
         );
 
         let disc_dir = staging_disc_with_markers(tmp.path(), &sanitized, &[]);
         staging::write_completed_marker(&disc_dir);
         assert!(
-            super::disc_already_completed(&cfg, device),
+            already_completed(&cfg, device),
             "a .completed staging dir must stop the unattended path re-ripping it"
         );
 
@@ -10130,7 +10168,7 @@ mod tests {
         // operator hasn't confirmed the title — the disc is NOT finished.
         staging::mark_handoff(&disc_dir, false, |_| {}).unwrap();
         assert!(
-            !super::disc_already_completed(&cfg, device),
+            !already_completed(&cfg, device),
             "a held-for-review dir is awaiting the operator, not finished"
         );
 
@@ -10138,7 +10176,7 @@ mod tests {
         let other = "sg_already_completed_other_test";
         let cfg2 = seed_scanned_disc(other, "Some Other Disc", tmp.path());
         assert!(
-            !super::disc_already_completed(&cfg2, other),
+            !already_completed(&cfg2, other),
             "another disc's staging dir must not count as this disc's completion"
         );
 
@@ -10203,9 +10241,10 @@ mod tests {
 
         // Both gates must still SEE the markers — a fail-open `false` here
         // would clobber the parked ISO / truncate the worker's read.
-        assert!(
-            super::disc_loss_aborted(&cfg, device),
-            "disc_loss_aborted must recover the poisoned lock, not re-sweep the .aborted-loss ISO"
+        assert_eq!(
+            super::disc_staging_hold(&cfg, device),
+            Some(super::StagingHold::OwnedByWorker),
+            "disc_staging_hold must recover the poisoned lock, not re-sweep the held ISO"
         );
         assert!(
             super::disc_owned_by_worker(&cfg, device),
@@ -10250,6 +10289,10 @@ mod tests {
         vec![
             ("completed", |d| staging::write_completed_marker(d)),
             ("done", |d| staging::mark_handoff(d, true, |_| {}).unwrap()),
+            // Old-format crash window: `.done` written, `.completed` not yet.
+            ("legacy-done", |d| {
+                std::fs::write(d.join(".done"), b"{}").unwrap()
+            }),
             ("review", |d| {
                 staging::mark_handoff(d, false, |_| {}).unwrap()
             }),
@@ -10274,6 +10317,10 @@ mod tests {
         for on_insert in ["rip", "resume"] {
             let mode = super::auto_insert_rip_mode(on_insert).expect("an auto-rip mode");
             for (label, arm) in protected_staging_arms() {
+                // Resume runs another (non-destructive) pass over a loss-aborted disc.
+                if on_insert == "resume" && label == "aborted-loss" {
+                    continue;
+                }
                 let device = format!("sg_insert_guard_{on_insert}_{label}_test");
                 let (_tmp, dir, st) = dispatch_over_staged_disc(&device, "Guarded Disc", mode, arm);
                 assert_eq!(
@@ -10286,6 +10333,151 @@ mod tests {
                     "on_insert={on_insert} over a {label} dir must stand down, not rip: {st:?}"
                 );
             }
+        }
+    }
+
+    // Stage a real partial sweep (ISO + pending mapfile) the resume paths accept.
+    fn stage_partial_sweep(d: &std::path::Path) {
+        freemkv_engine::Mapfile::create(&d.join("Sentinel.iso.mapfile"), 4096, "test").unwrap();
+    }
+
+    // on_insert=resume is "continue a resumable rip": a loss-aborted disc gets another
+    // recovery pass over its kept ISO (reaching rip_disc surfaces as "error" here).
+    #[test]
+    fn resume_on_insert_runs_another_pass_over_a_loss_aborted_disc() {
+        let mode = super::auto_insert_rip_mode("resume").expect("an auto-rip mode");
+        let (_tmp, dir, st) =
+            dispatch_over_staged_disc("sg_insert_resume_loss_test", "Lossy Disc", mode, |d| {
+                stage_partial_sweep(d);
+                staging::mark_aborted_on_loss(d, "loss over threshold");
+            });
+        assert_eq!(
+            st.status, "error",
+            "the resume pass must have been attempted: {st:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("Sentinel.iso")).ok().as_deref(),
+            Some(&b"precious"[..]),
+            "a resume pass must keep the loss-aborted ISO"
+        );
+    }
+
+    // Unreadable staging (NFS cold cache, EACCES) is unknown, not empty: stand down rather
+    // than wipe or sweep over what may be a finished rip.
+    #[cfg(unix)]
+    #[test]
+    fn insert_dispatch_stands_down_on_unreadable_staging() {
+        use std::os::unix::fs::PermissionsExt;
+        let modes = [
+            ("rip", super::auto_insert_rip_mode("rip").expect("mode")),
+            (
+                "resume",
+                super::auto_insert_rip_mode("resume").expect("mode"),
+            ),
+            ("default", crate::web::ResumeMode::Default),
+        ];
+        for (label, mode) in modes {
+            let device = format!("sg_insert_unreadable_{label}_test");
+            let (_tmp, dir, st) = dispatch_over_staged_disc(&device, "Cold Disc", mode, |d| {
+                staging::mark_handoff(d, true, |_| {}).unwrap();
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o000)).unwrap();
+            });
+            let unreadable = std::fs::read_dir(&dir).is_err();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if !unreadable {
+                eprintln!("skipping: running with CAP_DAC_OVERRIDE, chmod 000 is still readable");
+                return;
+            }
+            assert!(
+                dir.join("Sentinel.iso").exists(),
+                "{label}: unreadable dir touched"
+            );
+            assert_eq!(
+                st.status, "idle",
+                "{label} must stand down on unknown staging: {st:?}"
+            );
+        }
+    }
+
+    // Two drives holding the same disc share one staging dir: a fresh insert on drive B must
+    // not wipe drive A's live sweep, but a crashed sweep's leftover is stale and starts fresh.
+    #[test]
+    fn fresh_insert_spares_a_live_sweep_but_wipes_a_dead_one() {
+        let mode = super::auto_insert_rip_mode("rip").expect("an auto-rip mode");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let other = "sg_insert_live_sweep_other_test";
+        seed_scanned_disc(other, "Twin Disc", tmp.path());
+        let handle = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        super::register_rip_thread(other, handle).expect("register the other drive's rip");
+        let device = "sg_insert_live_sweep_test";
+        let cfg = seed_scanned_disc(device, "Twin Disc", tmp.path());
+        super::update_state_with(device, |s| s.status = "scanning".to_string());
+        let dir = tmp
+            .path()
+            .join(crate::util::sanitize_path_compact("Twin Disc"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Sentinel.iso"), b"precious").unwrap();
+        staging::write_sweeping_marker(&dir);
+        super::dispatch_rip_request(&cfg, device, "/nonexistent/autorip-test-drive", mode);
+        let status = super::STATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device)
+            .map(|s| s.status.clone());
+        drop(tx);
+        forget_device(other);
+        forget_device(device);
+        assert!(
+            dir.join("Sentinel.iso").exists(),
+            "another drive's live sweep was wiped"
+        );
+        assert_eq!(
+            status.as_deref(),
+            Some("idle"),
+            "must stand down on a live sweep"
+        );
+
+        // No drive is sweeping it: a crash leftover, discarded by the fresh rip.
+        let (_tmp3, dead, st) =
+            dispatch_over_staged_disc("sg_insert_dead_sweep_test", "Twin Disc", mode, |d| {
+                staging::write_sweeping_marker(d)
+            });
+        assert!(!dead.exists(), "a dead sweep's leftover must start fresh");
+        assert_eq!(st.status, "error", "and the fresh rip must be attempted");
+    }
+
+    // A6: an explicit Resume must not sweep over a finished rip the mover may be copying.
+    #[test]
+    fn resumable_for_disc_refuses_finished_rips() {
+        let display_name = "Finished Resume Disc";
+        let sanitized = crate::util::sanitize_path_compact(display_name);
+        let arms: Vec<(&str, Arm)> = vec![
+            ("completed", |d| staging::write_completed_marker(d)),
+            ("done", |d| staging::mark_handoff(d, true, |_| {}).unwrap()),
+            ("legacy-done", |d| {
+                std::fs::write(d.join(".done"), b"{}").unwrap()
+            }),
+        ];
+        for (label, arm) in arms {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cfg = crate::config::Config {
+                staging_dir: tmp.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            };
+            let disc_dir = tmp.path().join(&sanitized);
+            std::fs::create_dir(&disc_dir).unwrap();
+            std::fs::write(disc_dir.join(format!("{sanitized}.iso")), b"x").unwrap();
+            let mapfile = disc_dir.join(format!("{sanitized}.iso.mapfile"));
+            freemkv_engine::Mapfile::create(&mapfile, 4096, "test").unwrap();
+            arm(&disc_dir);
+            assert_eq!(
+                resumable_for_disc(&cfg, display_name, ""),
+                None,
+                "a {label} dir must not be offered for a resume sweep"
+            );
         }
     }
 

@@ -45,7 +45,7 @@ pub const RIPPED_MARKER: &str = ".ripped";
 pub const SWEEPING_MARKER: &str = ".sweeping";
 /// Exclusion lock written by the mux worker when it begins muxing a `.ripped`
 /// dir and removed on completion. Its presence means the dir is OWNED by the
-/// mux worker; the drive-resume paths (`disc_already_completed` auto-insert,
+/// mux worker; the drive-resume paths (`disc_staging_hold` insert guard,
 /// `find_resumable_for_disc`) must not select it (they would truncate the ISO
 /// the mux worker is reading, or double-mux the same output).
 pub const MUXING_MARKER: &str = ".muxing";

@@ -1204,7 +1204,7 @@ function renderSettings(s){
   }
   const groups=[
     {title:'Disc Lifecycle',fields:[
-      {key:'on_insert',label:'On Disc Insert',type:'radio',options:[{value:'nothing',label:'Do Nothing'},{value:'scan',label:'Scan'},{value:'rip',label:'Rip'},{value:'resume',label:'Resume'}],hint:'Rip starts fresh each time. Resume continues a resumable rip, or starts fresh if none is available.'},
+      {key:'on_insert',label:'On Disc Insert',type:'radio',options:[{value:'nothing',label:'Do Nothing'},{value:'scan',label:'Scan'},{value:'rip',label:'Rip'},{value:'resume',label:'Resume'}],hint:'Rip starts fresh each time. Resume continues a resumable rip, or starts fresh if none is available. Both leave finished, review-held and muxing discs alone; Rip also leaves loss-aborted discs for Accept/Resume.'},
       {key:'auto_eject',label:'Auto Eject',type:'bool',hint:'Eject disc after rip completes'},
     ]},
     {title:'Ripping',fields:[
