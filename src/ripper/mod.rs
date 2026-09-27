@@ -2737,7 +2737,16 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
     // Write `.sweeping` before Pass 1 to govern the whole sweep+patch window;
     // without it a crash mid-sweep leaves the dir ungoverned (restart-count
     // toward `.failed`, mover WARN-floods). Replaced by `.ripped`/`.failed`.
-    staging::write_sweeping_marker(std::path::Path::new(&staging));
+    if let Some(why) = staging::seed_sweeping_for_live_rip(std::path::Path::new(&staging)) {
+        crate::log::device_log(
+            device,
+            &format!(
+                "Replaced an unreadable state.json ({why}); the plan is rebuilt from the disc. The old file is kept as {}.",
+                staging::UNREADABLE_STATE_ASIDE
+            ),
+        );
+        crate::muxer::clear_error_with_prefix(&staging, staging::STATE_HELD_PREFIX);
+    }
     // RAII cleanup for `.sweeping`: terminal-marker writers clear it first,
     // so this only fires on error/panic, preventing a stale `.sweeping` from
     // stranding the dir InProgress across restarts.
@@ -3061,7 +3070,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 // orphaned dir. Driven by plan.quarantine (unit-tested).
                 if plan.quarantine {
                     let staging_disc_path = std::path::Path::new(&staging);
-                    staging::write_failed_marker(
+                    quarantine_or_log(
+                        device,
                         staging_disc_path,
                         "FMTS forensic keys missing — not ripping.",
                     );
@@ -4480,7 +4490,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     // and `.ripped` also failed, this ENOENT repeats every startup.
                     // Quarantine with `.failed` so restart classifies it terminal.
                     let staging_disc_path = std::path::Path::new(&staging);
-                    staging::write_failed_marker(staging_disc_path, &msg);
+                    quarantine_or_log(device, staging_disc_path, &msg);
                     staging::clear_restart_count(staging_disc_path);
                     update_state(
                         device,
@@ -4692,7 +4702,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 );
                 crate::log::device_log(device, &msg);
                 let staging_disc_path = std::path::Path::new(&staging);
-                staging::write_failed_marker(staging_disc_path, &msg);
+                quarantine_or_log(device, staging_disc_path, &msg);
                 staging::clear_restart_count(staging_disc_path);
                 update_state_with(device, |s| {
                     s.status = "failed".to_string();
@@ -4738,7 +4748,7 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 );
                 crate::log::device_log(device, &msg);
                 let staging_disc_path = std::path::Path::new(&staging);
-                staging::write_failed_marker(staging_disc_path, &msg);
+                quarantine_or_log(device, staging_disc_path, &msg);
                 staging::clear_restart_count(staging_disc_path);
                 update_state_with(device, |s| {
                     s.status = "failed".to_string();
@@ -4767,7 +4777,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                 .expect("finalize_error is Some when the header phase is HeaderPhase::Failed");
             crate::log::device_log(device, &format!("Mux failed: {reason}"));
             let staging_disc_path = std::path::Path::new(&staging);
-            staging::write_failed_marker(
+            quarantine_or_log(
+                device,
                 staging_disc_path,
                 &format!("mux header phase failed: {reason}"),
             );
@@ -4984,7 +4995,8 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
             // segment-size header wasn't written — unseekable/invalid. Quarantine
             // with `.failed` so mover skips it and resume treats it as terminal-failed.
             let staging_disc_path = std::path::Path::new(&staging);
-            staging::write_failed_marker(
+            quarantine_or_log(
+                device,
                 staging_disc_path,
                 &format!("mux finalize failed: {reason}"),
             );
@@ -5353,6 +5365,21 @@ fn title_is_confident(
 /// The legacy hand-off marker name (`.done`/`.review`). The completion paths now
 /// transition `state.json` via [`staging::mark_handoff`] / [`staging::handoff_label`];
 /// this is retained only for the tests that pin the `.done`/`.review` vocabulary.
+// Quarantine a staging dir as `.failed`; if that did not persist (state.json
+// unreadable, or staging unwritable) say so in the device log instead of
+// silently carrying on as if the dir were terminal.
+fn quarantine_or_log(device: &str, staging_disc_path: &std::path::Path, reason: &str) {
+    if !staging::write_failed_marker(staging_disc_path, reason) {
+        crate::log::device_log(
+            device,
+            &format!(
+                "The .failed quarantine for {} did not persist (state.json unreadable or staging unwritable); the dir is left as-is for the operator.",
+                staging_disc_path.display()
+            ),
+        );
+    }
+}
+
 #[cfg(test)]
 fn handoff_marker_name(title_confident: bool) -> &'static str {
     if title_confident { ".done" } else { ".review" }
@@ -11337,5 +11364,58 @@ mod probe_failure_tests {
             !body.contains("\"scanning\"") && body.contains("row_is_busy"),
             "forget_removed_device must use state::row_is_busy, not an inline copy of is_busy's predicate"
         );
+    }
+}
+
+#[cfg(test)]
+mod quarantine_persist_tests {
+    // Production source of this file: every `#[cfg(test)] mod` block removed
+    // (brace-matched), so the pins below see only non-test code.
+    fn production_src() -> String {
+        let src = crate::util::source_lf(include_str!("mod.rs"));
+        let mut out = String::new();
+        let mut rest: &str = &src;
+        while let Some(i) = rest.find("#[cfg(test)]\nmod ") {
+            out.push_str(&rest[..i]);
+            let open = i + rest[i..].find('{').expect("mod body");
+            let mut depth = 0usize;
+            let mut end = rest.len();
+            for (j, c) in rest[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + j + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    // Every rip-side quarantine must go through `quarantine_or_log` so a refused
+    // or failed `.failed` write is surfaced in the device log, and the live-disc
+    // sweep seed must be the one that may replace an unreadable state.json.
+    #[test]
+    fn rip_side_quarantines_log_when_not_persisted() {
+        let prod = production_src();
+        let bare = prod.matches("staging::write_failed_marker(").count();
+        assert_eq!(
+            bare, 1,
+            "only quarantine_or_log may call write_failed_marker; found {bare}"
+        );
+        assert_eq!(
+            prod.matches("quarantine_or_log(").count(),
+            7,
+            "6 call sites + the fn"
+        );
+        assert!(prod.contains("staging::seed_sweeping_for_live_rip("));
+        assert!(!prod.contains("staging::write_sweeping_marker("));
     }
 }

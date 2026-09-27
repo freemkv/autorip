@@ -897,6 +897,28 @@ pub fn write_sweeping_marker(staging_disc_dir: &Path) {
     }
 }
 
+/// Where [`seed_sweeping_for_live_rip`] keeps an unreadable state.json it replaced.
+pub const UNREADABLE_STATE_ASIDE: &str = "state.json.unreadable";
+
+/// Seed `Sweeping` for a LIVE-DISC rip. Unlike [`write_sweeping_marker`] this
+/// may replace an unreadable state.json (moved aside to [`UNREADABLE_STATE_ASIDE`]):
+/// the rip rebuilds the plan from the disc. Returns why, if it replaced one.
+pub fn seed_sweeping_for_live_rip(staging_disc_dir: &Path) -> Option<String> {
+    let StateRead::Unreadable(u) = read_state_checked(staging_disc_dir) else {
+        write_sweeping_marker(staging_disc_dir);
+        return None;
+    };
+    let p = state_path(staging_disc_dir);
+    if let Err(e) = std::fs::rename(&p, staging_disc_dir.join(UNREADABLE_STATE_ASIDE)) {
+        tracing::warn!(path = %p.display(), error = %e, "could not set the unreadable state.json aside; replacing it");
+    }
+    tracing::warn!(path = %p.display(), reason = %u.log_text(), "live-disc rip replacing an unreadable state.json");
+    if let Err(e) = try_write_state(staging_disc_dir, &DiscState::new(StagingState::Sweeping)) {
+        tracing::error!(path = %p.display(), error = %e, "failed to seed state.json for the live-disc rip");
+    }
+    Some(u.log_text())
+}
+
 /// Write the `.muxing` exclusion lock durably. Called by the mux worker when
 /// it begins muxing a `.ripped` dir; removed on completion (RAII guard).
 /// Carries a JSON `started` epoch-secs timestamp for observability. Best-effort
@@ -2057,6 +2079,40 @@ mod tests {
         let m = DiscState::new(StagingState::Ripped).to_ripped_marker();
         assert!(crate::muxer::write_marker(&d, &m).is_err());
         untouched(&d, "muxer::write_marker");
+    }
+
+    // A live-disc rip rebuilds the plan from the disc, so it may deliberately
+    // replace an unreadable state.json (kept aside); the hand-off must then land.
+    #[test]
+    fn live_disc_seed_replaces_unreadable_state_and_handoff_proceeds() {
+        let d = tmpdir();
+        fs::write(state_path(&d), b"{ torn").unwrap();
+        let replaced = seed_sweeping_for_live_rip(&d);
+        assert!(replaced.is_some(), "the replacement must be reported");
+        assert_eq!(
+            read_state(&d).map(|s| s.state),
+            Some(StagingState::Sweeping)
+        );
+        assert_eq!(fs::read(d.join(UNREADABLE_STATE_ASIDE)).unwrap(), b"{ torn");
+        let m = DiscState::new(StagingState::Ripped).to_ripped_marker();
+        assert!(
+            crate::muxer::write_marker(&d, &m).is_ok(),
+            "hand-off refused"
+        );
+        assert!(
+            mark_handoff(&d, true, |_| {}).is_ok(),
+            "mark_handoff refused"
+        );
+
+        // A readable state is seeded in place, nothing reported or set aside.
+        let ok = tmpdir();
+        write_state(&ok, &DiscState::new(StagingState::Ripped));
+        assert!(seed_sweeping_for_live_rip(&ok).is_none());
+        assert_eq!(
+            read_state(&ok).map(|s| s.state),
+            Some(StagingState::Sweeping)
+        );
+        assert!(!ok.join(UNREADABLE_STATE_ASIDE).exists());
     }
 
     // G5/G6: startup must hold (not wipe, not quarantine over) a dir whose

@@ -424,6 +424,12 @@ pub(crate) fn mux_failure_is_terminal(class: MuxFailureClass) -> bool {
 pub(crate) fn persist_terminal_mux_quarantine(path_str: &str, dir: &Path, reason: &str) -> bool {
     let landed = crate::ripper::staging::write_failed_marker(dir, reason);
     if !landed {
+        if let crate::ripper::staging::StateRead::Unreadable(u) =
+            crate::ripper::staging::read_state_checked(dir)
+        {
+            record_error(path_str, &u.held_reason(), u.hint());
+            return false;
+        }
         crate::log::syslog(&format!(
             "Mux quarantine FAILED to persist (state.json write error) — {path_str} will keep re-dispatching until the staging mount recovers"
         ));
@@ -1021,6 +1027,26 @@ mod tests {
         undismiss(&p);
         clear_error(&p);
         assert!(!rerecorded, "a dismissed error re-surfaced");
+    }
+
+    // A quarantine refused because state.json is unreadable must show the held
+    // card, not the "staging mount full / unwritable" one.
+    #[test]
+    fn terminal_quarantine_refused_on_unreadable_state_shows_held_card() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("Torn");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(crate::ripper::staging::STATE_FILE), b"{ torn").unwrap();
+        let path = dir.to_string_lossy().to_string();
+        assert!(!persist_terminal_mux_quarantine(&path, &dir, "E6008"));
+        let card = MUX_ERRORS.lock().unwrap().remove(&path).expect("card");
+        assert!(
+            card.reason
+                .starts_with(crate::ripper::staging::STATE_HELD_PREFIX),
+            "{}",
+            card.reason
+        );
+        assert!(!card.hint.contains("unwritable"), "{}", card.hint);
     }
 
     fn sample_marker() -> RippedMarker {
