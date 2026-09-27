@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Unattended rips no longer delete finished work.** With `on_insert` set to Rip or Resume, inserting a disc no longer wipes its completed, held-for-review, mux-in-progress or loss-aborted staging; only stale partial or failed attempts are cleared for a fresh rip. Resume no longer re-rips over a finished rip.
+- An unreadable `state.json` in a staging folder now holds that folder with an error card (repair it, or click Resume once it reads again) instead of being overwritten, wiped or auto-ripped over. A live-disc rip started from the UI still rebuilds it.
+- Drive polling now waits out a drive that is still settling (spinning up after a USB reset, or a tray closing). A disc spinning back up keeps its session, an empty tray closing no longer starts a rip, and a cleaning cartridge is never ripped. Drive rediscovery after a USB bridge crash re-probes a settling drive for up to ~20 s before moving on.
+
+### Changed
+
+- **New disk-space refusals.** TV discs reserve staging space for every planned episode, not just the selected title, and a resumed re-mux checks staging space before it starts. A refused re-mux has its own "staging full" hint and is logged once.
+- `AUTORIP_SKIP_DISKCHECK` only skips the disk-space check when set to `1`, `true` or `yes`; `0`, `false` or empty keep the check on.
+- Saving an `http://` keyserver URL is now rejected in Settings (rips already required `https://`). An `http://` URL saved before upgrading is named in the startup log.
+- Scan, rip and eject API calls for a device that is not an enumerated drive now return 404 instead of 409.
+
 ## [1.7.7] — 2026-09-26
 
 ### Maintenance
