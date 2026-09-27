@@ -14,22 +14,20 @@ use std::path::{Path, PathBuf};
 use freemkv_keysources::{KeySource, KeydbSource, OnlineSource};
 use libfreemkv::aacs::trace::ResolutionTrace;
 use libfreemkv::keysource::resolve_and_apply_traced;
-use libfreemkv::read_encrypted_units;
 
 use crate::config::Config;
 
-// The SSRF classifier + keyserver-URL validator live ONCE, in the keysources
-// crate. Both `build_sources` and the reachability probe gate on
-// `freemkv_keysources::validate_keyserver_url`, so their verdicts can't diverge.
+// The keyserver URL gate is `freemkv_keysources::validate_keyserver_url` (https-only + SSRF):
+// settings save, `build_sources` and the probe all call it so they agree. web.rs keeps its own
+// guard for other operator URLs; the probe uses it only to pin DNS.
 
 /// How many 6144-byte aligned encrypted units a sample-needing source is given.
 ///
 /// MUST be >= the online keyservice minimum: a request carrying fewer units is
 /// SILENTLY SKIPPED by the online source (see [`libfreemkv::keysource::MIN_SAMPLE_UNITS`]),
-/// which the ripper reads as "key service down" and fails the rip. Defined AS the
-/// floor so it tracks it and can never regress below — and the compile-time
-/// assertion below turns any regression into a BUILD error, not a silent runtime
-/// skip. (This bug shipped once as `= 4`; the assertion makes it un-shippable.)
+/// recording no decode verdict, so the disc-less probe answers and the rip reports
+/// a misleading generic "no key". Defined AS the floor so it tracks it, and the
+/// compile-time assertion below turns any regression into a BUILD error.
 pub const SAMPLE_UNITS: usize = libfreemkv::keysource::MIN_SAMPLE_UNITS;
 const _: () = assert!(
     SAMPLE_UNITS >= libfreemkv::keysource::MIN_SAMPLE_UNITS,
@@ -99,8 +97,11 @@ fn resolve_keydb(
 // as a migration fallback when the canonical AUTORIP_DIR path has no file yet.
 // An empty HOME (common in the container) yields None, never a stray relative path.
 fn legacy_home_keydb() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
+    legacy_keydb_under(std::env::var_os("HOME"))
+}
+
+fn legacy_keydb_under(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    home.filter(|h| !h.is_empty())
         .map(|home| PathBuf::from(home).join(".config/freemkv/keydb.cfg"))
 }
 
@@ -170,22 +171,32 @@ pub fn iso_scan_opts() -> libfreemkv::ScanOptions {
 pub fn build_sources(cfg: &Config) -> Vec<Box<dyn KeySource>> {
     let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
     match cfg.key_source.as_str() {
-        "online" => match freemkv_keysources::validate_keyserver_url(cfg.keyserver_url.trim()) {
-            Ok(()) => sources.push(Box::new(OnlineSource::new(
-                cfg.keyserver_url.clone(),
-                cfg.keyserver_secret.clone(),
-            ))),
-            // SSRF defense-in-depth: refuse to POST disc-key material to an
-            // internal/metadata address; drop the online source entirely
-            // rather than trust it. Covers values that slipped past save-time.
-            Err(e) => {
-                tracing::error!(
-                    phase = "key_resolve",
-                    url_origin = %crate::webhook::webhook_url_origin(&cfg.keyserver_url),
-                    "keyserver URL rejected (SSRF guard): {e} — online key source disabled for this rip"
-                );
+        "online" => {
+            let url = cfg.keyserver_url.trim();
+            let online = || Box::new(OnlineSource::new(url, cfg.keyserver_secret.clone()));
+            match freemkv_keysources::validate_keyserver_url(url) {
+                Ok(()) => sources.push(online()),
+                // DNS blip: keep the source; its per-POST re-guard retries the
+                // lookup and records a real (transient) reachability verdict.
+                Err(e) if url_error_is_transient(&e) => {
+                    tracing::warn!(
+                        phase = "key_resolve",
+                        url_origin = %crate::webhook::webhook_url_origin(url),
+                        "keyserver host lookup failed: {e} — will retry at request time"
+                    );
+                    sources.push(online());
+                }
+                // Standing config fault (bad scheme/host, SSRF-blocked address):
+                // never POST disc-key material there; drop the online source.
+                Err(e) => {
+                    tracing::error!(
+                        phase = "key_resolve",
+                        url_origin = %crate::webhook::webhook_url_origin(url),
+                        "keyserver URL rejected: {e} — online key source disabled for this rip"
+                    );
+                }
             }
-        },
+        }
         "local" => {
             // Loud diagnostic when local keys are selected but no keydb exists at
             // the resolved path — else every disc reports a bare "NO KEY" with no
@@ -396,11 +407,20 @@ pub fn classify_reachability(outcome: ProbeOutcome) -> ServiceReachability {
     }
 }
 
+// keysources' per-host DNS-cap refusal (GuardFail::Unreachable). Its other lookup failures share
+// web's RESOLVE_* texts. Follow-up: keysources should export the typed transient/permanent kind.
+const KEYSOURCES_DNS_CAP_MSG: &str = "too many concurrent DNS resolutions in flight for this host";
+
+// True when a keyserver-URL validation error (keysources' or web's) is a failed lookup, not a
+// permanent verdict on the URL. The ONE classifier for both `build_sources` and the probe.
+fn url_error_is_transient(err: &str) -> bool {
+    crate::web::is_transient_resolve_error(err) || err == KEYSOURCES_DNS_CAP_MSG
+}
+
 // What a URL we could not even validate says about the key SERVICE: a permanent verdict (bad
-// scheme/host/SSRF) means it was never asked, a failed DNS lookup means it was unreachable
-// (transient).
+// scheme/host/SSRF) means it was never asked, a failed DNS lookup means it was unreachable.
 fn reachability_for_unprobeable_url(err: &str) -> ServiceReachability {
-    if crate::web::is_transient_resolve_error(err) {
+    if url_error_is_transient(err) {
         ServiceReachability::Unreachable
     } else {
         ServiceReachability::NotAsked
@@ -491,12 +511,11 @@ fn reachability_from_decode(
 /// from WHERE the disc lives — a live drive or a staged ISO — so the resolution
 /// logic is written once. See [`DriveAccess`] and [`IsoAccess`].
 pub trait DiscKeyAccess {
-    /// Up to `n` encrypted aligned units sampled from the disc's content — the
-    /// ONLY thing `resolve_keys` can't get from `disc.inputs()` (the scan does
-    /// not retain the reader). The AACS inputs (inf, MKB, VID, disc_hash,
-    /// version) all come from `disc.inputs()`, so this trait is now purely a
-    /// sample-the-ciphertext seam over "where the disc lives" (drive vs ISO).
-    fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>>;
+    /// A reader over the disc, for sampling ciphertext via
+    /// [`libfreemkv::Disc::inputs_with_samples`] — the ONLY thing `resolve_keys`
+    /// can't get from `disc.inputs()` (the scan does not retain the reader).
+    /// `None` when the disc can't be opened; sampling is then skipped.
+    fn sector_source(&mut self) -> Option<&mut dyn libfreemkv::SectorSource>;
 }
 
 /// Resolve keys for `disc` via the ordered `sources`, reading inputs through
@@ -515,7 +534,7 @@ pub fn resolve_keys<A: DiscKeyAccess>(
     // ALL AACS inputs come from the keyless scan via `disc.inputs()` — the
     // single source of truth. `access` is used ONLY to sample ciphertext,
     // which the scan doesn't retain (the old out-of-band re-read is gone).
-    let Some(mut inputs) = disc.inputs() else {
+    let Some(inputs) = disc.inputs() else {
         tracing::warn!(phase = "key_resolve", "disc carries no AACS inputs");
         return (disc, KeyOutcome::MissingInputs);
     };
@@ -538,21 +557,23 @@ pub fn resolve_keys<A: DiscKeyAccess>(
         "resolving keys for disc"
     );
 
-    // Read content samples for ciphertext validation, UNCONDITIONALLY — both
-    // remaining sources need them (keydb UKs are only disproved by real
-    // ciphertext; online validates server-side). Skipped only if no source.
-    inputs.samples = if sources.is_empty() {
-        Vec::new()
+    // Content samples for ciphertext validation, UNCONDITIONALLY (keydb UKs are only disproved
+    // by real ciphertext; online validates server-side), drawn by the library from the main
+    // feature — the largest title WITH video, so a streamless decoy is never sampled.
+    let inputs = if sources.is_empty() {
+        inputs
+    } else if disc.titles.is_empty() {
+        tracing::warn!(
+            phase = "key_resolve",
+            "no titles — cannot sample for key validation"
+        );
+        inputs
     } else {
-        match disc.titles.iter().max_by_key(|t| t.size_bytes).cloned() {
-            Some(title) => access.sample_units(&title, SAMPLE_UNITS),
-            None => {
-                tracing::warn!(
-                    phase = "key_resolve",
-                    "no titles — cannot sample for key validation"
-                );
-                Vec::new()
-            }
+        match access.sector_source() {
+            Some(reader) => disc
+                .inputs_with_samples(reader, SAMPLE_UNITS)
+                .unwrap_or(inputs),
+            None => inputs,
         }
     };
 
@@ -713,8 +734,8 @@ impl<'a> DriveAccess<'a> {
 }
 
 impl DiscKeyAccess for DriveAccess<'_> {
-    fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>> {
-        read_encrypted_units(self.drive, title, n)
+    fn sector_source(&mut self) -> Option<&mut dyn libfreemkv::SectorSource> {
+        Some(self.drive)
     }
 }
 
@@ -722,44 +743,58 @@ impl DiscKeyAccess for DriveAccess<'_> {
 /// ciphertext from the ISO; all AACS inputs come from `disc.inputs()`.
 pub struct IsoAccess<'a> {
     iso_path: &'a Path,
+    reader: Option<libfreemkv::FileSectorSource>,
 }
 
 impl<'a> IsoAccess<'a> {
     pub fn new(iso_path: &'a Path) -> Self {
-        Self { iso_path }
+        Self {
+            iso_path,
+            reader: None,
+        }
     }
 }
 
 impl DiscKeyAccess for IsoAccess<'_> {
-    fn sample_units(&mut self, title: &libfreemkv::DiscTitle, n: usize) -> Vec<Vec<u8>> {
-        match libfreemkv::FileSectorSource::open(self.iso_path) {
-            Ok(mut r) => read_encrypted_units(&mut r, title, n),
-            Err(err) => {
-                // Without samples an online key request fires with no
-                // units_b64 and can fail later as NoKey with no visible cause;
-                // surface the real reason here.
-                tracing::warn!(
-                    phase = "key_resolve",
-                    path = %self.iso_path.display(),
-                    %err,
-                    "could not open ISO to sample units"
-                );
-                Vec::new()
+    fn sector_source(&mut self) -> Option<&mut dyn libfreemkv::SectorSource> {
+        if self.reader.is_none() {
+            match libfreemkv::FileSectorSource::open(self.iso_path) {
+                Ok(r) => self.reader = Some(r),
+                Err(err) => {
+                    // Without samples an online key request fires with no
+                    // units_b64 and can fail later as NoKey with no visible cause;
+                    // surface the real reason here.
+                    tracing::warn!(
+                        phase = "key_resolve",
+                        path = %self.iso_path.display(),
+                        %err,
+                        "could not open ISO to sample units"
+                    );
+                    return None;
+                }
             }
         }
+        self.reader
+            .as_mut()
+            .map(|r| r as &mut dyn libfreemkv::SectorSource)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libfreemkv::read_encrypted_units;
 
     #[test]
     fn ssrf_guard_blocks_metadata_and_internal_hosts() {
-        // Cloud metadata endpoint — the canonical SSRF target.
+        // Cloud metadata endpoint — the canonical SSRF target. https:// so the
+        // ADDRESS check fires, not the scheme check.
+        let err =
+            freemkv_keysources::validate_keyserver_url("https://169.254.169.254/latest/meta-data")
+                .unwrap_err();
         assert!(
-            freemkv_keysources::validate_keyserver_url("http://169.254.169.254/latest/meta-data")
-                .is_err()
+            err.contains("SSRF guard"),
+            "rejected for the address: {err}"
         );
         // Loopback and RFC1918.
         assert!(freemkv_keysources::validate_keyserver_url("https://127.0.0.1:8443/keys").is_err());
@@ -878,7 +913,7 @@ mod tests {
     }
 
     // The test above drives `read_encrypted_units` directly, not the real
-    // `IsoAccess::sample_units` impl `resolve_keys` calls in production —
+    // `IsoAccess` reader `resolve_keys` samples through in production —
     // route the same fixture through it so a regression there isn't silently missed.
     #[test]
     fn iso_access_sample_units_reads_through_the_real_trait_impl() {
@@ -907,7 +942,8 @@ mod tests {
 
         // Through the trait object, exactly as `resolve_keys` calls it.
         let mut access: Box<dyn DiscKeyAccess> = Box::new(IsoAccess::new(tmp.path()));
-        let units = access.sample_units(&title, SAMPLE_UNITS);
+        let reader = access.sector_source().expect("a real ISO must open");
+        let units = read_encrypted_units(reader, &title, SAMPLE_UNITS);
         assert_eq!(
             units.len(),
             SAMPLE_UNITS,
@@ -918,29 +954,15 @@ mod tests {
         }
     }
 
-    // `IsoAccess::sample_units` against a path that isn't a valid ISO must fail
-    // SAFE — an empty sample list, not a panic — since a bad/missing staged
-    // ISO must not crash key resolution.
+    // `IsoAccess` against a missing ISO must fail SAFE — no reader, not a
+    // panic — since a bad/missing staged ISO must not crash key resolution.
     #[test]
     fn iso_access_sample_units_empty_on_open_failure() {
-        let title = libfreemkv::DiscTitle {
-            playlist: "00800.mpls".into(),
-            playlist_id: 800,
-            duration_secs: 0.0,
-            size_bytes: 0,
-            clips: Vec::new(),
-            streams: Vec::new(),
-            chapters: Vec::new(),
-            extents: Vec::new(),
-            content_format: libfreemkv::ContentFormat::BdTs,
-            codec_privates: Vec::new(),
-        };
         let missing = Path::new("/nonexistent-autorip-iso-fixture-xyz.iso");
         let mut access = IsoAccess::new(missing);
-        let units = access.sample_units(&title, SAMPLE_UNITS);
         assert!(
-            units.is_empty(),
-            "a missing ISO must yield no samples, not panic"
+            access.sector_source().is_none(),
+            "a missing ISO must yield no reader, not panic"
         );
     }
 
@@ -1166,13 +1188,12 @@ mod tests {
         }
     }
 
-    /// `DiscKeyAccess` fixture whose `key_files()` returns the given option;
-    /// `volume_id` is a fixed all-zero VID; `sample_units` yields nothing (none
-    /// of the outcome tests use a sample-needing source).
+    /// `DiscKeyAccess` fixture with no reader (none of the outcome tests use a
+    /// sample-needing source).
     struct FixtureAccess;
     impl DiscKeyAccess for FixtureAccess {
-        fn sample_units(&mut self, _t: &libfreemkv::DiscTitle, _n: usize) -> Vec<Vec<u8>> {
-            Vec::new()
+        fn sector_source(&mut self) -> Option<&mut dyn libfreemkv::SectorSource> {
+            None
         }
     }
 
@@ -1194,6 +1215,71 @@ mod tests {
             mkb: Vec::new(),
         });
         disc
+    }
+
+    // Records the content samples a source is handed.
+    struct SampleSpy(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+    impl KeySource for SampleSpy {
+        fn get_unit_keys(
+            &self,
+            ctx: &dyn freemkv_keysources::ResolveCtx,
+        ) -> Result<Vec<freemkv_keysources::UnitKey>, libfreemkv::Error> {
+            *self.0.lock().unwrap() = ctx.samples(usize::MAX)?;
+            Ok(Vec::new())
+        }
+    }
+
+    fn title_over(start_lba: u32, sectors: u32, size_bytes: u64) -> libfreemkv::DiscTitle {
+        let mut t = libfreemkv::DiscTitle::empty();
+        t.size_bytes = size_bytes;
+        t.extents = vec![libfreemkv::Extent {
+            start_lba,
+            sector_count: sectors,
+        }];
+        t
+    }
+
+    // Samples must come from the main FEATURE (largest title with video), not a
+    // larger streamless decoy: decoy sectors are clear, feature sectors encrypted.
+    #[test]
+    fn resolve_keys_samples_the_video_feature_not_a_larger_decoy() {
+        use std::io::Write;
+        const HALF: usize = 600;
+        let mut img = vec![0u8; HALF * 2048];
+        img.extend(std::iter::repeat_n(0xC0u8, HALF * 2048));
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&img).unwrap();
+        tmp.flush().unwrap();
+
+        let decoy = title_over(0, HALF as u32, 50_000_000_000);
+        let mut feature = title_over(HALF as u32, HALF as u32, 20_000_000_000);
+        feature.streams = vec![libfreemkv::Stream::Video(libfreemkv::disc::VideoStream {
+            pid: 0x1011,
+            codec: libfreemkv::disc::Codec::H264,
+            resolution: libfreemkv::disc::Resolution::R1080p,
+            frame_rate: libfreemkv::disc::FrameRate::F24,
+            hdr: libfreemkv::disc::HdrFormat::Sdr,
+            color_space: libfreemkv::disc::ColorSpace::Bt709,
+            display_aspect: None,
+            secondary: false,
+            label: String::new(),
+            measured_cicp: None,
+        })];
+        let mut disc = keyless_encrypted_disc_with_aacs();
+        disc.titles = vec![decoy, feature];
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sources: Vec<Box<dyn KeySource>> = vec![Box::new(SampleSpy(seen.clone()))];
+        let mut access = IsoAccess::new(tmp.path());
+        let _ = resolve_keys(sources, &mut access, disc);
+
+        let samples = seen.lock().unwrap();
+        assert_eq!(
+            samples.len(),
+            SAMPLE_UNITS,
+            "samples must be drawn from the encrypted video feature"
+        );
+        assert!(samples.iter().all(|u| u.len() == 6144 && u[0] == 0xC0));
     }
 
     /// A disc with NO AACS state → `disc.inputs()` is `None` → `MissingInputs`,
@@ -1280,7 +1366,7 @@ mod tests {
     fn build_sources_drops_online_source_on_ssrf_blocked_url() {
         let cfg = Config {
             key_source: "online".into(),
-            keyserver_url: "http://169.254.169.254/keys".into(),
+            keyserver_url: "https://169.254.169.254/keys".into(),
             ..Config::default()
         };
         let sources = build_sources(&cfg);
@@ -1480,42 +1566,91 @@ mod tests {
         }
     }
 
-    // A URL the probe cannot even validate is classified by WHY. The transient
-    // literals come from `web`'s own constants (so this can't drift from the
-    // producer); the permanent side is pinned against real validate_fetch_url output.
+    // Permanent verdicts from the REAL keysources producer: the online source is
+    // dropped for these, so a no-key is genuine and must NOT be retried as an outage.
     #[test]
-    fn a_failed_lookup_is_an_outage_but_a_rejected_url_is_not() {
-        assert_eq!(
-            reachability_for_unprobeable_url(crate::web::RESOLVE_TIMEOUT_MSG),
-            ServiceReachability::Unreachable,
-            "a DNS timeout is not evidence that the key service answered"
-        );
-        assert_eq!(
-            reachability_for_unprobeable_url(crate::web::RESOLVE_NO_ADDRS_MSG),
-            ServiceReachability::Unreachable
-        );
-        assert_eq!(
-            reachability_for_unprobeable_url(&format!(
-                "{}Temporary failure in name resolution",
-                crate::web::RESOLVE_FAILED_PREFIX
-            )),
-            ServiceReachability::Unreachable
-        );
-
-        // Permanent verdicts on the URL itself: the online source was already
-        // dropped for these, so a no-key is genuine and must NOT park the disc.
-        for permanent in [
-            "URL is empty",
-            "URL must start with http:// or https://",
-            "URL has no host",
-            "refusing to connect to non-public address 127.0.0.1 (SSRF guard)",
+    fn keysources_config_rejections_are_not_asked() {
+        for url in [
+            "http://8.8.8.8/keys",
+            "https:///keys",
+            "https://8.8.8.8:notaport/keys",
+            "https://[::1/keys",
+            "https://127.0.0.1/keys",
+            "https://169.254.169.254/latest/meta-data",
         ] {
+            let err = freemkv_keysources::validate_keyserver_url(url)
+                .expect_err("keysources must reject this URL outright");
             assert_eq!(
-                reachability_for_unprobeable_url(permanent),
+                reachability_for_unprobeable_url(&err),
                 ServiceReachability::NotAsked,
-                "{permanent:?} is a config verdict, not an outage"
+                "{url:?} -> {err:?} is a config verdict, not an outage"
             );
         }
+    }
+
+    // A failed lookup from the REAL keysources producer (RFC 6761 `.test` never
+    // resolves) is an outage: nothing answered, so nothing is known about the disc.
+    #[test]
+    fn keysources_failed_lookup_is_unreachable() {
+        let err = freemkv_keysources::validate_keyserver_url("https://keys.autorip.test/keys")
+            .expect_err(".test must not resolve");
+        assert_eq!(
+            reachability_for_unprobeable_url(&err),
+            ServiceReachability::Unreachable,
+            "{err:?} is a DNS failure, not a config verdict"
+        );
+    }
+
+    // keysources' per-host DNS-cap (GuardFail::Unreachable) cannot be triggered
+    // deterministically, so its producer text is pinned here verbatim.
+    #[test]
+    fn keysources_dns_cap_is_unreachable() {
+        assert_eq!(
+            reachability_for_unprobeable_url(
+                "too many concurrent DNS resolutions in flight for this host"
+            ),
+            ServiceReachability::Unreachable
+        );
+    }
+
+    // web's own resolver failures (the probe's pinning step) stay transient.
+    #[test]
+    fn web_resolve_failures_are_unreachable() {
+        for msg in [
+            crate::web::RESOLVE_TIMEOUT_MSG.to_string(),
+            crate::web::RESOLVE_NO_ADDRS_MSG.to_string(),
+            format!("{}EAI_AGAIN", crate::web::RESOLVE_FAILED_PREFIX),
+        ] {
+            assert_eq!(
+                reachability_for_unprobeable_url(&msg),
+                ServiceReachability::Unreachable
+            );
+        }
+    }
+
+    // A DNS blip at build time must not drop the online source: its per-POST
+    // re-guard retries the lookup and records the real reachability verdict.
+    #[test]
+    fn build_sources_keeps_online_source_on_transient_lookup_failure() {
+        let cfg = Config {
+            key_source: "online".into(),
+            keyserver_url: "https://keys.autorip.test/decode".into(),
+            ..Config::default()
+        };
+        let sources = build_sources(&cfg);
+        assert_eq!(sources.len(), 1, "a DNS failure is not a config verdict");
+        assert_eq!(sources[0].label(), "online");
+    }
+
+    // Cleartext http:// is a standing config fault: the online source is dropped.
+    #[test]
+    fn build_sources_drops_online_source_on_http_url() {
+        let cfg = Config {
+            key_source: "online".into(),
+            keyserver_url: "http://8.8.8.8/decode".into(),
+            ..Config::default()
+        };
+        assert!(build_sources(&cfg).is_empty());
     }
 
     /// Same fail-safe expectation for a file that exists but is not a valid
@@ -1712,7 +1847,7 @@ mod tests {
         assert!(!probe_online_reachability(&empty).is_transient());
 
         let blocked = Config {
-            keyserver_url: "http://127.0.0.1:9/keys".into(),
+            keyserver_url: "https://127.0.0.1:9/keys".into(),
             ..Default::default()
         };
         assert_eq!(
@@ -1782,11 +1917,19 @@ mod tests {
         assert_eq!(got, PathBuf::from("/config/keydb.cfg"));
     }
 
-    /// Empty HOME (the container case that caused #46) yields no legacy path, so
-    /// resolution never collapses to a stray relative path — it lands on canonical.
+    /// Unset or empty HOME (the container case that caused #46) yields no legacy
+    /// path, so resolution never collapses to a stray relative path.
     #[test]
     fn resolve_keydb_no_legacy_when_home_absent() {
-        let got = resolve_keydb(None, "/config", None, &none_exists);
+        assert_eq!(legacy_keydb_under(None), None);
+        assert_eq!(legacy_keydb_under(Some(std::ffi::OsString::new())), None);
+        assert_eq!(
+            legacy_keydb_under(Some("/root".into())),
+            Some(PathBuf::from("/root/.config/freemkv/keydb.cfg"))
+        );
+        let got = resolve_keydb(None, "/config", legacy_keydb_under(Some("".into())), &|p| {
+            p != Path::new("/config/keydb.cfg")
+        });
         // Lands on canonical AUTORIP_DIR path, NOT the bare relative "keydb.cfg"
         // the HOME-less container collapsed to (#46). No is_absolute assert:
         // "/config" isn't absolute on Windows; the equality already proves it.
