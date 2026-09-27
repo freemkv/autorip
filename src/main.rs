@@ -727,7 +727,7 @@ fn prune_old_logs(log_dir: &str, retention_days: u64) {
     };
     // The tracing daily appender holds `autorip.log.<today>` (UTC) open; if the
     // daemon logged nothing for > retention_days its mtime can fall before the
-    // cutoff, so never prune it (see active_log_filenames). Read "today" once here.
+    // cutoff, so never prune the active appender file (see active_log_filenames).
     let active = active_log_filenames(&crate::util::format_date());
     // Recurse so the archive subdir (logs/rips/, where archive_device_log
     // writes per-rip files — the dir that actually grows over time) is
@@ -744,8 +744,8 @@ fn prune_old_logs(log_dir: &str, retention_days: u64) {
 /// retention must never delete out from under an open FD. The human log rolls
 /// daily as `autorip.log.<UTC-date>`; its bare base is included for the not-yet-
 /// rolled case. (`autorip.jsonl` is non-rolling and already excluded by
-/// `is_prunable_log_name`.) `today` is the caller's UTC date, read once and
-/// passed in rather than re-read here, so it can't drift from a sibling call.
+/// `is_prunable_log_name`.) `today` is a parameter (rather than read here via
+/// `format_date()`) so a test can inject a fixed date.
 fn active_log_filenames(today: &str) -> Vec<String> {
     vec!["autorip.log".to_string(), format!("autorip.log.{today}")]
 }
