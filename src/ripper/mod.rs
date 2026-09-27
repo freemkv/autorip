@@ -5362,9 +5362,6 @@ fn title_is_confident(
         || crate::tmdb::is_confident_match(disc_name, display_name, tmdb_year)
 }
 
-/// The legacy hand-off marker name (`.done`/`.review`). The completion paths now
-/// transition `state.json` via [`staging::mark_handoff`] / [`staging::handoff_label`];
-/// this is retained only for the tests that pin the `.done`/`.review` vocabulary.
 // Quarantine a staging dir as `.failed`; if that did not persist (state.json
 // unreadable, or staging unwritable) say so in the device log instead of
 // silently carrying on as if the dir were terminal.
@@ -5380,6 +5377,9 @@ fn quarantine_or_log(device: &str, staging_disc_path: &std::path::Path, reason: 
     }
 }
 
+/// The legacy hand-off marker name (`.done`/`.review`). The completion paths now
+/// transition `state.json` via [`staging::mark_handoff`] / [`staging::handoff_label`];
+/// this is retained only for the tests that pin the `.done`/`.review` vocabulary.
 #[cfg(test)]
 fn handoff_marker_name(title_confident: bool) -> &'static str {
     if title_confident { ".done" } else { ".review" }
