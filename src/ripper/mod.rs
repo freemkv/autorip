@@ -5953,6 +5953,15 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
              fails, the disc may be damaged.",
         ),
 
+        // Host certs were offered, but every one failed a local check before any
+        // drive round-trip — a keydb problem, not a rejection (distinct from
+        // E_AACS_NO_HOST_CERT: certs WERE present here).
+        ec::E_AACS_NO_USABLE_HOST_CERT => error_line(
+            code,
+            "Host certificates were found in your key sources, but none of them is \
+             usable. Refresh your key database and try again.",
+        ),
+
         // Other 7xxx — known AACS category but unmapped. Use a
         // generic-but-honest message rather than `({e:?})` debug-dump.
         7000..=7999 => error_line(
@@ -6220,6 +6229,7 @@ fn format_lib_error(phase: &str, e: &libfreemkv::Error) -> String {
         // ── Decryption (7xxx) — defer to the AACS/CSS humanizer ────────
         Error::DecryptFailed
         | Error::AacsKeyFileUnreadable
+        | Error::AacsNoUsableHostCert
         | Error::CssKeyMissing
         | Error::CssAuthFailed
         | Error::NoDiscKey { .. } => {
@@ -7416,6 +7426,19 @@ mod tests {
         assert!(!s.contains("unrecognized"), "msg: {s}");
     }
 
+    // E7033 (all offered host certs failed a local keydb check) is a key-database
+    // problem with its own advice, not the "unexpected error" or "unrecognized
+    // AACS stage" fallbacks it used to fall through to.
+    #[test]
+    fn no_usable_host_cert_renders_refresh_keydb_advice() {
+        let s = format_lib_error("Disc scan", &Error::AacsNoUsableHostCert);
+        assert!(s.starts_with("Disc scan failed:"), "msg: {s}");
+        assert!(s.to_lowercase().contains("refresh your key database"), "msg: {s}");
+        let s = aacs_failure_message(Some(&Error::AacsNoUsableHostCert));
+        assert!(s.starts_with("Error: E7033 "), "msg: {s}");
+        assert!(!s.contains("unrecognized"), "msg: {s}");
+    }
+
     #[test]
     fn format_lib_error_no_streams_plain_english() {
         let s = format_lib_error("Disc scan", &Error::NoStreams);
@@ -7526,6 +7549,7 @@ mod tests {
             },
             Error::AacsAgidAlloc,
             Error::AacsKeyFileUnreadable,
+            Error::AacsNoUsableHostCert,
         ] {
             let s = aacs_failure_message(Some(&e));
             assert!(
