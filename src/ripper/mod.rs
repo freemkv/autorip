@@ -7433,7 +7433,10 @@ mod tests {
     fn no_usable_host_cert_renders_refresh_keydb_advice() {
         let s = format_lib_error("Disc scan", &Error::AacsNoUsableHostCert);
         assert!(s.starts_with("Disc scan failed:"), "msg: {s}");
-        assert!(s.to_lowercase().contains("refresh your key database"), "msg: {s}");
+        assert!(
+            s.to_lowercase().contains("refresh your key database"),
+            "msg: {s}"
+        );
         let s = aacs_failure_message(Some(&Error::AacsNoUsableHostCert));
         assert!(s.starts_with("Error: E7033 "), "msg: {s}");
         assert!(!s.contains("unrecognized"), "msg: {s}");
