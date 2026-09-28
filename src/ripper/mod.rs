@@ -5946,6 +5946,13 @@ fn aacs_failure_message(err: Option<&libfreemkv::Error>) -> String {
              been sent, so it never looked for a key. Wait a while and try again.",
         ),
 
+        ec::E_AACS_KEY_FILE_UNREADABLE => error_line(
+            code,
+            "This disc's AACS key file (Unit_Key_RO.inf) is missing or could not be read, \
+             so no key can be checked against it. Clean the disc and try again; if it still \
+             fails, the disc may be damaged.",
+        ),
+
         // Other 7xxx — known AACS category but unmapped. Use a
         // generic-but-honest message rather than `({e:?})` debug-dump.
         7000..=7999 => error_line(
@@ -6212,6 +6219,7 @@ fn format_lib_error(phase: &str, e: &libfreemkv::Error) -> String {
 
         // ── Decryption (7xxx) — defer to the AACS/CSS humanizer ────────
         Error::DecryptFailed
+        | Error::AacsKeyFileUnreadable
         | Error::CssKeyMissing
         | Error::CssAuthFailed
         | Error::NoDiscKey { .. } => {
@@ -7395,6 +7403,19 @@ mod tests {
         assert!(!s.contains("/dev/sg9"), "msg: {s}");
     }
 
+    // E7031 (live disc's Unit_Key_RO.inf unreadable) is a dirty/damaged-disc outcome with
+    // its own advice, not an "unexpected error" nor an "unrecognized AACS stage".
+    #[test]
+    fn key_file_unreadable_renders_clean_the_disc_advice() {
+        let s = format_lib_error("Disc scan", &Error::AacsKeyFileUnreadable);
+        assert!(s.starts_with("Disc scan failed:"), "msg: {s}");
+        assert!(s.to_lowercase().contains("clean the disc"), "msg: {s}");
+        let s = aacs_failure_message(Some(&Error::AacsKeyFileUnreadable));
+        assert!(s.starts_with("Error: E7031 "), "msg: {s}");
+        assert!(s.contains("Unit_Key_RO.inf"), "msg: {s}");
+        assert!(!s.contains("unrecognized"), "msg: {s}");
+    }
+
     #[test]
     fn format_lib_error_no_streams_plain_english() {
         let s = format_lib_error("Disc scan", &Error::NoStreams);
@@ -7504,6 +7525,7 @@ mod tests {
                 path: "<no host cert>".into(),
             },
             Error::AacsAgidAlloc,
+            Error::AacsKeyFileUnreadable,
         ] {
             let s = aacs_failure_message(Some(&e));
             assert!(
