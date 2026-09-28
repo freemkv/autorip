@@ -730,6 +730,14 @@ impl PollAction {
             PollAction::Present(t) => t.latch,
         }
     }
+
+    /// Show the drive idle this tick, replacing any stale tile (e.g. a cleared wedge).
+    fn shows_idle(self) -> bool {
+        matches!(
+            self,
+            PollAction::Absent { .. } | PollAction::Hold { latch: false }
+        )
+    }
 }
 
 fn poll_action(
@@ -952,26 +960,26 @@ pub fn drive_poll_loop(cfg: &Arc<RwLock<Config>>) {
                 if action.latch() {
                     current_with_disc.insert(device.clone());
                 }
+                if action.shows_idle() && !is_busy(&device) {
+                    update_state(
+                        &device,
+                        RipState {
+                            device: device.clone(),
+                            status: "idle".to_string(),
+                            ..Default::default()
+                        },
+                    );
+                }
                 let tick = match action {
                     PollAction::Present(tick) => tick,
                     PollAction::Hold { .. } => {
-                        tracing::debug!(device = %device, "disc presence settling; no state change");
+                        tracing::debug!(device = %device, "disc presence settling; no insert or removal");
                         continue;
                     }
                     PollAction::Absent { removed } => {
                         if removed {
                             tracing::info!(device = %device, "disc removed");
                             drop_session(&device);
-                        }
-                        if !is_busy(&device) {
-                            update_state(
-                                &device,
-                                RipState {
-                                    device: device.clone(),
-                                    status: "idle".to_string(),
-                                    ..Default::default()
-                                },
-                            );
                         }
                         continue;
                     }
@@ -11089,8 +11097,21 @@ mod poll_presence_tests {
     }
 
     #[test]
-    fn a_cleaning_cartridge_never_rips() {
+    fn an_absent_drive_never_rips() {
         assert_eq!(run(&[Absent, Absent, Absent]), (0, 0));
+    }
+
+    // A drive recovering from a wedge may answer Settling first; its stale
+    // "firmware unresponsive" tile must not outlive the recovery.
+    #[test]
+    fn a_settling_drive_with_no_known_disc_shows_idle() {
+        assert!(poll_action(Settling, false, false).shows_idle());
+        assert!(
+            !poll_action(Settling, true, false).shows_idle(),
+            "a known disc re-spinning keeps its tile"
+        );
+        assert!(poll_action(Absent, true, false).shows_idle());
+        assert!(!poll_action(Present, false, false).shows_idle());
     }
 
     #[test]
