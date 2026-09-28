@@ -518,30 +518,48 @@ pub(super) fn drop_session(device: &str) {
 /// After a USB re-enumeration (bridge crash), the sg device number may
 /// change. Probe the original path and its neighbors to find the drive
 /// that still has the disc. Returns the new device path (e.g. "/dev/sg5").
-pub(super) fn rediscover_drive(device: &str, original_path: &str) -> Option<String> {
+pub(super) fn rediscover_drive(
+    device: &str,
+    original_path: &str,
+    halt: &libfreemkv::Halt,
+) -> Option<String> {
     rediscover_drive_with(
         device,
         original_path,
         expected_volume_id(device).as_deref(),
         |p| libfreemkv::disc_presence(std::path::Path::new(p)),
         probe_volume_id,
-        || std::thread::sleep(SETTLE_PAUSE),
+        || sleep_unless_halted(halt, SETTLE_PAUSE),
     )
+}
+
+/// Sleep `dur`, waking early on `halt`; false if halted.
+pub(super) fn sleep_unless_halted(halt: &libfreemkv::Halt, dur: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + dur;
+    while !halt.is_cancelled() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(libfreemkv::halt::POLL_INTERVAL));
+    }
+    false
 }
 
 // Pause between re-probes of a candidate whose presence is still settling.
 const SETTLE_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
 const SETTLE_RETRIES: u32 = 10;
 
-// `rediscover_drive` with its hardware I/O injected (`presence`, `volume_id`, `pause`).
+// `rediscover_drive` with its hardware I/O injected; `pause` returns false once halted.
 fn rediscover_drive_with(
     device: &str,
     original_path: &str,
     expected_vid: Option<&str>,
     mut presence: impl FnMut(&str) -> libfreemkv::Result<libfreemkv::DiscPresence>,
     mut volume_id: impl FnMut(&str) -> Option<String>,
-    mut pause: impl FnMut(),
+    mut pause: impl FnMut() -> bool,
 ) -> Option<String> {
+    use libfreemkv::DiscPresence::{Present, Settling};
     // TODO(step1-followup): not moved into DiscSession — entangled with
     // disc-identity/device_log/sg-shift logic; left per contract Q3. Only
     // valid for /dev/sgN; bail rather than risk latching a wrong drive.
@@ -571,15 +589,23 @@ fn rediscover_drive_with(
             continue;
         }
         let path = format!("/dev/sg{probe_num}");
-        // A settling node is neither accepted nor rejected until it settles (bounded).
+        // The original node settling is our drive spinning up (the re-open path waits
+        // for it); a settling neighbour is re-probed, bounded, until it settles.
         let mut answer = presence(&path);
         let mut retries = 0;
-        while matches!(answer, Ok(libfreemkv::DiscPresence::Settling)) && retries < SETTLE_RETRIES {
-            pause();
+        while !path_unchanged(delta) && matches!(answer, Ok(Settling)) && retries < SETTLE_RETRIES {
+            if !pause() {
+                return None;
+            }
             retries += 1;
             answer = presence(&path);
         }
-        if !matches!(answer, Ok(libfreemkv::DiscPresence::Present)) {
+        let accept = match answer {
+            Ok(Present) => true,
+            Ok(Settling) => path_unchanged(delta),
+            _ => false,
+        };
+        if !accept {
             continue;
         }
 
@@ -682,22 +708,22 @@ fn probe_volume_id(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod rediscover_tests {
-    use super::rediscover_drive_with;
+    use super::{rediscover_drive_with, sleep_unless_halted};
     use libfreemkv::DiscPresence::{self, Absent, Present, Settling};
     use std::collections::HashMap;
 
     // Rediscovery from /dev/sg4 against scripted per-path presence answers (the last
-    // answer repeats); returns the result and how often each path was probed.
+    // answer repeats; unscripted paths are Absent). Returns the result and probe counts.
     fn rediscover(
         script: &[(&str, &[DiscPresence])],
-        expected: Option<&str>,
         vids: &[(&str, &str)],
+        keep_waiting: bool,
     ) -> (Option<String>, HashMap<String, usize>) {
         let mut probes: HashMap<String, usize> = HashMap::new();
         let found = rediscover_drive_with(
             "sg4",
             "/dev/sg4",
-            expected,
+            Some("VID"),
             |p| {
                 let n = probes.entry(p.to_string()).or_default();
                 *n += 1;
@@ -709,40 +735,89 @@ mod rediscover_tests {
                     .find(|(q, _)| *q == p)
                     .map(|(_, v)| v.to_string())
             },
-            || {},
+            || keep_waiting,
         );
         (found, probes)
     }
 
+    // The original node spinning up after a USB reset is our drive; the re-open
+    // path (open_drive_with_backoff, wait_ready) already waits for it.
     #[test]
-    fn a_drive_spinning_up_after_a_usb_reset_is_rediscovered_once_present() {
-        let (found, probes) =
-            rediscover(&[("/dev/sg4", &[Settling, Settling, Present])], None, &[]);
+    fn the_original_node_spinning_up_is_accepted_without_waiting() {
+        let (found, probes) = rediscover(&[("/dev/sg4", &[Settling, Present])], &[], true);
         assert_eq!(found.as_deref(), Some("/dev/sg4"));
+        assert_eq!(probes["/dev/sg4"], 1);
+    }
+
+    #[test]
+    fn a_neighbour_spinning_up_is_accepted_once_present() {
+        let (found, probes) = rediscover(
+            &[("/dev/sg3", &[Settling, Settling, Present])],
+            &[("/dev/sg3", "VID")],
+            true,
+        );
+        assert_eq!(found.as_deref(), Some("/dev/sg3"));
         assert_eq!(
-            probes["/dev/sg4"], 3,
-            "a settling node must be re-probed, not accepted"
+            probes["/dev/sg3"], 3,
+            "a settling neighbour must be re-probed"
         );
     }
 
     #[test]
-    fn a_settling_node_that_turns_out_empty_is_not_accepted() {
+    fn a_settling_neighbour_that_turns_out_empty_is_not_accepted() {
         let (found, _) = rediscover(
-            &[("/dev/sg4", &[Settling, Absent]), ("/dev/sg5", &[Present])],
-            Some("VID"),
-            &[("/dev/sg5", "VID")],
+            &[("/dev/sg3", &[Settling, Absent]), ("/dev/sg5", &[Present])],
+            &[("/dev/sg3", "VID"), ("/dev/sg5", "VID")],
+            true,
         );
         assert_eq!(found.as_deref(), Some("/dev/sg5"));
     }
 
     #[test]
-    fn a_node_that_never_settles_is_retried_a_bounded_number_of_times() {
-        let (found, probes) = rediscover(&[("/dev/sg4", &[Settling])], None, &[]);
-        assert_eq!(found, None, "a never-settling node must not be accepted");
+    fn a_neighbour_that_never_settles_is_retried_a_bounded_number_of_times() {
+        let (found, probes) = rediscover(&[("/dev/sg3", &[Settling])], &[], true);
+        assert_eq!(
+            found, None,
+            "a never-settling neighbour must not be accepted"
+        );
         assert!(
-            (2..=super::SETTLE_RETRIES as usize + 1).contains(&probes["/dev/sg4"]),
+            (2..=super::SETTLE_RETRIES as usize + 1).contains(&probes["/dev/sg3"]),
             "bounded re-probing; got {}",
-            probes["/dev/sg4"]
+            probes["/dev/sg3"]
+        );
+    }
+
+    #[test]
+    fn a_halt_stops_rediscovery_while_a_neighbour_settles() {
+        let (found, probes) = rediscover(
+            &[("/dev/sg3", &[Settling]), ("/dev/sg5", &[Present])],
+            &[("/dev/sg5", "VID")],
+            false,
+        );
+        assert_eq!(
+            found, None,
+            "a halted rediscovery must not hand back a drive"
+        );
+        assert_eq!(probes["/dev/sg3"], 1, "no re-probe after the halt");
+        assert!(
+            !probes.contains_key("/dev/sg5"),
+            "no further candidates after the halt"
+        );
+    }
+
+    #[test]
+    fn sleep_unless_halted_wakes_promptly_on_a_halt() {
+        let halt = libfreemkv::Halt::new();
+        halt.cancel();
+        let t0 = std::time::Instant::now();
+        assert!(!sleep_unless_halted(
+            &halt,
+            std::time::Duration::from_secs(5)
+        ));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            t0.elapsed()
         );
     }
 }

@@ -3355,17 +3355,25 @@ pub fn rip_disc(cfg: &Arc<RwLock<Config>>, device: &str, device_path: &str, resu
                     );
                     drop_session(device);
 
-                    // Wait for USB re-enumeration with configurable delay.
-                    // Value snapshotted at the top of `rip_disc`; we no
-                    // longer hold the cfg read guard here.
-                    std::thread::sleep(std::time::Duration::from_secs(
-                        transport_recovery_delay_secs,
-                    ));
-
-                    // Re-discover the device. The poll loop may have already
-                    // found it; if not, try probing the original path and its
-                    // neighbors (sg numbers shift by ±1 on re-enumeration).
-                    let new_path = rediscover_drive(device, device_path);
+                    // Wait for USB re-enumeration (delay snapshotted at the top of
+                    // `rip_disc`), then re-discover the drive at its original path or a
+                    // shifted sg number. A Stop ends either wait.
+                    let recovery_halt = libfreemkv::Halt::from_arc(halt.clone());
+                    let new_path = if session::sleep_unless_halted(
+                        &recovery_halt,
+                        std::time::Duration::from_secs(transport_recovery_delay_secs),
+                    ) {
+                        rediscover_drive(device, device_path, &recovery_halt)
+                    } else {
+                        None
+                    };
+                    if recovery_halt.is_cancelled() {
+                        crate::log::device_log(
+                            device,
+                            "Pass 1 cancelled (halt) during transport-failure recovery",
+                        );
+                        return;
+                    }
                     match (new_path.as_deref(), &device_path) {
                         (Some(p), _) if p != device_path => {
                             crate::log::device_log(
