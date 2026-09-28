@@ -6,13 +6,21 @@
 
 - **Unattended rips no longer delete finished work.** With `on_insert` set to Rip or Resume, inserting a disc no longer wipes its completed, held-for-review, mux-in-progress or loss-aborted staging; only stale partial or failed attempts are cleared for a fresh rip. Resume no longer re-rips over a finished rip.
 - An unreadable `state.json` in a staging folder now holds that folder with an error card (repair it, or click Resume once it reads again) instead of being overwritten, wiped or auto-ripped over. A live-disc rip started from the UI still rebuilds it.
-- Drive polling now waits out a drive that is still settling (spinning up after a USB reset, or a tray closing). A disc spinning back up keeps its session, an empty tray closing no longer starts a rip, and a cleaning cartridge is never ripped. Drive rediscovery after a USB bridge crash re-probes a settling drive for up to ~20 s before moving on.
+- A disc spinning back up (for example after a USB reset) no longer drops its session: drive polling now treats a drive that is still settling as "no change" instead of "no disc".
+- After a USB bridge crash, the drive is rediscovered at its original device node even while it is still spinning up; a neighbouring node that is still settling is re-probed for up to ~20 s each (up to 6 neighbours). Stop now interrupts this recovery wait.
+- The mover never reports a move as done when the copy at the destination cannot be verified.
+- Key-service results now use the real `/decode` verdict for reused scans and resumes; HTTP 401/403 gets a credentials message, and a 422 on resume keeps the automatic mux.
+- A drive is reported "firmware unresponsive" only after a fresh drive enumeration still lists it, so an unplugged drive is no longer shown as wedged.
+- The example `docker-compose` healthcheck now runs `autorip --healthcheck`; the old `curl` check always failed in the image.
 
 ### Changed
 
+- Drives answering NOT READY with an incompatible or unreadable medium (30h other than cleaning cartridges), or 04/02, 04/04, 04/07, 04/08 or 0Ch, now count as holding a disc: such a disc is scanned and shows an error card instead of the drive sitting idle.
 - **New disk-space refusals.** TV discs reserve staging space for every planned episode, not just the selected title, and a resumed re-mux checks staging space before it starts. A refused re-mux has its own "staging full" hint and is logged once.
 - `AUTORIP_SKIP_DISKCHECK` only skips the disk-space check when set to `1`, `true` or `yes`; `0`, `false` or empty keep the check on.
 - Saving an `http://` keyserver URL is now rejected in Settings (rips already required `https://`). An `http://` URL saved before upgrading is named in the startup log.
+- Settings that set a webhook flag to a non-boolean value are rejected with HTTP 400.
+- Accept-loss is refused when autorip can't confirm the folder isn't being muxed, and it follows symlinked staging folders (a dangling link returns 404). Concurrent settings saves are coalesced; a save that times out returns 503 and says the result is unknown.
 - Scan, rip and eject API calls for a device that is not an enumerated drive now return 404 instead of 409.
 
 ## [1.7.7] — 2026-09-26
