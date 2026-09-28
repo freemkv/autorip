@@ -45,11 +45,14 @@ use crate::config::Config;
 
 use crate::keysource::DriveAccess;
 
-// Live-drive structure scan options: lookup-free, plus AACS host
-// credentials for the handshake. Keys are resolved afterward via
-// resolve_keys_from_drive.
+// Live-drive structure scan options: lookup-free, plus AACS host credentials for the
+// handshake. With capture_without_keys an unreadable AACS key file does not stop the
+// scan: the disc is captured raw (libfreemkv records E7031 and refuses keys).
 pub(crate) fn scan_opts_for(cfg: &Config) -> libfreemkv::ScanOptions {
-    crate::keysource::drive_scan_opts(cfg)
+    libfreemkv::ScanOptions {
+        raw_copy: cfg.capture_without_keys,
+        ..crate::keysource::drive_scan_opts(cfg)
+    }
 }
 
 // Scan-phase watchdog: emits a WARN every 15s while structure scan / key resolve are in flight,
@@ -8130,6 +8133,19 @@ mod tests {
             assert!(!super::seed_needs_reresolve(None, Some(v)), "{v:?}");
         }
         assert!(!super::seed_needs_reresolve(None, None));
+    }
+
+    // capture_without_keys is the raw-copy mode: only it scans on past an unreadable key file.
+    #[test]
+    fn scan_opts_raw_copy_follows_capture_without_keys() {
+        for capture in [true, false] {
+            let cfg = crate::config::Config {
+                capture_without_keys: capture,
+                keydb_path: Some("/nonexistent/autorip-test/keydb.cfg".into()),
+                ..Default::default()
+            };
+            assert_eq!(super::scan_opts_for(&cfg).raw_copy, capture);
+        }
     }
 
     // Wiring guard: scan_disc banks its verdict on the session, rip_disc reads it,

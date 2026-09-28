@@ -15,6 +15,7 @@
 
 ### Changed
 
+- A disc whose AACS key file (`Unit_Key_RO.inf`) cannot be read stops at the scan with error E7031. With "capture without keys" on, the disc is still captured to ISO.
 - Drives answering NOT READY with an incompatible or unreadable medium (30h other than cleaning cartridges), or 04/02, 04/04, 04/07, 04/08 or 0Ch, now count as holding a disc: such a disc is scanned and shows an error card instead of the drive sitting idle.
 - **New disk-space refusals.** TV discs reserve staging space for every planned episode, not just the selected title, and a resumed re-mux checks staging space before it starts. A refused re-mux has its own "staging full" hint and is logged once.
 - `AUTORIP_SKIP_DISKCHECK` only skips the disk-space check when set to `1`, `true` or `yes`; `0`, `false` or empty keep the check on.
