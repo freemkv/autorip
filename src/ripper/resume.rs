@@ -2524,6 +2524,10 @@ mod resume_remux_unreadable_plan_tests {
     // partial-output delete, state.json left for the operator, an error surfaced.
     fn assert_held(state_bytes: &[u8], tag: &str) {
         let _guard = crate::log::env_guard();
+        // Then the mover/muxer statics lock: this asserts on MUX_ERRORS and STATE.
+        let _g = crate::mover::TEST_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let d = tmpdir();
         // SAFETY: env access in tests, serialized by env_guard.
         unsafe {
