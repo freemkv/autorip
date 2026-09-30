@@ -116,10 +116,10 @@ jobs:
       - name: Check out the pinned siblings (autorip is frozen)
         run: bash autorip/.github/scripts/frozen-siblings.sh
       - uses: dtolnay/rust-toolchain@stable
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories bans licenses sources
-          manifest-path: autorip/Cargo.toml
+      - uses: taiki-e/install-action@cargo-deny
+      # Run from the repo dir so the generated .cargo/config.toml path patches apply.
+      - run: cargo deny --all-features check advisories bans licenses sources
+        working-directory: autorip
 
   # Coverage — additive, NON-REQUIRED. Mirrors the `test` job's sibling
   # checkouts so the workspace resolves the freemkv crates from their tips
