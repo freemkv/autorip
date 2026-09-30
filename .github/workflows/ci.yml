@@ -28,11 +28,8 @@ concurrency:
 # The fix mirrors the developer's local layout: every sibling is checked out
 # into a subdirectory of $GITHUB_WORKSPACE (reproducing ~/Developer/freemkv/*)
 # and a generated .cargo/config.toml redirects the git-tag patches at those
-# paths. The per-job checkout + heredoc is now the shared
-# `freemkv/.github` `checkout-siblings@v1` composite: it clones the siblings at
-# the branch-matched ref (qa->qa, main->main, else dev) and writes autorip's
-# [patch.crates-io]. freemkv-unlock is checked out but NOT patched: it is reached
-# as libfreemkv's path dep (../freemkv-unlock) under this layout.
+# paths. autorip is frozen (retired at 1.8.0), so the siblings are pinned to
+# the commits it last built green with (.github/scripts/frozen-siblings.sh).
 #
 # `--locked` is not used. The committed Cargo.lock resolves the freemkv crates
 # as path packages and carries [[patch.unused]] entries — artifacts of whichever
@@ -78,11 +75,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          self: autorip
+      - name: Check out the pinned siblings (autorip is frozen)
+        run: bash autorip/.github/scripts/frozen-siblings.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -100,11 +94,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          self: autorip
+      - name: Check out the pinned siblings (autorip is frozen)
+        run: bash autorip/.github/scripts/frozen-siblings.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -122,11 +113,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          self: autorip
+      - name: Check out the pinned siblings (autorip is frozen)
+        run: bash autorip/.github/scripts/frozen-siblings.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -147,11 +135,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          self: autorip
+      - name: Check out the pinned siblings (autorip is frozen)
+        run: bash autorip/.github/scripts/frozen-siblings.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -180,11 +165,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          self: autorip
+      - name: Check out the pinned siblings (autorip is frozen)
+        run: bash autorip/.github/scripts/frozen-siblings.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -219,11 +201,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          self: autorip
+      - name: Check out the pinned siblings (autorip is frozen)
+        run: bash autorip/.github/scripts/frozen-siblings.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -262,11 +241,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           path: autorip
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
-        with:
-          checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          self: autorip
+      - name: Check out the pinned siblings (autorip is frozen)
+        run: bash autorip/.github/scripts/frozen-siblings.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

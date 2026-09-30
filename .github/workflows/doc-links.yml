@@ -1,10 +1,7 @@
 name: doc-links
 
-# Thin caller → the canonical reusable doc-links gate in freemkv/.github.
-# autorip path-deps four freemkv crates, so the reusable checks out the sibling
-# tips under test (incl. freemkv-unlock, reached as libfreemkv's path dep) and
-# writes the [patch.crates-io] redirect; it resolves the toolchain from
-# rust-version instead of a hardcoded pin.
+# Broken intra-doc links fail the build. autorip is frozen, so it documents
+# against the pinned sibling commits (.github/scripts/frozen-siblings.sh).
 on: [push, pull_request]
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -12,8 +9,16 @@ concurrency:
 jobs:
   doc-links:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
-    uses: freemkv/.github/.github/workflows/guard-doclinks.yml@v1
-    with:
-      self: autorip
-      checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-      patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: autorip
+      - name: Check out the pinned siblings (autorip is frozen)
+        run: bash autorip/.github/scripts/frozen-siblings.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo doc (deny broken intra-doc links)
+        working-directory: autorip
+        env:
+          RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
+        run: cargo doc --no-deps --document-private-items --lib --bins
