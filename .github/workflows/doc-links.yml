@@ -16,4 +16,4 @@ jobs:
     with:
       self: autorip
       checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-      patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+      patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock

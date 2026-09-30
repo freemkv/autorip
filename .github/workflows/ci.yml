@@ -81,7 +81,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
           self: autorip
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -103,7 +103,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
           self: autorip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -125,7 +125,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
           self: autorip
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -150,7 +150,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
           self: autorip
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -183,7 +183,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
           self: autorip
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -222,7 +222,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
           self: autorip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -265,7 +265,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
-          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n
+          patch: libfreemkv freemkv-keysources freemkv-engine freemkv-i18n freemkv-unlock
           self: autorip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
