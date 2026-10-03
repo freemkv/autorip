@@ -11,7 +11,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: autorip
       - name: Check out the pinned siblings (autorip is frozen)

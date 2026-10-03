@@ -51,7 +51,7 @@ jobs:
   changelog:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Require a CHANGELOG entry for the crate version on main
         shell: bash
         run: |
@@ -72,7 +72,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: autorip
       - name: Check out the pinned siblings (autorip is frozen)
@@ -91,7 +91,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: autorip
       - name: Check out the pinned siblings (autorip is frozen)
@@ -110,7 +110,7 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: autorip
       - name: Check out the pinned siblings (autorip is frozen)
@@ -132,7 +132,7 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: autorip
       - name: Check out the pinned siblings (autorip is frozen)
@@ -162,7 +162,7 @@ jobs:
   release-build-musl:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: autorip
       - name: Check out the pinned siblings (autorip is frozen)
@@ -198,7 +198,7 @@ jobs:
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: autorip
       - name: Check out the pinned siblings (autorip is frozen)
@@ -238,7 +238,7 @@ jobs:
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: autorip
       - name: Check out the pinned siblings (autorip is frozen)

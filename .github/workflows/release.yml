@@ -16,7 +16,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Verify Cargo.toml version matches tag
         run: |
           # The rc cascade bumps Cargo.toml to the FULL rc version (1.7.0-rc1) in
@@ -94,7 +94,7 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -139,7 +139,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -250,7 +250,7 @@ jobs:
       # binary into a slim Debian base and pushes to GHCR.
       - name: Upload binary artifact for docker job
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: autorip-binary-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/autorip
@@ -266,7 +266,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Pull the prebuilt musl binary from the build job into the
       # docker build context. Dockerfile.ci consumes ./autorip from
@@ -306,7 +306,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Update org README with new version
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ secrets.ORG_DISPATCH_TOKEN }}
           repository: freemkv/.github
